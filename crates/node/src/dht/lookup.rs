@@ -41,6 +41,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use indexmap::IndexSet;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use rand::seq::SliceRandom;
 use tokio::task::JoinSet;
@@ -48,12 +49,12 @@ use tracing::{debug, warn};
 
 use crate::dht::client;
 use crate::dht::negative_cache::{Hash, NegativeProbeCache};
-use crate::dht::routing::{K_BUCKET_SIZE, NodeId, RoutingTable, xor_distance};
+use crate::dht::routing::{K_BUCKET_SIZE, NODE_ID_LEN, NodeId, RoutingTable, xor_distance};
 use crate::dht::staker_set::StakerSet;
 
-/// Default α — parallel in-flight RPCs per round. ADR 022 §99.
+/// Default α — parallel in-flight RPCs per round. ADR 022 § Routing Table.
 pub const DEFAULT_ALPHA: usize = 3;
-/// Default K — providers-accumulated saturation cap. ADR 022 §99.
+/// Default K — providers-accumulated saturation cap. ADR 022 § Routing Table.
 pub const DEFAULT_K: usize = K_BUCKET_SIZE;
 /// Default round timeout. Belt over the per-RPC 8s timeout in
 /// [`super::client`]; bounds the wall-clock budget for a single
@@ -82,6 +83,28 @@ impl Default for LookupConfig {
     }
 }
 
+/// Clamp zero values that would otherwise silently turn the lookup
+/// into a no-op (`alpha == 0` → empty batches; `k == 0` → instant
+/// "saturation" before any round runs). Emits a `warn!` so the
+/// misconfiguration is surfaced at runtime rather than hidden behind
+/// an empty result.
+fn sanitize_config(cfg: LookupConfig) -> LookupConfig {
+    let alpha = cfg.alpha.max(1);
+    let k = cfg.k.max(1);
+    if alpha != cfg.alpha || k != cfg.k {
+        warn!(
+            cfg_alpha = cfg.alpha,
+            cfg_k = cfg.k,
+            "dht lookup: LookupConfig had zero alpha/k; clamped to 1"
+        );
+    }
+    LookupConfig {
+        alpha,
+        k,
+        round_timeout: cfg.round_timeout,
+    }
+}
+
 /// Run the iterative `FindValue` lookup for `target`.
 ///
 /// Returns the randomised, deduplicated, filter-survived provider
@@ -89,10 +112,13 @@ impl Default for LookupConfig {
 /// — the caller should fall back to the on-chain origin directory
 /// (ADR 022 §192) if applicable.
 ///
-/// The function never panics or returns `Err`: a transport-level
-/// failure on any single peer is treated like an empty response
-/// (logged at `debug!`). The lookup is best-effort by spec; total
-/// failure manifests as an empty return.
+/// The function never panics or returns `Err`. Per-peer RPC
+/// failures are classified: transport-level failures are absorbed
+/// as empty responses and logged at `debug!`; an invalid Ed25519
+/// `NodeId` (which implies state corruption upstream) is logged at
+/// `warn!`; round-timeout aborts log the aborted-peer count at
+/// `warn!`. The lookup is best-effort by spec; total failure
+/// manifests as an empty return.
 pub async fn find_providers(
     endpoint: &Endpoint,
     routing_table: &Arc<Mutex<RoutingTable>>,
@@ -102,6 +128,7 @@ pub async fn find_providers(
     target: Hash,
     cfg: LookupConfig,
 ) -> Vec<NodeId> {
+    let cfg = sanitize_config(cfg);
     let ctx = LookupCtx {
         endpoint,
         staker_set: staker_set.as_ref(),
@@ -129,8 +156,19 @@ pub async fn find_providers(
     state.into_randomised_providers()
 }
 
-/// Shared inputs to a lookup round — bundled here so `run_round` /
-/// `process_response` don't have to thread eight arguments each.
+/// Per-peer error category surfaced by a single RPC attempt within a
+/// round. Distinguishes "this `NodeId` failed to decode as an
+/// Ed25519 public key" — which implies state-integrity damage
+/// upstream (routing table or filter pipeline let an invalid id
+/// through) and deserves a `warn!` — from a generic transport-level
+/// RPC failure, which is the expected best-effort outcome per the
+/// function docstring and gets logged at `debug!`.
+enum RoundRpcError {
+    InvalidPubKey,
+    Transport(anyhow::Error),
+}
+
+/// Shared inputs to a lookup round.
 struct LookupCtx<'a> {
     endpoint: &'a Endpoint,
     staker_set: &'a dyn StakerSet,
@@ -146,25 +184,23 @@ struct LookupCtx<'a> {
 /// strictly closer to the target than the previous best queried
 /// distance (the convergence signal).
 async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupState) -> bool {
-    let mut tasks: JoinSet<(
+    type RoundResult = (
         NodeId,
-        anyhow::Result<decdn_protocol::dht::FindValueResponse>,
-    )> = JoinSet::new();
+        Result<decdn_protocol::dht::FindValueResponse, RoundRpcError>,
+    );
+    let mut tasks: JoinSet<RoundResult> = JoinSet::new();
     for &peer in batch {
         let endpoint = ctx.endpoint.clone();
         let requester_id = ctx.requester_id;
         let target = ctx.target;
         tasks.spawn(async move {
             let Ok(pk) = PublicKey::from_bytes(&peer) else {
-                return (
-                    peer,
-                    Err(anyhow::anyhow!(
-                        "peer NodeId is not a valid Ed25519 public key"
-                    )),
-                );
+                return (peer, Err(RoundRpcError::InvalidPubKey));
             };
             let addr = EndpointAddr::new(pk);
-            let result = client::find_value(&endpoint, addr, target, requester_id).await;
+            let result = client::find_value(&endpoint, addr, target, requester_id)
+                .await
+                .map_err(RoundRpcError::Transport);
             (peer, result)
         });
     }
@@ -178,7 +214,16 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
                         observed_closer = true;
                     }
                 }
-                Ok((responder, Err(err))) => {
+                Ok((responder, Err(RoundRpcError::InvalidPubKey))) => {
+                    // Bytes already survived the routing-table seed
+                    // and/or three response filters; failing Ed25519
+                    // decode here points at state corruption upstream.
+                    warn!(
+                        ?responder,
+                        "dht lookup: peer NodeId is not a valid Ed25519 public key"
+                    );
+                }
+                Ok((responder, Err(RoundRpcError::Transport(err)))) => {
                     debug!(?responder, %err, "dht lookup: find_value RPC failed");
                 }
                 Err(err) => {
@@ -192,7 +237,14 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
         .await
         .is_err()
     {
+        // After the drain future drops, `tasks` still holds the
+        // handles for peers that hadn't been joined yet — these are
+        // the ones being aborted. Logging the count lets a future
+        // dashboard distinguish "round drained cleanly" from "round
+        // timed out with N peers in flight."
+        let aborted = tasks.len();
         warn!(
+            aborted_peers = aborted,
             timeout_ms = u64::try_from(ctx.cfg.round_timeout.as_millis()).unwrap_or(u64::MAX),
             "dht lookup: round timeout fired; aborting in-flight RPCs"
         );
@@ -212,22 +264,37 @@ fn process_response(
     responder: NodeId,
     state: &mut LookupState,
 ) -> bool {
-    let kept_closer = filter_xor_closer(resp.closer_nodes, &ctx.target, &responder);
-    let kept_closer = filter_active_stakers(kept_closer, ctx.staker_set);
-    let kept_providers = filter_active_stakers(resp.providers, ctx.staker_set);
-    let kept_providers = filter_negative_cache(kept_providers, &ctx.target, ctx.negative_cache);
+    fold_response(
+        &ctx.target,
+        ctx.staker_set,
+        ctx.negative_cache,
+        resp,
+        responder,
+        state,
+    )
+}
+
+/// Filter + fold step shared with the unit tests, which can't easily
+/// stand up an `iroh::Endpoint` to populate a full `LookupCtx`. Pure
+/// over its inputs.
+fn fold_response(
+    target: &Hash,
+    staker_set: &dyn StakerSet,
+    negative_cache: &NegativeProbeCache,
+    resp: decdn_protocol::dht::FindValueResponse,
+    responder: NodeId,
+    state: &mut LookupState,
+) -> bool {
+    let kept_closer = filter_xor_closer(resp.closer_nodes, target, &responder);
+    let kept_closer = filter_active_stakers(kept_closer, staker_set);
+    let kept_providers = filter_active_stakers(resp.providers, staker_set);
+    let kept_providers = filter_negative_cache(kept_providers, target, negative_cache);
 
     for p in kept_providers {
-        if p == ctx.requester_id {
-            continue;
-        }
         state.record_provider(p);
     }
     let mut observed_closer = false;
     for c in kept_closer {
-        if c == ctx.requester_id {
-            continue;
-        }
         if state.add_candidate(c) {
             observed_closer = true;
         }
@@ -245,11 +312,7 @@ fn process_response(
 /// offending entry is either responder misbehaviour or a relay-induced
 /// stale value.
 #[must_use]
-pub fn filter_xor_closer(
-    closer_nodes: Vec<NodeId>,
-    target: &Hash,
-    responder: &NodeId,
-) -> Vec<NodeId> {
+fn filter_xor_closer(closer_nodes: Vec<NodeId>, target: &Hash, responder: &NodeId) -> Vec<NodeId> {
     let responder_distance = xor_distance(responder, target);
     closer_nodes
         .into_iter()
@@ -262,7 +325,7 @@ pub fn filter_xor_closer(
 /// field). The DHT routing pool is restricted to staked nodes per
 /// ADR 022 §183.
 #[must_use]
-pub fn filter_active_stakers(nodes: Vec<NodeId>, staker_set: &dyn StakerSet) -> Vec<NodeId> {
+fn filter_active_stakers(nodes: Vec<NodeId>, staker_set: &dyn StakerSet) -> Vec<NodeId> {
     nodes
         .into_iter()
         .filter(|n| staker_set.is_active(n))
@@ -274,7 +337,7 @@ pub fn filter_active_stakers(nodes: Vec<NodeId>, staker_set: &dyn StakerSet) -> 
 /// previously denied holding `target` may still legitimately route
 /// `closer_nodes` for it.
 #[must_use]
-pub fn filter_negative_cache(
+fn filter_negative_cache(
     providers: Vec<NodeId>,
     target: &Hash,
     cache: &NegativeProbeCache,
@@ -294,14 +357,18 @@ pub fn filter_negative_cache(
 /// on insertion and used as the key for closest-first iteration.
 struct LookupState {
     target: Hash,
-    /// Distance → `NodeId`, sorted ascending. `BTreeMap` gives O(log n)
-    /// insert and `.iter().next()` for "closest unqueried" in O(log n).
+    /// Identity of the local node. Used to reject self from the
+    /// candidate / provider sets — self-filtering lives here, on the
+    /// state object, so a future caller can't accidentally pollute
+    /// the state via a code path that forgets the guard.
+    requester_id: NodeId,
+    /// Distance → `NodeId`, sorted ascending by XOR distance so
+    /// `iter().next()` yields the closest unqueried candidate.
     candidates: BTreeMap<[u8; NODE_ID_LEN], NodeId>,
     queried: HashSet<NodeId>,
-    /// Survivor set, deduplicated. Insertion order preserved here;
+    /// Survivor set, deduplicated. Insertion order preserved;
     /// randomisation happens at return time.
-    providers: Vec<NodeId>,
-    providers_seen: HashSet<NodeId>,
+    providers: IndexSet<NodeId>,
     /// Smallest XOR distance among queried nodes so far. New
     /// candidates only count as "closer" if they beat this.
     best_queried_distance: [u8; NODE_ID_LEN],
@@ -318,10 +385,10 @@ impl LookupState {
     ) -> Self {
         let mut state = Self {
             target: *target,
+            requester_id,
             candidates: BTreeMap::new(),
             queried: HashSet::new(),
-            providers: Vec::new(),
-            providers_seen: HashSet::new(),
+            providers: IndexSet::new(),
             best_queried_distance: [0xFFu8; NODE_ID_LEN],
             k: cfg.k,
             alpha: cfg.alpha,
@@ -338,9 +405,7 @@ impl LookupState {
             }
         };
         for peer in seed {
-            if peer != requester_id {
-                state.add_candidate(peer);
-            }
+            state.add_candidate(peer);
         }
         state
     }
@@ -348,8 +413,12 @@ impl LookupState {
     /// Insert `peer` into the candidate set if not already present
     /// and not already queried. Returns whether the insertion brought
     /// in a candidate strictly closer than the current best queried
-    /// distance (the convergence-tracking signal).
+    /// distance (the convergence-tracking signal). Rejects
+    /// `requester_id`.
     fn add_candidate(&mut self, peer: NodeId) -> bool {
+        if peer == self.requester_id {
+            return false;
+        }
         let dist = xor_distance(&peer, &self.target);
         // XOR distance is bijective for a fixed target, so
         // `contains_key(&dist)` is equivalent to scanning values for
@@ -381,26 +450,32 @@ impl LookupState {
         picked
     }
 
+    /// Insert `peer` into the provider survivor set if not already
+    /// present. Rejects `requester_id`. `IndexSet::insert` handles
+    /// dedup and insertion-order preservation in one step.
     fn record_provider(&mut self, peer: NodeId) {
-        if self.providers_seen.insert(peer) {
-            self.providers.push(peer);
+        if peer == self.requester_id {
+            return;
         }
+        self.providers.insert(peer);
     }
 
-    const fn have_enough_providers(&self) -> bool {
+    fn have_enough_providers(&self) -> bool {
         self.providers.len() >= self.k
     }
 
-    /// Consume state, return the randomised provider list capped at K.
-    /// ADR 022 §186: randomisation is mandatory before probing.
-    fn into_randomised_providers(mut self) -> Vec<NodeId> {
-        self.providers.shuffle(&mut rand::rng());
-        self.providers.truncate(self.k);
-        self.providers
+    /// Consume state, return the surviving provider set with order
+    /// randomised, then truncated to K. ADR 022 §186 requires
+    /// randomisation of the *surviving* set — shuffle precedes
+    /// truncation so the truncated K is a random sample, not a
+    /// deterministic prefix.
+    fn into_randomised_providers(self) -> Vec<NodeId> {
+        let mut providers: Vec<NodeId> = self.providers.into_iter().collect();
+        providers.shuffle(&mut rand::rng());
+        providers.truncate(self.k);
+        providers
     }
 }
-
-use crate::dht::routing::NODE_ID_LEN;
 
 #[cfg(test)]
 #[allow(
@@ -421,23 +496,18 @@ mod tests {
         [byte; 32]
     }
 
-    /// `filter_xor_closer` keeps entries strictly closer than the
-    /// responder; drops entries at-or-beyond the responder's distance.
     #[test]
     fn filter_xor_closer_drops_at_or_beyond_responder_distance() {
-        // target = 0x00…00. distance from peer X is just X itself.
+        // target = 0x00…00. Distance from peer X is just X itself.
         let target = h(0);
-        // responder at distance 0x10 (closer = lower XOR).
         let responder = nid(0x10);
-        // closer_nodes: 0x05 (closer), 0x10 (equal — drop), 0x20 (further — drop), 0x01 (closer).
+        // 0x05/0x01 closer; 0x10 equal → drop; 0x20 further → drop.
         let input = vec![nid(0x05), nid(0x10), nid(0x20), nid(0x01)];
         let kept = filter_xor_closer(input, &target, &responder);
-        // Only strictly-closer survives.
         let kept_set: StdHashSet<NodeId> = kept.into_iter().collect();
         assert_eq!(kept_set, StdHashSet::from([nid(0x05), nid(0x01)]));
     }
 
-    /// `filter_active_stakers` drops non-staked `NodeId`s; keeps staked.
     #[test]
     fn filter_active_stakers_drops_non_staked() {
         let mut staked = StdHashSet::new();
@@ -449,8 +519,6 @@ mod tests {
         assert_eq!(kept, vec![nid(1), nid(3)]);
     }
 
-    /// `filter_negative_cache` drops only entries the cache flags
-    /// active for the given target — leaves others untouched.
     #[test]
     fn filter_negative_cache_drops_only_active_pairs_for_target() {
         let cache = NegativeProbeCache::new();
@@ -463,12 +531,8 @@ mod tests {
         assert_eq!(kept, vec![nid(2), nid(3)]);
     }
 
-    /// `LookupState::pick_round_batch` returns up to α candidates
-    /// ordered closest-first, and marks them queried so a second
-    /// pick doesn't return the same peers.
     #[test]
     fn lookup_state_pick_returns_closest_alpha_marks_queried() {
-        // Empty routing table; we'll manually seed candidates.
         let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
         let target = h(0);
         let cfg = LookupConfig {
@@ -477,7 +541,6 @@ mod tests {
             round_timeout: Duration::from_secs(1),
         };
         let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
-        // Inject candidates manually.
         state.add_candidate(nid(0x10));
         state.add_candidate(nid(0x02));
         state.add_candidate(nid(0x40));
@@ -490,8 +553,6 @@ mod tests {
         assert!(third.is_empty());
     }
 
-    /// `LookupState::add_candidate` rejects already-queried peers
-    /// and reports whether a newcomer is strictly closer.
     #[test]
     fn lookup_state_add_candidate_tracks_strictly_closer() {
         let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
@@ -499,17 +560,14 @@ mod tests {
         let cfg = LookupConfig::default();
         let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
 
-        // First add: best is "infinity" (0xFF…FF), so any peer is closer.
+        // best_queried_distance starts at 0xFF…FF, so any peer wins.
         assert!(state.add_candidate(nid(0x80)));
-        // Query it, then add a closer peer — still strictly closer.
         let _ = state.pick_round_batch();
         assert!(state.add_candidate(nid(0x40)));
-        // A peer not closer than best_queried (0x80 → distance 0x80…80)
-        // — re-adding 0xC0 is further than 0x80, so not closer.
+        // 0xC0 is further than 0x80, so not strictly closer.
         assert!(!state.add_candidate(nid(0xC0)));
     }
 
-    /// `LookupState::record_provider` dedupes.
     #[test]
     fn lookup_state_record_provider_dedupes() {
         let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
@@ -518,17 +576,17 @@ mod tests {
         state.record_provider(nid(1));
         state.record_provider(nid(2));
         state.record_provider(nid(1));
-        assert_eq!(state.providers, vec![nid(1), nid(2)]);
+        let providers_in_order: Vec<NodeId> = state.providers.iter().copied().collect();
+        assert_eq!(providers_in_order, vec![nid(1), nid(2)]);
     }
 
-    /// `into_randomised_providers` returns all providers (≤ k) and
-    /// truncates beyond k. We verify ordering can differ across calls
-    /// to catch a deterministic regression — the assertion is "not
-    /// always equal", not "always different".
     #[test]
     fn into_randomised_providers_truncates_to_k_and_shuffles() {
-        let mut deterministic_count = 0;
+        // Stronger than "not always canonical": require at least two
+        // distinct orderings across 16 runs, so a swap-only-the-
+        // last-two shuffle bug doesn't ship green.
         let canonical = (1u8..=20).map(nid).collect::<Vec<_>>();
+        let mut seen_orderings: StdHashSet<Vec<NodeId>> = StdHashSet::new();
         for _ in 0..16 {
             let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
             let cfg = LookupConfig {
@@ -542,17 +600,157 @@ mod tests {
             }
             let out = state.into_randomised_providers();
             assert_eq!(out.len(), 10);
-            if out == canonical[..10] {
-                deterministic_count += 1;
-            }
+            assert!(
+                out.iter().all(|p| canonical.contains(p)),
+                "shuffle invented elements not in the canonical set"
+            );
+            seen_orderings.insert(out);
         }
-        // With 20 providers truncated to 10 and shuffled, the
-        // probability of seeing the canonical order across all 16
-        // runs is vanishingly small (factorially small). One
-        // deterministic match is plausible; 16/16 is not.
         assert!(
-            deterministic_count < 16,
-            "providers were never shuffled across 16 calls — randomisation broken"
+            seen_orderings.len() >= 2,
+            "providers came back in the same order across 16 runs — shuffle is degenerate or broken"
         );
+    }
+
+    /// ADR 022 §184 mandates that the negative-cache filter applies
+    /// only to `providers`, never `closer_nodes`. A peer that
+    /// previously denied holding `target` may still legitimately
+    /// route towards it, so dropping it from `closer_nodes` would
+    /// silently strand lookups whose only path passes through that
+    /// peer. Pin the asymmetry against a future "tidy-up" that
+    /// extends Filter-3 to both fields.
+    #[test]
+    fn fold_response_negative_cache_does_not_drop_closer_nodes() {
+        let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+        let target = h(0);
+        let cfg = LookupConfig::default();
+        let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
+
+        let staked: StdHashSet<NodeId> = [nid(0x05), nid(0x10), nid(0x20)].into_iter().collect();
+        let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
+
+        let cache = NegativeProbeCache::new();
+        // Both 0x05 and 0x10 are flagged negative for `target`.
+        cache.record_failure(nid(0x05), target);
+        cache.record_failure(nid(0x10), target);
+
+        // Responder 0x20 returns 0x05 + 0x10 in BOTH fields. Per
+        // ADR 022 §184 only `providers` is filtered.
+        let resp = decdn_protocol::dht::FindValueResponse {
+            hash: target,
+            providers: vec![nid(0x05), nid(0x10)],
+            closer_nodes: vec![nid(0x05), nid(0x10)],
+        };
+        fold_response(
+            &target,
+            staker_set.as_ref(),
+            &cache,
+            resp,
+            nid(0x20),
+            &mut state,
+        );
+
+        // Providers were dropped by Filter 3.
+        assert_eq!(state.providers.len(), 0);
+        // Closer_nodes survived — they appear as candidates.
+        assert!(state.candidates.values().any(|v| v == &nid(0x05)));
+        assert!(state.candidates.values().any(|v| v == &nid(0x10)));
+    }
+
+    /// A round can surface providers while no candidate is strictly
+    /// closer than the current best. `fold_response` must still fold
+    /// the providers into state, and the convergence signal it
+    /// returns is independent of provider presence.
+    #[test]
+    fn fold_response_records_providers_even_when_no_closer_node() {
+        let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+        let target = h(0);
+        let cfg = LookupConfig::default();
+        let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
+
+        let staked: StdHashSet<NodeId> = [nid(0x05), nid(0x07)].into_iter().collect();
+        let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
+        let cache = NegativeProbeCache::new();
+
+        // Responder at 0x05 returns provider 0x07 and a closer_node
+        // 0x07 that is NOT strictly closer than the responder
+        // (0x07 > 0x05 in XOR to target=0x00), so Filter 1 drops it.
+        let resp = decdn_protocol::dht::FindValueResponse {
+            hash: target,
+            providers: vec![nid(0x07)],
+            closer_nodes: vec![nid(0x07)],
+        };
+        let observed_closer = fold_response(
+            &target,
+            staker_set.as_ref(),
+            &cache,
+            resp,
+            nid(0x05),
+            &mut state,
+        );
+
+        assert!(!observed_closer, "no candidate was strictly closer");
+        assert_eq!(state.providers.len(), 1, "provider must still be folded");
+        assert!(state.providers.contains(&nid(0x07)));
+    }
+
+    /// `have_enough_providers` is `>= k`, not `> k`. Pin the
+    /// boundary so a regression at the comparison ships red.
+    #[test]
+    fn have_enough_providers_is_inclusive_at_k() {
+        let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+        let cfg = LookupConfig {
+            alpha: 3,
+            k: 2,
+            round_timeout: Duration::from_secs(1),
+        };
+        let mut state = LookupState::new(&routing, &h(0), nid(0xFF), cfg);
+        assert!(!state.have_enough_providers());
+        state.record_provider(nid(1));
+        assert!(!state.have_enough_providers());
+        state.record_provider(nid(2));
+        assert!(state.have_enough_providers());
+        state.record_provider(nid(3));
+        assert!(state.have_enough_providers());
+    }
+
+    /// `add_candidate` and `record_provider` reject `requester_id`
+    /// even if the wire layer somehow let it through. The self-
+    /// filter lives on `LookupState` itself (not in
+    /// `process_response`) precisely so this can't regress.
+    #[test]
+    fn lookup_state_rejects_self_in_candidates_and_providers() {
+        let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+        let cfg = LookupConfig::default();
+        let me = nid(0xAA);
+        let mut state = LookupState::new(&routing, &h(0), me, cfg);
+
+        // Both methods silently no-op for self.
+        assert!(!state.add_candidate(me));
+        assert!(state.candidates.is_empty());
+        state.record_provider(me);
+        assert!(state.providers.is_empty());
+
+        // Non-self still flows through.
+        assert!(state.add_candidate(nid(0x42)));
+        state.record_provider(nid(0x43));
+        assert_eq!(state.candidates.len(), 1);
+        assert_eq!(state.providers.len(), 1);
+    }
+
+    /// `sanitize_config` clamps zero alpha / k to 1; otherwise a
+    /// caller passing `LookupConfig::default()` with `..Default::default()`
+    /// patterns could silently wedge the lookup.
+    #[test]
+    fn sanitize_config_clamps_zero_alpha_and_k_to_one() {
+        let cfg = LookupConfig {
+            alpha: 0,
+            k: 0,
+            round_timeout: Duration::from_secs(1),
+        };
+        let clamped = sanitize_config(cfg);
+        assert_eq!(clamped.alpha, 1);
+        assert_eq!(clamped.k, 1);
+        assert_eq!(clamped.round_timeout, Duration::from_secs(1));
     }
 }

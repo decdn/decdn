@@ -12,25 +12,19 @@
 //!
 //! The DHT iterative lookup ([`super::lookup`]) consumes
 //! [`NegativeProbeCache::contains_active`] as the third ADR 022
-//! §Lookup-integrity filter on `FindValueResponse.providers`. The
-//! producer side ([`NegativeProbeCache::record_failure`]) belongs to
-//! a future outbound `cdn/probe/v1` client that does not exist on
-//! `main` yet; the method ships now so the lookup-side tests can
-//! populate the cache, and so the eventual probe client has a
-//! stable surface to call.
+//! §Lookup-integrity filter on `FindValueResponse.providers`.
+//! [`NegativeProbeCache::record_failure`] is the producer-side hook
+//! for the outbound `cdn/probe/v1` client.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use indexmap::IndexMap;
 use tracing::warn;
 
 use crate::dht::routing::NodeId;
 
-/// 32-byte content hash. Aliased here (matching the alias in
-/// [`crate::dht::records`]) so the lookup-side filter callsites read
-/// in domain language rather than as a raw `[u8; 32]`.
-pub type Hash = [u8; 32];
+pub use crate::dht::records::Hash;
 
 /// ADR 001 §99: negative cache TTL is 5 minutes — longer than the
 /// positive probe cache (15s) because false-STORE results are less
@@ -46,15 +40,14 @@ type Key = (NodeId, Hash);
 
 #[derive(Debug)]
 struct Inner {
-    /// Key → expiry deadline. The map is the authoritative
-    /// membership check; the queue below only tracks order.
-    map: HashMap<Key, Instant>,
-    /// Front = most-recently-used, back = least-recently-used.
-    /// Stays in lockstep with `map`: every key in `map` is present
-    /// exactly once in `order`. Bookkeeping is O(n) at cap=1024
-    /// which is fine for the consultation frequency (once per probe
-    /// candidate, not once per wire packet).
-    order: VecDeque<Key>,
+    /// Key → expiry deadline. `IndexMap` collapses what would
+    /// otherwise be a `HashMap` + side `VecDeque` (kept in lockstep
+    /// to track LRU order) into a single store: insertion order is
+    /// the LRU ordering, with index 0 = most-recently-used and
+    /// `len()-1` = least-recently-used. Bumping a hit means
+    /// `shift_remove` + `shift_insert(0, …)`; eviction means
+    /// `pop` from the back.
+    entries: IndexMap<Key, Instant>,
     cap: usize,
     ttl: Duration,
 }
@@ -80,25 +73,18 @@ impl NegativeProbeCache {
         Self::with_capacity_and_ttl(DEFAULT_CAPACITY, DEFAULT_TTL)
     }
 
-    /// Build with a custom capacity (TTL stays at the spec default).
-    /// `cap == 0` is clamped to 1. Test-only — only the unit tests
-    /// below need to override capacity.
     #[cfg(test)]
     #[must_use]
     fn with_capacity(cap: usize) -> Self {
         Self::with_capacity_and_ttl(cap, DEFAULT_TTL)
     }
 
-    /// Build with a custom capacity and TTL. Module-private: only
-    /// the unit tests below need sub-second TTL expiry; production
-    /// callers use [`Self::new`].
     #[must_use]
     fn with_capacity_and_ttl(cap: usize, ttl: Duration) -> Self {
         let cap = cap.max(1);
         Self {
             inner: Mutex::new(Inner {
-                map: HashMap::with_capacity(cap),
-                order: VecDeque::with_capacity(cap),
+                entries: IndexMap::with_capacity(cap),
                 cap,
                 ttl,
             }),
@@ -107,42 +93,45 @@ impl NegativeProbeCache {
 
     /// Filter 3 (ADR 022 §184): returns `true` iff
     /// `(node_id, hash)` is in the cache and its TTL hasn't elapsed.
-    /// A live hit bumps the entry to the front of the LRU ordering;
-    /// an expired entry is evicted before returning `false`.
+    /// A live hit bumps the entry to the front of the LRU ordering
+    /// (index 0) **without refreshing the entry's expiry** — TTL is
+    /// anchored at insertion per ADR 001 §99, not at read. An
+    /// expired entry is evicted before returning `false`.
     #[must_use]
     pub fn contains_active(&self, node_id: &NodeId, hash: &Hash) -> bool {
         let key = (*node_id, *hash);
         let now = Instant::now();
         let mut guard = self.lock();
-        let Some(expiry) = guard.map.get(&key).copied() else {
+        let Some(expiry) = guard.entries.get(&key).copied() else {
             return false;
         };
         if expiry <= now {
-            guard.map.remove(&key);
-            guard.order.retain(|k| k != &key);
+            guard.entries.shift_remove(&key);
             return false;
         }
-        Self::touch(&mut guard, &key);
+        // Bump to front of LRU, preserving the original expiry.
+        guard.entries.shift_remove(&key);
+        guard.entries.shift_insert(0, key, expiry);
         true
     }
 
-    /// Insert / refresh `(node_id, hash)` with `now + TTL` expiry.
-    /// Evicts the least-recently-used entry on cap overflow. Called
-    /// by the future outbound probe client after a `has_blob: false`
-    /// response; the lookup module never calls this directly.
+    /// Insert / refresh `(node_id, hash)` with `now + TTL` expiry,
+    /// moving the entry to the front of the LRU ordering. Evicts the
+    /// least-recently-used entry on cap overflow. Producer-side hook
+    /// for the outbound probe client; the lookup module never calls
+    /// this directly.
     pub fn record_failure(&self, node_id: NodeId, hash: Hash) {
         let key = (node_id, hash);
         let mut guard = self.lock();
         let expiry = Instant::now() + guard.ttl;
-        let was_present = guard.map.insert(key, expiry).is_some();
-        if was_present {
-            guard.order.retain(|k| k != &key);
-        } else if guard.map.len() > guard.cap
-            && let Some(victim) = guard.order.pop_back()
-        {
-            guard.map.remove(&victim);
+        // `shift_insert` removes the existing entry (if any) first
+        // and re-inserts at index 0, which is exactly the MRU bump
+        // we want for the refresh case.
+        guard.entries.shift_insert(0, key, expiry);
+        if guard.entries.len() > guard.cap {
+            // `pop` removes the last entry — the LRU back.
+            guard.entries.pop();
         }
-        guard.order.push_front(key);
     }
 
     /// Current entry count. Includes expired entries that haven't
@@ -150,18 +139,13 @@ impl NegativeProbeCache {
     /// precise live count is needed.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lock().map.len()
+        self.lock().entries.len()
     }
 
     /// Whether the cache holds zero entries (including stale).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.lock().map.is_empty()
-    }
-
-    fn touch(guard: &mut Inner, key: &Key) {
-        guard.order.retain(|k| k != key);
-        guard.order.push_front(*key);
+        self.lock().entries.is_empty()
     }
 
     /// Poison-tolerant lock acquisition. Matches the in-repo pattern
@@ -218,10 +202,12 @@ mod tests {
 
     #[test]
     fn expired_entry_returns_false_and_is_evicted() {
-        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(40));
+        // Margins kept generous (TTL 200ms, sleep 300ms) so CI runners
+        // under load don't flake on tight wall-clock checks.
+        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(200));
         c.record_failure(nid(1), h(1));
         assert!(c.contains_active(&nid(1), &h(1)));
-        thread::sleep(Duration::from_millis(60));
+        thread::sleep(Duration::from_millis(300));
         assert!(!c.contains_active(&nid(1), &h(1)));
         assert!(
             c.is_empty(),
@@ -255,16 +241,40 @@ mod tests {
         assert!(c.contains_active(&nid(3), &h(3)));
     }
 
+    /// Pins the ADR 001 §99 invariant that TTL is anchored at
+    /// insertion, NOT refreshed on read. A regression in
+    /// [`NegativeProbeCache::contains_active`] that re-stamped
+    /// expiry during the LRU bump would extend the suppression
+    /// window beyond spec and ship green without this test.
+    #[test]
+    fn read_hit_does_not_refresh_ttl() {
+        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(300));
+        c.record_failure(nid(1), h(1));
+        // Half-TTL — entry still live; read bumps LRU.
+        thread::sleep(Duration::from_millis(150));
+        assert!(c.contains_active(&nid(1), &h(1)));
+        // Past the original TTL window. If the read had refreshed
+        // the expiry, the entry would still be live here.
+        thread::sleep(Duration::from_millis(250));
+        assert!(
+            !c.contains_active(&nid(1), &h(1)),
+            "read-hit illegally extended the TTL window"
+        );
+    }
+
     #[test]
     fn re_recording_same_key_refreshes_ttl_does_not_grow_len() {
-        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(80));
+        // TTL=400ms; insert, wait 200ms, re-record, wait 300ms.
+        // Without the refresh the first insert (at t=0, TTL 400ms)
+        // would have expired by t=500ms; the refresh at t=200 reset
+        // the window, so the entry should still be live at t=500ms
+        // (300ms post-refresh, inside the 400ms TTL). 100ms margins
+        // each side keep this robust under CI load.
+        let c = NegativeProbeCache::with_capacity_and_ttl(8, Duration::from_millis(400));
         c.record_failure(nid(1), h(1));
-        thread::sleep(Duration::from_millis(40));
+        thread::sleep(Duration::from_millis(200));
         c.record_failure(nid(1), h(1));
-        thread::sleep(Duration::from_millis(60));
-        // First insert would have expired by now (40+60=100ms > 80ms);
-        // the refresh at 40ms reset the window so we're at 60ms post-
-        // refresh, still inside the 80ms TTL.
+        thread::sleep(Duration::from_millis(300));
         assert!(c.contains_active(&nid(1), &h(1)));
         assert_eq!(c.len(), 1);
     }

@@ -2651,6 +2651,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.9.0",
  "hyper-util",
+ "indexmap 2.13.1",
  "iroh",
  "iroh-blobs",
  "iroh-gossip",

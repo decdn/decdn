@@ -1,4 +1,4 @@
-//! Iterative `FindValue` lookup loopback (PR 5 of #320, ADR 022
+//! Iterative `FindValue` lookup loopback (ADR 022
 //! §`FIND_VALUE` Flow + §Lookup integrity).
 //!
 //! Spins up one or more DHT-server endpoints with seeded routing
@@ -102,7 +102,7 @@ async fn local_endpoint(
 /// Server handle: holds the endpoint, accept task, and shared
 /// routing / record handles so tests can seed them before issuing
 /// lookups.
-#[allow(dead_code)] // `routing` is held so tests CAN inspect server-side state if needed; not all tests do.
+#[allow(dead_code)]
 struct TestServer {
     endpoint: Endpoint,
     addr: SocketAddr,
