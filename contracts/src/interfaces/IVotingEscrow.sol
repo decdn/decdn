@@ -16,7 +16,4 @@ interface IVotingEscrow {
 
     /// @notice Total ve-supply at `timestamp`.
     function totalSupplyAt(uint256 timestamp) external view returns (uint256);
-
-    /// @notice Current total ve-supply.
-    function totalSupply() external view returns (uint256);
 }

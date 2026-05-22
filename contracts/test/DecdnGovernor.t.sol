@@ -94,6 +94,17 @@ contract DecdnGovernorTest is Test {
         assertEq(gov.quorum(block.timestamp), (2_000_000e18 * 4) / 100);
     }
 
+    function test_proposalThresholdUsesSnapshotSupply() public {
+        // The threshold reads ve-supply at the proposer-vote snapshot
+        // (clock() - 1), not current supply, so it stays consistent with the
+        // proposer's measured weight as ve-supply decays.
+        vm.warp(1_000_000);
+        uint256 snapshot = block.timestamp - 1;
+        ve.setSupplyAt(snapshot, 2_000_000e18); // supply at the snapshot
+        ve.setSupply(1_000_000e18); // different "current" supply -> must be ignored
+        assertEq(gov.proposalThreshold(), 2_000_000e18 / 1000);
+    }
+
     function test_getVotesReadsVeBalance() public {
         ve.setBalance(voterFor, 1234e18);
         // timepoint must not be in the future for the real VE; mock ignores it.
@@ -217,16 +228,17 @@ contract DecdnGovernorTest is Test {
     }
 
     function test_abstainCountsTowardQuorumButNotApproval() public {
+        address abstainer = makeAddr("abstainer");
         ve.setBalance(proposer, SUPPLY / 1000);
-        ve.setBalance(voterFor, (SUPPLY * 5) / 100); // 5% Abstain meets quorum
-        ve.setBalance(voterAgainst, (SUPPLY * 1) / 100); // 1% For, 0 Against
+        ve.setBalance(abstainer, (SUPPLY * 5) / 100); // 5% Abstain -> meets quorum
+        ve.setBalance(voterFor, (SUPPLY * 1) / 100); // 1% For, 0 Against
 
         (uint256 id,,,,) = _proposeSetValue(11, "abstain quorum");
         vm.warp(block.timestamp + gov.votingDelay() + 1);
 
-        vm.prank(voterFor);
+        vm.prank(abstainer);
         gov.castVote(id, ABSTAIN);
-        vm.prank(voterAgainst);
+        vm.prank(voterFor);
         gov.castVote(id, FOR);
 
         vm.warp(block.timestamp + gov.votingPeriod() + 1);

@@ -113,11 +113,13 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         return (votingEscrow.totalSupplyAt(timepoint) * QUORUM_NUMERATOR) / QUORUM_DENOMINATOR;
     }
 
-    /// @notice Proposal threshold = 0.1% of current total ve-supply. Evaluated
-    ///         at proposal time, which is the snapshot the proposer's weight is
-    ///         checked against (`clock() - 1`).
+    /// @notice Proposal threshold = 0.1% of total ve-supply at `clock() - 1` —
+    ///         the same snapshot OZ `Governor.propose` measures the proposer's
+    ///         weight against — so the threshold and the proposer's votes are
+    ///         read at one consistent timepoint as ve-supply decays.
     function proposalThreshold() public view override returns (uint256) {
-        return (votingEscrow.totalSupply() * PROPOSAL_THRESHOLD_NUMERATOR) / PROPOSAL_THRESHOLD_DENOMINATOR;
+        uint256 snapshot = uint256(clock()) - 1;
+        return (votingEscrow.totalSupplyAt(snapshot) * PROPOSAL_THRESHOLD_NUMERATOR) / PROPOSAL_THRESHOLD_DENOMINATOR;
     }
 
     /// @dev Voting weight = ve-balance at the proposal snapshot. `params` is
