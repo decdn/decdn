@@ -495,24 +495,26 @@ mod tests {
     }
 
     #[test]
-    fn seed_cold_start_schedules_every_hash_with_cold_start_jitter() {
-        // Seeding N hashes via `seed_cold_start` produces N scheduled
-        // entries, each due within the cold-start window. Returns N.
+    fn seed_cold_start_schedules_every_hash_within_cold_start_window() {
+        // Seeding N hashes returns N, and every hash drains within the
+        // cold-start window plus a small slack. Behavioural check via
+        // `drain_due` rather than peeking at the heap so the test
+        // survives a future switch to a different scheduling primitive.
         let s = RepublishScheduler::new();
         let hashes: Vec<[u8; 32]> = (1u8..=5).map(h).collect();
         let n = s.seed_cold_start(hashes.iter().copied());
         assert_eq!(n, 5);
         assert_eq!(s.len(), 5);
-        // None of them should be due in the next moment (jitter > 0 case);
-        // and all should be due before now + COLD_START_MAX (plus a small
-        // slack for clock drift between scheduling and the bound check).
-        let max_due = now_us()
+        let deadline_us = now_us()
             .saturating_add(u64::try_from(COLD_START_MAX.as_micros()).unwrap())
-            .saturating_add(1_000); // 1 ms slack
-        let heap = s.heap.lock().unwrap();
-        for Reverse(Entry { due_us, .. }) in heap.iter() {
-            assert!(*due_us <= max_due, "due_us {due_us} > max {max_due}");
-        }
+            .saturating_add(1_000); // 1 ms slack for drift between seed and check
+        let drained: HashSet<[u8; 32]> = s.drain_due(deadline_us).into_iter().collect();
+        let expected: HashSet<[u8; 32]> = hashes.into_iter().collect();
+        assert_eq!(drained, expected);
+        assert!(
+            s.is_empty(),
+            "drain_due at deadline should empty the scheduler"
+        );
     }
 
     #[test]

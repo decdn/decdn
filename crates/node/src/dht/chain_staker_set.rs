@@ -10,37 +10,39 @@
 //!
 //! # Spec mapping
 //!
-//! - ADR 022 §STORE Flow line 140: the receiver checks `holder` is in
-//!   "the cached active-staker set (populated from
-//!   `StakingRegistry.getActiveNodes()` per ADR 019 § Step 3.3)".
-//! - ADR 019 § Step 3.3: "initial full fetch via `getActiveNodes()`
-//!   pagination + event subscription for incremental updates."
-//! - ADR 022 §FIND\_VALUE Flow line 183: the requester-side iterative
-//!   lookup (PR 5) filters `closer_nodes` and `providers` against the
-//!   same cached set.
+//! - ADR 022 §STORE Flow: the receiver checks `holder` is in the
+//!   cached active-staker set populated from
+//!   `StakingRegistry.getActiveNodes()`.
+//! - ADR 019 § Step 3.3: bootstrap pattern (initial paginated
+//!   `getActiveNodes` + event subscription).
+//! - The event set this watcher follows is grounded in
+//!   `StakingRegistry.sol`'s own write-paths — every contract write
+//!   that flips the canonical `isActive` predicate is mirrored by an
+//!   event here.
 //!
 //! # Failure model
 //!
 //! Bootstrap RPC failure → caller propagates the error (the runtime
 //! treats it as fatal; the DHT cannot function without a staker set).
 //!
-//! Watcher RPC failure (mid-run) → the task logs and re-establishes
-//! its event filters with exponential backoff. After a sustained
-//! outage exceeding `WATCHER_RESYNC_THRESHOLD`, the watcher
-//! re-bootstraps from `getActiveNodes` to recover from any missed
-//! events; until then, the cached set may admit / reject one extra
-//! `Store` per missed transition. The existing `decdn_rpc_healthy`
-//! gauge (driven by the runtime's RPC watchdog at #283) is the
-//! operator-visible signal for both conditions.
+//! Watcher RPC failure (mid-run) → the task logs at `warn!`, sleeps
+//! for an exponentially-growing backoff (1s → 60s cap), and
+//! re-establishes its event filters. Today there is no `getActiveNodes`
+//! resync after extended outage, so the cached set can drift from
+//! chain state when an event arrives while filters are down. The
+//! operator-visible signal is the `warn!` log line — pair with a
+//! tail-the-logs alert, since `decdn_rpc_healthy` tracks the
+//! reachability watchdog, not this task.
+//!
+//! A `getActiveNodes` resync-on-extended-outage path is a follow-up.
 //!
 //! # N+1 round-trips at bootstrap
 //!
 //! Each page of `getActiveNodes` returns up to 100 entries; we then
 //! issue one `isActive(operator)` per entry to filter. At `PoC` scale
 //! (tens of nodes) this is tens of RPC round-trips — acceptable for a
-//! one-shot startup path. A `Multicall3` batching pass is the natural
-//! follow-up (ADR 022 line 192 already plans the same dependency for
-//! the origin-directory fallback path).
+//! one-shot startup path. `Multicall3` batching is a natural
+//! follow-up.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
@@ -71,24 +73,16 @@ const PAGE_SIZE: u64 = 100;
 const CHANGES_CHANNEL_CAPACITY: usize = 128;
 
 /// Backoff between watcher restart attempts after an event-stream
-/// terminates with an error. Capped, with a jittered initial step.
+/// terminates with an error.
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Upper bound for the watcher restart backoff.
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
-/// Threshold after which the watcher re-bootstraps the active set
-/// from `getActiveNodes` instead of just restarting event filters.
-/// Bounds the missed-events recovery window.
-#[allow(dead_code)] // Reserved for the re-bootstrap path (see watcher_loop TODO).
-const WATCHER_RESYNC_THRESHOLD: Duration = Duration::from_mins(5);
-
 /// Chain-backed staker set. Cheap to clone via the shared inner
 /// [`Arc`]; the runtime holds one `Arc<dyn StakerSet>` and consumers
-/// (handler, future iterative lookup, bootstrap) access the cached set
-/// through it. The background watcher task is owned by this struct
-/// via a private `AbortOnDrop` wrapper; dropping the `ChainStakerSet`
-/// aborts the watcher so a node-restart cycle never leaks chain-poll
-/// tasks.
+/// access the cached set through it. The background watcher task is
+/// owned via a private `AbortOnDrop` wrapper so a node-restart cycle
+/// never leaks chain-poll tasks.
 #[derive(Debug)]
 pub struct ChainStakerSet {
     active: Arc<RwLock<HashSet<NodeId>>>,
@@ -156,16 +150,20 @@ impl StakerSet for ChainStakerSet {
 
 /// Helper for the poison-tolerant `RwLock` read used by every
 /// `StakerSet` accessor: recover the inner set rather than propagate
-/// a panic into the handler hot path. Centralising the pattern keeps
-/// the trait impl shaped like data accessors instead of three copies
-/// of the same recovery boilerplate.
+/// a panic into the handler hot path. A poisoned read means *something
+/// panicked while holding the write lock* — we log on the recovery
+/// arm so the panic surfaces somewhere, matching the in-repo
+/// precedent in `cache/src/engine.rs`.
 fn read_active<R, F>(active: &Arc<RwLock<HashSet<NodeId>>>, f: F) -> R
 where
     F: FnOnce(&HashSet<NodeId>) -> R,
 {
     match active.read() {
         Ok(guard) => f(&guard),
-        Err(poisoned) => f(&poisoned.into_inner()),
+        Err(poisoned) => {
+            warn!("ChainStakerSet active set RwLock poisoned; recovering inner state");
+            f(&poisoned.into_inner())
+        }
     }
 }
 
@@ -199,6 +197,9 @@ where
             .call()
             .await
             .with_context(|| format!("getActiveNodes(offset={offset}, limit={PAGE_SIZE})"))?;
+        if page.is_empty() {
+            break;
+        }
         let page_len = page.len() as u64;
         for node in &page {
             let is_active = registry
@@ -209,9 +210,6 @@ where
             if is_active {
                 active.insert(node.nodeId.0);
             }
-        }
-        if page_len < PAGE_SIZE {
-            break;
         }
         offset = offset.saturating_add(page_len);
     }
@@ -272,6 +270,13 @@ async fn run_watcher_once<P>(
 where
     P: Provider + Clone,
 {
+    // EjectedByBlacklist is deliberately NOT subscribed: every
+    // `StakingRegistry.ejectNode` call emits both `EjectedByBlacklist`
+    // (operator-indexed) and `NodeAutoEjected` (nodeId-indexed) for
+    // any operator that has a bound nodeId. The nodeId variant lets
+    // us update the active set without a follow-up `nodeIdOf` RPC, so
+    // it's strictly more efficient. Operators with no nodeId binding
+    // are never in the active set anyway, so we lose no information.
     let mut node_registered = registry
         .NodeRegistered_filter()
         .watch()
@@ -295,12 +300,6 @@ where
         .watch()
         .await
         .context("watch Reinstated")?
-        .into_stream();
-    let mut ejected_by_blacklist = registry
-        .EjectedByBlacklist_filter()
-        .watch()
-        .await
-        .context("watch EjectedByBlacklist")?
         .into_stream();
     let mut unbonding_requested = registry
         .UnbondingRequested_filter()
@@ -339,13 +338,6 @@ where
                 Some(Err(e)) => return Err(e).context("Reinstated stream"),
                 None => return Ok(()),
             },
-            ev = ejected_by_blacklist.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    apply_operator_change(registry, active, changes_tx, event.operator, false).await;
-                }
-                Some(Err(e)) => return Err(e).context("EjectedByBlacklist stream"),
-                None => return Ok(()),
-            },
             ev = unbonding_requested.next() => match ev {
                 Some(Ok((event, _log))) => {
                     apply_operator_change(registry, active, changes_tx, event.operator, false).await;
@@ -377,7 +369,16 @@ async fn apply_operator_change<P>(
     let resolved = match registry.nodeIdOf(operator).call().await {
         Ok(r) => r,
         Err(err) => {
-            warn!(%err, %operator, "nodeIdOf RPC failed; dropping operator-indexed event");
+            // Dropping the change leaves the cached set out of sync
+            // with chain state until either a follow-up event for
+            // the same operator arrives or the resync-on-extended-
+            // outage path is implemented. Surface loudly so a noisy
+            // operator alert can fire.
+            warn!(
+                %err,
+                %operator,
+                "nodeIdOf RPC failed; cached active set may diverge from chain state for this operator"
+            );
             return;
         }
     };
@@ -386,17 +387,13 @@ async fn apply_operator_change<P>(
         debug!(%operator, "operator-indexed event for unbound operator; ignoring");
         return;
     }
-    // Trust nodeIdOf.active — it's the canonical predicate sampled
-    // immediately after the event, so it reflects any racing state
-    // change too. The event_implies_active hint is recorded for
-    // observability but not load-bearing.
     let now_active = resolved.active;
     if now_active != event_implies_active {
         debug!(
             %operator,
             event_implies_active,
             now_active,
-            "operator-indexed event disagrees with canonical isActive; trusting isActive"
+            "operator-indexed event disagrees with canonical nodeIdOf.active; trusting nodeIdOf"
         );
     }
     let change = if now_active {
@@ -420,7 +417,10 @@ fn apply_change(
     let mutated = {
         let mut guard = match active.write() {
             Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => {
+                warn!("ChainStakerSet active set RwLock poisoned; recovering inner state");
+                poisoned.into_inner()
+            }
         };
         match change {
             StakerChange::Active(id) => guard.insert(id),
@@ -428,9 +428,9 @@ fn apply_change(
         }
     };
     if mutated {
-        // Drop the result: no live subscriber is a normal case
-        // (nothing in PR 647 consumes the channel yet; PR 5's
-        // iterative lookup will).
+        // No live subscriber is a normal case for an empty
+        // ConfigStakerSet runtime, or a chain-backed set during
+        // bootstrap before any consumer has subscribed.
         let _ = changes_tx.send(change);
     }
 }

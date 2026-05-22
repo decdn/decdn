@@ -431,23 +431,10 @@ pub async fn run(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Chain-backed active-staker set. Reads
-    // `StakingRegistry.getActiveNodes()` once at startup and spawns a
-    // background watcher that follows the six membership-mutating
-    // events (`NodeRegistered`, `NodeDeregistered`, `NodeAutoEjected`,
-    // `Reinstated`, `EjectedByBlacklist`, `UnbondingRequested`) per
-    // ADR 022 §STORE Flow line 140 + ADR 019 § Step 3.3.
-    //
-    // The alloy `Provider` is built fresh here and not reused with the
-    // existing RPC connectivity watchdog (which uses a raw
-    // `reqwest::Client`). Folding the watchdog onto the same provider
-    // is a viable cleanup but orthogonal to the chain-backed staker
-    // work; deferred.
-    //
-    // Bootstrap failure is fatal: the DHT cannot function without a
-    // populated staker set (every `Store` would be silently rejected,
-    // and once iterative `FindValue` lands the lookup filter would
-    // drop every responder).
+    // Chain-backed active-staker set. Bootstrap failure is fatal: an
+    // empty set silently rejects every inbound `Store`, and once the
+    // iterative `FindValue` lookup filter exists it would drop every
+    // responder.
     let rpc_url: alloy::transports::http::reqwest::Url =
         cfg.blockchain.rpc_url.parse().with_context(|| {
             format!(
@@ -558,21 +545,10 @@ pub async fn run(
         DISPATCH_GC_INTERVAL,
     ));
 
-    // DHT republish scheduler (ADR 022 §STORE Flow). Subscribes to
-    // cache-insert events; for every committed blob it schedules a
-    // jittered (30–50 min) republish to the K+3 closest peers. Cold-
-    // start records (blobs already in cache at startup) get a
-    // uniform(0, 40min) first-publish window — ADR 022 §Bootstrap.
-    //
-    // The cold-start path seeds the scheduler from
-    // `CacheEngine::access_times_snapshot()` *before* the
-    // `run_republish` task spawns, so any blob already on disk gets a
-    // jittered first-publish entry without waiting for
-    // `subscribe_inserts` (which only fires on fresh pull-through
-    // commits, not on cache reuse across restarts). The subscribe
-    // channel handle is taken **before** the cold-start seed so a
-    // commit that races with seed-time still lands in the channel
-    // backlog and is picked up by the spawned task.
+    // DHT republish scheduler (ADR 022 §STORE Flow). The subscribe
+    // handle is taken before the cold-start seed so a commit racing
+    // with seed-time lands in the channel backlog rather than the
+    // gap between the snapshot and the spawn.
     let republish_scheduler = Arc::new(crate::dht::RepublishScheduler::new());
     let (republish_stop_tx, republish_stop_rx) = oneshot::channel::<()>();
     let cache_inserts_rx = cache.subscribe_inserts();

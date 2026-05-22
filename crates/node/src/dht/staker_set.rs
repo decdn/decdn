@@ -19,10 +19,11 @@ use crate::dht::routing::NodeId;
 /// Membership change emitted by [`StakerSet::subscribe_changes`].
 ///
 /// The chain-backed implementation emits one of these for every
-/// `NodeRegistered` / `NodeDeregistered` / `NodeAutoEjected` /
-/// `EjectedByBlacklist` / `Reinstated` / `UnbondingRequested` event
-/// observed on `StakingRegistry`, after the in-memory active set has
-/// been updated. `ConfigStakerSet` never emits — see its impl note.
+/// observed `StakingRegistry` event that flips the canonical
+/// `isActive` predicate (`NodeRegistered` / `NodeDeregistered` /
+/// `NodeAutoEjected` / `Reinstated` / `UnbondingRequested`), after
+/// the in-memory active set has been updated. `ConfigStakerSet` never
+/// emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StakerChange {
     /// `node_id` joined the active set (was absent, now present).
@@ -40,10 +41,9 @@ pub enum StakerChange {
 /// `is_active` is the only call the handler makes per request.
 /// `active_nodes` is exposed for the bootstrap path (seed the routing
 /// table from it) and for operator tooling. `subscribe_changes` lets
-/// long-running consumers (the iterative-lookup filter cache in PR 5,
-/// any future re-bootstrap-on-churn logic) follow membership without
-/// polling; the chain-backed impl emits on every relevant event, while
-/// the in-memory [`ConfigStakerSet`] returns a receiver that stays open
+/// long-running consumers follow membership without polling; the
+/// chain-backed impl emits on every relevant event, while the
+/// in-memory [`ConfigStakerSet`] returns a receiver that stays open
 /// forever without firing — this lets call sites be implementation-
 /// agnostic instead of branching on the concrete impl.
 pub trait StakerSet: Send + Sync + std::fmt::Debug {
@@ -69,10 +69,14 @@ pub trait StakerSet: Send + Sync + std::fmt::Debug {
 
     /// Subscribe to membership changes. The chain-backed impl emits on
     /// every `StakingRegistry` event that flips a node's `isActive`
-    /// predicate (after its own cache has been updated, so a
+    /// predicate, after its own cache has been updated — so a
     /// `recv().await` followed by `is_active` returns the post-event
-    /// state). `ConfigStakerSet` returns a receiver that never fires —
-    /// it does not poll the chain.
+    /// state. `ConfigStakerSet` returns a receiver that never fires.
+    ///
+    /// Receivers must handle `RecvError::Lagged` (a slow consumer is
+    /// not a fatal condition for the producer); subscribers that fall
+    /// further behind than the channel capacity can re-sync by
+    /// reading `active_nodes()`.
     fn subscribe_changes(&self) -> broadcast::Receiver<StakerChange>;
 }
 
