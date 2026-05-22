@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
+import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 /// @title PublisherRegistry — namespaces and content claims (ADR 002)
 /// @notice Permissionless namespace creation (publisher identity is implicit
@@ -26,12 +27,14 @@ import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol"
 ///         revoked, and multiple non-zero namespaces may claim the same hash
 ///         independently (ADR 002 § Multi-claim semantics).
 contract PublisherRegistry is AccessControl {
+    using SafeCast for uint256;
+
     /// @notice Setter authority for the two governable parameters. Held by
     ///         `TimelockController` post-deploy.
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
 
     // Governable-parameter defaults + bounds (ADR 002 / ADR 009).
-    uint256 internal constant DEFAULT_MAX_NAMESPACES = 100;
+    uint64 internal constant DEFAULT_MAX_NAMESPACES = 100;
     uint256 internal constant MAX_NAMESPACES_FLOOR = 1;
     uint256 internal constant MAX_NAMESPACES_CEILING = 1000;
 
@@ -39,9 +42,11 @@ contract PublisherRegistry is AccessControl {
     uint64 internal constant TRANSFER_TIMELOCK_FLOOR = 1 days;
     uint64 internal constant TRANSFER_TIMELOCK_CEILING = 30 days;
 
+    /// @dev Packs into a single slot: address (20 bytes) + uint64 (8 bytes).
+    ///      A uint64 unix timestamp is good past the year 500-billion.
     struct PendingTransfer {
         address newOwner;
-        uint256 readyAt;
+        uint64 readyAt;
     }
 
     /// @notice Owner of each namespace. `address(0)` for unassigned ids
@@ -54,9 +59,14 @@ contract PublisherRegistry is AccessControl {
     /// @notice In-flight ownership transfer per namespace (`(0,0)` if none).
     mapping(uint256 namespaceId => PendingTransfer) public pendingTransfer;
 
+    // The three fields below are all uint64 and declared consecutively so
+    // they pack into a single storage slot (3 * 8 = 24 bytes). `_nextNamespaceId`
+    // is incremented on every createNamespace and the cap is read there too, so
+    // co-locating them also warms one slot per call.
+
     /// @notice Per-publisher namespace cap (anti-squatting). Default 100,
-    ///         bounded `[1, 1000]`.
-    uint256 public maxNamespacesPerPublisher;
+    ///         bounded `[1, 1000]` (well within uint64).
+    uint64 public maxNamespacesPerPublisher;
 
     /// @notice Delay between initiating and finalizing a namespace transfer
     ///         (key-compromise mitigation). Default 7 days, bounded `[1d, 30d]`.
@@ -64,7 +74,7 @@ contract PublisherRegistry is AccessControl {
 
     /// @dev Monotonic namespace id allocator. Pre-incremented so the first
     ///      assigned id is 1, leaving 0 as the reserved default-open id.
-    uint256 internal _nextNamespaceId;
+    uint64 internal _nextNamespaceId;
 
     /// @dev hash => set of claiming namespace ids (append-only).
     mapping(bytes32 blake3Hash => uint256[]) internal _claimingNamespaces;
@@ -117,7 +127,7 @@ contract PublisherRegistry is AccessControl {
         if (namespaceCount[msg.sender] >= maxNamespacesPerPublisher) {
             revert NamespaceCapReached(maxNamespacesPerPublisher);
         }
-        namespaceId = ++_nextNamespaceId;
+        namespaceId = ++_nextNamespaceId; // uint64, widened to the uint256 return
         ownerOf[namespaceId] = msg.sender;
         namespaceCount[msg.sender] += 1;
         emit NamespaceCreated(namespaceId, msg.sender);
@@ -129,7 +139,9 @@ contract PublisherRegistry is AccessControl {
     function initiateNamespaceTransfer(uint256 namespaceId, address newOwner) external {
         _requireOwner(namespaceId);
         if (newOwner == address(0)) revert TransferToZeroAddress();
-        uint256 readyAt = block.timestamp + namespaceTransferTimelock;
+        // Fits uint64 comfortably (block.timestamp + <= 30 days); SafeCast
+        // reverts on the (unreachable) overflow.
+        uint64 readyAt = (block.timestamp + namespaceTransferTimelock).toUint64();
         pendingTransfer[namespaceId] = PendingTransfer({ newOwner: newOwner, readyAt: readyAt });
         emit NamespaceTransferInitiated(namespaceId, msg.sender, newOwner, readyAt);
     }
@@ -146,6 +158,13 @@ contract PublisherRegistry is AccessControl {
         if (block.timestamp < pending.readyAt) revert TransferNotReady(pending.readyAt);
 
         address from = ownerOf[namespaceId];
+        // Enforce the anti-squatting cap on the receiving side too — otherwise
+        // it could be bypassed by creating namespaces under throwaway addresses
+        // and transferring them to one publisher. Self-transfers (from ==
+        // newOwner) leave the count unchanged, so they're exempt.
+        if (from != pending.newOwner && namespaceCount[pending.newOwner] >= maxNamespacesPerPublisher) {
+            revert NamespaceCapReached(maxNamespacesPerPublisher);
+        }
         ownerOf[namespaceId] = pending.newOwner;
         namespaceCount[from] -= 1;
         namespaceCount[pending.newOwner] += 1;
@@ -196,7 +215,8 @@ contract PublisherRegistry is AccessControl {
             revert ParamOutOfBounds(newMax, MAX_NAMESPACES_FLOOR, MAX_NAMESPACES_CEILING);
         }
         uint256 old = maxNamespacesPerPublisher;
-        maxNamespacesPerPublisher = newMax;
+        // newMax <= 1000 after the bound check, so the cast never reverts.
+        maxNamespacesPerPublisher = newMax.toUint64();
         emit MaxNamespacesPerPublisherUpdated(old, newMax);
     }
 

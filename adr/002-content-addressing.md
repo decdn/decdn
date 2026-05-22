@@ -77,8 +77,8 @@ interface IPublisherRegistry {
     function namespaceOf(bytes32 blake3Hash) external view returns (uint256[] memory namespaceIds);
     function ownerOf(uint256 namespaceId) external view returns (address);
     function namespaceCount(address publisher) external view returns (uint256);
-    function pendingTransfer(uint256 namespaceId) external view returns (address newOwner, uint256 readyAt);
-    function maxNamespacesPerPublisher() external view returns (uint256);
+    function pendingTransfer(uint256 namespaceId) external view returns (address newOwner, uint64 readyAt);
+    function maxNamespacesPerPublisher() external view returns (uint64);
     function namespaceTransferTimelock() external view returns (uint64);
 
     // Governable parameter setters (GOVERNANCE_ROLE; standard 48h timelock).
@@ -100,7 +100,7 @@ interface IPublisherRegistry {
 
 `namespaceOf(hash)` returns an empty array for any hash not explicitly claimed; default-open semantics apply. The view never reverts on unknown hashes — callers cannot distinguish "hash unknown to the protocol" from "hash served as default-open" via this view, which is correct: both states are operationally identical. Storage is a per-hash `uint256[]` set of claiming namespaces — append-only since claims are content-immutable, never moved or revoked.
 
-Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md#adr-009-governance-model)). Defaults: `maxNamespacesPerPublisher = 100` (anti-squatting; bounded `[1, 1000]`), `namespaceTransferTimelock = 604800` seconds / 7 days (key-compromise mitigation; bounded `[86400, 2592000]` / `[24 h, 30 days]`). Values are stored on `PublisherRegistry` itself and updated via `setMaxNamespacesPerPublisher` / `setNamespaceTransferTimelock` under the standard `TimelockController` delay (`172800` seconds / 48 h); the contract enforces the safety bounds at the setter in seconds and rejects out-of-range writes regardless of caller.
+Per-publisher namespace cap and ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md#adr-009-governance-model)). Defaults: `maxNamespacesPerPublisher = 100` (anti-squatting; bounded `[1, 1000]`), `namespaceTransferTimelock = 604800` seconds / 7 days (key-compromise mitigation; bounded `[86400, 2592000]` / `[24 h, 30 days]`). Values are stored on `PublisherRegistry` itself and updated via `setMaxNamespacesPerPublisher` / `setNamespaceTransferTimelock` under the standard `TimelockController` delay (`172800` seconds / 48 h); the contract enforces the safety bounds at the setter in seconds and rejects out-of-range writes regardless of caller. The `maxNamespacesPerPublisher` cap is enforced both at `createNamespace` and at `finalizeNamespaceTransfer` (on the recipient, self-transfers exempt) so it cannot be bypassed by minting namespaces under throwaway addresses and transferring them to a single publisher.
 
 ## Consequences
 

@@ -239,6 +239,46 @@ contract PublisherRegistryTest is Test {
         reg.finalizeNamespaceTransfer(id);
     }
 
+    function test_transfer_revertsWhenRecipientAtCap() public {
+        // The anti-squatting cap must hold on the receiving side too —
+        // otherwise it's bypassable by minting namespaces under throwaway
+        // addresses and transferring them to one publisher.
+        vm.prank(admin);
+        reg.setMaxNamespacesPerPublisher(1);
+
+        vm.prank(bob);
+        reg.createNamespace(); // bob now at the cap
+
+        vm.prank(alice);
+        uint256 id = reg.createNamespace();
+        vm.prank(alice);
+        reg.initiateNamespaceTransfer(id, bob);
+
+        vm.warp(block.timestamp + DEFAULT_TIMELOCK);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NamespaceCapReached.selector, 1));
+        reg.finalizeNamespaceTransfer(id);
+    }
+
+    function test_transfer_selfTransferExemptFromCap() public {
+        vm.prank(admin);
+        reg.setMaxNamespacesPerPublisher(1);
+
+        vm.prank(alice);
+        uint256 id = reg.createNamespace(); // alice at the cap
+
+        // Transferring to oneself leaves the count unchanged, so the cap
+        // check must not block it.
+        vm.prank(alice);
+        reg.initiateNamespaceTransfer(id, alice);
+        vm.warp(block.timestamp + DEFAULT_TIMELOCK);
+        vm.prank(alice);
+        reg.finalizeNamespaceTransfer(id);
+
+        assertEq(reg.ownerOf(id), alice);
+        assertEq(reg.namespaceCount(alice), 1);
+    }
+
     // -----------------------------------------------------------------
     // Governable setters
     // -----------------------------------------------------------------
