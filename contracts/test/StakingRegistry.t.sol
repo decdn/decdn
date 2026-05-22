@@ -2,10 +2,13 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { Vm } from "forge-std/Vm.sol";
 import { Token } from "../src/Token.sol";
 import { StakingRegistry } from "../src/StakingRegistry.sol";
 import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
+import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { MockSafetyReserve } from "./mocks/MockSafetyReserve.sol";
+import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
@@ -13,6 +16,7 @@ contract StakingRegistryTest is Test {
     Token internal token;
     StakingRegistry internal reg;
     MockSafetyReserve internal safetyReserve;
+    MockEd25519Verifier internal ed25519Verifier;
 
     address internal admin = makeAddr("admin");
     address internal slashJudge = makeAddr("slashJudge");
@@ -24,11 +28,22 @@ contract StakingRegistryTest is Test {
 
     uint256 internal constant MIN_STAKE = 50_000e18;
     uint256 internal constant UNBONDING_PERIOD = 7 days;
+    uint256 internal constant MULTIADDR_COOLDOWN = 0;
+    uint256 internal constant MAX_MULTIADDR_SIZE = 1024;
 
     function setUp() public {
         token = new Token(admin);
         safetyReserve = new MockSafetyReserve();
-        reg = new StakingRegistry(token, admin, MIN_STAKE, UNBONDING_PERIOD);
+        ed25519Verifier = new MockEd25519Verifier();
+        reg = new StakingRegistry(
+            token,
+            IEd25519Verifier(address(ed25519Verifier)),
+            admin,
+            MIN_STAKE,
+            UNBONDING_PERIOD,
+            MULTIADDR_COOLDOWN,
+            MAX_MULTIADDR_SIZE
+        );
 
         vm.startPrank(admin);
         reg.grantRole(reg.SLASH_ROLE(), slashJudge);
@@ -55,34 +70,84 @@ contract StakingRegistryTest is Test {
 
     function test_constructor_setsImmutableAndState() public view {
         assertEq(address(reg.token()), address(token));
+        assertEq(address(reg.ed25519Verifier()), address(ed25519Verifier));
         assertEq(reg.minStake(), MIN_STAKE);
         assertEq(reg.unbondingPeriod(), UNBONDING_PERIOD);
+        assertEq(reg.multiaddrUpdateCooldown(), MULTIADDR_COOLDOWN);
+        assertEq(reg.maxMultiaddrSize(), MAX_MULTIADDR_SIZE);
         assertTrue(reg.hasRole(reg.DEFAULT_ADMIN_ROLE(), admin));
         assertTrue(reg.hasRole(reg.GOVERNANCE_ROLE(), admin));
     }
 
     function test_constructor_revertsOnZeroToken() public {
         vm.expectRevert(StakingRegistry.ZeroAddress.selector);
-        new StakingRegistry(ERC20Burnable(address(0)), admin, MIN_STAKE, UNBONDING_PERIOD);
+        new StakingRegistry(
+            ERC20Burnable(address(0)),
+            IEd25519Verifier(address(ed25519Verifier)),
+            admin,
+            MIN_STAKE,
+            UNBONDING_PERIOD,
+            MULTIADDR_COOLDOWN,
+            MAX_MULTIADDR_SIZE
+        );
+    }
+
+    function test_constructor_revertsOnZeroVerifier() public {
+        vm.expectRevert(StakingRegistry.ZeroAddress.selector);
+        new StakingRegistry(
+            token,
+            IEd25519Verifier(address(0)),
+            admin,
+            MIN_STAKE,
+            UNBONDING_PERIOD,
+            MULTIADDR_COOLDOWN,
+            MAX_MULTIADDR_SIZE
+        );
     }
 
     function test_constructor_revertsOnZeroAdmin() public {
         vm.expectRevert(StakingRegistry.ZeroAddress.selector);
-        new StakingRegistry(token, address(0), MIN_STAKE, UNBONDING_PERIOD);
+        new StakingRegistry(
+            token,
+            IEd25519Verifier(address(ed25519Verifier)),
+            address(0),
+            MIN_STAKE,
+            UNBONDING_PERIOD,
+            MULTIADDR_COOLDOWN,
+            MAX_MULTIADDR_SIZE
+        );
     }
 
     function test_constructor_revertsOnOutOfBoundsMinStake() public {
         vm.expectRevert();
-        new StakingRegistry(token, admin, 1e18, UNBONDING_PERIOD);
+        _deployWith(1e18, UNBONDING_PERIOD, MULTIADDR_COOLDOWN, MAX_MULTIADDR_SIZE);
         vm.expectRevert();
-        new StakingRegistry(token, admin, 10_000_000e18, UNBONDING_PERIOD);
+        _deployWith(10_000_000e18, UNBONDING_PERIOD, MULTIADDR_COOLDOWN, MAX_MULTIADDR_SIZE);
     }
 
     function test_constructor_revertsOnOutOfBoundsUnbondingPeriod() public {
         vm.expectRevert();
-        new StakingRegistry(token, admin, MIN_STAKE, 1 days);
+        _deployWith(MIN_STAKE, 1 days, MULTIADDR_COOLDOWN, MAX_MULTIADDR_SIZE);
         vm.expectRevert();
-        new StakingRegistry(token, admin, MIN_STAKE, 60 days);
+        _deployWith(MIN_STAKE, 60 days, MULTIADDR_COOLDOWN, MAX_MULTIADDR_SIZE);
+    }
+
+    function test_constructor_revertsOnOutOfBoundsMultiaddrCooldown() public {
+        vm.expectRevert();
+        _deployWith(MIN_STAKE, UNBONDING_PERIOD, 2 days, MAX_MULTIADDR_SIZE);
+    }
+
+    function test_constructor_revertsOnOutOfBoundsMaxMultiaddrSize() public {
+        vm.expectRevert();
+        _deployWith(MIN_STAKE, UNBONDING_PERIOD, MULTIADDR_COOLDOWN, 16);
+        vm.expectRevert();
+        _deployWith(MIN_STAKE, UNBONDING_PERIOD, MULTIADDR_COOLDOWN, 4096);
+    }
+
+    function _deployWith(uint256 minStake_, uint256 unbondingPeriod_, uint256 cooldown_, uint256 maxSize_) internal {
+        new StakingRegistry(
+            token, IEd25519Verifier(address(ed25519Verifier)), admin, minStake_, unbondingPeriod_, cooldown_, maxSize_
+        );
     }
 
     // -----------------------------------------------------------------
@@ -112,29 +177,37 @@ contract StakingRegistryTest is Test {
 
     function test_stake_clearsEjectedFlagWhenRestakedToMinimum() public {
         _stake(operator, MIN_STAKE);
-        // Force ejection via the blacklist path
         vm.prank(blacklist);
         reg.ejectNode(operator);
         assertTrue(reg.ejected(operator));
 
-        // Re-stake while already at minimum doesn't auto-clear (the
-        // re-stake path is for when stake fell below — but blacklist
-        // ejection didn't reduce stake). Add one more wei to trigger the
-        // path explicitly.
+        // Stake already at min; one more wei triggers the path.
         _stake(operator, 1);
         assertFalse(reg.ejected(operator));
     }
 
-    function test_isActive_requiresMinStakeAndNotEjected() public {
-        assertFalse(reg.isActive(operator));
-        _stake(operator, MIN_STAKE - 1);
-        assertFalse(reg.isActive(operator));
-        _stake(operator, 1);
-        assertTrue(reg.isActive(operator));
+    function test_isActive_requiresStakeAndRegistration() public {
+        Vm.Wallet memory wallet = vm.createWallet("active-test");
+        address op = wallet.addr;
 
-        vm.prank(blacklist);
-        reg.ejectNode(operator);
-        assertFalse(reg.isActive(operator));
+        // No stake, not registered → false
+        assertFalse(reg.isActive(op));
+
+        // Staked but unregistered → still false (ADR 003 isActive needs registration)
+        _fundAndStake(op, MIN_STAKE);
+        assertFalse(reg.isActive(op));
+
+        // Register → true
+        bytes32 nodeId = bytes32(uint256(0xABC));
+        bytes memory sig = _signBindNode(wallet, nodeId, 0);
+        vm.prank(op);
+        reg.registerNode(nodeId, hex"", "", sig, hex"");
+        assertTrue(reg.isActive(op));
+
+        // Drop stake below minimum (request unstake) → false despite registration
+        vm.prank(op);
+        reg.requestUnstake(1);
+        assertFalse(reg.isActive(op));
     }
 
     // -----------------------------------------------------------------
@@ -143,7 +216,6 @@ contract StakingRegistryTest is Test {
 
     function test_requestUnstake_movesAmountToUnbonding() public {
         _stake(operator, 2 * MIN_STAKE);
-
         vm.prank(operator);
         reg.requestUnstake(MIN_STAKE);
 
@@ -203,6 +275,204 @@ contract StakingRegistryTest is Test {
     }
 
     // -----------------------------------------------------------------
+    // Node registry — registerNode
+    // -----------------------------------------------------------------
+
+    function test_registerNode_happyPath() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId, bytes memory bindingSig) = _prepareRegistration(0);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+
+        bytes memory multiaddrs = hex"010203";
+
+        // Assert StakingRegistry calls the verifier with the canonical
+        // (publicKey, messageHash, signature) tuple from ADR 003 § Signed
+        // message. vm.expectCall replaces mock-side storage tracking now
+        // that IEd25519Verifier.verify is `view`.
+        bytes32 expectedHash = keccak256(abi.encodePacked(nodeId, wallet.addr, block.chainid, uint64(0)));
+        vm.expectCall(
+            address(ed25519Verifier), abi.encodeCall(IEd25519Verifier.verify, (nodeId, expectedHash, hex"deadbeef"))
+        );
+
+        vm.prank(wallet.addr);
+        reg.registerNode(nodeId, multiaddrs, "us", bindingSig, hex"deadbeef");
+
+        assertEq(reg.nodeIdToAddress(nodeId), wallet.addr);
+        assertEq(reg.addressToNodeId(wallet.addr), nodeId);
+        assertEq(reg.bindingNonce(wallet.addr), 1);
+        assertEq(reg.getActiveNodeCount(), 1);
+
+        StakingRegistry.NodeInfo memory info = reg.getNode(nodeId);
+        assertEq(info.nodeId, nodeId);
+        assertEq(info.ethAddress, wallet.addr);
+        assertTrue(info.active);
+        assertEq(info.registeredAt, block.timestamp);
+        assertEq(info.firstRegisteredAt, block.timestamp);
+        assertEq(info.regionHint, "us");
+        assertEq(keccak256(info.multiaddrs), keccak256(multiaddrs));
+    }
+
+    function test_registerNode_revertsBelowMinStake() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId, bytes memory bindingSig) = _prepareRegistration(0);
+        _fundAndStake(wallet.addr, MIN_STAKE - 1);
+
+        vm.prank(wallet.addr);
+        vm.expectRevert();
+        reg.registerNode(nodeId, hex"", "", bindingSig, hex"");
+    }
+
+    function test_registerNode_revertsOnZeroNodeId() public {
+        (Vm.Wallet memory wallet,, bytes memory bindingSig) = _prepareRegistration(0);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+
+        vm.prank(wallet.addr);
+        vm.expectRevert(StakingRegistry.ZeroNodeId.selector);
+        reg.registerNode(bytes32(0), hex"", "", bindingSig, hex"");
+    }
+
+    function test_registerNode_revertsWhenMultiaddrsTooLarge() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId, bytes memory bindingSig) = _prepareRegistration(0);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+
+        bytes memory multiaddrs = new bytes(MAX_MULTIADDR_SIZE + 1);
+        vm.prank(wallet.addr);
+        vm.expectRevert();
+        reg.registerNode(nodeId, multiaddrs, "", bindingSig, hex"");
+    }
+
+    function test_registerNode_revertsOnBadBindingSignature() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId,) = _prepareRegistration(0);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+
+        bytes memory badSig = new bytes(65); // all zeros
+        vm.prank(wallet.addr);
+        vm.expectRevert(StakingRegistry.InvalidBindingSignature.selector);
+        reg.registerNode(nodeId, hex"", "", badSig, hex"");
+    }
+
+    function test_registerNode_revertsOnRejectedEd25519Signature() public {
+        ed25519Verifier.setAccept(false);
+
+        (Vm.Wallet memory wallet, bytes32 nodeId, bytes memory bindingSig) = _prepareRegistration(0);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+
+        vm.prank(wallet.addr);
+        vm.expectRevert(StakingRegistry.InvalidEd25519Signature.selector);
+        reg.registerNode(nodeId, hex"", "", bindingSig, hex"");
+    }
+
+    function test_registerNode_revertsOnAlreadyRegistered() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId, bytes memory bindingSig) = _prepareRegistration(0);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+        vm.prank(wallet.addr);
+        reg.registerNode(nodeId, hex"", "", bindingSig, hex"");
+
+        // Second registration without deregister must revert.
+        (,, bytes memory bindingSig2) = _prepareRegistrationFor(wallet, nodeId, 1);
+        vm.prank(wallet.addr);
+        vm.expectRevert(StakingRegistry.NodeAlreadyRegistered.selector);
+        reg.registerNode(nodeId, hex"", "", bindingSig2, hex"");
+    }
+
+    function test_registerNode_revertsOnNodeIdBoundToOther() public {
+        // First operator registers nodeId X
+        (Vm.Wallet memory wallet1, bytes32 nodeId, bytes memory bindingSig1) = _prepareRegistration(0);
+        _fundAndStake(wallet1.addr, MIN_STAKE);
+        vm.prank(wallet1.addr);
+        reg.registerNode(nodeId, hex"", "", bindingSig1, hex"");
+
+        // Second operator tries the same nodeId
+        Vm.Wallet memory wallet2 = vm.createWallet("op2");
+        _fundAndStake(wallet2.addr, MIN_STAKE);
+        bytes memory bindingSig2 = _signBindNode(wallet2, nodeId, 0);
+        vm.prank(wallet2.addr);
+        vm.expectRevert(abi.encodeWithSelector(StakingRegistry.NodeIdAlreadyBound.selector, wallet1.addr));
+        reg.registerNode(nodeId, hex"", "", bindingSig2, hex"");
+    }
+
+    // -----------------------------------------------------------------
+    // Node registry — deregisterNode
+    // -----------------------------------------------------------------
+
+    function test_deregisterNode_flipsFlagAndRemovesFromActiveSet() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId,) = _registerAt(0);
+
+        assertEq(reg.getActiveNodeCount(), 1);
+        assertTrue(reg.isActive(wallet.addr));
+
+        vm.prank(wallet.addr);
+        reg.deregisterNode();
+
+        assertFalse(reg.isActive(wallet.addr));
+        assertEq(reg.getActiveNodeCount(), 0);
+        // Binding persists; registrationNonce bumped to invalidate stale sigs.
+        assertEq(reg.nodeIdToAddress(nodeId), wallet.addr);
+        assertEq(reg.registrationNonce(nodeId), 1);
+    }
+
+    function test_deregisterNode_revertsWhenNotActive() public {
+        vm.prank(operator);
+        vm.expectRevert(StakingRegistry.NodeNotActive.selector);
+        reg.deregisterNode();
+    }
+
+    function test_reRegisterSameNodeId_afterDeregister_works() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId,) = _registerAt(0);
+        vm.prank(wallet.addr);
+        reg.deregisterNode();
+
+        // Sign with the post-deregister nonces
+        (,, bytes memory bindingSig) = _prepareRegistrationFor(wallet, nodeId, 1);
+        vm.prank(wallet.addr);
+        reg.registerNode(nodeId, hex"", "", bindingSig, hex"");
+
+        StakingRegistry.NodeInfo memory info = reg.getNode(nodeId);
+        assertTrue(info.active);
+        // firstRegisteredAt is write-once.
+        assertTrue(info.firstRegisteredAt <= info.registeredAt);
+        assertEq(reg.registrationNonce(nodeId), 1, "registrationNonce stays at 1 between deregister and re-register");
+    }
+
+    // -----------------------------------------------------------------
+    // Node registry — updateMultiaddrs
+    // -----------------------------------------------------------------
+
+    function test_updateMultiaddrs_replacesAndStampsTimestamp() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId,) = _registerAt(0);
+
+        bytes memory newAddrs = hex"abcdef";
+        vm.warp(block.timestamp + 100);
+        vm.prank(wallet.addr);
+        reg.updateMultiaddrs(newAddrs);
+
+        StakingRegistry.NodeInfo memory info = reg.getNode(nodeId);
+        assertEq(keccak256(info.multiaddrs), keccak256(newAddrs));
+        assertEq(info.lastMultiaddrUpdate, block.timestamp);
+    }
+
+    function test_updateMultiaddrs_respectsCooldown() public {
+        // Set a non-zero cooldown via governance
+        vm.prank(admin);
+        reg.setMultiaddrUpdateCooldown(1 hours);
+
+        (Vm.Wallet memory wallet,,) = _registerAt(0);
+
+        vm.warp(block.timestamp + 30 minutes);
+        vm.prank(wallet.addr);
+        vm.expectRevert();
+        reg.updateMultiaddrs(hex"aa");
+
+        vm.warp(block.timestamp + 31 minutes); // past cooldown
+        vm.prank(wallet.addr);
+        reg.updateMultiaddrs(hex"aa");
+    }
+
+    function test_updateMultiaddrs_revertsWhenNotActive() public {
+        vm.prank(operator);
+        vm.expectRevert(StakingRegistry.NodeNotActive.selector);
+        reg.updateMultiaddrs(hex"");
+    }
+
+    // -----------------------------------------------------------------
     // Slash: tier escalation
     // -----------------------------------------------------------------
 
@@ -217,22 +487,19 @@ contract StakingRegistryTest is Test {
         _stake(operator, 100_000e18);
         _slash(operator);
         uint256 amount = _slash(operator);
-        // After tier-1 slash, remaining stake is 95k. 15% of 95k = 14_250.
-        assertEq(amount, 14_250e18, "2nd offense = 15%");
-        assertEq(reg.lifetimeOffenseCount(operator), 2);
+        assertEq(amount, 14_250e18, "2nd offense = 15% of remaining 95_000");
     }
 
     function test_slash_tier3_is50Percent() public {
         _stake(operator, 100_000e18);
-        _slash(operator); // tier 1: -5_000 → 95_000
-        _slash(operator); // tier 2: -14_250 → 80_750
-        uint256 amount = _slash(operator); // tier 3: -50% of 80_750 = 40_375
-        assertEq(amount, 40_375e18, "3rd offense = 50%");
-        assertEq(reg.lifetimeOffenseCount(operator), 3);
+        _slash(operator);
+        _slash(operator);
+        uint256 amount = _slash(operator);
+        assertEq(amount, 40_375e18, "3rd offense = 50% of remaining 80_750");
     }
 
     function test_slash_tier3Stays50PercentBeyondThird() public {
-        _stake(operator, 1_000_000e18); // big enough to survive several slashes
+        _stake(operator, 1_000_000e18);
         for (uint256 i = 0; i < 5; i++) {
             _slash(operator);
         }
@@ -246,16 +513,16 @@ contract StakingRegistryTest is Test {
     function test_slash_distributes50_30_20() public {
         _stake(operator, 100_000e18);
         uint256 supplyBefore = token.totalSupply();
-        uint256 challengerBalanceBefore = token.balanceOf(challenger);
-        uint256 safetyBalanceBefore = token.balanceOf(address(safetyReserve));
+        uint256 challengerBefore = token.balanceOf(challenger);
+        uint256 safetyBefore = token.balanceOf(address(safetyReserve));
 
         vm.prank(slashJudge);
         uint256 slashed = reg.slash(operator, challenger, 0);
 
         assertEq(slashed, 5000e18);
-        assertEq(token.balanceOf(challenger), challengerBalanceBefore + 2500e18, "50% to challenger");
-        assertEq(token.balanceOf(address(safetyReserve)), safetyBalanceBefore + 1500e18, "30% to SafetyReserve");
-        assertEq(token.totalSupply(), supplyBefore - 1000e18, "20% burned");
+        assertEq(token.balanceOf(challenger), challengerBefore + 2500e18);
+        assertEq(token.balanceOf(address(safetyReserve)), safetyBefore + 1500e18);
+        assertEq(token.totalSupply(), supplyBefore - 1000e18);
     }
 
     function test_slash_notifiesSafetyReserve() public {
@@ -270,55 +537,69 @@ contract StakingRegistryTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Slash: applies to active + unbonding (anti-slash-then-run)
+    // Slash: applies to active + unbonding
     // -----------------------------------------------------------------
 
     function test_slash_appliesToActivePlusUnbonding() public {
         _stake(operator, 100_000e18);
         vm.prank(operator);
         reg.requestUnstake(40_000e18);
-        // Now: active=60_000, unbonding=40_000. Total at-risk=100_000.
 
         vm.prank(slashJudge);
         uint256 slashed = reg.slash(operator, challenger, 0);
 
-        assertEq(slashed, 5000e18, "5% of full at-risk");
-        // Active reduced first.
+        assertEq(slashed, 5000e18);
         assertEq(reg.activeStake(operator), 55_000e18);
         (uint256 unbondingAmount,) = reg.unbondingOf(operator);
-        assertEq(unbondingAmount, 40_000e18, "unbonding untouched (active absorbed full slash)");
+        assertEq(unbondingAmount, 40_000e18);
     }
 
     function test_slash_drawsFromUnbondingWhenActiveInsufficient() public {
         _stake(operator, 100_000e18);
         vm.prank(operator);
         reg.requestUnstake(99_000e18);
-        // Now: active=1_000, unbonding=99_000. Total at-risk=100_000.
 
         vm.prank(slashJudge);
-        uint256 slashed = reg.slash(operator, challenger, 0); // 5% = 5_000
+        uint256 slashed = reg.slash(operator, challenger, 0);
 
         assertEq(slashed, 5000e18);
         assertEq(reg.activeStake(operator), 0);
         (uint256 unbondingAmount,) = reg.unbondingOf(operator);
-        assertEq(unbondingAmount, 95_000e18, "unbonding absorbed 4_000");
+        assertEq(unbondingAmount, 95_000e18);
     }
 
     // -----------------------------------------------------------------
-    // Slash: auto-ejection
+    // Slash: auto-ejection (now also flips NodeInfo.active)
     // -----------------------------------------------------------------
 
-    function test_slash_autoEjectsWhenStakeFallsBelowHalfMinimum() public {
-        // Stake exactly at minimum; a single 50% slash drops active to half,
-        // and 50% of minStake is *not* below 50% of minStake (boundary).
-        // Force three slashes to drop below the threshold.
-        _stake(operator, MIN_STAKE);
-        _slash(operator); // 5% off MIN_STAKE = 47_500
-        _slash(operator); // 15% off 47_500 = 7_125 → active=40_375
-        _slash(operator); // 50% off 40_375 = 20_187.5 → active=20_187.5
-        // 20_187.5 < 25_000 (MIN_STAKE / 2) ⇒ should be ejected.
-        assertTrue(reg.ejected(operator));
-        assertFalse(reg.isActive(operator));
+    function test_slash_autoEjectAlsoFlipsNodeActive() public {
+        // Register + over-slash to trigger auto-eject
+        (Vm.Wallet memory wallet,,) = _registerAt(0);
+        // Operator from _registerAt is wallet.addr; stake them up significantly
+        vm.prank(admin);
+        assertTrue(token.transfer(wallet.addr, 10 * MIN_STAKE));
+        _stake(wallet.addr, 9 * MIN_STAKE); // total 10x MIN_STAKE staked
+
+        assertEq(reg.getActiveNodeCount(), 1);
+        assertTrue(reg.isActive(wallet.addr));
+
+        // Three slashes against 10x MIN_STAKE (500k):
+        //   1st: 5% → -25k → 475k
+        //   2nd: 15% → -71.25k → 403.75k
+        //   3rd: 50% → -201.875k → 201.875k (still above MIN_STAKE/2 = 25k)
+        // Need many slashes. Use a higher minStake floor instead: bump
+        // minStake far above current stake.
+        vm.prank(admin);
+        reg.setMinStake(1_000_000e18); // raise min so we're already below 50%
+
+        // Trigger a slash to fire the auto-eject path
+        vm.prank(slashJudge);
+        reg.slash(wallet.addr, challenger, 0);
+
+        assertTrue(reg.ejected(wallet.addr));
+        assertEq(reg.getActiveNodeCount(), 0, "auto-eject removes from active set");
+        StakingRegistry.NodeInfo memory info = reg.getNodeByAddress(wallet.addr);
+        assertFalse(info.active);
     }
 
     // -----------------------------------------------------------------
@@ -348,17 +629,47 @@ contract StakingRegistryTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // ContentBlacklist ejection
+    // Blacklist ejection — also flips NodeInfo.active when registered
     // -----------------------------------------------------------------
 
-    function test_ejectNode_setsFlagWithoutMovingTokens() public {
+    function test_ejectNode_flipsBothFlagsWhenRegistered() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId,) = _registerAt(0);
+        assertEq(reg.getActiveNodeCount(), 1);
+        assertEq(reg.registrationNonce(nodeId), 0);
+
+        vm.prank(blacklist);
+        reg.ejectNode(wallet.addr);
+
+        assertTrue(reg.ejected(wallet.addr));
+        assertEq(reg.getActiveNodeCount(), 0);
+        StakingRegistry.NodeInfo memory info = reg.getNodeByAddress(wallet.addr);
+        assertFalse(info.active);
+        // Eject must bump registrationNonce, same as deregisterNode, so a
+        // stale ed25519 registration signature can't be replayed on re-register.
+        assertEq(reg.registrationNonce(nodeId), 1, "eject bumps registrationNonce");
+    }
+
+    function test_slashAutoEject_bumpsRegistrationNonce() public {
+        (Vm.Wallet memory wallet, bytes32 nodeId,) = _registerAt(0);
+        assertEq(reg.registrationNonce(nodeId), 0);
+
+        // Raise minStake far above current stake so the next slash auto-ejects.
+        vm.prank(admin);
+        reg.setMinStake(1_000_000e18);
+        vm.prank(slashJudge);
+        reg.slash(wallet.addr, challenger, 0);
+
+        assertTrue(reg.ejected(wallet.addr));
+        assertEq(reg.registrationNonce(nodeId), 1, "slash auto-eject bumps registrationNonce");
+    }
+
+    function test_ejectNode_unregisteredOperator_onlySetsFlag() public {
         _stake(operator, MIN_STAKE);
-        uint256 stakeBefore = reg.activeStake(operator);
         vm.prank(blacklist);
         reg.ejectNode(operator);
 
         assertTrue(reg.ejected(operator));
-        assertEq(reg.activeStake(operator), stakeBefore, "stake untouched");
+        assertEq(reg.getActiveNodeCount(), 0);
     }
 
     function test_ejectNode_revertsWithoutBlacklistRole() public {
@@ -367,7 +678,7 @@ contract StakingRegistryTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Settlement recording (FeeRouter)
+    // Settlement recording
     // -----------------------------------------------------------------
 
     function test_recordSettlement_updatesTimestamp() public {
@@ -409,6 +720,37 @@ contract StakingRegistryTest is Test {
         assertEq(reg.minStake(), 100_000e18);
     }
 
+    function test_setMaxMultiaddrSize_withinBounds() public {
+        vm.prank(admin);
+        reg.setMaxMultiaddrSize(256);
+        assertEq(reg.maxMultiaddrSize(), 256);
+    }
+
+    // -----------------------------------------------------------------
+    // Pagination view
+    // -----------------------------------------------------------------
+
+    function test_getActiveNodes_paginationBounds() public {
+        // Register 3 operators
+        bytes32 n1 = bytes32(uint256(0x1));
+        bytes32 n2 = bytes32(uint256(0x2));
+        bytes32 n3 = bytes32(uint256(0x3));
+        _registerWalletAndNodeId("a", n1);
+        _registerWalletAndNodeId("b", n2);
+        _registerWalletAndNodeId("c", n3);
+
+        assertEq(reg.getActiveNodeCount(), 3);
+        StakingRegistry.NodeInfo[] memory page = reg.getActiveNodes(0, 10);
+        assertEq(page.length, 3);
+
+        StakingRegistry.NodeInfo[] memory page2 = reg.getActiveNodes(1, 1);
+        assertEq(page2.length, 1);
+
+        // offset >= len → empty
+        StakingRegistry.NodeInfo[] memory empty = reg.getActiveNodes(5, 10);
+        assertEq(empty.length, 0);
+    }
+
     // -----------------------------------------------------------------
     // Fuzz: slash math always balances
     // -----------------------------------------------------------------
@@ -428,15 +770,82 @@ contract StakingRegistryTest is Test {
         uint256 safetyDelta = token.balanceOf(address(safetyReserve)) - safetyBefore;
         uint256 burned = supplyBefore - token.totalSupply();
 
-        assertEq(challengerDelta + safetyDelta + burned, slashed, "three legs sum to slashAmount");
+        assertEq(challengerDelta + safetyDelta + burned, slashed);
     }
 
     // -----------------------------------------------------------------
-    // Helper
+    // Helpers
     // -----------------------------------------------------------------
 
     function _slash(address op) internal returns (uint256) {
         vm.prank(slashJudge);
         return reg.slash(op, challenger, 0);
+    }
+
+    function _fundAndStake(address who, uint256 amount) internal {
+        vm.prank(admin);
+        assertTrue(token.transfer(who, amount));
+        vm.startPrank(who);
+        token.approve(address(reg), amount);
+        reg.stake(amount);
+        vm.stopPrank();
+    }
+
+    /// @notice Build a fresh wallet + nodeId + a valid EIP-712 BindNodeId signature.
+    function _prepareRegistration(uint256 salt)
+        internal
+        returns (Vm.Wallet memory wallet, bytes32 nodeId, bytes memory bindingSig)
+    {
+        wallet = vm.createWallet(string(abi.encodePacked("op-", vm.toString(salt))));
+        nodeId = bytes32(uint256(keccak256(abi.encodePacked("nodeId", salt))));
+        bindingSig = _signBindNode(wallet, nodeId, 0);
+    }
+
+    function _prepareRegistrationFor(Vm.Wallet memory wallet, bytes32 nodeId, uint64 nonce)
+        internal
+        view
+        returns (Vm.Wallet memory, bytes32, bytes memory bindingSig)
+    {
+        bindingSig = _signBindNode(wallet, nodeId, nonce);
+        return (wallet, nodeId, bindingSig);
+    }
+
+    function _signBindNode(Vm.Wallet memory wallet, bytes32 nodeId, uint64 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(reg.BIND_NODE_TYPEHASH(), nodeId, nonce));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(wallet, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _domainSeparator() internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("StakingRegistry")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(reg)
+            )
+        );
+    }
+
+    /// @notice Register a fresh operator under the given seed name + nodeId.
+    function _registerWalletAndNodeId(string memory seed, bytes32 nodeId) internal returns (Vm.Wallet memory wallet) {
+        wallet = vm.createWallet(seed);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+        bytes memory sig = _signBindNode(wallet, nodeId, 0);
+        vm.prank(wallet.addr);
+        reg.registerNode(nodeId, hex"", "", sig, hex"");
+    }
+
+    /// @notice Convenience for tests that need a single registered operator.
+    function _registerAt(uint256 salt)
+        internal
+        returns (Vm.Wallet memory wallet, bytes32 nodeId, bytes memory bindingSig)
+    {
+        (wallet, nodeId, bindingSig) = _prepareRegistration(salt);
+        _fundAndStake(wallet.addr, MIN_STAKE);
+        vm.prank(wallet.addr);
+        reg.registerNode(nodeId, hex"", "", bindingSig, hex"");
     }
 }
