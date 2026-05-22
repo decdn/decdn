@@ -5,6 +5,7 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title VotingEscrow - linear-decay vote-escrowed TOKEN (veCRV-style)
@@ -44,6 +45,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///         needs the per-account `balanceOfAt` shipped here.
 contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
+    using SafeCast for uint256;
 
     /// @notice Pause / unpause authority (emergency multisig).
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
@@ -72,9 +74,13 @@ contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
     ///         the slope: `slope = amount / maxLockDuration` ve-units/second.
     uint256 public immutable maxLockDuration;
 
+    /// @dev Packed into a single storage slot. `amount` is bounded by the
+    ///      TOKEN supply (1e27) and `end` is a timestamp, both far inside
+    ///      `uint128`; the narrowing casts at the write sites go through
+    ///      `SafeCast.toUint128` (reverts on overflow).
     struct LockedBalance {
-        uint256 amount;
-        uint256 end;
+        uint128 amount;
+        uint128 end;
     }
 
     /// @notice A decay checkpoint: ve-weight is `bias - slope * (t - ts)` for
@@ -181,7 +187,7 @@ contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
         uint256 weekAligned = (unlockTime / WEEK) * WEEK;
         _requireDurationInRange(weekAligned);
 
-        LockedBalance memory newLock = LockedBalance({ amount: amount, end: weekAligned });
+        LockedBalance memory newLock = LockedBalance({ amount: amount.toUint128(), end: weekAligned.toUint128() });
         _commitLock(msg.sender, existing, newLock);
 
         token.safeTransferFrom(msg.sender, address(this), amount);
@@ -196,7 +202,8 @@ contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
         if (existing.amount == 0) revert NoLock();
         if (existing.end <= block.timestamp) revert LockExpired();
 
-        LockedBalance memory newLock = LockedBalance({ amount: existing.amount + amount, end: existing.end });
+        LockedBalance memory newLock =
+            LockedBalance({ amount: (uint256(existing.amount) + amount).toUint128(), end: existing.end });
         _commitLock(msg.sender, existing, newLock);
 
         token.safeTransferFrom(msg.sender, address(this), amount);
@@ -213,7 +220,7 @@ contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
         if (weekAligned <= existing.end) revert UnlockTimeNotInFuture(weekAligned, existing.end);
         _requireDurationInRange(weekAligned);
 
-        LockedBalance memory newLock = LockedBalance({ amount: existing.amount, end: weekAligned });
+        LockedBalance memory newLock = LockedBalance({ amount: existing.amount, end: weekAligned.toUint128() });
         _commitLock(msg.sender, existing, newLock);
 
         emit LockExtended(msg.sender, existing.end, weekAligned);
@@ -274,8 +281,11 @@ contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
     ///         Future lookups revert.
     function totalSupplyAt(uint256 timestamp) public view returns (uint256) {
         if (timestamp > block.timestamp) revert FutureLookup(timestamp);
-        // Genesis point guarantees pointHistory is non-empty.
-        uint256 idx = _findGlobalPointIndex(timestamp);
+        uint256 idx = _findPointIndex(pointHistory, timestamp);
+        // `timestamp` precedes the genesis checkpoint (before deployment) —
+        // no supply existed, and walking `_supplyAt` from a later point back
+        // to `timestamp` would underflow the time delta.
+        if (idx == pointHistory.length) return 0;
         Point memory point = pointHistory[idx];
         return _supplyAt(point, timestamp);
     }
@@ -415,23 +425,6 @@ contract VotingEscrow is AccessControl, ReentrancyGuard, Pausable {
         while (lo + 1 < hi) {
             uint256 mid = (lo + hi) / 2;
             if (points[mid].ts <= timestamp) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        return lo;
-    }
-
-    /// @dev Index into `pointHistory` of the latest global point with
-    ///      `ts <= timestamp`. The genesis point guarantees index 0 qualifies
-    ///      for any `timestamp >= deployment`.
-    function _findGlobalPointIndex(uint256 timestamp) internal view returns (uint256) {
-        uint256 lo = 0;
-        uint256 hi = pointHistory.length;
-        while (lo + 1 < hi) {
-            uint256 mid = (lo + hi) / 2;
-            if (pointHistory[mid].ts <= timestamp) {
                 lo = mid;
             } else {
                 hi = mid;

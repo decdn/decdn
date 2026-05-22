@@ -310,6 +310,14 @@ contract VotingEscrowTest is Test {
         ve.totalSupplyAt(block.timestamp + 1);
     }
 
+    function test_totalSupplyAt_zeroBeforeGenesis() public {
+        _lock(alice, 100_000e18, MAX_LOCK);
+        (,, uint256 genesisTs) = ve.pointHistory(0);
+        // A timestamp before the genesis checkpoint returns 0, not an
+        // arithmetic-underflow panic (the regression gemini flagged).
+        assertEq(ve.totalSupplyAt(genesisTs - 1), 0);
+    }
+
     // -----------------------------------------------------------------
     // Pause
     // -----------------------------------------------------------------
