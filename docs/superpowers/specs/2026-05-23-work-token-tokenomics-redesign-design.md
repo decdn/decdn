@@ -84,18 +84,23 @@ bond_required(Mbps) = k × Mbps^α
 
 The 2.5× per-Mbps ratio at α=1.2 matches ADR 026's gauge-boost ratio (`1 / boostFloor = 1 / 0.4 = 2.5×`). Decentralization pressure is preserved; the mechanism just shifts from yield-haircut-to-not-lock (ADR 026) to capital-cost-to-operate (this design). Picking k and α this way makes the redesign neutral on decentralization, strictly better on simplicity and regulatory defensibility.
 
-### Supply impact at S2-scale buildout
+### Supply impact across scale scenarios
 
-Assumed reference distribution: 100 × 1G ops + 30 × 10G ops + 5 × 100G ops.
+Scale scenarios denote total monthly traffic delivered by the network. Peak capacity assumes ~30% average-of-peak utilization (`peak_Gbps ≈ PB/month × 10.3`). Operator mixes are illustrative — the design imposes no preferred mix.
 
-```
-100 × 50,000     =   5,000,000 TOKEN
- 30 × 795,000    =  23,850,000 TOKEN
-  5 × 12,600,000 =  63,000,000 TOKEN
-                 = ~91.85M TOKEN bonded
-```
+| Scenario | Monthly traffic | Peak capacity | Representative operator mix | Total bonded (α=1.2) | % of 1B supply |
+|---|---:|---:|---|---:|---:|
+| S1 | 1 PB | ~10 Gbps | 10 × 1G | 500K TOKEN | 0.05% |
+| S2 | 10 PB | ~100 Gbps | 50 × 1G + 5 × 10G | 6.475M TOKEN | ~0.6% |
+| S3 | 100 PB | ~1 Tbps | 100 × 1G + 30 × 10G + 5 × 100G | 91.85M TOKEN | ~9.2% |
+| S4 | 500 PB | ~5 Tbps | 500 × 1G + 100 × 10G + 30 × 100G | 482.5M TOKEN | ~48% |
 
-At 1B total supply, that's ~9% bonded at S2. At S3 (10× scale) ~30%. Matches ADR 026's target ve-lock rate of 30–50% as the natural mechanical equivalent.
+**Observations:**
+
+- S1 and S2 leave essentially all TOKEN liquid — bond demand is sub-1% of supply, so price impact from bonding is minimal. Bootstrap-grant bucket alone (120M, see Section 5) covers operator entry through ~S3.
+- S3 is the healthy steady-state zone — ~9% bonded gives meaningful demand without supply-lockup pressure on payment-channel topups, governance, or new-operator entry.
+- S4 is the design-tension scenario. At default α=1.2 the bond curve absorbs nearly half of supply, leaving a thin liquid float. Governance has the α lever for this: at α=1.1 the same S4 mix bonds ~325M (~33%); at α=1.0 (linear, no concentration pressure) ~225M (~23%). This is precisely why α is governable within [1.0, 1.8] (Section 2 parameter table) — the curve flattens at scale as the network matures into a commodity-bandwidth equilibrium.
+- Reference: ADR 026 targeted a 30–50% ve-lock rate as steady state. Under work-token at default α=1.2, that range is approached between S3 and S4 (not at the smaller "S2-scale" the previous draft incorrectly cited) — and the equivalent lever is α-tuning rather than lock-duration incentives.
 
 ## Section 3. Revenue split — four buckets, not six
 
@@ -190,10 +195,13 @@ Seed backers (22%), team (17%), treasury (25%), POL holders (10%) — all hold T
 - Operator-only governance is the cleanest regulatory posture, mirroring how Filecoin's storage-provider class and Helium's hotspot class are the load-bearing voting constituency in those networks.
 - It enforces the work-token framing structurally rather than rhetorically.
 
-**The political cost:**
+**The political cost is smaller than it appears.**
 
-- Seed investors and team members lose direct governance say. This needs to be agreed up-front in term-sheet renegotiation.
-- Mitigation: any TOKEN holder who *also* operates a node votes like any other operator. Seed/team are not excluded from governance — they're excluded from *passive* governance.
+- Per `internal/Legal/entity-structure-design.md` § Pattern A (Legal Fiction Separation), the entity design **already** excludes investors from DAO voting — this is a pre-existing structural choice independent of tokenomics. DAO governance is permissionless and no-KYC (entity-structure-design.md:406); investor influence sits at the Labs (C-Corp) equity layer: Series A+ board seats, standard preferred-stock protective provisions (veto on sale, new equity issuance, debt above threshold), and indirect TOKEN exposure via Labs' ~15% treasury allocation (entity-structure-design.md:168, 180–181).
+- Work-token does not narrow investor power *relative to that existing entity design*. It narrows DAO voting from "ve-lockers" to "operators" — a change to who-among-active-participants votes, not a removal of an investor right that ever existed in entity design.
+- The non-trivial nuance worth flagging in term-sheet language: under ADR 026 an investor who *also chose to lock* TOKEN could gain ve-voting weight as a side effect. Under work-token, they would need to *also operate* a node. Term sheets should not promise the ADR 026 path, because passive-governance-via-lock was never a designed-in investor right — it was an artifact of ve-tokenomics that the entity design explicitly excluded from investor channels.
+- Mitigation if any investor wants direct DAO signal: any TOKEN holder who *also* operates a node votes like any other operator. This path is open to investors, team, treasury, and seed equally.
+- Non-operator holder protection lives at the contract level (immutable share floors per Section 3), not at the governance level. Operators cannot vote to push the operator-base share above 90% or burn below 5%; non-operator value accrual is structurally guaranteed within those bounds.
 
 ### Bootstrap governance — temporary multisig phase
 
@@ -331,7 +339,7 @@ The recently merged `StakingRegistry.bindNodeId` / `reclaimNodeId` work (PR #668
 3. **Bootstrap-grant gaming.** Section 5's auto-deposit-into-bond mechanism needs careful design to prevent operators from cycling: register at 1G, earn grant, upgrade, drop service to default, repeat. The capacity-shortfall slashing partially defends but may not be sufficient on the bootstrap path specifically.
 4. **Liquid-bond wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This isn't strictly possible under work-token because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Disposition: out of scope for this spec; flag for future ADR if seen.
 5. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders can't operate on the canonical L2 and so can't vote — this is consistent with operator-only governance but worth being explicit about.
-6. **The "any TOKEN holder votes" softer governance variant.** If political resistance to operator-only voting is too high, a fallback is to allow non-operator TOKEN holders to vote by locking TOKEN in a simple time-locked contract (a stripped-down `VotingEscrow` with no yield, only voting weight; no gauge, no delegator pool). This adds one contract but avoids the full ve-gauge complexity of ADR 026 and preserves the work-token framing for operators while giving passive holders a governance say. Disposition: present option; defer unless requested.
+6. **Should non-operator TOKEN holders (including private investors) have a DAO governance path?** Investigated and resolved. Per `internal/Legal/entity-structure-design.md` § Pattern A, the existing entity design already excludes investors and other non-operator holders from DAO voting by structure — DAO governance is permissionless and no-KYC, with investor influence routed to the Labs (C-Corp) equity layer (board seats, protective provisions, treasury exposure). Work-token's operator-only DAO is *consistent* with that design — it does not remove any investor right that ever existed in the entity-level documents; it only narrows DAO voting from "ve-lockers" to "operators." **Disposition: no separate investor-governance mechanism. Operator-only DAO + Labs board seats + immutable contract-level non-operator-holder floors (Section 3) remains the recommended split.** If, post-launch, a non-operator governance path is wanted (e.g., for ecosystem partners or treasury committees), a stripped `VotingEscrow` (lock-only, no yield) with a non-operator weight cap (~20%) is the minimum-surface addition — defer until concretely requested.
 
 ## Acceptance criteria for "this spec is implementable"
 
@@ -350,6 +358,6 @@ The recently merged `StakingRegistry.bindNodeId` / `reclaimNodeId` work (PR #668
 
 ## Recommendation
 
-**Adopt option C (work-token) as specified in Sections 1–6.** The trade-offs the design makes against ADR 026 are intentional and favor the four user-stated priorities. The single significant political commit is Section 4's operator-only voting; that needs sign-off from the team and seed-investor stakeholders before the ADR rewrites land.
+**Adopt option C (work-token) as specified in Sections 1–6.** The trade-offs the design makes against ADR 026 are intentional and favor the four user-stated priorities. Section 4's operator-only voting is consistent with the pre-existing entity design (Pattern A excludes investors from DAO voting independent of tokenomics — see Section 4 "political cost is smaller than it appears"), so no new stakeholder renegotiation is required to land the redesign.
 
-If Section 4 cannot be made to fly with stakeholders, the design's regulatory crispness is reduced but the rest of the redesign (Sections 1, 2, 3, 5, 6) still hold and produce a meaningfully simpler, more value-accruing, and more decentralization-aligned system than ADR 026. In that fallback, voting reverts to raw-bond-weighted with delegation to any address.
+If, after stakeholder conversations, a non-operator DAO governance path is wanted (e.g., for ecosystem partners or treasury committees), the minimum-surface addition is a stripped `VotingEscrow` (lock-only, no yield) with a non-operator weight cap of ~20% — flagged in Open Question 6 and deferrable post-launch.
