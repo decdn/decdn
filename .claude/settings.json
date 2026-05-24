@@ -4,6 +4,7 @@
     "documentation-generation@claude-code-workflows": true,
     "cicd-automation@claude-code-workflows": true,
     "systems-programming@claude-code-workflows": true,
-    "rust-analyzer-lsp@claude-plugins-official": true
+    "rust-analyzer-lsp@claude-plugins-official": true,
+    "openzeppelin-skills@openzeppelin-skills": true
   }
 }
