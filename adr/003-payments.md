@@ -569,7 +569,7 @@ bytes32 constant VOUCHER_TYPEHASH = keccak256(
 );
 ```
 
-Per-operator-epoch attribution is derived by `FeeRouter.routeSettlement` at settlement time as `epoch = uint64(block.timestamp / EPOCH_LENGTH)`; the voucher itself does not carry an epoch. All cumulative bytes from the final voucher are credited to the epoch the settlement transaction lands in. Operator gaming via late settlement is bounded by the 48-hour dispute window, which is small relative to the monthly emission distribution cadence.
+Per-operator-epoch attribution is derived by `FeeRouter.routeSettlement` at settlement time as `epoch = uint64(block.timestamp / EPOCH_LENGTH)`; the voucher itself does not carry an epoch. All cumulative bytes from the final voucher are credited to the epoch the settlement transaction lands in. The operator chooses when to invoke `settleChannel` within `[disputeDeadline, expiresAt]` — `settleChannel` is permissionlessly callable but only the operator has an incentive to spend gas on it, since they receive the 60% base share. Practical bound on epoch-shifting is `maxChannelDuration` (default 90 days, governance-tuned). The effective gaming surface — shifting attribution across roughly 4–12 weekly epochs within a monthly emission distribution — is a second-order effect on emission share and shrinks further as the active-operator set grows.
 
 **Signature digest:**
 

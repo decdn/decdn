@@ -49,8 +49,7 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 ### Protocol-Owned Liquidity mechanics
 
 - **Source:** The 15pp Protocol-Owned Liquidity allocation (150M TOKEN per [ADR 026 § Allocation](026-tokenomics.md#allocation)) funds the TOKEN side. The USDC side is drawn from the pre-seed USDC bootstrap (~30% of the $1M+ pre-seed pool, ~$300K nominal — sized larger than the prior 10%-POL design's USDC seed because the TOKEN-side allocation is ~1.5× larger).
-- **PoC seed:** A minimal position for integration testing. Exact amount is chosen by governance at deployment; the target range of $5K–$20K USDC equivalent per side reflects expected PoC scale.
-- **Production seed:** Sized so that a single `maxBuybackAmount` swap causes less than `slippageBps` price impact, making buyback execution well-conditioned on its own pool.
+- **Initial pool seed:** Sized so that a single `maxBuybackAmount` swap causes less than `slippageBps` price impact, making buyback execution well-conditioned on its own pool.
 - **Custody:** BPT is held by the DAO treasury address. PoC: admin key. Production: Governor + `TimelockController`. No withdraw path to an EOA — liquidity exit requires a governance proposal through the timelock. This invariant is enforced by BPT being held at the Timelock address and the absence of any bespoke withdraw function; Balancer has no protocol-level lockup, so custody discipline is the sole enforcement mechanism.
 - **No `LiquidityManager` contract.** A weighted pool's curve handles rebalancing implicitly via arbitrage. There is no range to manage, no `rebalance()` keeper, no `KEEPER_ROLE` for liquidity operations.
 - **No liquidity mining.** The retired Liquidity Mining Rewards bucket (15pp under prior designs) is redeployed as additional POL under v2.1. Mercenary LPs exit when rewards stop and consume TOKEN supply for a benefit POL provides more reliably. A future ADR may reintroduce LM if external-LP-attraction strategic priority changes, but the v2.1 design is intentionally LM-free for regulatory cleanliness (no per-holder passive yield).
@@ -131,11 +130,11 @@ Balancer's smoother curve reduces the need for TWAP versus V3's concentrated ban
 | TWAP `subSwapCount` | 4 (default) [^subswap-rationale] |
 | TWAP `subSwapMinBlockGap` | 10 blocks (~2 minutes on Arbitrum) |
 | Private-RPC routing | **Required** — Flashbots Protect / MEV-Share equivalent on the production L2; public-mempool routing is not an acceptable fallback |
-| Per-epoch liquidity cap | **Required** — `epochLiquidityCapFraction` of in-pool USDC depth at epoch start (default 10%, bounded `[1%, 30%]` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)) |
+| Per-epoch liquidity cap | **Required** — `epochLiquidityCapFraction` of in-pool USDC depth at epoch start (default 10%, bounded `[1%, 30%]`; see [§ TWAP policy](#twap-policy-subswapcount--1)) |
 | POL withdraw cap | 10% of POL per 30-day window per governance proposal |
 | Execution activation | Disabled at launch — governance vote required to enable |
 
-Per-parameter governability (which parameters are mutable, by whom, and within what safety bounds) lives in [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
+All `BuybackBurner` setters above (`setSwapRouter`, `setPool`, `setMinBuybackAmount`, `setMaxBuybackAmount`, `setSlippageBps`, `setSubSwapCount`, `setSubSwapMinBlockGap`) are `GOVERNANCE_ROLE`-gated through the standard 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model); `epochLiquidityCapFraction` carries the explicit `[1%, 30%]` safety bound noted in [§ TWAP policy](#twap-policy-subswapcount--1). Pool weights, pool swap fee, POL TOKEN-side allocation, private-RPC routing, and POL withdraw cap are structural — not parameter-tunable in-contract; changes require pool redeployment, governance proposal, or a hard requirement on keeper configuration.
 
 [^subswap-rationale]: A default of 4 balances MEV mitigation against gas overhead and keeper complexity. 2 sub-swaps provides marginal splitting benefit; ≥8 multiplies keeper gas and `ceilDiv` rounding artifacts without proportionate MEV improvement on a weighted pool. With the v2.1 5× volume increase governance may consider raising the default to 6–8; this is left as production tuning.
 
@@ -143,7 +142,7 @@ Per-parameter governability (which parameters are mutable, by whom, and within w
 
 Buyback execution should be enabled by governance vote only when all of the following hold:
 
-1. The Balancer V3 80/20 TOKEN/USDC Weighted Pool has been deployed and seeded with POL at the production seed size, and its contract address has been set via `setPool(address)`.
+1. The Balancer V3 80/20 TOKEN/USDC Weighted Pool has been deployed and seeded with POL at the initial pool seed size, and its contract address has been set via `setPool(address)`.
 2. The `BuybackBurner` contract has been configured with the Balancer V3 Router address via `setSwapRouter(address)`, and USDC has been approved to the Balancer V3 **Vault** address (not the Router — see the approvals footgun in [Buyback execution via Balancer V3](#buyback-execution-via-balancer-v3)).
 3. A single swap of size `maxBuybackAmount` against the pool causes less than `slippageBps` price impact.
 4. Accumulated USDC in the `BuybackBurner` contract exceeds `minBuybackAmount`.
