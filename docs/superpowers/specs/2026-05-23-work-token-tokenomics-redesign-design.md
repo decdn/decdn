@@ -1,6 +1,6 @@
 # Work-Token Tokenomics Redesign — Design Spec
 
-**Status:** Draft (brainstorming output, awaiting user review).
+**Status:** Superseded by v2.1 (2026-05-25) — see [`2026-05-24-work-token-tokenomics-redesign-v2.1.md`](2026-05-24-work-token-tokenomics-redesign-v2.1.md). Retained for design-history audit only. Adopt v2.1 for canonical work-token mechanics; v1's allocation section was replaced first by v2 (13-group taxonomy) and then by v2.1 (POL-redeployed LM).
 **Supersedes (if adopted):** ADRs 026, 034, 035. Substantial edits to 009 and 016. Minor edits to 003, 028, 032.
 
 ## Summary

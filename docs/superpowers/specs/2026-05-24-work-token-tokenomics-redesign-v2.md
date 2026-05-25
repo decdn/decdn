@@ -1,6 +1,6 @@
 # Work-Token Tokenomics Redesign — Design Spec v2 (13-Group Distribution)
 
-**Status:** Draft (brainstorming output, awaiting user review).
+**Status:** Superseded by v2.1 (2026-05-25) — see [`2026-05-24-work-token-tokenomics-redesign-v2.1.md`](2026-05-24-work-token-tokenomics-redesign-v2.1.md). Retained for design-history audit only. v2.1 resolves §5.2's Bootstrap LM question to the POL-redeployment fallback (no LM program; 15pp moves to POL). Adopt v2.1 for canonical work-token mechanics.
 **Supersedes (if adopted):** v1 spec (`2026-05-23-work-token-tokenomics-redesign-design.md`). ADRs 026, 034, 035. Substantial edits to 009 and 016. Minor edits to 003, 028, 032.
 **Relationship to v1:** Sections 1–4 and 6 are unchanged in substance. Section 5 (allocation) is replaced with a 13-group distribution to align with conventional fundraising-tool group taxonomies. The work-token mechanics (CapacityBond, four-bucket FeeRouter, operator-only governance) are identical to v1.
 
