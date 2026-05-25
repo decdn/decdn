@@ -64,7 +64,7 @@ BOOK_SRCS := \
   _build/part-3-payments.md \
   003-payments.md 012-client.md 024-account-abstraction.md \
   _build/part-4-tokenomics.md \
-  026-tokenomics.md 034-gauge-boost-voting-escrow.md 035-delegator-pool.md 033-safety-insurance-reserve.md 018-liquidity-strategy.md \
+  026-tokenomics.md 033-safety-insurance-reserve.md 018-liquidity-strategy.md \
   _build/part-5-verification.md \
   014-on-chain-verification.md 008-reputation.md 011-content-takedown.md \
   028-slashing-appeals.md 032-safety-reserve-appeals-contract.md \
