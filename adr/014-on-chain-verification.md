@@ -23,7 +23,7 @@ Phantom, rate, and blacklist all require verifying cryptographic signatures from
 
 Each slashing-participating message (`ProbeResponse`, `StreamResponse`) carries a single message-body signature, `slash_sig`, produced with the node's Ethereum key. Connection-level peer identity is authenticated separately by the iroh QUIC handshake against the registered Ed25519 NodeId; the body signature makes message contents portable evidence verifiable both off-chain and on-chain.
 
-The Ethereum key is the same secp256k1 key the node already holds for staking and channels: `StakingRegistry.registerNode` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` followed by a `StakingRegistry.nodeIdOf(recovered)` lookup attributes the message to a NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; an Ed25519 wire signature would have cost ~500k–1M gas via Solidity library and was rejected for this reason.
+The Ethereum key is the same secp256k1 key the node already holds for staking and channels: `CapacityBond.registerNode` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` followed by a `CapacityBond.nodeIdOf(recovered)` lookup attributes the message to a NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; an Ed25519 wire signature would have cost ~500k–1M gas via Solidity library and was rejected for this reason.
 
 ##### Wire protocol
 
@@ -51,7 +51,7 @@ bytes32 constant STREAM_RESPONSE_TYPEHASH = keccak256(
 );
 ```
 
-The `SlashJudge` contract uses its own EIP-712 domain separator, not shared with `StakingRegistry` or `PaymentChannel`. This prevents cross-contract signature replay.
+The `SlashJudge` contract uses its own EIP-712 domain separator, not shared with `CapacityBond` or `PaymentChannel`. This prevents cross-contract signature replay.
 
 ```solidity
 EIP712Domain({
@@ -66,7 +66,7 @@ EIP712Domain({
 
 1. Challenger submits the serialized message fields and `slash_sig` to `SlashJudge`.
 2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)).
-3. The challenger-provided address is looked up in `StakingRegistry` to confirm it maps to a registered node.
+3. The challenger-provided address is looked up in `CapacityBond` to confirm it maps to a registered node.
 4. For offenses requiring two messages (phantom, rate manipulation), the signatures must both validate against the **same** node address.
 
 #### Node Implementation
@@ -77,7 +77,7 @@ When constructing a `ProbeResponse` or `StreamResponse`, the node signs the secu
 
 ### SlashJudge Contract
 
-A unified contract that adjudicates the three signature-dependent offenses (phantom announcement, rate manipulation, blacklist violation). All resolve synchronously at submit time — see § Bond Handling. The contract holds challenge bonds, verifies evidence, and calls `StakingRegistry.slash()` on each successful submission.
+A unified contract that adjudicates the three signature-dependent offenses (phantom announcement, rate manipulation, blacklist violation). All resolve synchronously at submit time — see § Bond Handling. The contract holds challenge bonds, verifies evidence, and calls `CapacityBond.slash()` on each successful submission.
 
 #### Interface
 
@@ -140,7 +140,7 @@ interface ISlashJudge {
 
     // All three offense types (Phantom, RateManipulation, Blacklist) resolve
     // synchronously at submit time. There is no counter-evidence window —
-    // `Slashed` is emitted atomically with `StakingRegistry.slash()` inside
+    // `Slashed` is emitted atomically with `CapacityBond.slash()` inside
     // each `submit*Challenge` call.
 }
 ```
@@ -156,7 +156,7 @@ interface ISlashJudge {
 5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
 6. Verify `streamResponse.timestamp_us >= probeResponse.timestamp_us`
 7. Verify `streamResponse.timestamp_us - probeResponse.timestamp_us < 30_000_000` (30-second window)
-8. Look up `challengedNode` in `StakingRegistry` — must be a registered node
+8. Look up `challengedNode` in `CapacityBond` — must be a registered node
 
 ##### Evidence staleness
 
@@ -164,10 +164,10 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 
 ##### Interaction with unbonding period
 
-`MAX_EVIDENCE_AGE_US` MUST be strictly less than `StakingRegistry.unbondingPeriod` (converted to microseconds). Otherwise a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. PoC defaults (evidence age 5 days, unbonding 7 days) satisfy the invariant with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md#adr-009-governance-model)) admit configurations that violate this invariant in isolation, so both setters enforce it as a paired cross-parameter check at the contract layer:
+`MAX_EVIDENCE_AGE_US` MUST be strictly less than `CapacityBond.unbondingPeriod` (converted to microseconds). Otherwise a node could commit an offense, immediately initiate unstaking, and complete withdrawal before the evidence is submitted — avoiding the slash entirely. PoC defaults (evidence age 5 days, unbonding 7 days) satisfy the invariant with a 2-day margin. The safety bounds ([1 day, 30 days] for evidence age vs [3 days, 30 days] for unbonding per [ADR 009](009-governance.md#adr-009-governance-model)) admit configurations that violate this invariant in isolation, so both setters enforce it as a paired cross-parameter check at the contract layer:
 
-- `SlashJudge.setMaxEvidenceAge(uint256 newValueUs)` MUST revert if `newValueUs >= StakingRegistry.unbondingPeriod * 1_000_000` (or the integer-overflow-safe equivalent), in addition to the [1 day, 30 days] individual bound.
-- `StakingRegistry.setUnbondingPeriod(uint256 newValueSeconds)` MUST revert if `newValueSeconds * 1_000_000 <= SlashJudge.maxEvidenceAgeUs`, in addition to the [3 days, 30 days] individual bound.
+- `SlashJudge.setMaxEvidenceAge(uint256 newValueUs)` MUST revert if `newValueUs >= CapacityBond.unbondingPeriod * 1_000_000` (or the integer-overflow-safe equivalent), in addition to the [1 day, 30 days] individual bound.
+- `CapacityBond.setUnbondingPeriod(uint256 newValueSeconds)` MUST revert if `newValueSeconds * 1_000_000 <= SlashJudge.maxEvidenceAgeUs`, in addition to the [3 days, 30 days] individual bound.
 
 The check applies at initialization too — neither contract may be deployed with an initial pair that violates the invariant. This matches the cross-parameter setter pattern used elsewhere (see [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds): the FeeRouter sum-to-100% invariant) — invariants between parameters with a genuine ordering relationship are contract-enforced, not implementation-enforced.
 
@@ -175,22 +175,22 @@ The check applies at initialization too — neither contract may be deployed wit
 4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
 5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
 6–8. Same timestamp and registration checks as phantom
-9. Slash immediately via `StakingRegistry.slash()` — no counter-evidence window. Two signed messages from the same NodeId disagreeing about that node's own rate within 30 seconds are non-repudiable; the node's last probe-quoted rate is binding for the slashing window. Legitimate rate changes wait out the 30-second window before serving a stream at the new rate.
+9. Slash immediately via `CapacityBond.slash()` — no counter-evidence window. Two signed messages from the same NodeId disagreeing about that node's own rate within 30 seconds are non-repudiable; the node's last probe-quoted rate is binding for the slashing window. Legitimate rate changes wait out the 30-second window before serving a stream at the new rate.
 
 ##### Blacklist violation
 
 1. Challenger provides `challengedNode` address
 2. `SignatureChecker.isValidSignatureNow(challengedNode, responseDigest, slashSig)` — must pass
-3. Look up `challengedNode` in `StakingRegistry` — must be a registered node
+3. Look up `challengedNode` in `CapacityBond` — must be a registered node
 4. Decode `hash` from the response; verify it matches `blobHash`
 5. If `ProbeResponse`: verify `has_blob == true`. If `StreamResponse`: verify `ok == true`
 6. Query `ContentBlacklist.getEntry(blobHash)` — must exist and `effectiveAt` must be before the response's `timestamp_us`
-7. **Regional scope limitation (PoC):** [ADR 011](011-content-takedown.md#slashing) specifies a node is only slashable for hashes blacklisted in its declared region. But the node's region is self-reported and not stored on-chain in `StakingRegistry` for the PoC, so `SlashJudge` cannot enforce regional scope in the PoC — all blacklist violations are treated as globally scoped. Production should add a `region` field to `NodeInfo` to enable on-chain regional filtering
+7. **Regional scope limitation (PoC):** [ADR 011](011-content-takedown.md#slashing) specifies a node is only slashable for hashes blacklisted in its declared region. But the node's region is self-reported and not stored on-chain in `CapacityBond` for the PoC, so `SlashJudge` cannot enforce regional scope in the PoC — all blacklist violations are treated as globally scoped. Production should add a `region` field to `NodeInfo` to enable on-chain regional filtering
 
 #### Bond Handling
 
 - Challengers must `TOKEN.approve(slashJudge, bondAmount)` before calling any `submit*Challenge()` function. The contract transfers the bond on submission.
-- **Successful challenge:** bond returned to challenger; node slashed via `StakingRegistry.slash()`.
+- **Successful challenge:** bond returned to challenger; node slashed via `CapacityBond.slash()`.
 - **All three offenses** (phantom, rate manipulation, blacklist): if on-chain verification passes, the slash executes synchronously at submit time — no counter-evidence window. Each offense's evidence is cryptographically dispositive: phantom and rate manipulation rely on two contradictory signed messages from the same node within 30 s; blacklist relies on a signed response for an already-blacklisted hash. The node's recourse is to not commit the offense; for rate changes, honor the last probe-quoted rate for the 30-second slashing window before serving streams at a new rate.
 - **Frivolous-challenge bond loss.** A `submit*Challenge` that fails on-chain verification (signature mismatch, timestamp out of window, hash mismatch, etc.) reverts and the challenger pays only gas; the bond is not transferred for failed verifications. A challenge that *passes* verification always slashes the node — there is no second-stage dispute that could forfeit the bond after-the-fact.
 
@@ -198,14 +198,14 @@ The check applies at initialization too — neither contract may be deployed wit
 
 Every slash that reduces operator stake emits `Slashed(slashId, operator, offenseType, amount, evidenceHash)` (see the `ISlashJudge` interface block above). The event is the canonical slash record and the appeal-pinning identifier consumed by [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface) `openSlashAppeal(slashId, evidenceBundleHash)` — without it, no [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) appeal can be filed.
 
-- **`slashId`** is a globally monotonic `uint256` (single counter across all offense types, not per-operator and not per-offense-type), allocated from a `nextSlashId` storage slot incremented inline in the same transaction as the `StakingRegistry.slash(...)` call. `slashId` values are stable, non-reusable, and non-zero — `slashId == 0` is reserved as the "no slash" sentinel.
+- **`slashId`** is a globally monotonic `uint256` (single counter across all offense types, not per-operator and not per-offense-type), allocated from a `nextSlashId` storage slot incremented inline in the same transaction as the `CapacityBond.slash(...)` call. `slashId` values are stable, non-reusable, and non-zero — `slashId == 0` is reserved as the "no slash" sentinel.
 - **`offenseType`** is the `OffenseType` enum from the interface above.
 - **`evidenceHash`** is `keccak256` over a per-offense canonical preimage that uniquely identifies the (offenseType, evidence) pair the slash relied on. The preimage uses `abi.encode(...)` (not `abi.encodePacked`) so field encoding is unambiguous across implementers. Every preimage is prefixed by `uint8(offenseType)` so two distinct offenses against the same operator on overlapping evidence (e.g., a single `(probe, stream)` pair where `streamResponse.ok == false` AND `streamResponse.rate_per_mb > probeResponse.rate_per_mb` triggers both phantom and rate-manipulation) produce distinct `evidenceHash` values, not just distinct `slashId`s. Signatures are **excluded** — the [§ Slash Signatures — secp256k1 EIP-712](#slash-signatures--secp256k1-eip-712) EIP-712 typed-data digests they sign already uniquely identify the message contents, so a successful slash trivially fixes the digest set; including the variable-length signature blobs would add an `abi.encode` vs `abi.encodePacked` field-length ambiguity without adding evidentiary content. The `blobHash` parameter passed to the immediate-execution `submit*Challenge` paths is similarly excluded — the [§ SlashJudge Contract](#slashjudge-contract) evidence-verification flow already binds it via the `responseData.hash == blobHash` check, and the EIP-712 `*Response` struct hash commits to `hash` directly. The per-offense preimages are:
   - **Phantom:** `keccak256(abi.encode(uint8(OffenseType.Phantom), probeStructHash, streamStructHash))`.
   - **Rate manipulation:** `keccak256(abi.encode(uint8(OffenseType.RateManipulation), probeStructHash, streamStructHash))`. The `OffenseType` prefix is what distinguishes this preimage from phantom on overlapping evidence.
   - **Blacklist:** `keccak256(abi.encode(uint8(OffenseType.Blacklist), responseStructHash, isStreamResponse))`. The boolean is required because it is a `submitBlacklistChallenge` parameter, not part of any `*Response` struct.
   Each `*StructHash` is the EIP-712 struct hash of the corresponding `*Response` per [§ Slash Signatures — secp256k1 EIP-712](#slash-signatures--secp256k1-eip-712) (head-only `bytes32` — `abi.encode` adds no padding to a fixed-width 32-byte value). Appeals reference `evidenceHash` to prove they challenge the same evidence the slash relied on; [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface) `openSlashAppeal(slashId, evidenceBundleHash)` requires `evidenceBundleHash == evidenceHash` of the referenced `Slashed` event.
-- **Emission sites.** All three offenses are immediate: `Slashed` is emitted from the synchronous `submit*Challenge` paths immediately after the inline `StakingRegistry.slash()` returns. The "`StakingRegistry.slash()` then `emit Slashed`" sequence is contract-enforced atomic (single transaction); a slash without a matching event is impossible.
+- **Emission sites.** All three offenses are immediate: `Slashed` is emitted from the synchronous `submit*Challenge` paths immediately after the inline `CapacityBond.slash()` returns. The "`CapacityBond.slash()` then `emit Slashed`" sequence is contract-enforced atomic (single transaction); a slash without a matching event is impossible.
 
 The companion `SafetyReserve` events (`SlashAppealOpened`, `SlashAppealRatified`, etc.) remain forward-referenced to a future contract-implementation ADR per [ADR 028 § Cross-ADR Impact](028-slashing-appeals.md#cross-adr-impact); only `Slashed` itself is canonicalised here.
 
@@ -216,7 +216,7 @@ The companion `SafetyReserve` events (`SlashAppealOpened`, `SlashAppealRatified`
 | `submitPhantomChallenge` | ~65k–90k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage + bond transfer + `Slashed` emit on success |
 | `submitRateChallenge` | ~65k–90k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage for pending challenge + bond transfer + `Slashed` emit on success |
 | `submitBlacklistChallenge` | ~55k–70k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + `ContentBlacklist` lookup + bond transfer + `Slashed` emit on success |
-| `Slashed` event emit | ~5k–7k | `nextSlashId++` (cold SLOAD + non-zero→non-zero SSTORE on first emit per tx, ~5k post-EIP-2929) + LOG3 base + 3 stack topics (event signature + 2 indexed) + 96 bytes non-indexed data (~2k); negligible vs the surrounding `StakingRegistry.slash()`. The very first `Slashed` ever emitted on a fresh deployment pays an additional ~17k for the 0→non-zero `nextSlashId` SSTORE. |
+| `Slashed` event emit | ~5k–7k | `nextSlashId++` (cold SLOAD + non-zero→non-zero SSTORE on first emit per tx, ~5k post-EIP-2929) + LOG3 base + 3 stack topics (event signature + 2 indexed) + 96 bytes non-indexed data (~2k); negligible vs the surrounding `CapacityBond.slash()`. The very first `Slashed` ever emitted on a fresh deployment pays an additional ~17k for the 0→non-zero `nextSlashId` SSTORE. |
 
 Using secp256k1 EIP-712 for `slash_sig` keeps per-signature verification at ~3k gas via `ecrecover`, against the ~500k–1M gas a Solidity Ed25519 library would require — making routine slashing economically viable.
 
@@ -224,15 +224,15 @@ Using secp256k1 EIP-712 for `slash_sig` keeps per-signature verification at ~3k 
 
 | Parameter | Contract | Default | Min | Max | Cross-parameter invariant |
 | --- | --- | --- | --- | --- | --- |
-| `MAX_EVIDENCE_AGE_US` | `SlashJudge` | 5 days | 1 day | 30 days | `< StakingRegistry.unbondingPeriod` (paired) |
+| `MAX_EVIDENCE_AGE_US` | `SlashJudge` | 5 days | 1 day | 30 days | `< CapacityBond.unbondingPeriod` (paired) |
 | `MAX_FUTURE_SKEW_US` | `SlashJudge` | 60 s | (fixed) | (fixed) | — |
 | Challenge bond | `SlashJudge` | (per [ADR 009](009-governance.md#governable-parameters-with-safety-bounds)) | 1 TOKEN | 1,000 TOKEN | — |
 
-The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contracts. Setter paths on both `SlashJudge` and `StakingRegistry` enforce the post-update inequality at the contract layer (see [Interaction with unbonding period](#interaction-with-unbonding-period) for the exact revert conditions); violating updates revert atomically with the setter call. `MAX_FUTURE_SKEW_US` is fixed at 60 seconds at deployment and not governable — it absorbs NTP drift between challenger and evidence-signing node and has no economic surface that varies by network conditions. Challenge bond bounds are canonical in [ADR 009](009-governance.md#governable-parameters-with-safety-bounds); listed here for completeness.
+The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contracts. Setter paths on both `SlashJudge` and `CapacityBond` enforce the post-update inequality at the contract layer (see [Interaction with unbonding period](#interaction-with-unbonding-period) for the exact revert conditions); violating updates revert atomically with the setter call. `MAX_FUTURE_SKEW_US` is fixed at 60 seconds at deployment and not governable — it absorbs NTP drift between challenger and evidence-signing node and has no economic surface that varies by network conditions. Challenge bond bounds are canonical in [ADR 009](009-governance.md#governable-parameters-with-safety-bounds); listed here for completeness.
 
 ### Integration with Existing Contracts
 
-**StakingRegistry ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 003](003-payments.md#adr-003-payment-model), [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)):**
+**CapacityBond ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 003](003-payments.md#adr-003-payment-model), [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)):**
 
 - Adds `slash(address operator, address challenger, uint8 offenseType) external returns (uint256 slashAmount)` callable only by the `SlashJudge` contract address (`SLASH_ROLE`). Implements the escalating schedule from [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5% / 15% / 50% indexed by a `uint32` monotonic lifetime offense counter. The slashed amount is split inline as 50% to `challenger` / 30% to `SafetyReserve` / 20% burn; the SafetyReserve leg calls `safeTransfer` then `SafetyReserve.recordSlashInflow(operator, share)`, which requires `SLASH_INFLOW_REPORTER_ROLE` on the reserve per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization) step 3. Reverts if the SafetyReserve address has not been wired. Checks auto-ejection threshold (50% of `minStake`) on the post-slash active stake; the returned `slashAmount` is the canonical figure consumed by the `Slashed` event on `SlashJudge`.
 - No new fields in `NodeInfo` for PoC — the existing `msg.sender` Ethereum address serves as the slash key.
@@ -251,7 +251,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 
 - All three slashable offenses now have a concrete, gas-efficient on-chain evidence path. Slashing is no longer aspirational.
 - `ecrecover` at 3,000 gas per signature is 100–300× cheaper than a Solidity Ed25519 library, making routine slashing economically viable even for small offenses.
-- `slash_sig` reuses the existing NodeId-to-Ethereum-address binding in `StakingRegistry` — no new on-chain registration step.
+- `slash_sig` reuses the existing NodeId-to-Ethereum-address binding in `CapacityBond` — no new on-chain registration step.
 - `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Universal on-chain accountability is the protocol's single stance — there is no opt-out and no validation-mode difference between PoC and production for this field.
 - The unified `SlashJudge` contract provides a single audit surface for all slashing logic.
 
@@ -259,6 +259,6 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 
 - Nodes perform a secp256k1 EIP-712 signature on every `ProbeResponse` and `StreamResponse`, adding ~1ms of computation per message — negligible relative to network RTT, but nonzero.
 - The `slash_sig` field adds ~65 bytes per `ProbeResponse` and `StreamResponse`. For probe messages this is meaningful overhead; for stream responses preceding multi-MB deliveries, it is negligible.
-- Off-chain verifiers (clients, requesting nodes, third-party fraud detectors) must `ecrecover` and look up `StakingRegistry.nodeIdOf(recovered)` to attribute a message to a NodeId, rather than verifying directly against the iroh key. These parties already maintain the binding cache for voucher attribution, so the marginal cost is one extra map lookup per verification.
+- Off-chain verifiers (clients, requesting nodes, third-party fraud detectors) must `ecrecover` and look up `CapacityBond.nodeIdOf(recovered)` to attribute a message to a NodeId, rather than verifying directly against the iroh key. These parties already maintain the binding cache for voucher attribution, so the marginal cost is one extra map lookup per verification.
 - Cross-contract replay is prevented by per-contract EIP-712 domains, but implementers must configure domain separators correctly at deployment.
-- The [§ SlashJudge Contract](#slashjudge-contract) `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface — small but real: every slash path emits the event atomically with `StakingRegistry.slash()`, and the `OffenseType` ordering is contract-canonical (any reordering requires coordinated migration of `SafetyReserve` per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)).
+- The [§ SlashJudge Contract](#slashjudge-contract) `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface — small but real: every slash path emits the event atomically with `CapacityBond.slash()`, and the `OffenseType` ordering is contract-canonical (any reordering requires coordinated migration of `SafetyReserve` per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)).

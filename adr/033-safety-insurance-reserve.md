@@ -5,11 +5,11 @@
 
 ## Context
 
-The 3% safety/insurance bucket of the `FeeRouter` six-bucket split ([ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553)) is held in a governance-gated `SafetyReserve` contract. This ADR specifies that reserve: eligible payout categories, spending controls, cross-category payout ordering, interface stability, and the `ISafetyReserve` contract surface. The economic model that sizes the bucket is [ADR 026](026-tokenomics.md#adr-026-tokenomics); the appeal-surface that feeds slash-restitution claims into it is [ADR 032](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface).
+The 5% safety/insurance bucket of the `FeeRouter` four-bucket split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) is held in a governance-gated `SafetyReserve` contract. This ADR specifies that reserve: eligible payout categories, spending controls, cross-category payout ordering, interface stability, and the `ISafetyReserve` contract surface. The economic model that sizes the bucket is [ADR 026](026-tokenomics.md#adr-026-tokenomics); the appeal-surface that feeds slash-restitution claims into it is [ADR 032](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface).
 
 ## Decision
 
-The 3% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve. Eligible payout categories:
+The 5% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve. Eligible payout categories:
 
 - Incorrect slashing / appeal reversals.
 - Relay, sequencer, or payment-channel downtime.
@@ -118,10 +118,10 @@ interface ISafetyReserve {
     function pendingClaimHead() external view returns (PendingClaim memory);
     function pendingClaimCount() external view returns (uint256);
 
-    // ─── Slashing-redirect inflow (callback from StakingRegistry) ─────
+    // ─── Slashing-redirect inflow (callback from CapacityBond) ─────
     // Records the 30% slashed-TOKEN redirect against an indexable
     // operator+amount tuple. `SLASH_INFLOW_REPORTER_ROLE`-gated; granted
-    // to `StakingRegistry` post-deploy per [ADR 016 § Post-Deployment
+    // to `CapacityBond` post-deploy per [ADR 016 § Post-Deployment
     // Initialization](016-contract-interactions.md#post-deployment-initialization).
     // TOKEN is transferred separately via `safeTransfer`; this is the
     // indexable accounting event.

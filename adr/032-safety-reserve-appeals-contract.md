@@ -1,7 +1,7 @@
 # ADR 032: SafetyReserve appeal-surface contract surface
 
 **Date:** 2026-05-14
-**Status:** Locked-for-implementation
+**Status:** Draft (flipped from Locked-for-implementation pending CapacityBond rebase under v2.1)
 
 ## Context
 
@@ -24,7 +24,7 @@ One enum, two user-defined value types (UDVTs), and one struct describe an appea
 // (8 bytes, zero runtime cost) but are not implicitly convertible, so a future
 // field addition cannot mix epoch indices with microsecond timestamps.
 // See §Risks "Mixed time units" for the residual hazard surface.
-type EpochIndex is uint64;      // FeeRouter 1-week epoch (ADR 026 § FeeRouter split (40/40/7/5/5/3) Epoch mechanics)
+type EpochIndex is uint64;      // FeeRouter 1-week epoch counter (analytics-only under v2.1; see ADR 026 § FeeRouter split)
 type MicroTimestamp is uint64;  // microsecond wall-clock (block.timestamp * 1_000_000)
 
 enum AppealStatus {

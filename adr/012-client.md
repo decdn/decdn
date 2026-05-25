@@ -130,7 +130,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 4. **Session:** The node verifies the signature via `SignatureChecker` semantics (`ecrecover` for EOA clients, ERC-1271 `isValidSignature` RPC call for smart account clients — see [ADR 024](024-account-abstraction.md#off-chain-erc-1271-verification)), caches the binding for the connection's lifetime, and uses the verified address for voucher attribution. Subsequent requests on the same connection omit these fields.
 5. **Disconnect:** The node discards the cached binding. No on-chain state to clean up.
 
-**Security properties of `nonce=0`:** The ephemeral binding is not a replay vulnerability because the node only uses it for the authenticated QUIC connection on which it was received — a binding from connection A is never applied to connection B. On-chain `bindNodeId` ([ADR 003](003-payments.md#adr-003-payment-model)) also starts at nonce 0 (`bindingNonce[msg.sender]` is initially 0), so the nonce value alone does not distinguish off-chain from on-chain bindings. Protection against on-chain replay is the EIP-712 domain separator: the node verifies the off-chain binding via `SignatureChecker` semantics (locally, not on-chain), while on-chain `bindNodeId` verifies against `DOMAIN_SEPARATOR` (which includes the `StakingRegistry` contract address and chain ID). A signature produced for off-chain use cannot pass the on-chain domain check unless the client uses the exact same domain parameters — and if it does, the on-chain binding consumes the nonce, preventing reuse.
+**Security properties of `nonce=0`:** The ephemeral binding is not a replay vulnerability because the node only uses it for the authenticated QUIC connection on which it was received — a binding from connection A is never applied to connection B. On-chain `bindNodeId` ([ADR 003](003-payments.md#adr-003-payment-model)) also starts at nonce 0 (`bindingNonce[msg.sender]` is initially 0), so the nonce value alone does not distinguish off-chain from on-chain bindings. Protection against on-chain replay is the EIP-712 domain separator: the node verifies the off-chain binding via `SignatureChecker` semantics (locally, not on-chain), while on-chain `bindNodeId` verifies against `DOMAIN_SEPARATOR` (which includes the `CapacityBond` contract address and chain ID). A signature produced for off-chain use cannot pass the on-chain domain check unless the client uses the exact same domain parameters — and if it does, the on-chain binding consumes the nonce, preventing reuse.
 
 **Key rotation:** Generating a new iroh key and reconnecting produces a new NodeId. The client signs a fresh `BindNodeId` with the same Ethereum key and the new NodeId. Open payment channels remain valid — channels are keyed by `(client_ethereum_address, provider_ethereum_address, nonce)`, not by NodeId.
 
@@ -146,7 +146,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 At small mesh scale, eclipse attacks require both Sybil-scale capital (staking enough nodes to dominate the registry) and RPC endpoint compromise (returning a fabricated node list); the on-chain registry alone suffices as the discovery source. As the mesh grows and operator-set diversity increases, clients adopt **multi-source bootstrap (Option B)** — discovering initial peers from at least two independent sources:
 
-1. **On-chain registry** — `StakingRegistry.getActiveNodes()` via the configured RPC endpoint.
+1. **On-chain registry** — `CapacityBond.getActiveNodes()` via the configured RPC endpoint.
 2. **DNS seed list** — TXT records at `_decdn-seeds.{domain}` for each domain in a governance-maintained seed list. Record format: `nodeId=<hex>; addrs=<multiaddr>,<multiaddr>`.
 
 Each client release ships with a built-in default seed list compiled into the binary; the `dns_seeds` configuration key (see [Client Configuration](#client-configuration)) provides a runtime override. Seed domains are maintained by governance ([ADR 009](009-governance.md#adr-009-governance-model)) and updated via new client releases or local config. An attacker must compromise both the RPC endpoint and all effective DNS seed domains to fully eclipse a client.
@@ -168,7 +168,7 @@ Each client release ships with a built-in default seed list compiled into the bi
 #### Trusted — the client relies on external guarantees
 
 - **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list (eclipse). Mitigated in production by multi-source bootstrap (Option B above).
-- **Registry correctness:** The `StakingRegistry` contract accurately reflects staked nodes. Enforced by EVM execution — trust in the chain, not any specific party.
+- **Registry correctness:** The `CapacityBond` contract accurately reflects staked nodes. Enforced by EVM execution — trust in the chain, not any specific party.
 - **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement.
 - **Clock:** NTP-synchronized local clock, used for gossip validation (±60 s freshness). Drift beyond this window causes the client to reject valid gossip.
 

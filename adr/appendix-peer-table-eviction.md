@@ -42,7 +42,7 @@ The 10× ratio (not the absolute 600 s) is the stable invariant: if the announce
 
 The peer table is **not size-capped by default**. Growth is bounded externally:
 
-- Gossip-validation rule (2) rejects every `NodeAnnounce` whose `node_id` is not active in the on-chain `StakingRegistry`. The insertable `node_id` set is exactly the active staked node set.
+- Gossip-validation rule (2) rejects every `NodeAnnounce` whose `node_id` is not active in the on-chain `CapacityBond`. The insertable `node_id` set is exactly the active staked node set.
 - Memory cost is small even at production scale: a `NodeAnnounce` worst case is 800 B per [ADR 001 § Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis), so `≤ 1 KB/entry × 10,000 active nodes ≲ 10 MB` including HashMap overhead. At PoC scale the table is ~tens of KB.
 - An LRU/age/reputation-priority layer would solve a problem the staking gate already constrains.
 
@@ -56,7 +56,7 @@ Implementing `gossip.max_peer_entries` is OPTIONAL for the PoC (`peer_table_size
 
 ### Registry-cache interaction (active eviction)
 
-The local registry cache, when implemented per [ADR 001 § Registry cache](001-network.md#registry-cache) and [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry), subscribes to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On `NodeDeregistered` and `NodeAutoEjected` for a `node_id`, the subscriber MUST also **remove the matching peer-table entry** in the same handler, alongside its registry-cache update. Origin blacklisting ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) routes through `StakingRegistry.ejectNode` and emits `NodeAutoEjected`, so the same code path covers it. The subscriber does not yet exist; this clause adds one behavior on top of the subscriber introduced by [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow).
+The local registry cache, when implemented per [ADR 001 § Registry cache](001-network.md#registry-cache) and [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry), subscribes to `NodeRegistered`, `NodeDeregistered`, and `NodeAutoEjected` events. On `NodeDeregistered` and `NodeAutoEjected` for a `node_id`, the subscriber MUST also **remove the matching peer-table entry** in the same handler, alongside its registry-cache update. Origin blacklisting ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) routes through `CapacityBond.ejectNode` and emits `NodeAutoEjected`, so the same code path covers it. The subscriber does not yet exist; this clause adds one behavior on top of the subscriber introduced by [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow).
 
 **Rationale.**
 

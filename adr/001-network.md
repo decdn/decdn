@@ -201,7 +201,7 @@ This score is used in Content Discovery step 4 above and in all other node selec
 
 ### On-chain Registration
 
-Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes register in `StakingRegistry` — the on-chain contract holding `NodeId → (Ethereum address, multiaddrs, region, active flag)`. The contract surface (`NodeInfo` struct, `registerNode` with atomic NodeId↔Ethereum binding and ed25519 ownership proof, `updateMultiaddrs`, `deregisterNode`, `reclaimNodeId`, events, gas costs) is specified in [ADR 003 § Node Registry](003-payments.md#node-registry). Nodes and clients bootstrap their peer table from this registry on startup (see [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry) and [ADR 012 § Bootstrap Procedure](012-client.md#bootstrap-procedure)).
+Node identity is the iroh `NodeId` (ed25519 public key). All staked nodes register in `CapacityBond` — the on-chain contract holding `NodeId → (Ethereum address, multiaddrs, region, active flag)`. The contract surface (`NodeInfo` struct, `registerNode` with atomic NodeId↔Ethereum binding and ed25519 ownership proof, `updateMultiaddrs`, `deregisterNode`, `reclaimNodeId`, events, gas costs) is specified in [ADR 003 § Node Registry](003-payments.md#node-registry). Nodes and clients bootstrap their peer table from this registry on startup (see [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry) and [ADR 012 § Bootstrap Procedure](012-client.md#bootstrap-procedure)).
 
 ## Consequences
 

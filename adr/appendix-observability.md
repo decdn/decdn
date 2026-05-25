@@ -157,51 +157,43 @@ These replace the identical names from [ADR 015](015-zero-rtt.md#adr-015-quic-0-
 
 #### Tokenomics Metrics
 
-Per [ADR 026](026-tokenomics.md#adr-026-tokenomics). These metrics expose the `FeeRouter`, `VotingEscrow`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, gauge-claim debugging, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 § Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket), [ADR 009](009-governance.md#adr-009-governance-model)).
+Per [ADR 026](026-tokenomics.md#adr-026-tokenomics) (v2.1 work-token rewrite). These metrics expose the `FeeRouter`, `CapacityBond`, `OperatorEmissions`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket), [ADR 009](009-governance.md#adr-009-governance-model)).
 
-A subset is sourced from on-chain contract state (`FeeRouter`, `VotingEscrow`, `SafetyReserve`, `BuybackBurner` / `DelegatorBuyer`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
+A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `OperatorEmissions`, `SafetyReserve`, `BuybackBurner`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
 
 ##### FeeRouter Metrics
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={node_base,gauge,delegator,burn,treasury,safety}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. Rate of change gives the per-bucket inflow rate ([ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553)). |
-| `decdn_fee_router_inflow_usdc_rate` | Gauge | R | `bucket={node_base,gauge,delegator,burn,treasury,safety}` | Derived (rolling 7-epoch avg over `..._inflow_usdc_total`) | Governance + capacity-planning dashboards | Rolling-average per-bucket USDC inflow per epoch. Computed locally from the counter. |
-| `decdn_gauge_pool_distribution_usdc_total` | Counter | R | `phase={inflow,claimed,swept_to_treasury}` | `FeeRouter` events: bucket inflow, `claimBoost`, sweep-on-26-epoch-timeout | Gauge-claim debugging + treasury reporting | Per-epoch gauge-pool USDC lifecycle: inflow, disbursed via `claimBoost`, swept to treasury on the 26-epoch unclaimed timeout ([ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553)). |
-| `decdn_pool_swept_to_treasury_usdc_total` | Counter | R | `pool={gauge,delegator}` | `FeeRouter` sweep events | Treasury + governance dashboards | Cumulative unclaimed-after-26-epochs sweep volume per pool. Differs from `..._gauge_pool_distribution_..._{phase=swept_to_treasury}` only in covering both pools; the gauge-pool label remains the canonical gauge-specific view. |
+| `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={operator_base,burn,treasury,safety}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. All four legs transfer same-tx under v2.1 ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). |
+| `decdn_fee_router_inflow_usdc_rate` | Gauge | R | `bucket={operator_base,burn,treasury,safety}` | Derived (rolling 7-epoch avg over `..._inflow_usdc_total`) | Governance + capacity-planning dashboards | Rolling-average per-bucket USDC inflow per epoch. |
 
-##### Operator Gauge-Boost Metrics
+##### Operator Service Emissions Metrics
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_operator_working_bytes` | Gauge | R | `epoch` | `FeeRouter.workingBytes(operator, epoch)` (RPC) | Operator dashboard, gauge-claim debugging | This node's `working_bytes_i` for the labeled epoch, per the gauge formula ([ADR 026 § Gauge-boost formula](026-tokenomics.md#gauge-boost-formula)). Explains why a claim payout is what it is. |
-| `decdn_operator_bytes_delivered` | Gauge | R | `epoch` | `FeeRouter.bytesDelivered(operator, epoch)` (RPC) | Operator dashboard | Raw `bytes_i` for the labeled epoch — paired with `decdn_operator_working_bytes` to derive the boost factor. |
-| `decdn_operator_boost_factor` | Gauge | R | `epoch` | Derived (`working_bytes / bytes_delivered`) | Operator dashboard, UI "your current boost" surface | Effective boost factor for the labeled epoch, in `[boostFloor, 1.0]` (default `[0.4, 1.0]`). At `boostFloor` for a zero-ve operator; `1.0` for a fair-share-or-higher ve operator. |
+| `decdn_operator_bytes_delivered` | Gauge | R | `epoch` | `FeeRouter.bytesPerEpoch(operator, epoch)` (RPC) | Operator dashboard, emissions debugging | This node's analytics-counter byte share for the labeled epoch — input to `OperatorEmissions.distribute`. |
+| `decdn_operator_emissions_token_total` | Counter | R | — | `OperatorEmissions.GrantDeposited(operator, epoch, amount)` events | Operator dashboard | Cumulative TOKEN granted to this operator across all epochs via `OperatorEmissions`; auto-bonded into `CapacityBond` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). |
+| `decdn_operator_emissions_remaining_bucket_token` | Gauge | R | — | `OperatorEmissions.remainingBucket()` (RPC) | Governance dashboard | Remaining TOKEN in the 200M Operator Service Emissions bucket; sunsets to Treasury when exhausted or by governance. |
 
-##### Delegator-Pool Execution Metrics
+##### CapacityBond Metrics
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_delegator_swap_slippage_bps` | Histogram | R | — | `DelegatorBuyer` (or `BuybackBurner` multi-output mode) swap events | Keeper monitoring, MEV-defense review | Realized TWAP slippage on the per-epoch USDC→TOKEN swap, in basis points below the swap's `minOut` reference. Buckets: `[1, 5, 10, 25, 50, 100, 250, 500]`. Sustained tail = MEV / liquidity-cap pressure ([ADR 026 § Delegator pool — USDC → TOKEN conversion](026-tokenomics.md#delegator-pool--usdc--token-conversion), [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)). |
-| `decdn_delegator_liquidity_cap_utilization` | Gauge | R | — | Derived (`swap_size_usdc / per_epoch_cap_usdc`) | Keeper monitoring, governance dashboard | Per-epoch liquidity-cap utilization in `[0, 1]`. Sustained `≥ 1.0` means the cap is binding and excess delegator-pool USDC rolls forward — feeds the cap-resize discussion. |
-| `decdn_delegator_usdc_to_token_ratio` | Gauge | R | `epoch` | Derived (`token_acquired / usdc_spent`) | Governance + delegator-yield dashboards | Per-epoch ratio of TOKEN distributed to delegators against USDC acquired into the bucket. Tracks market-price drift and aggregate swap quality across the epoch. |
+| `decdn_capacity_bond_amount_token` | Gauge | R | — | `CapacityBond.bondOf(operator)` (RPC) | Operator dashboard, governance | This operator's current bonded TOKEN (including service-emission grants), used to compute the operator's tier and shortfall margin. |
+| `decdn_capacity_bond_declared_mbps` | Gauge | R | — | `CapacityBond.declaredCapacityMbps(operator)` (RPC) | Operator dashboard | This operator's declared bandwidth capacity in Mbps; voting-weight base before `age_ramp`. |
+| `decdn_capacity_bond_delivery_ratio` | Gauge | R | `window={4w}` | Probe-attestation aggregation | Operator dashboard, capacity-shortfall warning | Operator's 4-week rolling verified delivery as a fraction of `declared_capacity`. Capacity-shortfall slashing auto-downgrades at sustained `< min_delivery_ratio` per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing). |
+| `decdn_capacity_bond_total_voting_weight` | Gauge | R | — | `CapacityBond.totalVotingWeightAt(latest)` (RPC) | Governance dashboard | Network-wide sum of `capacityAt × age_ramp` across all active operators — the quorum / proposal-threshold denominator per [ADR 009 § Production: Operator-Weighted DAO Governance](009-governance.md#production-operator-weighted-dao-governance). |
+| `decdn_capacity_bond_active_operator_count` | Gauge | R | — | `CapacityBond.activeOperatorCount()` (RPC) | Governance dashboard, bootstrap-multisig transition tracking | Active operator count; gates the bootstrap-multisig → DAO transition (≥30 operators AND ≥100 Gbps per [ADR 009](009-governance.md#bootstrap-multisig-phase)). |
 
 ##### SafetyReserve Metrics
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_safety_reserve_balance_usdc` | Gauge | R | — | `SafetyReserve.balance()` (RPC) | Public dashboard, governance, enterprise-tier credibility | Current USDC balance of the `SafetyReserve` contract. Public-transparency requirement per [ADR 026 § Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket). |
+| `decdn_safety_reserve_balance_usdc` | Gauge | R | — | `SafetyReserve.balance()` (RPC) | Public dashboard, governance, enterprise-tier credibility | Current USDC balance of the `SafetyReserve` contract. Public-transparency requirement per [ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket). |
 | `decdn_safety_reserve_incidents` | Gauge | R | `state={pending,approved,disputed}` | `SafetyReserve` incident-registry (RPC) | Public incident registry, governance dashboard | Incident count per registry state. `pending` = bundle filed, awaiting governance/multisig action; `approved` = approved for payout (within or after 48h appeal window); `disputed` = under on-chain challenge. |
 | `decdn_safety_reserve_payouts_total` | Counter | R | — | `SafetyReserve.payout` events | Public registry, governance reporting | Cumulative executed payouts across the reserve's lifetime. |
 | `decdn_safety_reserve_outflow_usdc_total` | Counter | R | — | `SafetyReserve.payout` events | Public registry, governance reporting | Cumulative USDC paid out across all approved incidents. |
-
-##### VotingEscrow Metrics
-
-| Metric | Type | Tier | Labels | Source | Consumer | Description |
-|--------|------|------|--------|--------|----------|-------------|
-| `decdn_ve_total_supply` | Gauge | R | — | `VotingEscrow.totalSupply()` (RPC) | Governance dashboard, gauge-share denominator sanity-check | Current total ve-supply (sum of ve-balances across all live locks). |
-| `decdn_ve_lock_rate` | Gauge | R | — | Derived (`TOKEN.balanceOf(address(VotingEscrow)) / TOKEN.totalSupply()`) | Governance dashboard, adaptive-feedback heuristic input | Fraction of TOKEN supply locked in `VotingEscrow`, in `[0, 1]`. The canonical numerator is the underlying TOKEN balance held by the escrow — `TOKEN.balanceOf(address(VotingEscrow))` — **not** the time-weighted ve-supply from `VotingEscrow.totalSupply()` / `totalSupplyAt(...)`. Every consumer (governance dashboards, automated controllers) MUST key off this same underlying-locked definition; ve-supply has different units. |
-| `decdn_ve_lock_duration_median_seconds` | Gauge | R | — | `VotingEscrow` per-lock checkpoint scan (RPC) | Governance dashboard, ve-economy health view | Median remaining lock duration across all live locks, in seconds. Distribution-shape signal complementing aggregate `decdn_ve_total_supply` and `decdn_ve_lock_rate`. |
 
 #### DHT / Content-Discovery Metrics
 
@@ -340,4 +332,4 @@ Covers M-tier slash-safety metrics and the most common R-tier panels for a first
 ## Deferred & Open
 
 - **OpenMetrics migration.** Prometheus text format 0.0.4 is the current default; the OpenMetrics exposition format (used by `prometheus_client` crate's `MetricsEncoder`) adds exemplars and native histograms — evaluate once tooling support is broader.
-- **Tokenomics + reputation dashboard panels.** The reference dashboard in [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is deliberately scoped to M-tier core operations. [§ Reputation Metrics](#reputation-metrics) reputation and [§ Tokenomics Metrics](#tokenomics-metrics) tokenomics metrics warrant their own dedicated dashboards (governance, delegator-yield, gauge-claim debugging) — these are deployment-specific and belong outside the reference set.
+- **Tokenomics + reputation dashboard panels.** The reference dashboard in [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is deliberately scoped to M-tier core operations. [§ Reputation Metrics](#reputation-metrics) reputation and [§ Tokenomics Metrics](#tokenomics-metrics) tokenomics metrics warrant their own dedicated dashboards (governance, operator-emissions tracking, capacity-shortfall warning, bootstrap-multisig transition tracking) — these are deployment-specific and belong outside the reference set.

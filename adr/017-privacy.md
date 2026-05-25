@@ -63,7 +63,7 @@ BLAKE3 hashes are deterministic global identifiers; repeated requests are correl
 
 ##### Payment and identity linkability (P-02, P-03, P-07, P-14)
 
-On-chain data permanently links client to provider Ethereum addresses via payment channels; settlement amounts make node revenue computable; `StakingRegistry` publishes node identity and network location; reporter credibility leaks a node's settlement history. Inherent to the accountability model — staking, slashing, and dispute resolution require on-chain identities and state. Acceptable for the PoC (testnet, no real economic value).
+On-chain data permanently links client to provider Ethereum addresses via payment channels; settlement amounts make node revenue computable; `CapacityBond` publishes node identity and network location; reporter credibility leaks a node's settlement history. Inherent to the accountability model — staking, slashing, and dispute resolution require on-chain identities and state. Acceptable for the PoC (testnet, no real economic value).
 
 ##### Settlement volume leakage (P-22)
 
