@@ -82,7 +82,7 @@ diversity_factor = min(distinct_counterparties / min_counterparties, 1.0)
 
 Where `min_counterparties = 5` (governance-tunable; hardcoded floor: 2).
 
-**Effect on wash trading:** An attacker cycling funds between two self-owned addresses has `distinct_counterparties = 1`, yielding `diversity_factor = 0.2` — an 80% reduction in effective weight. Full credit needs settlements with 5+ distinct counterparties, each requiring a separate staking deposit (minimum 50,000 TOKEN per [ADR 026 § Operator economics](026-tokenomics.md#operator-economics)) and its own capital cycling fees.
+**Effect on wash trading:** An attacker cycling funds between two self-owned addresses has `distinct_counterparties = 1`, yielding `diversity_factor = 0.2` — an 80% reduction in effective weight. Full credit needs settlements with 5+ distinct counterparties, each requiring a separate capacity bond (≈50,000 TOKEN at the 1 Gbps entry tier per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) and its own capital cycling fees.
 
 **Counterparty validation:** Only counterparty addresses that had a `CapacityBond` NodeId binding at the time of channel settlement count toward `distinct_counterparties`. Unregistered addresses (pure clients without stake) do not count, since only staked nodes submit gossip reports (Section 6) and counterparty diversity matters only for reporter weight in the network score.
 

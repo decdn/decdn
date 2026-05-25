@@ -112,9 +112,11 @@ interface IFeeRouter {
     // Called by `PaymentChannel.settleChannel`. Forwards the operator's
     // full USDC balance through the four-bucket split per ADR 026
     // § FeeRouter split: 60% operator base, 25% buyback, 10% treasury,
-    // 5% safety. All four legs transfer same-tx. Updates
-    // `lastSettlementAt[operator]` and `bytesPerEpoch[operator][epochId]`
-    // on `CapacityBond` via `SETTLEMENT_REPORTER_ROLE`. Reverts if paused.
+    // 5% safety. All four legs transfer same-tx. Increments the internal
+    // `bytesPerEpoch[operator][epochId]` analytics counter (see below)
+    // and calls `CapacityBond.recordSettlement(operator)` via
+    // `SETTLEMENT_REPORTER_ROLE` to update `lastSettlementAt`.
+    // Reverts if paused.
     function routeSettlement(
         address operator,
         uint256 bytesDelivered,
@@ -414,7 +416,7 @@ graph LR
     SPC -->|"isActive(provider)"| CBOND
     SPC -->|"safeTransferFrom / safeTransfer"| ERC
     SPC -->|"routeSettlement(op, bytes, amount)"| FR
-    FR -->|"recordSettlement(op) + bytesPerEpoch++"| CBOND
+    FR -->|"recordSettlement(op)"| CBOND
     FR -->|"25% USDC same-tx"| BB
     FR -->|"10% USDC same-tx"| GOV
     FR -->|"5% USDC same-tx"| SAFE
@@ -446,7 +448,7 @@ graph LR
 | PaymentChannel | IERC20 (USDC) | `safeTransferFrom()` | Caller must have allowance | Yes |
 | PaymentChannel | IERC20 (USDC) | `safeTransfer()` | Caller holds balance | Yes |
 | PaymentChannel | FeeRouter | `routeSettlement(operator, bytesDelivered, amount, epochId)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) | Yes |
-| FeeRouter | CapacityBond | `recordSettlement(operator)` (also increments `bytesPerEpoch[operator][epochId]` analytics counter) | `SETTLEMENT_REPORTER_ROLE` (granted to FeeRouter post-deploy; settlement counter moves with the routing call) | Yes |
+| FeeRouter | CapacityBond | `recordSettlement(operator)` | `SETTLEMENT_REPORTER_ROLE` (granted to FeeRouter post-deploy; updates `CapacityBond.lastSettlementAt[operator]` only — the `bytesPerEpoch` analytics counter is FeeRouter-internal and incremented inline within `routeSettlement`) | Yes |
 | FeeRouter | BuybackBurner | `safeTransfer()` (25% USDC same-tx) | Caller holds balance | Yes |
 | FeeRouter | SafetyReserve | `safeTransfer()` (5% USDC same-tx) | Caller holds balance | Yes |
 | FeeRouter | Treasury wallet | `safeTransfer()` (10% USDC same-tx) | Caller holds balance | Yes |
@@ -671,7 +673,7 @@ Every state-mutating function that makes an external call is listed below with i
 | `slash(node, offenseType)` | `IERC20.safeTransfer()` (TOKEN: 50% challenger / 30% SafetyReserve / 20% burn per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
 | `slashCapacityShortfall(op)` | `IERC20.safeTransfer()` (TOKEN bond delta to SafetyReserve per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing)) | `nonReentrant`, checks-effects-interactions; permissionless — deterministic on probe data; reverts if the operator's 4-week verified delivery is not below `min_delivery_ratio × declared_capacity` |
 | `depositGrant(operator, amount)` | None (state change only; pulls TOKEN from caller via `safeTransferFrom`) | `nonReentrant`, checks-effects-interactions, `BOND_GRANTOR_ROLE` (held by `OperatorEmissions`) |
-| `recordSettlement(operator)` | None (single SSTORE; also increments `bytesPerEpoch[operator][epochId]` analytics counter) | `SETTLEMENT_REPORTER_ROLE` |
+| `recordSettlement(operator)` | None (single SSTORE updating `lastSettlementAt[operator]`) | `SETTLEMENT_REPORTER_ROLE` |
 | `ejectNode()` | None (state change only) | `BLACKLIST_ROLE` |
 | `capacityAt(operator, ts)`, `firstBondedAt(operator)`, `totalVotingWeightAt(ts)`, `isActive(operator)` | None (read-only) | N/A |
 
@@ -705,7 +707,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `routeSettlement(operator, bytesDelivered, amount, epochId)` | `IERC20.safeTransfer()` × 4 (operator base 60%, BuybackBurner 25%, Treasury 10%, SafetyReserve 5%; all four legs same-tx), `CapacityBond.recordSettlement(operator)` (also increments `bytesPerEpoch[operator][epochId]` analytics counter). Emits `Settled`. Off-chain reputation indexers correlate this `Settled` event with `PaymentChannel.ChannelSettled(channelId, ...)` from the same transaction to recover the channel context. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
+| `routeSettlement(operator, bytesDelivered, amount, epochId)` | `IERC20.safeTransfer()` × 4 (operator base 60%, BuybackBurner 25%, Treasury 10%, SafetyReserve 5%; all four legs same-tx), `CapacityBond.recordSettlement(operator)`. Increments the FeeRouter-internal `bytesPerEpoch[operator][epochId]` analytics counter inline. Emits `Settled`. Off-chain reputation indexers correlate this `Settled` event with `PaymentChannel.ChannelSettled(channelId, ...)` from the same transaction to recover the channel context. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
 | `setShares(...)`, `setSafetyReserve(addr)`, `setBuybackBurner(addr)`, `setTreasury(addr)` | None (state change only) | `GOVERNANCE_ROLE` (Governor via timelock); sum-to-100% across the four router shares enforced; per-share bounds enforced ([ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)); cross-validated against dependency addresses |
 
 > **Cashflow invariant.** The 40% lower bound on the operator-base share is enforced at the contract level (`AccessControl` bound check) and guarantees operators always receive enough liquid USDC to cover infrastructure costs even under extreme governance proposals. See [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).

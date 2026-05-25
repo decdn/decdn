@@ -4,7 +4,7 @@
 
 ## Context
 
-Several ADRs describe PoC-vs-production differences, and they fall into three kinds: **network-scale operational choices** (single RPC endpoint, clients holding ETH for gas, simplified peer bootstrap), **component implementations** (file-based vs platform-keychain key storage, local-only vs gossip-weighted reputation), and **governance process** (admin key vs ve-weighted Governor).
+Several ADRs describe PoC-vs-production differences, and they fall into three kinds: **network-scale operational choices** (single RPC endpoint, clients holding ETH for gas, simplified peer bootstrap), **component implementations** (file-based vs platform-keychain key storage, local-only vs gossip-weighted reputation), and **governance process** (admin key vs capacity-weighted Governor with the bootstrap-multisig transition phase per [ADR 009](009-governance.md#adr-009-governance-model)).
 
 Crucially, none of these is a *contract-surface* difference. Per [ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory), the full on-chain surface ships in a single audit pass with governance-tunable economics from day one; "PoC" is a network-scale milestone (tens of nodes on a testnet), not a reduced contract surface — there are no contract-surface scope reductions, only the non-contract differences this appendix addresses.
 

@@ -226,9 +226,9 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 ### Re-Onboarding after Deregistration or Auto-Ejection
 
-A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of `minStake` due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
+A node that voluntarily deregistered or was auto-ejected (bond dropped below 50% of the minimum bond for its declared tier due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
 
-1. **`firstRegisteredAt` is preserved.** The cold-start bootstrap bonus ([ADR 008](008-reputation.md#adr-008-reputation-system)) is not re-granted — the `firstRegisteredAt` field in `CapacityBond` is immutable once set, and the bonus is one-time per operator address.
+1. **`firstBondedAt` is preserved.** The cold-start bootstrap bonus ([ADR 008](008-reputation.md#adr-008-reputation-system)) is not re-granted — the `firstBondedAt` field in `CapacityBond` is immutable once set, and the bonus is one-time per operator address. The `age_ramp` ([ADR 026 § Governance](026-tokenomics.md#governance)) similarly resumes from the original bonded date, so a re-onboarding operator does not restart the age-ramp clock.
 
 2. **`registrationNonce` is incremented.** On deregistration, `registrationNonce[nodeId]` is incremented. The operator must sign fresh `ed25519Signature` and `bindingSignature` parameters with the new nonce before calling `registerNode` again.
 
