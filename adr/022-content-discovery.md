@@ -1,7 +1,6 @@
 # ADR 022 — Content Discovery at Scale
 
 **Status:** Proposed
-**Deciders:** Core team
 **Date:** 2026-04-08
 
 ## Context

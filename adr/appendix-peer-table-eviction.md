@@ -2,8 +2,6 @@
 
 > **This is an appendix, not a core protocol ADR.** Peer-table eviction is a local implementation choice — two nodes running different TTLs or admission policies still interoperate so long as they satisfy the gossip-validation rules in [ADR 001 § Gossip validation](001-network.md#gossip-validation). This appendix codifies the recommended approach (default 600 s TTL on `last_seen_us`, `NodeDeregistered` / `NodeAutoEjected`-driven active eviction, optional `gossip.max_peer_entries` ceiling, observability metrics). Alternative implementations are acceptable.
 
-**Touches:** [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 008](008-reputation.md#adr-008-reputation-system), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)
-
 ## Context
 
 [ADR 001 § Node Discovery (Gossip)](001-network.md#node-discovery-gossip) defines the peer table (`NodeId → NodeAnnounce`) and the five gossip-validation rules that gate insertion (signature, on-chain stake, ±60 s clock skew, monotonic `timestamp_us`, region format). It does **not** specify when entries leave the table. This appendix resolves the missing decisions:

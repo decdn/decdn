@@ -2,7 +2,6 @@
 
 **Date:** 2026-05-14
 **Status:** Draft
-**Touches:** [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 008](008-reputation.md#adr-008-reputation-system), [ADR 009](009-governance.md#adr-009-governance-model), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model), [ADR 017](017-privacy.md#adr-017-privacy-analysis), [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow), [ADR 026](026-tokenomics.md#adr-026-tokenomics), [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)
 
 ## Context
 

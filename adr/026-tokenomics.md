@@ -34,22 +34,22 @@ TOKEN is `ERC20Burnable`; any contract may burn TOKEN it holds via `burn` / `bur
 
 Thirteen groups summing to 100%, aligned to conventional fundraising-tool taxonomy. The Liquidity Mining Rewards group is retained in the taxonomy at 0% for tool compatibility; its 15pp is redeployed to Protocol-Owned Liquidity.
 
-| # | Group | Allocation | Type | Category | Vesting / mechanic |
-|---|---|---:|---|---|---|
-| 1 | Core Contributors | 12% | Internal | Core Contributors | 4-year linear, 12mo cliff |
-| 2 | Advisors | 3% | Internal | Core Contributors | 2-year linear, 6mo cliff |
-| 3 | Seed Investors | 9% | Internal | Private Investors | 3-year linear, 6mo cliff |
-| 4 | Private Investors | 7% | Internal | Private Investors | 3-year linear, 6mo cliff |
-| 5 | DAO Treasury | 15% | Internal | Treasury | 4-year linear unlock to Timelock-controlled wallet |
-| 6 | Public Sale | 3% | Internal | Public Sale | Genesis-liquid (or 6mo lockup if regulatory posture requires) |
-| 7 | Operator Service Emissions *(see [§ Operator Service Emissions](#operator-service-emissions))* | 20% | External | Ecosystem Incentives | Service-based emission; auto-deposited into `CapacityBond`; not withdrawable as liquid TOKEN until full unbond |
-| 8 | Liquidity Mining Rewards | 0% | External | Ecosystem Incentives | Not deployed; 15pp redeployed to group 13 — see [§ POL allocation](#pol-allocation) |
-| 9 | Airdrops | 3% | External | Ecosystem Incentives | Genesis-claim window (12 weeks); unclaimed sweeps to Treasury |
-| 10 | Incentivized Testnet Rewards | 3% | External | Ecosystem Incentives | Genesis-claim window (12 weeks) for pre-launch testnet participants |
-| 11 | Misc. Marketing, PR, and KOLs | 3% | Internal | Marketing | Treasury-managed, ad-hoc spend within annual budget cap |
-| 12 | Exchange Partnerships | 3% | External | Marketing | Milestone-based to CEX listings, market-makers |
-| 13 | Liquidity Provision, Market Making *(see [§ POL allocation](#pol-allocation))* | 19% | External | Liquidity Provision | 4pp MM partner allocation (genesis-liquid) + 15pp Protocol-Owned Liquidity (treasury position on Balancer V3 80/20 per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) |
-| | **Total** | **100%** | | | |
+| # | Group | Allocation | Category | Vesting / mechanic |
+|---|---|---:|---|---|
+| 1 | Core Contributors | 12% | Core Contributors | 4-year linear, 12mo cliff |
+| 2 | Advisors | 3% | Core Contributors | 2-year linear, 6mo cliff |
+| 3 | Seed Investors | 9% | Private Investors | 3-year linear, 6mo cliff |
+| 4 | Private Investors | 7% | Private Investors | 3-year linear, 6mo cliff |
+| 5 | DAO Treasury | 15% | Treasury | 4-year linear unlock to Timelock-controlled wallet |
+| 6 | Public Sale | 3% | Public Sale | Genesis-liquid (or 6mo lockup if regulatory posture requires) |
+| 7 | Operator Service Emissions *(see [§ Operator Service Emissions](#operator-service-emissions))* | 20% | Ecosystem Incentives | Service-based emission; auto-deposited into `CapacityBond`; not withdrawable as liquid TOKEN until full unbond |
+| 8 | Liquidity Mining Rewards | 0% | Ecosystem Incentives | Not deployed; 15pp redeployed to group 13 — see [§ POL allocation](#pol-allocation) |
+| 9 | Airdrops | 3% | Ecosystem Incentives | Genesis-claim window (12 weeks); unclaimed sweeps to Treasury |
+| 10 | Incentivized Testnet Rewards | 3% | Ecosystem Incentives | Genesis-claim window (12 weeks) for pre-launch testnet participants |
+| 11 | Misc. Marketing, PR, and KOLs | 3% | Marketing | Treasury-managed, ad-hoc spend within annual budget cap |
+| 12 | Exchange Partnerships | 3% | Marketing | Milestone-based to CEX listings, market-makers |
+| 13 | Liquidity Provision, Market Making *(see [§ POL allocation](#pol-allocation))* | 19% | Liquidity Provision | 4pp MM partner allocation (genesis-liquid) + 15pp Protocol-Owned Liquidity (treasury position on Balancer V3 80/20 per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) |
+| | **Total** | **100%** | | |
 
 **Categorical rollup.**
 

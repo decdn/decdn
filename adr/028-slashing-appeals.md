@@ -1,8 +1,7 @@
 # ADR 028: Slashing Appeals and Dispute Escalation
 
 **Date:** 2026-05-06
-**Status:** Draft (flipped from Locked-for-implementation pending CapacityBond rebase under v2.1)
-**Touches:** [ADR 008](008-reputation.md#adr-008-reputation-system), [ADR 009](009-governance.md#adr-009-governance-model), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence), [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol), [ADR 026](026-tokenomics.md#adr-026-tokenomics)
+**Status:** Draft
 
 ## Context
 

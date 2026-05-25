@@ -43,7 +43,7 @@ classDiagram
         +settleChannel(op, bytes, amount)
     }
     class FeeRouter {
-        +routeSettlement(op, bytes, amount, epochId)
+        +routeSettlement(op, bytes, amount)
         +bytesPerEpoch(op, epoch)
     }
     class CapacityBond {
@@ -112,23 +112,22 @@ interface IFeeRouter {
     // Called by `PaymentChannel.settleChannel`. Forwards the operator's
     // full USDC balance through the four-bucket split per ADR 026
     // § FeeRouter split: 60% operator base, 25% buyback, 10% treasury,
-    // 5% safety. All four legs transfer same-tx. Increments the internal
-    // `bytesPerEpoch[operator][epochId]` analytics counter (see below)
-    // and calls `CapacityBond.recordSettlement(operator)` via
+    // 5% safety. All four legs transfer same-tx. Derives the current
+    // epoch as `uint64(block.timestamp / EPOCH_LENGTH)`, increments the
+    // internal `bytesPerEpoch[operator][epoch]` analytics counter (see
+    // below), and calls `CapacityBond.recordSettlement(operator)` via
     // `SETTLEMENT_REPORTER_ROLE` to update `lastSettlementAt`.
     // Reverts if paused.
     function routeSettlement(
         address operator,
         uint256 bytesDelivered,
-        uint256 amount,
-        uint64  epochId             // voucher.epochId per ADR 003
+        uint256 amount
     ) external;
 
     // Populated inline by routeSettlement; analytics-only under v2.1 (no
     // gauge formula). Read by `OperatorEmissions.distribute(epoch)` as
     // the per-operator delivery signal for the service-emission curve.
     function bytesPerEpoch(address operator, uint64 epoch) external view returns (uint256);
-    function epochTotalBytes(uint64 epoch) external view returns (uint256);
 
     // Configured shares (bps) and dependency addresses. INVARIANT: these
     // are governance-set state (via `setShares` / `setSharesAndDestinations`),
@@ -171,11 +170,12 @@ interface IFeeRouter {
     function unpause() external;
 
     // ─── Events ───────────────────────────────────────────────────────
+    // `epoch` is FeeRouter-derived as `uint64(block.timestamp / EPOCH_LENGTH)`.
     event Settled(
         address indexed operator,
         uint256 bytesDelivered,
         uint256 amount,
-        uint64 indexed epochId
+        uint64 indexed epoch
     );
     event SharesUpdated(uint256[4] newShares);
     event SafetyReserveUpdated(address indexed oldAddr, address indexed newAddr);
@@ -216,8 +216,8 @@ interface IOperatorEmissions {
     // within the bounds in ADR 026 § Operator Service Emissions.
     function setEmissionCurve(EmissionCurve calldata curve) external;
 
-    // View: per-epoch and lifetime emission accounting.
-    function emittedForEpoch(uint64 epoch) external view returns (uint256);
+    // View: lifetime and remaining emission accounting. Per-epoch totals
+    // are emitted as an event field on `EpochDistributed` below.
     function totalEmitted() external view returns (uint256);
     function remainingBucket() external view returns (uint256);  // out of 200M
 
@@ -308,7 +308,7 @@ graph TD
 | 6 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, initial pool contract `address` (may be zero-address at deploy and set later via `setPool(address)` — see [ADR 003](003-payments.md#buybackburner) for the interface and [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) for the venue rationale). **Inflow source:** `FeeRouter` (25% of every settlement under v2.1, per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)). **Router address and naming:** see [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). **Approvals note:** `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (distinct from the Router) during initialization — the Vault pulls input tokens from `msg.sender`. |
 | 7 | FeeRouter | USDC address, **`TimelockController` address** (treasury bucket destination), `epochLength` (1 week; analytics-only under v2.1), launch split shares per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds) (cross-validated against dependency addresses). **Dependency addresses** (`safetyReserve`, `buybackBurner`) may both be `address(0)` at deploy and set later via the governance-mutable setters in [§ Tunable Economics](#tunable-economics); the cross-validation invariant ensures any non-zero share has a non-zero destination at construction time. Steady-state target shares are `6000 / 2500 / 1000 / 500` in basis points. |
 | 8 | OperatorEmissions | TOKEN address, **`CapacityBond` address** (target for `depositGrant`), **`FeeRouter` address** (source of `bytesPerEpoch` reads), initial 200M TOKEN allocation transferred to the contract at deploy, initial `EmissionCurve` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). After deployment, governance grants `OperatorEmissions` the `BOND_GRANTOR_ROLE` on `CapacityBond` (post-deploy step 6). |
-| 9 | PaymentChannel | USDC address, CapacityBond address, FeeRouter address, `disputeWindow` (48h), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md#adr-003-payment-model)). `settleChannel` does not skim a protocol fee inline — it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction. `setFeeRouter(address)` is governance-mutable per [§ No proxy deployment patterns](#no-proxy-deployment-patterns) carve-out. |
+| 9 | PaymentChannel | USDC address, CapacityBond address, FeeRouter address, `disputeWindow` (48h), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md#adr-003-payment-model)). `settleChannel` does not skim a protocol fee inline — it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. `setFeeRouter(address)` is governance-mutable per [§ No proxy deployment patterns](#no-proxy-deployment-patterns) carve-out. |
 | 10 | PublisherRegistry | None. Permissionless namespace creation (publisher identity is implicit on first call); namespace cap and ownership-transfer timelock are stored on `PublisherRegistry` itself and updated via governable setters (`setMaxNamespacesPerPublisher`, `setNamespaceTransferTimelock`) per [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
 | 11 | OriginAssignment | CapacityBond, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`). Min-redundancy, timelock, and default-open parameters are governance-controlled. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
 | 12 | ContentBlacklist | `ContentBlacklist(address capacityBond)`. CapacityBond address is required for `ejectNode()`. `ContentBlacklist` does not cross-call `OriginAssignment`; security relies on runtime checks (see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedAssignment` queries `ContentBlacklist.isOriginBlacklisted`). |
@@ -359,7 +359,7 @@ After all contracts are deployed, the deployer must execute these transactions b
    feeRouter.grantRole(ROUTER_CALLER_ROLE, address(paymentChannel));
    ```
 
-   This authorizes `PaymentChannel.settleChannel` to invoke `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)`. Without this grant the settlement path reverts.
+   This authorizes `PaymentChannel.settleChannel` to invoke `FeeRouter.routeSettlement(operator, bytesDelivered, amount)`. Without this grant the settlement path reverts.
 
 5. **Grant `SETTLEMENT_REPORTER_ROLE` on CapacityBond to FeeRouter:**
 
@@ -447,7 +447,7 @@ graph LR
 | PaymentChannel | CapacityBond | `isActive(provider)` | Public (read-only) | No |
 | PaymentChannel | IERC20 (USDC) | `safeTransferFrom()` | Caller must have allowance | Yes |
 | PaymentChannel | IERC20 (USDC) | `safeTransfer()` | Caller holds balance | Yes |
-| PaymentChannel | FeeRouter | `routeSettlement(operator, bytesDelivered, amount, epochId)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) | Yes |
+| PaymentChannel | FeeRouter | `routeSettlement(operator, bytesDelivered, amount)` | `ROUTER_CALLER_ROLE` on FeeRouter ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) | Yes |
 | FeeRouter | CapacityBond | `recordSettlement(operator)` | `SETTLEMENT_REPORTER_ROLE` (granted to FeeRouter post-deploy; updates `CapacityBond.lastSettlementAt[operator]` only — the `bytesPerEpoch` analytics counter is FeeRouter-internal and incremented inline within `routeSettlement`) | Yes |
 | FeeRouter | BuybackBurner | `safeTransfer()` (25% USDC same-tx) | Caller holds balance | Yes |
 | FeeRouter | SafetyReserve | `safeTransfer()` (5% USDC same-tx) | Caller holds balance | Yes |
@@ -661,7 +661,7 @@ Every state-mutating function that makes an external call is listed below with i
 | --- | --- | --- |
 | `openChannel()` | `IERC20.safeTransferFrom()`, `CapacityBond.isActive()` (read) | `nonReentrant`, checks-effects-interactions |
 | `topUp()` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions |
-| `settleChannel()` | `IERC20.safeTransfer()` (unused balance to client), `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` (full operator balance forwarded; FeeRouter performs the four-way split internally) | `nonReentrant`, checks-effects-interactions; FeeRouter is `nonReentrant`-guarded on `routeSettlement` to defend against re-entry through the operator-base `safeTransfer` |
+| `settleChannel()` | `IERC20.safeTransfer()` (unused balance to client), `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` (full operator balance forwarded; FeeRouter performs the four-way split internally) | `nonReentrant`, checks-effects-interactions; FeeRouter is `nonReentrant`-guarded on `routeSettlement` to defend against re-entry through the operator-base `safeTransfer` |
 | `reclaimExpired()` | `IERC20.safeTransfer()` | `nonReentrant`, checks-effects-interactions |
 
 #### CapacityBond
@@ -707,7 +707,7 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `routeSettlement(operator, bytesDelivered, amount, epochId)` | `IERC20.safeTransfer()` × 4 (operator base 60%, BuybackBurner 25%, Treasury 10%, SafetyReserve 5%; all four legs same-tx), `CapacityBond.recordSettlement(operator)`. Increments the FeeRouter-internal `bytesPerEpoch[operator][epochId]` analytics counter inline. Emits `Settled`. Off-chain reputation indexers correlate this `Settled` event with `PaymentChannel.ChannelSettled(channelId, ...)` from the same transaction to recover the channel context. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
+| `routeSettlement(operator, bytesDelivered, amount)` | `IERC20.safeTransfer()` × 4 (operator base 60%, BuybackBurner 25%, Treasury 10%, SafetyReserve 5%; all four legs same-tx), `CapacityBond.recordSettlement(operator)`. Derives `epoch = uint64(block.timestamp / EPOCH_LENGTH)` and increments the FeeRouter-internal `bytesPerEpoch[operator][epoch]` analytics counter inline. Emits `Settled`. Off-chain reputation indexers correlate this `Settled` event with `PaymentChannel.ChannelSettled(channelId, ...)` from the same transaction to recover the channel context. | `nonReentrant`, checks-effects-interactions, `ROUTER_CALLER_ROLE` |
 | `setShares(...)`, `setSafetyReserve(addr)`, `setBuybackBurner(addr)`, `setTreasury(addr)` | None (state change only) | `GOVERNANCE_ROLE` (Governor via timelock); sum-to-100% across the four router shares enforced; per-share bounds enforced ([ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)); cross-validated against dependency addresses |
 
 > **Cashflow invariant.** The 40% lower bound on the operator-base share is enforced at the contract level (`AccessControl` bound check) and guarantees operators always receive enough liquid USDC to cover infrastructure costs even under extreme governance proposals. See [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).

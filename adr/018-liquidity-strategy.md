@@ -116,25 +116,26 @@ Balancer's smoother curve reduces the need for TWAP versus V3's concentrated ban
 
 ### Parameter Table
 
-| Parameter | PoC | Production | Governable |
-| --- | --- | --- | --- |
-| Venue (`setSwapRouter`) | Balancer V3 Router (address on L2) | Balancer V3 Router (address on L2) | Yes (via `setSwapRouter`) |
-| Token approvals spender | Balancer V3 Vault (distinct from Router) | Balancer V3 Vault | No (structural V3 requirement) |
-| Pool identifier (`pool`, `address`) | Deployed pool contract address | Deployed pool contract address | Yes (via `setPool`) |
-| Pool weights | 80% TOKEN / 20% USDC | 80% TOKEN / 20% USDC | No (fixed at pool creation; venue migration is the path to change weights) |
-| Pool swap fee | 1% (100 bps) | 1% (100 bps) | Governable on the Balancer pool itself |
-| POL TOKEN-side allocation | 150M (15% of supply) | 150M (15% of supply) | No (fixed at genesis; redeployable via venue migration under 10%/30-day cap) |
-| PoC seed size | $5K–$20K USDC equivalent per side | N/A | N/A |
-| Production seed size | N/A | Sized so `maxBuybackAmount` causes < `slippageBps` impact (~$300K nominal USDC seed at launch) | Via governance proposal (treasury disbursement) |
-| `minBuybackAmount` | N/A (execution disabled) | 100 USDC | Yes |
-| `maxBuybackAmount` | N/A (execution disabled) | Set so a single swap causes < `slippageBps` impact | Yes |
-| `slippageBps` | N/A (execution disabled) | 200 bps (2%) | Yes |
-| TWAP `subSwapCount` | 1 (no splitting) | 4 (default, governable) [^subswap-rationale] | Yes |
-| TWAP `subSwapMinBlockGap` | N/A | 10 blocks (~2 minutes on Arbitrum) | Yes |
-| Private-RPC routing | N/A (execution disabled) | **Required** — Flashbots Protect / MEV-Share equivalent on the production L2; public-mempool routing is not an acceptable fallback | No (hard requirement; only the endpoint URL is operator-configurable) |
-| Per-epoch liquidity cap | N/A (execution disabled) | **Required** — `epochLiquidityCapFraction` of in-pool USDC depth at epoch start (default 10%, bounded `[1%, 30%]` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)) | Yes (the fraction; presence of the cap is structural) |
-| POL withdraw cap | N/A (no POL withdraws in PoC) | 10% of POL per 30-day window per governance proposal | No (cap is immutable; the proposal mechanism is the path) |
-| Execution activation | Disabled — fees accumulate only | Governance vote required to enable | — |
+| Parameter | Value |
+| --- | --- |
+| Venue (`setSwapRouter`) | Balancer V3 Router (address on L2) |
+| Token approvals spender | Balancer V3 Vault (distinct from Router) |
+| Pool identifier (`pool`, `address`) | Deployed pool contract address |
+| Pool weights | 80% TOKEN / 20% USDC |
+| Pool swap fee | 1% (100 bps) |
+| POL TOKEN-side allocation | 150M (15% of supply) |
+| Initial pool seed size | Sized so `maxBuybackAmount` causes < `slippageBps` impact (~$300K nominal USDC seed at launch) |
+| `minBuybackAmount` | 100 USDC |
+| `maxBuybackAmount` | Set so a single swap causes < `slippageBps` impact |
+| `slippageBps` | 200 bps (2%) |
+| TWAP `subSwapCount` | 4 (default) [^subswap-rationale] |
+| TWAP `subSwapMinBlockGap` | 10 blocks (~2 minutes on Arbitrum) |
+| Private-RPC routing | **Required** — Flashbots Protect / MEV-Share equivalent on the production L2; public-mempool routing is not an acceptable fallback |
+| Per-epoch liquidity cap | **Required** — `epochLiquidityCapFraction` of in-pool USDC depth at epoch start (default 10%, bounded `[1%, 30%]` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)) |
+| POL withdraw cap | 10% of POL per 30-day window per governance proposal |
+| Execution activation | Disabled at launch — governance vote required to enable |
+
+Per-parameter governability (which parameters are mutable, by whom, and within what safety bounds) lives in [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
 
 [^subswap-rationale]: A default of 4 balances MEV mitigation against gas overhead and keeper complexity. 2 sub-swaps provides marginal splitting benefit; ≥8 multiplies keeper gas and `ceilDiv` rounding artifacts without proportionate MEV improvement on a weighted pool. With the v2.1 5× volume increase governance may consider raising the default to 6–8; this is left as production tuning.
 

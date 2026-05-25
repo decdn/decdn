@@ -176,10 +176,10 @@ omitted — measure during integration testing on Arbitrum Sepolia, re-confirm a
 Arbitrum One fee markets at deployment. Three MUST gates:
 
 1. **`FeeRouter` per-settlement overhead.** Every `settleChannel` routes through
-   `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` — four
+   `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` — four
    `safeTransfer` legs (60/25/10/5 same-tx per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)),
-   one inline write to the FeeRouter-internal `bytesPerEpoch[operator][epochId]`
-   analytics counter consumed by `OperatorEmissions`, and a single
+   one inline write to the FeeRouter-internal `bytesPerEpoch[operator][epoch]`
+   analytics counter (epoch derived from `block.timestamp`) consumed by `OperatorEmissions`, and a single
    `CapacityBond.recordSettlement` SSTORE updating `lastSettlementAt[operator]`.
    Overhead **~5–10K gas** atop the settlement tx; at 100K settlements/year
    (medium operator) a small fraction of total cost. Aggregate per-settlement gas

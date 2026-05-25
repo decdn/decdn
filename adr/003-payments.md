@@ -28,7 +28,7 @@ Key parameters:
 
 - Voucher cadence: 1 MB delivered per voucher (default; negotiable up to `maxVoucherIntervalMb` for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Minimum deposit: 1 USDC (contract floor, governable); recommended practical minimum: 10 USDC (see [Deposit Economics](#deposit-economics))
-- Fee routing: at settlement, the full operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in a single transaction; the four-bucket split (60% operator base, 25% buyback, 10% treasury, 5% safety) is dispatched same-tx per [ADR 026](026-tokenomics.md#adr-026-tokenomics). See [FeeRouter Integration](#feerouter-integration).
+- Fee routing: at settlement, the full operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in a single transaction; the four-bucket split (60% operator base, 25% buyback, 10% treasury, 5% safety) is dispatched same-tx per [ADR 026](026-tokenomics.md#adr-026-tokenomics). See [FeeRouter Integration](#feerouter-integration).
 - Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the channel contract.
 
 ### Deposit Economics
@@ -107,13 +107,13 @@ See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#paymen
 
 ### Fee Routing on Disputed Closes
 
-> **Fee routing model.** `settleChannel` does not skim a fee inline; it forwards the entire operator-bound balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction. Split details: [FeeRouter Integration](#feerouter-integration).
+> **Fee routing model.** `settleChannel` does not skim a fee inline; it forwards the entire operator-bound balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. Split details: [FeeRouter Integration](#feerouter-integration).
 
 The settled amount is still calculated **at final settlement**, after the dispute window expires, based on the highest valid voucher amount on-chain at that point. The three-step channel close lifecycle is:
 
 1. **`closeChannel`** — callable by client or provider only. Records the submitted voucher's `amount` in `claimedAmount`, `nonce` in `claimedNonce`, and `bytesDelivered` in `claimedBytes`, sets status to `Closing`, starts the dispute window. **No fee deduction, no router call.** **Zero-voucher close:** when **either party** calls `closeChannel` with `amount=0`, `nonce=0`, `bytesDelivered=0`, and an empty signature (`signature.length == 0`) on a channel with `claimedNonce == 0`, the signature verification is skipped — no client-signed voucher is needed. All other `closeChannel` calls — any call with `signature.length > 0`, or any call where `amount != 0`, `nonce != 0`, or `bytesDelivered != 0` — require normal EIP-712/ECDSA voucher verification. This is safe because voucher nonces start at 1 (nonce 0 is the sentinel for "no voucher submitted"; see [Voucher Nonce Convention](#voucher-nonce-convention)), so any real voucher has nonce ≥ 1 and can always be submitted via `disputeChannel` (which requires strictly higher nonce than `claimedNonce`). The dispute window still applies: if a valid voucher exists, any party can submit it via `disputeChannel`. At settlement, `claimedAmount=0` means the full deposit is refunded to the client and the provider receives nothing — no router call is made for a zero-amount settlement.
 2. **`disputeChannel`** (during dispute window) — callable by any address. If the submitted voucher has a strictly higher nonce, updates both `claimedAmount`, `claimedNonce`, and `claimedBytes` (see [Voucher Bytes-Delivered Field](#voucher-bytes-delivered-field)) to the new values. Still **no fee deduction, no router call**. Submissions with an equal or lower nonce revert with no state change.
-3. **`settleChannel`** (after dispute window expires) — callable by anyone. If `claimedAmount > 0`, computes `bytesDelivered` from the final voucher, transfers the full `claimedAmount` of USDC to the `FeeRouter`, and invokes `FeeRouter.routeSettlement(channel.provider, bytesDelivered, claimedAmount, voucher.epochId)` in the same transaction. Refunds `deposit - claimedAmount` to the client. Sets status to `Closed`. The router (not `PaymentChannel`) applies the four-bucket split and increments `bytesPerEpoch[operator][epochId]` as an analytics counter consumed by `OperatorEmissions` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions) — split legs and bounds in [FeeRouter Integration](#feerouter-integration). The wash-trading defense is capacity-shortfall slashing on `CapacityBond` per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing) — faking bytes does not increase revenue (operator base is per-byte at settlement, paid by the client) and capacity-shortfall slashing auto-downgrades operators with sustained delivery below `min_delivery_ratio × declared_capacity`.
+3. **`settleChannel`** (after dispute window expires) — callable by anyone. If `claimedAmount > 0`, computes `bytesDelivered` from the final voucher, transfers the full `claimedAmount` of USDC to the `FeeRouter`, and invokes `FeeRouter.routeSettlement(channel.provider, bytesDelivered, claimedAmount)` in the same transaction. Refunds `deposit - claimedAmount` to the client. Sets status to `Closed`. The router (not `PaymentChannel`) applies the four-bucket split and increments `bytesPerEpoch[operator][epoch]` — where `epoch = block.timestamp / EPOCH_LENGTH` is derived inside `routeSettlement` — as an analytics counter consumed by `OperatorEmissions` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). Split legs and bounds in [FeeRouter Integration](#feerouter-integration). The wash-trading defense is capacity-shortfall slashing on `CapacityBond` per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing) — faking bytes does not increase revenue (operator base is per-byte at settlement, paid by the client) and capacity-shortfall slashing auto-downgrades operators with sustained delivery below `min_delivery_ratio × declared_capacity`.
 
    > **Invariants:**
    > 1. `closeChannel` and `disputeChannel` MUST revert if the submitted voucher's `amount > channel.deposit`. This prevents client bugs or malicious over-deposit vouchers from causing an underflow revert in `settleChannel` that would lock the channel.
@@ -341,7 +341,6 @@ struct Channel {
     uint256 expiresAt;
     uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
     uint256 disputeDeadline;  // set when close is initiated; may be extended once via the forced-inclusion path (see § L2 sequencer censorship)
-    address lastDisputor;     // msg.sender of the most recent disputeChannel call
     bool    extended;         // true if disputeDeadline has been extended once via the forced-inclusion path; reset to false on closeChannel
 }
 ```
@@ -443,7 +442,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 
 - `closeChannel` → requires status `Open`. **Callable by `channel.client` or `channel.provider` only** (`require(msg.sender == channel.client || msg.sender == channel.provider)`). Sets status to `Closing`, records `claimedAmount`, `claimedNonce`, and `claimedBytes` from the submitted voucher, emits `ChannelCloseInitiated`. No fund transfers. Third parties cannot initiate a close — they act only via `disputeChannel` (during the dispute window) or `settleChannel` (after expiration). **Zero-voucher close:** when **either party** calls with `amount == 0`, `nonce == 0`, `bytesDelivered == 0`, an empty signature (`signature.length == 0`), and `channel.claimedNonce == 0`, the voucher signature is not verified. Full mechanic, safety argument, and dispute symmetry: [Fee Routing on Disputed Closes](#fee-routing-on-disputed-closes).
 - `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Callable by any address holding a valid voucher with a strictly higher nonce. Updates `claimedAmount`, `claimedNonce`, and `claimedBytes`, emits `ChannelDisputed`. No fund transfers. Unrestricted caller access is intentional: third-party fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)) must be able to submit higher-nonce vouchers on behalf of an offline party during the dispute window.
-- `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address. Refunds `deposit - claimedAmount` to the client and, if `claimedAmount > 0`, transfers `claimedAmount` of the payment token to the configured `FeeRouter` and invokes `FeeRouter.routeSettlement(channel.provider, claimedBytes, claimedAmount, voucher.epochId)` in the same transaction. Sets status to `Closed`, emits `ChannelSettled`. **No fee is computed or skimmed inside this contract** — the router applies the four-bucket split, pays the operator's 60% base share same-tx (alongside the 25%/10%/5% legs), and increments `bytesPerEpoch[operator][epochId]` as an analytics counter for `OperatorEmissions`; see [FeeRouter Integration](#feerouter-integration). The wash-trading defense is capacity-shortfall slashing per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing).
+- `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address. Refunds `deposit - claimedAmount` to the client and, if `claimedAmount > 0`, transfers `claimedAmount` of the payment token to the configured `FeeRouter` and invokes `FeeRouter.routeSettlement(channel.provider, claimedBytes, claimedAmount)` in the same transaction. Sets status to `Closed`, emits `ChannelSettled`. **No fee is computed or skimmed inside this contract** — the router applies the four-bucket split, pays the operator's 60% base share same-tx (alongside the 25%/10%/5% legs), and increments `bytesPerEpoch[operator][epoch]` (epoch derived from `block.timestamp`) as an analytics counter for `OperatorEmissions`; see [FeeRouter Integration](#feerouter-integration). The wash-trading defense is capacity-shortfall slashing per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing).
 - `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client or the provider. Regardless of caller, the full deposit is returned to `channel.client` — the provider cannot claim funds via this path. This ensures abandoned channels where the client is absent can be cleaned up by the provider to free on-chain state.
 
 **Safety bounds (hardcoded):**
@@ -511,7 +510,7 @@ Under [ADR 026](026-tokenomics.md#adr-026-tokenomics), `PaymentChannel.settleCha
 
 #### Settlement-path interface
 
-`PaymentChannel.settleChannel` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount, uint64 epochId)` in the same transaction as the payment-token `safeTransferFrom` to the router. The router pays the operator's 60% base share in that transaction, dispatches the 25% / 10% / 5% same-tx legs, and increments `bytesPerEpoch[operator][epochId]` as an analytics counter read by `OperatorEmissions` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
+`PaymentChannel.settleChannel` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount)` in the same transaction as the payment-token `safeTransferFrom` to the router. The router pays the operator's 60% base share in that transaction, dispatches the 25% / 10% / 5% same-tx legs, derives the current epoch as `uint64(block.timestamp / EPOCH_LENGTH)`, and increments `bytesPerEpoch[operator][epoch]` as an analytics counter read by `OperatorEmissions` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
 
 #### Settlement-path invariants
 
@@ -566,11 +565,11 @@ The domain separator binds every voucher to a specific contract deployment on a 
 
 ```solidity
 bytes32 constant VOUCHER_TYPEHASH = keccak256(
-    "Voucher(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token,uint64 epochId)"
+    "Voucher(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)"
 );
 ```
 
-The `epochId` field is consumed by `FeeRouter.routeSettlement` for per-(operator, epoch) bytes attribution feeding `OperatorEmissions.distribute(epoch)` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions); the client sets it at signing time. `FeeRouter` validates that `epochId` is current or recent (within `MAX_EPOCH_LAG`, default 4 epochs) and rejects future-dated values. For long-lived channels spanning multiple epochs, the client signs separate per-epoch vouchers (incrementing `voucherNonce` across them per [Voucher Nonce Convention](#voucher-nonce-convention)); the operator submits each at the relevant `settleChannel` call cadence — typically once per epoch boundary per active channel.
+Per-operator-epoch attribution is derived by `FeeRouter.routeSettlement` at settlement time as `epoch = uint64(block.timestamp / EPOCH_LENGTH)`; the voucher itself does not carry an epoch. All cumulative bytes from the final voucher are credited to the epoch the settlement transaction lands in. Operator gaming via late settlement is bounded by the 48-hour dispute window, which is small relative to the monthly emission distribution cadence.
 
 **Signature digest:**
 
@@ -578,7 +577,7 @@ The `epochId` field is consumed by `FeeRouter.routeSettlement` for per-(operator
 bytes32 digest = keccak256(abi.encodePacked(
     "\x19\x01",
     DOMAIN_SEPARATOR,
-    keccak256(abi.encode(VOUCHER_TYPEHASH, channelId, amount, nonce, bytesDelivered, token, epochId))
+    keccak256(abi.encode(VOUCHER_TYPEHASH, channelId, amount, nonce, bytesDelivered, token))
 ));
 ```
 
@@ -884,7 +883,7 @@ The `token` field (ERC-20 address) is in the signed EIP-712 typed data to preven
 
 ### Voucher Bytes-Delivered Field
 
-`bytesDelivered` is a cumulative byte count signed alongside `amount` and `nonce`. It is the canonical settlement-record byte count carried in the `Voucher`, forwarded to `FeeRouter.routeSettlement`, and aggregated into `bytesPerEpoch[operator][epochId]` — an analytics counter consumed by `OperatorEmissions.distribute(epoch)` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). Properties:
+`bytesDelivered` is a cumulative byte count signed alongside `amount` and `nonce`. It is the canonical settlement-record byte count carried in the `Voucher`, forwarded to `FeeRouter.routeSettlement`, and aggregated into `bytesPerEpoch[operator][epoch]` (where `epoch` is derived from `block.timestamp` at settlement time) — an analytics counter consumed by `OperatorEmissions.distribute(epoch)` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). Properties:
 
 - **Cumulative, monotonic.** Like `amount` and `nonce`, `bytesDelivered` is strictly non-decreasing across vouchers within a channel. `disputeChannel` MUST revert if the new voucher's `bytesDelivered < claimedBytes`.
 - **Derivable from MB-denominated voucher cadence.** Voucher cadence is MB-denominated (default 1 MB; see [Voucher Interval Negotiation](#voucher-interval-negotiation)) and `rate_per_mb` is MB-denominated. Clients computing `amount` from `bytesDelivered` use `amount = ⌈bytesDelivered / 1_048_576⌉ × rate_per_mb` (1 MB = 1,048,576 bytes per [ADR 005](005-protocol.md#adr-005-wire-protocol)); equivalently, `bytesDelivered = mb_delivered × 1_048_576` when delivery boundaries align with MB intervals. The unit conversion is purely an off-chain arithmetic concern; the voucher carries the byte count directly so the contract does not need to re-derive it.
