@@ -1,6 +1,6 @@
 # Work-Token Tokenomics Redesign — Design Spec v2.1 (13-Group Distribution, No LM)
 
-**Status:** Accepted (canonical work-token tokenomics; supersedes v1, v2, and ADRs 026/034/035 as the rewrite commits land).
+**Status:** Accepted 2026-05-25 (canonical work-token tokenomics; supersedes v1, v2, and ADRs 026/034/035 as the rewrite commits land).
 **Supersedes:** v2 spec (`2026-05-24-work-token-tokenomics-redesign-v2.md`), v1 spec (`2026-05-23-work-token-tokenomics-redesign-design.md`), ADRs 026, 034, 035. Substantial edits to 009 and 016. Minor edits to 003, 028, 032.
 **Relationship to v2:** Identical except Section 5 resolves the §5.2 "Liquidity Mining Rewards" bucket to the POL-redeployment fallback rather than the sunsetting-LM default. Mechanically, the 15% LM bucket is moved to Protocol-Owned Liquidity (the Liquidity Provision group grows from 4% → 19%). One contract (`BootstrapLMRewards`) is dropped relative to v2. Section 6's v2 LM caveat is removed because there is no LM exposure under v2.1.
 

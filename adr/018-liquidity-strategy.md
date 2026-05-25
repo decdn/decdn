@@ -56,7 +56,7 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 
 ### POL Governance
 
-The 19% combined POL+MM allocation is on the high end for general DeFi (typical 5–15%) and is large enough that governance controls on its operation are load-bearing. (Resolves v2.1 spec Open Q #4 — POL withdraw cap — and #8 — trading-fee routing.)
+The 19% combined POL+MM allocation is on the high end for general DeFi (typical 5–15%) and is large enough that governance controls on its operation are load-bearing. (Resolves v2.1 spec Open Q #4 — POL management governance: rebalance authority, withdraw cap, and trading-fee accounting — and #8 — trading-fee routing.)
 
 **Rebalance authority.** The 80/20 weight is fixed at pool creation per Balancer V3 weighted-pool semantics; the curve handles intra-pool rebalancing via arbitrage. Governance may *change the pool* (deploy a new pool with different weights, migrate POL there) only via a standard governance proposal under the 48-hour timelock. There is no per-block rebalance keeper.
 
@@ -134,7 +134,7 @@ Balancer's smoother curve reduces the need for TWAP versus V3's concentrated ban
 | POL withdraw cap | 10% of POL per 30-day window per governance proposal |
 | Execution activation | Disabled at launch — governance vote required to enable |
 
-All `BuybackBurner` setters above (`setSwapRouter`, `setPool`, `setMinBuybackAmount`, `setMaxBuybackAmount`, `setSlippageBps`, `setSubSwapCount`, `setSubSwapMinBlockGap`) are `GOVERNANCE_ROLE`-gated through the standard 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model); `epochLiquidityCapFraction` carries the explicit `[1%, 30%]` safety bound noted in [§ TWAP policy](#twap-policy-subswapcount--1). Pool weights, pool swap fee, POL TOKEN-side allocation, private-RPC routing, and POL withdraw cap are structural — not parameter-tunable in-contract; changes require pool redeployment, governance proposal, or a hard requirement on keeper configuration.
+The `BuybackBurner` setters listed above (`setSwapRouter`, `setPool`, `setSlippageTolerance`, `setMinBuybackAmount`, `setMaxBuybackAmount`, plus the keeper-rotation `setKeeper` per [ADR 003](003-payments.md#buybackburner)) are `GOVERNANCE_ROLE`-gated through the standard 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model); `epochLiquidityCapFraction` carries the explicit `[1%, 30%]` safety bound noted in [§ TWAP policy](#twap-policy-subswapcount--1). Pool weights, pool swap fee, POL TOKEN-side allocation, private-RPC routing, and POL withdraw cap are structural — not parameter-tunable in-contract; changes require pool redeployment, governance proposal, or a hard requirement on keeper configuration. The `subSwapCount` / `subSwapMinBlockGap` TWAP parameters are governance-tunable but their canonical setter signatures are not in [ADR 003 § BuybackBurner](003-payments.md#buybackburner)'s interface table yet; either add them there or accept that the v2.1 wiring leaves the TWAP knobs as constructor-set immutables.
 
 [^subswap-rationale]: A default of 4 balances MEV mitigation against gas overhead and keeper complexity. 2 sub-swaps provides marginal splitting benefit; ≥8 multiplies keeper gas and `ceilDiv` rounding artifacts without proportionate MEV improvement on a weighted pool. With the v2.1 5× volume increase governance may consider raising the default to 6–8; this is left as production tuning.
 
