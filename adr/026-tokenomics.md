@@ -207,7 +207,7 @@ A new deterministic slashing path that replaces the prior design's wash-trading 
 
 **Buyback-and-burn inflow.** **25% of routed USDC** flows to `BuybackBurner` from `FeeRouter` (5× the prior design's 5%). [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) mechanics (Balancer V3 80/20 swap, TWAP, `minTokenOut`, POL custody) are inherited; the 5× volume increase implications are addressed in that ADR.
 
-**Operational constraint.** Burn must be TWAP-limited and liquidity-aware. Mature burn budgets can exceed available market depth, especially at low TOKEN prices — the [ADR 018 § Liquidity-cap interaction](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) governs the per-epoch liquidity ceiling.
+**Operational constraint.** Burn must be TWAP-limited and liquidity-aware. Mature burn budgets can exceed available market depth, especially at low TOKEN prices — the [ADR 018 § TWAP policy](018-liquidity-strategy.md#twap-policy-subswapcount--1) governs the per-epoch liquidity ceiling (`epochLiquidityCapFraction`, default 10%, bounded `[1%, 30%]`).
 
 ### Governance
 

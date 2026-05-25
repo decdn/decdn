@@ -54,9 +54,9 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 - **No `LiquidityManager` contract.** A weighted pool's curve handles rebalancing implicitly via arbitrage. There is no range to manage, no `rebalance()` keeper, no `KEEPER_ROLE` for liquidity operations.
 - **No liquidity mining.** The retired Liquidity Mining Rewards bucket (15pp under prior designs) is redeployed as additional POL under v2.1. Mercenary LPs exit when rewards stop and consume TOKEN supply for a benefit POL provides more reliably. A future ADR may reintroduce LM if external-LP-attraction strategic priority changes, but the v2.1 design is intentionally LM-free for regulatory cleanliness (no per-holder passive yield).
 
-### POL Governance (resolves spec Open Q #4 and #8)
+### POL Governance
 
-The 19% combined POL+MM allocation is on the high end for general DeFi (typical 5–15%) and is large enough that governance controls on its operation are load-bearing.
+The 19% combined POL+MM allocation is on the high end for general DeFi (typical 5–15%) and is large enough that governance controls on its operation are load-bearing. (Resolves v2.1 spec Open Q #4 — POL withdraw cap — and #8 — trading-fee routing.)
 
 **Rebalance authority.** The 80/20 weight is fixed at pool creation per Balancer V3 weighted-pool semantics; the curve handles intra-pool rebalancing via arbitrage. Governance may *change the pool* (deploy a new pool with different weights, migrate POL there) only via a standard governance proposal under the 48-hour timelock. There is no per-block rebalance keeper.
 
