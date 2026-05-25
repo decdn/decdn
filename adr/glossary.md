@@ -36,7 +36,7 @@ Terms used across multiple ADRs without inline definition.
 | **Slashing** | Punitive reduction of bonded TOKEN on detected protocol violations. Escalating tiers 5%/15%/50% by lifetime offense count; distribution 50% challenger / 30% safety reserve / 20% burn — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn). Capacity-shortfall slashing is a separate deterministic path (`min_delivery_ratio` violation → auto-downgrade with bond delta to `SafetyReserve`). |
 | **Epoch** | The 1-week analytics and service-emission distribution window. Per-operator `bytes_delivered` counters reset at epoch rollover; counters feed the `OperatorEmissions` distribution but no longer drive bucket payouts (FeeRouter is fully same-tx under v2.1). |
 | **FeeRouter** | The settlement-time four-bucket USDC distributor. Split: 60 operator base / 25 burn / 10 treasury / 5 safety. All four legs transfer in the settlement transaction; no epoch buckets, no pull-claim windows — see [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split). |
-| **SafetyReserve** | A governance-gated USDC incident reserve (3% bucket). Payouts cover incorrect-slashing reversals, payment-channel downtime, and bad-data incidents — see [ADR 026 § Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket). |
+| **SafetyReserve** | A governance-gated USDC incident reserve (5% bucket). Payouts cover incorrect-slashing reversals, payment-channel downtime, and bad-data incidents — see [ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket). |
 
 ## On-chain enforcement
 

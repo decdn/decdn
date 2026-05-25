@@ -5,7 +5,7 @@
 
 ## Context
 
-[ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) specifies the semantics of the per-entry blacklist-appeal flow (regional-only scope, standing paths and synthetic-standing clawback, evidence requirements, bond and frequency caps, the multisig fast-track + ve-Governor ratification authority, the per-body concurrent-appeal cap, and the lifecycle across `openBlacklistAppeal` → (`fastTrackAppeal` | `rejectAppeal`) → (`ratifyAppealRemoval` | `reverseAppeal` | lapse)). High-level signatures appear in the [`IContentBlacklist` interface](011-content-takedown.md#contract-contentblacklist). [ADR 011 § Contract surface](011-content-takedown.md#contract-surface):
+[ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) specifies the semantics of the per-entry blacklist-appeal flow (regional-only scope, standing paths and synthetic-standing clawback, evidence requirements, bond and frequency caps, the multisig fast-track + DecdnGovernor ratification authority, the per-body concurrent-appeal cap, and the lifecycle across `openBlacklistAppeal` → (`fastTrackAppeal` | `rejectAppeal`) → (`ratifyAppealRemoval` | `reverseAppeal` | lapse)). High-level signatures appear in the [`IContentBlacklist` interface](011-content-takedown.md#contract-contentblacklist). [ADR 011 § Contract surface](011-content-takedown.md#contract-surface):
 
 > The full ABI (per-appeal storage layout, exact event topics, gas-optimized struct packing) is deferred to a future contract-implementation ADR — same approach as [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface).
 
@@ -27,7 +27,7 @@ Two enums and one struct describe an appeal; auxiliary mappings carry the per-fi
 enum AppealStatus {
     None,           // 0 — sentinel; appeals[0] is uninitialized
     Open,           // 1 — bond escrowed; multisig has not yet acted
-    FastTracked,    // 2 — entry.suspended = true; awaiting ve-Governor ratification
+    FastTracked,    // 2 — entry.suspended = true; awaiting DecdnGovernor ratification
     Ratified,       // 3 — terminal: _removeHashRegional executed; bond refunded
     Reversed,       // 4 — terminal: entry.suspended cleared; bond burned
     Rejected,       // 5 — terminal: rejected at intake or after un-fast-track; bond burned
@@ -58,7 +58,7 @@ struct BlacklistAppeal {
     uint256 bond;                   // escrowed TOKEN amount (BLACKLIST_APPEAL_BOND at filing time)
     // ─── Slot 4 (32 bytes, packed) ─────────────────────────────
     uint64  fastTrackedAtUs;        // 8 bytes — non-zero iff entered FastTracked; refreshed on UnFastTracked → FastTracked re-entry
-    uint64  reviewWindowEndsUs;     // 8 bytes — running deadline for the active review window (multisig pre-fast-track, ve-Governor post-fast-track)
+    uint64  reviewWindowEndsUs;     // 8 bytes — running deadline for the active review window (multisig pre-fast-track, DecdnGovernor post-fast-track)
     bytes2  region;                 // 2 bytes — ISO 3166-1 alpha-2 per ADR 011's bytes2 gas-optimization
     uint8   alreadyUnFastTracked;   // 1 byte — non-zero iff unFastTrackAppeal has ever fired on this appeal (enforces one-shot per ADR 011)
     bytes13 _pad1;                  // 13 bytes — explicit padding for slot completion

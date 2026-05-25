@@ -27,7 +27,7 @@ sequenceDiagram
     participant Op as Operator
     participant SR as SafetyReserve
     participant EM as Emergency Multisig
-    participant Gov as ve-Governor
+    participant Gov as DecdnGovernor
     Note over Op,Gov: T+0 — SlashJudge resolution executes the slash
     Op->>SR: T+0..30d — TOKEN.approve(SR, APPEAL_BOND)
     Op->>SR: openSlashAppeal(slashId, evidenceBundleHash) — bond transferred
@@ -42,9 +42,9 @@ sequenceDiagram
                 SR->>SR: appeal fails, escrow returns to SR — 50% bond burned, 50% to counter-bundle filer
             else 48h elapses with no successful counter-bundle
                 Note over SR: RATIFICATION_WINDOW = 14d begins (sequential, not parallel)
-                alt ve-Governor ratifies
+                alt DecdnGovernor ratifies
                     SR-->>Op: escrow released to operator — APPEAL_BOND refunded
-                else ve-Governor reverses
+                else DecdnGovernor reverses
                     SR->>SR: escrow returns to SafetyReserve — 50% bond burned, 50% to challenger-incentive pool
                 else governance silent past RATIFICATION_WINDOW
                     SR->>SR: escrow returns to SafetyReserve — APPEAL_BOND refunded (operator not at fault)
@@ -54,7 +54,7 @@ sequenceDiagram
             SR->>SR: 100% of bond burned (no counter-bundle filer to credit at intake)
         end
     else multisig silent past MULTISIG_REVIEW_WINDOW
-        SR->>SR: appeal expires unless ve-Governor acts directly — APPEAL_BOND refunded
+        SR->>SR: appeal expires unless DecdnGovernor acts directly — APPEAL_BOND refunded
     end
 ```
 
@@ -82,10 +82,10 @@ Evidence type (b) is the on-chain-verifiable path; (a) and (c) are off-chain-roo
 
 The operator posts `APPEAL_BOND` in TOKEN at the time of filing. Default 1,000 TOKEN; governable with hard bounds `[100, 10,000]` per [ADR 009](009-governance.md#adr-009-governance-model) safety-bound pattern. Bond economics mirror [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling):
 
-- **Successful appeal (ratified by ve-Governor):** bond refunded to operator in full.
+- **Successful appeal (ratified by DecdnGovernor):** bond refunded to operator in full.
 - **Multisig rejects at intake (no fast-track granted):** 100% of bond burned. No counter-bundle filer exists to credit at intake; this case has no direct analog in [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling).
 - **Failed appeal — successful counter-bundle in 48h `SafetyReserve` window:** mirrors [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling) bond split — 50% of bond burned, 50% routed *directly to the counter-bundle filer* as the prevailing party.
-- **Failed appeal — ve-Governor reverses (no counter-bundle filer):** 50% of bond burned, 50% credited to a `SafetyReserve` challenger-incentive pool used to compensate parties who file successful counter-bundles in *future* 48h windows. (This case has no specific prevailing party to route to directly.)
+- **Failed appeal — DecdnGovernor reverses (no counter-bundle filer):** 50% of bond burned, 50% credited to a `SafetyReserve` challenger-incentive pool used to compensate parties who file successful counter-bundles in *future* 48h windows. (This case has no specific prevailing party to route to directly.)
 - **Governance silent past `MULTISIG_REVIEW_WINDOW` or `RATIFICATION_WINDOW`:** bond refunded — the operator is not at fault for governance inaction, and the appeal lapses without economic penalty.
 
 The bond is the primary economic deterrent against pro-forma appeals filed hoping for multisig sympathy. The 365-day frequency cap ([§ Hard caps and frequency limits](#hard-caps-and-frequency-limits)) and the perjury re-slash ([§ Eligibility and evidence standard](#eligibility-and-evidence-standard)) are secondary deterrents.
@@ -97,8 +97,8 @@ The bond is the primary economic deterrent against pro-forma appeals filed hopin
 | `APPEAL_FILING_WINDOW` | 30 days | `[7d, 90d]` | Allows operators to discover the slash, gather logs, and file. 30d matches the issue-403 suggestion. |
 | `APPEAL_BOND` | 1,000 TOKEN | `[100, 10,000]` | High enough to deter abuse, low enough that an operator with a genuine outage will pay it. |
 | `MULTISIG_REVIEW_WINDOW` | 14 days | `[3d, 30d]` | Time the emergency multisig has to grant interim relief. After this, the appeal expires unless governance acts directly. |
-| `RATIFICATION_WINDOW` | 14 days | (fixed, mirrors [ADR 011](011-content-takedown.md#regional-governance-bodies)) | ve-Governor must ratify or reverse within this window. Same window as regional-body suspension. |
-| `MAX_APPEAL_RESTITUTION` | 1× minimum stake denominated in USDC at the slash block's TWAP | (fixed) | An appeal cannot net the operator more than the slashable stake floor ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)). Larger slashes are restituted up to this cap; the operator absorbs the residual. The TOKEN→USDC conversion uses the same Balancer V3 80/20 pool TWAP that [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) uses for buyback-and-burn — specifically the same window length and oracle path as [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) — read at the slash block, not the appeal block, so the cap does not move with TOKEN price during the 30-day filing window. Reusing one oracle parameter set keeps appeal and buyback numerics auditable from a single configuration. |
+| `RATIFICATION_WINDOW` | 14 days | (fixed, mirrors [ADR 011](011-content-takedown.md#regional-governance-bodies)) | DecdnGovernor must ratify or reverse within this window. Same window as regional-body suspension. |
+| `MAX_APPEAL_RESTITUTION` | 1× minimum stake denominated in USDC at the slash block's TWAP | (fixed) | An appeal cannot net the operator more than the slashable stake floor ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)). Larger slashes are restituted up to this cap; the operator absorbs the residual. The TOKEN→USDC conversion uses the same Balancer V3 80/20 pool TWAP that [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) uses for buyback-and-burn — specifically the same window length and oracle path as [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) — read at the slash block, not the appeal block, so the cap does not move with TOKEN price during the 30-day filing window. Reusing one oracle parameter set keeps appeal and buyback numerics auditable from a single configuration. |
 | `OPERATOR_APPEAL_FREQUENCY` | 1 accepted appeal per 365 days | (fixed) | Prevents a serially-failing operator from rolling outage appeals indefinitely. Resets on the date the *previous* successful appeal was ratified. |
 
 **Window timing invariant.** `APPEAL_FILING_WINDOW`, `MULTISIG_REVIEW_WINDOW`, and `RATIFICATION_WINDOW` are sequential, each on its own clock starting from a distinct event (slash block, `openSlashAppeal` block, `fastTrackAppeal` block respectively). They are independently governable with no ordering relationship between their bounds — `MULTISIG_REVIEW_WINDOW` may exceed `APPEAL_FILING_WINDOW`, and an appeal filed at the last block of `APPEAL_FILING_WINDOW` is still processed for the full review and ratification windows after the filing window closes (the filing window gates *when* an appeal may be opened, not how long it has to conclude). `SafetyReserve` enforces this at the contract layer: `openSlashAppeal` reverts if `block.timestamp - slashBlock.timestamp > APPEAL_FILING_WINDOW`, but no setter or post-filing path consults `APPEAL_FILING_WINDOW` again. Updates to the three parameters are independent and require no paired update (cf. [ADR 009 § Governable Parameters with Safety Bounds](009-governance.md#governable-parameters-with-safety-bounds), which uses paired cross-parameter invariants only where parameters have a genuine ordering relationship).
@@ -162,7 +162,7 @@ Modeled abuse paths and counters:
 ### Positive
 
 - Closes the issue-403 gap with a bounded, documented mechanism — no ad-hoc multisig discretion for legitimate-outage cases.
-- Reuses existing primitives: `SafetyReserve` contract, emergency multisig, ve-Governor, [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling) bond economics, [ADR 011](011-content-takedown.md#regional-governance-bodies) ratification pattern. No new governance body, no new contract.
+- Reuses existing primitives: `SafetyReserve` contract, emergency multisig, DecdnGovernor, [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling) bond economics, [ADR 011](011-content-takedown.md#regional-governance-bodies) ratification pattern. No new governance body, no new contract.
 - Operator relief is bounded and predictable: the multisig fast-track decision lands within `MULTISIG_REVIEW_WINDOW` (default 14 days) and disbursement follows ratification within at most another ~16 days (48h SafetyReserve counter-bundle window + 14d ratification, sequential), vs. the ~9-day minimum + indefinite proposal-drafting latency of a Governor-only path.
 - Operator trust improves — onboarding pitches can point to a documented appeal path rather than "trust the multisig."
 - Reputation and offense-count are preserved, so the repeat-behavior deterrent is intact.
@@ -171,7 +171,7 @@ Modeled abuse paths and counters:
 
 - Adds six new entry points (`openSlashAppeal`, `fastTrackAppeal`, `rejectAppeal`, `ratifyAppeal`, `reverseAppeal`, plus the permissionless `cleanupExpiredAppeal` introduced in [ADR 032 § Multisig capability scope](032-safety-reserve-appeals-contract.md#multisig-capability-scope)) plus per-appeal escrow accounting to `SafetyReserve`, increasing surface area and audit cost.
 - Operators must front `APPEAL_BOND` (1,000 TOKEN default) to file — a real frictional cost at PoC TOKEN prices for genuinely-affected smaller operators. Cold-start considerations may motivate a lower default during the PoC window.
-- Escrow-until-ratification ([§ Appeal flow](#appeal-flow)) means the operator sees no disbursed restitution until ve-Governor ratification — up to ~16 days after the multisig fast-track. For larger slashes this is real working-capital exposure; the trade-off is buying out clawback exposure entirely.
+- Escrow-until-ratification ([§ Appeal flow](#appeal-flow)) means the operator sees no disbursed restitution until DecdnGovernor ratification — up to ~16 days after the multisig fast-track. For larger slashes this is real working-capital exposure; the trade-off is buying out clawback exposure entirely.
 - Evidence standard (≥2 corroborating sources) is documentation-heavy for solo operators without enterprise-grade observability.
 - **TOKEN→USDC market risk.** `MAX_APPEAL_RESTITUTION` is denominated in USDC at the slash-block TWAP ([§ Hard caps and frequency limits](#hard-caps-and-frequency-limits)). The full appeal lifecycle — 30-day filing window + multisig review + 48-hour SafetyReserve appeal + 14-day ratification — can run up to ~60 days, during which TOKEN may appreciate against USDC. The operator receives a fixed-USDC restitution that may buy back fewer TOKEN than were slashed, leaving them short of pre-slash standing even after a successful appeal. The slash-block TWAP is deliberate (settling at appeal-block TWAP would expose `SafetyReserve` to TOKEN price moves and incentivize timing the appeal); operators bear the residual price risk.
 

@@ -118,7 +118,7 @@ The settled amount is still calculated **at final settlement**, after the disput
    > **Invariants:**
    > 1. `closeChannel` and `disputeChannel` MUST revert if the submitted voucher's `amount > channel.deposit`. This prevents client bugs or malicious over-deposit vouchers from causing an underflow revert in `settleChannel` that would lock the channel.
    > 2. `disputeChannel` MUST revert if `newAmount < claimedAmount` or `newBytes < claimedBytes`. Vouchers are cumulative across both axes; a higher nonce must correspond to a non-decreasing amount and a non-decreasing byte count. This prevents a malicious client from reducing the provider's payout — or the provider's analytics-counter byte share — via a higher-nonce dispute.
-   > 3. `settleChannel` MUST forward `claimedAmount` of the payment token to `FeeRouter` and call `routeSettlement` in the same transaction iff `claimedAmount > 0`. The provider's 40% base share lands in the operator's wallet in the same transaction as `settleChannel`; this is the cashflow guarantee that backs operator P&L Case A in [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake). Reverting after partial transfer is unacceptable — implementations MUST use checks-effects-interactions, MUST guard `settleChannel` and `disputeChannel` with a `nonReentrant` modifier (the `FeeRouter` call path crosses a contract boundary and is the new reentrancy surface), and the `FeeRouter` MUST hold a stable interface contract.
+   > 3. `settleChannel` MUST forward `claimedAmount` of the payment token to `FeeRouter` and call `routeSettlement` in the same transaction iff `claimedAmount > 0`. The provider's 60% base share lands in the operator's wallet in the same transaction as `settleChannel`; this is the cashflow guarantee that backs operator P&L Case A in [ADR 026 § Operator economics](026-tokenomics.md#operator-economics). Reverting after partial transfer is unacceptable — implementations MUST use checks-effects-interactions, MUST guard `settleChannel` and `disputeChannel` with a `nonReentrant` modifier (the `FeeRouter` call path crosses a contract boundary and is the new reentrancy surface), and the `FeeRouter` MUST hold a stable interface contract.
 
 A dispute that raises the settlement amount (e.g., 50 → 80 payment-token units) raises every router-bucket allocation proportionally, and a higher `claimedBytes` raises the operator's analytics-counter byte share for the epoch (read by `OperatorEmissions`). The router computes its split once, on the final settled amount and byte count — never on intermediate values, never more than once per channel.
 
@@ -280,11 +280,12 @@ Registry check + per-sender rate limiting. Residual gap: the local registry cach
 
 Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
 
-The core weakness is governance-token-price dependency: at $0.001/TOKEN, a minimum stake of 1,000 TOKEN costs $1 per sybil node. The unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` (see [ADR 001](001-network.md#node-selection-algorithm)) helps — a sybil fleet must be real hardware in the right geography, competitively priced, and build reputation over time — but does not eliminate the risk when the token is cheap. Options:
+The core weakness is governance-token-price dependency: at $0.001/TOKEN, the 1 Gbps entry-tier capacity bond (~50,000 TOKEN at default `k=12.6`, `α=1.2` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) costs $50 per sybil node. Higher tiers are super-linearly more expensive (10 Gbps ≈ 795K TOKEN; 100 Gbps ≈ 12.6M TOKEN), but a sybil fleet can be dominated by many entry-tier nodes. The unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` (see [ADR 001](001-network.md#node-selection-algorithm)) helps — a sybil fleet must be real hardware in the right geography, competitively priced, and build reputation over time — but does not eliminate the risk when the token is cheap. Options:
 
-- **Option A — Governance raises minimum stake if governance-token price falls.** The minimum stake is governable. Governance-token holders are incentivised to raise it to protect the network, since a sybil-dominated network reduces usage and governance-token value. Reactive but aligned.
-- **Option B — Minimum stake denominated in USD equivalent via oracle.** Requires a price oracle, which introduces oracle dependency, manipulation, and downtime risks (see rate bounds discussion above). The same concerns apply here, but the impact of oracle failure is lower (new stakers temporarily blocked, not payments broken).
+- **Option A — Governance raises the 1 Gbps-tier bond via the `k`-bound mechanism in [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).** The 1G-tier bond is governable within [10K, 200K TOKEN]; raising it lifts the whole curve. Governance is incentivised to do so when TOKEN price is low, since a sybil-dominated network reduces usage and TOKEN value. Reactive but aligned.
+- **Option B — Bond denominated in USD equivalent via oracle.** Requires a price oracle, which introduces oracle dependency, manipulation, and downtime risks (see rate bounds discussion above). The same concerns apply here, but the impact of oracle failure is lower (new operators temporarily blocked, not payments broken).
 - **Option C — Reputation as a second filter.** New nodes (low reputation, few settled channels) are deprioritised in client selection even if their `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` score is competitive. A sybil fleet takes time to build reputation, limiting its effectiveness during that window.
+- **Option D — Capacity-shortfall slashing.** Sybil nodes that don't deliver real bytes are auto-downgraded by the capacity-shortfall path per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing); operators delivering below `min_delivery_ratio × declared_capacity` lose the bond delta to `SafetyReserve`. This forces sybils to either deliver real bytes (defeating the cheap-sybil premise) or eat continuous bond losses.
 
 #### Rate manipulation cartel
 
@@ -467,7 +468,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. Prevents zero-rate free-riding while imposing no practical constraint on legitimate pricing. Nodes are expected to set rates well above this floor; the floor is purely an anti-zero safeguard, not a recommended price. |
 | `deliveryCeiling` | $0.001/MB | 1,000 | 100× expected market rate. Accommodates origin-backed nodes with high-egress backends (e.g., S3 at $0.09/GB) while remaining well above any legitimate pricing scenario ($1.00/GB vs Akamai's ~$0.12–0.20/GB). |
 
-The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, ve-Governor in production (see [ADR 009](009-governance.md#adr-009-governance-model)).
+The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, DecdnGovernor in production (see [ADR 009](009-governance.md#adr-009-governance-model)).
 
 ### Rate Bounds Refresh
 
@@ -514,7 +515,7 @@ Under [ADR 026](026-tokenomics.md#adr-026-tokenomics), `PaymentChannel.settleCha
 
 #### Settlement-path invariants
 
-1. **Atomic base-share payout.** The 40% base share MUST land in the operator's wallet in the same transaction as `settleChannel` — no claim step, no keeper, no off-chain queue. This is the Case A cashflow guarantee from [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake).
+1. **Atomic base-share payout.** The 60% base share MUST land in the operator's wallet in the same transaction as `settleChannel` — no claim step, no keeper, no off-chain queue. This is the Case A cashflow guarantee from [ADR 026 § Operator economics](026-tokenomics.md#operator-economics).
 2. **No reentry.** `settleChannel` holds a `nonReentrant` guard for the duration of the router call.
 3. **One settlement per channel.** Enforced by the existing `Closed` status; the router need only tolerate duplicate calls (idempotency or revert — pinned in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model)).
 
@@ -594,7 +595,7 @@ Voucher nonces within a channel start at **1**. Nonce 0 is reserved as the senti
 
 ### Node Registry
 
-The on-chain registry of staked nodes is part of the `CapacityBond` contract, not a separate contract. Staking is a prerequisite for registration ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
+The on-chain registry of staked nodes is part of the `CapacityBond` contract, not a separate contract. Staking is a prerequisite for registration ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
 
 > **No on-channel fee-discount path.** Operator return is differentiated through the `CapacityBond` lock-to-capacity curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), not via a stake-multiple fee toggle on the channel contract. `getEffectiveFee`, `getStakeMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `CapacityBond` carries the registration, bond-bookkeeping, capacity-shortfall, and slashing responsibilities; the operator bond is `bond = k × Mbps^α` with defaults `k=12.6`, `α=1.2` (≈50K TOKEN at 1 Gbps) per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve).
 
@@ -621,7 +622,7 @@ Field order is chosen for storage packing: `ethAddress` (20 B) and `active` (1 B
 ```solidity
 // --- Node Registry ---
 
-// Registration (requires active stake >= minStake)
+// Registration (requires active bond >= bond_required(declared_capacity))
 function registerNode(
     bytes32 nodeId,
     bytes calldata multiaddrs,
@@ -674,7 +675,7 @@ event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 - **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This enforces a one-stake-position-per-node invariant.
 - **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in [§ Off-Chain (Ephemeral) Binding for Clients](#off-chain-ephemeral-binding-for-clients). The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [§ Binding Message Format](#binding-message-format)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [§ NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `CapacityBond.bindNodeId()` function in [§ On-Chain Registration](#on-chain-registration) remains available for rebinding (key rotation) after initial registration.
 - **`deregisterNode` deactivates without touching stake.** Sets `active = false`, removes the operator from the active set, and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. It does **not** move stake into unbonding — deactivation and stake exit are separate operations. The stake stays bonded and fully slashable after deregistration (accountability is preserved), and an operator who changes their mind can re-register without re-funding. To withdraw, the operator calls `requestUnstake` (which starts the unbonding period) then `unstake`; the slash-then-run protection is the `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant ([ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period)), which keys off `requestUnstake` rather than off deregistration, so it holds regardless. Separating the two lets an operator pause node duties (stop serving, leave the active set) without forcing a stake-return clock, while a full exit is just `deregisterNode` followed by `requestUnstake`.
-- **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
+- **Auto-ejection.** When slashing drops a node's bond below 50% of the minimum bond for its declared tier ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-bond at the full tier minimum to rejoin.
 - **`firstRegisteredAt` is write-once.** `registerNode` sets `firstRegisteredAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection it retains its original value; it is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#cold-start-bootstrap)).
 
 #### Multiaddr Update Policy
@@ -690,7 +691,7 @@ A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md#adr-00
 | `deregisterNode()` | ~80k gas | ~$0.05 |
 | `reclaimNodeId()` | ~600k–1.1M gas | ~$0.24–$0.44 |
 
-`registerNode` and `reclaimNodeId` include ~500k–1M gas for on-chain ed25519 signature verification (Solidity library) — a one-time cost per node lifetime, negligible vs. the minimum stake deposit. Estimates assume typical multiaddr sizes (2–4 addresses, ~200 bytes total); larger payloads increase storage gas proportionally.
+`registerNode` and `reclaimNodeId` include ~500k–1M gas for on-chain ed25519 signature verification (Solidity library) — a one-time cost per node lifetime, negligible vs. the entry-tier capacity bond. Estimates assume typical multiaddr sizes (2–4 addresses, ~200 bytes total); larger payloads increase storage gas proportionally.
 
 #### Client Query Patterns
 
@@ -704,7 +705,7 @@ Three tiers, from simplest to most scalable:
 
 #### NodeId Ownership Verification
 
-`registerNode` requires an ed25519 signature proving the caller controls the private key corresponding to `nodeId`. Without this proof, an attacker could front-run legitimate registrations by calling `registerNode` with someone else's NodeId — the attacker gains no traffic (cannot complete iroh QUIC handshakes with that identity), but under the one-to-one uniqueness constraint the legitimate owner is permanently blocked from registering. Even with the ed25519 verification overhead, the total `registerNode` cost (~$0.26–$0.46 gas + recoverable minimum stake) is low enough that squatting remains a cheap griefing/DoS vector without the ownership proof.
+`registerNode` requires an ed25519 signature proving the caller controls the private key corresponding to `nodeId`. Without this proof, an attacker could front-run legitimate registrations by calling `registerNode` with someone else's NodeId — the attacker gains no traffic (cannot complete iroh QUIC handshakes with that identity), but under the one-to-one uniqueness constraint the legitimate owner is permanently blocked from registering. Even with the ed25519 verification overhead, the total `registerNode` cost (~$0.26–$0.46 gas + recoverable entry-tier capacity bond) is low enough that squatting remains a cheap griefing/DoS vector without the ownership proof.
 
 **Note:** The `bindingSignature` parameter proves the caller's Ethereum key signed the NodeId binding — it does not prove ownership of the ed25519 NodeId itself. These are orthogonal concerns: `bindingSignature` prevents un-slashable registration, while ed25519 ownership verification prevents NodeId squatting.
 
@@ -731,7 +732,7 @@ If a NodeId was squatted (e.g., during a transition period or via a contract bug
 Node admission and queueing policy — how a node orders incoming `StreamRequest`s under congestion — is implementation-defined and lives outside the protocol. The wire format carries no priority bits, the channel and voucher mechanisms encode no per-stream priority state, and different operators are expected to tune their policy differently. Two signals are available to any admission policy:
 
 - **Committed voucher rate.** The advertised `rate_per_mb` in `ProbeResponse` / `StreamResponse` is a **floor**, not equality — nodes verify `amount_delta / bytes_delta >= rate_per_mb`. Clients MAY commit at higher rates; nodes MAY use the committed rate as a per-stream priority key, with the premium paid directly via [`FeeRouter.routeSettlement`](#feerouter-integration).
-- **Registered node-stake.** `CapacityBond.stakeOf(address)` is readable on-chain for any registered operator. Nodes MAY treat addresses with `stakeOf >= MIN_STAKE` ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)) as eligible for a higher-priority admission lane.
+- **Registered node-stake.** `CapacityBond.bondOf(address)` is readable on-chain for any registered operator. Nodes MAY treat addresses with `bondOf >= bond_required(declared_capacity)` ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)) as eligible for a higher-priority admission lane.
 
 ## NodeId-to-Ethereum Binding
 
@@ -774,13 +775,14 @@ mapping(address => uint64) public bindingNonce;
 // ADR 016 § Off-Chain Read API, ADR 022 § Origin discovery). `nodeId` is
 // `bytes32(0)` if the operator never registered or cleared their binding via
 // rebinding; `active` is `false` if the operator is unbound, in unbonding,
-// auto-ejected, or below `minStake`.
+// auto-ejected, or below the tier minimum bond.
 function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
 
 // Single-purpose per-operator activity check. Returns `true` iff `operator` is
-// currently registered with active (non-unbonding) stake at or above
-// `minStake`; `false` for unregistered addresses, stake below `minStake`,
-// stake fully or partially in unbonding, and auto-ejected operators.
+// currently registered with an active (non-unbonding) bond at or above
+// `bond_required(declared_capacity)`; `false` for unregistered addresses,
+// bond below the tier minimum, bond fully or partially in unbonding,
+// and auto-ejected operators.
 // SECURITY: operator-level blacklist status (ADR 011) is intentionally NOT
 // consulted — this is a pure single-contract storage read; callers needing the
 // combined "authorized origin" predicate filter against
@@ -897,7 +899,7 @@ Slashing and payment channels are independent by design.
 
 **Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN stake in the `CapacityBond` (schedule per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5%/15%/50% escalation tiers, 50% challenger / 30% safety / 20% burn). Channel funds are client deposits held in escrow — not stake, never touched by slashing. This follows from the functional separation in [Consequences](#consequences): payment channel contracts never hold or move TOKEN stake, cannot be called by `CapacityBond` to slash or reassign stake, and any `CapacityBond` interaction is read-only (e.g., resolving NodeId↔address bindings).
 
-**Slashing can drop a node below minimum stake while channels are open.** Channel deposits being independent of stake, a node can be slashed below the minimum (or to zero) with open channels. The channels continue their normal lifecycle — close, dispute window, settle — regardless of staking status; settlement is purely a function of voucher state, not registry status.
+**Slashing can drop a node below its tier minimum bond while channels are open.** Channel deposits being independent of the bond, a node can be slashed below the tier minimum (or to zero) with open channels. The channels continue their normal lifecycle — close, dispute window, settle — regardless of bonding status; settlement is purely a function of voucher state, not registry status.
 
 **Auto-ejection does not interrupt open channels.** When a node's stake drops below 50% of the minimum and auto-ejection triggers (see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)):
 
