@@ -88,7 +88,7 @@ This single transaction atomically:
 
 - Verifies the EIP-712 `bindingSignature` over `BindNodeId(nodeId, bindingNonce[ethAddress])`, establishing the `nodeId → ethAddress` mapping for slash evidence and payment attribution.
 - Verifies the `ed25519Signature` over `keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId]))`, proving the operator controls the iroh private key (prevents NodeId squatting). (`ethAddress` is `msg.sender` and `chainId` is `block.chainid` on-chain; this ADR uses operator-perspective names for consistency with the signing pseudo-code below.)
-- Records `NodeInfo` (including `firstRegisteredAt` if this is the node's first-ever registration — used for cold-start bootstrap eligibility in [ADR 008](008-reputation.md#cold-start-bootstrap)).
+- Records `NodeInfo` (including `firstBondedAt` if this is the node's first-ever registration — used for cold-start bootstrap eligibility in [ADR 008](008-reputation.md#cold-start-bootstrap)).
 - Sets `active = true` in the registry.
 
 **Constructing `multiaddrs`:** The iroh `Endpoint` is not yet bound in Phase 2, so hole-punched addresses are unavailable at registration time:

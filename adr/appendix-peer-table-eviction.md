@@ -42,9 +42,9 @@ The 10× ratio (not the absolute 600 s) is the stable invariant: if the announce
 
 The peer table is **not size-capped by default**. Growth is bounded externally:
 
-- Gossip-validation rule (2) rejects every `NodeAnnounce` whose `node_id` is not active in the on-chain `CapacityBond`. The insertable `node_id` set is exactly the active staked node set.
+- Gossip-validation rule (2) rejects every `NodeAnnounce` whose `node_id` is not active in the on-chain `CapacityBond`. The insertable `node_id` set is exactly the active bonded operator set.
 - Memory cost is small even at production scale: a `NodeAnnounce` worst case is 800 B per [ADR 001 § Gossip Bandwidth Analysis](001-network.md#gossip-bandwidth-analysis), so `≤ 1 KB/entry × 10,000 active nodes ≲ 10 MB` including HashMap overhead. At PoC scale the table is ~tens of KB.
-- An LRU/age/reputation-priority layer would solve a problem the staking gate already constrains.
+- An LRU/age/reputation-priority layer would solve a problem the CapacityBond registry gate already constrains.
 
 For defense-in-depth against an unforeseen growth path (registry-validation regression, future schema change), operators MAY set an optional ceiling:
 

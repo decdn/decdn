@@ -177,13 +177,14 @@ Arbitrum One fee markets at deployment. Three MUST gates:
 
 1. **`FeeRouter` per-settlement overhead.** Every `settleChannel` routes through
    `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` — four
-   `safeTransfer` legs (60/25/10/5 same-tx per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split))
-   plus a `CapacityBond.recordSettlement` SSTORE that also increments the analytics
-   `bytesPerEpoch` counter consumed by `OperatorEmissions`. Overhead **~5–10K gas**
-   atop the settlement tx; at 100K settlements/year (medium operator) a small
-   fraction of total cost. Aggregate per-settlement gas (USDC-equivalent, incl. this
-   overhead) MUST stay within the operator P&L affordability bounds of
-   [ADR 026 § Operator economics](026-tokenomics.md#operator-economics).
+   `safeTransfer` legs (60/25/10/5 same-tx per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)),
+   one inline write to the FeeRouter-internal `bytesPerEpoch[operator][epochId]`
+   analytics counter consumed by `OperatorEmissions`, and a single
+   `CapacityBond.recordSettlement` SSTORE updating `lastSettlementAt[operator]`.
+   Overhead **~5–10K gas** atop the settlement tx; at 100K settlements/year
+   (medium operator) a small fraction of total cost. Aggregate per-settlement gas
+   (USDC-equivalent, incl. this overhead) MUST stay within the operator P&L
+   affordability bounds of [ADR 026 § Operator economics](026-tokenomics.md#operator-economics).
 
 2. **Per-epoch keeper-call gas economics.** One TWAP-protected USDC→TOKEN swap
    keeper call per epoch via `BuybackBurner` (25% buyback-and-burn flow under v2.1

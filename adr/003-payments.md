@@ -608,7 +608,7 @@ struct NodeInfo {
     bool    active;              // false after deregistration or auto-ejection (1 byte)
                                  // ↑ ethAddress + active pack into one slot
     uint256 registeredAt;        // block.timestamp of current registration
-    uint256 firstRegisteredAt;   // block.timestamp of first-ever registration (immutable once set)
+    uint256 firstBondedAt;   // block.timestamp of first-ever registration (immutable once set)
     uint256 lastMultiaddrUpdate; // block.timestamp of last multiaddr change
     bytes   multiaddrs;          // packed QUIC multiaddrs (length-prefixed entries)
     string  regionHint;          // ISO 3166-1 alpha-2 code (self-reported, unverified)
@@ -648,7 +648,7 @@ function isActiveNode(bytes32 nodeId) external view returns (bool);
 function getActiveNodeCount() external view returns (uint256);
 function getActiveNodes(uint256 offset, uint256 limit)
     external view returns (NodeInfo[] memory);
-function getFirstRegisteredAt(address ethAddress) external view returns (uint256);
+function getFirstBondedAt(address ethAddress) external view returns (uint256);
 
 // State — per-nodeId nonce for ed25519 registration replay protection
 mapping(bytes32 => uint64) public registrationNonce;
@@ -676,7 +676,7 @@ event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 - **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in [§ Off-Chain (Ephemeral) Binding for Clients](#off-chain-ephemeral-binding-for-clients). The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [§ Binding Message Format](#binding-message-format)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [§ NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `CapacityBond.bindNodeId()` function in [§ On-Chain Registration](#on-chain-registration) remains available for rebinding (key rotation) after initial registration.
 - **`deregisterNode` deactivates without touching the bond.** Sets `active = false`, removes the operator from the active set, and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. It does **not** move the bond into unbonding — deactivation and bond exit are separate operations. The bond stays locked and fully slashable after deregistration (accountability is preserved), and an operator who changes their mind can re-register without re-funding. To withdraw, the operator calls `unbond()` (which starts the 14-day unbonding window per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)); the slash-then-run protection is the `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant ([ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period)), which keys off the `unbond()` call rather than off deregistration, so it holds regardless. Separating the two lets an operator pause node duties (stop serving, leave the active set) without forcing a bond-return clock, while a full exit is just `deregisterNode` followed by `unbond()`.
 - **Auto-ejection.** When slashing drops a node's bond below 50% of the minimum bond for its declared tier ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-bond at the full tier minimum to rejoin.
-- **`firstRegisteredAt` is write-once.** `registerNode` sets `firstRegisteredAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection it retains its original value; it is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#cold-start-bootstrap)).
+- **`firstBondedAt` is write-once.** `registerNode` sets `firstBondedAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection it retains its original value; it is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#cold-start-bootstrap)).
 
 #### Multiaddr Update Policy
 
