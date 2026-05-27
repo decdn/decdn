@@ -3,7 +3,7 @@
 **Date:** 2026-05-27
 **Status:** Draft
 
-**Supersedes:** the voting-weight clauses of [ADR 009 § Production: Operator-Weighted DAO Governance](009-governance.md#production-operator-weighted-dao-governance) and [ADR 026 § Governance](026-tokenomics.md#governance). Sibling design spec: [`docs/superpowers/specs/2026-05-27-served-bytes-voting-design.md`](../docs/superpowers/specs/2026-05-27-served-bytes-voting-design.md).
+**Supersedes:** the voting-weight clauses of [ADR 009 § Production: Operator-Weighted DAO Governance](009-governance.md#production-operator-weighted-dao-governance) and [ADR 026 § Governance](026-tokenomics.md#governance).
 
 ## Context
 
