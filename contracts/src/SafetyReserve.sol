@@ -346,18 +346,18 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     /// @inheritdoc ISafetyReserve
     /// @dev Calls the `_doSwap` virtual hook so subclasses with a live
     ///      Balancer V3 Vault integration can override the swap body
-    ///      without rewriting the outer access-control / reentrancy frame.
-    ///      Base hook reverts with `SwapNotImplemented` after emitting
-    ///      `SwapAttempted` (the emit also lets solc see a state-mutating
-    ///      side effect through the virtual call, avoiding both the
-    ///      "Function state mutability can be restricted to view" and the
-    ///      "unreachable code in `_nonReentrantAfter`" warnings under
-    ///      `--deny-warnings`).
+    ///      without rewriting the outer access-control frame.
+    ///      `nonReentrant` is intentionally absent: the base `_doSwap`
+    ///      always reverts before any external call, so the OZ
+    ///      `_nonReentrantAfter` would be unreachable (tripping CI
+    ///      `--deny-warnings`). Subclasses that override `_doSwap` with a
+    ///      real swap MUST re-add the modifier on `swapAccumulatedTokens`
+    ///      in the subclass — not enforced by the type system; production
+    ///      override checklist item.
     function swapAccumulatedTokens(uint256 amountIn, uint256 minOut)
         external
         virtual
         override
-        nonReentrant
         whenNotPaused
         onlyRole(KEEPER_ROLE)
     {
@@ -367,7 +367,9 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
 
     /// @dev Virtual swap hook overridden by production subclasses with the
     ///      live Vault ABI binding. Base reverts so a freshly deployed
-    ///      SafetyReserve cannot silently no-op a swap.
+    ///      SafetyReserve cannot silently no-op a swap. The `emit` before
+    ///      the revert lets solc classify the function as state-mutating
+    ///      (avoids the "can be view" warning).
     function _doSwap(uint256 amountIn, uint256 minOut) internal virtual {
         emit SwapAttempted(msg.sender, amountIn, minOut);
         revert SwapNotImplemented();
