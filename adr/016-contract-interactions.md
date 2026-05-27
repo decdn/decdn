@@ -9,7 +9,7 @@ The deCDN deploys multiple interacting smart contracts with cross-contract calls
 
 This ADR consolidates that analysis into a single reference for security audits and implementation. It does not introduce new functionality — it systematizes what other ADRs already specify.
 
-> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) driver.** The contract surface in this ADR follows the v2.1 work-token rewrite of [ADR 026](026-tokenomics.md#adr-026-tokenomics). `FeeRouter` ships as a four-bucket settlement distributor; `CapacityBond` (renamed from the prior `StakingRegistry`, with the capacity-curve lock-to-capacity logic added) is the operator-registry contract; `OperatorEmissions` is a new contract that distributes the 20% Operator Service Emissions bucket; `SafetyReserve` and `BuybackBurner` are wired with adjusted flows. The retired `VotingEscrow` and `DelegatorBuyer` contracts are not part of the v2.1 surface. Read [ADR 026](026-tokenomics.md#adr-026-tokenomics) first for the economic model; this ADR is the integration view.
+> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) driver.** The contract surface in this ADR follows the v2.2 no-emission rewrite of [ADR 026](026-tokenomics.md#adr-026-tokenomics). `FeeRouter` ships as a four-bucket settlement distributor; `CapacityBond` (renamed from the prior `StakingRegistry`, with the capacity-curve lock-to-capacity logic added, plus a `PendingCredit` extension that holds and vests Genesis Bond Credits) is the operator-registry contract; `SafetyReserve` and `BuybackBurner` are wired with adjusted flows. The retired `VotingEscrow`, `DelegatorBuyer`, and `OperatorEmissions` contracts are not part of the v2.2 surface (`OperatorEmissions` was v2.1-only and is deleted under v2.2). Read [ADR 026](026-tokenomics.md#adr-026-tokenomics) first for the economic model; this ADR is the integration view.
 
 ## Decision
 
@@ -20,10 +20,9 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | Contract | ADR | Holds Funds | Token Types | OZ Base Contracts |
 | --- | --- | --- | --- | --- |
 | TOKEN (ERC-20) | [026](026-tokenomics.md#adr-026-tokenomics) | No (fungible token) | — | `ERC20`, `ERC20Burnable`, `ERC20Permit` (fixed-supply per [ADR 026 § Supply and distribution](026-tokenomics.md#supply-and-distribution); no post-genesis mint function; `ERC20Burnable` is the sink for the 20% burn leg of the slashing path per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn); `ERC20Votes` is intentionally omitted because Governor vote weight is sourced from `CapacityBond.capacityAt × age_ramp` per [ADR 026 § Governance](026-tokenomics.md#governance), so the per-transfer checkpoint cost is not earned) |
-| CapacityBond | [003](003-payments.md#adr-003-payment-model), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` (operator-registry contract; renamed from the prior `StakingRegistry` under v2.1. Adds the lock-to-capacity curve `bond = k × Mbps^α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve), capacity-shortfall auto-downgrade slashing per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing), `isActive(operator)` per [ADR 003](003-payments.md#adr-003-payment-model) `ICapacityBond`, `capacityAt(operator)` and `firstBondedAt(operator)` for the `age_ramp` source on `DecdnGovernor`, and `bindNodeId` / `reclaimNodeId` for the NodeId↔Ethereum-address binding from PR #668) |
+| CapacityBond | [003](003-payments.md#adr-003-payment-model), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | TOKEN | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` (operator-registry contract; renamed from the prior `StakingRegistry` under v2.1. Adds the lock-to-capacity curve `bond = k × Mbps^α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve), capacity-shortfall auto-downgrade slashing per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing), `isActive(operator)` per [ADR 003](003-payments.md#adr-003-payment-model) `ICapacityBond`, `capacityAt(operator)` and `firstBondedAt(operator)` for the `age_ramp` source on `DecdnGovernor`, and `bindNodeId` / `reclaimNodeId` for the NodeId↔Ethereum-address binding from PR #668; under v2.2 also holds and vests PendingCredit positions for Genesis Bond Credits per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits)) |
 | PaymentChannel | [003](003-payments.md#adr-003-payment-model) | Yes | USDC | `Ownable`, `ReentrancyGuard`, `Pausable`, `EIP712` (USDC-only; the USDC address is fixed at deployment; `settleChannel` forwards full balance to `FeeRouter.routeSettlement` rather than skimming inline) |
 | FeeRouter | [026](026-tokenomics.md#adr-026-tokenomics) | Yes (transient) | USDC (transient; all four buckets transfer same-tx) | `AccessControl`, `ReentrancyGuard`, `Pausable` (four-bucket settlement distributor: 60% operator base / 25% buyback-and-burn / 10% treasury / 5% safety per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split); no epoch buckets, no claim windows under v2.1) |
-| OperatorEmissions | [026](026-tokenomics.md#adr-026-tokenomics) | Yes | TOKEN (200M Operator Service Emissions bucket) | `AccessControl`, `ReentrancyGuard`, `Pausable` (distributes the 20% Operator Service Emissions allocation by verified service delivery on a monthly/epoch cadence; reads probe-attested bytes via `FeeRouter.bytesPerEpoch`; auto-deposits into `CapacityBond` so the granted TOKEN is non-withdrawable until full unbond; bucket sunsets per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions)) |
 | SafetyReserve | [026](026-tokenomics.md#adr-026-tokenomics), [028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) | Yes | USDC (5% router bucket + slashing redirect + capacity-shortfall forfeitures), TOKEN (transient until keeper swap) | `AccessControl`, `ReentrancyGuard`, `Pausable` (includes [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) appeal extensions: `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `ratifyAppeal` / `reverseAppeal`; also receives capacity-shortfall bond deltas from `CapacityBond` per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing)) |
 | BuybackBurner | [018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (Balancer V3 swap-and-burn path; receives 25% of every settlement under v2.1, 5× the prior design's volume) |
 | ContentBlacklist | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` (full surface: hash-level — global + regional — operator-level — `addOrigin` / `removeOrigin` / `isOriginBlacklisted` — and the [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) API) |
@@ -35,7 +34,7 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 
 #### Contract Architecture (classDiagram)
 
-The diagram below shows the full contract surface and its primary call relationships. `CapacityBond` is the operator-registry contract; `Governor` reads `capacityAt × age_ramp` from it as the voting-weight source. `OperatorEmissions` distributes the 20% Operator Service Emissions bucket and writes back into `CapacityBond` so granted TOKEN is bonded, not liquid.
+The diagram below shows the full contract surface and its primary call relationships. `CapacityBond` is the operator-registry contract; `Governor` reads `capacityAt × age_ramp` from it as the voting-weight source. Under v2.2, `CapacityBond` also holds the 50M TOKEN Genesis Bond Credit allocation in `PendingCredit` positions per operator and vests them over 24mo via continued operation; there is no separate emissions contract.
 
 ```mermaid
 classDiagram
@@ -53,11 +52,9 @@ classDiagram
         +capacityAt(op, ts)
         +firstBondedAt(op)
         +totalVotingWeightAt(ts)
-        +depositGrant(op, amount)
-    }
-    class OperatorEmissions {
-        +distribute(epoch)
-        +setEmissionCurve(curve)
+        +grantGenesisCredit(op, amount)
+        +accrueGenesisVest(op)
+        +claimVestedCredit(op)
     }
     class BuybackBurner {
         +executeBuyback(amount, minOut)
@@ -79,9 +76,8 @@ classDiagram
     FeeRouter ..> Treasury : 10% USDC (same-tx)
     FeeRouter ..> SafetyReserve : 5% USDC (same-tx)
     FeeRouter ..> CapacityBond : recordSettlement
-    OperatorEmissions ..> FeeRouter : bytesPerEpoch (read)
-    OperatorEmissions ..> CapacityBond : depositGrant (TOKEN auto-bond)
     BuybackBurner ..> BalancerV3Pool : swap USDC→TOKEN
+    Treasury ..> CapacityBond : grantGenesisCredit (TGE one-shot)
     Governor ..> CapacityBond : capacityAt × age_ramp (voting weight)
     Governor ..> SafetyReserve : payout authorization
     CapacityBond ..> SafetyReserve : capacity-shortfall forfeitures
