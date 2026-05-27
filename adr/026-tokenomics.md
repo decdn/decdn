@@ -32,39 +32,37 @@ TOKEN is `ERC20Burnable`; any contract may burn TOKEN it holds via `burn` / `bur
 
 #### Allocation
 
-Thirteen groups summing to 100%, aligned to conventional fundraising-tool taxonomy. The Liquidity Mining Rewards group is retained in the taxonomy at 0% for tool compatibility; its 15pp is redeployed to Protocol-Owned Liquidity.
+Eleven groups summing to 100%. The v2.1 13-group taxonomy is collapsed: Operator Service Emissions (was group 7, 20%) is removed entirely; Liquidity Mining Rewards (was group 8 at 0%) is removed; Airdrops (was group 9 at 3%) is removed at TGE (DAO may fund a later airdrop discretionarily from the operational Treasury sub-bucket); Incentivized Testnet Rewards (was group 10 at 3%) is absorbed into the Genesis Bond Credits program described in [§ Genesis Bond Credits](#genesis-bond-credits). See the v2.2 design spec `docs/superpowers/specs/2026-05-27-remove-operator-emissions-design.md` for the full v2.1→v2.2 delta.
 
-| # | Group | Allocation | Category | Vesting / mechanic |
-|---|---|---:|---|---|
-| 1 | Core Contributors | 12% | Core Contributors | 4-year linear, 12mo cliff |
-| 2 | Advisors | 3% | Core Contributors | 2-year linear, 6mo cliff |
-| 3 | Seed Investors | 9% | Private Investors | 3-year linear, 6mo cliff |
-| 4 | Private Investors | 7% | Private Investors | 3-year linear, 6mo cliff |
-| 5 | DAO Treasury | 15% | Treasury | 4-year linear unlock to Timelock-controlled wallet |
-| 6 | Public Sale | 3% | Public Sale | Genesis-liquid (or 6mo lockup if regulatory posture requires) |
-| 7 | Operator Service Emissions *(see [§ Operator Service Emissions](#operator-service-emissions))* | 20% | Ecosystem Incentives | Service-based emission; auto-deposited into `CapacityBond`; not withdrawable as liquid TOKEN until full unbond |
-| 8 | Liquidity Mining Rewards | 0% | Ecosystem Incentives | Not deployed; 15pp redeployed to group 13 — see [§ POL allocation](#pol-allocation) |
-| 9 | Airdrops | 3% | Ecosystem Incentives | Genesis-claim window (12 weeks); unclaimed sweeps to Treasury |
-| 10 | Incentivized Testnet Rewards | 3% | Ecosystem Incentives | Genesis-claim window (12 weeks) for pre-launch testnet participants |
-| 11 | Misc. Marketing, PR, and KOLs | 3% | Marketing | Treasury-managed, ad-hoc spend within annual budget cap |
-| 12 | Exchange Partnerships | 3% | Marketing | Milestone-based to CEX listings, market-makers |
-| 13 | Liquidity Provision, Market Making *(see [§ POL allocation](#pol-allocation))* | 19% | Liquidity Provision | 4pp MM partner allocation (genesis-liquid) + 15pp Protocol-Owned Liquidity (treasury position on Balancer V3 80/20 per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) |
-| | **Total** | **100%** | | |
+| # | Group | Allocation | Type | Category | Vesting / mechanic |
+|---|---|---:|---|---|---|
+| 1 | Core Contributors | 15% | Internal | Core Contributors | 4-year linear, 12mo cliff |
+| 2 | DAO Treasury | 15% | Internal | Treasury | 5pp earmarked at TGE for [§ Genesis Bond Credits](#genesis-bond-credits); 10pp 4-year linear unlock to Timelock-controlled wallet (operational Treasury) |
+| 3 | Protocol Owned Liquidity | 15% | External | Liquidity Provision | Treasury-owned position on Balancer V3 80/20 per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) |
+| 4 | App Incentives | 14% | External | Ecosystem Incentives | 4-year linear unlock to Timelock-controlled multisig; publisher rebates + integration grants per [§ App Incentives](#app-incentives) |
+| 5 | Seed Investors | 11% | Internal | Private Investors | 3-year linear, 6mo cliff |
+| 6 | Private Investors | 9% | Internal | Private Investors | 3-year linear, 6mo cliff |
+| 7 | Market Making | 5% | External | Liquidity Provision | Genesis-liquid, MM-partner-allocated |
+| 8 | Misc. Marketing, PR, and KOLs | 5% | Internal | Marketing | Treasury-managed, ad-hoc spend within annual budget cap |
+| 9 | Public Sale | 5% | External | Public Sale | Genesis-liquid (or 6mo lockup if regulatory posture requires) |
+| 10 | Advisors | 3% | Internal | Core Contributors | 2-year linear, 6mo cliff |
+| 11 | Exchange Partnerships | 3% | External | Marketing | Milestone-based to CEX listings, market-makers |
+| | **Total** | **100%** | | | |
 
 **Categorical rollup.**
 
 | Category | Allocation | # Groups |
 |---|---:|---:|
-| Core Contributors | 15% | 2 |
-| Private Investors | 16% | 2 |
+| Core Contributors | 18% | 2 |
+| Private Investors | 20% | 2 |
 | Treasury | 15% | 1 |
-| Public Sale | 3% | 1 |
-| Ecosystem Incentives | 26% | 4 (1 zeroed) |
-| Marketing | 6% | 2 |
-| Liquidity Provision | 19% | 1 |
-| **Total** | **100%** | **13** |
+| Public Sale | 5% | 1 |
+| Ecosystem Incentives | 14% | 1 |
+| Marketing | 8% | 2 |
+| Liquidity Provision | 20% | 2 |
+| **Total** | **100%** | **11** |
 
-**Internal / External rollup.** Internal allocations (recipients identified at TGE: Core, Advisors, Seed, Private, Treasury, Public Sale, Marketing-direct) total 52%; External allocations (programmatic distribution: Operator Service Emissions, Airdrops, Testnet, Exchange, LP/MM/POL) total 48%.
+**Internal / External rollup.** Internal (Core, Advisors, Seed, Private, Treasury, Misc Marketing) = 58%; External (POL, App Incentives, Market Making, Public Sale, Exchange Partnerships) = 42%. Public Sale's Type changes from Internal (v2.1) to External (v2.2) to reflect open-window distribution.
 
 **Genesis liquid float (TGE Day 1).**
 
