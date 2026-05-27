@@ -3,11 +3,9 @@
 **Date:** 2026-05-27
 **Status:** Draft
 
-**Supersedes:** the voting-weight clauses of [ADR 009 § Production: Operator-Weighted DAO Governance](009-governance.md#production-operator-weighted-dao-governance) and [ADR 026 § Governance](026-tokenomics.md#governance).
-
 ## Context
 
-Before this ADR, the [ADR 009 § Production](009-governance.md#production-operator-weighted-dao-governance) and [ADR 026 § Governance](026-tokenomics.md#governance) clauses defined DAO voting weight as `declared_capacity_Mbps × age_ramp(months_bonded)`, sourced from `CapacityBond.capacityAt × age_ramp`. The capacity figure is operator-asserted at registration time and only loosely tied to actual delivery — capacity-shortfall slashing ([ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing)) is forward-looking and slow (4-week rolling probe window). A deeply-bonded but lightly-serving operator would carry a vote weight that does not reflect their real contribution to the network.
+DAO voting weight could be keyed on declared capacity — `declared_capacity_Mbps × age_ramp(months_bonded)`, sourced from `CapacityBond.capacityAt × age_ramp` — but the capacity figure is operator-asserted at registration time and only loosely tied to actual delivery: capacity-shortfall slashing ([ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing)) is forward-looking and slow (4-week rolling probe window). A deeply-bonded but lightly-serving operator would then carry a vote weight that does not reflect their real contribution to the network.
 
 The on-chain raw material to fix this already exists. [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter) populates `bytesPerEpoch[operator][epoch]` inline on every `routeSettlement`. This ADR makes that counter the canonical voting-weight source.
 
@@ -73,7 +71,7 @@ The full Solidity surface is documented in [ADR 016 § Contract: FeeRouter](016-
 - `mapping(address => uint64) slashedAtEpoch;` — set by `slash()` and `slashCapacityShortfall()`, cleared by `reverseAppeal` flow per [ADR 028](028-slashing-appeals.md#contract-surface).
 - `function slashedAtEpoch(address op) external view returns (uint64);` — public getter for the Governor.
 
-**`DecdnGovernor` rewrite of `_getVotes`** (pseudocode):
+**`DecdnGovernor._getVotes`** (pseudocode):
 
 ```solidity
 function _getVotes(address op, uint256 timepoint, bytes memory) override returns (uint256) {
@@ -95,7 +93,7 @@ function _getVotes(address op, uint256 timepoint, bytes memory) override returns
 
 `CapacityBond.totalVotingWeightAt(ts)` is no longer consumed by the Governor under this ADR. The getter remains on the contract surface — deprecated — so existing off-chain readers continue to function; flagged for removal in the next contract revision.
 
-`IVotes`/IERC-5805 remains abandoned. The rationale strengthens: voting weight is derived from FeeRouter epoch accounting, not from per-account checkpoint structures, and `GovernorVotes` / `GovernorVotesQuorumFraction` are unused.
+`IVotes`/IERC-5805 is not used: voting weight is derived from FeeRouter epoch accounting, not from per-account checkpoint structures, so `GovernorVotes` / `GovernorVotesQuorumFraction` are unused.
 
 ### Governable parameters with safety bounds
 
@@ -129,7 +127,7 @@ Defended by `age_ramp`. A fresh operator who bonds at `t=0` and serves the entir
 
 ### Slashed-but-still-voting
 
-Defended by the slashing zero-out. Without zero-out, a slashed operator continues voting with their accumulated window bytes for up to N weeks. With zero-out, slashing immediately revokes vote weight for the remainder of the window. This is a tighter response than today's `capacityAt × age_ramp` mechanism (which only reduces vote weight by the bond-reduction ratio).
+Defended by the slashing zero-out. Without zero-out, a slashed operator continues voting with their accumulated window bytes for up to N weeks. With zero-out, slashing immediately revokes vote weight for the remainder of the window. This is a tighter response than a `capacityAt × age_ramp` mechanism, which would only reduce vote weight by the bond-reduction ratio.
 
 ### Concentration
 
@@ -142,7 +140,7 @@ The per-operator cap (`voteCapBps`, default 5%) is the primary concentration def
 - **Voting weight tracks demonstrated network contribution.** An operator who isn't serving has no vote; an operator who is serving heavily has weight proportional to that service (up to the cap).
 - **Reuses existing on-chain accounting.** No new fundamental data flow; `bytesPerEpoch` is already populated. Marginal contract surface is two integer mappings, one trailing-sum helper, one tenure-ramp lookup.
 - **Strengthens skin-in-the-game story.** Combined with [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)'s per-byte operator payment, governance influence and economic upside both scale with actual delivery.
-- **Slashing-zero-out tightens response time.** Slash → immediate vote zero, recovers naturally over `windowEpochs`. Cleaner than the capacityAt-proportional reduction the prior model implied.
+- **Slashing-zero-out tightens response time.** Slash → immediate vote zero, recovers naturally over `windowEpochs`. Cleaner than a capacityAt-proportional reduction.
 
 ### Negative
 
@@ -161,16 +159,16 @@ The per-operator cap (`voteCapBps`, default 5%) is the primary concentration def
 ## Alternatives Considered
 
 1. **Cumulative-lifetime served bytes (no decay).** Mirrors the FeeRouter operator-leg's denominator exactly. Rejected: oldest operators dominate forever; fresh entrants cannot catch up; vote weight does not reflect *current* contribution.
-2. **EWMA-decayed served bytes (single accumulator, exponential decay).** Smoother than fixed-window; no hard edge as epochs fall off; requires one accumulator updated on each settlement and supports a single `_getVotes` SLOAD instead of O(N). Rejected: requires per-settlement on-chain writes to maintain the accumulator (small but non-zero gas), couples vote weight to settlement timing in ways harder to audit, and the fixed-window approach gives operationally-clearer reasoning during governance disputes ("here are the 13 epoch totals"). The fixed-window approach was the user-resolved design choice.
+2. **EWMA-decayed served bytes (single accumulator, exponential decay).** Smoother than fixed-window; no hard edge as epochs fall off; requires one accumulator updated on each settlement and supports a single `_getVotes` SLOAD instead of O(N). Rejected: requires per-settlement on-chain writes to maintain the accumulator (small but non-zero gas), couples vote weight to settlement timing in ways harder to audit, and the fixed-window approach gives operationally-clearer reasoning during governance disputes ("here are the 13 epoch totals").
 3. **No slashing zero-out — let the rolling window do it naturally.** Slashed operators retain accumulated bytes-weight and vote for up to N weeks until the window decays past the slash. Rejected: leaves a meaningful immediate-response gap; the slashing zero-out costs one storage slot per operator and one SLOAD per vote-cast.
 4. **Probe-verified delivery cap multiplier.** Use `min(voucher_bytes, probe_capacity × epoch_length × min_delivery_ratio)` as the per-epoch bytes input. Rejected for now: ties vote weight directly to probe attestation throughput, which is a separate roadmap concern ([ADR 026 § Deferred & Open](026-tokenomics.md#deferred--open) item 2). Available as a future tightening lever if wash-trading economics shift.
 
 ## Cross-ADR Impact
 
-- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** §Production: Operator-Weighted DAO Governance table updated — voting-source row replaced with a pointer to this ADR and the new formula. Clock paragraph re-anchored to `FeeRouter` epoch accounting. Quorum-calibration paragraph reads `FeeRouter.totalBytesInWindow` in place of `CapacityBond.totalVotingWeightAt`. Governable Parameters table adds `windowEpochs` row. Consequences > Negative adds a wash-trading-as-vote-buying bullet.
-- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** Contract Inventory `DecdnGovernor` row reads `FeeRouter` for vote weight. `classDiagram` `FeeRouter` exposes `totalBytesPerEpoch`, `bytesInWindow`, `totalBytesInWindow`; `Governor` edges retargeted. `Contract: FeeRouter` section carries the new mappings, getters, and `setWindowEpochs`. `Contract: CapacityBond` section carries `slashedAtEpoch`. Cross-Contract Call Graph + Complete Call Table list `Governor → FeeRouter: bytesInWindow / totalBytesInWindow`. Deployment Order step 13 (`DecdnGovernor`) lists `FeeRouter` as a non-zero constructor input.
-- **[ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics):** §Governance — `vote_weight` formula and the "Vote weight scales with capacity (Mbps), not bond size" rationale replaced with the served-bytes formula. Governance parameters table `Voting source` row points at FeeRouter + this ADR. §Governable parameters with safety bounds adds `windowEpochs`.
-- **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** `reverseAppeal` path additionally clears `CapacityBond.slashedAtEpoch[op]`. Document this in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface) alongside the existing escrow-release semantics; no other appeal-flow change.
+- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** §Production: Operator-Weighted DAO Governance sources voting weight from this ADR's formula, with its clock anchored to `FeeRouter` epoch accounting and its quorum calibration reading `FeeRouter.totalBytesInWindow`. Its Governable Parameters table carries `windowEpochs`, and its Consequences > Negative notes wash-trading-as-vote-buying.
+- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** Contract Inventory `DecdnGovernor` row reads `FeeRouter` for vote weight. `classDiagram` `FeeRouter` exposes `totalBytesPerEpoch`, `bytesInWindow`, `totalBytesInWindow`; the `Governor` vote-weight edges target `FeeRouter`. `Contract: FeeRouter` section carries the `bytesPerEpoch` / `totalBytesPerEpoch` mappings, getters, and `setWindowEpochs`. `Contract: CapacityBond` section carries `slashedAtEpoch`. Cross-Contract Call Graph + Complete Call Table list `Governor → FeeRouter: bytesInWindow / totalBytesInWindow`. Deployment Order step 13 (`DecdnGovernor`) lists `FeeRouter` as a non-zero constructor input.
+- **[ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics):** §Governance states the served-bytes `vote_weight` formula and points its `Voting source` row at `FeeRouter` + this ADR. §Governable parameters with safety bounds carries `windowEpochs`.
+- **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** the `reverseAppeal` path clears `CapacityBond.slashedAtEpoch[op]` alongside its escrow-release semantics (see [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)); no other appeal-flow change.
 
 ## References
 

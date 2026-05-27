@@ -2,7 +2,6 @@
 
 **Date:** 2026-05-27
 **Status:** Draft
-**Supersedes:** [ADR 034 — Gauge Boost and Voting Escrow](_history/034-gauge-boost-voting-escrow.md), [ADR 035 — Delegator Pool](_history/035-delegator-pool.md), and this ADR's pre-rewrite ve-gauge body.
 
 ## Context
 
@@ -393,13 +392,13 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 ## Cross-ADR Impact
 
-- **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model):** `FeeRouter.routeSettlement` ABI and bucket count change (6 → 4). The same-tx settlement invariant is *strengthened* (now applies to all four buckets). Minor edits to §FeeRouter Integration.
-- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source is `FeeRouter`-derived served-bytes weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders zero-weighted. Multisig bootstrap phase formalized with transition thresholds.
-- **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Supersedes the §Governance "Voting weight" formula above. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, capped per-operator at `voteCapBps` against the bytes-weighted total, zeroed if `CapacityBond.slashedAtEpoch` falls inside the trailing window. `windowEpochs` (default 13) is added to the governable-parameters table above.
+- **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model):** `FeeRouter.routeSettlement` distributes to four buckets, and the same-tx settlement invariant holds across all four (see §FeeRouter Integration).
+- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source is `FeeRouter`-derived served-bytes weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders carry zero weight. The multisig bootstrap phase has explicit transition thresholds.
+- **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Defines the canonical DAO voting-weight formula the §Governance "Voting weight" section above points to. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, capped per-operator at `voteCapBps` against the bytes-weighted total, zeroed if `CapacityBond.slashedAtEpoch` falls inside the trailing window. `windowEpochs` (default 13) is a governable parameter.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** `CapacityBond` holds the `PendingCredit` vesting state and exposes `grantGenesisCredit` / `accrueGenesisVest` / `claimVestedCredit`. `FeeRouter` is the four-bucket settlement distributor. Class diagrams reflect this surface.
 - **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol):** POL is 15% (group 3); MM is 5% (group 7); combined Liquidity-Provision category is 20%. `BuybackBurner` receives 25% of routed USDC at every settlement. §POL Governance formalizes rebalance / withdraw / fee-accounting rules.
 - **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** Slashing applies to `CapacityBond`. `PendingCredit` is slashable alongside `bondedAmount` per [§ Genesis Bond Credits](#genesis-bond-credits).
-- **[ADR 032 — SafetyReserve Appeal-Surface Contract Surface](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface):** Capacity reads replace ve-supply reads where relevant.
+- **[ADR 032 — SafetyReserve Appeal-Surface Contract Surface](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface):** Reads operator capacity from `CapacityBond` where relevant.
 - **[ADR 034 — Gauge Boost and Voting Escrow](_history/034-gauge-boost-voting-escrow.md):** RETIRED. The gauge-boost mechanism, `VotingEscrow` contract, and per-operator gauge-share cap are replaced by the capacity-bond curve. Body archived verbatim in `_history/`.
 - **[ADR 035 — Delegator Pool](_history/035-delegator-pool.md):** RETIRED. The 7% delegator bucket and `DelegatorBuyer` pipeline are deleted entirely; the freed 7pp is absorbed into the four-bucket split. Body archived verbatim in `_history/`.
 
