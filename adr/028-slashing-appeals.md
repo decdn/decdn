@@ -1,6 +1,6 @@
 # ADR 028: Slashing Appeals and Dispute Escalation
 
-**Date:** 2026-05-06
+**Date:** 2026-05-27 (initial 2026-05-06; rebased under v2.1 work-token redesign and v2.2 no-emission rewrite — `CapacityBond` replaces `StakingRegistry`; `PendingCredit` is slashable alongside `bondedAmount`; FeeRouter USDC revenue replaces `OperatorEmissions` distribution as the operator-economics context for cross-subsidy / depletion analysis)
 **Status:** Draft
 
 ## Context

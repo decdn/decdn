@@ -1,6 +1,6 @@
 # ADR 026: Tokenomics
 
-**Date:** 2026-05-25 (substantial rewrite under [spec v2.1 — work-token redesign](../docs/superpowers/specs/2026-05-24-work-token-tokenomics-redesign-v2.1.md))
+**Date:** 2026-05-27 (substantial rewrite under [spec v2.1 — work-token redesign](../docs/superpowers/specs/2026-05-24-work-token-tokenomics-redesign-v2.1.md), then again under [spec v2.2 — no-emission rewrite](../docs/superpowers/specs/2026-05-27-remove-operator-emissions-design.md): 13-group → 11-group, Operator Service Emissions removed, Genesis Bond Credits + App Incentives added)
 **Status:** Draft
 
 ## Context
@@ -259,7 +259,7 @@ N                          = windowEpochs                                       
 - **Per-operator voting cap = 5% of total bytes-weighted weight** (governable `[1%, 25%]`). Single biggest carrier still capped at 5%; cap is the primary defense against bytes-weighted concentration in a power-law-skewed CDN traffic distribution.
 - **Slashing zero-out.** Any slash (including capacity-shortfall) stamps `CapacityBond.slashedAtEpoch[op]`; vote weight is zero for the operator while `slashedAtEpoch[op]` falls inside the trailing window. Successful slash-appeal reversal via [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)'s `reverseAppeal` clears the field. See [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out).
 
-**Non-operator TOKEN holders have ZERO voting weight.** Per the [§ Allocation](#allocation): Core Contributors (15%), Private Investors (16%), Treasury (15%), Public Sale (3%), Airdrops/Testnet (6%), Marketing (6%), Liquidity Provision (19%) — all hold or receive TOKEN, but **none can vote** unless they also bond it to operate.
+**Non-operator TOKEN holders have ZERO voting weight.** Per the [§ Allocation](#allocation) categorical rollup: Core Contributors (18%), Private Investors (20%), Treasury (15%), Public Sale (5%), Ecosystem Incentives / App Incentives (14%), Marketing (8%), Liquidity Provision (20%) — 100% of supply — **none can vote** unless they also bond TOKEN to operate. Served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) further ties weight to delivered bytes, so a TOKEN holder who bonds without actually delivering bytes still accrues zero vote weight.
 
 **Why this is right:**
 
@@ -313,16 +313,16 @@ The voting set is narrow at launch (likely <50 operators in the first 6–12 mon
 
 ### Safety and insurance reserve (5% bucket)
 
-The 5% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve covering incorrect-slashing / appeal reversals, relay / sequencer / payment-channel downtime, and bad-data incidents. Full specification is in [ADR 033](033-safety-insurance-reserve.md#adr-033-safety-and-insurance-reserve); the bucket share grows from the prior 3% to 5% under the v2.1 four-bucket split.
+The 5% safety bucket is held in `SafetyReserve`, a governance-gated incident reserve covering incorrect-slashing / appeal reversals, relay / sequencer / payment-channel downtime, and bad-data incidents. Full specification is in [ADR 033](033-safety-insurance-reserve.md#adr-033-safety-and-insurance-reserve); the bucket share grew from the prior 3% to 5% under the v2.1 four-bucket split and is unchanged under v2.2.
 
-### POL allocation
+### Liquidity Provision allocation (POL + Market Making)
 
-The 19% Liquidity Provision allocation has two sub-allocations:
+The 20% Liquidity Provision category splits across two top-level groups:
 
-- **4pp Market-Maker partner allocation** (genesis-liquid). Distributed to vetted market-maker partners under standard MM agreements for two-sided quoting on CEXes and DEX aggregators.
-- **15pp Protocol-Owned Liquidity** (treasury-deployed). Held by DAO Treasury and deployed as a single-sided 80% TOKEN position on the Balancer V3 80/20 pool per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol), paired with the USDC arm from the pre-seed bootstrap. Earns trading fees (yield flows to Treasury, not to per-holder claims). Cannot be withdrawn without a governance proposal (timelock + quorum).
+- **Market Making — 5pp / 50M TOKEN** (group 7, genesis-liquid). Distributed to vetted market-maker partners under standard MM agreements for two-sided quoting on CEXes and DEX aggregators.
+- **Protocol-Owned Liquidity — 15pp / 150M TOKEN** (group 3, treasury-deployed). Held by DAO Treasury and deployed as a single-sided 80% TOKEN position on the Balancer V3 80/20 pool per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol), paired with the USDC arm from the pre-seed bootstrap. Earns trading fees (yield flows to Treasury, not to per-holder claims). Cannot be withdrawn without a governance proposal (timelock + quorum).
 
-POL is *protocol-owned*; it doesn't create passive yield to any external holder. Trading-fee yield is treasury-direct (not re-routed through `FeeRouter`), preserving the FeeRouter's strict per-byte-settlement accounting. The deeper-than-typical 19% allocation is defensible for an infrastructure protocol focused on liquidity depth as a primary value-accrual lever; the absence of a Liquidity Mining program (15pp formerly deployed there is now POL) eliminates the residual Howey prong-4 exposure that an LP-token-yield program would carry.
+POL is *protocol-owned*; it doesn't create passive yield to any external holder. Trading-fee yield is treasury-direct (not re-routed through `FeeRouter`), preserving the FeeRouter's strict per-byte-settlement accounting. The deeper-than-typical 20% combined allocation is defensible for an infrastructure protocol focused on liquidity depth as a primary value-accrual lever; the absence of a Liquidity Mining program (15pp formerly deployed there is now POL) eliminates the residual Howey prong-4 exposure that an LP-token-yield program would carry.
 
 ### Bootstrap mechanism — pre-seed USDC
 
@@ -333,7 +333,7 @@ Approximate use of pre-seed USDC:
 | Use | Approx allocation | Notes |
 |---|---:|---|
 | Operator infrastructure subsidies (direct USDC) | ~55% | Covers VPS/bandwidth for first 12 months for early operators; pairs with [§ Genesis Bond Credits](#genesis-bond-credits) (for testnet-eligible operators) to make first-year operator unit economics positive |
-| Genesis POL seed (USDC side of 80/20 Balancer) | ~30% | Pairs with the 15pp treasury-owned TOKEN POL position; the deeper POL allocation under v2.1 motivates a larger USDC-side seed |
+| Genesis POL seed (USDC side of 80/20 Balancer) | ~30% | Pairs with the 15pp treasury-owned TOKEN POL position; the deeper POL allocation vs the prior 10%-POL design motivates a larger USDC-side seed |
 | `SafetyReserve` genesis pre-fund (USDC) | ~10% | Covers incidents before fee inflows reach steady state |
 | Audits, legal, contingency | ~5% | Operational, not protocol-bound |
 
@@ -392,7 +392,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 - **Capacity-claim verification at scale.** The 7-day initial probe window assumes probe throughput is non-binding. With 100+ operators registering concurrently in the first months, probe scheduling may need a queue/throttle. Tracked in [§ Deferred & Open](#deferred--open).
 - **k governance volatility.** k=12.6 is a discovered constant for the chosen 1G target bond (50K TOKEN). Governance changes to k can shift the entire bond curve. The k bound is parameterized via the 1G-tier bond range rather than as a raw range to constrain volatility; see [§ Deferred & Open](#deferred--open).
 - **Genesis Bond Credit weighting precision.** The testnet-contribution score formula in [§ Genesis Bond Credits](#genesis-bond-credits) is described in skeletal form; exact normalization, minimum thresholds, and per-operator caps need specification before the TGE grant window opens. Recommend modeling in `finance/notebooks/` against testnet telemetry. Tracked in [§ Deferred & Open](#deferred--open).
-- **POL governance surface.** The 19% POL position is large and needs explicit governance controls — see [ADR 018 § POL Governance](018-liquidity-strategy.md#pol-governance) for the canonical specification.
+- **POL governance surface.** The 15% POL position (group 3) is large — and combined with the 5% MM allocation (group 7) the 20% Liquidity-Provision category is at the upper end of the typical 5–15% DeFi range — and needs explicit governance controls. See [ADR 018 § POL Governance](018-liquidity-strategy.md#pol-governance) for the canonical specification.
 - **Convex-capture-style wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This is structurally limited because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Tracked in [§ Deferred & Open](#deferred--open).
 
 ## Cross-ADR Impact
@@ -401,7 +401,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 - **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source replaced — was `VotingEscrow.balanceOfAt`, then `CapacityBond.capacityAt × age_ramp` under v2.2 pre-ADR-036, now `FeeRouter`-derived served-bytes-weighted weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders zero-weighted. Multisig bootstrap phase formalized with transition thresholds.
 - **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Supersedes the §Governance "Voting weight" formula above. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, capped per-operator at `voteCapBps` against the bytes-weighted total, zeroed if `CapacityBond.slashedAtEpoch` falls inside the trailing window. `windowEpochs` (default 13) is added to the governable-parameters table above.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** OperatorEmissions removed from Contract Inventory (v2.1's new contract is deleted under v2.2); CapacityBond extended with PendingCredit vesting + grantGenesisCredit/accrueGenesisVest/claimVestedCredit. VotingEscrow and DelegatorBuyer stay removed. FeeRouter unchanged from v2.1. Class diagrams updated.
-- **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol):** POL grows 10% → 19% (15pp redeployment from former LM bucket); BuybackBurner sees 5× volume. New §POL Governance section formalizes rebalance / withdraw / fee-accounting rules.
+- **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol):** POL grows from prior 10% to 15% (5pp redeployment from the retired Liquidity Mining bucket); MM grows from 4pp (v2.1) to 5pp (v2.2); combined Liquidity-Provision category is 20%. BuybackBurner sees 5× volume vs prior. New §POL Governance section formalizes rebalance / withdraw / fee-accounting rules.
 - **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** Slashing applies to `CapacityBond` (not `StakingRegistry`); status flipped from Locked-for-implementation back to Draft pending the CapacityBond rebase.
 - **[ADR 032 — SafetyReserve Appeal-Surface Contract Surface](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface):** Capacity reads replace ve-supply reads where relevant.
 - **[ADR 034 — Gauge Boost and Voting Escrow](_history/034-gauge-boost-voting-escrow.md):** RETIRED. The gauge-boost mechanism, `VotingEscrow` contract, and per-operator gauge-share cap are replaced by the capacity-bond curve. Body archived verbatim in `_history/`.
@@ -416,4 +416,4 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 5. **App Incentives 10/4 split governance.** The publisher-rebate / integration-grant split (100M / 40M indicative) is a governance norm, not on-chain enforced. Confirm DAO can rebalance within the 14% envelope without requiring an ADR amendment.
 6. **Liquid-bond wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This isn't strictly possible under work-token because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Flag for future ADR if observed.
 7. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the canonical L2 and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Particularly relevant for the Airdrops bucket if airdrop recipients are on other chains.
-8. **POL trading-fee accounting.** The 19% POL position earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the four-bucket split if that improves predictability of treasury yield.
+8. **POL trading-fee accounting.** The 15% POL position (group 3) earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the four-bucket split if that improves predictability of treasury yield.

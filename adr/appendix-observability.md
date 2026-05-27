@@ -157,9 +157,9 @@ These replace the identical names from [ADR 015](015-zero-rtt.md#adr-015-quic-0-
 
 #### Tokenomics Metrics
 
-Per [ADR 026](026-tokenomics.md#adr-026-tokenomics) (v2.1 work-token rewrite). These metrics expose the `FeeRouter`, `CapacityBond`, `OperatorEmissions`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket), [ADR 009](009-governance.md#adr-009-governance-model)).
+Per [ADR 026](026-tokenomics.md#adr-026-tokenomics) (v2.2 no-emission work-token rewrite). These metrics expose the `FeeRouter`, `CapacityBond`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket), [ADR 009](009-governance.md#adr-009-governance-model)).
 
-A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `OperatorEmissions`, `SafetyReserve`, `BuybackBurner`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
+A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `SafetyReserve`, `BuybackBurner`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
 
 ##### FeeRouter Metrics
 
@@ -168,13 +168,24 @@ A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `
 | `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={operator_base,burn,treasury,safety}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. All four legs transfer same-tx under v2.1 ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). |
 | `decdn_fee_router_inflow_usdc_rate` | Gauge | R | `bucket={operator_base,burn,treasury,safety}` | Derived (rolling 7-epoch avg over `..._inflow_usdc_total`) | Governance + capacity-planning dashboards | Rolling-average per-bucket USDC inflow per epoch. |
 
-##### Operator Service Emissions Metrics
+##### Served-Bytes Voting Metrics
+
+Per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight): the per-operator `bytesPerEpoch` and trailing-window sums on `FeeRouter` are the governance vote-weight source. The previously-exposed `OperatorEmissions` metrics are removed under v2.2 — the contract is deleted and no ongoing TOKEN-denominated service emission exists.
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_operator_bytes_delivered` | Gauge | R | `epoch` | `FeeRouter.bytesPerEpoch(operator, epoch)` (RPC) | Operator dashboard, emissions debugging | This node's analytics-counter byte share for the labeled epoch — input to `OperatorEmissions.distribute`. |
-| `decdn_operator_emissions_token_total` | Counter | R | — | `OperatorEmissions.GrantDeposited(operator, epoch, amount)` events | Operator dashboard | Cumulative TOKEN granted to this operator across all epochs via `OperatorEmissions`; auto-bonded into `CapacityBond` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). |
-| `decdn_operator_emissions_remaining_bucket_token` | Gauge | R | — | `OperatorEmissions.remainingBucket()` (RPC) | Governance dashboard | Remaining TOKEN in the 200M Operator Service Emissions bucket; sunsets to Treasury when exhausted or by governance. |
+| `decdn_operator_bytes_delivered` | Gauge | R | `epoch` | `FeeRouter.bytesPerEpoch(operator, epoch)` (RPC) | Operator dashboard, governance dashboard | This operator's served-bytes share for the labeled epoch — input to the trailing-window vote-weight numerator per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). |
+| `decdn_operator_bytes_in_window` | Gauge | R | `window={windowEpochs}` | `FeeRouter.bytesInWindow(operator, currentEpoch, windowEpochs)` (RPC) | Operator dashboard, governance dashboard | This operator's trailing-window served-bytes sum — the pre-cap, pre-`age_ramp` numerator of the vote-weight formula per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). |
+| `decdn_capacity_bond_slashed_at_epoch` | Gauge | R | — | `CapacityBond.slashedAtEpoch(operator)` (RPC) | Governance dashboard, operator alerting | The epoch of this operator's most recent slash; zero if never slashed. Vote weight is zero while this watermark falls inside the trailing window per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out). |
+
+##### Genesis Bond Credit Metrics
+
+Per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits): a bounded, one-shot, 24-month-vest TOKEN grant to verified pre-launch testnet operators, held in `CapacityBond.PendingCredit`. There is no ongoing emission to expose; these metrics let an operator track their vesting position.
+
+| Metric | Type | Tier | Labels | Source | Consumer | Description |
+|--------|------|------|--------|--------|----------|-------------|
+| `decdn_capacity_bond_pending_credit_total_token` | Gauge | R | — | `CapacityBond.pendingCredit(operator).total` (RPC) | Operator dashboard | This operator's total Genesis Bond Credit grant (vested + unvested), zero if not eligible. |
+| `decdn_capacity_bond_pending_credit_vested_token` | Gauge | R | — | `CapacityBond.pendingCredit(operator).vested` (RPC) | Operator dashboard | This operator's vested-but-still-bonded portion of the Genesis Bond Credit grant. |
 
 ##### CapacityBond Metrics
 

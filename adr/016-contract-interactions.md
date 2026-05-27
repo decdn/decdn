@@ -1,6 +1,6 @@
 # ADR 016: Smart Contract Interaction Model
 
-**Date:** 2026-05-25 (substantial rewrite under [spec v2.1 — work-token redesign](../docs/superpowers/specs/2026-05-24-work-token-tokenomics-redesign-v2.1.md))
+**Date:** 2026-05-27 (substantial rewrite under [spec v2.1 — work-token redesign](../docs/superpowers/specs/2026-05-24-work-token-tokenomics-redesign-v2.1.md), then again under [spec v2.2 — no-emission rewrite](../docs/superpowers/specs/2026-05-27-remove-operator-emissions-design.md): `OperatorEmissions` contract deleted, `CapacityBond.PendingCredit` extension added)
 **Status:** Draft
 
 ## Context

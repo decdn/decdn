@@ -1,6 +1,6 @@
 # ADR 009: Governance Model
 
-**Date:** 2026-05-25 (substantial rewrite under [spec v2.1 — work-token redesign](../docs/superpowers/specs/2026-05-24-work-token-tokenomics-redesign-v2.1.md))
+**Date:** 2026-05-27 (substantial rewrite under [spec v2.1 — work-token redesign](../docs/superpowers/specs/2026-05-24-work-token-tokenomics-redesign-v2.1.md); voting-weight clauses then superseded by [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) under [spec v2.2 served-bytes voting design](../docs/superpowers/specs/2026-05-27-served-bytes-voting-design.md))
 **Status:** Draft
 
 ## Context

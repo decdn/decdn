@@ -1,23 +1,23 @@
 # ADR 018: Liquidity Strategy (Balancer 80/20 POL)
 
-**Date:** 2026-05-25 (rewrite under [spec v2.1 — work-token redesign](../docs/superpowers/specs/2026-05-24-work-token-tokenomics-redesign-v2.1.md))
+**Date:** 2026-05-27 (rewrite under [spec v2.1 — work-token redesign](../docs/superpowers/specs/2026-05-24-work-token-tokenomics-redesign-v2.1.md), with [spec v2.2 — no-emission rewrite](../docs/superpowers/specs/2026-05-27-remove-operator-emissions-design.md) bumping MM 4pp → 5pp and combined Liquidity-Provision to 20%)
 **Status:** Draft
 
 ## Context
 
-> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) alignment.** Under v2.1, this ADR's `BuybackBurner` is router-driven (25% of routed USDC at settlement, not manual treasury transfers). The pool design is unchanged — Balancer V3, 80/20 TOKEN/USDC, 1% swap fee, MEV protection via TWAP + `minTokenOut` + Flashbots-style private-RPC routing + per-epoch liquidity cap, POL custody by the Timelock. **The genesis liquidity allocation grows to 19% of supply under v2.1** (4pp Market-Maker partner + 15pp Protocol-Owned Liquidity), up from 10% in the prior tokenomics. The 15pp POL growth absorbs the 15pp redeployed from the retired Liquidity Mining Rewards bucket.
+> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) alignment.** Under v2.2, this ADR's `BuybackBurner` is router-driven (25% of routed USDC at settlement, not manual treasury transfers — the change introduced under v2.1 and carried forward). The pool design is unchanged — Balancer V3, 80/20 TOKEN/USDC, 1% swap fee, MEV protection via TWAP + `minTokenOut` + Flashbots-style private-RPC routing + per-epoch liquidity cap, POL custody by the Timelock. **The combined Liquidity-Provision category is 20% of supply under v2.2** (5pp Market-Maker partner / group 7 + 15pp Protocol-Owned Liquidity / group 3 per [ADR 026 § Allocation](026-tokenomics.md#allocation)), up from 10% (POL-only) in the prior tokenomics. POL grew from 10% to 15% under v2.1 — absorbing the 5pp redeployed from the retired Liquidity Mining Rewards bucket — and is unchanged at 15% under v2.2; MM grew from 4pp (v2.1) to 5pp (v2.2).
 
 Buyback execution is deferred to production because thin TOKEN/USDC pool liquidity at genesis cannot absorb buyback flow without unacceptable slippage. [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model) recommends TWAP execution as MEV mitigation but does not specify how pool depth is created.
 
 Questions answered by this ADR:
 
-1. How is the 19% genesis liquidity-provision allocation ([ADR 026 § Allocation](026-tokenomics.md#allocation)) actually deployed?
+1. How is the 20% combined Liquidity-Provision allocation ([ADR 026 § Allocation](026-tokenomics.md#allocation)) actually deployed across POL and MM?
 2. Is liquidity mercenary (LP rewards / liquidity mining) or protocol-owned?
 3. Which venue and pool type — Uniswap V3 concentrated, Uniswap V2 full-range, Balancer weighted, or other?
 4. How does buyback execution interact with the pool to avoid self-inflicted price impact?
 5. Who can rebalance / withdraw POL, and how do POL trading-fee earnings flow?
 
-The treasury holds the 15pp Protocol-Owned Liquidity allocation (150M of the 1B supply) and is USDC-poor at PoC scale. The 4pp Market-Maker partner allocation (40M TOKEN) is distributed to vetted MM partners (e.g., GSR, Wintermute, Auros, Flowdesk) under standard MM agreements for two-sided quoting on CEXes and DEX aggregators and is genesis-liquid. The small protocol team has no bandwidth to operate a concentrated-liquidity keeper stack; this favours a venue that minimizes USDC requirements and operational burden.
+The treasury holds the 15pp Protocol-Owned Liquidity allocation (150M of the 1B supply) and is USDC-poor at PoC scale. The 5pp Market-Maker partner allocation (50M TOKEN) is distributed to vetted MM partners (e.g., GSR, Wintermute, Auros, Flowdesk) under standard MM agreements for two-sided quoting on CEXes and DEX aggregators and is genesis-liquid. The small protocol team has no bandwidth to operate a concentrated-liquidity keeper stack; this favours a venue that minimizes USDC requirements and operational burden.
 
 ## Decision
 
@@ -56,7 +56,7 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 
 ### POL Governance
 
-The 19% combined POL+MM allocation is on the high end for general DeFi (typical 5–15%) and is large enough that governance controls on its operation are load-bearing. (Resolves v2.1 spec Open Q #4 — POL management governance: rebalance authority, withdraw cap, and trading-fee accounting — and #8 — trading-fee routing.)
+The 20% combined POL+MM allocation is on the high end for general DeFi (typical 5–15%) and is large enough that governance controls on its operation are load-bearing. (Resolves v2.1 spec Open Q #4 — POL management governance: rebalance authority, withdraw cap, and trading-fee accounting — and #8 — trading-fee routing.)
 
 **Rebalance authority.** The 80/20 weight is fixed at pool creation per Balancer V3 weighted-pool semantics; the curve handles intra-pool rebalancing via arbitrage. Governance may *change the pool* (deploy a new pool with different weights, migrate POL there) only via a standard governance proposal under the 48-hour timelock. There is no per-block rebalance keeper.
 
@@ -74,7 +74,7 @@ Permitted operations within these bounds:
 
 **Trading-fee accounting.** POL earns trading fees from third-party swaps against the pool (and from the protocol's own buyback swaps). Accrued fees flow to the Timelock-custodied BPT position; they are **not** re-routed through `FeeRouter` (this preserves `FeeRouter`'s strict per-byte-settlement accounting and resolves Open Q #8 — POL trading-fee yield is treasury-direct revenue). Governance may withdraw accrued trading fees to the treasury via the same 10%/30-day-cap proposal path. The expected baseline yield from POL trading fees at PoC scale is modest (under-trafficked pool); the strategic purpose of POL is depth and price stability, not yield.
 
-**Why POL-heavy is consistent with work-token.** POL is *protocol-owned*; it doesn't create passive yield to any external holder. Trading-fee yield flows to treasury (operator-governed); no individual holder receives passive returns. The 19% combined allocation is defensible for an infrastructure protocol focused on liquidity depth as a primary value-accrual lever, comparable to Olympus Pro / OHM-style POL-heavy strategies but without the rebase mechanics that made those problematic. Removing LM eliminates the Howey-prong-4 exposure that an LP-token-yield program would carry.
+**Why POL-heavy is consistent with work-token.** POL is *protocol-owned*; it doesn't create passive yield to any external holder. Trading-fee yield flows to treasury (operator-governed); no individual holder receives passive returns. The 20% combined allocation is defensible for an infrastructure protocol focused on liquidity depth as a primary value-accrual lever, comparable to Olympus Pro / OHM-style POL-heavy strategies but without the rebase mechanics that made those problematic. Removing LM eliminates the Howey-prong-4 exposure that an LP-token-yield program would carry.
 
 ### Buyback inflow source and rate (router-driven per [ADR 026](026-tokenomics.md#adr-026-tokenomics))
 
@@ -172,7 +172,7 @@ Criteria 1–4 are quantitative; governance voters verify them off-chain before 
 - Fee capture per dollar of TVL is lower than a well-managed V3 concentrated position.
 - Aggregator routing density for Balancer V3 pools on Arbitrum is lower than for Uniswap V3 (and materially lower than for Balancer V2). V3 is newer; aggregator coverage and solver integrations are still maturing. A transient concern that should improve as V3 ages.
 - **Security — realized V2 event, V3 shorter track record.** On 2025-11-03, Balancer V2 Composable Stable Pools were exploited for ~$125M across multiple chains. Root cause (per Certora, Trail of Bits, OpenZeppelin post-mortems): a rounding-direction bug in `_upscale`/`_downscale` latent since 2021. The exploit affected V2 Composable Stable Pools specifically, **not** V2 standard Weighted Pools and **not** Balancer V3. Certora explicitly cites V3's new Vault architecture as mitigating this bug class. This ADR uses V3 (not V2) and further restricts the choice to **standard V3 Weighted Pools with no hooks**. **Residual risk:** V3 has been in production materially less time than V2 and has fewer integration-hours behind its audits. The protocol team MUST track Balancer security advisories.
-- Treasury bears impermanent loss directly. With the 19% allocation under v2.1 (vs 10% prior), absolute IL exposure scales accordingly. Buyback-and-burn provides an indirect reward loop (fees → buyback → TOKEN appreciation → LP position value), and the 5× higher burn flow under v2.1 strengthens that loop. Worst-case IL exposure is bounded by the 15% Protocol-Owned Liquidity allocation plus the paired USDC seed.
+- Treasury bears impermanent loss directly. With the 20% combined Liquidity-Provision allocation under v2.2 (vs 10% prior), absolute IL exposure scales accordingly. Buyback-and-burn provides an indirect reward loop (fees → buyback → TOKEN appreciation → LP position value), and the 5× higher burn flow under v2.1/v2.2 strengthens that loop. Worst-case IL exposure is bounded by the 15% Protocol-Owned Liquidity allocation plus the paired USDC seed.
 - One new interface method (`setPool(address)`) must be added to `IBuybackBurner` — a minor extension, but must be reflected in the [ADR 003](003-payments.md#adr-003-payment-model) interface block. V3's approvals footgun must also be documented in deployment runbooks.
 - **Mandatory private-RPC dependency.** A third-party operational dependency on the chosen private-bundle provider for the production L2 — provider downtime or de-listing of the protocol's bundles is a new failure mode. Mitigated by selecting a provider with a strong uptime track record and keeping the keeper code provider-agnostic.
 - **5× higher buyback flow vs prior design.** The per-epoch liquidity cap is binding more frequently; pool depth and cap sizing must scale with revenue growth or burns will queue. This is the principal operational risk introduced by v2.1's 25% burn share.
@@ -184,4 +184,4 @@ Criteria 1–4 are quantitative; governance voters verify them off-chain before 
 - [ADR 003 — Payment Channels (IBuybackBurner interface)](003-payments.md#buybackburner)
 - [ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)
 - [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model)
-- [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics) — source of the four-bucket FeeRouter split (60/25/10/5), the 25% buyback share, the 19% POL allocation, the POL governance bounds, and the v2.1 work-token framing
+- [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics) — source of the four-bucket FeeRouter split (60/25/10/5), the 25% buyback share, the 15% POL allocation (group 3) within the 20% combined Liquidity-Provision category, the POL governance bounds, and the v2.2 work-token framing
