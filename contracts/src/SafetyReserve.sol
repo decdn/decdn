@@ -366,6 +366,10 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     ///      than taken from the caller (I2 fix). This closes the unverified-
     ///      operator hole where an appellant could open an appeal naming any
     ///      operator and force the multisig to verify off-chain.
+    ///      `slashRecords` is a view on a trusted, immutable contract; the
+    ///      third tuple element (`slashAmount`) is intentionally discarded
+    ///      (restitution is capped at `maxAppealRestitution` independently).
+    // slither-disable-next-line unused-return
     function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash)
         external
         override
@@ -373,14 +377,7 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
         whenNotPaused
         returns (uint256 appealId)
     {
-        // `slashRecords` is a view call on a trusted protocol contract
-        // (CapacityBond), set immutable in this contract's constructor.
-        // No reentrancy surface — the analyzer flags any external call
-        // followed by a later state write regardless of mutability. The
-        // third tuple element (`slashAmount`) is intentionally discarded:
-        // restitution is capped at `maxAppealRestitution` independently.
         // aderyn-ignore-next-line(reentrancy-state-change)
-        // slither-disable-next-line unused-return
         (address operator, uint64 slashedAt_,) = capacityBond.slashRecords(slashId);
         if (operator == address(0) || slashedAt_ == 0) revert UnknownSlash(slashId);
         // forge-lint: disable-next-line(block-timestamp)
