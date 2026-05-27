@@ -7,7 +7,7 @@
 
 ## Context
 
-Before this ADR, the [ADR 009 § Production](009-governance.md#production-operator-weighted-dao-governance) and [ADR 026 § Governance](026-tokenomics.md#governance) clauses defined DAO voting weight as `declared_capacity_Mbps × age_ramp(months_bonded)`, sourced from `CapacityBond.capacityAt × age_ramp`. The capacity figure is operator-asserted at registration time and only loosely tied to actual delivery — capacity-shortfall slashing ([ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing)) is forward-looking and slow (4-week rolling probe window). A deeply-bonded but lightly-serving operator would carry a vote weight that does not reflect their real contribution to the network.
+Before this ADR, the [ADR 009 § Production](009-governance.md#production-operator-weighted-dao-governance) and [ADR 026 § Governance](026-tokenomics.md#governance) clauses defined DAO voting weight as `declared_capacity_Mbps × age_ramp(months_bonded)`, sourced from `CapacityBond.capacityAt × age_ramp`. The capacity figure is operator-asserted at registration time and only loosely tied to actual delivery. A deeply-bonded but lightly-serving operator would carry a vote weight that does not reflect their real contribution to the network.
 
 The on-chain raw material to fix this already exists. [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter) populates `bytesPerEpoch[operator][epoch]` inline on every `routeSettlement`. This ADR makes that counter the canonical voting-weight source.
 
@@ -49,7 +49,7 @@ Where `t` is the OpenZeppelin Governor timepoint (timestamp clock per ERC-6372, 
 
 ### Slashing zero-out
 
-On any slash invocation (`CapacityBond.slash`, including capacity-shortfall slashing per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing)), `CapacityBond` stamps `slashedAtEpoch[op] = epoch(block.timestamp)`. The Governor's `_getVotes(op, t)` returns zero whenever `slashedAtEpoch[op] >= epoch(t) - N + 1` — i.e., whenever the slash falls inside the current trailing window. Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
+On any slash invocation (`CapacityBond.slash`), `CapacityBond` stamps `slashedAtEpoch[op] = epoch(block.timestamp)`. The Governor's `_getVotes(op, t)` returns zero whenever `slashedAtEpoch[op] >= epoch(t) - N + 1` — i.e., whenever the slash falls inside the current trailing window. Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
 
 On successful slash-appeal **reversal** via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `reverseAppeal` path (the path that determines the operator was wrongly slashed), `CapacityBond` clears `slashedAtEpoch[op]` back to zero. `ratifyAppeal` (which only authorizes SafetyReserve restitution without modifying the on-chain slash per [ADR 028 § Decision](028-slashing-appeals.md#decision)) does **not** clear the field.
 
@@ -70,7 +70,7 @@ The full Solidity surface is documented in [ADR 016 § Contract: FeeRouter](016-
 
 **`CapacityBond` additions:**
 
-- `mapping(address => uint64) slashedAtEpoch;` — set by `slash()` and `slashCapacityShortfall()`, cleared by `reverseAppeal` flow per [ADR 028](028-slashing-appeals.md#contract-surface).
+- `mapping(address => uint64) slashedAtEpoch;` — set by `slash()`, cleared by `reverseAppeal` flow per [ADR 028](028-slashing-appeals.md#contract-surface).
 - `function slashedAtEpoch(address op) external view returns (uint64);` — public getter for the Governor.
 
 **`DecdnGovernor` rewrite of `_getVotes`** (pseudocode):
@@ -163,7 +163,7 @@ The per-operator cap (`voteCapBps`, default 5%) is the primary concentration def
 1. **Cumulative-lifetime served bytes (no decay).** Mirrors the FeeRouter operator-leg's denominator exactly. Rejected: oldest operators dominate forever; fresh entrants cannot catch up; vote weight does not reflect *current* contribution.
 2. **EWMA-decayed served bytes (single accumulator, exponential decay).** Smoother than fixed-window; no hard edge as epochs fall off; requires one accumulator updated on each settlement and supports a single `_getVotes` SLOAD instead of O(N). Rejected: requires per-settlement on-chain writes to maintain the accumulator (small but non-zero gas), couples vote weight to settlement timing in ways harder to audit, and the fixed-window approach gives operationally-clearer reasoning during governance disputes ("here are the 13 epoch totals"). The fixed-window approach was the user-resolved design choice.
 3. **No slashing zero-out — let the rolling window do it naturally.** Slashed operators retain accumulated bytes-weight and vote for up to N weeks until the window decays past the slash. Rejected: leaves a meaningful immediate-response gap; the slashing zero-out costs one storage slot per operator and one SLOAD per vote-cast.
-4. **Probe-verified delivery cap multiplier.** Use `min(voucher_bytes, probe_capacity × epoch_length × min_delivery_ratio)` as the per-epoch bytes input. Rejected for now: ties vote weight directly to probe attestation throughput, which is a separate roadmap concern ([ADR 026 § Deferred & Open](026-tokenomics.md#deferred--open) item 2). Available as a future tightening lever if wash-trading economics shift.
+4. **Probe-verified delivery cap multiplier.** Use `min(voucher_bytes, probe_capacity × epoch_length)` as the per-epoch bytes input. Rejected: this would require re-introducing probe-vs-declared-capacity enforcement on-chain, the same machinery that was deliberately removed alongside capacity-shortfall slashing in the same revision of [ADR 026](026-tokenomics.md#adr-026-tokenomics). The fixed-window served-bytes accounting plus the per-operator cap covers the threat surface; revisit only if wash-trading economics shift materially.
 
 ## Cross-ADR Impact
 

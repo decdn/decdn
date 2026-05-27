@@ -98,7 +98,6 @@ bond_required(Mbps) = k × Mbps^α
 | α (exponent) | 1.2 | [1.0, 1.8] | 1.0 = linear (no decentralization pressure); 1.8 = strong concentration penalty |
 | k (bond constant, TOKEN) | 12.6 | bounded by 1G tier ∈ [10K, 200K TOKEN] | Picked so `bond_required(1000) ≈ 50,000 TOKEN` |
 | `MAX_CAPACITY_PER_OPERATOR` | 200 Gbps | [50, 1000] Gbps | Prevents one operator cornering edge-tier capacity |
-| `min_delivery_ratio` | 70% | [50%, 90%] | Min sustained delivery as fraction of declared capacity (95th-percentile over 7-day probe window). Lower = more forgiving; higher = stricter |
 
 **Worked numbers at α=1.2, k=12.6.**
 
@@ -112,10 +111,9 @@ The super-linear curve makes high-capacity operators pay more per Mbps. At α=1.
 
 **Bond lifecycle.**
 
-- `CapacityBond.register(declaredMbps)` deposits the bond and emits `CapacityClaimed(operator, Mbps)`.
-- The probe service samples the operator over a 7-day window using the existing `cdn/probe/v1` ALPN ([ADR 013](013-schema-evolution.md#adr-013-schema-evolution)). If 95th-percentile sustained delivery falls below `min_delivery_ratio × declaredMbps`, registration auto-reverts the bond minus a fixed probe-cost fee (~50 TOKEN) deposited to the treasury.
-- Re-registration at a lower tier is permitted at any time; re-registration at a higher tier requires a new probe window.
-- **Unbonding window: 14 days, slashable during unbonding.** Sized for capacity-claim-verification overlap, not pure security — the binding consideration is the probe window plus a safety margin.
+- `CapacityBond.register(declaredMbps)` deposits the bond and emits `CapacityClaimed(operator, Mbps)`. Declared capacity is operator-self-attested; it is not verified at registration. Vote weight, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), is sourced from `FeeRouter.bytesInWindow` (proven delivered bytes), not from declared capacity, so over-declaration does not translate into governance influence; the bond cost is the primary structural disincentive against tier inflation.
+- Re-registration at a different tier is permitted at any time, subject to the same `bond_required(declaredMbps)` deposit/refund.
+- **Unbonding window: 14 days, slashable during unbonding.** Sized to exceed the [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) 5-day `SlashJudge` evidence-presentation window with a 9-day safety margin so misbehavior detected just before unbond initiation still has bond available to slash; the `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is enforced as a paired cross-parameter check on the `SlashJudge` and `CapacityBond` setters per [ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period).
 
 **Supply impact across scale scenarios.**
 
@@ -212,14 +210,6 @@ Group 4 (14% / 140M TOKEN) funds demand-side adoption — publishers serving con
 
 **Constraints.** App Incentives recipients are **not** eligible for [§ Genesis Bond Credits](#genesis-bond-credits) and vice versa. Co-marketing spend (case studies, conferences, advertising) is funded from the separate Misc. Marketing bucket (group 8), not from App Incentives.
 
-### Capacity-shortfall slashing
-
-A deterministic slashing path that defends against wash-trading by measuring actual delivery against the declared tier — an operator cannot inflate apparent network share by faking traffic.
-
-- If 4-week rolling verified delivery is below `min_delivery_ratio × declared_capacity`, the operator is auto-downgraded to the next-lower tier; the bond delta (`current_tier_bond − new_tier_bond`) is forfeit to `SafetyReserve`.
-- Deterministic on probe data; no governance vote needed. Probe data is on-chain by virtue of the existing `cdn/probe/v1` attestation flow.
-- `min_delivery_ratio` default 70%, governable within [50%, 90%]. Lower values are more forgiving; higher values are stricter.
-
 ### Slashing and burn
 
 **Slashing rates.** 5% / 15% / 50% escalation tiers, lifetime offense counter (`uint32`, monotonically increasing), increasing reset periods, challenge-bond mechanics. Applied to the `CapacityBond`.
@@ -253,7 +243,7 @@ N                          = windowEpochs                                       
 - Defends against "buy your way to instant governance" attacks on both axes: `age_ramp` gates speed-to-influence by tenure, and the rolling bytes window requires sustained activity.
 - Vote weight scales with demonstrated served bytes, not declared capacity, not bond size — see [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) for the full derivation.
 - **Per-operator voting cap = 5% of total bytes-weighted weight** (governable `[1%, 25%]`). Single biggest carrier still capped at 5%; cap is the primary defense against bytes-weighted concentration in a power-law-skewed CDN traffic distribution.
-- **Slashing zero-out.** Any slash (including capacity-shortfall) stamps `CapacityBond.slashedAtEpoch[op]`; vote weight is zero for the operator while `slashedAtEpoch[op]` falls inside the trailing window. Successful slash-appeal reversal via [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)'s `reverseAppeal` clears the field. See [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out).
+- **Slashing zero-out.** Any slash stamps `CapacityBond.slashedAtEpoch[op]`; vote weight is zero for the operator while `slashedAtEpoch[op]` falls inside the trailing window. Successful slash-appeal reversal via [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)'s `reverseAppeal` clears the field. See [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out).
 
 **Non-operator TOKEN holders have ZERO voting weight.** Per the [§ Allocation](#allocation) categorical rollup: Core Contributors (18%), Private Investors (20%), Treasury (15%), Public Sale (5%), Ecosystem Incentives / App Incentives (14%), Marketing (8%), Liquidity Provision (20%) — 100% of supply — **none can vote** unless they also bond TOKEN to operate. Served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) further ties weight to delivered bytes, so a TOKEN holder who bonds without actually delivering bytes still accrues zero vote weight.
 
@@ -337,7 +327,7 @@ Approximate use of pre-seed USDC:
 
 ### Governable parameters with safety bounds
 
-Router shares, capacity-curve parameters, and capacity-shortfall thresholds are governable, gated by 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model), and bounded as below. Sum-to-100% across the four router shares is enforced on every governance update; updates that violate the sum or exceed any individual bound revert.
+Router shares and capacity-curve parameters are governable, gated by 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model), and bounded as below. Sum-to-100% across the four router shares is enforced on every governance update; updates that violate the sum or exceed any individual bound revert.
 
 | Parameter | Default | Min | Max |
 |---|---:|---:|---:|
@@ -348,7 +338,6 @@ Router shares, capacity-curve parameters, and capacity-shortfall thresholds are 
 | α (capacity-curve exponent) | 1.2 | 1.0 | 1.8 |
 | k (capacity-curve constant, TOKEN) | 12.6 | bounded by 1G bond ∈ [10K, 200K] | — |
 | `MAX_CAPACITY_PER_OPERATOR` | 200 Gbps | 50 Gbps | 1000 Gbps |
-| `min_delivery_ratio` | 70% | 50% | 90% |
 | `age_ramp_months` | 6 | 1 | 24 |
 | Per-operator voting cap | 5% | 1% | 25% |
 | `windowEpochs` (served-bytes voting window, on `FeeRouter`) | 13 | 4 | 26 |
@@ -373,7 +362,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 - **USDC pre-seed eliminates TOKEN-price reflexivity in bootstrap.** Subsidy purchasing power does not collapse with TOKEN price.
 - **Safety reserve creates enterprise-tier credibility.** Funded SLA-failure compensation makes the Enterprise tier sellable rather than purely best-effort decentralized.
 - **Slashing funds user recourse.** 30% of slashed bond funds incident payouts via `SafetyReserve`; 20% burns; 50% rewards the challenger.
-- **Wash-trading is structurally defeated.** Capacity-shortfall slashing measures actual delivery against the declared tier; faking traffic does not raise revenue share because revenue is per-byte at the FeeRouter, not pooled.
+- **Wash-trading is structurally defeated.** Operator revenue is per-byte at the `FeeRouter` (the operator base is paid by the client, not pooled), so faking traffic does not raise revenue. Governance vote weight is sourced from `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — proven delivered bytes, not declared capacity — so over-declaring a tier does not translate into governance influence either. The super-linear bond curve makes over-declared capacity a dead-capital drag with no governance or revenue upside.
 
 ### Negative
 
@@ -385,7 +374,6 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 ### Risks
 
-- **Capacity-claim verification at scale.** The 7-day initial probe window assumes probe throughput is non-binding. With 100+ operators registering concurrently in the first months, probe scheduling may need a queue/throttle. Tracked in [§ Deferred & Open](#deferred--open).
 - **k governance volatility.** k=12.6 is a discovered constant for the chosen 1G target bond (50K TOKEN). Governance changes to k can shift the entire bond curve. The k bound is parameterized via the 1G-tier bond range rather than as a raw range to constrain volatility; see [§ Deferred & Open](#deferred--open).
 - **Genesis Bond Credit weighting precision.** The testnet-contribution score formula in [§ Genesis Bond Credits](#genesis-bond-credits) is described in skeletal form; exact normalization, minimum thresholds, and per-operator caps need specification before the TGE grant window opens. Recommend modeling in `finance/notebooks/` against testnet telemetry. Tracked in [§ Deferred & Open](#deferred--open).
 - **POL governance surface.** The 15% POL position (group 3) is large — and combined with the 5% MM allocation (group 7) the 20% Liquidity-Provision category is at the upper end of the typical 5–15% DeFi range — and needs explicit governance controls. See [ADR 018 § POL Governance](018-liquidity-strategy.md#pol-governance) for the canonical specification.
@@ -395,7 +383,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 - **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model):** `FeeRouter.routeSettlement` ABI and bucket count change (6 → 4). The same-tx settlement invariant is *strengthened* (now applies to all four buckets). Minor edits to §FeeRouter Integration.
 - **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source is `FeeRouter`-derived served-bytes weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders zero-weighted. Multisig bootstrap phase formalized with transition thresholds.
-- **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Supersedes the §Governance "Voting weight" formula above. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, capped per-operator at `voteCapBps` against the bytes-weighted total, zeroed if `CapacityBond.slashedAtEpoch` falls inside the trailing window. `windowEpochs` (default 13) is added to the governable-parameters table above.
+- **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Supersedes the §Governance "Voting weight" formula above. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, capped per-operator at `voteCapBps` against the bytes-weighted total, zeroed if `CapacityBond.slashedAtEpoch` falls inside the trailing window. `windowEpochs` (default 13) is added to the governable-parameters table above. Because vote weight derives from proven delivered bytes rather than declared capacity, the prior capacity-shortfall slashing path (4-week rolling probe-vs-declared auto-downgrade + bond delta forfeiture) and the 7-day registration probe gate were removed in this revision — `min_delivery_ratio` is retired, and the `cdn/probe/v1` ALPN remains in service only for [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) phantom-blob evidence and operator latency/availability discovery, not for declared-capacity enforcement.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** `CapacityBond` holds the `PendingCredit` vesting state and exposes `grantGenesisCredit` / `accrueGenesisVest` / `claimVestedCredit`. `FeeRouter` is the four-bucket settlement distributor. Class diagrams reflect this surface.
 - **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol):** POL is 15% (group 3); MM is 5% (group 7); combined Liquidity-Provision category is 20%. `BuybackBurner` receives 25% of routed USDC at every settlement. §POL Governance formalizes rebalance / withdraw / fee-accounting rules.
 - **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** Slashing applies to `CapacityBond`. `PendingCredit` is slashable alongside `bondedAmount` per [§ Genesis Bond Credits](#genesis-bond-credits).
@@ -406,10 +394,9 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 ## Deferred & Open
 
 1. **k governance volatility.** k=12.6 is a discovered constant for the chosen 1G-tier target bond (50K TOKEN). The current bound parameterizes k indirectly via the 1G-tier bond range [10K, 200K TOKEN]; an alternative is to make k immutable post-genesis and only governable via a one-shot setter behind a higher quorum. Recommend modeling impact in finance notebooks before locking the convention.
-2. **Probe-verification throughput at scale.** The 7-day initial probe window assumes probe throughput is non-binding. With 100+ operators registering concurrently in the first months, probe scheduling may need a queue/throttle. Resolution depends on probe-network capacity-planning analysis not yet complete.
-3. **Testnet-contribution weighting formula.** The score formula in [§ Genesis Bond Credits](#genesis-bond-credits) is given in skeletal form. Exact normalization, minimum thresholds, and per-operator caps need specification before the TGE grant window opens. Recommend modeling in `finance/notebooks/` against testnet telemetry.
-4. **PublisherRebateRouter trigger.** If publisher-rebate volume grows large enough (e.g., > 4M TOKEN rebated per quarter for two consecutive quarters), a programmatic `PublisherRebateRouter` contract may replace the Treasury-multisig flow. Deferred to post-launch.
-5. **App Incentives 10/4 split governance.** The publisher-rebate / integration-grant split (100M / 40M indicative) is a governance norm, not on-chain enforced. Confirm DAO can rebalance within the 14% envelope without requiring an ADR amendment.
-6. **Liquid-bond wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This isn't strictly possible under work-token because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Flag for future ADR if observed.
-7. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the canonical L2 and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Most relevant for any holder cohort distributed without an operating expectation (Public Sale, MM-partner allocations).
-8. **POL trading-fee accounting.** The 15% POL position (group 3) earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the four-bucket split if that improves predictability of treasury yield.
+2. **Testnet-contribution weighting formula.** The score formula in [§ Genesis Bond Credits](#genesis-bond-credits) is given in skeletal form. Exact normalization, minimum thresholds, and per-operator caps need specification before the TGE grant window opens. Recommend modeling in `finance/notebooks/` against testnet telemetry.
+3. **PublisherRebateRouter trigger.** If publisher-rebate volume grows large enough (e.g., > 4M TOKEN rebated per quarter for two consecutive quarters), a programmatic `PublisherRebateRouter` contract may replace the Treasury-multisig flow. Deferred to post-launch.
+4. **App Incentives 10/4 split governance.** The publisher-rebate / integration-grant split (100M / 40M indicative) is a governance norm, not on-chain enforced. Confirm DAO can rebalance within the 14% envelope without requiring an ADR amendment.
+5. **Liquid-bond wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This isn't strictly possible under work-token because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Flag for future ADR if observed.
+6. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the canonical L2 and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Most relevant for any holder cohort distributed without an operating expectation (Public Sale, MM-partner allocations).
+7. **POL trading-fee accounting.** The 15% POL position (group 3) earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the four-bucket split if that improves predictability of treasury yield.
