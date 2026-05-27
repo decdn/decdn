@@ -889,7 +889,7 @@ The `token` field (ERC-20 address) is in the signed EIP-712 typed data to preven
 - **Carried through `closeChannel` / `disputeChannel` to `settleChannel`.** Recorded in `channel.claimedBytes` and forwarded as the `bytesDelivered` argument to `FeeRouter.routeSettlement` at settlement.
 - **Cross-channel consistency.** A voucher signed for one channel is bound by its EIP-712 typed data; `bytesDelivered` is part of that signed payload and cannot be replayed against a different channel.
 
-The router does not validate `bytesDelivered` against any oracle of physical delivery — the value is whatever the client signed. The defense is structural: per-byte settlement revenue requires real client USDC inflow rather than self-attested byte counts (a client cannot sign a voucher without depositing the USDC first), and governance vote weight is sourced from the same per-byte counter ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), so the same constraint binds vote-buying via wash trades.
+The router does not validate `bytesDelivered` against any oracle of physical delivery — the value is whatever the client signed. The defense is structural: per-byte settlement revenue requires real client USDC inflow rather than self-attested byte counts (on-chain settlement is capped at `channel.deposit`, with `closeChannel` / `disputeChannel` reverting on `amount > deposit` per [§ Fee Routing on Disputed Closes](#fee-routing-on-disputed-closes)), and governance vote weight is sourced from the same per-byte counter ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), so the same constraint binds vote-buying via wash trades.
 
 ## Slashing and Channel Interactions
 
