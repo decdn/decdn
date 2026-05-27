@@ -152,7 +152,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     ///         ADR 036 § Behaviors that follow from the formula.
     function quorum(uint256 timepoint) public view override returns (uint256) {
         uint64 endEpoch = uint64(timepoint / feeRouter.epochLength());
-        uint64 n = feeRouter.windowEpochs();
+        uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
         uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
         return (total * QUORUM_NUMERATOR) / QUORUM_DENOMINATOR;
     }
@@ -162,7 +162,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     function proposalThreshold() public view override returns (uint256) {
         uint256 snapshot = uint256(clock()) - 1;
         uint64 endEpoch = uint64(snapshot / feeRouter.epochLength());
-        uint64 n = feeRouter.windowEpochs();
+        uint64 n = feeRouter.windowEpochsAt(uint48(snapshot));
         uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
         return (total * PROPOSAL_THRESHOLD_NUMERATOR) / PROPOSAL_THRESHOLD_DENOMINATOR;
     }
@@ -191,7 +191,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     function _slashedInWindow(address account, uint256 timepoint) internal view returns (bool) {
         uint64 slashed = capacityBond.slashedAtEpoch(account);
         if (slashed == 0) return false;
-        uint64 n = feeRouter.windowEpochs();
+        uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
         uint64 endEpoch = uint64(timepoint / feeRouter.epochLength());
         uint64 windowStart = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
         // Upper-bound the slash epoch at `endEpoch`. A slash that happened
@@ -202,7 +202,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     }
 
     function _cappedServed(address account, uint256 timepoint) internal view returns (uint256) {
-        uint64 n = feeRouter.windowEpochs();
+        uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
         uint64 endEpoch = uint64(timepoint / feeRouter.epochLength());
         uint256 served = feeRouter.bytesInWindow(account, endEpoch, n);
         uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);

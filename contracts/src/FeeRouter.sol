@@ -6,13 +6,22 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
+import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import { Time } from "@openzeppelin/contracts/utils/types/Time.sol";
 
 import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
 
 /// @notice Minimal surface of `CapacityBond` needed at the `FeeRouter`
-///         settlement-reporter callback.
+///         settlement-reporter callback. Includes `epochLength()` so the
+///         router's constructor can assert that the deployer-passed
+///         `epochLength_` matches `CapacityBond.EPOCH_LENGTH` — without
+///         this check, a mismatched deployment silently mis-anchors
+///         `DecdnGovernor._slashedInWindow` (which mixes epoch indices
+///         from both contracts).
 interface ICapacityBondReporter {
     function recordSettlement(address operator) external;
+    function epochLength() external view returns (uint64);
 }
 
 /// @title FeeRouter
@@ -34,6 +43,8 @@ interface ICapacityBondReporter {
 ///         never gets routed to an inactive bucket's `address(0)` sink.
 contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
+    using Checkpoints for Checkpoints.Trace208;
+    using SafeCast for uint256;
 
     // -----------------------------------------------------------------
     // Roles
@@ -100,7 +111,12 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     mapping(address operator => mapping(uint64 epoch => uint256)) internal _bytesPerEpoch;
     mapping(uint64 epoch => uint256) internal _totalBytesPerEpoch;
 
-    uint64 public override windowEpochs;
+    /// @notice Checkpointed `windowEpochs` history (ADR 036 § Governable
+    ///         parameters with safety bounds). Read by `DecdnGovernor` via
+    ///         `windowEpochsAt(snapshotTp)` so a mid-vote setter change does
+    ///         not shift quorum / vote weights for in-flight proposals
+    ///         (mirrors the I4 pattern on `DecdnGovernor.voteCapBps`).
+    Checkpoints.Trace208 internal _windowEpochsHistory;
 
     // -----------------------------------------------------------------
     // Events
@@ -124,6 +140,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     error NonZeroShareNeedsDestination(uint256 bucket);
     error WindowOutOfBounds(uint64 value, uint64 floor, uint64 ceiling);
     error ZeroEpochLength();
+    error EpochLengthMismatch(uint64 capacityBondEpoch, uint64 routerEpoch);
 
     // -----------------------------------------------------------------
     // Constructor
@@ -161,13 +178,21 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
         }
         if (admin == address(0)) revert ZeroAddress();
         if (epochLength_ == 0) revert ZeroEpochLength();
+        uint64 bondEpoch = capacityBond_.epochLength();
+        if (bondEpoch != epochLength_) revert EpochLengthMismatch(bondEpoch, epochLength_);
         _enforceWindowBounds(windowEpochs_);
 
         usdc = usdc_;
         capacityBond = capacityBond_;
         treasury = treasury_;
         epochLength = epochLength_;
-        windowEpochs = windowEpochs_;
+        // Seed the checkpoint at clock()=now so any subsequent
+        // `windowEpochsAt(timepoint)` read at a timepoint ≥ deploy returns
+        // the constructor-set value. Trace208 stores uint208, the value is
+        // bounded to [4, 26] by `_enforceWindowBounds` above so the cast
+        // is trivially safe.
+        // slither-disable-next-line unused-return
+        _windowEpochsHistory.push(_clock(), uint208(uint256(windowEpochs_)));
 
         // Destinations first, then shares — the cross-validation check inside
         // `_setShares` reads the destination state and requires both to be
@@ -324,9 +349,20 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
 
     function setWindowEpochs(uint64 newWindow) external onlyRole(GOVERNANCE_ROLE) {
         _enforceWindowBounds(newWindow);
-        uint64 old = windowEpochs;
-        windowEpochs = newWindow;
+        uint64 old = windowEpochs();
+        // slither-disable-next-line unused-return
+        _windowEpochsHistory.push(_clock(), uint208(uint256(newWindow)));
         emit WindowEpochsUpdated(old, newWindow);
+    }
+
+    /// @inheritdoc IFeeRouter
+    function windowEpochs() public view override returns (uint64) {
+        return uint64(_windowEpochsHistory.latest());
+    }
+
+    /// @inheritdoc IFeeRouter
+    function windowEpochsAt(uint48 timepoint) external view override returns (uint64) {
+        return uint64(_windowEpochsHistory.upperLookupRecent(timepoint));
     }
 
     // -----------------------------------------------------------------
@@ -417,5 +453,13 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
         if (value < WINDOW_EPOCHS_FLOOR || value > WINDOW_EPOCHS_CEILING) {
             revert WindowOutOfBounds(value, WINDOW_EPOCHS_FLOOR, WINDOW_EPOCHS_CEILING);
         }
+    }
+
+    /// @dev Matches `DecdnGovernor.clock()` (ERC-6372 timestamp mode) so the
+    ///      checkpoint timepoints in this contract and the governor share
+    ///      one time axis. Wrapped here to keep the constructor and setter
+    ///      readable.
+    function _clock() internal view returns (uint48) {
+        return Time.timestamp();
     }
 }

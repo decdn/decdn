@@ -23,6 +23,13 @@ contract MockFeeRouter is IFeeRouter {
         windowEpochs = n;
     }
 
+    /// @notice The mock collapses `windowEpochsAt(timepoint)` to the current
+    ///         `windowEpochs` — sufficient for `DecdnGovernor` math tests
+    ///         that do not exercise mid-proposal window changes.
+    function windowEpochsAt(uint48) external view override returns (uint64) {
+        return windowEpochs;
+    }
+
     function setBytes(address operator, uint64 epoch, uint256 amount) external {
         _bytes[operator][epoch] = amount;
     }

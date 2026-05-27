@@ -87,6 +87,11 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     uint256 internal constant MIN_STAKE_FLOOR = 10_000e18;
     uint256 internal constant MIN_STAKE_CEILING = 1_000_000e18;
 
+    // Deviation from ADR 009 § CapacityBond curve and governance parameters
+    // (spec table is [7d, 60d]). Bounds narrowed to [3d, 30d] for the testnet
+    // rapid-iteration phase; this lets the network exercise short unbond
+    // cycles without an ADR amendment. Production deployment MUST widen these
+    // back to [7d, 60d] via a CapacityBond upgrade or redeploy.
     uint256 internal constant UNBONDING_PERIOD_FLOOR = 3 days;
     uint256 internal constant UNBONDING_PERIOD_CEILING = 30 days;
 
@@ -112,8 +117,20 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     /// @notice Canonical epoch length shared with `FeeRouter` (ADR 026 §
     ///         FeeRouter split, ADR 036 § Formula). Stored as a constant
     ///         on this contract so `slashedAtEpoch` derives the same epoch
-    ///         index `FeeRouter` writes into `bytesPerEpoch`.
+    ///         index `FeeRouter` writes into `bytesPerEpoch`. Exposed via the
+    ///         lowercase `epochLength()` accessor so `FeeRouter`'s
+    ///         constructor can assert equality against the value the
+    ///         deployer passes for `epochLength_` (closes the silent
+    ///         epoch-mis-anchor footgun where `DecdnGovernor._slashedInWindow`
+    ///         would compare incompatible epoch indices).
     uint64 public constant EPOCH_LENGTH = 7 days;
+
+    /// @notice Lowercase accessor for `EPOCH_LENGTH` — exists so
+    ///         `ICapacityBondReporter` can declare it without tripping
+    ///         solhint `func-name-mixedcase` on the SCREAMING_SNAKE auto-getter.
+    function epochLength() external pure returns (uint64) {
+        return EPOCH_LENGTH;
+    }
 
     /// @notice Bounds for `claimSlashGateEpochs` — match `FeeRouter`'s
     ///         `[WINDOW_EPOCHS_FLOOR, WINDOW_EPOCHS_CEILING]` so governance
@@ -498,8 +515,15 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
 
     /// @dev Transfers the unvested portion of `operator`'s Genesis Bond Credit
     ///      to `treasury` (or burns if treasury is zero). Reduces `originalGrant`
-    ///      to the already-vested amount so future curve reads stop at the
-    ///      forfeit boundary.
+    ///      to the already-vested amount AND stamps `grantedAt` with the
+    ///      `FULLY_VESTED_SENTINEL` so the truncated grant is immediately
+    ///      fully vested for future `claimVestedCredit` calls. Without the
+    ///      sentinel, the curve would re-stretch the new (smaller) principal
+    ///      over the original timeline and silently claw back already-vested-
+    ///      but-unclaimed credit on subsequent claims (operator had vested
+    ///      500, claimed 400, would have been owed 100 more, but the
+    ///      un-stamped curve at the forfeit instant returned 250 →
+    ///      `claimable = 0`).
     function _forfeitUnvestedCredit(address operator) internal {
         PendingCredit storage pc = _pendingCredit[operator];
         if (pc.originalGrant == 0) return;
@@ -510,6 +534,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         // slither-disable-next-line incorrect-equality
         if (unvested == 0) return;
         pc.originalGrant = uint128(vested);
+        pc.grantedAt = FULLY_VESTED_SENTINEL;
 
         address sink = treasury;
         if (sink == address(0)) {
@@ -673,13 +698,25 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         emit Staked(msg.sender, claimable, newBalance);
     }
 
+    /// @notice Sentinel `grantedAt` value used by `_forfeitUnvestedCredit`
+    ///         to mark a credit position as "principal truncated to the
+    ///         already-vested amount, immediately fully vested for the
+    ///         purposes of future curve reads." `_curveVested` short-circuits
+    ///         on this sentinel before touching `block.timestamp` so the
+    ///         choice of sentinel value (max-uint64) is timestamp-safe even
+    ///         on test chains where `block.timestamp` is small.
+    uint64 internal constant FULLY_VESTED_SENTINEL = type(uint64).max;
+
     /// @dev Curve helper that reads storage directly so callers don't
     ///      pass storage→memory copies into a memory-param helper
-    ///      (aderyn H-2). Result is `originalGrant × min(elapsed, DUR) / DUR`.
+    ///      (aderyn H-2). Result is `originalGrant × min(elapsed, DUR) / DUR`,
+    ///      OR `originalGrant` directly if `grantedAt == FULLY_VESTED_SENTINEL`
+    ///      (post-forfeit "principal-only-remaining" state).
     function _curveVested(address operator) internal view returns (uint256) {
         PendingCredit storage pc = _pendingCredit[operator];
         uint128 grant = pc.originalGrant;
         if (grant == 0) return 0;
+        if (pc.grantedAt == FULLY_VESTED_SENTINEL) return grant;
         // forge-lint: disable-next-line(block-timestamp)
         uint256 elapsed = block.timestamp - pc.grantedAt;
         if (elapsed >= GENESIS_VEST_DURATION) return grant;

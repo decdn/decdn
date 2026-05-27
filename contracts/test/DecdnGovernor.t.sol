@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
+import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
 import { IFeeRouter } from "../src/interfaces/IFeeRouter.sol";
@@ -10,6 +11,25 @@ import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
 
 import { MockFeeRouter } from "./mocks/MockFeeRouter.sol";
 import { MockCapacityBond } from "./mocks/MockCapacityBond.sol";
+
+/// @notice DecdnGovernor subclass that exposes a privileged push helper for
+///         the `_voteCapBpsHistory` Trace208 — used to exercise the I4
+///         snapshot semantics without staging a full propose/vote/queue/
+///         execute dance. The production `setVoteCapBps` is timelock-gated;
+///         testing the read path (`voteCapBpsAt(historicalTp)` returns the
+///         prior value after a later push) only requires that we can push
+///         from two distinct timepoints — the gate itself is verified
+///         independently by `test_setVoteCapBps_enforcesBounds`.
+contract TestableDecdnGovernor is DecdnGovernor {
+    using Checkpoints for Checkpoints.Trace208;
+
+    constructor(IFeeRouter f, ICapacityBond c, TimelockController t) DecdnGovernor(f, c, t) { }
+
+    function pushVoteCapBpsForTest(uint208 value) external {
+        // slither-disable-next-line unused-return
+        _voteCapBpsHistory.push(clock(), value);
+    }
+}
 
 /// @title DecdnGovernor smoke tests
 /// @notice Exercises the ADR 036 `_getVotes` formula in isolation using mock
@@ -117,6 +137,50 @@ contract DecdnGovernorTest is Test {
         // Calling without governance role (we're not the executor) reverts.
         vm.expectRevert();
         gov.setVoteCapBps(500);
+    }
+
+    /// @notice I4 regression — a later `setVoteCapBps` push must NOT shift
+    ///         the vote weight read at an earlier `timepoint`. Without the
+    ///         Trace208 checkpointing (and `voteCapBpsAt(timepoint)` reads
+    ///         in `_cappedServed`), a mid-proposal governance change to the
+    ///         per-operator cap would retroactively re-anchor every active
+    ///         proposal's weights. This test deploys the privileged-push
+    ///         subclass so we can stage two distinct cap values at two
+    ///         distinct timepoints without the timelock dance.
+    function test_voteCapBpsAt_preservesPriorReadAfterLaterPush() public {
+        // Deploy the testable subclass on top of the existing mocks.
+        TestableDecdnGovernor t =
+            new TestableDecdnGovernor(IFeeRouter(address(feeRouter)), ICapacityBond(address(bond)), timelock);
+
+        // Stage the operator with substantial served-bytes at the historical
+        // timepoint. Use full ramp so weight = capped serve directly.
+        vm.warp(BASE + 2);
+        bond.setFirstBondedAt(operator, uint64(BASE - 365 days));
+        _setBytesAtTimepoint(operator, 100_000, 1_000_000);
+
+        // Capture the historical timepoint and the weight at the seeded
+        // cap (500 bps = 5% of 1_000_000 = 50_000).
+        uint48 historicalTp = uint48(block.timestamp);
+        uint256 historicalWeight = t.getVotes(operator, historicalTp);
+        assertEq(historicalWeight, 50_000);
+        assertEq(t.voteCapBpsAt(historicalTp), 500);
+
+        // Warp forward and push a tighter cap (200 bps). Any reader that
+        // looked at `voteCapBps()` live would now see 200; the I4 invariant
+        // says historical reads MUST stay at 500.
+        vm.warp(block.timestamp + 30 days);
+        t.pushVoteCapBpsForTest(200);
+
+        // Latest is 200, but the snapshot read returns the prior 500.
+        assertEq(t.voteCapBps(), 200);
+        assertEq(t.voteCapBpsAt(historicalTp), 500);
+
+        // And the actual weight at the historical timepoint is unchanged —
+        // proves `_cappedServed` consults `voteCapBpsAt(tp)`, not `voteCapBps()`.
+        // This is the core I4 invariant: an in-flight proposal whose
+        // snapshot is `historicalTp` sees the old 500 bps cap even after
+        // governance pushed the new 200 bps.
+        assertEq(t.getVotes(operator, historicalTp), historicalWeight);
     }
 
     /// @notice T-4 — slash that happens AFTER a historical timepoint must

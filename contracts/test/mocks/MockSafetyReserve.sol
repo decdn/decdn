@@ -16,9 +16,21 @@ contract MockSafetyReserve is ISafetyReserve {
 
     Inflow[] public inflows;
 
+    /// @notice When true, `recordSlashInflow` reverts with
+    ///         `RecordSlashInflowFailed()`. Used to exercise the I3 try/catch
+    ///         in `CapacityBond._routeSlashShares` (a faulty SafetyReserve
+    ///         MUST NOT brick slashing).
+    bool public revertOnRecordSlashInflow;
+
     error NotImplementedInMock();
+    error RecordSlashInflowFailed();
+
+    function setRevertOnRecordSlashInflow(bool value) external {
+        revertOnRecordSlashInflow = value;
+    }
 
     function recordSlashInflow(address operator, uint256 amount) external override {
+        if (revertOnRecordSlashInflow) revert RecordSlashInflowFailed();
         inflows.push(Inflow({ operator: operator, amount: amount }));
     }
 

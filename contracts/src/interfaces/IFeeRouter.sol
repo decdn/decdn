@@ -46,6 +46,13 @@ interface IFeeRouter {
     /// @notice Current trailing-window length (default 13, bounded [4, 26]).
     function windowEpochs() external view returns (uint64);
 
+    /// @notice `windowEpochs` value as of `timepoint` (ERC-6372 timestamp
+    ///         mode). Consumed by `DecdnGovernor` so a governance change to
+    ///         the window cannot shift quorum / weights for proposals whose
+    ///         snapshot is earlier than the change (closes the in-flight
+    ///         weight-drift seam left open by `windowEpochs()` reads).
+    function windowEpochsAt(uint48 timepoint) external view returns (uint64);
+
     /// @notice Constructor-immutable epoch length. Must equal
     ///         `CapacityBond.EPOCH_LENGTH` (7 days) at deploy time —
     ///         otherwise `slashedAtEpoch` (CapacityBond) and `bytesPerEpoch`

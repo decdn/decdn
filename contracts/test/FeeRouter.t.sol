@@ -18,6 +18,11 @@ contract MockUSDC is ERC20 {
 
 contract MockBondReporter is ICapacityBondReporter {
     address[] public reported;
+    uint64 public epochLengthValue;
+
+    constructor(uint64 epochLengthValue_) {
+        epochLengthValue = epochLengthValue_;
+    }
 
     function recordSettlement(address operator) external override {
         reported.push(operator);
@@ -25,6 +30,10 @@ contract MockBondReporter is ICapacityBondReporter {
 
     function reportedCount() external view returns (uint256) {
         return reported.length;
+    }
+
+    function epochLength() external view override returns (uint64) {
+        return epochLengthValue;
     }
 }
 
@@ -44,7 +53,7 @@ contract FeeRouterTest is Test {
 
     function setUp() public {
         usdc = new MockUSDC();
-        bondReporter = new MockBondReporter();
+        bondReporter = new MockBondReporter(EPOCH);
 
         // 6000 / 2500 / 1000 / 500 — ADR 026 steady-state default.
         uint256[4] memory shares = [uint256(6000), uint256(2500), uint256(1000), uint256(500)];
@@ -144,6 +153,30 @@ contract FeeRouterTest is Test {
         vm.expectRevert();
         router.setSafetyReserve(address(0));
         vm.stopPrank();
+    }
+
+    /// @notice routeSettlement is gated on ROUTER_CALLER_ROLE — the role
+    ///         exists specifically to prevent any account from inflating
+    ///         their own per-epoch served-bytes (which would translate to
+    ///         voting weight via ADR 036). A caller without the role MUST
+    ///         revert before the bytesPerEpoch increment.
+    function test_routeSettlement_revertsWithoutRouterRole() public {
+        // `operator` does not hold ROUTER_CALLER_ROLE. Fund + approve so
+        // any failure can only come from the role gate, not the
+        // safeTransferFrom or address checks.
+        usdc.transfer(operator, 1000e6);
+        vm.prank(operator);
+        usdc.approve(address(router), type(uint256).max);
+
+        vm.warp(EPOCH + 1);
+        vm.prank(operator);
+        vm.expectRevert();
+        router.routeSettlement(operator, 1_000_000, 1000e6);
+
+        // bytesPerEpoch unaffected — the revert happened before the write.
+        uint64 epoch = uint64((EPOCH + 1) / EPOCH);
+        assertEq(router.bytesPerEpoch(operator, epoch), 0);
+        assertEq(router.totalBytesPerEpoch(epoch), 0);
     }
 
     /// @notice T-1 — `opShare` absorbs the rounding remainder so a 1-wei

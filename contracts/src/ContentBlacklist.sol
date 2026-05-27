@@ -47,6 +47,10 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     uint256 internal constant APPEAL_RATIFICATION_WINDOW = 14 days;
     uint256 internal constant APPEAL_FREQUENCY_WINDOW = 90 days;
     uint256 internal constant BODY_CONCURRENT_APPEAL_CAP = 3;
+    // Deviation from ADR 011 § Bond and frequency caps (spec is
+    // [100e18, 10_000e18]). Bounds halved to [50e18, 5000e18] for the
+    // testnet phase so appeal-bond economics scale with the smaller TGE
+    // float; widen on production redeploy.
     uint256 internal constant APPEAL_BOND_FLOOR = 50e18;
     uint256 internal constant APPEAL_BOND_CEILING = 5000e18;
 

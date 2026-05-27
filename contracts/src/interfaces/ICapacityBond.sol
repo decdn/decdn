@@ -10,9 +10,13 @@ pragma solidity 0.8.28;
 ///         concrete contract. This interface declares only the cross-contract
 ///         entrypoints other contracts in the system need to know about.
 interface ICapacityBond {
-    /// @notice Timestamp of the operator's first successful `register` call.
-    ///         Source of the `age_ramp` numerator on `DecdnGovernor` per
-    ///         ADR 036 § Formula. Returns 0 if the operator has never bonded.
+    /// @notice Timestamp at which the operator's `activeStake` first became
+    ///         non-zero — set by the first `stake()` call that lifts the
+    ///         balance above zero, or by `claimVestedCredit()` if a Genesis
+    ///         Bond Credit claim is the first thing to activate the operator.
+    ///         Never overwritten by subsequent re-bonds. Source of the
+    ///         `age_ramp` numerator on `DecdnGovernor` per ADR 036 § Formula.
+    ///         Returns 0 if the operator has never bonded.
     function firstBondedAt(address operator) external view returns (uint64);
 
     /// @notice Epoch index at which the operator was most recently slashed, or
