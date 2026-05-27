@@ -50,7 +50,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 | Survives rotation | Reason |
 |-------------------|--------|
-| Capacity bond, service-emission grant history | Keyed by Ethereum address ([ADR 026](026-tokenomics.md#adr-026-tokenomics)) |
+| Capacity bond, Genesis Bond Credit `PendingCredit` position | Keyed by Ethereum address ([ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits)) |
 | Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, nonce)` ([ADR 003](003-payments.md#adr-003-payment-model)); Ethereum address unchanged |
 | `firstBondedAt` | Write-once; never cleared by `deregisterNode` or auto-ejection, and `bindNodeId` does not touch it ([ADR 003 § Node Registry](003-payments.md#node-registry); [ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
 
@@ -131,7 +131,7 @@ The cheap path — the on-chain Safe address does not change.
 
 #### PoC (1-of-1 Safe)
 
-Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. The Safe address is unchanged; bond, channels, service-emission grant history, `firstBondedAt`, and `age_ramp` progress all carry over. No iroh-side action needed.
+Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. The Safe address is unchanged; bond, channels, Genesis Bond Credit `PendingCredit` position, `firstBondedAt`, and `age_ramp` progress all carry over. No iroh-side action needed.
 
 #### Production (2-of-3 + `erc7579/smartsessions`)
 

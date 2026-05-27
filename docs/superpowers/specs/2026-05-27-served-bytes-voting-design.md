@@ -24,7 +24,7 @@ The narrative shift: voting power belongs to operators who are *currently servin
 
 ## Design Decisions
 
-User-resolved during the planning phase (`/home/thiras/.claude/plans/voting-should-be-weight-deep-beacon.md`):
+User-resolved during the planning phase (notes are not in this repo):
 
 ### Time window: trailing N epochs (rolling)
 

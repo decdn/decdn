@@ -262,7 +262,7 @@ There is no on-chain selection-eligibility gate keyed on reputation. Capacity-sh
 
 The reputation system exposes a per-operator **regional-coverage signal** — a derived metric (not a component of `final_score`) summarizing where an operator's verified deliveries originate geographically. Operators serving high-demand low-coverage regions receive a positive signal; operators serving only oversaturated regions receive a neutral signal.
 
-**This signal is not an input to `final_score` or to any on-chain payout (settlement or governance vote weight) (Section 12).** It is an externally-readable per-operator attribute computed from the same gossip reports that drive Sections 3–4, exposed alongside the main score so downstream programs can consume it without subscribing to anything new.
+**This signal is not an input to `final_score` or to any on-chain payout (settlement or governance vote weight) (see [§ Capacity-Shortfall and Wash-Trading: Reputation as Off-Chain Signal](#capacity-shortfall-and-wash-trading-reputation-as-off-chain-signal)).** It is an externally-readable per-operator attribute computed from the same gossip reports that drive [§ Local Score Calculation](#local-score-calculation) and [§ Network Score Aggregation](#network-score-aggregation), exposed alongside the main score so downstream programs can consume it without subscribing to anything new.
 
 #### Region taxonomy
 

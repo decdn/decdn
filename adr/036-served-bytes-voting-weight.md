@@ -45,7 +45,7 @@ Where `t` is the OpenZeppelin Governor timepoint (timestamp clock per ERC-6372, 
 - **A registered operator with zero served bytes in the trailing window has zero vote.** The bond gates eligibility to vote; it does not directly grant weight.
 - **A fresh operator who serves heavily on day 1 still ramps in over `age_ramp_months`.** `age_ramp` is the tenure-buy-in defense; it stays defense-in-depth on top of bytes.
 - **Per-operator cap is computed against the bytes-weighted total at the same timepoint**, not against any historical or capacity-derived total. The cap clamp applies pre-multiplication by `age_ramp`.
-- **`quorum(t)` and `proposalThreshold(t)` are calibrated against `Σ_op vote_weight(op, t)`.** The Governor reads `FeeRouter.totalBytesInWindow(epoch(t), N)` as the denominator basis; per-operator caps may push individual contributions below their raw served-bytes value, but quorum tracks the sum of capped contributions.
+- **`quorum(t)` and `proposalThreshold(t)` use `FeeRouter.totalBytesInWindow(epoch(t), N)` as the denominator — an *upper-bound proxy* for `Σ_op vote_weight(op, t)`, not the exact sum.** The exact sum applies the per-operator cap and the `age_ramp` multiplier (both `≤ 1`), so `Σ_op vote_weight ≤ totalBytesInWindow` always. Calibrating quorum against the proxy is intentionally conservative — it makes quorum strictly harder to reach than against the true Σ — and avoids the gas of summing per-operator capped contributions on every `castVote`. The proxy is exact when no operator is above the cap and all operators are past `age_ramp_months` of tenure (the steady state).
 
 ### Slashing zero-out
 
