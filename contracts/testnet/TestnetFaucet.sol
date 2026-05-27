@@ -31,7 +31,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///         in scope: Circle operates the canonical Sepolia USDC faucet at
 ///         developers.circle.com/stablecoins/docs/usdc-on-testnet.
 ///
-/// @dev    Composition mirrors `StakingRegistry`:
+/// @dev    Composition mirrors `CapacityBond`:
 ///           - `AccessControl`: three roles
 ///               * `DEFAULT_ADMIN_ROLE` — held by the deployer multisig;
 ///                 grants and revokes the other two roles.

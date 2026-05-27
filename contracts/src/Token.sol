@@ -15,16 +15,15 @@ import { ERC20Permit } from "@openzeppelin/contracts/token/ERC20/extensions/ERC2
 ///             consumed by the slashing path's 20% burn leg
 ///             (ADR 026 § Slashing and burn).
 ///           - `ERC20Permit`: EIP-2612 gasless approvals. Used by
-///             `StakingRegistry.stake` and `VotingEscrow.createLock` so
-///             users can sign approval + state-changing call as a single
-///             user op (ADR 024 § ERC-4337 path).
+///             `CapacityBond.stake` so operators can sign approval +
+///             state-changing call as a single user op (ADR 024 § ERC-4337
+///             path).
 ///
 ///         `ERC20Votes` is intentionally omitted. Governance vote weight is
-///         sourced from `VotingEscrow.balanceOfAt` per ADR 026 § Voting weight
-///         = ve-balance — not from raw-TOKEN checkpoints. Inheriting
-///         `ERC20Votes` would add ~2× transfer gas and ~10 public functions
-///         to the audit perimeter for a checkpoint stream the Governor never
-///         reads.
+///         sourced from `FeeRouter.bytesInWindow` per ADR 036 § Formula —
+///         not from raw-TOKEN checkpoints. Inheriting `ERC20Votes` would
+///         add ~2× transfer gas and ~10 public functions to the audit
+///         perimeter for a checkpoint stream the Governor never reads.
 ///
 ///         Audit checklist (this contract is intentionally tiny):
 ///           1. Total supply is exactly `1_000_000_000e18`, set once,
