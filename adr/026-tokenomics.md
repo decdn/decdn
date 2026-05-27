@@ -69,11 +69,9 @@ Eleven groups summing to 100%.
 
 | Source | Allocation |
 |---|---:|
-| Public Sale | 3% |
-| Airdrops (claimed) | up to 3% over 12 weeks |
-| Incentivized Testnet (claimed) | up to 3% over 12 weeks |
-| Market-Maker partner allocation | 4% |
-| **Total liquid float at TGE** | **~10–13%** |
+| Public Sale | up to 5% (genesis-liquid or 6mo lockup if regulatory posture requires) |
+| Market-Maker partner allocation | 5% |
+| **Total liquid float at TGE** | **~5–10%** |
 
 The 15pp POL position is "in the pool" but not floating in the sense of being available to circulate — it sits as a treasury-owned LP position, removable only by governance.
 
@@ -413,5 +411,5 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 4. **PublisherRebateRouter trigger.** If publisher-rebate volume grows large enough (e.g., > 4M TOKEN rebated per quarter for two consecutive quarters), a programmatic `PublisherRebateRouter` contract may replace the Treasury-multisig flow. Deferred to post-launch.
 5. **App Incentives 10/4 split governance.** The publisher-rebate / integration-grant split (100M / 40M indicative) is a governance norm, not on-chain enforced. Confirm DAO can rebalance within the 14% envelope without requiring an ADR amendment.
 6. **Liquid-bond wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This isn't strictly possible under work-token because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Flag for future ADR if observed.
-7. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the canonical L2 and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Particularly relevant for the Airdrops bucket if airdrop recipients are on other chains.
+7. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the canonical L2 and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Most relevant for any holder cohort distributed without an operating expectation (Public Sale, MM-partner allocations).
 8. **POL trading-fee accounting.** The 15% POL position (group 3) earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the four-bucket split if that improves predictability of treasury yield.
