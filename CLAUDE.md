@@ -35,10 +35,27 @@ cargo nextest run -p decdn-protocol  # single crate
 cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit
 pre-commit run --all-files           # run all hooks
-(cd contracts && forge fmt --check && forge build --sizes && forge test)  # contracts
+# Contracts — mirror what CI runs (see § Solidity CI gotchas below).
+(cd contracts && forge fmt --check && FOUNDRY_PROFILE=ci forge build --sizes --deny warnings && forge test)
+(cd contracts && aderyn -o /tmp/aderyn.md --no-snippets --skip-update-check)  # fail-on: high
+(cd contracts && slither . --config-file slither.config.json)                 # fail-on: medium
 ```
 
 Full Solidity workflow (static analysis, coverage, gas snapshots) lives in [CONTRIBUTING.md § Solidity development](CONTRIBUTING.md#solidity-development).
+
+### Solidity CI gotchas
+
+CI (`.github/workflows/ci.yml`) runs Solidity jobs that fail on subtler warnings than local `forge test`. Reproduce locally by running the exact commands above before pushing.
+
+- **`--deny warnings` is fatal under `FOUNDRY_PROFILE=ci`.** Includes both solc warnings AND forge-lint warnings. The most common solc trap is **W5740 (unreachable code) in OZ `ReentrancyGuard._nonReentrantAfter`** when a `nonReentrant` function body always reverts. Either drop `nonReentrant` on always-reverting stubs, or make the call go through a TRULY-abstract function (no body) so solc can't propagate the revert. Virtual hooks with concrete bodies are NOT enough — solc inlines them at compile time.
+- **Forge-lint warnings** (`unsafe-typecast`, `erc20-unchecked-transfer`) are suppressed globally in `contracts/foundry.toml` `[lint] exclude_lints = [...]` because per-line waivers would be ~60 sites. The `bytes32("literal")` event-key casts and test-only ERC20 transfers are safe by construction.
+- **Slither directive placement matters.** `// slither-disable-next-line <detector>` must be the **immediate predecessor** of the target line — comments in between break the targeting. For `unused-return` on tuple destructuring, slither attributes the finding to the **enclosing function**, so the directive goes above the `function` declaration, not the call site.
+- **Aderyn directives** (`// aderyn-ignore-next-line(<detector>)`) likewise need to be the immediate predecessor. Detector names live in `aderyn registry`.
+- **`forge fmt` vs `solhint` 120-char rule** can disagree by ±1 char on named-args revert calls. Positional args (`revert ParamOutOfBounds(value, floor, ceiling)`) are the safe tie-breaker.
+- **`emit` before `revert`** in always-reverting functions lets solc classify them as state-mutating (avoids the "function state mutability can be restricted to view" warning, which is also fatal under `--deny warnings`).
+- **Pre-commit hooks** (`pre-commit run --all-files`) re-run forge-fmt and solhint. If a hook auto-fixes, the commit aborts and you re-stage; CI's `forge fmt --check` then passes.
+
+The fail thresholds for the static-analysis jobs are set in their respective configs: aderyn uses `fail-on: high` via the GitHub Action input; slither uses `fail_on: medium` in `contracts/slither.config.json`.
 
 ## Architecture
 
@@ -61,7 +78,7 @@ crates/
   gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
   reputation/   — reputation scoring (ADR 008): local EWMA now, gossip aggregation deferred
-contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, VotingEscrow, StakingRegistry, PublisherRegistry, DecdnGovernor with test suites)
+contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, CapacityBond, FeeRouter, SafetyReserve, BuybackBurner, ContentBlacklist, PublisherRegistry, DecdnGovernor with test suites)
 ```
 
 **Dependency flow:** `node → cache, gossip, incentive, reputation, protocol, common`; `cli → common, protocol, incentive`; `common → config-types, protocol` (no longer `→ cache`, #578); `cache → config-types, protocol`. `config-types` is a leaf (alongside `protocol`), so the publisher CLI links no blob store / AWS SDK. The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
