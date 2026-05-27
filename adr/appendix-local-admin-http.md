@@ -9,7 +9,7 @@ A deCDN node has two observation points today:
 - A loopback-only `/metrics` HTTP endpoint (hyper on `observability.metrics_port`, default `9090`) emitting OpenMetrics text — text-only, aggregate, read-only by design.
 - The `cdn/probe/v1` ALPN, hittable by any remote iroh peer for latency/availability checks — not a local control channel, no auth beyond "anyone with an iroh connection".
 
-Neither fits when a same-host operator must **read live internal state** (gossip peer table) or **trigger a local control action** (graceful drain). A control-plane surface is therefore needed; this ADR pins its shape so the first method (`admin_v1_peersList`) and future ones (drain, health, config reload, …) share a common transport.
+Neither fits when a same-host operator must **read live internal state** (gossip peer table) or **trigger a local control action** (graceful drain). A control-plane surface is therefore needed; this appendix pins its shape so the first method (`admin_v1_peersList`) and future ones (drain, health, config reload, …) share a common transport.
 
 ## Decision
 

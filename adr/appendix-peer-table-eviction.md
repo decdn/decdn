@@ -11,7 +11,7 @@
 3. **Offline handling** — when does a missing-from-gossip peer get evicted vs. just marked stale
 4. **Registry-cache interaction** — does deregistration trigger immediate removal, or wait for natural expiry
 
-The current implementation in `crates/gossip/src/peer_table.rs` already evicts by TTL on `last_seen_us` (default 600 s, sweep cadence 30 s — `crates/gossip/src/service.rs:430–446`, default `DEFAULT_PEER_TTL_SEC = 600` at `crates/common/src/config/mod.rs:49`). Reputation interaction, registry-cache interaction, and size-cap policy are unimplemented and unspecified. This ADR codifies the existing TTL behavior and resolves the four questions above.
+The current implementation in `crates/gossip/src/peer_table.rs` already evicts by TTL on `last_seen_us` (default 600 s, sweep cadence 30 s — `crates/gossip/src/service.rs:430–446`, default `DEFAULT_PEER_TTL_SEC = 600` at `crates/common/src/config/mod.rs:49`). Reputation interaction, registry-cache interaction, and size-cap policy are unimplemented and unspecified. This appendix codifies the existing TTL behavior and resolves the four questions above.
 
 ## Decision
 
@@ -75,7 +75,7 @@ Reputation governs *selection* (the `selection_score` formula in [ADR 001 § Nod
 - It creates a collusive-eviction vector: a coalition sending negative `ReputationReport` messages could push a competitor below an "eviction threshold" and remove them from peer tables network-wide, bypassing the hard floor in [ADR 008](008-reputation.md#adr-008-reputation-system).
 - Reputation is noisy in the tail; a transient bad-luck dip should not erase a peer from discovery.
 
-This ADR therefore excludes reputation from the eviction decision. Reputation-system changes ([ADR 008](008-reputation.md#adr-008-reputation-system)) need not consider peer-table side effects.
+This appendix therefore excludes reputation from the eviction decision. Reputation-system changes ([ADR 008](008-reputation.md#adr-008-reputation-system)) need not consider peer-table side effects.
 
 ### Offline handling
 
