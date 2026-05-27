@@ -293,3 +293,14 @@ Source: [ADR 003 § Attack Vectors → Probe fishing](../003-payments.md#probe-f
 Source: [ADR 018 — Liquidity Strategy](../018-liquidity-strategy.md). The canonical decision (Balancer **V3** 80/20 weighted POL, with the affirmative V3 security justification in ADR 018 § Consequences) is documented inline. The rejected alternative:
 
 - **Balancer V2.** An earlier draft targeted Balancer V2. Rejected before merge after the 2025-11-03 V2 Composable Stable Pool exploit (~$125M, per Certora / Trail of Bits / OpenZeppelin post-mortems) demonstrated a latent V2 codebase risk not present in V3's new Vault architecture. The core 80/20 weighted-POL decision (USDC efficiency, IL alignment, zero-keeper posture) is a property of weighted pools in general and is not version-specific.
+
+---
+
+## ADR 036 — Served-Bytes Voting Weight
+
+Source: [ADR 036 — Served-Bytes Voting Weight](../036-served-bytes-voting-weight.md). The canonical decision — DAO vote weight as the trailing-window sum of an operator's served bytes × `age_ramp`, per-operator-capped, with a slashing zero-out — is documented inline in ADR 036. The rejected alternatives:
+
+1. **Cumulative-lifetime served bytes (no decay).** Mirrors the FeeRouter operator-leg's denominator exactly. Rejected: oldest operators dominate forever; fresh entrants cannot catch up; vote weight does not reflect *current* contribution.
+2. **EWMA-decayed served bytes (single accumulator, exponential decay).** Smoother than fixed-window; no hard edge as epochs fall off; requires one accumulator updated on each settlement and supports a single `_getVotes` SLOAD instead of O(N). Rejected: requires per-settlement on-chain writes to maintain the accumulator (small but non-zero gas), couples vote weight to settlement timing in ways harder to audit, and the fixed-window approach gives operationally-clearer reasoning during governance disputes ("here are the 13 epoch totals").
+3. **No slashing zero-out — let the rolling window do it naturally.** Slashed operators retain accumulated bytes-weight and vote for up to N weeks until the window decays past the slash. Rejected: leaves a meaningful immediate-response gap; the slashing zero-out costs one storage slot per operator and one SLOAD per vote-cast.
+4. **Probe-verified delivery cap multiplier.** Use `min(voucher_bytes, probe_capacity × epoch_length)` as the per-epoch bytes input. Rejected: this would require re-introducing probe-vs-declared-capacity enforcement on-chain, the same machinery the design deliberately omits alongside capacity-shortfall slashing (see [ADR 026](../026-tokenomics.md#adr-026-tokenomics)). The fixed-window served-bytes accounting plus the per-operator cap covers the threat surface; revisit only if wash-trading economics shift materially.
