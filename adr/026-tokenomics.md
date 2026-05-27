@@ -129,7 +129,7 @@ Scale scenarios denote total monthly traffic delivered by the network. Peak capa
 | S3 | 100 PB | ~1 Tbps | 100 × 1G + 30 × 10G + 5 × 100G | 91.85M TOKEN | ~9.2% |
 | S4 | 500 PB | ~5 Tbps | 500 × 1G + 100 × 10G + 30 × 100G | 482.5M TOKEN | ~48% |
 
-S1 and S2 leave essentially all TOKEN liquid; the [§ Operator Service Emissions](#operator-service-emissions) bucket covers operator-tier-upgrade economics through ~S3 without external TOKEN buys. S3 is the steady-state zone — ~9% bonded gives meaningful demand without supply-lockup pressure. S4 is the design-tension zone: at default α=1.2 the curve absorbs ~half of supply; α-tuning is the lever (at α=1.0 the same S4 mix bonds ~23%).
+S1 and S2 leave essentially all TOKEN liquid; [§ Genesis Bond Credits](#genesis-bond-credits) (50M / 5%) covers operator tier upgrades for the testnet-eligible cohort through year 2 without external TOKEN buys; non-testnet operators bond TOKEN purchased on market. S3 is the steady-state zone — ~9% bonded gives meaningful demand without supply-lockup pressure. S4 is the design-tension zone: at default α=1.2 the curve absorbs ~half of supply; α-tuning is the lever (at α=1.0 the same S4 mix bonds ~23%).
 
 ### What the bond grants and does not grant
 
@@ -137,7 +137,7 @@ S1 and S2 leave essentially all TOKEN liquid; the [§ Operator Service Emissions
 
 - Right to register as an active operator at the declared capacity tier.
 - 100% of the operator share of the fee split (60% — see [§ FeeRouter split](#feerouter-split)).
-- Eligibility to receive Operator Service Emissions (see [§ Operator Service Emissions](#operator-service-emissions)) for verified delivery.
+- Eligibility to receive [§ Genesis Bond Credits](#genesis-bond-credits) if the operator participated in the pre-launch incentivized testnet.
 - Governance voting weight (see [§ Governance](#governance)).
 
 **Does NOT grant:**
@@ -157,7 +157,7 @@ S1 and S2 leave essentially all TOKEN liquid; the [§ Operator Service Emissions
 | Safety & insurance reserve | 5% | Same-tx to `SafetyReserve` ([ADR 033](033-safety-insurance-reserve.md#adr-033-safety-and-insurance-reserve)) |
 | **Total** | **100%** | |
 
-**Same-transaction guarantees.** All four buckets transfer in the settlement transaction. There are no epoch buckets, no pull-based claims, no claim windows. `FeeRouter.routeSettlement` does its full work in one tx, recovering the [ADR 003 § FeeRouter Integration](003-payments.md#feerouter-integration) one-tx invariant for every bucket. Per-epoch byte counters are retained for analytics and to feed the [§ Operator Service Emissions](#operator-service-emissions) distribution; they no longer drive bucket payouts.
+**Same-transaction guarantees.** All four buckets transfer in the settlement transaction. There are no epoch buckets, no pull-based claims, no claim windows. `FeeRouter.routeSettlement` does its full work in one tx, recovering the [ADR 003 § FeeRouter Integration](003-payments.md#feerouter-integration) one-tx invariant for every bucket. Per-epoch byte counters are retained for analytics only; they no longer drive bucket payouts and no longer feed any TOKEN-distribution contract under v2.2.
 
 **Node-to-node cache-miss paid pulls bypass the router.** Direct peer USDC payment, no skim. Internal cost-recovery flow, not net protocol revenue.
 
@@ -293,13 +293,13 @@ The voting set is narrow at launch (likely <50 operators in the first 6–12 mon
 **Revenue streams.**
 
 1. **60% of every channel settlement** — direct USDC, same-tx, per-byte.
-2. **Operator Service Emissions** (TOKEN-denominated) — auto-deposited into `CapacityBond`; not withdrawable until full unbond; sized at 20% of supply distributed over ~6 years.
+2. **Genesis Bond Credits** (TOKEN-denominated, testnet-eligible operators only) — auto-deposited into `CapacityBond` at TGE; vests linearly over 24mo via continued operation; not withdrawable as liquid until vested and unbonded; sized at 5% of supply / 50M TOKEN.
 
 **Genesis-day operator math (1 Gbps operator, no starting TOKEN).**
 
 - Genesis: buys 50K TOKEN at POL discovery price (~$0.05–0.10 → $2,500–$5,000 capital outlay).
 - Months 1–12: earns USDC fees from delivery + pre-seed USDC subsidy → roughly cost-neutral on bandwidth.
-- Months 1–24: earns Operator Service Emissions → bond grows 50K → ~200K → ~795K (climbs 1G → ~3G → 10G tier).
+- Months 1–24 (testnet-eligible operator): Genesis Bond Credit auto-bonded at TGE; vests linearly. For a median testnet operator at ~500K TOKEN credit, bond effectively climbs from voluntary 50K → 50K+vested as continued operation accrues. Non-testnet operator at the same scale must purchase TOKEN on market to climb 1G → ~3G → 10G tier and is excluded from credit eligibility.
 - Month 12: operating at 5–10G tier, paid in USDC fees, governance-eligible (with age-ramp at full weight from month 6).
 - Month 24: established mid-tier operator with bond financed primarily by service delivery, not capital injection.
 
@@ -324,7 +324,7 @@ Approximate use of pre-seed USDC:
 
 | Use | Approx allocation | Notes |
 |---|---:|---|
-| Operator infrastructure subsidies (direct USDC) | ~55% | Covers VPS/bandwidth for first 12 months for early operators; pairs with [§ Operator Service Emissions](#operator-service-emissions) to make first-year operator unit economics positive |
+| Operator infrastructure subsidies (direct USDC) | ~55% | Covers VPS/bandwidth for first 12 months for early operators; pairs with [§ Genesis Bond Credits](#genesis-bond-credits) (for testnet-eligible operators) to make first-year operator unit economics positive |
 | Genesis POL seed (USDC side of 80/20 Balancer) | ~30% | Pairs with the 15pp treasury-owned TOKEN POL position; the deeper POL allocation under v2.1 motivates a larger USDC-side seed |
 | `SafetyReserve` genesis pre-fund (USDC) | ~10% | Covers incidents before fee inflows reach steady state |
 | Audits, legal, contingency | ~5% | Operational, not protocol-bound |
@@ -361,7 +361,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 ### Positive
 
-- **Smaller contract surface.** Net subtractive vs the prior design: `VotingEscrow` and `DelegatorBuyer` are deleted; `FeeRouter` simplifies from six buckets to four with no epoch / claim / snapshot machinery; `StakingRegistry` is renamed `CapacityBond` with one added piece of capacity-curve logic; `OperatorEmissions` is a new but small contract. `SafetyReserve`, slashing primitive, payment channels, and POL/BuybackBurner carry over largely unchanged.
+- **Smaller contract surface.** Net subtractive vs the prior design: `VotingEscrow` and `DelegatorBuyer` are deleted; `FeeRouter` simplifies from six buckets to four with no epoch / claim / snapshot machinery; `StakingRegistry` is renamed `CapacityBond` with one added piece of capacity-curve logic; `OperatorEmissions` (v2.1's new contract) is deleted; `CapacityBond` gains a small `PendingCredit` vesting extension instead. `SafetyReserve`, slashing primitive, payment channels, and POL/BuybackBurner carry over largely unchanged.
 - **Cleaner regulatory posture on Howey prong 4.** Passive holding earns nothing. No delegator pool, no ve-lock yield, no per-holder claim on revenue. Operator-only governance + entity design Pattern A's existing exclusion of investors from DAO voting closes both the cashflow-rights and common-enterprise vectors.
 - **Mechanical value-accrual lever.** Capacity-growth lock demand scales with network throughput; 25% burn provides 5× the prior design's deflationary pressure.
 - **No cashflow crisis at the operator layer.** 60% liquid USDC per settlement is comfortably above infrastructure-cost coverage at the reference 1 Gbps / 30K GB/mo node.
@@ -372,7 +372,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 ### Negative
 
-- **Capital-cost-to-operate at edge tier.** The super-linear curve makes 100 Gbps + tiers expensive: ~12.6M TOKEN bond at the 100G tier. Mitigated by the Operator Service Emissions runway (operators can grow tiers using granted TOKEN rather than market buys) and α-tunability.
+- **Capital-cost-to-operate at edge tier.** The super-linear curve makes 100 Gbps + tiers expensive: ~12.6M TOKEN bond at the 100G tier. Mitigated for testnet-eligible operators by the [§ Genesis Bond Credits](#genesis-bond-credits) program and by α-tunability; non-testnet operators must buy TOKEN on market to climb tiers, by design.
 - **Governance bootstrap depends on multisig discipline.** First 6–12 months run through a multisig; capacity-weighted DAO voting kicks in only when the transition thresholds are met. Pre-transition parameter changes are constrained to the [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds).
 - **Smaller external LP base in year 1.** v2.1 forgoes the v2 Bootstrap LM subsidy that would have attracted external LPs and broadened the holder base. POL provides depth; external LP growth depends on organic trading-fee yield.
 - **Per-byte burn flow may exceed market depth at low TOKEN prices.** 5× volume increase on `BuybackBurner` — [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)'s per-epoch liquidity cap is now load-bearing.
@@ -382,7 +382,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 - **Capacity-claim verification at scale.** The 7-day initial probe window assumes probe throughput is non-binding. With 100+ operators registering concurrently in the first months, probe scheduling may need a queue/throttle. Tracked in [§ Deferred & Open](#deferred--open).
 - **k governance volatility.** k=12.6 is a discovered constant for the chosen 1G target bond (50K TOKEN). Governance changes to k can shift the entire bond curve. The k bound is parameterized via the 1G-tier bond range rather than as a raw range to constrain volatility; see [§ Deferred & Open](#deferred--open).
-- **Service-emission curve precision.** The front-loaded / tapering shape is described qualitatively; the exact mathematical form needs specification with explicit per-month emission rates. Recommend modeling in `finance/notebooks/` before locking in contract. Tracked in [§ Deferred & Open](#deferred--open).
+- **Genesis Bond Credit weighting precision.** The testnet-contribution score formula in [§ Genesis Bond Credits](#genesis-bond-credits) is described in skeletal form; exact normalization, minimum thresholds, and per-operator caps need specification before the TGE grant window opens. Recommend modeling in `finance/notebooks/` against testnet telemetry. Tracked in [§ Deferred & Open](#deferred--open).
 - **POL governance surface.** The 19% POL position is large and needs explicit governance controls — see [ADR 018 § POL Governance](018-liquidity-strategy.md#pol-governance) for the canonical specification.
 - **Convex-capture-style wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This is structurally limited because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Tracked in [§ Deferred & Open](#deferred--open).
 
@@ -390,7 +390,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 - **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model):** `FeeRouter.routeSettlement` ABI and bucket count change (6 → 4). The same-tx settlement invariant is *strengthened* (now applies to all four buckets). Minor edits to §FeeRouter Integration.
 - **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source replaced — was `VotingEscrow.balanceOfAt`, now `CapacityBond.capacityAt × age_ramp`. Non-operator holders zero-weighted. Multisig bootstrap phase formalized with transition thresholds.
-- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** `VotingEscrow` and `DelegatorBuyer` removed from Contract Inventory; `StakingRegistry` renamed `CapacityBond`; new `OperatorEmissions` contract added. FeeRouter simplifies. Class diagrams updated.
+- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** OperatorEmissions removed from Contract Inventory (v2.1's new contract is deleted under v2.2); CapacityBond extended with PendingCredit vesting + grantGenesisCredit/accrueGenesisVest/claimVestedCredit. VotingEscrow and DelegatorBuyer stay removed. FeeRouter unchanged from v2.1. Class diagrams updated.
 - **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol):** POL grows 10% → 19% (15pp redeployment from former LM bucket); BuybackBurner sees 5× volume. New §POL Governance section formalizes rebalance / withdraw / fee-accounting rules.
 - **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** Slashing applies to `CapacityBond` (not `StakingRegistry`); status flipped from Locked-for-implementation back to Draft pending the CapacityBond rebase.
 - **[ADR 032 — SafetyReserve Appeal-Surface Contract Surface](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface):** Capacity reads replace ve-supply reads where relevant.
@@ -401,7 +401,9 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 1. **k governance volatility.** k=12.6 is a discovered constant for the chosen 1G-tier target bond (50K TOKEN). The current bound parameterizes k indirectly via the 1G-tier bond range [10K, 200K TOKEN]; an alternative is to make k immutable post-genesis and only governable via a one-shot setter behind a higher quorum. Recommend modeling impact in finance notebooks before locking the convention.
 2. **Probe-verification throughput at scale.** The 7-day initial probe window assumes probe throughput is non-binding. With 100+ operators registering concurrently in the first months, probe scheduling may need a queue/throttle. Resolution depends on probe-network capacity-planning analysis not yet complete.
-3. **Service-emission curve form.** The front-loaded-tapering shape ([§ Operator Service Emissions](#operator-service-emissions)) is described qualitatively. The exact mathematical form (exponential decay vs linear taper vs step function) needs specification with explicit per-month emission rates. Recommend modeling in `finance/notebooks/` before locking the curve in contract.
-4. **Liquid-bond wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This isn't strictly possible under work-token because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Flag for future ADR if observed.
-5. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the canonical L2 and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Particularly relevant for the Airdrops bucket if airdrop recipients are on other chains.
-6. **POL trading-fee accounting.** The 19% POL position earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the four-bucket split if that improves predictability of treasury yield.
+3. **Testnet-contribution weighting formula.** The score formula in [§ Genesis Bond Credits](#genesis-bond-credits) is given in skeletal form. Exact normalization, minimum thresholds, and per-operator caps need specification before the TGE grant window opens. Recommend modeling in `finance/notebooks/` against testnet telemetry.
+4. **PublisherRebateRouter trigger.** If publisher-rebate volume grows large enough (e.g., > 4M TOKEN rebated per quarter for two consecutive quarters), a programmatic `PublisherRebateRouter` contract may replace the Treasury-multisig flow. Deferred to post-launch.
+5. **App Incentives 10/4 split governance.** The publisher-rebate / integration-grant split (100M / 40M indicative) is a governance norm, not on-chain enforced. Confirm DAO can rebalance within the 14% envelope without requiring an ADR amendment.
+6. **Liquid-bond wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This isn't strictly possible under work-token because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Flag for future ADR if observed.
+7. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the canonical L2 and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Particularly relevant for the Airdrops bucket if airdrop recipients are on other chains.
+8. **POL trading-fee accounting.** The 19% POL position earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the four-bucket split if that improves predictability of treasury yield.
