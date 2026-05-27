@@ -1,6 +1,6 @@
 # ADR 028: Slashing Appeals and Dispute Escalation
 
-**Date:** 2026-05-27 (initial 2026-05-06; rebased under v2.1 work-token redesign and v2.2 no-emission rewrite — `CapacityBond` replaces `StakingRegistry`; `PendingCredit` is slashable alongside `bondedAmount`; FeeRouter USDC revenue replaces `OperatorEmissions` distribution as the operator-economics context for cross-subsidy / depletion analysis)
+**Date:** 2026-05-27
 **Status:** Draft
 
 ## Context
@@ -19,7 +19,7 @@ All three `SlashJudge` offense types are appealable: phantom, rate manipulation,
 
 The eligibility bar ([§ Eligibility and evidence standard](#eligibility-and-evidence-standard)) is the gate against frivolous appeals, not the offense type. **Scope limitation: [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) covers appeals against the *slash event itself* on operational-failure grounds — the operator could not comply because of an outage, NTP drift, or similar.** Appeals against the *underlying [`ContentBlacklist`](011-content-takedown.md#contract-contentblacklist) entry* — disputing whether the blacklisted hash belongs on the list — are out of scope and tracked separately under [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting). [§ Eligibility and evidence standard](#eligibility-and-evidence-standard)'s evidence standard does not admit content-policy arguments; only the [§ Eligibility and evidence standard](#eligibility-and-evidence-standard) operational-failure evidence types are admissible. The multisig is expected to apply heightened scrutiny to blacklist-offense appeals (deliberate moderation noncompliance, not operational failure); this guidance is not coded into the contract.
 
-**Genesis Bond Credits (v2.2).** A slashed operator's pending unvested Genesis Bond Credit (`pendingCredit[op].total - pendingCredit[op].vested` on `CapacityBond` per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits)) is subject to the same slashing rates and distribution as voluntarily-bonded TOKEN. The vested-but-unclaimed portion is no longer separately slashable — it has functionally become voluntarily-bonded TOKEN and is slashed as part of `bondedAmount`. The slashing primitive in `CapacityBond._slash` iterates both pools atomically; no separate appeal path applies. Appeals flow is unchanged regardless of which pool the slash originated from.
+**Genesis Bond Credits.** A slashed operator's pending unvested Genesis Bond Credit (`pendingCredit[op].total - pendingCredit[op].vested` on `CapacityBond` per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits)) is subject to the same slashing rates and distribution as voluntarily-bonded TOKEN. The vested-but-unclaimed portion is no longer separately slashable — it has functionally become voluntarily-bonded TOKEN and is slashed as part of `bondedAmount`. The slashing primitive in `CapacityBond._slash` iterates both pools atomically; no separate appeal path applies. Appeals flow is unchanged regardless of which pool the slash originated from.
 
 ### Appeal flow
 

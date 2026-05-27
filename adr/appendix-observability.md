@@ -157,7 +157,7 @@ These replace the identical names from [ADR 015](015-zero-rtt.md#adr-015-quic-0-
 
 #### Tokenomics Metrics
 
-Per [ADR 026](026-tokenomics.md#adr-026-tokenomics) (v2.2 no-emission work-token rewrite). These metrics expose the `FeeRouter`, `CapacityBond`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket), [ADR 009](009-governance.md#adr-009-governance-model)).
+Per [ADR 026](026-tokenomics.md#adr-026-tokenomics). These metrics expose the `FeeRouter`, `CapacityBond`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket), [ADR 009](009-governance.md#adr-009-governance-model)).
 
 A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `SafetyReserve`, `BuybackBurner`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
 
@@ -165,12 +165,12 @@ A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={operator_base,burn,treasury,safety}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. All four legs transfer same-tx under v2.1 ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). |
+| `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={operator_base,burn,treasury,safety}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. All four legs transfer same-tx ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). |
 | `decdn_fee_router_inflow_usdc_rate` | Gauge | R | `bucket={operator_base,burn,treasury,safety}` | Derived (rolling 7-epoch avg over `..._inflow_usdc_total`) | Governance + capacity-planning dashboards | Rolling-average per-bucket USDC inflow per epoch. |
 
 ##### Served-Bytes Voting Metrics
 
-Per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight): the per-operator `bytesPerEpoch` and trailing-window sums on `FeeRouter` are the governance vote-weight source. The previously-exposed `OperatorEmissions` metrics are removed under v2.2 — the contract is deleted and no ongoing TOKEN-denominated service emission exists.
+Per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight): the per-operator `bytesPerEpoch` and trailing-window sums on `FeeRouter` are the governance vote-weight source.
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
@@ -195,7 +195,7 @@ Per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits): a
 | `decdn_capacity_bond_declared_mbps` | Gauge | R | — | `CapacityBond.declaredCapacityMbps(operator)` (RPC) | Operator dashboard | This operator's declared bandwidth capacity in Mbps; gates capacity-tier checks and capacity-shortfall slashing. No longer feeds voting weight directly under [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). |
 | `decdn_capacity_bond_delivery_ratio` | Gauge | R | `window={4w}` | Probe-attestation aggregation | Operator dashboard, capacity-shortfall warning | Operator's 4-week rolling verified delivery as a fraction of `declared_capacity`. Capacity-shortfall slashing auto-downgrades at sustained `< min_delivery_ratio` per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing). |
 | `decdn_fee_router_total_bytes_in_window` | Gauge | R | `window={windowEpochs}` | `FeeRouter.totalBytesInWindow(currentEpoch, windowEpochs)` (RPC) | Governance dashboard | Network-wide sum of served bytes over the trailing `windowEpochs` window — the quorum / proposal-threshold denominator per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). Supersedes the previous `decdn_capacity_bond_total_voting_weight` metric, which read the deprecated `CapacityBond.totalVotingWeightAt` getter. |
-| `decdn_capacity_bond_active_operator_count` | Gauge | R | — | `CapacityBond.getActiveNodeCount()` (RPC) | Governance dashboard, bootstrap-multisig transition tracking | Active operator count; gates the bootstrap-multisig → DAO transition (≥30 operators AND ≥100 Gbps per [ADR 009](009-governance.md#bootstrap-multisig-phase)). Under v2.1 the NodeId↔Ethereum-address binding is 1:1 ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)), so active-node count and active-operator count coincide. |
+| `decdn_capacity_bond_active_operator_count` | Gauge | R | — | `CapacityBond.getActiveNodeCount()` (RPC) | Governance dashboard, bootstrap-multisig transition tracking | Active operator count; gates the bootstrap-multisig → DAO transition (≥30 operators AND ≥100 Gbps per [ADR 009](009-governance.md#bootstrap-multisig-phase)). The NodeId↔Ethereum-address binding is 1:1 ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)), so active-node count and active-operator count coincide. |
 
 ##### SafetyReserve Metrics
 

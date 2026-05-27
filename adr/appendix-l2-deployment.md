@@ -187,14 +187,14 @@ Arbitrum One fee markets at deployment. Three MUST gates:
    affordability bounds of [ADR 026 § Operator economics](026-tokenomics.md#operator-economics).
 
 2. **Per-epoch keeper-call gas economics.** One TWAP-protected USDC→TOKEN swap
-   keeper call per epoch via `BuybackBurner` (25% buyback-and-burn flow under v2.1
-   per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) and
+   keeper call per epoch via `BuybackBurner` (25% buyback-and-burn flow per
+   [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) and
    [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) —
    at a 1-week epoch, **52+ swaps/year minimum**, via the Balancer V3 80/20
    TOKEN/USDC pool with TWAP windows, `minOut`, mandatory private-RPC routing, and
-   a per-epoch liquidity cap (binding much more frequently than under prior designs
-   because the burn flow is 5× the prior rate). Per-epoch keeper costs MUST be not
-   cost-prohibitive at S2/S3 scale and a small fraction of the inflow each call routes.
+   a per-epoch liquidity cap that binds under sustained network revenue at the
+   25% burn share. Per-epoch keeper costs MUST be not cost-prohibitive at S2/S3
+   scale and a small fraction of the inflow each call routes.
 
 3. **Private-RPC gate.** The L2 MUST support private-RPC routing (Flashbots-style
    bundles) for the hardened MEV-protection requirement in

@@ -76,7 +76,7 @@ Call `CapacityBond.register(declaredMbps)`, which atomically pulls `bond_require
 
 The bond locks immediately and is slashable from this point forward, including during the **14-day unbonding window** if the node later unbonds ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)).
 
-**No separate ve-position exists under v2.1.** The bond is the only TOKEN-side requirement on operators. There is no optional lock for additional yield; non-operator TOKEN holders earn nothing and have no governance weight ([ADR 026 § Governance](026-tokenomics.md#governance)).
+**No separate ve-position exists.** The bond is the only TOKEN-side requirement on operators. There is no optional lock for additional yield; non-operator TOKEN holders earn nothing and have no governance weight ([ADR 026 § Governance](026-tokenomics.md#governance)).
 
 **Gas:** ~$0.05.
 
