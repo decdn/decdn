@@ -47,7 +47,7 @@ Terms used across multiple ADRs without inline definition.
 
 | Term | Definition |
 | --- | --- |
-| **`CapacityBond`** | The on-chain capacity-bonded operator-registry contract (formerly `StakingRegistry` in earlier drafts). Holds TOKEN bond, enforces `bond ≥ bond_required(declared_capacity)` via the lock-to-capacity curve `bond = k × Mbps^α`, performs slashing, manages the NodeId↔Ethereum-address binding. |
+| **`CapacityBond`** | The on-chain capacity-bonded operator-registry contract. Holds TOKEN bond, enforces `bond ≥ bond_required(declared_capacity)` via the lock-to-capacity curve `bond = k × Mbps^α`, performs slashing, manages the NodeId↔Ethereum-address binding. |
 | **`SlashJudge`** | The on-chain contract that adjudicates all slashable offenses: verifies slash signatures, manages challenge bonds, runs counter-evidence windows, calls `CapacityBond.slash()` — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). |
 | **`BuybackBurner`** | The contract that swaps the 25% burn-bucket USDC into TOKEN via Balancer V3 80/20 weighted pool and burns the proceeds — see [ADR 003 § BuybackBurner](003-payments.md#buybackburner) and [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol). |
 | **Slash signature** | An EIP-712 secp256k1 signature (`slash_sig`) on `ProbeResponse` / `StreamResponse`, used for on-chain slash evidence via `ecrecover` and as the message-body attribution signature for the paid-delivery path — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). |

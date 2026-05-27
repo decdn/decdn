@@ -8,7 +8,7 @@ Metrics are referenced throughout the protocol ADRs and listed informally in `ar
 
 ### Note on existing ADR names
 
-Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This ADR is the authoritative canonical registry; the names below supersede those informal references. The changes are purely naming — the semantic intent is unchanged.
+Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This appendix is the authoritative canonical registry; the names below are the canonical forms of those informal references, with identical semantic intent.
 
 ## Decision
 
@@ -147,7 +147,7 @@ Per [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment). All 
 | `decdn_quic_0rtt_accepted_total` | Counter | R | 0-RTT connections accepted by server. |
 | `decdn_quic_0rtt_rejected_total` | Counter | R | 0-RTT rejected, fell back to 1-RTT. |
 
-These replace the identical names from [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) — no semantic change, now under the canonical naming regime.
+These are the canonical forms of the identical names in [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) — identical semantics under the canonical naming regime.
 
 #### Node / Process Metrics
 
@@ -193,7 +193,7 @@ Per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits): a
 |--------|------|------|--------|--------|----------|-------------|
 | `decdn_capacity_bond_amount_token` | Gauge | R | — | `CapacityBond.bondOf(operator)` (RPC) | Operator dashboard, governance | This operator's current bonded TOKEN (voluntary bond plus the vested portion of any Genesis Bond Credit grant per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits)); used to compute the operator's tier and bond-curve position. Unvested `PendingCredit` is tracked separately via `decdn_capacity_bond_pending_credit_*`. |
 | `decdn_capacity_bond_declared_mbps` | Gauge | R | — | `CapacityBond.declaredCapacityMbps(operator)` (RPC) | Operator dashboard | This operator's declared bandwidth capacity in Mbps; used for capacity-tier checks and bond-curve calculations. Does not feed voting weight directly under [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). |
-| `decdn_fee_router_total_bytes_in_window` | Gauge | R | `window={windowEpochs}` | `FeeRouter.totalBytesInWindow(currentEpoch, windowEpochs)` (RPC) | Governance dashboard | Network-wide sum of served bytes over the trailing `windowEpochs` window — the quorum / proposal-threshold denominator per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). Supersedes the previous `decdn_capacity_bond_total_voting_weight` metric, which read the deprecated `CapacityBond.totalVotingWeightAt` getter. |
+| `decdn_fee_router_total_bytes_in_window` | Gauge | R | `window={windowEpochs}` | `FeeRouter.totalBytesInWindow(currentEpoch, windowEpochs)` (RPC) | Governance dashboard | Network-wide sum of served bytes over the trailing `windowEpochs` window — the quorum / proposal-threshold denominator per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). |
 | `decdn_capacity_bond_active_operator_count` | Gauge | R | — | `CapacityBond.getActiveNodeCount()` (RPC) | Governance dashboard, bootstrap-multisig transition tracking | Active operator count; gates the bootstrap-multisig → DAO transition (≥30 operators AND ≥100 Gbps per [ADR 009](009-governance.md#bootstrap-multisig-phase)). The NodeId↔Ethereum-address binding is 1:1 ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)), so active-node count and active-operator count coincide. |
 
 ##### SafetyReserve Metrics
@@ -277,7 +277,7 @@ Metrics cover aggregates; structured logs cover per-event detail. Complementary 
 
 Earlier ADRs used informal metric names; this table maps them to canonical replacements. **No wire protocol or on-chain change** — instrumentation names only.
 
-| Informal name (prior ADR) | Canonical name (this ADR) | Source ADR |
+| Informal name (prior ADR) | Canonical name (this appendix) | Source ADR |
 |---------------------------|---------------------------|------------|
 | `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_total{reason="clock_skew"}` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
 | `probe_hold_violations` | `decdn_probe_hold_violations_total` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
@@ -336,7 +336,7 @@ Covers M-tier slash-safety metrics and the most common R-tier panels for a first
 
 ### Negative
 
-- Existing ADRs reference informal names differing from the canonical ones here. The cross-reference table (Section 6) documents all renames; no ADR is retroactively edited (avoids draft-document churn), but implementations must use this ADR's canonical names.
+- Existing ADRs reference informal names differing from the canonical ones here. The cross-reference table (Section 6) documents all renames; no ADR is retroactively edited (avoids draft-document churn), but implementations must use this appendix's canonical names.
 - Mandatory metrics add startup complexity — all M-tier collectors must initialize before accepting connections. Small overhead for guaranteed observability.
 
 ## Deferred & Open

@@ -13,7 +13,7 @@
 
 ## Context
 
-The PoC runs on **Arbitrum Sepolia**. TOKEN is canonical on one L2 — all staking, channel settlements, and governance happen on this chain. This ADR selects the production L2.
+The PoC runs on **Arbitrum Sepolia**. TOKEN is canonical on one L2 — all staking, channel settlements, and governance happen on this chain. This appendix selects the production L2.
 
 The choice affects the criteria enumerated below. Dependent ADRs: **[ADR 003](003-payments.md#adr-003-payment-model) / [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)** gas estimates assume Arbitrum-class L2 fee markets; [ADR 003 § L2 sequencer
 censorship](003-payments.md#l2-sequencer-censorship) assumes
@@ -171,7 +171,7 @@ for Arbitrum One mainnet equivalents at each step. No contract logic changes.
 [ADR 026](026-tokenomics.md#adr-026-tokenomics) adds two gas-cost surfaces to re-validate
 before mainnet — economic, not architectural: they do not invalidate the Arbitrum
 One choice but must be quantified on the chosen L2 with measured (not estimated)
-numbers, additive to this ADR's selection criteria. Gas tables are intentionally
+numbers, additive to this appendix's selection criteria. Gas tables are intentionally
 omitted — measure during integration testing on Arbitrum Sepolia, re-confirm against
 Arbitrum One fee markets at deployment. Three MUST gates:
 

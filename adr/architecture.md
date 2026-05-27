@@ -102,7 +102,7 @@ How protocol violations are detected, adjudicated, and punished. The slashing sc
 The governance model that sets the parameters earlier chapters consume, and the cross-contract interaction map that consolidates the on-chain surface.
 
 1. [ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)
-2. [ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — supersedes the voting-weight clauses of [ADR 009 § Production](009-governance.md#production-operator-weighted-dao-governance) and [ADR 026 § Governance](026-tokenomics.md#governance); promotes `FeeRouter.bytesPerEpoch` to governance-canonical and adds `windowEpochs` + slash-zero-out on `CapacityBond.slashedAtEpoch`.
+2. [ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — defines the canonical DAO voting-weight formula (served bytes from `FeeRouter.bytesPerEpoch` × `age_ramp`) that [ADR 009 § Production](009-governance.md#production-operator-weighted-dao-governance) and [ADR 026 § Governance](026-tokenomics.md#governance) reference; adds the governable `windowEpochs` and the slash-zero-out on `CapacityBond.slashedAtEpoch`.
 3. [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model)
 
 ### Chapter 7 — Operations

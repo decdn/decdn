@@ -85,10 +85,9 @@ Implementations SHOULD NOT treat 0-RTT rejection as an error — it is a normal 
 
 ### Replay Safety Is Client-Side, Not Server-Gated
 
-> **Implementation reality (iroh 0.98.x).** An earlier draft asserted that 0-RTT was
-> gated *server-side per handler* — that only an `on_accepting` override exposes early
-> data and the default handler makes the QUIC stack drop it. **That is false** and is
-> recorded here so the safety model is not misunderstood. iroh sets
+> **Implementation reality (iroh 0.98.x).** 0-RTT is **not** gated *server-side per
+> handler*: it is not the case that only an `on_accepting` override exposes early data
+> while the default handler makes the QUIC stack drop it. iroh sets
 > `crypto.max_early_data_size = u32::MAX` on *every* server TLS config
 > (`iroh::tls::make_server_config`), so the TLS/QUIC layer accepts 0-RTT early data
 > for **any** ALPN regardless of the handler. `Accepting::into_0rtt()` only changes
@@ -180,7 +179,7 @@ under Consequences and SHOULD be added when that loop lands.
 - **Session ticket storage** adds a small memory footprint (~200 bytes per ticket x 1,000 max = ~200 KB), owned by rustls inside iroh.
 - **Complexity cost** is modest: iroh's `Connecting::into_0rtt()` / `Accepting::into_0rtt()` handle the transport-level details and the ticket store. The implementation burden is the per-handler `on_accepting` override, the client attempt/fallback path, the `max_tls_tickets` sizing, and the metrics.
 - **Future protocol versions** that add state-changing behavior to `ProbeRequest` must re-evaluate 0-RTT eligibility. The replay safety analysis in this ADR is tied to the current message semantics.
-- **Known deviation (defense-in-depth):** the independent client-side 24-hour ticket-age cap from earlier drafts is not enforced — iroh exposes no hook into the rustls session store — so the server-advertised `ticket_lifetime` is the sole bound on the 0-RTT replay window. Acceptable at PoC scale; revisit if iroh exposes session-store control.
+- **Known deviation (defense-in-depth):** an independent client-side 24-hour ticket-age cap is not enforced — iroh exposes no hook into the rustls session store — so the server-advertised `ticket_lifetime` is the sole bound on the 0-RTT replay window. Acceptable at PoC scale; revisit if iroh exposes session-store control.
 - **Follow-up:** `decdn_quic_session_ticket_cache_size` is an approximation (rustls has no size API), and the `probe_collection_latency_seconds` histogram is deferred until the node's DHT→probe cache-miss loop exists. The 0-RTT mechanism is implemented as a reusable probe-client helper so that loop can adopt it without rework.
 
 ## References

@@ -74,7 +74,7 @@ Backstops for the pre-positioned case are deliberately off-protocol: (a) declare
 
 ### Positive
 
-- Closes the region-attestation gap with a concrete decision; supersedes the three "future work / production mitigation: oracle" passages in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), and [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow).
+- Closes the region-attestation gap with a concrete decision, resolving the three "future work / production mitigation: oracle" passages in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), and [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow).
 - No new external trust root and no new external dependency.
 - Appeals-standing flipping *and* reactive blacklist-scope flipping become protocol invariants rather than, respectively, a multisig norm and an unmitigated gap.
 - Operator UX unchanged for honest deployments — VPN, anycast, mobile, and multi-region operators are not penalized by an IP-geolocation gate that would systematically misclassify them.
