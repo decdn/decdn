@@ -459,13 +459,18 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         }
         if (unbondingOf[msg.sender].amount != 0) revert UnbondingInProgress();
 
-        // ADR 026 § Genesis Bond Credits — exit clause: initiating unbonding
-        // forfeits any unvested credit to Treasury (burn if no Treasury wired).
-        _forfeitUnvestedCredit(msg.sender);
-
+        // CEI: finalize stake state BEFORE the external token operations in
+        // `_forfeitUnvestedCredit` (token.burn / safeTransfer). The token is
+        // the protocol's own ERC20Burnable so reentrancy isn't real, but
+        // ordering this way satisfies slither's reentrancy-no-eth detector
+        // and keeps the contract robust against a future TOKEN swap.
         activeStake[msg.sender] -= amount;
         uint256 unlockAt = block.timestamp + unbondingPeriod;
         unbondingOf[msg.sender] = UnbondingRequest({ amount: amount, unlockAt: unlockAt });
+
+        // ADR 026 § Genesis Bond Credits — exit clause: initiating unbonding
+        // forfeits any unvested credit to Treasury (burn if no Treasury wired).
+        _forfeitUnvestedCredit(msg.sender);
 
         emit UnbondingRequested(msg.sender, amount, unlockAt, activeStake[msg.sender]);
     }
@@ -477,8 +482,11 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     function _forfeitUnvestedCredit(address operator) internal {
         PendingCredit storage pc = _pendingCredit[operator];
         if (pc.originalGrant == 0) return;
-        uint256 vested = _curveVestedFromMem(_pendingCredit[operator]);
+        uint256 vested = _curveVested(operator);
         uint256 unvested = uint256(pc.originalGrant) - vested;
+        // `unvested` is a derived amount, not a token-balance read; zero is
+        // the well-defined "fully vested" sentinel.
+        // slither-disable-next-line incorrect-equality
         if (unvested == 0) return;
         pc.originalGrant = uint128(vested);
 
@@ -559,17 +567,17 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     ///         `originalGrant × min(elapsed, DURATION) / DURATION`. Decoupled
     ///         from `claimed` so partial claims do not skew the curve.
     function curveVested(address operator) external view returns (uint256) {
-        return _curveVestedFromMem(_pendingCredit[operator]);
+        return _curveVested(operator);
     }
 
     /// @notice Amount currently available to `claimVestedCredit`. Bounded
     ///         below by 0 so a post-slash decrease in `originalGrant` cannot
     ///         produce a negative claimable.
     function claimableCredit(address operator) public view returns (uint256) {
-        PendingCredit memory pc = _pendingCredit[operator];
-        uint256 vested = _curveVestedFromMem(pc);
-        if (vested <= pc.claimed) return 0;
-        return vested - pc.claimed;
+        uint256 vested = _curveVested(operator);
+        uint256 claimed = _pendingCredit[operator].claimed;
+        if (vested <= claimed) return 0;
+        return vested - claimed;
     }
 
     /// @notice One-shot TGE grant. Treasury must `approve(this, amount)` first;
@@ -610,6 +618,9 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         if (_slashedAtEpoch[msg.sender] != 0) revert SlashedInWindowForClaim(msg.sender);
 
         uint256 claimable = claimableCredit(msg.sender);
+        // Derived from the curve, not a balance read; zero is the
+        // well-defined "nothing to claim yet" sentinel.
+        // slither-disable-next-line incorrect-equality
         if (claimable == 0) revert NothingVested();
 
         PendingCredit storage pc = _pendingCredit[msg.sender];
@@ -626,13 +637,17 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         emit Staked(msg.sender, claimable, newBalance);
     }
 
-    /// @dev Pure curve helper — `originalGrant × min(elapsed, DUR) / DUR`.
-    function _curveVestedFromMem(PendingCredit memory pc) internal view returns (uint256) {
-        if (pc.originalGrant == 0) return 0;
+    /// @dev Curve helper that reads storage directly so callers don't
+    ///      pass storage→memory copies into a memory-param helper
+    ///      (aderyn H-2). Result is `originalGrant × min(elapsed, DUR) / DUR`.
+    function _curveVested(address operator) internal view returns (uint256) {
+        PendingCredit storage pc = _pendingCredit[operator];
+        uint128 grant = pc.originalGrant;
+        if (grant == 0) return 0;
         // forge-lint: disable-next-line(block-timestamp)
         uint256 elapsed = block.timestamp - pc.grantedAt;
-        if (elapsed >= GENESIS_VEST_DURATION) return pc.originalGrant;
-        return (uint256(pc.originalGrant) * elapsed) / GENESIS_VEST_DURATION;
+        if (elapsed >= GENESIS_VEST_DURATION) return grant;
+        return (uint256(grant) * elapsed) / GENESIS_VEST_DURATION;
     }
 
     // -----------------------------------------------------------------
@@ -856,11 +871,13 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     function _slashPendingCreditAtTier(address operator, uint256 tierBps) internal returns (uint256 slashed) {
         PendingCredit storage pc = _pendingCredit[operator];
         if (pc.originalGrant == 0) return 0;
-        uint256 vested = _curveVestedFromMem(_pendingCredit[operator]);
+        uint256 vested = _curveVested(operator);
         uint256 unvested = uint256(pc.originalGrant) - vested;
+        // slither-disable-next-line incorrect-equality
         if (unvested == 0) return 0;
         // slither-disable-next-line divide-before-multiply
         slashed = (unvested * tierBps) / BPS_DENOMINATOR;
+        // slither-disable-next-line incorrect-equality
         if (slashed == 0) return 0;
         pc.originalGrant = uint128(uint256(pc.originalGrant) - slashed);
     }

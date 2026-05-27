@@ -20,7 +20,7 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 ///         `_performSwap` with the live Balancer V3 ABI. Once that override
 ///         is in place, the contract performs a single swap against the
 ///         Vault then burns the received TOKEN.
-contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
+abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     // -----------------------------------------------------------------
@@ -105,20 +105,15 @@ contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
         emit BuybackExecuted(amountIn, tokenOut);
     }
 
-    /// @dev Placeholder for the live Balancer V3 swap. Returns 0 in this
-    ///      revision — overridden by the deployment PR that binds the Vault
-    ///      ABI. Marked `virtual` so a test mock can stub it.
-    function _performSwap(
-        uint256,
-        /*amountIn*/
-        uint256 /*minOut*/
-    )
-        internal
-        virtual
-        returns (uint256)
-    {
-        return 0;
-    }
+    /// @dev Abstract hook for the live Balancer V3 swap. The deployment PR
+    ///      that binds the Vault ABI subclasses `BuybackBurner` and provides
+    ///      a concrete `_performSwap` returning the post-swap TOKEN amount.
+    ///      Keeping this `virtual` without a body (a) keeps the base
+    ///      contract abstract — it cannot be deployed by itself — and
+    ///      (b) makes solc's unreachable-code analysis treat the call site
+    ///      as opaque, avoiding the OZ ReentrancyGuard `--deny-warnings`
+    ///      trip that a return-0 base implementation would cause.
+    function _performSwap(uint256 amountIn, uint256 minOut) internal virtual returns (uint256);
 
     // -----------------------------------------------------------------
     // Governance setters

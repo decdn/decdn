@@ -234,12 +234,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     }
 
     function isHashBlacklisted(bytes32 hash) external view returns (bool) {
-        return _isLive(_hashEntries[GLOBAL_REGION][hash]);
+        return _isLive(GLOBAL_REGION, hash);
     }
 
     function isHashBlacklistedInRegion(bytes32 hash, bytes32 region) external view returns (bool) {
-        if (_isLive(_hashEntries[GLOBAL_REGION][hash])) return true;
-        return _isLive(_hashEntries[region][hash]);
+        if (_isLive(GLOBAL_REGION, hash)) return true;
+        return _isLive(region, hash);
     }
 
     function getHashEntry(bytes32 region, bytes32 hash) external view returns (HashEntry memory) {
@@ -432,7 +432,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         emit HashRemoved(region, hash);
     }
 
-    function _isLive(HashEntry memory e) internal pure returns (bool) {
+    /// @dev Reads storage directly to avoid the `storage → memory` flagged
+    ///      by aderyn H-2. An entry is live iff it was added (`addedAt != 0`)
+    ///      and not currently fast-track-suspended.
+    function _isLive(bytes32 region, bytes32 hash) internal view returns (bool) {
+        HashEntry storage e = _hashEntries[region][hash];
         return e.addedAt != 0 && !e.suspended;
     }
 

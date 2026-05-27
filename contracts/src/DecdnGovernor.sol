@@ -88,9 +88,13 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         feeRouter = feeRouter_;
         capacityBond = capacityBond_;
         // Seed the checkpoints at clock()=now so any read at a timepoint
-        // ≥ deploy time returns the initial values.
+        // ≥ deploy time returns the initial values. `Trace208.push` returns
+        // (prevValue, newValue); we discard both — initial seeding has no
+        // prior value worth recording.
+        // slither-disable-start unused-return
         _voteCapBpsHistory.push(clock(), 500);
         _ageRampMonthsHistory.push(clock(), 6);
+        // slither-disable-end unused-return
     }
 
     // -----------------------------------------------------------------
@@ -234,6 +238,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
             revert ParamOutOfBounds({ value: newValue, floor: VOTE_CAP_BPS_FLOOR, ceiling: VOTE_CAP_BPS_CEILING });
         }
         uint256 old = voteCapBps();
+        // slither-disable-next-line unused-return
         _voteCapBpsHistory.push(clock(), newValue.toUint208());
         emit VoteCapBpsUpdated(old, newValue);
     }
@@ -245,6 +250,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
             revert ParamOutOfBounds(newValue, AGE_RAMP_MONTHS_FLOOR, AGE_RAMP_MONTHS_CEILING);
         }
         uint256 old = ageRampMonths();
+        // slither-disable-next-line unused-return
         _ageRampMonthsHistory.push(clock(), newValue.toUint208());
         emit AgeRampMonthsUpdated(old, newValue);
     }

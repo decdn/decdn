@@ -144,6 +144,13 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     ///         (`reason=1`).
     event DisburseSkipped(uint8 reason);
     event SlashInflowRecorded(address indexed operator, uint256 amount);
+    /// @notice Emitted by `swapAccumulatedTokens` immediately before the
+    ///         `SwapNotImplemented` revert so solc classifies the function
+    ///         as state-mutating (it would otherwise warn "can be view"). The
+    ///         emit is logically rolled back by the revert, so this event is
+    ///         not actually observable on-chain in this revision — downstream
+    ///         observers should react to the `SwapNotImplemented` error.
+    event SwapAttempted(address indexed keeper, uint256 amountIn, uint256 minOut);
 
     event SlashAppealOpened(
         uint256 indexed appealId,
@@ -331,19 +338,22 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     /// @dev Until the Balancer V3 Vault swap ABI is bound (separate PR),
     ///      this entrypoint reverts with `SwapNotImplemented` even after a
     ///      `balancerPool` is wired. Emitting `SwapExecuted` for a no-op
-    ///      would mislead off-chain indexers (I1 fix).
-    function swapAccumulatedTokens(
-        uint256,
-        /*amountIn*/
-        uint256 /*minOut*/
-    )
+    ///      would mislead off-chain indexers (I1 fix). `nonReentrant` is
+    ///      intentionally absent: this body always reverts before any
+    ///      external call, so the OZ `_nonReentrantAfter` would be
+    ///      unreachable (tripping CI `--deny-warnings`). Subclasses that
+    ///      override with a real swap MUST re-add the modifier.
+    function swapAccumulatedTokens(uint256 amountIn, uint256 minOut)
         external
         override
-        nonReentrant
         whenNotPaused
         onlyRole(KEEPER_ROLE)
     {
         if (balancerPool == address(0)) revert PoolNotWired();
+        // Emit before the revert so solc sees a state-mutating side effect
+        // (avoids the "Function state mutability can be restricted to view"
+        // warning that would otherwise trip CI `--deny-warnings`).
+        emit SwapAttempted(msg.sender, amountIn, minOut);
         revert SwapNotImplemented();
     }
 
@@ -363,6 +373,14 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
         whenNotPaused
         returns (uint256 appealId)
     {
+        // `slashRecords` is a view call on a trusted protocol contract
+        // (CapacityBond), set immutable in this contract's constructor.
+        // No reentrancy surface — the analyzer flags any external call
+        // followed by a later state write regardless of mutability. The
+        // third tuple element (`slashAmount`) is intentionally discarded:
+        // restitution is capped at `maxAppealRestitution` independently.
+        // slither-disable-next-line unused-return,reentrancy-no-eth
+        // aderyn-ignore-next-line(reentrancy-state-change)
         (address operator, uint64 slashedAt_,) = capacityBond.slashRecords(slashId);
         if (operator == address(0) || slashedAt_ == 0) revert UnknownSlash(slashId);
         // forge-lint: disable-next-line(block-timestamp)
@@ -374,16 +392,17 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
             if (block.timestamp < nextAvailable) revert FrequencyCapHit(nextAvailable);
         }
 
-        IERC20(address(token)).safeTransferFrom(msg.sender, address(this), appealBond);
-
+        // CEI: write the appeal record before the bond pull so the appeal
+        // state is final before any external token call (aderyn H-1).
         appealId = _appeals.length;
+        uint256 bondToPull = appealBond;
         _appeals.push(
             Appeal({
                 slashId: slashId,
                 operator: operator,
                 appellant: msg.sender,
                 evidenceBundleHash: evidenceBundleHash,
-                bond: appealBond,
+                bond: bondToPull,
                 escrowAmount: 0,
                 openedAt: uint64(block.timestamp),
                 fastTrackedAt: 0,
@@ -391,7 +410,8 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
             })
         );
 
-        emit SlashAppealOpened(appealId, slashId, operator, msg.sender, evidenceBundleHash, appealBond);
+        IERC20(address(token)).safeTransferFrom(msg.sender, address(this), bondToPull);
+        emit SlashAppealOpened(appealId, slashId, operator, msg.sender, evidenceBundleHash, bondToPull);
     }
 
     /// @inheritdoc ISafetyReserve
