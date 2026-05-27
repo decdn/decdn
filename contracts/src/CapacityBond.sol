@@ -115,16 +115,12 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     ///         index `FeeRouter` writes into `bytesPerEpoch`.
     uint64 public constant EPOCH_LENGTH = 7 days;
 
-    /// @notice Number of epochs after a slash during which
-    ///         `claimVestedCredit` is blocked. Matches the default
-    ///         `FeeRouter.windowEpochs` (13 ≈ one quarter) but lives as a
-    ///         local constant here so the claim gate doesn't introduce a
-    ///         cross-contract read on every claim. Once the current epoch
-    ///         exceeds `slashedAtEpoch + CLAIM_SLASH_GATE_EPOCHS`, the
-    ///         operator's claim is unblocked (gemini-code-assist medium
-    ///         finding — without the window the gate would block claims
-    ///         forever after any historical slash).
-    uint64 internal constant CLAIM_SLASH_GATE_EPOCHS = 13;
+    /// @notice Bounds for `claimSlashGateEpochs` — match `FeeRouter`'s
+    ///         `[WINDOW_EPOCHS_FLOOR, WINDOW_EPOCHS_CEILING]` so governance
+    ///         can keep the two in lock-step in a single multi-call without
+    ///         this contract taking a cross-contract dependency on FeeRouter.
+    uint64 internal constant CLAIM_SLASH_GATE_FLOOR = 4;
+    uint64 internal constant CLAIM_SLASH_GATE_CEILING = 26;
 
     // -----------------------------------------------------------------
     // EIP-712 typehashes
@@ -207,6 +203,15 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     /// @notice Cooldown enforced between `updateRegion` calls per ADR 030
     ///         (default 7 days; governable [3d, 30d]).
     uint256 public regionStabilityWindow;
+
+    /// @notice Number of epochs after a slash during which
+    ///         `claimVestedCredit` is blocked. Default 13 (≈ one quarter),
+    ///         matching the `FeeRouter.windowEpochs` default. Governance
+    ///         SHOULD keep this in lock-step with `FeeRouter.windowEpochs`
+    ///         in the same multi-call so the claim gate doesn't drift from
+    ///         the slash zero-out window used by `DecdnGovernor`. Bounded
+    ///         [4, 26] to match FeeRouter.
+    uint64 public claimSlashGateEpochs;
 
     // -----------------------------------------------------------------
     // Storage — Genesis Bond Credits (ADR 026 § Genesis Bond Credits)
@@ -304,6 +309,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     event MultiaddrUpdateCooldownUpdated(uint256 oldValue, uint256 newValue);
     event MaxMultiaddrSizeUpdated(uint256 oldValue, uint256 newValue);
     event RegionStabilityWindowUpdated(uint256 oldValue, uint256 newValue);
+    event ClaimSlashGateEpochsUpdated(uint64 oldValue, uint64 newValue);
 
     event NodeRegistered(
         bytes32 indexed nodeId,
@@ -339,7 +345,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     event SlashRecorded(uint256 indexed slashId, address indexed operator, uint64 slashedAt, uint256 slashAmount);
 
     // I3 — best-effort slash inflow callback.
-    event SlashInflowReportFailed(address indexed operator, uint256 amount);
+    event SlashInflowReportFailed(uint256 indexed slashId, address indexed operator, uint256 amount, bytes reason);
 
     // Treasury wiring (C3).
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
@@ -433,6 +439,10 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         maxMultiaddrSize = maxMultiaddrSize_;
         regionStabilityWindow = regionStabilityWindow_;
         genesisCreditWindowEnd = uint64(block.timestamp + genesisCreditWindow_);
+        // Default the claim slash gate to 13 epochs (matches FeeRouter's
+        // initial `windowEpochs` default). Governance can retune via
+        // `setClaimSlashGateEpochs` in lock-step with FeeRouter changes.
+        claimSlashGateEpochs = 13;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
@@ -618,8 +628,12 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
 
     /// @notice Move the currently-claimable portion (curve - alreadyClaimed)
     ///         from `pendingCredit` into the caller's `activeStake`. Gated on
-    ///         `activeStake > 0 && !ejected && slashedAtEpoch == 0` — the
-    ///         practical "operating, non-slashed" predicate per ADR 026
+    ///         `activeStake > 0 && !ejected` plus an unexpired slash-zero-out
+    ///         window: while `currentEpoch < slashedAtEpoch +
+    ///         claimSlashGateEpochs`, the claim reverts. Once the window
+    ///         elapses (or `slashedAtEpoch` is cleared by a successful
+    ///         appeal reversal) the claim is unblocked. Matches the
+    ///         "operating, non-slashed-in-window" predicate per ADR 026
     ///         § Genesis Bond Credits. (Strict `isActive` additionally
     ///         requires NodeId registration; the looser gate here mirrors
     ///         the economic intent without requiring node-registry tests
@@ -627,13 +641,14 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     function claimVestedCredit() external nonReentrant whenNotPaused {
         if (activeStake[msg.sender] == 0 || ejected[msg.sender]) revert NotActiveForClaim(msg.sender);
         // Only block while the operator is still inside their slash zero-out
-        // window — past that, the claim is unblocked (gemini-code-assist
-        // medium finding: the prior `!= 0` check locked the operator out
-        // forever after any historical slash).
+        // window — past that, the claim is unblocked (closes the lock-out-
+        // forever bug from the prior `!= 0` check). The window length is
+        // governance-tunable via `setClaimSlashGateEpochs` so it can be
+        // kept in lock-step with `FeeRouter.windowEpochs`.
         uint64 slashEpoch = _slashedAtEpoch[msg.sender];
         if (slashEpoch != 0) {
             uint64 currentEpoch = uint64(block.timestamp / EPOCH_LENGTH);
-            if (currentEpoch < slashEpoch + CLAIM_SLASH_GATE_EPOCHS) {
+            if (currentEpoch < slashEpoch + claimSlashGateEpochs) {
                 revert SlashedInWindowForClaim(msg.sender);
             }
         }
@@ -863,7 +878,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         totalSlash = stakeSlash + creditSlash;
         slashId = _mintSlashRecord(operator, totalSlash);
         if (creditSlash != 0) emit GenesisCreditSlashed(operator, creditSlash);
-        _distributeAndStamp(operator, challenger, offenseType, totalSlash, newCount);
+        _distributeAndStamp(slashId, operator, challenger, offenseType, totalSlash, newCount);
     }
 
     /// @dev Reduce active + unbonding stake at `tierBps`. Active first, then
@@ -922,6 +937,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     ///      ejection events. `recordSlashInflow` is best-effort (I3): a
     ///      faulty SafetyReserve cannot brick the slash path.
     function _distributeAndStamp(
+        uint256 slashId,
         address operator,
         address challenger,
         uint8 offenseType,
@@ -938,7 +954,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         emit SlashedAtEpochStamped(operator, _slashedAtEpoch[operator]);
 
         _maybeAutoEject(operator);
-        _routeSlashShares(operator, challenger, challengerShare, safetyShare, burnShare);
+        _routeSlashShares(slashId, operator, challenger, challengerShare, safetyShare, burnShare);
 
         emit Slashed(operator, challenger, offenseType, newCount, totalSlash, challengerShare, safetyShare, burnShare);
     }
@@ -955,19 +971,25 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     /// @dev Route the three shares (challenger / safety / burn) and emit the
     ///      best-effort `recordSlashInflow` callback per I3. Stack-isolated
     ///      from `_distributeAndStamp` to keep both fns under the 16-slot limit.
+    ///      On callback failure, surfaces the revert reason in the event so
+    ///      off-chain reconcilers can distinguish OOG / pause / role-revoked
+    ///      causes without correlating by tx hash.
     function _routeSlashShares(
+        uint256 slashId,
         address operator,
         address challenger,
         uint256 challengerShare,
         uint256 safetyShare,
         uint256 burnShare
     ) internal {
-        if (challengerShare != 0) IERC20(address(token)).safeTransfer(challenger, challengerShare);
+        if (challengerShare != 0) {
+            IERC20(address(token)).safeTransfer(challenger, challengerShare);
+        }
         if (safetyShare != 0) {
             IERC20(address(token)).safeTransfer(address(safetyReserve), safetyShare);
             try safetyReserve.recordSlashInflow(operator, safetyShare) { }
-            catch {
-                emit SlashInflowReportFailed(operator, safetyShare);
+            catch (bytes memory reason) {
+                emit SlashInflowReportFailed(slashId, operator, safetyShare, reason);
             }
         }
         if (burnShare != 0) token.burn(burnShare);
@@ -1064,6 +1086,23 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         uint256 oldWindow = regionStabilityWindow;
         regionStabilityWindow = newWindow;
         emit RegionStabilityWindowUpdated(oldWindow, newWindow);
+    }
+
+    /// @notice Set the claim slash gate window. Governance SHOULD update
+    ///         this in the same multi-call as any `FeeRouter.windowEpochs`
+    ///         change so the claim gate stays aligned with the slash
+    ///         zero-out window read by `DecdnGovernor._slashedInWindow`.
+    function setClaimSlashGateEpochs(uint64 newValue) external onlyRole(GOVERNANCE_ROLE) {
+        if (newValue < CLAIM_SLASH_GATE_FLOOR || newValue > CLAIM_SLASH_GATE_CEILING) {
+            revert ParamOutOfBounds({
+                value: uint256(newValue),
+                floor: uint256(CLAIM_SLASH_GATE_FLOOR),
+                ceiling: uint256(CLAIM_SLASH_GATE_CEILING)
+            });
+        }
+        uint64 old = claimSlashGateEpochs;
+        claimSlashGateEpochs = newValue;
+        emit ClaimSlashGateEpochsUpdated(old, newValue);
     }
 
     // -----------------------------------------------------------------

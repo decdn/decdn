@@ -60,6 +60,7 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     error ZeroAmount();
     error PoolNotWired();
     error SwapNotImplemented();
+    error SwapReportMismatch(uint256 reported, uint256 actual);
 
     // -----------------------------------------------------------------
     // Constructor
@@ -91,6 +92,7 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     ///         `SwapNotImplemented` revert unreachable.
     function executeBuyback(uint256 amountIn, uint256 minOut)
         external
+        virtual
         nonReentrant
         whenNotPaused
         onlyRole(KEEPER_ROLE)
@@ -99,10 +101,20 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
         if (amountIn == 0) revert ZeroAmount();
         if (balancerPool == address(0) || balancerVault == address(0)) revert PoolNotWired();
 
+        // Verify the subclass's reported `tokenOut` matches the actual
+        // balance delta. Closes the trust boundary: a buggy override that
+        // returns a smaller amount would otherwise burn less than
+        // received, leaving residual TOKEN stranded in this contract.
+        uint256 balanceBefore = IERC20(address(token)).balanceOf(address(this));
         tokenOut = _performSwap(amountIn, minOut);
-        if (tokenOut == 0) revert SwapNotImplemented();
-        token.burn(tokenOut);
-        emit BuybackExecuted(amountIn, tokenOut);
+        uint256 actual = IERC20(address(token)).balanceOf(address(this)) - balanceBefore;
+        // Derived balance delta, not a token-balance read. Strict equality
+        // against 0 is the correct sentinel for "no swap occurred".
+        // slither-disable-next-line incorrect-equality
+        if (actual == 0) revert SwapNotImplemented();
+        if (actual != tokenOut) revert SwapReportMismatch(tokenOut, actual);
+        token.burn(actual);
+        emit BuybackExecuted(amountIn, actual);
     }
 
     /// @dev Abstract hook for the live Balancer V3 swap. The deployment PR

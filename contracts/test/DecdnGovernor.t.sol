@@ -118,4 +118,25 @@ contract DecdnGovernorTest is Test {
         vm.expectRevert();
         gov.setVoteCapBps(500);
     }
+
+    /// @notice T-4 — slash that happens AFTER a historical timepoint must
+    ///         NOT retroactively zero its vote weight. Regression test for
+    ///         the `slashed <= endEpoch` upper bound.
+    function test_getVotes_historicalSnapshotIgnoresFutureSlash() public {
+        vm.warp(BASE + 2);
+        bond.setFirstBondedAt(operator, uint64(BASE - 180 days));
+        _setBytesAtTimepoint(operator, 10_000, 1_000_000);
+
+        // Capture the historical vote weight (no slash yet).
+        uint256 historicalWeight = gov.getVotes(operator, tp);
+        assertGt(historicalWeight, 0);
+
+        // Now a slash happens at a LATER epoch than the timepoint's window.
+        // `tp / EPOCH` ≈ 104; pick a slash epoch strictly greater.
+        bond.setSlashedAtEpoch(operator, uint64(tp / EPOCH) + 1);
+
+        // The historical snapshot weight must NOT change — the slash is
+        // beyond `endEpoch` of the historical window.
+        assertEq(gov.getVotes(operator, tp), historicalWeight);
+    }
 }

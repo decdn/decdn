@@ -235,4 +235,31 @@ contract SafetyReserveTest is Test {
 
         assertEq(reserve.availableUsdc(), before - MAX_RESTITUTION);
     }
+
+    /// @notice T-2 — Duplicate `openSlashAppeal(slashId)` must revert with
+    ///         `SlashAlreadyAppealed`. Without this guard, multiple appeals
+    ///         could each be ratified up to `maxAppealRestitution`,
+    ///         draining the reserve.
+    function test_openSlashAppeal_revertsDuplicateSlashId() public {
+        bond.setSlashRecord(0, operator, uint64(block.timestamp), 50_000e18);
+
+        vm.prank(appellant);
+        reserve.openSlashAppeal(0, bytes32("first"));
+
+        // Second call from any caller on the same slashId must revert.
+        // Fund a second appellant so the failure is the dedup guard, not
+        // the bond pull.
+        address secondAppellant = address(0xA8);
+        vm.prank(admin);
+        token.transfer(secondAppellant, APPEAL_BOND);
+        vm.prank(secondAppellant);
+        token.approve(address(reserve), type(uint256).max);
+
+        vm.prank(secondAppellant);
+        vm.expectRevert(abi.encodeWithSelector(SafetyReserve.SlashAlreadyAppealed.selector, uint256(0)));
+        reserve.openSlashAppeal(0, bytes32("second"));
+
+        // Confirm the guard flag is set.
+        assertTrue(reserve.slashAppealed(0));
+    }
 }

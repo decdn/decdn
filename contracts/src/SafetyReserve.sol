@@ -134,10 +134,10 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
 
     /// @notice One-shot guard against multiple appeals for the same slashId.
     ///         Set on the first successful `openSlashAppeal`; never cleared.
-    ///         Without this guard an attacker could open + fast-track + ratify
-    ///         multiple appeals for one slash event and drain the reserve at
-    ///         `maxAppealRestitution` per ratification (gemini-code-assist
-    ///         high-severity finding).
+    ///         Closes the duplicate-appeal reserve-drain vector: without
+    ///         this guard, an attacker could open + fast-track + ratify
+    ///         multiple appeals for one slash event and pull
+    ///         `maxAppealRestitution` per ratification.
     mapping(uint256 slashId => bool) public slashAppealed;
 
     // -----------------------------------------------------------------
@@ -344,24 +344,31 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     }
 
     /// @inheritdoc ISafetyReserve
-    /// @dev Until the Balancer V3 Vault swap ABI is bound (separate PR),
-    ///      this entrypoint reverts with `SwapNotImplemented` even after a
-    ///      `balancerPool` is wired. Emitting `SwapExecuted` for a no-op
-    ///      would mislead off-chain indexers (I1 fix). `nonReentrant` is
-    ///      intentionally absent: this body always reverts before any
-    ///      external call, so the OZ `_nonReentrantAfter` would be
-    ///      unreachable (tripping CI `--deny-warnings`). Subclasses that
-    ///      override with a real swap MUST re-add the modifier.
+    /// @dev Calls the `_doSwap` virtual hook so subclasses with a live
+    ///      Balancer V3 Vault integration can override the swap body
+    ///      without rewriting the outer access-control / reentrancy frame.
+    ///      Base hook reverts with `SwapNotImplemented` after emitting
+    ///      `SwapAttempted` (the emit also lets solc see a state-mutating
+    ///      side effect through the virtual call, avoiding both the
+    ///      "Function state mutability can be restricted to view" and the
+    ///      "unreachable code in `_nonReentrantAfter`" warnings under
+    ///      `--deny-warnings`).
     function swapAccumulatedTokens(uint256 amountIn, uint256 minOut)
         external
+        virtual
         override
+        nonReentrant
         whenNotPaused
         onlyRole(KEEPER_ROLE)
     {
         if (balancerPool == address(0)) revert PoolNotWired();
-        // Emit before the revert so solc sees a state-mutating side effect
-        // (avoids the "Function state mutability can be restricted to view"
-        // warning that would otherwise trip CI `--deny-warnings`).
+        _doSwap(amountIn, minOut);
+    }
+
+    /// @dev Virtual swap hook overridden by production subclasses with the
+    ///      live Vault ABI binding. Base reverts so a freshly deployed
+    ///      SafetyReserve cannot silently no-op a swap.
+    function _doSwap(uint256 amountIn, uint256 minOut) internal virtual {
         emit SwapAttempted(msg.sender, amountIn, minOut);
         revert SwapNotImplemented();
     }
@@ -387,10 +394,8 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
         returns (uint256 appealId)
     {
         // One appeal per slashId — no duplicate appeals can be filed for
-        // the same slash event, even after rejection/lapse of a prior one
-        // (gemini-code-assist high finding: duplicate appeals could be
-        // ratified for the same slash, draining the reserve at
-        // `maxAppealRestitution` per ratification).
+        // the same slash event, even after rejection/lapse of a prior one.
+        // Closes the duplicate-appeal reserve-drain vector.
         if (slashAppealed[slashId]) revert SlashAlreadyAppealed(slashId);
 
         // aderyn-ignore-next-line(reentrancy-state-change)

@@ -145,4 +145,29 @@ contract FeeRouterTest is Test {
         router.setSafetyReserve(address(0));
         vm.stopPrank();
     }
+
+    /// @notice T-1 — `opShare` absorbs the rounding remainder so a 1-wei
+    ///         settlement with zero safety share + zero safetyReserve does
+    ///         NOT attempt `safeTransfer(address(0), 1)` and revert.
+    ///         Regression test for the dust-to-address(0) bug that would
+    ///         brick settlements.
+    function test_routeSettlement_dustRoutesToOperatorWhenSafetyUnset() public {
+        // Valid bps split with safety = 0 so safetyReserve can be address(0).
+        // Operator floor is 4000, buyback floor (when non-zero) 500, treasury
+        // ceiling 3000, safety ceiling 2000. Pick 9000/500/500/0.
+        uint256[4] memory split = [uint256(9000), uint256(500), uint256(500), uint256(0)];
+        FeeRouter.ShareDestinations memory dests =
+            FeeRouter.ShareDestinations({ safetyReserve: address(0), buybackBurner: buyback, treasury: treasury });
+        vm.prank(admin);
+        router.setSharesAndDestinations(split, dests);
+
+        // Settle 1 wei. With these shares all four computed legs round to
+        // zero except the operator remainder; opShare = 1 - 0 - 0 - 0 = 1.
+        // Pre-fix the remainder went to safetyShare → safeTransfer(0, 1) → revert.
+        uint256 opBefore = usdc.balanceOf(operator);
+        vm.warp(EPOCH + 1);
+        vm.prank(channel);
+        router.routeSettlement(operator, 0, 1);
+        assertEq(usdc.balanceOf(operator) - opBefore, 1);
+    }
 }

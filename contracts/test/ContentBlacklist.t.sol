@@ -171,4 +171,77 @@ contract ContentBlacklistTest is Test {
             bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
         );
     }
+
+    /// @notice T-3 — concurrent appeals on the same (region, hash) revert.
+    function test_openBlacklistAppeal_revertsDuplicatePerHash() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e1"), ContentBlacklist.StandingPath.Operator);
+
+        // Fund a second filer; even with a different filer, same (region, hash)
+        // can't have a second active appeal.
+        address filer2 = address(0xF2);
+        vm.prank(admin);
+        token.transfer(filer2, APPEAL_BOND);
+        vm.prank(filer2);
+        token.approve(address(blacklist), type(uint256).max);
+
+        vm.prank(filer2);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.AppealAlreadyActive.selector, REGION_US, SAMPLE_HASH));
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e2"), ContentBlacklist.StandingPath.Operator);
+
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+    }
+
+    /// @notice T-3 — `hasActiveAppeal` clears on reject, allowing a new
+    ///         appeal to be filed afterwards.
+    function test_hasActiveAppeal_clearedOnReject() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        vm.prank(filer);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        vm.prank(multisig);
+        blacklist.rejectBlacklistAppeal(appealId);
+
+        assertFalse(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+
+        // A follow-up open should succeed (freq cap doesn't apply since the
+        // prior appeal was rejected, not ratified).
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e2"), ContentBlacklist.StandingPath.Operator);
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+    }
+
+    /// @notice T-3 — `hasActiveAppeal` clears on reverse.
+    function test_hasActiveAppeal_clearedOnReverse() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        vm.prank(filer);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+        vm.prank(admin);
+        blacklist.reverseBlacklistAppeal(appealId);
+        assertFalse(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+    }
+
+    /// @notice T-3 — `hasActiveAppeal` clears on lapse from Open and
+    ///         FastTracked branches.
+    function test_hasActiveAppeal_clearedOnLapseOpen() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        vm.prank(filer);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        vm.warp(block.timestamp + 15 days);
+        blacklist.cleanupExpiredBlacklistAppeal(appealId);
+        assertFalse(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+    }
 }

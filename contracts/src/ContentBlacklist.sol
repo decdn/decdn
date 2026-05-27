@@ -131,8 +131,8 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         same entry — without this guard, multiple fast-tracked
     ///         appeals could share a single `suspended` flag, and the first
     ///         to terminate (reject/lapse/reverse) would clear `suspended`
-    ///         out from under any remaining live appeals (gemini-code-assist
-    ///         high finding: state override across concurrent appeals).
+    ///         out from under any remaining live appeals (state-override
+    ///         bug across concurrent appeals).
     mapping(bytes32 region => mapping(bytes32 hash => bool)) public hasActiveAppeal;
 
     // -----------------------------------------------------------------

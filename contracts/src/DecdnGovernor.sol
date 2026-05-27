@@ -197,7 +197,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         // Upper-bound the slash epoch at `endEpoch`. A slash that happened
         // AFTER the snapshot timepoint (e.g., between an old proposal's
         // snapshot and "now") must NOT retroactively zero historical votes
-        // for that proposal — gemini-code-assist high-severity finding.
+        // for that proposal.
         return slashed >= windowStart && slashed <= endEpoch;
     }
 
