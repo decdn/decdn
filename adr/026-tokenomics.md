@@ -172,19 +172,48 @@ S1 and S2 leave essentially all TOKEN liquid; the [§ Operator Service Emissions
 
 The first prong is mechanically larger at scale than any individual prong of the prior three-prong (gauge / delegator / burn) design; the second is a direct 5× multiplier on the deflationary lever.
 
-### Operator Service Emissions
+### Genesis Bond Credits
 
-Group 7 (20% / 200M TOKEN) is distributed as service emissions to active operators based on verified delivery. The bucket is interpreted as **payment for work** — operators are delivering bytes verified by the probe network — not as passive yield to holders. This is the canonical bucket alignment with the work-token framing.
+Group 2 carves 5pp / 50M TOKEN at TGE for **Genesis Bond Credits** to verified pre-launch testnet operators. Purpose: replace the year-1 operator-tier-upgrade runway that v2.1's Operator Service Emissions previously provided, without ongoing emission. A bounded, retroactive, one-shot grant — not a service-conditional distribution schedule.
 
-- Distribution: probe-attested bytes × capacity tier × diminishing-returns curve.
-- Auto-deposited into the operator's `CapacityBond` on a monthly (or per-epoch) cadence. Operators **cannot withdraw the granted TOKEN as liquid** until they unbond fully and exit operator status (subject to the 14-day unbonding window).
-- Subsidies stack with the operator's tier-upgrade economics: an operator can use granted TOKEN to bond up to a higher tier (which then requires probe re-verification) instead of buying TOKEN at market.
-- Emission schedule is front-loaded: ~40% in years 1–2 (S1→S3 bootstrap), tapering to ~20% in years 3–4 and ~10% per year thereafter until the 200M bucket exhausts (≈year 6 at default emission curve).
-- Bucket sunsets when exhausted or by governance vote after the transition thresholds in [§ Governance](#governance) (active operator count ≥ 30 AND total declared capacity ≥ 100 Gbps) are met for ≥6 months.
+**Eligibility.** Pre-launch incentivized-testnet operators only. Per-operator allocation is computed at TGE as a weighted score of measured testnet contribution:
 
-**Public-facing label:** the bucket retains the "Staking Rewards" label in fundraising materials and on tokenomics-tool exports for recognizability. Term-sheet language and this ADR refer to it as **Operator Service Emissions** to align with the work-token framing. The label disagreement is documented in fundraising one-pagers as a glossary entry.
+```
+score(op) = bytes_delivered(op) × uptime_ratio(op) × probe_success_ratio(op)
+allocation(op) = 50M × score(op) / Σ score(all eligible operators)
+```
 
-Precedent: Filecoin's storage-provider block rewards, Livepeer's orchestrator subsidies, and Helium's hotspot subsidies are direct analogs.
+Exact normalization, minimum thresholds, and per-operator caps are open questions — see [§ Deferred & Open](#deferred--open). No post-TGE application window; no anchor-operator discretionary carve.
+
+**Distribution at TGE.** Treasury executes a single batched `CapacityBond.grantGenesisCredit(operator, amount)` per eligible operator within a one-shot TGE window (default: 30 days post-deploy). After the window closes, the grant function is permanently disabled on-chain. TOKEN is auto-deposited directly into the operator's `CapacityBond` position; never enters the operator's wallet at any point before vest.
+
+**Vesting.** 24 months from TGE, linear by epoch. Vest accrues only if the operator is `isActive(op) && !isSlashed(op)` during the epoch. No minimum bytes-delivered threshold — non-delivery is already handled by the existing slashing pipeline.
+
+**Slashing.** The full pending credit (`pendingCredit.total - pendingCredit.vested`) is slashable on the same terms as the operator's voluntary bond. Slashed amounts route to `SafetyReserve` per [ADR 033](033-safety-insurance-reserve.md#adr-033-safety-and-insurance-reserve). Vested-but-unclaimed credit is no longer slashable — it has functionally become voluntarily-bonded TOKEN; this is reflected in [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
+
+**Exit before 24mo.** On voluntary unbond, the vested portion follows the standard 14-day unbonding window; the unvested portion is transferred back to the operational Treasury via the existing Treasury reference. The grant is one-shot per operator — an exited operator who re-registers does not recover the forfeited unvested portion.
+
+**Howey framing.** This is a retroactive grant for prior verifiable work (testnet), with a retention-style vesting cliff. Structurally distinct from ongoing service emission: the work that earned the grant is complete at TGE; the cliff is a retention incentive, not payment for ongoing service. Shape matches founding-employee RSU grants, not yield to passive bonders. See the v2.2 design spec § Regulatory posture for the full Howey-prong comparison across v1/v2/v2.1/v2.2.
+
+### App Incentives
+
+Group 4 (14% / 140M TOKEN) funds demand-side adoption — publishers serving content via deCDN and apps that integrate deCDN as their CDN backend. A customer-acquisition incentive aimed at consumers of the service, not at TOKEN bonders.
+
+**Distribution mechanism.** 4-year linear unlock into a dedicated Timelock-controlled multisig (separate wallet from operational Treasury for accounting cleanliness). No new on-chain contract at launch; both sub-programs are Treasury-multisig-administered. A future `PublisherRebateRouter` contract may subsume the rebate flow post-launch — see [§ Deferred & Open](#deferred--open).
+
+**Sub-programs (governance norm, not on-chain enforced).** The 10/4 split below is a DAO-rebalanceable norm within the 14% envelope.
+
+1. **Publisher Rebates (~10pp / 100M TOKEN indicative).** Quarterly TOKEN rebate to enrolled publishers whose USDC fee contributions exceed a minimum threshold. Mechanism:
+   - Publishers self-identify by signing a rebate-program agreement and completing light KYC.
+   - Each quarter, Treasury multisig audits served-bytes attributed to each enrolled publisher using `FeeRouter` accounting data and probe-verified delivery.
+   - Rebate paid in TOKEN, denominated as a DAO-tunable fraction of the publisher's quarterly USDC FeeRouter contribution.
+   - Indicative quarterly budget: (140M × 10/14) / 16 quarters ≈ 6.25M / quarter; unused budget rolls forward.
+
+2. **Integration Grants (~4pp / 40M TOKEN indicative).** Milestone-based lump-sum grants to projects integrating deCDN as their CDN backend. Targets: CMS plugins, framework adapters, hosting platforms, language SDKs beyond Rust. Per-project ceiling is DAO-tunable; indicative range 50K–500K TOKEN.
+
+**Howey framing.** Publisher Rebates are TOKEN-denominated discounts to paying customers — analogous to airline frequent-flyer miles or AWS cloud credits, not investment contracts. Integration Grants are milestone-based work-for-hire payouts. Neither is conditional on the recipient holding TOKEN; neither generates an expectation of profit from "the efforts of others."
+
+**Constraints.** App Incentives recipients are **not** eligible for [§ Genesis Bond Credits](#genesis-bond-credits) and vice versa. Co-marketing spend (case studies, conferences, advertising) is funded from the separate Misc. Marketing bucket (group 8), not from App Incentives.
 
 ### Capacity-shortfall slashing
 
