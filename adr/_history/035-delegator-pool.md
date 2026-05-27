@@ -1,7 +1,9 @@
 # ADR 035: Delegator Pool
 
+> **Status:** Retired 2026-05-25 under the work-token rewrite. The 7% delegator bucket and `DelegatorBuyer` USDC→TOKEN pipeline are deleted entirely. No analog exists: passive yield to ve-lockers is eliminated to break Howey prong 4. The freed 7pp is absorbed into the four-bucket FeeRouter (operator base 60 / burn 25 / treasury 10 / safety 5) in [ADR 026](../026-tokenomics.md#adr-026-tokenomics). Original ADR body preserved verbatim below for historical reference; do not link to from canonical ADRs.
+
 **Date:** 2026-04-25
-**Status:** Draft
+**Status (pre-retirement):** Draft
 
 ## Context
 

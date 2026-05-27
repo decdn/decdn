@@ -28,8 +28,8 @@ Key parameters:
 
 - Voucher cadence: 1 MB delivered per voucher (default; negotiable up to `maxVoucherIntervalMb` for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Minimum deposit: 1 USDC (contract floor, governable); recommended practical minimum: 10 USDC (see [Deposit Economics](#deposit-economics))
-- Fee routing: at settlement, the full operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in a single transaction; the operator's 40% base share is paid out same-tx and the remaining buckets (gauge boost, delegator pool, buyback-and-burn, treasury, safety) are distributed per [ADR 026](026-tokenomics.md#adr-026-tokenomics). See [FeeRouter Integration](#feerouter-integration).
-- Operator return is differentiated through ve-locked gauge boost per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the channel contract.
+- Fee routing: at settlement, the full operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in a single transaction; the four-bucket split (60% operator base, 25% buyback, 10% treasury, 5% safety) is dispatched same-tx per [ADR 026](026-tokenomics.md#adr-026-tokenomics). See [FeeRouter Integration](#feerouter-integration).
+- Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the channel contract.
 
 ### Deposit Economics
 
@@ -107,22 +107,22 @@ See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#paymen
 
 ### Fee Routing on Disputed Closes
 
-> **Fee routing model.** `settleChannel` does not skim a fee inline; it forwards the entire operator-bound balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)` in the same transaction. Split details: [FeeRouter Integration](#feerouter-integration).
+> **Fee routing model.** `settleChannel` does not skim a fee inline; it forwards the entire operator-bound balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. Split details: [FeeRouter Integration](#feerouter-integration).
 
 The settled amount is still calculated **at final settlement**, after the dispute window expires, based on the highest valid voucher amount on-chain at that point. The three-step channel close lifecycle is:
 
 1. **`closeChannel`** — callable by client or provider only. Records the submitted voucher's `amount` in `claimedAmount`, `nonce` in `claimedNonce`, and `bytesDelivered` in `claimedBytes`, sets status to `Closing`, starts the dispute window. **No fee deduction, no router call.** **Zero-voucher close:** when **either party** calls `closeChannel` with `amount=0`, `nonce=0`, `bytesDelivered=0`, and an empty signature (`signature.length == 0`) on a channel with `claimedNonce == 0`, the signature verification is skipped — no client-signed voucher is needed. All other `closeChannel` calls — any call with `signature.length > 0`, or any call where `amount != 0`, `nonce != 0`, or `bytesDelivered != 0` — require normal EIP-712/ECDSA voucher verification. This is safe because voucher nonces start at 1 (nonce 0 is the sentinel for "no voucher submitted"; see [Voucher Nonce Convention](#voucher-nonce-convention)), so any real voucher has nonce ≥ 1 and can always be submitted via `disputeChannel` (which requires strictly higher nonce than `claimedNonce`). The dispute window still applies: if a valid voucher exists, any party can submit it via `disputeChannel`. At settlement, `claimedAmount=0` means the full deposit is refunded to the client and the provider receives nothing — no router call is made for a zero-amount settlement.
 2. **`disputeChannel`** (during dispute window) — callable by any address. If the submitted voucher has a strictly higher nonce, updates both `claimedAmount`, `claimedNonce`, and `claimedBytes` (see [Voucher Bytes-Delivered Field](#voucher-bytes-delivered-field)) to the new values. Still **no fee deduction, no router call**. Submissions with an equal or lower nonce revert with no state change.
-3. **`settleChannel`** (after dispute window expires) — callable by anyone. If `claimedAmount > 0`, computes `bytesDelivered` from the final voucher, transfers the full `claimedAmount` of USDC to the `FeeRouter`, and invokes `FeeRouter.routeSettlement(channel.provider, bytesDelivered, claimedAmount, voucher.epochId)` in the same transaction. Refunds `deposit - claimedAmount` to the client. Sets status to `Closed`. The router (not `PaymentChannel`) applies the six-bucket split and increments `bytesPerEpoch[operator][epochId]` for the gauge formula in [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) — split legs and bounds in [FeeRouter Integration](#feerouter-integration). The per-operator gauge-share cap from [ADR 034 § Per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) is the binding wash-trading defense; gauge bytes flow through `settleChannel` directly with no separate commit step.
+3. **`settleChannel`** (after dispute window expires) — callable by anyone. If `claimedAmount > 0`, computes `bytesDelivered` from the final voucher, transfers the full `claimedAmount` of USDC to the `FeeRouter`, and invokes `FeeRouter.routeSettlement(channel.provider, bytesDelivered, claimedAmount)` in the same transaction. Refunds `deposit - claimedAmount` to the client. Sets status to `Closed`. The router (not `PaymentChannel`) applies the four-bucket split and increments `bytesPerEpoch[operator][epoch]` — where `epoch = block.timestamp / EPOCH_LENGTH` is derived inside `routeSettlement` — as the trailing-window served-bytes accumulator read by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) as the governance vote-weight source. Split legs and bounds in [FeeRouter Integration](#feerouter-integration). The wash-trading defense is capacity-shortfall slashing on `CapacityBond` per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing) — faking bytes does not increase revenue (operator base is per-byte at settlement, paid by the client) and capacity-shortfall slashing auto-downgrades operators with sustained delivery below `min_delivery_ratio × declared_capacity`.
 
    > **Invariants:**
    > 1. `closeChannel` and `disputeChannel` MUST revert if the submitted voucher's `amount > channel.deposit`. This prevents client bugs or malicious over-deposit vouchers from causing an underflow revert in `settleChannel` that would lock the channel.
-   > 2. `disputeChannel` MUST revert if `newAmount < claimedAmount` or `newBytes < claimedBytes`. Vouchers are cumulative across both axes; a higher nonce must correspond to a non-decreasing amount and a non-decreasing byte count. This prevents a malicious client from reducing the provider's payout — or the provider's gauge-pool byte share — via a higher-nonce dispute.
-   > 3. `settleChannel` MUST forward `claimedAmount` of the payment token to `FeeRouter` and call `routeSettlement` in the same transaction iff `claimedAmount > 0`. The provider's 40% base share lands in the operator's wallet in the same transaction as `settleChannel`; this is the cashflow guarantee that backs operator P&L Case A in [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake). Reverting after partial transfer is unacceptable — implementations MUST use checks-effects-interactions, MUST guard `settleChannel` and `disputeChannel` with a `nonReentrant` modifier (the `FeeRouter` call path crosses a contract boundary and is the new reentrancy surface), and the `FeeRouter` MUST hold a stable interface contract.
+   > 2. `disputeChannel` MUST revert if `newAmount < claimedAmount` or `newBytes < claimedBytes`. Vouchers are cumulative across both axes; a higher nonce must correspond to a non-decreasing amount and a non-decreasing byte count. This prevents a malicious client from reducing the provider's payout — or the provider's analytics-counter byte share — via a higher-nonce dispute.
+   > 3. `settleChannel` MUST forward `claimedAmount` of the payment token to `FeeRouter` and call `routeSettlement` in the same transaction iff `claimedAmount > 0`. The provider's 60% base share lands in the operator's wallet in the same transaction as `settleChannel`; this is the cashflow guarantee that backs operator P&L Case A in [ADR 026 § Operator economics](026-tokenomics.md#operator-economics). Reverting after partial transfer is unacceptable — implementations MUST use checks-effects-interactions, MUST guard `settleChannel` and `disputeChannel` with a `nonReentrant` modifier (the `FeeRouter` call path crosses a contract boundary and is the new reentrancy surface), and the `FeeRouter` MUST hold a stable interface contract.
 
-A dispute that raises the settlement amount (e.g., 50 → 80 payment-token units) raises every router-bucket allocation proportionally, and a higher `claimedBytes` raises the operator's gauge-pool weighting for the epoch. The router computes its split once, on the final settled amount and byte count — never on intermediate values, never more than once per channel.
+A dispute that raises the settlement amount (e.g., 50 → 80 payment-token units) raises every router-bucket allocation proportionally, and a higher `claimedBytes` raises the operator's served-bytes share for the epoch (read by `DecdnGovernor` as the vote-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)). The router computes its split once, on the final settled amount and byte count — never on intermediate values, never more than once per channel.
 
-The governance token (TOKEN) is not used for delivery payments. It is reserved for staking, gauge-boost ve-locking (see [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) and [§ Voting escrow (`VotingEscrow`)](034-gauge-boost-voting-escrow.md#voting-escrow-votingescrow)), and governance (see [ADR 009](009-governance.md#adr-009-governance-model)).
+The governance token (TOKEN) is not used for delivery payments. It is reserved for operator capacity bonding (see [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) and governance (see [ADR 009](009-governance.md#adr-009-governance-model)).
 
 **Rate setting is entirely up to each node.** Nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a market with natural arbitrage dynamics:
 
@@ -163,7 +163,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
 - Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the governance maximum interval (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — still small relative to the recommended 10 USDC minimum deposit (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
-- The `PaymentChannel` contract is functionally separated from the `StakingRegistry`, keeping the audit surface for each contract's core logic bounded
+- The `PaymentChannel` contract is functionally separated from the `CapacityBond`, keeping the audit surface for each contract's core logic bounded
 
 ### Negative
 
@@ -280,11 +280,12 @@ Registry check + per-sender rate limiting. Residual gap: the local registry cach
 
 Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
 
-The core weakness is governance-token-price dependency: at $0.001/TOKEN, a minimum stake of 1,000 TOKEN costs $1 per sybil node. The unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` (see [ADR 001](001-network.md#node-selection-algorithm)) helps — a sybil fleet must be real hardware in the right geography, competitively priced, and build reputation over time — but does not eliminate the risk when the token is cheap. Options:
+The core weakness is governance-token-price dependency: at $0.001/TOKEN, the 1 Gbps entry-tier capacity bond (~50,000 TOKEN at default `k=12.6`, `α=1.2` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) costs $50 per sybil node. Higher tiers are super-linearly more expensive (10 Gbps ≈ 795K TOKEN; 100 Gbps ≈ 12.6M TOKEN), but a sybil fleet can be dominated by many entry-tier nodes. The unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` (see [ADR 001](001-network.md#node-selection-algorithm)) helps — a sybil fleet must be real hardware in the right geography, competitively priced, and build reputation over time — but does not eliminate the risk when the token is cheap. Options:
 
-- **Option A — Governance raises minimum stake if governance-token price falls.** The minimum stake is governable. Governance-token holders are incentivised to raise it to protect the network, since a sybil-dominated network reduces usage and governance-token value. Reactive but aligned.
-- **Option B — Minimum stake denominated in USD equivalent via oracle.** Requires a price oracle, which introduces oracle dependency, manipulation, and downtime risks (see rate bounds discussion above). The same concerns apply here, but the impact of oracle failure is lower (new stakers temporarily blocked, not payments broken).
+- **Option A — Governance raises the 1 Gbps-tier bond via the `k`-bound mechanism in [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).** The 1G-tier bond is governable within [10K, 200K TOKEN]; raising it lifts the whole curve. Governance is incentivised to do so when TOKEN price is low, since a sybil-dominated network reduces usage and TOKEN value. Reactive but aligned.
+- **Option B — Bond denominated in USD equivalent via oracle.** Requires a price oracle, which introduces oracle dependency, manipulation, and downtime risks (see rate bounds discussion above). The same concerns apply here, but the impact of oracle failure is lower (new operators temporarily blocked, not payments broken).
 - **Option C — Reputation as a second filter.** New nodes (low reputation, few settled channels) are deprioritised in client selection even if their `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` score is competitive. A sybil fleet takes time to build reputation, limiting its effectiveness during that window.
+- **Option D — Capacity-shortfall slashing.** Sybil nodes that don't deliver real bytes are auto-downgraded by the capacity-shortfall path per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing); operators delivering below `min_delivery_ratio × declared_capacity` lose the bond delta to `SafetyReserve`. This forces sybils to either deliver real bytes (defeating the cheap-sybil premise) or eat continuous bond losses.
 
 #### Rate manipulation cartel
 
@@ -340,7 +341,6 @@ struct Channel {
     uint256 expiresAt;
     uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
     uint256 disputeDeadline;  // set when close is initiated; may be extended once via the forced-inclusion path (see § L2 sequencer censorship)
-    address lastDisputor;     // msg.sender of the most recent disputeChannel call
     bool    extended;         // true if disputeDeadline has been extended once via the forced-inclusion path; reset to false on closeChannel
 }
 ```
@@ -367,7 +367,7 @@ struct Channel {
 | Governance | `setRateBounds(floor, ceiling)` | Rate floor and ceiling in payment-token base units. |
 | Governance | `setMaxVoucherIntervalMb(mb)` | Max negotiable voucher interval (bounded 1–1024 MB). |
 
-Bucket shares (40/40/7/5/5/3) are governed on `FeeRouter`, not on `PaymentChannel`; the treasury share (5%) is configured on `FeeRouter`.
+Bucket shares (60/25/10/5) are governed on `FeeRouter`, not on `PaymentChannel`; the treasury share (10%) is configured on `FeeRouter`.
 
 #### Governance setter: setFeeRouter
 
@@ -401,7 +401,7 @@ event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
 
 The constructor takes `(usdc, feeRouter, disputeWindow)` and sets the remaining governable parameters: `maxVoucherIntervalMb = 1` (1 MB) and `maxChannelDuration = 7776000` (90 days). All values are within the hardcoded safety bounds table further below (see also [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject `feeRouter == address(0)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
-Default deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md#adr-009-governance-model): 43200–259200 seconds (12h–72h). Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s six buckets (see [FeeRouter Integration](#feerouter-integration)).
+Default deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md#adr-009-governance-model): 43200–259200 seconds (12h–72h). Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) the `feePercentage` / `discountedFeePercentage` / treasury-address constructor parameters from earlier drafts are removed; bucket shares are governed on `FeeRouter` instead, and the treasury bucket is one of `FeeRouter`'s four buckets (see [FeeRouter Integration](#feerouter-integration)).
 
 #### L2 sequencer censorship
 
@@ -442,7 +442,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 
 - `closeChannel` → requires status `Open`. **Callable by `channel.client` or `channel.provider` only** (`require(msg.sender == channel.client || msg.sender == channel.provider)`). Sets status to `Closing`, records `claimedAmount`, `claimedNonce`, and `claimedBytes` from the submitted voucher, emits `ChannelCloseInitiated`. No fund transfers. Third parties cannot initiate a close — they act only via `disputeChannel` (during the dispute window) or `settleChannel` (after expiration). **Zero-voucher close:** when **either party** calls with `amount == 0`, `nonce == 0`, `bytesDelivered == 0`, an empty signature (`signature.length == 0`), and `channel.claimedNonce == 0`, the voucher signature is not verified. Full mechanic, safety argument, and dispute symmetry: [Fee Routing on Disputed Closes](#fee-routing-on-disputed-closes).
 - `disputeChannel` → requires status `Closing` and `block.timestamp < disputeDeadline`. Callable by any address holding a valid voucher with a strictly higher nonce. Updates `claimedAmount`, `claimedNonce`, and `claimedBytes`, emits `ChannelDisputed`. No fund transfers. Unrestricted caller access is intentional: third-party fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)) must be able to submit higher-nonce vouchers on behalf of an offline party during the dispute window.
-- `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address. Refunds `deposit - claimedAmount` to the client and, if `claimedAmount > 0`, transfers `claimedAmount` of the payment token to the configured `FeeRouter` and invokes `FeeRouter.routeSettlement(channel.provider, claimedBytes, claimedAmount, voucher.epochId)` in the same transaction. Sets status to `Closed`, emits `ChannelSettled`. **No fee is computed or skimmed inside this contract** — the router applies the split, pays the operator's 40% base share same-tx, and increments `bytesPerEpoch[operator][epochId]` for the [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) gauge formula; see [FeeRouter Integration](#feerouter-integration). The per-operator gauge-share cap from [ADR 034 § Per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) is the binding wash-trading defense.
+- `settleChannel` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address. Refunds `deposit - claimedAmount` to the client and, if `claimedAmount > 0`, transfers `claimedAmount` of the payment token to the configured `FeeRouter` and invokes `FeeRouter.routeSettlement(channel.provider, claimedBytes, claimedAmount)` in the same transaction. Sets status to `Closed`, emits `ChannelSettled`. **No fee is computed or skimmed inside this contract** — the router applies the four-bucket split, pays the operator's 60% base share same-tx (alongside the 25%/10%/5% legs), and increments `bytesPerEpoch[operator][epoch]` (epoch derived from `block.timestamp`) as the served-bytes accumulator consumed by `DecdnGovernor` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight); see [FeeRouter Integration](#feerouter-integration). The wash-trading defense is capacity-shortfall slashing per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing).
 - `reclaimExpired` → requires status `Open` and `block.timestamp >= expiresAt`. Returns the full deposit to the client (no fee deducted — no voucher was submitted). Sets status to `Closed`, emits `ChannelExpiredReclaimed`. Callable by the client or the provider. Regardless of caller, the full deposit is returned to `channel.client` — the provider cannot claim funds via this path. This ensures abandoned channels where the client is absent can be cleaned up by the provider to free on-chain state.
 
 **Safety bounds (hardcoded):**
@@ -456,7 +456,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | Max voucher interval | 1 MB | 1024 MB (~1 GB) |
 | Max channel duration | 604800 seconds (7 days) | 31536000 seconds (365 days) |
 
-`PaymentChannel` does not hold a fee-percentage parameter. Bucket-share bounds (40/40/7/5/5/3 + `boostFloor`) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
+`PaymentChannel` does not hold a fee-percentage parameter. Bucket-share bounds (60/25/10/5 with per-share bounds 40–90 / 5–50 / 0–30 / 0–20) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
 
 **Rate bounds are in USDC base units (6 decimals).** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`.
 
@@ -467,7 +467,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. Prevents zero-rate free-riding while imposing no practical constraint on legitimate pricing. Nodes are expected to set rates well above this floor; the floor is purely an anti-zero safeguard, not a recommended price. |
 | `deliveryCeiling` | $0.001/MB | 1,000 | 100× expected market rate. Accommodates origin-backed nodes with high-egress backends (e.g., S3 at $0.09/GB) while remaining well above any legitimate pricing scenario ($1.00/GB vs Akamai's ~$0.12–0.20/GB). |
 
-The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, ve-Governor in production (see [ADR 009](009-governance.md#adr-009-governance-model)).
+The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, DecdnGovernor in production (see [ADR 009](009-governance.md#adr-009-governance-model)).
 
 ### Rate Bounds Refresh
 
@@ -500,40 +500,40 @@ For how nodes validate `rate_per_mb` against cached bounds before signing protoc
 | `setSlippageTolerance(bps)` / `setMinBuybackAmount(n)` / `setMaxBuybackAmount(n)` | Governance: per-call execution guards. |
 | `keeper() → address` / `getAccumulatedFees() → uint256` | Views: current keeper and accumulated buyback inflow (USDC). |
 
-This is the canonical `BuybackBurner` interface. [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553) defines the economic parameters and the inflow source (5% router-fed). [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
+This is the canonical `BuybackBurner` interface. [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) defines the economic parameters and the 25% router-fed inflow source. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
 
 All `set*` functions are governance-only behind a timelock.
 
 ### FeeRouter Integration
 
-Under [ADR 026](026-tokenomics.md#adr-026-tokenomics), `PaymentChannel.settleChannel` does not split fees inline. The full operator-bound payment-token balance is forwarded to a `FeeRouter` contract, which applies the canonical six-bucket split (40% node base / 40% gauge boost / 7% delegator pool / 5% buyback-and-burn / 5% treasury / 3% safety reserve — full table and bounds in [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553) and [§ Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)). This ADR specifies the `FeeRouter` interface only as it relates to the settlement path; the gauge formula, ve-escrow mechanics, and bucket disbursement schedule live in [ADR 026](026-tokenomics.md#adr-026-tokenomics).
+Under [ADR 026](026-tokenomics.md#adr-026-tokenomics), `PaymentChannel.settleChannel` does not split fees inline. The full operator-bound payment-token balance is forwarded to a `FeeRouter` contract, which applies the canonical four-bucket split (60% operator base / 25% buyback-and-burn / 10% treasury / 5% safety reserve — full table and bounds in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) and [§ Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)). All four legs transfer in the settlement transaction. This ADR specifies the `FeeRouter` interface only as it relates to the settlement path; the per-bucket details live in [ADR 026](026-tokenomics.md#adr-026-tokenomics).
 
 #### Settlement-path interface
 
-`PaymentChannel.settleChannel` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount, uint64 epochId)` in the same transaction as the payment-token `safeTransferFrom` to the router. The router pays the operator's 40% base share in that transaction, dispatches the 5% / 5% / 3% same-tx legs, and increments `bytesPerEpoch[operator][epochId]` for the gauge formula per [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula). The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
+`PaymentChannel.settleChannel` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount)` in the same transaction as the payment-token `safeTransferFrom` to the router. The router pays the operator's 60% base share in that transaction, dispatches the 25% / 10% / 5% same-tx legs, derives the current epoch as `uint64(block.timestamp / EPOCH_LENGTH)`, and increments `bytesPerEpoch[operator][epoch]` as the trailing-window served-bytes accumulator read by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) as the governance vote-weight source. The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
 
 #### Settlement-path invariants
 
-1. **Atomic base-share payout.** The 40% base share MUST land in the operator's wallet in the same transaction as `settleChannel` — no claim step, no keeper, no off-chain queue. This is the Case A cashflow guarantee from [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake).
+1. **Atomic base-share payout.** The 60% base share MUST land in the operator's wallet in the same transaction as `settleChannel` — no claim step, no keeper, no off-chain queue. This is the Case A cashflow guarantee from [ADR 026 § Operator economics](026-tokenomics.md#operator-economics).
 2. **No reentry.** `settleChannel` holds a `nonReentrant` guard for the duration of the router call.
 3. **One settlement per channel.** Enforced by the existing `Closed` status; the router need only tolerate duplicate calls (idempotency or revert — pinned in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model)).
 
-Conservation, same-tx satellite legs (5%/5%/3%), and epoch-consistency invariants live with the router itself in [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553) / [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model). The `SettlementRouted` event (operator + epoch + per-bucket deltas) is emitted by the router; full event set is in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
+Conservation and same-tx four-bucket invariants (60/25/10/5) live with the router itself in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) / [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model). The `Settled` event (operator + epoch + per-bucket deltas) is emitted by the router; full event set is in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
 
 #### Cache-miss bypass (node-to-node paid pulls)
 
-**Node-to-node cache-miss paid pulls bypass the router entirely.** When node B pulls a blob from origin-backed node A and pays via a payment channel, that settlement is internal cost-recovery between two operators — not net protocol revenue. Routing it would double-charge the same revenue (once when B pays A, again when B's clients pay B for the same bytes). Per [ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553):
+**Node-to-node cache-miss paid pulls bypass the router entirely.** When node B pulls a blob from origin-backed node A and pays via a payment channel, that settlement is internal cost-recovery between two operators — not net protocol revenue. Routing it would double-charge the same revenue (once when B pays A, again when B's clients pay B for the same bytes). Per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split):
 
 - Node-to-node settlements use direct peer payment-token transfer with no router invocation.
 - Implementations distinguish node-to-node from client-to-node settlements via the channel's `client` and `provider` fields cross-referenced against the on-chain registry: if both addresses have a registered NodeId binding (see [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)), the channel is node-to-node; otherwise it is client-to-node.
-- The `PaymentChannel` may implement the bypass either by exposing a separate `settleChannelNoRoute(channelId)` entry point usable only when both parties are registered nodes, or by having `settleChannel` detect the case and skip the `FeeRouter` call. Either way the operator-to-operator USDC transfer is direct and bypasses the router's per-epoch USDC accumulators (those bytes were already counted at the client-to-node settlement that paid for them downstream). Gauge eligibility for these bytes is naturally bounded by the [ADR 034 § per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) — even if a colluding operator pair routed bypassed bytes through the gauge counter, each operator-identity's share is capped at 5%.
-- Permissionless fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)) can observe node-to-node settlements for self-routed-traffic / wash-trading patterns despite the bypass. The on-chain remedy is the per-operator gauge-share cap; off-chain reputation gauges ([ADR 008 § Gauge-Pool Wash-Trading: Reputation as Off-Chain Signal](008-reputation.md#gauge-pool-wash-trading-reputation-as-off-chain-signal)) consume the observation as a soft signal.
+- The `PaymentChannel` may implement the bypass either by exposing a separate `settleChannelNoRoute(channelId)` entry point usable only when both parties are registered nodes, or by having `settleChannel` detect the case and skip the `FeeRouter` call. Either way the operator-to-operator USDC transfer is direct and bypasses the router's per-epoch byte accumulators (those bytes were already counted at the client-to-node settlement that paid for them downstream). The wash-trading defense is capacity-shortfall slashing per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing) — auto-downgrade on sustained delivery below `min_delivery_ratio × declared_capacity` measured against probe data; routing bytes through node-to-node bypass settlements does not raise revenue and cannot extract from the four-bucket FeeRouter, since the bypass path does not invoke the router.
+- Permissionless fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)) can observe node-to-node settlements for self-routed-traffic / wash-trading patterns despite the bypass. The on-chain remedy is capacity-shortfall slashing; off-chain reputation signals ([ADR 008](008-reputation.md#adr-008-reputation-system)) consume the observation as a soft signal feeding peer selection.
 
 #### Settlement sequence
 
 End-to-end payment-token flow (client→node settlement, then the parallel cache-miss bypass) is diagrammed in [ADR 016 §"FeeRouter integration"](016-contract-interactions.md#adr-016-smart-contract-interaction-model). This ADR documents only the `PaymentChannel ↔ FeeRouter` interface contract.
 
-The full six-bucket split applies to every network deployment from launch. Simplified launch configurations are expressed by setting non-active bucket shares to zero via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), not by deploying a reduced-surface stub. The cross-validation invariant in that section ensures any non-zero share has a wired non-zero destination, so the launch share configuration alone determines which downstream contracts must be ready at deploy time.
+The full four-bucket split applies to every network deployment from launch. Simplified launch configurations are expressed by setting non-active bucket shares to zero via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), not by deploying a reduced-surface stub. The cross-validation invariant in that section ensures any non-zero share has a wired non-zero destination, so the launch share configuration alone determines which downstream contracts must be ready at deploy time.
 
 ### EIP-712 Voucher Signature
 
@@ -565,11 +565,11 @@ The domain separator binds every voucher to a specific contract deployment on a 
 
 ```solidity
 bytes32 constant VOUCHER_TYPEHASH = keccak256(
-    "Voucher(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token,uint64 epochId)"
+    "Voucher(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)"
 );
 ```
 
-The `epochId` field is consumed by `FeeRouter.routeSettlement` for per-(operator, epoch) bytes attribution feeding [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula)'s gauge formula; the client sets it at signing time. `FeeRouter` validates that `epochId` is current or recent (within `MAX_EPOCH_LAG`, default 4 epochs) and rejects future-dated values. For long-lived channels spanning multiple epochs, the client signs separate per-epoch vouchers (incrementing `voucherNonce` across them per [Voucher Nonce Convention](#voucher-nonce-convention)); the operator submits each at the relevant `settleChannel` call cadence — typically once per epoch boundary per active channel.
+Per-operator-epoch attribution is derived by `FeeRouter.routeSettlement` at settlement time as `epoch = uint64(block.timestamp / EPOCH_LENGTH)`; the voucher itself does not carry an epoch. All cumulative bytes from the final voucher are credited to the epoch the settlement transaction lands in. The operator must call `closeChannel` before `expiresAt` (else the client may invoke `reclaimExpired` and the operator forfeits the claim); once the channel is in `Closing` status, `settleChannel` is callable at any time at or after `disputeDeadline` with no on-chain upper bound. `settleChannel` is permissionless but only the operator has an incentive to pay gas, since they receive the 60% base share. The practical bound on epoch-shifting is therefore `maxChannelDuration` (default 90 days, governance-tuned). The effective gaming surface — shifting attribution across roughly 4–12 weekly epochs within a monthly emission distribution — is a second-order effect on emission share and shrinks further as the active-operator set grows.
 
 **Signature digest:**
 
@@ -577,7 +577,7 @@ The `epochId` field is consumed by `FeeRouter.routeSettlement` for per-(operator
 bytes32 digest = keccak256(abi.encodePacked(
     "\x19\x01",
     DOMAIN_SEPARATOR,
-    keccak256(abi.encode(VOUCHER_TYPEHASH, channelId, amount, nonce, bytesDelivered, token, epochId))
+    keccak256(abi.encode(VOUCHER_TYPEHASH, channelId, amount, nonce, bytesDelivered, token))
 ));
 ```
 
@@ -594,9 +594,9 @@ Voucher nonces within a channel start at **1**. Nonce 0 is reserved as the senti
 
 ### Node Registry
 
-The on-chain registry of staked nodes is part of the `StakingRegistry` contract, not a separate contract. Staking is a prerequisite for registration ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
+The on-chain registry of staked nodes is part of the `CapacityBond` contract, not a separate contract. Staking is a prerequisite for registration ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
 
-> **No on-channel fee-discount path.** Operator return is differentiated through ve-locked gauge boost ([ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula)), not via a stake-multiple fee toggle on the channel contract. `getEffectiveFee`, `getStakeMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `StakingRegistry` retains its slashing, registration, and stake-bookkeeping responsibilities; the minimum stake is **50,000 TOKEN** ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)).
+> **No on-channel fee-discount path.** Operator return is differentiated through the `CapacityBond` lock-to-capacity curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), not via a stake-multiple fee toggle on the channel contract. `getEffectiveFee`, `getStakeMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `CapacityBond` carries the registration, bond-bookkeeping, capacity-shortfall, and slashing responsibilities; the operator bond is `bond = k × Mbps^α` with defaults `k=12.6`, `α=1.2` (≈50K TOKEN at 1 Gbps) per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve).
 
 #### Data Structure
 
@@ -607,7 +607,7 @@ struct NodeInfo {
     bool    active;              // false after deregistration or auto-ejection (1 byte)
                                  // ↑ ethAddress + active pack into one slot
     uint256 registeredAt;        // block.timestamp of current registration
-    uint256 firstRegisteredAt;   // block.timestamp of first-ever registration (immutable once set)
+    uint256 firstBondedAt;   // block.timestamp of first-ever registration (immutable once set)
     uint256 lastMultiaddrUpdate; // block.timestamp of last multiaddr change
     bytes   multiaddrs;          // packed QUIC multiaddrs (length-prefixed entries)
     string  regionHint;          // ISO 3166-1 alpha-2 code (self-reported, unverified)
@@ -616,12 +616,12 @@ struct NodeInfo {
 
 Field order is chosen for storage packing: `ethAddress` (20 B) and `active` (1 B) share one 32-byte slot, dropping `NodeInfo` from 8 slots to 7. `multiaddrs` uses `bytes` rather than `string[]` for gas efficiency: a packed array of `(uint16 length, bytes data)` entries, parsed off-chain by clients. Maximum encoded size is bounded by the governable `maxMultiaddrSize` parameter (initial value 1024 bytes; safety bounds 64–1024 bytes per [ADR 009](009-governance.md#adr-009-governance-model)).
 
-#### Interface (additions to StakingRegistry)
+#### Interface (additions to CapacityBond)
 
 ```solidity
 // --- Node Registry ---
 
-// Registration (requires active stake >= minStake)
+// Registration (requires active bond >= bond_required(declared_capacity))
 function registerNode(
     bytes32 nodeId,
     bytes calldata multiaddrs,
@@ -647,7 +647,7 @@ function isActiveNode(bytes32 nodeId) external view returns (bool);
 function getActiveNodeCount() external view returns (uint256);
 function getActiveNodes(uint256 offset, uint256 limit)
     external view returns (NodeInfo[] memory);
-function getFirstRegisteredAt(address ethAddress) external view returns (uint256);
+function getFirstBondedAt(address ethAddress) external view returns (uint256);
 
 // State — per-nodeId nonce for ed25519 registration replay protection
 mapping(bytes32 => uint64) public registrationNonce;
@@ -672,10 +672,10 @@ event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 #### Constraints
 
 - **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This enforces a one-stake-position-per-node invariant.
-- **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in [§ Off-Chain (Ephemeral) Binding for Clients](#off-chain-ephemeral-binding-for-clients). The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [§ Binding Message Format](#binding-message-format)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [§ NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `StakingRegistry.bindNodeId()` function in [§ On-Chain Registration](#on-chain-registration) remains available for rebinding (key rotation) after initial registration.
-- **`deregisterNode` deactivates without touching stake.** Sets `active = false`, removes the operator from the active set, and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. It does **not** move stake into unbonding — deactivation and stake exit are separate operations. The stake stays bonded and fully slashable after deregistration (accountability is preserved), and an operator who changes their mind can re-register without re-funding. To withdraw, the operator calls `requestUnstake` (which starts the unbonding period) then `unstake`; the slash-then-run protection is the `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant ([ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period)), which keys off `requestUnstake` rather than off deregistration, so it holds regardless. Separating the two lets an operator pause node duties (stop serving, leave the active set) without forcing a stake-return clock, while a full exit is just `deregisterNode` followed by `requestUnstake`.
-- **Auto-ejection.** When slashing drops a node's stake below 50% of the minimum stake requirement ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-stake at full minimum to rejoin.
-- **`firstRegisteredAt` is write-once.** `registerNode` sets `firstRegisteredAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection it retains its original value; it is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#cold-start-bootstrap)).
+- **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in [§ Off-Chain (Ephemeral) Binding for Clients](#off-chain-ephemeral-binding-for-clients). The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [§ Binding Message Format](#binding-message-format)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [§ NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `CapacityBond.bindNodeId()` function in [§ On-Chain Registration](#on-chain-registration) remains available for rebinding (key rotation) after initial registration.
+- **`deregisterNode` deactivates without touching the bond.** Sets `active = false`, removes the operator from the active set, and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. It does **not** move the bond into unbonding — deactivation and bond exit are separate operations. The bond stays locked and fully slashable after deregistration (accountability is preserved), and an operator who changes their mind can re-register without re-funding. To withdraw, the operator calls `unbond()` (which starts the 14-day unbonding window per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)); the slash-then-run protection is the `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant ([ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period)), which keys off the `unbond()` call rather than off deregistration, so it holds regardless. Separating the two lets an operator pause node duties (stop serving, leave the active set) without forcing a bond-return clock, while a full exit is just `deregisterNode` followed by `unbond()`.
+- **Auto-ejection.** When slashing drops a node's bond below 50% of the minimum bond for its declared tier ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-bond at the full tier minimum to rejoin.
+- **`firstBondedAt` is write-once.** `registerNode` sets `firstBondedAt = block.timestamp` only if the stored value is 0 (first-ever registration for this address). On re-registration after deregistration or auto-ejection it retains its original value; it is never cleared by `deregisterNode` or auto-ejection. Used by clients to determine cold-start bootstrap eligibility ([ADR 008](008-reputation.md#cold-start-bootstrap)).
 
 #### Multiaddr Update Policy
 
@@ -690,7 +690,7 @@ A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md#adr-00
 | `deregisterNode()` | ~80k gas | ~$0.05 |
 | `reclaimNodeId()` | ~600k–1.1M gas | ~$0.24–$0.44 |
 
-`registerNode` and `reclaimNodeId` include ~500k–1M gas for on-chain ed25519 signature verification (Solidity library) — a one-time cost per node lifetime, negligible vs. the minimum stake deposit. Estimates assume typical multiaddr sizes (2–4 addresses, ~200 bytes total); larger payloads increase storage gas proportionally.
+`registerNode` and `reclaimNodeId` include ~500k–1M gas for on-chain ed25519 signature verification (Solidity library) — a one-time cost per node lifetime, negligible vs. the entry-tier capacity bond. Estimates assume typical multiaddr sizes (2–4 addresses, ~200 bytes total); larger payloads increase storage gas proportionally.
 
 #### Client Query Patterns
 
@@ -704,7 +704,7 @@ Three tiers, from simplest to most scalable:
 
 #### NodeId Ownership Verification
 
-`registerNode` requires an ed25519 signature proving the caller controls the private key corresponding to `nodeId`. Without this proof, an attacker could front-run legitimate registrations by calling `registerNode` with someone else's NodeId — the attacker gains no traffic (cannot complete iroh QUIC handshakes with that identity), but under the one-to-one uniqueness constraint the legitimate owner is permanently blocked from registering. Even with the ed25519 verification overhead, the total `registerNode` cost (~$0.26–$0.46 gas + recoverable minimum stake) is low enough that squatting remains a cheap griefing/DoS vector without the ownership proof.
+`registerNode` requires an ed25519 signature proving the caller controls the private key corresponding to `nodeId`. Without this proof, an attacker could front-run legitimate registrations by calling `registerNode` with someone else's NodeId — the attacker gains no traffic (cannot complete iroh QUIC handshakes with that identity), but under the one-to-one uniqueness constraint the legitimate owner is permanently blocked from registering. Even with the ed25519 verification overhead, the total `registerNode` cost (~$0.26–$0.46 gas + recoverable entry-tier capacity bond) is low enough that squatting remains a cheap griefing/DoS vector without the ownership proof.
 
 **Note:** The `bindingSignature` parameter proves the caller's Ethereum key signed the NodeId binding — it does not prove ownership of the ed25519 NodeId itself. These are orthogonal concerns: `bindingSignature` prevents un-slashable registration, while ed25519 ownership verification prevents NodeId squatting.
 
@@ -724,14 +724,14 @@ EVM has no native ed25519 precompile, and the RIP-7212 proposal is not yet deplo
 
 ##### Reclaim flow
 
-If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, deactivates the current holder's node if the reclaimed NodeId was its bound id (clearing the active flag and removing it from the active set — stake is left bonded and slashable, exactly as `deregisterNode`; the holder exits stake separately via `requestUnstake`), clears the NodeId↔address mappings (and zeroes the holder's now-stale `NodeInfo.nodeId` so the read views stay consistent with the cleared binding), increments `registrationNonce[nodeId]`, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 on-chain signatures used for slash evidence ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) and EIP-712 NodeId↔Ethereum binding ([§ NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)).
+If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, deactivates the current holder's node if the reclaimed NodeId was its bound id (clearing the active flag and removing it from the active set — the bond is left locked and slashable, exactly as `deregisterNode`; the holder exits the bond separately via `unbond()`), clears the NodeId↔address mappings (and zeroes the holder's now-stale `NodeInfo.nodeId` so the read views stay consistent with the cleared binding), increments `registrationNonce[nodeId]`, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 on-chain signatures used for slash evidence ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) and EIP-712 NodeId↔Ethereum binding ([§ NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)).
 
 ## Admission and Priority
 
 Node admission and queueing policy — how a node orders incoming `StreamRequest`s under congestion — is implementation-defined and lives outside the protocol. The wire format carries no priority bits, the channel and voucher mechanisms encode no per-stream priority state, and different operators are expected to tune their policy differently. Two signals are available to any admission policy:
 
 - **Committed voucher rate.** The advertised `rate_per_mb` in `ProbeResponse` / `StreamResponse` is a **floor**, not equality — nodes verify `amount_delta / bytes_delta >= rate_per_mb`. Clients MAY commit at higher rates; nodes MAY use the committed rate as a per-stream priority key, with the premium paid directly via [`FeeRouter.routeSettlement`](#feerouter-integration).
-- **Registered node-stake.** `StakingRegistry.stakeOf(address)` is readable on-chain for any registered operator. Nodes MAY treat addresses with `stakeOf >= MIN_STAKE` ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)) as eligible for a higher-priority admission lane.
+- **Registered node-stake.** `CapacityBond.bondOf(address)` is readable on-chain for any registered operator. Nodes MAY treat addresses with `bondOf >= bond_required(declared_capacity)` ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)) as eligible for a higher-priority admission lane.
 
 ## NodeId-to-Ethereum Binding
 
@@ -752,20 +752,20 @@ Where:
 - `nodeId`: the 32-byte ed25519 public key (iroh `NodeId`)
 - `nonce`: a monotonic counter per Ethereum address, preventing replay of revoked bindings
 
-The EIP-712 domain separator is the same as the `StakingRegistry` contract deployment (chain ID + contract address), preventing cross-chain and cross-contract replay.
+The EIP-712 domain separator is the same as the `CapacityBond` contract deployment (chain ID + contract address), preventing cross-chain and cross-contract replay.
 
 ### On-Chain Registration
 
-Node registration and NodeId binding are atomic. `StakingRegistry.registerNode()` ([§ Node Registry](#node-registry)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [§ NodeId Ownership Verification](#nodeid-ownership-verification)). It verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, giving replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
+Node registration and NodeId binding are atomic. `CapacityBond.registerNode()` ([§ Node Registry](#node-registry)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [§ NodeId Ownership Verification](#nodeid-ownership-verification)). It verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, giving replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
 
-The standalone `StakingRegistry.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is no longer needed at initial registration time.
+The standalone `CapacityBond.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is no longer needed at initial registration time.
 
 **Canonical source of truth:** The `nodeIdToAddress` / `addressToNodeId` mappings — written atomically by `registerNode` at initial registration and by `bindNodeId` on rebinding — are the authoritative source for payment attribution and slashing. `NodeInfo.ethAddress` in [§ Data Structure](#data-structure) is always `msg.sender`, so the two are consistent by construction under the one-to-one constraint. If the implementation stores both, `NodeInfo.ethAddress` MUST equal `nodeIdToAddress[nodeId]` at all times.
 
 This creates an authoritative, publicly queryable mapping:
 
 ```solidity
-// StakingRegistry additions
+// CapacityBond additions
 mapping(bytes32 => address) public nodeIdToAddress;
 mapping(address => bytes32) public addressToNodeId;
 mapping(address => uint64) public bindingNonce;
@@ -774,13 +774,14 @@ mapping(address => uint64) public bindingNonce;
 // ADR 016 § Off-Chain Read API, ADR 022 § Origin discovery). `nodeId` is
 // `bytes32(0)` if the operator never registered or cleared their binding via
 // rebinding; `active` is `false` if the operator is unbound, in unbonding,
-// auto-ejected, or below `minStake`.
+// auto-ejected, or below the tier minimum bond.
 function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
 
 // Single-purpose per-operator activity check. Returns `true` iff `operator` is
-// currently registered with active (non-unbonding) stake at or above
-// `minStake`; `false` for unregistered addresses, stake below `minStake`,
-// stake fully or partially in unbonding, and auto-ejected operators.
+// currently registered with an active (non-unbonding) bond at or above
+// `bond_required(declared_capacity)`; `false` for unregistered addresses,
+// bond below the tier minimum, bond fully or partially in unbonding,
+// and auto-ejected operators.
 // SECURITY: operator-level blacklist status (ADR 011) is intentionally NOT
 // consulted — this is a pure single-contract storage read; callers needing the
 // combined "authorized origin" predicate filter against
@@ -882,22 +883,22 @@ The `token` field (ERC-20 address) is in the signed EIP-712 typed data to preven
 
 ### Voucher Bytes-Delivered Field
 
-`bytesDelivered` is a cumulative byte count signed alongside `amount` and `nonce`. It is the canonical settlement-record byte count carried in the `Voucher`, forwarded to `FeeRouter.routeSettlement`, and aggregated into `bytesPerEpoch[operator][epochId]` for the gauge formula in [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula). Properties:
+`bytesDelivered` is a cumulative byte count signed alongside `amount` and `nonce`. It is the canonical settlement-record byte count carried in the `Voucher`, forwarded to `FeeRouter.routeSettlement`, and aggregated into `bytesPerEpoch[operator][epoch]` (where `epoch` is derived from `block.timestamp` at settlement time) — the trailing-window served-bytes accumulator consumed by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) as the governance vote-weight source. Properties:
 
 - **Cumulative, monotonic.** Like `amount` and `nonce`, `bytesDelivered` is strictly non-decreasing across vouchers within a channel. `disputeChannel` MUST revert if the new voucher's `bytesDelivered < claimedBytes`.
 - **Derivable from MB-denominated voucher cadence.** Voucher cadence is MB-denominated (default 1 MB; see [Voucher Interval Negotiation](#voucher-interval-negotiation)) and `rate_per_mb` is MB-denominated. Clients computing `amount` from `bytesDelivered` use `amount = ⌈bytesDelivered / 1_048_576⌉ × rate_per_mb` (1 MB = 1,048,576 bytes per [ADR 005](005-protocol.md#adr-005-wire-protocol)); equivalently, `bytesDelivered = mb_delivered × 1_048_576` when delivery boundaries align with MB intervals. The unit conversion is purely an off-chain arithmetic concern; the voucher carries the byte count directly so the contract does not need to re-derive it.
 - **Carried through `closeChannel` / `disputeChannel` to `settleChannel`.** Recorded in `channel.claimedBytes` and forwarded as the `bytesDelivered` argument to `FeeRouter.routeSettlement` at settlement.
 - **Cross-channel consistency.** A voucher signed for one channel is bound by its EIP-712 typed data; `bytesDelivered` is part of that signed payload and cannot be replayed against a different channel.
 
-The router does not validate `bytesDelivered` against any oracle of physical delivery — the value is whatever the client signed. The gauge-pool wash-trading defense is the [ADR 034 § per-operator gauge-share cap](034-gauge-boost-voting-escrow.md#per-operator-gauge-share-cap) bounding per-operator extraction; it does not depend on byte-truth verification at settlement.
+The router does not validate `bytesDelivered` against any oracle of physical delivery — the value is whatever the client signed. The wash-trading defense is capacity-shortfall slashing per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing) — operators with sustained delivery below `min_delivery_ratio × declared_capacity` are auto-downgraded, and per-byte settlement revenue requires real client USDC inflow rather than self-attested byte counts.
 
 ## Slashing and Channel Interactions
 
 Slashing and payment channels are independent by design.
 
-**Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN stake in the `StakingRegistry` (schedule per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5%/15%/50% escalation tiers, 50% challenger / 30% safety / 20% burn). Channel funds are client deposits held in escrow — not stake, never touched by slashing. This follows from the functional separation in [Consequences](#consequences): payment channel contracts never hold or move TOKEN stake, cannot be called by `StakingRegistry` to slash or reassign stake, and any `StakingRegistry` interaction is read-only (e.g., resolving NodeId↔address bindings).
+**Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN stake in the `CapacityBond` (schedule per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5%/15%/50% escalation tiers, 50% challenger / 30% safety / 20% burn). Channel funds are client deposits held in escrow — not stake, never touched by slashing. This follows from the functional separation in [Consequences](#consequences): payment channel contracts never hold or move TOKEN stake, cannot be called by `CapacityBond` to slash or reassign stake, and any `CapacityBond` interaction is read-only (e.g., resolving NodeId↔address bindings).
 
-**Slashing can drop a node below minimum stake while channels are open.** Channel deposits being independent of stake, a node can be slashed below the minimum (or to zero) with open channels. The channels continue their normal lifecycle — close, dispute window, settle — regardless of staking status; settlement is purely a function of voucher state, not registry status.
+**Slashing can drop a node below its tier minimum bond while channels are open.** Channel deposits being independent of the bond, a node can be slashed below the tier minimum (or to zero) with open channels. The channels continue their normal lifecycle — close, dispute window, settle — regardless of bonding status; settlement is purely a function of voucher state, not registry status.
 
 **Auto-ejection does not interrupt open channels.** When a node's stake drops below 50% of the minimum and auto-ejection triggers (see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)):
 
@@ -905,4 +906,4 @@ Slashing and payment channels are independent by design.
 - The ejected node cannot participate in new channels (clients verify node registration before opening channels, and nodes verify counterparty status before accepting a `StreamRequest`).
 - The ejected node is removed from gossip routing, so it receives no new client connections.
 - `closeChannel` (client/provider only), `disputeChannel` (any address), and `settleChannel` (any address) remain callable on existing channels — these functions check channel state, not registry status.
-- The node must re-stake at the full minimum and re-register to resume operations.
+- The node must re-bond at the full tier minimum (`bond_required(declared_capacity)`) and re-register to resume operations.

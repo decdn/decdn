@@ -1,7 +1,9 @@
 # ADR 034: Gauge Boost and Voting Escrow
 
+> **Status:** Retired 2026-05-25 under the work-token rewrite. The gauge-boost formula, `VotingEscrow` contract, and per-operator gauge-share cap are replaced by the CapacityBond lock-to-capacity curve (`bond = k × Mbps^α`) in [ADR 026](../026-tokenomics.md#adr-026-tokenomics). Operator-yield differentiation now flows from capital-cost-to-operate rather than yield-haircut-to-not-lock. Original ADR body preserved verbatim below for historical reference; do not link to from canonical ADRs.
+
 **Date:** 2026-04-25
-**Status:** Draft
+**Status (pre-retirement):** Draft
 
 ## Context
 

@@ -4,7 +4,7 @@ Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh
 
 ## How It Works
 
-- **Nodes** stake TOKEN, cache content, and serve BLAKE3-addressed blobs over QUIC
+- **Nodes** bond TOKEN proportional to declared bandwidth capacity, cache content, and serve BLAKE3-addressed blobs over QUIC
 - **Clients** probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream content, and pay via off-chain USDC vouchers
 - On a **cache miss**, nodes pull from peers (paid), cache locally, and stream to the client simultaneously
 - All byte transfers are paid — client-to-node and node-to-node

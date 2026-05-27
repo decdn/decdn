@@ -42,7 +42,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 ## iroh node-key rotation only
 
-**API used:** `StakingRegistry.bindNodeId(newNodeId, signature)` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)).
+**API used:** `CapacityBond.bindNodeId(newNodeId, signature)` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)).
 
 `bindNodeId` is rebind-only — atomically deletes the old `nodeId → ethAddress` mapping and writes the new one. Ethereum address unchanged.
 
@@ -50,9 +50,9 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 | Survives rotation | Reason |
 |-------------------|--------|
-| Stake, ve-locks, gauge-claim history | Keyed by Ethereum address ([ADR 026](026-tokenomics.md#adr-026-tokenomics)) |
+| Capacity bond, Genesis Bond Credit `PendingCredit` position | Keyed by Ethereum address ([ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits)) |
 | Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, nonce)` ([ADR 003](003-payments.md#adr-003-payment-model)); Ethereum address unchanged |
-| `firstRegisteredAt` | Cleared only by `deregisterNode`; `bindNodeId` does not touch it ([ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
+| `firstBondedAt` | Write-once; never cleared by `deregisterNode` or auto-ejection, and `bindNodeId` does not touch it ([ADR 003 § Node Registry](003-payments.md#node-registry); [ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
 
 ### What does not carry over
 
@@ -72,7 +72,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
    Probe-hold drain is critical: rotating before holds clear opens a phantom-slash window — outstanding holds were signed by the *old* NodeId but the *new* one would not honor them. See [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold).
 3. **Stop** the node process.
 4. **Build the EIP-712 `BindNodeId` binding signature** with the operator's Ethereum key at the current `bindingNonce[ethAddress]` — `bindingSignature = EIP-712 sign(ethKey, BindNodeId { nodeId: newNodeId, nonce: bindingNonce[ethAddress] })`.
-5. **Submit** `StakingRegistry.bindNodeId(newNodeId, bindingSignature)`. The transaction must originate from the same Ethereum address that owns the existing binding. Wait one block confirmation and verify the `NodeIdBound` event.
+5. **Submit** `CapacityBond.bindNodeId(newNodeId, bindingSignature)`. The transaction must originate from the same Ethereum address that owns the existing binding. Wait one block confirmation and verify the `NodeIdBound` event.
 6. **Update** the node config to point at the new keystore; replace the iroh keystore file at the configured path.
 7. **Restart** the node, confirm:
    - `/health` reports `ready`
@@ -100,30 +100,30 @@ cast code <addr>      # EOA → returns 0x ; Safe → returns deployed proxy cod
 
 ### EOA → EOA migration (PoC default)
 
-**No rebinding API exists for the on-chain Ethereum address.** The address is the stake owner — to rotate, move the entire identity. Expect downtime and loss of `firstRegisteredAt` (cold-start bootstrap signal in [ADR 008 § Cold-Start Bootstrap](008-reputation.md#cold-start-bootstrap)).
+**No rebinding API exists for the on-chain Ethereum address.** The address is the stake owner — to rotate, move the entire identity. Expect downtime and loss of `firstBondedAt` (cold-start bootstrap signal in [ADR 008 § Cold-Start Bootstrap](008-reputation.md#cold-start-bootstrap)).
 
 Procedure:
 
 1. **Drain** and **stop** the node (same as [§ iroh node-key rotation only](#iroh-node-key-rotation-only) steps 2–3).
 2. **Wait** for all open inbound channels to settle. Watch `decdn_channels_open`. If any channel is in the dispute window, do **not** rotate — settling a stale state in step 7 requires the old keystore. Dispute window 48h ([ADR 003](003-payments.md#adr-003-payment-model)); production governable 12h–72h ([ADR 009](009-governance.md#adr-009-governance-model)).
-3. **`StakingRegistry.deregisterNode()`** from the old address. Sets `active = false`, starts the unbonding period, increments `registrationNonce[nodeId]`. Stake remains slashable during unbonding ([ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)).
-4. **Wait** the full unbonding period (default 7d, minimum 3d governable). Stake remains slashable here — do not relax monitoring.
-5. **`StakingRegistry.withdraw()`** to the old address.
+3. **`CapacityBond.deregisterNode()`** from the old address. Sets `active = false`, increments `registrationNonce[nodeId]`. Does **not** start unbonding by itself — `deregisterNode` only deactivates; bond exit is a separate operation ([ADR 003 § Node Registry](003-payments.md#node-registry)).
+4. **`CapacityBond.unbond()`** to start the 14-day unbonding window (default per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve); governable `[7, 60]` days). Bond remains slashable here — do not relax monitoring.
+5. **Wait the full unbonding window**, then `CapacityBond.withdraw()` (or whatever the released-bond reclaim entry point is named in the final interface) to the old address.
 6. **Generate** the new EOA. Fund it with TOKEN (transfer from old, or from treasury) and a small ETH float for gas.
 7. **Keep the old EVM keystore reachable until your last open outbound channel settles or expires.** Vouchers are *client*-signed ([ADR 003](003-payments.md#adr-003-payment-model)); as node-operator-as-client (cache-miss pulls upstream) you hold signed vouchers under the old address, and the upstream counterparty may submit your latest voucher via `closeChannel`, triggering the 48h dispute window. Channels live up to `maxChannelDuration` (default 90 days per [ADR 003](003-payments.md#adr-003-payment-model)). As provider you do not sign vouchers, so inbound channels carry no key-side liability post-deregistration.
-8. **Re-stake from the new address with a fresh NodeId.** `TOKEN.approve` → `StakingRegistry.stake` → atomic `registerNode(newNodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)` (see [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow) § Phase 2 — On-chain Setup). **Reusing the original NodeId is not possible** without a separate `bindNodeId` on the *old* address before deregister: `deregisterNode` only sets `active = false` and increments `registrationNonce`, and does **not** clear `nodeIdToAddress[originalNodeId]` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 003](003-payments.md#nodeid-to-ethereum-binding)), so a fresh address calling `registerNode(originalNodeId, …)` reverts `"NodeId bound to another address"`. To reuse it (e.g., reputation continuity), chain [§ iroh node-key rotation only](#iroh-node-key-rotation-only) → [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default): [§ iroh node-key rotation only](#iroh-node-key-rotation-only)'s `bindNodeId` to a temporary NodeId clears the original mapping, then [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) re-registers it from the new address.
+8. **Re-bond from the new address with a fresh NodeId.** `TOKEN.approve(capacityBond, bond_required(declaredMbps))` → `CapacityBond.register(declaredMbps)` (pulls the bond per [ADR 019 § Step 2.2](019-node-onboarding.md#step-22--register-at-declared-capacity)) → `CapacityBond.registerNode(newNodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)` for the NodeId binding (see [ADR 019 § Phase 2 — On-chain Setup](019-node-onboarding.md#phase-2--on-chain-setup)). **Reusing the original NodeId is not possible** without a separate `bindNodeId` on the *old* address before deregister: `deregisterNode` only sets `active = false` and increments `registrationNonce`, and does **not** clear `nodeIdToAddress[originalNodeId]` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 003](003-payments.md#nodeid-to-ethereum-binding)), so a fresh address calling `registerNode(originalNodeId, …)` reverts `"NodeId bound to another address"`. To reuse it (e.g., reputation continuity), chain [§ iroh node-key rotation only](#iroh-node-key-rotation-only) → [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default): [§ iroh node-key rotation only](#iroh-node-key-rotation-only)'s `bindNodeId` to a temporary NodeId clears the original mapping, then [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) re-registers it from the new address.
 9. **Restart** the node with config pointing at the new EVM keystore. Confirm `/health` reports `ready` and `decdn_channel_deposit_usdc` is zero (no channels yet).
 10. **Re-open outbound channels** as needed for cache-miss pulls — no carry-over.
 
-**Real cost:** `firstRegisteredAt` resets to the new registration timestamp (cold-start bootstrap window restarts); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score decay](008-reputation.md#adr-008-reputation-system); stake-time-weighted gauge-boost (where the gauge formula consumes `firstRegisteredAt`) is lost.
+**Real cost:** `firstBondedAt` resets to the new registration timestamp (cold-start bootstrap window restarts); the operator's `age_ramp` resets to zero and rebuilds to full weight at 6 months per [ADR 026 § Governance](026-tokenomics.md#governance); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score decay](008-reputation.md#adr-008-reputation-system).
 
 > **Recommendation.** Treat EOA rotation as a last resort. Prefer the **one-time migration to a Safe** ([§ EOA → Safe migration (one-time, recommended)](#eoa--safe-migration-one-time-recommended)) — once on a Safe, all future "rotations" are owner/session-key swaps with no on-chain identity change.
 
 ### EOA → Safe migration (one-time, recommended)
 
-`SignatureChecker` is wired across every contract per [ADR 024 § Universal `SignatureChecker` in All Contracts](024-account-abstraction.md#universal-signaturechecker-in-all-contracts), so a Safe is a drop-in EOA replacement. The migration follows [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) (deregister → unbond → withdraw → re-stake from the Safe), performed once, yielding a stable on-chain identity for all subsequent rotations.
+`SignatureChecker` is wired across every contract per [ADR 024 § Universal `SignatureChecker` in All Contracts](024-account-abstraction.md#universal-signaturechecker-in-all-contracts), so a Safe is a drop-in EOA replacement. The migration follows [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) (deregister → unbond → withdraw → re-register from the Safe), performed once, yielding a stable on-chain identity for all subsequent rotations.
 
-After migration, the Safe holds TOKEN and executes `stake` / `registerNode` / `openChannel` / `closeChannel` / `topUp`. The Safe's owner key rotates thereafter ([§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path)).
+After migration, the Safe holds TOKEN and executes `register` / `openChannel` / `closeChannel` / `topUp`. The Safe's owner key rotates thereafter ([§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path)).
 
 ### Safe owner / session-key rotation (production preferred path)
 
@@ -131,7 +131,7 @@ The cheap path — the on-chain Safe address does not change.
 
 #### PoC (1-of-1 Safe)
 
-Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. The Safe address is unchanged; stake, channels, ve-locks, and `firstRegisteredAt` all carry over. No iroh-side action needed.
+Replace the single owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)`. The Safe address is unchanged; bond, channels, Genesis Bond Credit `PendingCredit` position, `firstBondedAt`, and `age_ramp` progress all carry over. No iroh-side action needed.
 
 #### Production (2-of-3 + `erc7579/smartsessions`)
 
@@ -170,7 +170,7 @@ Exception: **emergency compromise of the Ethereum key.** Run [§ Ethereum signin
 | Scenario | Detection | Rollback |
 |----------|-----------|----------|
 | `bindNodeId` succeeded but node won't restart | `decdn_node_uptime_seconds` reset, `/health` `not_ready` | Repoint config at old keystore, re-`bindNodeId` to old NodeId from same Ethereum key, restart |
-| Mid-procedure abort during [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) (deregister submitted, withdraw not done) | `StakingRegistry.isActiveNode(nodeId) == false`, stake still locked | Wait the unbonding window; you may re-register from the same address before it elapses — old `nodeId` is reusable |
+| Mid-procedure abort during [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) (deregister submitted, withdraw not done) | `CapacityBond.isActiveNode(nodeId) == false`, stake still locked | Wait the unbonding window; you may re-register from the same address before it elapses — old `nodeId` is reusable |
 | [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) step 7: latent voucher submitted by a counterparty | `closeChannel` event against old address post-deregister | Old keystore must be reachable; `closeChannel` runs against the old address regardless of registration state |
 | [§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path) session-key revocation fails | Module revert | Revert to the old session key, file a bug; slash signing degrades gracefully (still-valid old-key signatures accepted) |
 
@@ -178,7 +178,7 @@ Exception: **emergency compromise of the Ethereum key.** Run [§ Ethereum signin
 
 - **Client-side iroh-key rotation.** See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model), inline "Key rotation": open client→node channels survive client iroh-key rotation (keyed by the client's Ethereum address), mirroring the operator-side carry-over in [§ iroh node-key rotation only](#iroh-node-key-rotation-only).
 - **Out-of-scope production hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are infeasible per [ADR 012 § Consequences](012-client.md#consequences) — 2–5s confirmation latencies cannot keep the per-MB voucher cadence. A separate delegated-voucher-signer contract path is similarly superseded. The sole production hot-signing path is [ADR 024 § Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions).
-- **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: file an incident report with the SafetyReserve registry ([ADR 026 § Safety and insurance reserve (3% bucket)](026-tokenomics.md#safety-and-insurance-reserve-3-bucket)) if losses occurred, alert peer operators via reputation gossip, and rotate before any further wire-level signature under the compromised key.
+- **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: file an incident report with the SafetyReserve registry ([ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket)) if losses occurred, alert peer operators via reputation gossip, and rotate before any further wire-level signature under the compromised key.
 
 ## Cross-ADR Impact
 

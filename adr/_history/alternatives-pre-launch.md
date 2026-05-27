@@ -3,6 +3,8 @@
 > **Audit trail.** This file collects the `## Alternatives Considered` sections that previously lived inline across the ADR set. It is **not** part of the canonical protocol specification — it is a record of design alternatives evaluated and rejected before launch, retained so future contributors can see what was on the table without inferring it from the current design. Tracked in [#346](https://github.com/decdn/decdn/issues/346); see [`adr/README.md` § Decision-record context](../README.md#decision-record-context) for the project-level framing.
 >
 > Neither the numeric `adrs.pdf` nor the reading-order `adrs-book.pdf` build includes this file, and the ADR bodies intentionally do **not** link to it — there is no `## Alternatives Considered` stub or breadcrumb in any ADR. Readers approaching the protocol get the canonical spec; this archive is browsed directly, by the per-ADR sections below.
+>
+> **Related: retired full ADRs.** Full ADRs that were accepted, then retired when a later spec superseded the underlying mechanism, live as standalone files alongside this one — a different artifact category than the rejected-pre-launch-alternative entries below. Current retirees: [`034-gauge-boost-voting-escrow.md`](034-gauge-boost-voting-escrow.md) and [`035-delegator-pool.md`](035-delegator-pool.md), both retired by the v2.1 work-token rewrite (replaces the ve-gauge model with the `CapacityBond` lock-to-capacity curve). Each retired file has a top-of-file retirement banner with the canonical pointer; original bodies are preserved verbatim.
 
 Sections below are anchored by source ADR. Cross-references back to each source use relative paths (`../NNN-name.md`).
 

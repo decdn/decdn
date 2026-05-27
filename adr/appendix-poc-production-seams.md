@@ -4,7 +4,7 @@
 
 ## Context
 
-Several ADRs describe PoC-vs-production differences, and they fall into three kinds: **network-scale operational choices** (single RPC endpoint, clients holding ETH for gas, simplified peer bootstrap), **component implementations** (file-based vs platform-keychain key storage, local-only vs gossip-weighted reputation), and **governance process** (admin key vs ve-weighted Governor).
+Several ADRs describe PoC-vs-production differences, and they fall into three kinds: **network-scale operational choices** (single RPC endpoint, clients holding ETH for gas, simplified peer bootstrap), **component implementations** (file-based vs platform-keychain key storage, local-only vs gossip-weighted reputation), and **governance process** (admin key vs capacity-weighted Governor with the bootstrap-multisig transition phase per [ADR 009](009-governance.md#adr-009-governance-model)).
 
 Crucially, none of these is a *contract-surface* difference. Per [ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory), the full on-chain surface ships in a single audit pass with governance-tunable economics from day one; "PoC" is a network-scale milestone (tens of nodes on a testnet), not a reduced contract surface — there are no contract-surface scope reductions, only the non-contract differences this appendix addresses.
 
@@ -14,7 +14,7 @@ The question this appendix answers: **how does the codebase express the non-cont
 
 **Mode selection lives only at the composition boundary — the `node` binary's wiring layer. Domain crates are leaf: they contain no mode-conditional logic.**
 
-- **Trait seams at crate boundaries.** Each mode-varying capability — key storage, reputation scoring, the payment-channel client, the governance/parameter reader, and the on-chain contract clients (`FeeRouter`, `VotingEscrow`, swap helper, `SafetyReserve`) — is a trait owned by its crate. PoC and production concrete implementations sit behind that trait; the wiring layer constructs the right one.
+- **Trait seams at crate boundaries.** Each mode-varying capability — key storage, reputation scoring, the payment-channel client, the governance/parameter reader, and the on-chain contract clients (`FeeRouter`, `CapacityBond`, `BuybackBurner`, `SafetyReserve`) — is a trait owned by its crate. PoC and production concrete implementations sit behind that trait; the wiring layer constructs the right one.
 - **Leaf crates stay pure.** The domain crates carry no mode branching. The two-binary split (`node` daemon, `decdn` CLI) shares config schema and identity loading via `common`; mode selection is a `node`-wiring concern. The current crate/binary layout is defined by the workspace `CLAUDE.md` and [appendix-binaries.md](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split) — that is the source of truth; this appendix deliberately does not restate a crate list that would rot.
 - **One source of truth for numeric differences.** Mode-dependent constants (challenge bond, announce interval, dispute window, bootstrap-peer minimum) live in a single constants type with a per-mode constructor — never as magic numbers in domain logic.
 - **Compile-time, not runtime.** No `NetworkMode` enum is threaded through call sites; selection is resolved once, at wiring, so a PoC build cannot accidentally run production logic or vice versa. The exact compile-time mechanism (feature, build profile, or cfg) is a wiring-layer detail kept out of every other crate.

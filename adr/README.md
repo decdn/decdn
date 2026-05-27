@@ -1,6 +1,6 @@
 # deCDN — Protocol Specification
 
-A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain payment-token channels with on-chain settlement; staked operators compete on price and latency, with reputation, slashing, and gauge-weighted incentives keeping the mesh honest.
+A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain payment-token channels with on-chain settlement; bonded operators compete on price and latency, with reputation, slashing, and capacity-bonded incentives keeping the mesh honest.
 
 This directory is the protocol's canonical specification. Each numbered file is an Architecture Decision Record (ADR) covering one component or invariant of the design. [`architecture.md`](architecture.md) is the living overview — system diagram, ADR-by-ADR summaries, key invariants, trust assumptions, and the canonical reading order.
 
@@ -10,7 +10,7 @@ This directory is the protocol's canonical specification. Each numbered file is 
 - **Paid byte delivery, end to end.** Every byte transferred — client→node *and* node→node — is paid. There is no free-rider tier and no unpaid relay layer. Off-chain payment-token channels settle on-chain.
 - **Stake to participate, slash on misbehavior.** Nodes must stake TOKEN before joining the mesh. Misbehavior (phantom announcements, rate manipulation, corruption, blacklist violation) is detectable on-chain and slashable. Challenge bonds prevent zero-cost griefing.
 - **Origin storage is opaque.** Origin-backed nodes hold canonical content in S3/R2/B2/NFS/local-disk backends, but no external origin URL is ever exposed. Bypassing the payment layer requires bypassing the network entirely.
-- **Operator return is differentiated by long-term commitment, not raw stake.** Curve-style gauge-boost via opt-in `VotingEscrow` rewards operators who lock TOKEN for longer periods, instead of a regressive stake-multiple fee discount.
+- **Operator return is differentiated by capacity commitment, not raw stake.** The `CapacityBond` lock-to-capacity curve `bond = k × Mbps^α` requires operators to bond TOKEN proportional to declared bandwidth, with super-linear pressure against concentration. No fee discounts, no passive yield to non-operators.
 - **Pre-launch the protocol has one design.** ADRs read as the canonical specification, not as an iteration log. Rejected pre-launch alternatives are kept out of the ADR bodies entirely — archived in [`adr/_history/`](_history/alternatives-pre-launch.md), which is part of neither built PDF (see *Decision-record context* below).
 
 ## Reading order
@@ -20,7 +20,7 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 1. **Foundations** — language stack, network topology, content addressing, wire protocol.
 2. **Discovery** — DHT-based content lookup, QUIC 0-RTT.
 3. **Payments** — channels, vouchers, client architecture, smart-wallet support.
-4. **Tokenomics & incentives** — gauge-boost tokenomics, liquidity strategy, deferred follow-ups.
+4. **Tokenomics & incentives** — work-token tokenomics, liquidity strategy, deferred follow-ups.
 5. **Verification & enforcement** — on-chain slashing evidence, reputation, content takedown.
 6. **Governance & contracts** — Governor + Timelock model, contract interaction map.
 7. **Operations** — node onboarding.

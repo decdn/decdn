@@ -176,22 +176,25 @@ omitted — measure during integration testing on Arbitrum Sepolia, re-confirm a
 Arbitrum One fee markets at deployment. Three MUST gates:
 
 1. **`FeeRouter` per-settlement overhead.** Every `settleChannel` routes through
-   `FeeRouter.routeSettlement(operator, bytesDelivered, amount, epochId)`, feeding
-   the [ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula) gauge
-   formula. Overhead **~5–10K gas** atop the settlement tx (1 SLOAD + 1 SSTORE); at
-   100K settlements/year (medium operator) a small fraction of total cost. Aggregate
-   per-settlement gas (USDC-equivalent, incl. this overhead) MUST stay within the
-   operator P&L affordability bounds of
-   [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake).
+   `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` — four
+   `safeTransfer` legs (60/25/10/5 same-tx per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)),
+   one inline write to the FeeRouter-internal `bytesPerEpoch[operator][epoch]`
+   served-bytes counter (epoch derived from `block.timestamp`) consumed by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), and a single
+   `CapacityBond.recordSettlement` SSTORE updating `lastSettlementAt[operator]`.
+   Overhead **~5–10K gas** atop the settlement tx; at 100K settlements/year
+   (medium operator) a small fraction of total cost. Aggregate per-settlement gas
+   (USDC-equivalent, incl. this overhead) MUST stay within the operator P&L
+   affordability bounds of [ADR 026 § Operator economics](026-tokenomics.md#operator-economics).
 
-2. **Per-epoch keeper-call gas economics.** Two TWAP-protected USDC→TOKEN swap
-   keeper calls per epoch: `BuybackBurner` (5% buyback-and-burn flow per
-   [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) and delegator-pool conversion (7%
-   delegator-pool flow per [ADR 026 § Delegator pool — USDC → TOKEN conversion](026-tokenomics.md#delegator-pool--usdc--token-conversion)) — at a
-   1-week epoch, **52+ swaps/year minimum**, both via the Balancer V3 80/20
-   TOKEN/USDC pool with TWAP windows, `minOut`, and per-epoch liquidity caps (which
-   bind at S2/S3 scale per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)). Per-epoch keeper costs MUST be not cost-prohibitive at
-   S2/S3 scale and a small fraction of the inflow each call routes.
+2. **Per-epoch keeper-call gas economics.** One TWAP-protected USDC→TOKEN swap
+   keeper call per epoch via `BuybackBurner` (25% buyback-and-burn flow per
+   [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) and
+   [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) —
+   at a 1-week epoch, **52+ swaps/year minimum**, via the Balancer V3 80/20
+   TOKEN/USDC pool with TWAP windows, `minOut`, mandatory private-RPC routing, and
+   a per-epoch liquidity cap that binds under sustained network revenue at the
+   25% burn share. Per-epoch keeper costs MUST be not cost-prohibitive at S2/S3
+   scale and a small fraction of the inflow each call routes.
 
 3. **Private-RPC gate.** The L2 MUST support private-RPC routing (Flashbots-style
    bundles) for the hardened MEV-protection requirement in

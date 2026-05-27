@@ -43,7 +43,7 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 
 `disputeChannel` validates the voucher signature using the same scheme as `closeChannel` and migrates the same way.
 
-**StakingRegistry ([ADR 003](003-payments.md#adr-003-payment-model)):**
+**CapacityBond ([ADR 003](003-payments.md#adr-003-payment-model)):**
 
 | Function | Current | After |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 | `submitRateChallenge` | `ecrecover` → address A, `ecrecover` → address B, verify A == B | `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSig)` + `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSig)` |
 | `submitBlacklistChallenge` | `ecrecover` → address, verify registered | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
 
-**Note on SlashJudge pattern change:** The current design recovers an address from `ecrecover` and then looks it up in `StakingRegistry`. With `SignatureChecker`, the pattern becomes: the challenger provides the `challengedNode` address (the node's Ethereum address / Safe address), the contract verifies the signature against that address, then confirms the address is registered. This is equivalent but avoids the "recover then lookup" pattern which does not work for ERC-1271 (there is no "recovery" from a smart account signature — only validation).
+**Note on SlashJudge pattern change:** The current design recovers an address from `ecrecover` and then looks it up in `CapacityBond`. With `SignatureChecker`, the pattern becomes: the challenger provides the `challengedNode` address (the node's Ethereum address / Safe address), the contract verifies the signature against that address, then confirms the address is registered. This is equivalent but avoids the "recover then lookup" pattern which does not work for ERC-1271 (there is no "recovery" from a smart account signature — only validation).
 
 #### Gas Impact
 
@@ -77,7 +77,7 @@ Safe smart wallets are the **recommended** wallet type for both node operators a
 **Recommended PoC configuration: 1-of-1 Safe.** **Production: 2-of-3 + session keys (see [§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions)).**
 
 - **Owners (PoC):** 1-of-1. The single owner is a software-held key on the signing host — same trust posture as today's `eth_keystore`. 2-of-3 is not recommended for the PoC because `SignatureChecker` → Safe's `checkSignatures` cannot reach a multi-owner threshold at wire speed: every `slash_sig` would need signatures from multiple owners, and pre-approving every digest via `signMessage` is infeasible.
-- **Stake management:** The Safe holds TOKEN and executes `StakingRegistry.stake()`, `registerNode()`, `deregister()`.
+- **Bond management:** The Safe holds TOKEN and executes `CapacityBond.register(declaredMbps)` (bond pull), `registerNode()` (NodeId binding), `deregisterNode()` (deactivate), and `unbond()` (start the 14-day unbonding window).
 - **Channel operations:** The Safe executes `openChannel()`, `closeChannel()`, `topUp()` for outbound node-to-node payment channels (cache-miss pulls). Infrequent — not on the hot path.
 - **Hot signing (slash_sig) — PoC:** The 1-of-1 owner signs the EIP-712 digest directly. `SignatureChecker.isValidSignatureNow(safeAddress, digest, sig)` routes through Safe's stock `CompatibilityFallbackHandler` → `checkSignatures`, which passes at threshold 1.
 - **Hot signing (slash_sig) — Production:** 2-of-3 Safe with a session key authorized via `erc7579/smartsessions` (see [§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions)). Multisig protects stake/withdraw/channel-open; the session key signs `slash_sig` at wire speed without quorum per message.

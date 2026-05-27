@@ -2,8 +2,6 @@
 
 > **This is an appendix, not a core protocol ADR.** Blob cache eviction is a local implementation choice — two nodes running different eviction strategies (LRU, LFU, hybrid) still interoperate so long as they honour the probe-triggered hold in [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold). This appendix codifies the recommended LRU approach (refreshed on every successful `CacheEngine::get`), the operator-pinning override, the durable operator-evict orthogonality, the probe-hold composition, and the observability metrics. Alternative implementations are acceptable.
 
-**Touches:** [ADR 005](005-protocol.md#adr-005-wire-protocol), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale), [architecture.md](architecture.md#architecture-overview), [appendix-observability.md](appendix-observability.md#appendix-observability-and-metrics)
-
 ## Context
 
 The local blob cache holds pulled content; certain entries must be exempt from eviction — the probe-triggered hold introduced by [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold). The protocol does **not** specify the eviction order itself — the canonical wording is *"LRU or frequency-weighted eviction (LFU)"*, which leaves the choice open. This appendix resolves five questions:

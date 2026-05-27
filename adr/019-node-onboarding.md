@@ -28,7 +28,7 @@ flowchart TD
 
 Before any on-chain or protocol activity:
 
-1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month egress. See [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake) for operator economics.
+1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month egress. See [ADR 026 § Operator economics](026-tokenomics.md#operator-economics) for operator economics.
 
 2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes gossip messages to be silently rejected by all peers ([ADR 001](001-network.md#clock-synchronization)). Nodes SHOULD expose a `decdn_gossip_messages_rejected_total` Prometheus counter with the `reason="clock_skew"` label ([Appendix: Observability](appendix-observability.md#gossip-metrics)).
 
@@ -37,7 +37,7 @@ Before any on-chain or protocol activity:
    - **Production:** platform keychain or HSM. See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) for key management guidance (the same tiers apply to node keys).
 
 4. **Prepare Ethereum key.** The operator needs an Ethereum address (`ethAddress`) with sufficient funds:
-   - **TOKEN:** at minimum **50,000 TOKEN** for the minimum stake deposit ([ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)). There is no discount-stake threshold; operators wanting amplified return on capital ve-lock TOKEN in `VotingEscrow` for gauge boost ([ADR 034 § Gauge-boost formula](034-gauge-boost-voting-escrow.md#gauge-boost-formula)) rather than staking above a threshold for fee discount. Operators lacking the 50K minimum may qualify for externally-funded operator-onboarding programs (see [ADR 026 § Bootstrap mechanism — pre-seed USDC](026-tokenomics.md#bootstrap-mechanism--pre-seed-usdc)).
+   - **TOKEN:** at minimum **`k × declared_Mbps^α`** for the capacity bond ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). At defaults `k=12.6`, `α=1.2`: ~50K TOKEN for a 1 Gbps tier, ~795K TOKEN for 10 Gbps, ~12.6M TOKEN for 100 Gbps. There is no discount-stake threshold; operators do not earn additional yield by bonding above their declared capacity. Operators lacking the entry-tier bond may qualify for externally-funded operator-onboarding programs (see [ADR 026 § Bootstrap mechanism — pre-seed USDC](026-tokenomics.md#bootstrap-mechanism--pre-seed-usdc)).
    - **Native gas token:** ~$0.50–$1.00 for the Phase 2 transactions at typical L2 gas prices.
    - **Optional USDC:** only required if the operator intends to open outbound payment channels immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients open inbound channels to the node without any USDC on the node side.
 
@@ -66,29 +66,29 @@ All transactions must be confirmed on-chain before proceeding to Phase 3.
 
 #### Step 2.1 — Approve TOKEN transfer
 
-Call `TOKEN.approve(stakingRegistry, amount)` where `amount ≥ minStake` (**50,000 TOKEN** under [ADR 026 § Operator economics and minimum stake](026-tokenomics.md#operator-economics-and-minimum-stake)). This ERC-20 approval authorizes `StakingRegistry` to pull the stake deposit.
+Call `TOKEN.approve(capacityBond, amount)` where `amount ≥ bond_required(declared_Mbps)` per the curve `bond = k × Mbps^α` ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). This ERC-20 approval authorizes `CapacityBond` to pull the bond deposit.
 
-**Gas:** ~$0.03 (one-time; re-stakes reuse the allowance if set above `minStake`).
+**Gas:** ~$0.03 (one-time; re-registrations reuse the allowance if set high enough).
 
-#### Step 2.2 — Stake TOKEN
+#### Step 2.2 — Register at declared capacity
 
-Call `StakingRegistry.stake(amount)` with `amount ≥ 50,000 TOKEN`.
+Call `CapacityBond.register(declaredMbps)`, which atomically pulls `bond_required(declaredMbps)` TOKEN from the operator. The probe service then samples the operator over a 7-day window via the `cdn/probe/v1` ALPN; if 95th-percentile sustained delivery falls below `min_delivery_ratio × declared_capacity` (default 70%), registration auto-reverts the bond minus a fixed probe-cost fee (~50 TOKEN). Re-registration at a lower tier is permitted at any time; re-registration at a higher tier requires a new probe window.
 
-The stake locks immediately and is slashable from this point forward, including during the unbonding period if the node later deregisters (7-day unbonding by default; governable per [ADR 026](026-tokenomics.md#adr-026-tokenomics)).
+The bond locks immediately and is slashable from this point forward, including during the **14-day unbonding window** if the node later unbonds ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)).
 
-**ve-position is separate.** Operator stake in `StakingRegistry` and any ve-locked TOKEN in `VotingEscrow` are independent positions per [ADR 034 § Voting escrow](034-gauge-boost-voting-escrow.md#voting-escrow-votingescrow). ve-locked TOKEN is non-slashable and does not satisfy the minimum stake; staked TOKEN does not earn gauge boost. An operator wanting gauge boost must hold both.
+**No separate ve-position exists.** The bond is the only TOKEN-side requirement on operators. There is no optional lock for additional yield; non-operator TOKEN holders earn nothing and have no governance weight ([ADR 026 § Governance](026-tokenomics.md#governance)).
 
 **Gas:** ~$0.05.
 
 #### Step 2.3 — Register node
 
-Call `StakingRegistry.registerNode(nodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)`.
+Call `CapacityBond.registerNode(nodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)`.
 
 This single transaction atomically:
 
 - Verifies the EIP-712 `bindingSignature` over `BindNodeId(nodeId, bindingNonce[ethAddress])`, establishing the `nodeId → ethAddress` mapping for slash evidence and payment attribution.
 - Verifies the `ed25519Signature` over `keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId]))`, proving the operator controls the iroh private key (prevents NodeId squatting). (`ethAddress` is `msg.sender` and `chainId` is `block.chainid` on-chain; this ADR uses operator-perspective names for consistency with the signing pseudo-code below.)
-- Records `NodeInfo` (including `firstRegisteredAt` if this is the node's first-ever registration — used for cold-start bootstrap eligibility in [ADR 008](008-reputation.md#cold-start-bootstrap)).
+- Records `NodeInfo` (including `firstBondedAt` if this is the node's first-ever registration — used for cold-start bootstrap eligibility in [ADR 008](008-reputation.md#cold-start-bootstrap)).
 - Sets `active = true` in the registry.
 
 **Constructing `multiaddrs`:** The iroh `Endpoint` is not yet bound in Phase 2, so hole-punched addresses are unavailable at registration time:
@@ -130,7 +130,7 @@ After initial sync, the node polls `getBlacklistVersion()` every `blacklist_poll
 
 #### Step 3.3 — Build initial peer table from on-chain registry
 
-Query `StakingRegistry.getActiveNodes(offset=0, limit=100)` to bootstrap the peer table. For PoC (tens of nodes) a single call suffices; for larger networks, paginate until all active nodes are fetched.
+Query `CapacityBond.getActiveNodes(offset=0, limit=100)` to bootstrap the peer table. For PoC (tens of nodes) a single call suffices; for larger networks, paginate until all active nodes are fetched.
 
 This registry snapshot is the initial peer table; gossip updates (Phase 4) keep it fresh. The node also subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to maintain a local registry cache used during gossip validation ([ADR 001](001-network.md#registry-cache)).
 
@@ -185,7 +185,7 @@ After Phases 1–4, the node is fully operational and should accept traffic.
 
 | # | Check | How to verify |
 |---|-------|---------------|
-| 1 | Node is active in the on-chain registry | `StakingRegistry.isActiveNode(nodeId)` returns `true` |
+| 1 | Node is active in the on-chain registry | `CapacityBond.isActiveNode(nodeId)` returns `true` |
 | 2 | Rate bounds loaded | Node has `deliveryFloor` and `deliveryCeiling` in memory |
 | 3 | Blacklist synced | Local blacklist is at the current `blacklistVersion` |
 | 4 | QUIC listener open | `iroh::Endpoint` bound and listening on configured port(s) |
@@ -218,7 +218,7 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 **Multiaddr refresh:**
 
-- When `Endpoint::direct_addresses()` changes (iroh emits an event), call `StakingRegistry.updateMultiaddrs(newMultiaddrs)` to keep the registry current.
+- When `Endpoint::direct_addresses()` changes (iroh emits an event), call `CapacityBond.updateMultiaddrs(newMultiaddrs)` to keep the registry current.
 - **PoC:** No cooldown — updates can be submitted on any change (~$0.03/call).
 - **Production:** A governable cooldown prevents rapid address flipping by a compromised key ([ADR 003 § Multiaddr Update Policy](003-payments.md#multiaddr-update-policy)).
 
@@ -226,13 +226,13 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 ### Re-Onboarding after Deregistration or Auto-Ejection
 
-A node that voluntarily deregistered or was auto-ejected (stake dropped below 50% of `minStake` due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
+A node that voluntarily deregistered or was auto-ejected (bond dropped below 50% of the minimum bond for its declared tier due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
 
-1. **`firstRegisteredAt` is preserved.** The cold-start bootstrap bonus ([ADR 008](008-reputation.md#adr-008-reputation-system)) is not re-granted — the `firstRegisteredAt` field in `StakingRegistry` is immutable once set, and the bonus is one-time per operator address.
+1. **`firstBondedAt` is preserved.** The cold-start bootstrap bonus ([ADR 008](008-reputation.md#adr-008-reputation-system)) is not re-granted — the `firstBondedAt` field in `CapacityBond` is immutable once set, and the bonus is one-time per operator address. The `age_ramp` ([ADR 026 § Governance](026-tokenomics.md#governance)) similarly resumes from the original bonded date, so a re-onboarding operator does not restart the age-ramp clock.
 
 2. **`registrationNonce` is incremented.** On deregistration, `registrationNonce[nodeId]` is incremented. The operator must sign fresh `ed25519Signature` and `bindingSignature` parameters with the new nonce before calling `registerNode` again.
 
-If the node's iroh identity was replaced (key rotation), use `StakingRegistry.bindNodeId()` after re-registration to associate the new `nodeId` with the same `ethAddress` — see [ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding). The old `nodeId` mapping is cleared.
+If the node's iroh identity was replaced (key rotation), use `CapacityBond.bindNodeId()` after re-registration to associate the new `nodeId` with the same `ethAddress` — see [ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding). The old `nodeId` mapping is cleared.
 
 ## Consequences
 
