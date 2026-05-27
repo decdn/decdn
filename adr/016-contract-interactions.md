@@ -195,57 +195,53 @@ No deCDN contract uses proxy (upgradeable) deployment patterns. Production contr
 
 **Build toolchain:** [Foundry](https://book.getfoundry.sh/) (forge, cast, anvil) for compilation, testing, and deployment.
 
-#### Contract: OperatorEmissions
+#### Contract: CapacityBond
 
-`OperatorEmissions` distributes the 20% Operator Service Emissions bucket (200M TOKEN) to active operators based on verified service delivery, per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). It holds its allocation in TOKEN, reads per-operator delivery signals from `FeeRouter.bytesPerEpoch`, applies the front-loaded service-emission curve, and writes the resulting per-operator grants back into `CapacityBond` via a privileged `depositGrant(operator, amount)` call so the granted TOKEN is bonded — not withdrawable as liquid until the operator unbonds fully.
+Under v2.2, `CapacityBond` absorbs the responsibilities of the (now-deleted) `OperatorEmissions` contract by hosting the 50M TOKEN Genesis Bond Credit allocation directly. Per-operator `PendingCredit` positions vest linearly over 24 months of continued operation per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits). The interface below specifies only the genesis-credit entrypoints added under v2.2; the broader `CapacityBond` surface (`register`, `unbond`, `slash`, `capacityAt`, `firstBondedAt`, `totalVotingWeightAt`, `recordSettlement`, `bindNodeId` / `reclaimNodeId`, `isActive`) is covered in [§ Contract Inventory](#contract-inventory), [§ Contract Architecture](#contract-architecture-classdiagram), [§ Cross-Contract Call Graph](#cross-contract-call-graph), and [§ Off-Chain Read API](#off-chain-read-api-client--node-bootstrap).
 
 ```solidity
-interface IOperatorEmissions {
-    // Computes and distributes the per-epoch emission for `epoch`.
-    // Reads `FeeRouter.bytesPerEpoch(op, epoch)` for each active operator
-    // and applies the configured emission curve. Per-operator grants are
-    // deposited into `CapacityBond` via `depositGrant`. Idempotent per
-    // epoch (a second call for the same epoch reverts).
-    function distribute(uint64 epoch) external;
+interface ICapacityBond {
+    // ============================================================
+    // Genesis Bond Credits (v2.2 § Genesis Bond Credits in ADR 026)
+    // ============================================================
 
-    // Configured per-epoch emission cap (front-loaded curve), governable
-    // within the bounds in ADR 026 § Operator Service Emissions.
-    function setEmissionCurve(EmissionCurve calldata curve) external;
-
-    // View: lifetime and remaining emission accounting. Per-epoch totals
-    // are emitted as an event field on `EpochDistributed` below.
-    function totalEmitted() external view returns (uint256);
-    function remainingBucket() external view returns (uint256);  // out of 200M
-
-    // Bucket sunset: callable by governance once the transition thresholds
-    // in ADR 026 § Governance are met for ≥6 months, or once `totalEmitted`
-    // reaches the 200M cap. Sweeps any remainder to Treasury and disables
-    // future `distribute` calls.
-    function sunsetBucket() external;
-
-    function pause() external;
-    function unpause() external;
-
-    event EpochDistributed(uint64 indexed epoch, uint256 totalEmitted, uint32 recipients);
-    event GrantDeposited(address indexed operator, uint64 indexed epoch, uint256 amount);
-    event EmissionCurveUpdated(EmissionCurve newCurve);
-    event BucketSunset(uint256 swept);
-
-    struct EmissionCurve {
-        uint256 year1Bps;        // share of bucket distributed in Y1 (default ~25%)
-        uint256 year2Bps;        // ~15%
-        uint256 year3Bps;        // ~12%
-        uint256 year4Bps;        // ~10%
-        uint256 tailBpsPerYear;  // ~10% per year thereafter until exhausted
+    /// Per-operator pending credit accounting. `total` is set once at TGE
+    /// by the Treasury via `grantGenesisCredit`; `vested` accrues over
+    /// 24mo via `accrueGenesisVest`. The operator may claim the vested
+    /// portion into bonded TOKEN via `claimVestedCredit`. Unvested
+    /// portion is slashable on the same terms as voluntarily-bonded
+    /// TOKEN.
+    struct PendingCredit {
+        uint128 total;
+        uint128 vested;
+        uint64  grantedAt;
     }
+
+    function pendingCredit(address operator) external view returns (PendingCredit memory);
+
+    /// One-shot grant at TGE. Callable only by Treasury within the
+    /// `GENESIS_CREDIT_WINDOW` (default 30 days post-deploy). After the
+    /// window closes, the function permanently reverts. Requires
+    /// `pendingCredit(op).total == 0` (one grant per operator). Pulls
+    /// TOKEN from Treasury via `safeTransferFrom`.
+    function grantGenesisCredit(address operator, uint256 amount) external;
+
+    /// Permissionless, idempotent. Updates `pendingCredit[op].vested`
+    /// to reflect epochs since `grantedAt` during which the operator
+    /// was `isActive(op) && !isSlashed(op)`. Safe to call from any
+    /// bond-mutating tx as a refresh.
+    function accrueGenesisVest(address operator) external;
+
+    /// Moves the currently-vested portion from `pendingCredit[op].vested`
+    /// into the operator's `bondedAmount`. Callable by the operator at
+    /// any time. After claim, the credit is functionally voluntary bond
+    /// (per ADR 026 §Genesis Bond Credits, vested-claimed credit is no
+    /// longer separately slashable as pending credit).
+    function claimVestedCredit(address operator) external;
 }
 ```
 
-**Notes:**
-
-- **Idempotency per epoch.** A second `distribute(epoch)` call for the same epoch reverts. Combined with the standard 48h governance timelock on `setEmissionCurve`, this prevents retroactive re-distribution.
-- **Curve precision is deferred** ([ADR 026 § Deferred & Open](026-tokenomics.md#deferred--open) item 3). The default values above are placeholders; the canonical curve is to be fixed after modeling in `finance/notebooks/`.
-- **Granted TOKEN is non-withdrawable.** `CapacityBond.depositGrant(operator, amount)` increases the operator's bonded balance without allowing the operator to unbond it separately — the only path out is full operator unbond after the 14-day unbonding window.
+The Genesis Bond Credit entrypoints replace v2.1's external `depositGrant(operator, amount)` hook that was called by the (now-deleted) `OperatorEmissions` contract. The 50M TOKEN Genesis Bond Credit allocation is held by `CapacityBond` itself (transferred in at TGE via the batched `grantGenesisCredit` calls), with per-operator vesting tracked in the `pendingCredit` mapping. Slashing of an operator's position applies to both `bondedAmount` and `pendingCredit[op].total - pendingCredit[op].vested` simultaneously.
 
 ### Deployment Order and Initialization Dependencies
 
