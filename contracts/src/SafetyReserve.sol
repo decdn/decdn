@@ -132,6 +132,14 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     ///         pending ratification.
     uint256 public totalEscrowLien;
 
+    /// @notice One-shot guard against multiple appeals for the same slashId.
+    ///         Set on the first successful `openSlashAppeal`; never cleared.
+    ///         Without this guard an attacker could open + fast-track + ratify
+    ///         multiple appeals for one slash event and drain the reserve at
+    ///         `maxAppealRestitution` per ratification (gemini-code-assist
+    ///         high-severity finding).
+    mapping(uint256 slashId => bool) public slashAppealed;
+
     // -----------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------
@@ -180,6 +188,7 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     error UnknownSlash(uint256 slashId);
     error FilingWindowClosed(uint64 slashedAt);
     error FrequencyCapHit(uint64 nextAvailableAt);
+    error SlashAlreadyAppealed(uint256 slashId);
     error AppealNotOpen(uint256 appealId);
     error AppealNotFastTracked(uint256 appealId);
     error ReviewWindowOpen(uint64 readyAt);
@@ -377,6 +386,13 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
         whenNotPaused
         returns (uint256 appealId)
     {
+        // One appeal per slashId — no duplicate appeals can be filed for
+        // the same slash event, even after rejection/lapse of a prior one
+        // (gemini-code-assist high finding: duplicate appeals could be
+        // ratified for the same slash, draining the reserve at
+        // `maxAppealRestitution` per ratification).
+        if (slashAppealed[slashId]) revert SlashAlreadyAppealed(slashId);
+
         // aderyn-ignore-next-line(reentrancy-state-change)
         (address operator, uint64 slashedAt_,) = capacityBond.slashRecords(slashId);
         if (operator == address(0) || slashedAt_ == 0) revert UnknownSlash(slashId);
@@ -391,6 +407,7 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
 
         // CEI: write the appeal record before the bond pull so the appeal
         // state is final before any external token call (aderyn H-1).
+        slashAppealed[slashId] = true;
         appealId = _appeals.length;
         uint256 bondToPull = appealBond;
         _appeals.push(

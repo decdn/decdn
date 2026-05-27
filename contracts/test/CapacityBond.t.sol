@@ -186,13 +186,31 @@ contract CapacityBondTest is Test {
         bond.stake(MIN_STAKE);
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
-        // Sanity check: slashedAtEpoch must be non-zero for the gate to trip.
         assertGt(bond.slashedAtEpoch(operator), 0);
 
-        vm.warp(block.timestamp + 365 days);
+        // Stay inside the 13-epoch slash gate window (advance only a few
+        // weeks past the slash). Claim must revert.
+        vm.warp(block.timestamp + 4 weeks);
         vm.prank(operator);
         vm.expectRevert();
         bond.claimVestedCredit();
+    }
+
+    function test_claimVestedCredit_succeedsAfterSlashGateExpires() public {
+        // Stamp slashedAtEpoch on the operator, then warp past the gate.
+        vm.warp(2 * 7 days);
+        _setupGenesisGrant(100_000e18);
+        vm.prank(operator);
+        bond.stake(MIN_STAKE);
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+
+        // Warp 14 epochs (= 98 days) past the slash so currentEpoch
+        // exceeds slashEpoch + CLAIM_SLASH_GATE_EPOCHS (13).
+        vm.warp(block.timestamp + 14 weeks);
+        vm.prank(operator);
+        bond.claimVestedCredit();
+        assertGt(bond.pendingCredit(operator).claimed, 0);
     }
 
     function test_claimVestedCredit_multiClaimFollowsLinearCurve() public {

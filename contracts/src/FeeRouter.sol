@@ -30,7 +30,8 @@ interface ICapacityBondReporter {
 ///         allowed during launch wiring). Buyback / treasury / safety
 ///         buckets short-circuit before the `safeTransfer` when their share
 ///         is 0; the operator share is bounded away from 0 by
-///         `OPERATOR_BPS_FLOOR`.
+///         `OPERATOR_BPS_FLOOR` and absorbs the rounding remainder so dust
+///         never gets routed to an inactive bucket's `address(0)` sink.
 contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
@@ -121,7 +122,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     error SharesDoNotSum(uint256 sum);
     error ShareOutOfBounds(uint256 bucket, uint256 value, uint256 floor, uint256 ceiling);
     error NonZeroShareNeedsDestination(uint256 bucket);
-    error NonZeroDestinationNeedsShare(uint256 bucket);
     error WindowOutOfBounds(uint64 value, uint64 floor, uint64 ceiling);
     error ZeroEpochLength();
 
@@ -210,11 +210,19 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
 
         uint256[4] memory s = _shares;
 
-        uint256 opShare = (amount * s[BUCKET_OPERATOR]) / BPS_DENOMINATOR;
         uint256 buybackShare = (amount * s[BUCKET_BUYBACK]) / BPS_DENOMINATOR;
         uint256 treasuryShare = (amount * s[BUCKET_TREASURY]) / BPS_DENOMINATOR;
-        // Safety leg is the remainder so rounding dust never strands USDC.
-        uint256 safetyShare = amount - opShare - buybackShare - treasuryShare;
+        uint256 safetyShare = (amount * s[BUCKET_SAFETY]) / BPS_DENOMINATOR;
+        // Operator leg absorbs the rounding remainder. Two reasons:
+        // (a) operator share is bounded ≥ `OPERATOR_BPS_FLOOR` (4000 bps) and
+        //     its destination is the per-call operator argument (always
+        //     non-zero by the entry guard) — so the dust transfer never
+        //     targets `address(0)`.
+        // (b) avoids the bug where dust ended up in the safety leg even when
+        //     `safetyShare` was 0; that would attempt a transfer to
+        //     `safetyReserve == address(0)` (allowed when share is 0) and
+        //     revert, bricking settlements.
+        uint256 opShare = amount - buybackShare - treasuryShare - safetyShare;
 
         if (opShare != 0) usdc.safeTransfer(operator, opShare);
         if (buybackShare != 0) usdc.safeTransfer(buybackBurner, buybackShare);

@@ -194,7 +194,11 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         uint64 n = feeRouter.windowEpochs();
         uint64 endEpoch = uint64(timepoint / feeRouter.epochLength());
         uint64 windowStart = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
-        return slashed >= windowStart;
+        // Upper-bound the slash epoch at `endEpoch`. A slash that happened
+        // AFTER the snapshot timepoint (e.g., between an old proposal's
+        // snapshot and "now") must NOT retroactively zero historical votes
+        // for that proposal — gemini-code-assist high-severity finding.
+        return slashed >= windowStart && slashed <= endEpoch;
     }
 
     function _cappedServed(address account, uint256 timepoint) internal view returns (uint256) {

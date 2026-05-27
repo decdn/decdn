@@ -126,6 +126,15 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     mapping(address filer => uint64 lastSuccessAt) public lastRatifiedSuccessAt;
     mapping(bytes32 region => uint256 active) public regionActiveReliefCount;
 
+    /// @notice `true` when there is an Open or FastTracked appeal for the
+    ///         given `(region, hash)`. Prevents concurrent appeals on the
+    ///         same entry — without this guard, multiple fast-tracked
+    ///         appeals could share a single `suspended` flag, and the first
+    ///         to terminate (reject/lapse/reverse) would clear `suspended`
+    ///         out from under any remaining live appeals (gemini-code-assist
+    ///         high finding: state override across concurrent appeals).
+    mapping(bytes32 region => mapping(bytes32 hash => bool)) public hasActiveAppeal;
+
     // -----------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------
@@ -166,6 +175,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error ReviewWindowOpen(uint64 readyAt);
     error RatificationWindowOpen(uint64 readyAt);
     error RegionalCapHit(bytes32 region, uint256 cap);
+    error AppealAlreadyActive(bytes32 region, bytes32 hash);
     error FrequencyCapHit(uint64 nextAvailableAt);
     error UnauthorizedStanding(StandingPath path);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
@@ -269,6 +279,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (regionActiveReliefCount[region] >= BODY_CONCURRENT_APPEAL_CAP) {
             revert RegionalCapHit(region, BODY_CONCURRENT_APPEAL_CAP);
         }
+        // Single live appeal per (region, hash) — see `hasActiveAppeal`
+        // declaration for the override bug this prevents.
+        if (hasActiveAppeal[region][hash]) revert AppealAlreadyActive(region, hash);
         uint64 last = lastRatifiedSuccessAt[msg.sender];
         if (last != 0) {
             uint64 nextAvailable = last + uint64(APPEAL_FREQUENCY_WINDOW);
@@ -298,6 +311,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             })
         );
         regionActiveReliefCount[region] += 1;
+        hasActiveAppeal[region][hash] = true;
 
         emit BlacklistAppealOpened(appealId, hash, region, msg.sender, standingPath, evidenceBundleHash, appealBond);
     }
@@ -321,6 +335,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         a.bond = 0;
         a.status = AppealStatus.Rejected;
         if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+        hasActiveAppeal[a.region][a.hash] = false;
         if (bondBurned != 0) token.burn(bondBurned);
         emit BlacklistAppealRejected(appealId, bondBurned);
     }
@@ -337,6 +352,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         a.bond = 0;
         a.status = AppealStatus.Ratified;
         if (regionActiveReliefCount[region] != 0) regionActiveReliefCount[region] -= 1;
+        hasActiveAppeal[region][hash] = false;
         lastRatifiedSuccessAt[filer] = uint64(block.timestamp);
 
         _removeHashRegional(region, hash);
@@ -353,6 +369,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         a.status = AppealStatus.Reversed;
         _hashEntries[a.region][a.hash].suspended = false;
         if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+        hasActiveAppeal[a.region][a.hash] = false;
         if (bondBurned != 0) token.burn(bondBurned);
         emit BlacklistAppealReversed(appealId, bondBurned);
     }
@@ -367,6 +384,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             a.bond = 0;
             a.status = AppealStatus.Lapsed;
             if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+            hasActiveAppeal[a.region][a.hash] = false;
             if (bondBurned != 0) token.burn(bondBurned);
             emit BlacklistAppealLapsed(appealId, 1);
             return;
@@ -380,6 +398,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             a.status = AppealStatus.Lapsed;
             _hashEntries[a.region][a.hash].suspended = false;
             if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+            hasActiveAppeal[a.region][a.hash] = false;
             if (bondBurned != 0) token.burn(bondBurned);
             emit BlacklistAppealLapsed(appealId, 2);
             return;

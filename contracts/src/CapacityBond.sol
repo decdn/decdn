@@ -115,6 +115,17 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     ///         index `FeeRouter` writes into `bytesPerEpoch`.
     uint64 public constant EPOCH_LENGTH = 7 days;
 
+    /// @notice Number of epochs after a slash during which
+    ///         `claimVestedCredit` is blocked. Matches the default
+    ///         `FeeRouter.windowEpochs` (13 ≈ one quarter) but lives as a
+    ///         local constant here so the claim gate doesn't introduce a
+    ///         cross-contract read on every claim. Once the current epoch
+    ///         exceeds `slashedAtEpoch + CLAIM_SLASH_GATE_EPOCHS`, the
+    ///         operator's claim is unblocked (gemini-code-assist medium
+    ///         finding — without the window the gate would block claims
+    ///         forever after any historical slash).
+    uint64 internal constant CLAIM_SLASH_GATE_EPOCHS = 13;
+
     // -----------------------------------------------------------------
     // EIP-712 typehashes
     // -----------------------------------------------------------------
@@ -615,7 +626,17 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     ///         to mint EIP-712 signatures.)
     function claimVestedCredit() external nonReentrant whenNotPaused {
         if (activeStake[msg.sender] == 0 || ejected[msg.sender]) revert NotActiveForClaim(msg.sender);
-        if (_slashedAtEpoch[msg.sender] != 0) revert SlashedInWindowForClaim(msg.sender);
+        // Only block while the operator is still inside their slash zero-out
+        // window — past that, the claim is unblocked (gemini-code-assist
+        // medium finding: the prior `!= 0` check locked the operator out
+        // forever after any historical slash).
+        uint64 slashEpoch = _slashedAtEpoch[msg.sender];
+        if (slashEpoch != 0) {
+            uint64 currentEpoch = uint64(block.timestamp / EPOCH_LENGTH);
+            if (currentEpoch < slashEpoch + CLAIM_SLASH_GATE_EPOCHS) {
+                revert SlashedInWindowForClaim(msg.sender);
+            }
+        }
 
         uint256 claimable = claimableCredit(msg.sender);
         // Derived from the curve, not a balance read; zero is the
