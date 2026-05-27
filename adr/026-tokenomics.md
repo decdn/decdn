@@ -243,14 +243,21 @@ This is the design's strongest commitment.
 **Voting weight.**
 
 ```
-vote_weight(operator) = declared_capacity_Mbps × age_ramp(months_bonded)
-age_ramp = min(months_bonded / 6, 1.0)
+vote_weight(op, t) = min(
+    served_bytes_window(op, t),
+    voteCapBps × total_bytes_window(t) / 10_000
+) × age_ramp(op, t)
+
+served_bytes_window(op, t) = Σ_{e = epoch(t)-N+1 .. epoch(t)} FeeRouter.bytesPerEpoch[op][e]
+age_ramp(op, t)            = min((t − CapacityBond.firstBondedAt[op]) / (age_ramp_months × seconds_per_month), 1.0)
+N                          = windowEpochs                                               // default 13 (~1 quarter)
 ```
 
-- Fresh bonds vote at zero; full weight at 6 months; half-weight at 3 months.
-- Defends against "buy your way to instant governance" attacks (a hostile party cannot register a fleet of operators and immediately vote them).
-- Vote weight scales with capacity (Mbps), not bond size. At α=1.2 raw bond would concentrate voting in edge-tier operators at ~252:1 vs entry-tier; capacity-based gives ~100:1.
-- **Per-operator voting cap = 5% of total voting weight.** Direct mirror of the prior gauge-share cap, repurposed for governance.
+- Fresh bonds vote at zero (no served bytes); full weight requires both `age_ramp_months` of tenure and sustained delivery across the `windowEpochs` trailing window.
+- Defends against "buy your way to instant governance" attacks on both axes: `age_ramp` gates speed-to-influence by tenure, and the rolling bytes window requires sustained activity.
+- Vote weight scales with demonstrated served bytes, not declared capacity, not bond size. The capacity-based formula in earlier drafts of this ADR is superseded by [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight).
+- **Per-operator voting cap = 5% of total bytes-weighted weight** (governable `[1%, 25%]`). Single biggest carrier still capped at 5%; cap is the primary defense against bytes-weighted concentration in a power-law-skewed CDN traffic distribution.
+- **Slashing zero-out.** Any slash (including capacity-shortfall) stamps `CapacityBond.slashedAtEpoch[op]`; vote weight is zero for the operator while `slashedAtEpoch[op]` falls inside the trailing window. Successful slash-appeal reversal via [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)'s `reverseAppeal` clears the field. See [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out).
 
 **Non-operator TOKEN holders have ZERO voting weight.** Per the [§ Allocation](#allocation): Core Contributors (15%), Private Investors (16%), Treasury (15%), Public Sale (3%), Airdrops/Testnet (6%), Marketing (6%), Liquidity Provision (19%) — all hold or receive TOKEN, but **none can vote** unless they also bond it to operate.
 
@@ -268,15 +275,16 @@ age_ramp = min(months_bonded / 6, 1.0)
 
 | Parameter | Value | Source |
 |---|---|---|
-| Voting source | `CapacityBond.capacityAt × age_ramp` | this ADR |
-| Proposal threshold | 0.1% of total voting weight | matches [ADR 009](009-governance.md#adr-009-governance-model) |
-| Quorum | 4% of total voting weight | matches [ADR 009](009-governance.md#adr-009-governance-model) |
+| Voting source | `FeeRouter.bytesInWindow` + `FeeRouter.totalBytesInWindow` × `age_ramp(CapacityBond.firstBondedAt)`; zeroed for `windowEpochs` after slash via `CapacityBond.slashedAtEpoch` | [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) |
+| Proposal threshold | 0.1% of total bytes-weighted weight | matches [ADR 009](009-governance.md#adr-009-governance-model) |
+| Quorum | 4% of total bytes-weighted weight | matches [ADR 009](009-governance.md#adr-009-governance-model) |
 | Voting delay | 1 day | matches [ADR 009](009-governance.md#adr-009-governance-model) |
 | Voting period | 7 days | matches [ADR 009](009-governance.md#adr-009-governance-model) |
 | Timelock | 48 hours | matches [ADR 009](009-governance.md#adr-009-governance-model) |
 | Total governance latency | ≈10 days | matches [ADR 009](009-governance.md#adr-009-governance-model) |
 | Delegation | EIP-712 (Governor Bravo pattern) — voting power delegable, bond itself non-delegable | this ADR |
-| Per-operator voting cap | 5% of total voting weight | this ADR |
+| Per-operator voting cap | 5% of total bytes-weighted weight | this ADR ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) for full formula) |
+| `windowEpochs` (served-bytes trailing window) | 13 (~1 quarter) | [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) |
 
 **Bootstrap governance — temporary multisig phase.**
 
@@ -347,6 +355,7 @@ Router shares, capacity-curve parameters, and capacity-shortfall thresholds are 
 | `min_delivery_ratio` | 70% | 50% | 90% |
 | `age_ramp_months` | 6 | 1 | 24 |
 | Per-operator voting cap | 5% | 1% | 25% |
+| `windowEpochs` (served-bytes voting window, on `FeeRouter`) | 13 | 4 | 26 |
 | Multisig-bootstrap transition: operator-count threshold | 30 | 10 | 200 |
 | Multisig-bootstrap transition: capacity threshold | 100 Gbps | 10 Gbps | 1000 Gbps |
 | Unbonding window | 14 days | 7 days | 60 days |
@@ -389,7 +398,8 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 ## Cross-ADR Impact
 
 - **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model):** `FeeRouter.routeSettlement` ABI and bucket count change (6 → 4). The same-tx settlement invariant is *strengthened* (now applies to all four buckets). Minor edits to §FeeRouter Integration.
-- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source replaced — was `VotingEscrow.balanceOfAt`, now `CapacityBond.capacityAt × age_ramp`. Non-operator holders zero-weighted. Multisig bootstrap phase formalized with transition thresholds.
+- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source replaced — was `VotingEscrow.balanceOfAt`, then `CapacityBond.capacityAt × age_ramp` under v2.2 pre-ADR-036, now `FeeRouter`-derived served-bytes-weighted weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders zero-weighted. Multisig bootstrap phase formalized with transition thresholds.
+- **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Supersedes the §Governance "Voting weight" formula above. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, capped per-operator at `voteCapBps` against the bytes-weighted total, zeroed if `CapacityBond.slashedAtEpoch` falls inside the trailing window. `windowEpochs` (default 13) is added to the governable-parameters table above.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** OperatorEmissions removed from Contract Inventory (v2.1's new contract is deleted under v2.2); CapacityBond extended with PendingCredit vesting + grantGenesisCredit/accrueGenesisVest/claimVestedCredit. VotingEscrow and DelegatorBuyer stay removed. FeeRouter unchanged from v2.1. Class diagrams updated.
 - **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol):** POL grows 10% → 19% (15pp redeployment from former LM bucket); BuybackBurner sees 5× volume. New §POL Governance section formalizes rebalance / withdraw / fee-accounting rules.
 - **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** Slashing applies to `CapacityBond` (not `StakingRegistry`); status flipped from Locked-for-implementation back to Draft pending the CapacityBond rebase.

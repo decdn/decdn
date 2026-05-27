@@ -259,9 +259,10 @@ This does not constitute legal advice; it is a structural posture comparison. Le
 | **016 (Contract interactions)** | Targeted edit         | Remove `OperatorEmissions` from the Contract Inventory. Add `PendingCredit` struct + three functions to the `CapacityBond` interface. Update class diagram.                                  |
 | **028 (Slashing appeals)**   | Minor edit            | Note that `pendingCredit.total - pendingCredit.vested` is slashable on the same terms as voluntarily bonded amount; appeals flow unchanged.                                                  |
 | 003 (Payments)               | No change             | FeeRouter is already 4-bucket; v2.2 does not touch the fee split.                                                                                                                            |
-| 009 (Governance)             | No change             | Capacity-weighted voting is unaffected by emission removal.                                                                                                                                  |
+| 009 (Governance)             | **Amended (separate spec)** | Voting source moved from `CapacityBond.capacityAt × age_ramp` to `FeeRouter` served-bytes-weighted weight per new ADR 036. Sibling spec: `2026-05-27-served-bytes-voting-design.md` — independent of emission removal; this row records the cross-impact only. |
 | 018 (Liquidity strategy)     | No change             | POL still 15%, MM still 5%. Same buyback-burn shape; v2.2 likely sees somewhat lower TOKEN sell-pressure than v2.1 (no emission stream).                                                     |
 | 033 (SafetyReserve)          | No change             | Receives slashed credits via the existing slashing pathway.                                                                                                                                  |
+| 036 (Served-Bytes Voting)    | **New (sibling spec)** | Canonical ADR introduced by `2026-05-27-served-bytes-voting-design.md`. Promotes `FeeRouter.bytesPerEpoch` from analytics-only to governance-canonical; adds `windowEpochs` governable parameter; adds `slashedAtEpoch` zero-out on `CapacityBond`. Independent of emission removal. |
 
 ### Downstream materializations
 

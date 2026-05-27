@@ -102,7 +102,8 @@ How protocol violations are detected, adjudicated, and punished. The slashing sc
 The governance model that sets the parameters earlier chapters consume, and the cross-contract interaction map that consolidates the on-chain surface.
 
 1. [ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)
-2. [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model)
+2. [ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — supersedes the voting-weight clauses of [ADR 009 § Production](009-governance.md#production-operator-weighted-dao-governance) and [ADR 026 § Governance](026-tokenomics.md#governance); promotes `FeeRouter.bytesPerEpoch` to governance-canonical and adds `windowEpochs` + slash-zero-out on `CapacityBond.slashedAtEpoch`.
+3. [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model)
 
 ### Chapter 7 — Operations
 
@@ -146,7 +147,8 @@ Numeric per-ADR index.
 - **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model)** — Off-chain payment-token channels (USDC, fixed at deployment). Market-driven rates within governance-set bounds.
 - **[ADR 005 — Wire Protocol](005-protocol.md#adr-005-wire-protocol)** — Two core protocols (ALPN-negotiated) plus iroh-gossip. `cdn/client/v1` covers all paid delivery.
 - **[ADR 008 — Reputation System](008-reputation.md#adr-008-reputation-system)** — Interaction-weighted scoring with gossip propagation.
-- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)** — Admin key for PoC; bootstrap multisig phase post-launch; transition to capacity-weighted Governor (`CapacityBond.capacityAt × age_ramp`) + Timelock once active operators ≥ 30 AND total declared capacity ≥ 100 Gbps.
+- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)** — Admin key for PoC; bootstrap multisig phase post-launch; transition to served-bytes-weighted Governor (`FeeRouter.bytesInWindow × age_ramp` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)) + Timelock once active operators ≥ 30 AND total declared capacity ≥ 100 Gbps.
+- **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)** — Promotes `FeeRouter.bytesPerEpoch` from analytics-only to governance-canonical; vote weight = served-bytes trailing-window sum × `age_ramp`, capped per-operator at 5% of bytes-weighted total, zeroed for `windowEpochs` epochs after any slash via the new `CapacityBond.slashedAtEpoch` watermark.
 - **[ADR 011 — Content Takedown and Hash Blacklisting](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)** — Governance-controlled on-chain hash blacklist with regional bodies and emergency fast-path; per-entry appeals for regional entries via emergency-multisig fast-track + DecdnGovernor ratification ([§ Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals)).
 - **[ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)** — Client bootstrap, key management, identity lifecycle, trust boundary, multi-node parallel download, crash recovery, and file manifests.
 - **[ADR 013 — Schema Evolution](013-schema-evolution.md#adr-013-schema-evolution)** — Varint-length framing, protocol enums, three-tier evolution model.

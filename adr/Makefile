@@ -70,7 +70,7 @@ BOOK_SRCS := \
   028-slashing-appeals.md 032-safety-reserve-appeals-contract.md \
   031-content-blacklist-appeals-contract.md 030-node-region-self-attestation.md \
   _build/part-6-governance.md \
-  009-governance.md 016-contract-interactions.md \
+  009-governance.md 036-served-bytes-voting-weight.md 016-contract-interactions.md \
   _build/part-7-operations.md \
   019-node-onboarding.md \
   _build/part-8-supporting.md \

@@ -5,7 +5,7 @@
 
 ## Context
 
-[ADR 026](026-tokenomics.md#adr-026-tokenomics) replaces the prior ve-gauge tokenomics with a work-token model. The governance-relevant primitives are: (i) a single `CapacityBond` contract that holds operator bonds proportional to declared bandwidth (`bond = k × Mbps^α`), exposes `capacityAt(operator, ts)` and `firstBondedAt(operator)` as the source of voting weight, and runs the deterministic capacity-shortfall slashing path; (ii) a four-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds (no epoch buckets, no claim windows); (iii) a `SafetyReserve` contract whose payouts are gated by governance-authorized rules.
+[ADR 026](026-tokenomics.md#adr-026-tokenomics) replaces the prior ve-gauge tokenomics with a work-token model. The governance-relevant primitives are: (i) a single `CapacityBond` contract that holds operator bonds proportional to declared bandwidth (`bond = k × Mbps^α`), exposes `firstBondedAt(operator)` as the source of the `age_ramp` tenure factor, exposes `slashedAtEpoch(operator)` for the slash-aware voting-weight zero-out, and runs the deterministic capacity-shortfall slashing path; (ii) a four-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds (no epoch buckets, no claim windows) and whose per-operator `bytesPerEpoch` accounting is the source of served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight); (iii) a `SafetyReserve` contract whose payouts are gated by governance-authorized rules.
 
 Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. The governance contracts (`DecdnGovernor`, `TimelockController`) ship in the day-one single-audit-pass surface ([ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory)); what differs by phase is the governance *process*, not the contract surface. In the PoC, parameters are changed through a single admin key. At launch, a bootstrap multisig replaces the admin key while the operator set is too thin for capacity-weighted DAO voting to be safe. Once the operator set reaches the transition thresholds, full operator-weighted DAO governance activates.
 
@@ -38,23 +38,23 @@ Post-launch, the voting set is narrow (likely <50 active operators in the first 
 
 ### Production: Operator-Weighted DAO Governance
 
-Based on OpenZeppelin Governor, sourcing voting weight from `CapacityBond` (per [ADR 026 § Governance](026-tokenomics.md#governance)):
+Based on OpenZeppelin Governor, sourcing voting weight from `FeeRouter` served-bytes accounting and `CapacityBond` tenure data per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):
 
 | Parameter | Value |
 | --- | --- |
-| Voting source | `CapacityBond.capacityAt(operator, ts) × age_ramp(operator, ts)` |
-| Voting weight | `declared_capacity_Mbps × min(months_bonded / 6, 1.0)` — full weight at 6 months, half-weight at 3 months, zero at registration |
+| Voting source | `FeeRouter.bytesInWindow(operator, epoch(ts), windowEpochs)` (served-bytes trailing-window sum), per-operator-capped, multiplied by `age_ramp` derived from `CapacityBond.firstBondedAt(operator)` — full formula in [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula) |
+| Voting weight | `min(served_bytes_window(op), voteCapBps × total_bytes_window) × age_ramp(op)` — zero at registration; ramps with served-bytes and tenure jointly; zeroed for `windowEpochs` epochs after any slash per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out) |
 | Voting delay | 1 day between proposal creation and the vote snapshot |
 | Proposal threshold | 0.1% of total voting weight at proposal snapshot |
 | Voting period | 7 days |
 | Quorum | 4% of total voting weight at proposal snapshot |
 | Timelock | 48 hours between vote passing and execution |
-| Per-operator voting cap | 5% of total voting weight |
+| Per-operator voting cap | 5% of total voting weight (now applied against the bytes-weighted total) |
 | Vote delegation | EIP-712 signed delegation (Governor Bravo pattern) — voting power is delegable; the bond itself is not |
 
-The clock is timestamp-based (ERC-6372 `mode=timestamp`) to align with `CapacityBond`'s timestamp-keyed checkpoints. Voting weight is read directly from `CapacityBond.capacityAt × age_ramp` rather than through an `IVotes`/IERC-5805 surface — `CapacityBond` exposes capacity-weighted operator-class voting power, not voting-unit checkpoints — so the Governor supplies the vote source, quorum, and per-operator cap as thin overrides over `CapacityBond` rather than via OZ's `GovernorVotes` / `GovernorVotesQuorumFraction` modules.
+The clock is timestamp-based (ERC-6372 `mode=timestamp`) to align with `FeeRouter`'s epoch-keyed accounting (epoch length immutable, 1 week — see [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter)). Voting weight is computed from `FeeRouter`'s `bytesInWindow` / `totalBytesInWindow` helpers and `CapacityBond.firstBondedAt` / `slashedAtEpoch` directly, not through an `IVotes`/IERC-5805 surface — vote weight is derived from FeeRouter epoch accounting rather than from per-account checkpoint structures, so the Governor supplies the vote source, quorum, and per-operator cap as thin overrides rather than via OZ's `GovernorVotes` / `GovernorVotesQuorumFraction` modules.
 
-Quorum and proposal threshold are calibrated against `CapacityBond.totalVotingWeightAt(ts)` — i.e., the sum of `capacityAt(op, ts) × age_ramp(op, ts)` across all active operators — **not** total TOKEN supply. Voting weight tracks active operator commitment rather than passive holdings; calibrating against it avoids the failure mode where the quorum bar trivially exceeds engaged voting power as TOKEN circulates.
+Quorum and proposal threshold are calibrated against `FeeRouter.totalBytesInWindow(epoch(ts), windowEpochs)` — the unramped, uncapped sum of served bytes across all operators over the trailing window — **not** total TOKEN supply and **not** the per-operator-capped weighted total. The Governor uses the unramped total as a tractable upper bound for the strictly-correct capped-and-ramped sum (which would be O(active_operators × N) to compute); the resulting quorum / threshold is mildly conservative. Voting weight tracks active operator service delivery rather than passive holdings; calibrating against it avoids the failure mode where the quorum bar trivially exceeds engaged voting power as TOKEN circulates.
 
 **Non-operator TOKEN holders carry zero voting weight.** Traders, passive holders, vesting recipients (Core Contributors, Advisors, Seed, Private, Treasury, Public Sale, Airdrop / Testnet, Marketing, LP/MM/POL), and any TOKEN not bonded into `CapacityBond` have no vote. Per [ADR 026 § Governance](026-tokenomics.md#governance), this is the work-token regulatory-cleanliness commitment: passive holding earns nothing — neither revenue nor governance privilege.
 
@@ -97,11 +97,12 @@ The 40% floor on the operator-base share is the cashflow invariant: operators al
 | `min_delivery_ratio` | 70% | 50% | 90% |
 | `age_ramp_months` | 6 | 1 | 24 |
 | Per-operator voting cap | 5% | 1% | 25% |
+| `windowEpochs` (served-bytes trailing window, on `FeeRouter`) | 13 | 4 | 26 |
 | Multisig-bootstrap transition: operator-count threshold | 30 | 10 | 200 |
 | Multisig-bootstrap transition: capacity threshold | 100 Gbps | 10 Gbps | 1000 Gbps |
 | Unbonding window | 14 days | 7 days | 60 days |
 
-The α range upper-bounds at 1.8 to prevent a concentration penalty so steep that mid-tier operators are economically barred from upgrading; the lower bound at 1.0 ensures decentralization pressure is never fully disabled. k is parameterized via the 1G-tier bond range to constrain governance volatility — direct changes to k can shift the entire bond curve, so the bound is on the *resulting bond* rather than on k itself. The 5% per-operator voting cap (and its `[1%, 25%]` governable range) mirrors the prior gauge-share cap, repurposed for governance.
+The α range upper-bounds at 1.8 to prevent a concentration penalty so steep that mid-tier operators are economically barred from upgrading; the lower bound at 1.0 ensures decentralization pressure is never fully disabled. k is parameterized via the 1G-tier bond range to constrain governance volatility — direct changes to k can shift the entire bond curve, so the bound is on the *resulting bond* rather than on k itself. The 5% per-operator voting cap (and its `[1%, 25%]` governable range) mirrors the prior gauge-share cap, repurposed for governance over the served-bytes axis per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). The `windowEpochs` bounds are pinned in [ADR 036 § Governable parameters with safety bounds](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds): below 4 epochs (~1 month) vote weight is too reactive to single-burst wash trading; above 26 epochs (~6 months) the trailing window lags actual operator-set composition and `DecdnGovernor._getVotes` cold-SLOAD gas rises to ~55K per voter per `castVote`.
 
 #### Other protocol parameters
 
@@ -148,7 +149,8 @@ CapacityBond parameters are defined in [ADR 026 § Capacity-bond curve](026-toke
 - **α range 1.0–1.8 and k bounded by 1G-tier bond [10K, 200K TOKEN]:** The α floor at 1.0 (linear) prevents disabling decentralization pressure entirely. The α ceiling at 1.8 prevents a concentration penalty so steep that mid-tier operators face >5× per-Mbps capital cost vs entry-tier and effectively cannot upgrade. The k bound is parameterized via the 1G-tier bond to constrain governance volatility — k=12.6 gives ≈50K TOKEN at 1 Gbps; the [10K, 200K] range allows governance to halve or quadruple the entry-tier bond without rewriting the curve from scratch.
 - **`min_delivery_ratio` 50%–90%:** Below 50% the capacity-shortfall slashing is too lax to deter capacity inflation; above 90% honest operators with transient probe failures (network blips, NTP drift) get auto-downgraded.
 - **`age_ramp_months` 1–24:** The age-ramp defends against "buy your way to instant governance" attacks. 1 month is the operational floor; 24 months is high enough to materially delay hostile-fleet votes but low enough that legitimate new operators reach full weight in a reasonable time.
-- **Per-operator voting cap 1%–25%:** The 5% default mirrors the prior design's gauge-share cap. The 1% floor prevents governance from making any single operator's vote vanishingly small (which would push the network toward de facto majority-of-cap voting); the 25% ceiling keeps any single operator's vote bounded.
+- **Per-operator voting cap 1%–25%:** The 5% default mirrors the prior design's gauge-share cap. The 1% floor prevents governance from making any single operator's vote vanishingly small (which would push the network toward de facto majority-of-cap voting); the 25% ceiling keeps any single operator's vote bounded. The cap is the primary defense against bytes-weighted concentration — real CDN traffic skews power-law, so the cap floor (1%) is the first tightening lever if observed concentration warrants per [ADR 036 § Threat Model — Concentration](036-served-bytes-voting-weight.md#concentration).
+- **`windowEpochs` 4–26:** The trailing-window length over which served bytes are summed for voting weight. Below 4 epochs (~1 month) vote weight is too reactive to single-burst wash trading and statistically thin for small operators; above 26 epochs (~6 months) the trailing window lags actual operator-set composition (an operator who exited service ~5 months ago still carries half-weight) and `_getVotes` cold-SLOAD gas rises to ~55K per voter per `castVote`. Per [ADR 036 § Governable parameters with safety bounds](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds).
 - **Multisig transition thresholds:** Operator count `[10, 200]` and capacity `[10 Gbps, 1000 Gbps]` give governance flexibility to delay or advance the transition based on operator-set diversity that's not visible at deploy time.
 
 ### SafetyReserve Payout Authorization
@@ -190,8 +192,9 @@ The emergency multisig's fast-track authority over gate 2 is constrained by the 
 
 ### Negative
 
-- Capacity-weighted governance shifts capture risk from large TOKEN holders to large-capacity operators; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the operator base share to the 90% maximum). The 5% per-operator voting cap and the age-ramp partially mitigate concentration.
+- Served-bytes-weighted governance shifts capture risk from large TOKEN holders to high-traffic operators; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the operator base share to the 90% maximum). The 5% per-operator voting cap and the age-ramp partially mitigate concentration. Real CDN traffic skews power-law, so the cap is load-bearing and may need tightening toward the 1% floor during early mainnet per [ADR 036 § Risks](036-served-bytes-voting-weight.md#risks).
+- Served-bytes-weighted voting is gameable by operators self-paying for delivery — an attacker forfeits ~40% of paid USDC (burn + treasury + safety legs) and recoups 60% as the operator base. The attack is bounded by the per-operator cap and `age_ramp`, but cost-to-buy-5%-vote is non-zero. Per [ADR 036 § Threat Model — Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying).
 - 1-day voting delay + 7-day voting period + 48-hour timelock means ~10 days minimum to respond to non-emergency issues via governance
-- Governance participation typically skews low; 4% quorum (against total voting weight) may be difficult to reach consistently, especially during the bootstrap-multisig phase where capacity-weighted voting isn't yet active
+- Governance participation typically skews low; 4% quorum (against total voting weight) may be difficult to reach consistently, especially during the bootstrap-multisig phase where served-bytes-weighted voting isn't yet active
 - Non-operator TOKEN holders — including investors, team, treasury, and vesting recipients — have zero DAO vote unless they also operate a node. This is the deliberate regulatory-cleanliness commitment but it materially narrows the political base of the DAO. See [Investor disposition (Open Q #7 resolved)](#investor-disposition-open-q-7-resolved) above for the resolution.
 - Regulatory framing improves under work-token (Howey prong 4 is broken) but is not eliminated; counsel review required before deployment per [ADR 026 § Regulatory framing and ADR delta](026-tokenomics.md#cross-adr-impact).
