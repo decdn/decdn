@@ -8,7 +8,23 @@ Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
-**ADR note:** Next ADR number is 037. File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by checking `adr/` for the highest number before creating a new ADR. (036 is canonical (`036-served-bytes-voting-weight.md`, supersedes voting-weight clauses of ADR 009 §Production and ADR 026 §Governance; promotes `FeeRouter.bytesPerEpoch` from analytics-only to governance-canonical, adds `windowEpochs` governable parameter, adds `slashedAtEpoch` zero-out on `CapacityBond`). 035 was canonical (`035-delegator-pool.md`) but retired under the work-token rewrite; archived in `adr/_history/035-delegator-pool.md`; do not reuse 035. 034 was canonical (`034-gauge-boost-voting-escrow.md`) but retired under the work-token rewrite; archived in `adr/_history/034-gauge-boost-voting-escrow.md`; do not reuse 034. 033 is canonical (`033-safety-insurance-reserve.md`, SafetyReserve split out of ADR 026 §5 per #590); 032 is canonical (`032-safety-reserve-appeals-contract.md`, #524); 031 is canonical (`031-content-blacklist-appeals-contract.md`); 030 is canonical (`030-node-region-self-attestation.md`, #400). 029 was canonical but reclassified as `appendix-peer-table-eviction.md`; do not reuse 029. 028 is canonical (`028-slashing-appeals.md`, status unlocked from "Locked-for-implementation" to "Draft" pending CapacityBond rebase). 027 was canonical (Distinct-Client Diversity Gating / Delivery Receipts) but deleted when its content collapsed into ADR 026 §3 per-operator gauge-share cap (itself now retired); do not reuse 027. 010 was canonical (Multi-Token Payment Support) but dropped for a single immutable USDC token set at deployment; rationale archived in `adr/_history/alternatives-pre-launch.md`; do not reuse 010. 006/020/021/023/025 were canonical but demoted to appendices in a pre-launch cleanup (`appendix-encrypted-content-publishing.md`, `appendix-observability.md`, `appendix-l2-deployment.md`, `appendix-poc-production-seams.md`, `appendix-local-admin-http.md` respectively); 004 (tokenomics) was superseded by ADR 026, which was rewritten to the work-token model and again to the no-emission variant (Genesis Bond Credits + App Incentives in place of OperatorEmissions); do not reuse 004.)
+**ADR note:**
+
+- **Next ADR number: 037.** File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by listing `adr/` for the highest number before creating a new ADR.
+- **Do not reuse numbers:** 004, 010, 027, 029, 034, 035 (retired or reclassified — see history below).
+- **Canonical ADRs (recent):** 028, 030, 031, 032, 033, 036.
+- **History:**
+  - 036 (`036-served-bytes-voting-weight.md`): supersedes voting-weight clauses of ADR 009 §Production and ADR 026 §Governance; promotes `FeeRouter.bytesPerEpoch` from analytics-only to governance-canonical, adds `windowEpochs` governable parameter, adds `slashedAtEpoch` zero-out on `CapacityBond`.
+  - 035 (`035-delegator-pool.md`): retired under the work-token rewrite; archived in `adr/_history/035-delegator-pool.md`.
+  - 034 (`034-gauge-boost-voting-escrow.md`): retired under the work-token rewrite; archived in `adr/_history/034-gauge-boost-voting-escrow.md`.
+  - 033 (`033-safety-insurance-reserve.md`): SafetyReserve split out of ADR 026 §5 per #590.
+  - 032 (`032-safety-reserve-appeals-contract.md`, #524); 031 (`031-content-blacklist-appeals-contract.md`); 030 (`030-node-region-self-attestation.md`, #400).
+  - 029: reclassified as `appendix-peer-table-eviction.md`.
+  - 028 (`028-slashing-appeals.md`): status unlocked from "Locked-for-implementation" to "Draft" pending CapacityBond rebase.
+  - 027 (Distinct-Client Diversity Gating / Delivery Receipts): collapsed into ADR 026 §3 per-operator gauge-share cap (itself now retired).
+  - 010 (Multi-Token Payment Support): dropped for a single immutable USDC token set at deployment; rationale archived in `adr/_history/alternatives-pre-launch.md`.
+  - 006/020/021/023/025: demoted to appendices in a pre-launch cleanup (`appendix-encrypted-content-publishing.md`, `appendix-observability.md`, `appendix-l2-deployment.md`, `appendix-poc-production-seams.md`, `appendix-local-admin-http.md`).
+  - 004 (tokenomics): superseded by ADR 026, which was rewritten to the work-token model and again to the no-emission variant (Genesis Bond Credits + App Incentives in place of OperatorEmissions).
 
 ## Common Commands
 
@@ -45,7 +61,7 @@ crates/
   gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
   reputation/   — reputation scoring (ADR 008): local EWMA now, gossip aggregation deferred
-contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace, not yet populated)
+contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, VotingEscrow, StakingRegistry, PublisherRegistry, DecdnGovernor with test suites)
 ```
 
 **Dependency flow:** `node → cache, gossip, incentive, reputation, protocol, common`; `cli → common, protocol, incentive`; `common → config-types, protocol` (no longer `→ cache`, #578); `cache → config-types, protocol`. `config-types` is a leaf (alongside `protocol`), so the publisher CLI links no blob store / AWS SDK. The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).
