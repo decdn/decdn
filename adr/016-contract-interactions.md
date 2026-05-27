@@ -245,7 +245,7 @@ The Genesis Bond Credit entrypoints replace v2.1's external `depositGrant(operat
 
 ### Deployment Order and Initialization Dependencies
 
-Contracts must be deployed in dependency order — each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `SafetyReserve` / `BuybackBurner` at construction; the cross-validation invariant in [§ Tunable Economics](#tunable-economics) ensures any non-zero share has a non-zero destination, so the launch share configuration determines which dependencies must already be wired. `OperatorEmissions` is deployed after `CapacityBond` and `FeeRouter` so its constructor can pin those addresses as immutable.
+Contracts must be deployed in dependency order — each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `SafetyReserve` / `BuybackBurner` at construction; the cross-validation invariant in [§ Tunable Economics](#tunable-economics) ensures any non-zero share has a non-zero destination, so the launch share configuration determines which dependencies must already be wired.
 
 ```mermaid
 graph TD
@@ -256,13 +256,12 @@ graph TD
     SAFE["5. SafetyReserve"]
     BB["6. BuybackBurner"]
     FR["7. FeeRouter"]
-    OE["8. OperatorEmissions"]
-    SPC["9. PaymentChannel"]
-    PR["10. PublisherRegistry"]
-    OA["11. OriginAssignment"]
-    CB["12. ContentBlacklist"]
-    SJ["13. SlashJudge"]
-    GOV["14. DecdnGovernor"]
+    SPC["8. PaymentChannel"]
+    PR["9. PublisherRegistry"]
+    OA["10. OriginAssignment"]
+    CB["11. ContentBlacklist"]
+    SJ["12. SlashJudge"]
+    GOV["13. DecdnGovernor"]
 
     CBOND --> TOKEN
     SAFE --> USDC
@@ -272,9 +271,6 @@ graph TD
     FR --> TL
     FR -.->|"optional at deploy"| BB
     FR -.->|"optional at deploy"| SAFE
-    OE --> TOKEN
-    OE --> CBOND
-    OE --> FR
     SPC --> USDC
     SPC --> CBOND
     SPC --> FR
@@ -294,18 +290,17 @@ graph TD
 | --- | --- | --- |
 | 1 | TOKEN | Initial holder, initial supply (1B fixed per [ADR 026](026-tokenomics.md#adr-026-tokenomics) [§ Supply and distribution](026-tokenomics.md#supply-and-distribution)), owner. No `mint()` function; testnet seeding happens via the constructor `_mint(initialHolder, 1_000_000_000e18)`. |
 | 2 | USDC | External (testnet faucet or mainnet address) |
-| 3 | TimelockController | OZ `TimelockController(minDelay, proposers, executors, admin)` — `minDelay` is 48h ([ADR 009](009-governance.md#adr-009-governance-model)). Deployed early so its address is available to `FeeRouter` as the treasury bucket destination and to every `AccessControl`-bearing contract as the eventual `DEFAULT_ADMIN_ROLE` holder. `proposers` is initialized empty and `PROPOSER_ROLE` is granted to `DecdnGovernor` post-deploy (step 14); `executors` is `[address(0)]` (anyone may execute after the delay). |
+| 3 | TimelockController | OZ `TimelockController(minDelay, proposers, executors, admin)` — `minDelay` is 48h ([ADR 009](009-governance.md#adr-009-governance-model)). Deployed early so its address is available to `FeeRouter` as the treasury bucket destination and to every `AccessControl`-bearing contract as the eventual `DEFAULT_ADMIN_ROLE` holder. `proposers` is initialized empty and `PROPOSER_ROLE` is granted to `DecdnGovernor` post-deploy (step 13); `executors` is `[address(0)]` (anyone may execute after the delay). |
 | 4 | CapacityBond | TOKEN address, capacity-curve params (`k` and `α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve); defaults `k=12.6`, `α=1.2`), `MAX_CAPACITY_PER_OPERATOR` (default 200 Gbps), `min_delivery_ratio` (default 70%), `age_ramp_months` (default 6), `unbondingPeriod` (14 days per [ADR 026 § Capacity-bond curve — Bond lifecycle](026-tokenomics.md#capacity-bond-curve)). Adds capacity-shortfall slashing per [ADR 026 § Capacity-shortfall slashing](026-tokenomics.md#capacity-shortfall-slashing). Renamed from the prior `StakingRegistry`; the `bindNodeId` / `reclaimNodeId` surface from PR #668 carries over unchanged. |
 | 5 | SafetyReserve | USDC address, Governor address (payout authorizer; may be `address(0)` at deploy and set via `setGovernor` once `DecdnGovernor` is deployed), emergency-multisig address (fast-track approver under hard caps), `appealWindow` (48h) per [ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket). [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) appeal extensions are part of the same contract — no separate deployment. |
 | 6 | BuybackBurner | TOKEN address, USDC address, Balancer V3 Router address, initial pool contract `address` (may be zero-address at deploy and set later via `setPool(address)` — see [ADR 003](003-payments.md#buybackburner) for the interface and [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) for the venue rationale). **Inflow source:** `FeeRouter` (25% of every settlement under v2.1, per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)). **Router address and naming:** see [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3). **Approvals note:** `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (distinct from the Router) during initialization — the Vault pulls input tokens from `msg.sender`. |
 | 7 | FeeRouter | USDC address, **`TimelockController` address** (treasury bucket destination), `epochLength` (1 week; analytics-only under v2.1), launch split shares per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds) (cross-validated against dependency addresses). **Dependency addresses** (`safetyReserve`, `buybackBurner`) may both be `address(0)` at deploy and set later via the governance-mutable setters in [§ Tunable Economics](#tunable-economics); the cross-validation invariant ensures any non-zero share has a non-zero destination at construction time. Steady-state target shares are `6000 / 2500 / 1000 / 500` in basis points. |
-| 8 | OperatorEmissions | TOKEN address, **`CapacityBond` address** (target for `depositGrant`), **`FeeRouter` address** (source of `bytesPerEpoch` reads), initial 200M TOKEN allocation transferred to the contract at deploy, initial `EmissionCurve` per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions). After deployment, governance grants `OperatorEmissions` the `BOND_GRANTOR_ROLE` on `CapacityBond` (post-deploy step 6). |
-| 9 | PaymentChannel | USDC address, CapacityBond address, FeeRouter address, `disputeWindow` (48h), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md#adr-003-payment-model)). `settleChannel` does not skim a protocol fee inline — it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. `setFeeRouter(address)` is governance-mutable per [§ No proxy deployment patterns](#no-proxy-deployment-patterns) carve-out. |
-| 10 | PublisherRegistry | None. Permissionless namespace creation (publisher identity is implicit on first call); namespace cap and ownership-transfer timelock are stored on `PublisherRegistry` itself and updated via governable setters (`setMaxNamespacesPerPublisher`, `setNamespaceTransferTimelock`) per [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
-| 11 | OriginAssignment | CapacityBond, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`). Min-redundancy, timelock, and default-open parameters are governance-controlled. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
-| 12 | ContentBlacklist | `ContentBlacklist(address capacityBond)`. CapacityBond address is required for `ejectNode()`. `ContentBlacklist` does not cross-call `OriginAssignment`; security relies on runtime checks (see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedAssignment` queries `ContentBlacklist.isOriginBlacklisted`). |
-| 13 | SlashJudge | CapacityBond address, TOKEN address, `challengeBond` (100 TOKEN), `counterEvidenceWindow` (24h) |
-| 14 | DecdnGovernor | OZ Governor wrapper composing `Governor` + `GovernorCountingSimple` + `GovernorTimelockControl`, with a custom capacity vote source (`_getVotes` → `CapacityBond.capacityAt × age_ramp`; `quorum` / `proposalThreshold` → `CapacityBond.totalVotingWeightAt`). Constructor wires `CapacityBond` (vote source, non-zero) + `TimelockController` (execution target) + the fixed [ADR 009](009-governance.md#adr-009-governance-model) defaults (timestamp clock, 1-day delay, 7-day vote, 0.1% proposal threshold, 4% quorum, 5% per-operator voting cap). EIP-712 delegation per Governor Bravo. After deployment, `TimelockController.grantRole(PROPOSER_ROLE, address(decdnGovernor))` (and `CANCELLER_ROLE`); execution is open (`executors == [address(0)]`, step 3). |
+| 8 | PaymentChannel | USDC address, CapacityBond address, FeeRouter address, `disputeWindow` (48h), `maxChannelDuration` (90 days), rate bounds ([ADR 003](003-payments.md#adr-003-payment-model)). `settleChannel` does not skim a protocol fee inline — it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. `setFeeRouter(address)` is governance-mutable per [§ No proxy deployment patterns](#no-proxy-deployment-patterns) carve-out. |
+| 9 | PublisherRegistry | None. Permissionless namespace creation (publisher identity is implicit on first call); namespace cap and ownership-transfer timelock are stored on `PublisherRegistry` itself and updated via governable setters (`setMaxNamespacesPerPublisher`, `setNamespaceTransferTimelock`) per [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
+| 10 | OriginAssignment | CapacityBond, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`). Min-redundancy, timelock, and default-open parameters are governance-controlled. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
+| 11 | ContentBlacklist | `ContentBlacklist(address capacityBond)`. CapacityBond address is required for `ejectNode()`. `ContentBlacklist` does not cross-call `OriginAssignment`; security relies on runtime checks (see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedAssignment` queries `ContentBlacklist.isOriginBlacklisted`). |
+| 12 | SlashJudge | CapacityBond address, TOKEN address, `challengeBond` (100 TOKEN), `counterEvidenceWindow` (24h) |
+| 13 | DecdnGovernor | OZ Governor wrapper composing `Governor` + `GovernorCountingSimple` + `GovernorTimelockControl`, with a custom capacity vote source (`_getVotes` → `CapacityBond.capacityAt × age_ramp`; `quorum` / `proposalThreshold` → `CapacityBond.totalVotingWeightAt`). Constructor wires `CapacityBond` (vote source, non-zero) + `TimelockController` (execution target) + the fixed [ADR 009](009-governance.md#adr-009-governance-model) defaults (timestamp clock, 1-day delay, 7-day vote, 0.1% proposal threshold, 4% quorum, 5% per-operator voting cap). EIP-712 delegation per Governor Bravo. After deployment, `TimelockController.grantRole(PROPOSER_ROLE, address(decdnGovernor))` (and `CANCELLER_ROLE`); execution is open (`executors == [address(0)]`, step 3). |
 
 #### OriginAssignment construction notes
 
@@ -361,13 +356,17 @@ After all contracts are deployed, the deployer must execute these transactions b
 
    See [§ Cross-Contract Call Graph](#cross-contract-call-graph) below; `lastSettlementAt[operator]` is updated on each `routeSettlement` call.
 
-6. **Grant `BOND_GRANTOR_ROLE` on CapacityBond to OperatorEmissions:**
+6. **Grant `GENESIS_GRANTOR_ROLE` on CapacityBond to Treasury (one-shot, scoped to `GENESIS_CREDIT_WINDOW`):**
 
-   ```solidity
-   capacityBond.grantRole(BOND_GRANTOR_ROLE, address(operatorEmissions));
+   ```bash
+   cast send $CAPACITY_BOND \
+     "grantRole(bytes32,address)" \
+     $(cast keccak "GENESIS_GRANTOR_ROLE") \
+     $TREASURY \
+     --rpc-url $RPC --private-key $GOVERNANCE_KEY
    ```
 
-   This authorizes `OperatorEmissions.distribute(epoch)` to call `CapacityBond.depositGrant(operator, amount)` so granted TOKEN is auto-bonded (non-withdrawable until full unbond) per [ADR 026 § Operator Service Emissions](026-tokenomics.md#operator-service-emissions).
+   This authorizes Treasury to call `CapacityBond.grantGenesisCredit(operator, amount)` within the TGE window (default 30 days post-deploy) per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits). After the window closes the role is functionally moot — the entrypoint reverts on the time-window guard regardless of caller authorization. Governance may revoke the role explicitly after the window for hygiene.
 
 7. **Register regional governance bodies** (when jurisdictional bodies are constituted):
 
@@ -399,7 +398,6 @@ graph LR
     SJ["SlashJudge"]
     BB["BuybackBurner"]
     FR["FeeRouter"]
-    OE["OperatorEmissions"]
     SAFE["SafetyReserve"]
     GOV["DecdnGovernor +<br/>TimelockController"]
     ERC["ERC-20 Tokens<br/>(USDC, TOKEN)"]
@@ -413,12 +411,9 @@ graph LR
     FR -->|"10% USDC same-tx"| GOV
     FR -->|"5% USDC same-tx"| SAFE
     FR -->|"safeTransfer (60% operator base)"| ERC
-    OE -->|"bytesPerEpoch(op, epoch)"| FR
-    OE -->|"depositGrant(op, amount)"| CBOND
     GOV -->|"capacityAt × age_ramp"| CBOND
     GOV -->|"payout(bundle, recipient, amount)"| SAFE
     GOV -->|"setShares / setSafetyReserve / setBuybackBurner / setTreasury"| FR
-    GOV -->|"setEmissionCurve / sunsetBucket"| OE
     CB -->|"ejectNode(operatorAddress)"| CBOND
     OA -->|"isActive(operator)"| CBOND
     OA -->|"ownerOf(namespaceId)"| PR
@@ -445,11 +440,9 @@ graph LR
 | FeeRouter | SafetyReserve | `safeTransfer()` (5% USDC same-tx) | Caller holds balance | Yes |
 | FeeRouter | Treasury wallet | `safeTransfer()` (10% USDC same-tx) | Caller holds balance | Yes |
 | FeeRouter | IERC20 (USDC) | `safeTransfer()` (60% operator base, same-tx) | Caller holds balance | Yes |
-| OperatorEmissions | FeeRouter | `bytesPerEpoch(operator, epoch)` (read; per-operator delivery signal for the service-emission curve) | Public (read-only) | No |
-| OperatorEmissions | CapacityBond | `depositGrant(operator, amount)` (auto-bond the TOKEN grant) | `BOND_GRANTOR_ROLE` on CapacityBond | Yes |
+| Treasury | CapacityBond | `grantGenesisCredit(op, amount)` (TGE one-shot; allocates Genesis Bond Credit per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits)) | `GENESIS_GRANTOR_ROLE` on CapacityBond | Yes |
 | Governor | FeeRouter | `setShares(operatorBaseBps, buybackBps, treasuryBps, safetyBps)`, `setSafetyReserve(addr)`, `setBuybackBurner(addr)`, `setTreasury(addr)` | `GOVERNANCE_ROLE` on FeeRouter; sum-to-10000 invariant; per-share bounds enforced; cross-validated against dependency addresses (see [§ Tunable Economics](#tunable-economics)) | Yes |
 | Governor | CapacityBond | `capacityAt(operator)`, `firstBondedAt(operator)`, `totalVotingWeightAt(ts)` (vote-weight source); `setAlpha`, `setK`, `setMaxCapacityPerOperator`, `setMinDeliveryRatio`, `setAgeRampMonths`, `setUnbondingPeriod` (parameter updates) | Public (read-only) for views; `GOVERNANCE_ROLE` for setters | View: No / Setters: Yes |
-| Governor | OperatorEmissions | `setEmissionCurve(curve)`, `sunsetBucket()` | `GOVERNANCE_ROLE` on OperatorEmissions | Yes |
 | Governor | SafetyReserve | `payout(bundle, recipient, amount)` | `PAYOUT_AUTHORIZER_ROLE` (Governor + emergency-multisig within hard caps; [ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket)) | Yes |
 | ContentBlacklist | CapacityBond | `ejectNode(operatorAddress)` | `BLACKLIST_ROLE` | Yes |
 | OriginAssignment | CapacityBond | `isActive(operator)` | Public (read-only) | No |
@@ -463,7 +456,7 @@ graph LR
 | BuybackBurner | Balancer V3 Router | `swapSingleTokenExactIn(pool, tokenIn, tokenOut, exactAmountIn, minAmountOut, deadline, wethIsEth, userData)` | `BuybackBurner` self-approves the **Balancer V3 Vault** address (NOT the Router) during its initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. This is the V3 footgun; see [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Yes |
 | BuybackBurner | IERC20 (USDC, TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 
-**Note:** No contract calls governance functions on another deCDN contract. Cross-contract state mutations are limited to `ejectNode()`, `slash()`, `routeSettlement()`, `recordSettlement()`, `depositGrant()`, and `payout()` — each protected by a dedicated role.
+**Note:** No contract calls governance functions on another deCDN contract. Cross-contract state mutations are limited to `ejectNode()`, `slash()`, `routeSettlement()`, `recordSettlement()`, `grantGenesisCredit()`, and `payout()` — each protected by a dedicated role.
 
 #### Off-Chain Read API (Client / Node Bootstrap)
 
