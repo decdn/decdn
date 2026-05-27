@@ -8,7 +8,7 @@ Metrics are referenced throughout the protocol ADRs and listed informally in `ar
 
 ### Note on existing ADR names
 
-Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This ADR is the authoritative canonical registry; the names below are the canonical forms of those informal references, with identical semantic intent.
+Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This appendix is the authoritative canonical registry; the names below are the canonical forms of those informal references, with identical semantic intent.
 
 ## Decision
 
@@ -277,7 +277,7 @@ Metrics cover aggregates; structured logs cover per-event detail. Complementary 
 
 Earlier ADRs used informal metric names; this table maps them to canonical replacements. **No wire protocol or on-chain change** — instrumentation names only.
 
-| Informal name (prior ADR) | Canonical name (this ADR) | Source ADR |
+| Informal name (prior ADR) | Canonical name (this appendix) | Source ADR |
 |---------------------------|---------------------------|------------|
 | `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_total{reason="clock_skew"}` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
 | `probe_hold_violations` | `decdn_probe_hold_violations_total` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
@@ -336,7 +336,7 @@ Covers M-tier slash-safety metrics and the most common R-tier panels for a first
 
 ### Negative
 
-- Existing ADRs reference informal names differing from the canonical ones here. The cross-reference table (Section 6) documents all renames; no ADR is retroactively edited (avoids draft-document churn), but implementations must use this ADR's canonical names.
+- Existing ADRs reference informal names differing from the canonical ones here. The cross-reference table (Section 6) documents all renames; no ADR is retroactively edited (avoids draft-document churn), but implementations must use this appendix's canonical names.
 - Mandatory metrics add startup complexity — all M-tier collectors must initialize before accepting connections. Small overhead for guaranteed observability.
 
 ## Deferred & Open
