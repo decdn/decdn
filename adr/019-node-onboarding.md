@@ -72,7 +72,7 @@ Call `TOKEN.approve(capacityBond, amount)` where `amount ≥ bond_required(decla
 
 #### Step 2.2 — Register at declared capacity
 
-Call `CapacityBond.register(declaredMbps)`, which atomically pulls `bond_required(declaredMbps)` TOKEN from the operator. The probe service then samples the operator over a 7-day window via the `cdn/probe/v1` ALPN; if 95th-percentile sustained delivery falls below `min_delivery_ratio × declared_capacity` (default 70%), registration auto-reverts the bond minus a fixed probe-cost fee (~50 TOKEN). Re-registration at a lower tier is permitted at any time; re-registration at a higher tier requires a new probe window.
+Call `CapacityBond.register(declaredMbps)`, which atomically pulls `bond_required(declaredMbps)` TOKEN from the operator. Declared capacity is operator-self-attested at registration; there is no on-chain verification against actual delivery (vote weight is sourced from `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), not from `declaredMbps`, so over-declaration provides no governance upside; the super-linear bond curve is the structural disincentive). Re-registration at a different tier is permitted at any time, subject to the same `bond_required(declaredMbps)` deposit/refund.
 
 The bond locks immediately and is slashable from this point forward, including during the **14-day unbonding window** if the node later unbonds ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)).
 
