@@ -379,8 +379,8 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
         // followed by a later state write regardless of mutability. The
         // third tuple element (`slashAmount`) is intentionally discarded:
         // restitution is capped at `maxAppealRestitution` independently.
-        // slither-disable-next-line unused-return,reentrancy-no-eth
         // aderyn-ignore-next-line(reentrancy-state-change)
+        // slither-disable-next-line unused-return
         (address operator, uint64 slashedAt_,) = capacityBond.slashRecords(slashId);
         if (operator == address(0) || slashedAt_ == 0) revert UnknownSlash(slashId);
         // forge-lint: disable-next-line(block-timestamp)
