@@ -159,9 +159,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
         uint64 windowEpochs_,
         address admin,
         uint256[4] memory initialShares,
-        // `safetyReserve_` / `buybackBurner_` may be `address(0)` iff the
-        // matching `initialShares` bucket is also zero — cross-validated in
-        // `_setShares`. See NatSpec on lines 161-164.
         // slither-disable-next-line missing-zero-check
         address safetyReserve_,
         // slither-disable-next-line missing-zero-check
