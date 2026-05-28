@@ -16,7 +16,7 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::ProbeSlashData;
-use decdn_node::dispatch::ConnectionLimiter;
+use decdn_node::dispatch::{ConnectionLimiter, RejectReason};
 use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
@@ -585,14 +585,15 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     // source key to `127.0.0.1` (`source_key` leaves IPv4 unchanged); charging
     // it here exhausts the burst-1 budget before the live connection arrives.
     // Dropping the returned permit releases only the global semaphore slot —
-    // the consumed per-source token is time-based and stays spent under the
-    // 1000s refill period.
+    // the consumed per-source token is time-based and stays spent for the full
+    // refill period (1 / `per_source_rate_per_sec`, ~1000s here).
     drop(
         limiter
             .acquire_for_test(Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)))
             .map_err(|r| anyhow::anyhow!("pre-drain unexpectedly rejected: {r:?}"))?,
     );
 
+    let limiter_probe = Arc::clone(&limiter);
     let (cache, _cache_tmp) = empty_cache().await?;
     let (handler, _signer, _domain) = build_handler(server_id, 1, &metrics, limiter, cache);
 
@@ -626,15 +627,28 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
         .connect(target, ALPN_PROBE)
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    // `closed()` resolves with the application close code, which iroh exposes
-    // as ConnectionError::ApplicationClosed.
+    // `closed()` resolves with the application close code. Assert on the
+    // close reason bytes too, not just the 0x10 code: the reject path stamps
+    // `RejectReason::as_str()` into the frame, so checking it proves the
+    // *per-source* layer fired rather than the (also-0x10) global cap.
     let close_err = conn.closed().await;
     let expected = VarInt::from_u32(APP_ERR_RATE_LIMITED);
     match close_err {
-        ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
-            if error_code == expected => {}
-        other => anyhow::bail!("expected ApplicationClosed({expected:?}), got {other:?}"),
+        ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason })
+            if error_code == expected
+                && reason.as_ref() == RejectReason::PerSource.as_str().as_bytes() => {}
+        other => {
+            anyhow::bail!("expected ApplicationClosed({expected:?}, \"per-source\"), got {other:?}")
+        }
     }
+    // The live connection must have charged the *same* pre-drained key, not a
+    // fresh one: a single tracked source confirms `peer_ip` resolved it to
+    // 127.0.0.1 (a different key would have been admitted, not rejected).
+    assert_eq!(
+        limiter_probe.per_source_tracked(),
+        1,
+        "live connection must hit the pre-drained 127.0.0.1 bucket"
+    );
 
     client_ep.close().await;
     accept_task
