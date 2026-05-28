@@ -11,18 +11,7 @@ import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { Time } from "@openzeppelin/contracts/utils/types/Time.sol";
 
 import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
-
-/// @notice Minimal surface of `CapacityBond` needed at the `FeeRouter`
-///         settlement-reporter callback. Includes `epochLength()` so the
-///         router's constructor can assert that the deployer-passed
-///         `epochLength_` matches `CapacityBond.EPOCH_LENGTH` — without
-///         this check, a mismatched deployment silently mis-anchors
-///         `DecdnGovernor._slashedInWindow` (which mixes epoch indices
-///         from both contracts).
-interface ICapacityBondReporter {
-    function recordSettlement(address operator) external;
-    function epochLength() external view returns (uint64);
-}
+import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 
 /// @title FeeRouter
 /// @notice Four-bucket settlement distributor + canonical served-bytes
@@ -170,7 +159,9 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
         uint64 windowEpochs_,
         address admin,
         uint256[4] memory initialShares,
+        // slither-disable-next-line missing-zero-check
         address safetyReserve_,
+        // slither-disable-next-line missing-zero-check
         address buybackBurner_
     ) {
         if (address(usdc_) == address(0) || address(capacityBond_) == address(0) || treasury_ == address(0)) {

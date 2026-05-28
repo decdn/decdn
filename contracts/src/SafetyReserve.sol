@@ -586,12 +586,14 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     // -----------------------------------------------------------------
 
     function setBalancerPool(address newPool) external onlyRole(GOVERNANCE_ROLE) {
+        if (newPool == address(0)) revert ZeroAddress();
         address old = balancerPool;
         balancerPool = newPool;
         emit AddressParameterUpdated(bytes32("balancerPool"), old, newPool);
     }
 
     function setChallengerIncentivePool(address newPool) external onlyRole(GOVERNANCE_ROLE) {
+        if (newPool == address(0)) revert ZeroAddress();
         address old = challengerIncentivePool;
         challengerIncentivePool = newPool;
         emit AddressParameterUpdated(bytes32("challengerIncentivePool"), old, newPool);

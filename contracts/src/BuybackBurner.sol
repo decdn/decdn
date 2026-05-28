@@ -20,6 +20,7 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 ///         `_performSwap` with the live Balancer V3 ABI. Once that override
 ///         is in place, the contract performs a single swap against the
 ///         Vault then burns the received TOKEN.
+// slither-disable-next-line unimplemented-functions
 abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
@@ -131,12 +132,19 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     // Governance setters
     // -----------------------------------------------------------------
 
+    /// @dev `newPool == address(0)` is the documented "not wired" state;
+    ///      `executeBuyback` reverts with `PoolNotWired` in that case. Use
+    ///      `pause()` for a single-flag disable instead of zeroing the pool.
+    // slither-disable-next-line missing-zero-check
     function setPool(address newPool) external onlyRole(GOVERNANCE_ROLE) {
         address old = balancerPool;
         balancerPool = newPool;
         emit PoolUpdated(old, newPool);
     }
 
+    /// @dev `newVault == address(0)` is the documented "not wired" state;
+    ///      `executeBuyback` reverts with `PoolNotWired` in that case.
+    // slither-disable-next-line missing-zero-check
     function setVault(address newVault) external onlyRole(GOVERNANCE_ROLE) {
         address old = balancerVault;
         balancerVault = newVault;

@@ -3,7 +3,8 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 
-import { ContentBlacklist, ICapacityBondEjector } from "../src/ContentBlacklist.sol";
+import { ContentBlacklist } from "../src/ContentBlacklist.sol";
+import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 import { Token } from "../src/Token.sol";
 
 contract MockEjector is ICapacityBondEjector {

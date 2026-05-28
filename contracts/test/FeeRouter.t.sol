@@ -4,7 +4,8 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-import { FeeRouter, ICapacityBondReporter } from "../src/FeeRouter.sol";
+import { FeeRouter } from "../src/FeeRouter.sol";
+import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
 
 contract MockUSDC is ERC20 {
     constructor() ERC20("USDC", "USDC") {
