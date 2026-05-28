@@ -182,7 +182,6 @@ contract CapacityBond is
     mapping(address operator => uint256 amount) public activeStake;
     mapping(address operator => UnbondingRequest) public unbondingOf;
     mapping(address operator => uint32) public lifetimeOffenseCount;
-    mapping(address operator => uint256) public lastSettlementAt;
     mapping(address operator => bool) public ejected;
 
     /// @notice First-bond-time stamp per operator (ADR 036 § Formula —
@@ -223,6 +222,15 @@ contract CapacityBond is
     // -----------------------------------------------------------------
 
     /// @notice Previous-region snapshot taken on each `updateRegion` call.
+    ///         Pre-positioned for the ADR 030 § 52 blacklist-scope ripening
+    ///         predicate (*"a node is in scope iff the entry is global, OR
+    ///         entry.region == regionHint, OR (block.timestamp - effective <
+    ///         REGION_STABILITY_WINDOW AND entry.region == regionPrev)"*),
+    ///         which is an on-chain check that must consult this slot at
+    ///         scope-test / slash-eligibility time. No contract reads it in
+    ///         this revision — ContentBlacklist's scope test currently
+    ///         covers only GLOBAL ∪ region; the ripening leg lands with the
+    ///         ADR 030 enforcement PR.
     mapping(address operator => string) public regionPrev;
 
     /// @notice Last `updateRegion` timestamp; 0 means region has never been
@@ -291,11 +299,13 @@ contract CapacityBond is
 
     struct NodeInfo {
         bytes32 nodeId;
+        // `ethAddress` (20B) + `active` (1B) + `lastMultiaddrUpdate` (8B) =
+        // 29 bytes — pack into one storage slot. Don't separate or widen
+        // any of these three without re-checking the packing or every
+        // `_writeNodeInfo` pays an extra SSTORE.
         address ethAddress;
         bool active;
-        uint256 registeredAt;
-        uint256 firstRegisteredAt;
-        uint256 lastMultiaddrUpdate;
+        uint64 lastMultiaddrUpdate;
         bytes multiaddrs;
         string regionHint;
     }
@@ -589,8 +599,10 @@ contract CapacityBond is
     /// @dev    The new region is stored in the operator's `NodeInfo.regionHint`
     ///         so all downstream readers (`getActiveNodes`, off-chain DHT)
     ///         see the same source of truth. `regionPrev` retains the prior
-    ///         value for the ADR 030 ripening predicate ("blacklist scope
-    ///         applies previous region's entries until window ripens").
+    ///         value for the ADR 030 § 52 blacklist-scope ripening predicate
+    ///         ("the previous region's entries keep applying until the change
+    ///         ripens"); the on-chain enforcement of that predicate lands with
+    ///         the ADR 030 implementation PR and is not active in this revision.
     function updateRegion(string calldata newRegion) external whenNotPaused {
         if (bytes(newRegion).length > MAX_REGION_HINT_BYTES) {
             revert RegionHintTooLong({ size: bytes(newRegion).length, ceiling: MAX_REGION_HINT_BYTES });
@@ -813,12 +825,7 @@ contract CapacityBond is
         info.nodeId = nodeId;
         info.ethAddress = msg.sender;
         info.active = true;
-        info.registeredAt = block.timestamp;
-        // slither-disable-next-line incorrect-equality
-        if (info.firstRegisteredAt == 0) {
-            info.firstRegisteredAt = block.timestamp;
-        }
-        info.lastMultiaddrUpdate = block.timestamp;
+        info.lastMultiaddrUpdate = uint64(block.timestamp);
         info.multiaddrs = multiaddrs;
         info.regionHint = regionHint;
     }
@@ -898,7 +905,7 @@ contract CapacityBond is
         if (block.timestamp < readyAt) revert MultiaddrCooldownActive(readyAt);
 
         info.multiaddrs = multiaddrs;
-        info.lastMultiaddrUpdate = block.timestamp;
+        info.lastMultiaddrUpdate = uint64(block.timestamp);
 
         emit NodeMultiaddrUpdated(info.nodeId, multiaddrs);
     }
@@ -1096,7 +1103,6 @@ contract CapacityBond is
 
     function recordSettlement(address operator) external override onlyRole(SETTLEMENT_REPORTER_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
-        lastSettlementAt[operator] = block.timestamp;
         emit SettlementRecorded(operator);
     }
 
@@ -1248,10 +1254,6 @@ contract CapacityBond is
         address ethAddress = nodeIdToAddress[nodeId];
         if (ethAddress == address(0)) return false;
         return isActive(ethAddress);
-    }
-
-    function getFirstRegisteredAt(address operator) external view returns (uint256) {
-        return _nodes[operator].firstRegisteredAt;
     }
 
     function getActiveNodeCount() external view returns (uint256) {

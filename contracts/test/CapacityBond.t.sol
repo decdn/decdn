@@ -465,8 +465,11 @@ contract CapacityBondTest is Test {
     ///         call has no cooldown (operators may correct their initial
     ///         `registerNode` region); every subsequent call is gated by
     ///         `regionStabilityWindow` and snapshots the prior value into
-    ///         `regionPrev`. Uses a key-derived operator so the EIP-712
-    ///         binding signature for `registerNode` is forge-signable.
+    ///         `regionPrev`. Also asserts the `RegionUpdated` event payload
+    ///         on both successful calls so a future emit-arg rename or
+    ///         omission lands as a test failure. Uses a key-derived operator
+    ///         so the EIP-712 binding signature for `registerNode` is
+    ///         forge-signable.
     function test_updateRegion_cooldownAndPrevSnapshot() public {
         uint256 opPk = 0xC0FFEE;
         address opAddr = vm.addr(opPk);
@@ -494,6 +497,8 @@ contract CapacityBondTest is Test {
         bond.registerNode(nodeId, hex"", "us-east", bindingSig, edSig);
 
         // First updateRegion has no cooldown (lastChanged == 0 branch).
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.RegionUpdated(nodeId, "us-east", "eu-west");
         vm.prank(opAddr);
         bond.updateRegion("eu-west");
         assertEq(bond.regionPrev(opAddr), "us-east");
@@ -508,6 +513,8 @@ contract CapacityBondTest is Test {
         // After the window elapses, the call succeeds and `regionPrev`
         // captures the now-prior region.
         vm.warp(block.timestamp + 7 days + 1);
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.RegionUpdated(nodeId, "eu-west", "ap-south");
         vm.prank(opAddr);
         bond.updateRegion("ap-south");
         assertEq(bond.regionPrev(opAddr), "eu-west");
