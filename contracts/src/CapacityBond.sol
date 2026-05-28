@@ -11,6 +11,8 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
+import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
+import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
 import { ISafetyReserve } from "./interfaces/ISafetyReserve.sol";
 
@@ -45,7 +47,15 @@ import { ISafetyReserve } from "./interfaces/ISafetyReserve.sol";
 ///         routed through the same 50% challenger / 30% SafetyReserve / 20%
 ///         burn split (ADR 026 § Genesis Bond Credits — "same terms as
 ///         voluntary bond").
-contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable, EIP712 {
+contract CapacityBond is
+    ICapacityBond,
+    ICapacityBondEjector,
+    ICapacityBondReporter,
+    AccessControl,
+    ReentrancyGuard,
+    Pausable,
+    EIP712
+{
     using SafeERC20 for IERC20;
 
     // -----------------------------------------------------------------
@@ -128,7 +138,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     /// @notice Lowercase accessor for `EPOCH_LENGTH` — exists so
     ///         `ICapacityBondReporter` can declare it without tripping
     ///         solhint `func-name-mixedcase` on the SCREAMING_SNAKE auto-getter.
-    function epochLength() external pure returns (uint64) {
+    function epochLength() external pure override returns (uint64) {
         return EPOCH_LENGTH;
     }
 
@@ -402,7 +412,6 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     // ADR 026 — Genesis Bond Credits
     error GenesisCreditWindowClosed(uint64 windowEnd);
     error GenesisCreditAlreadyGranted(address operator);
-    error NoPendingCredit();
     error NothingVested();
     error NotActiveForClaim(address operator);
     error SlashedInWindowForClaim(address operator);
@@ -1069,7 +1078,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     // Blacklist ejection
     // -----------------------------------------------------------------
 
-    function ejectNode(address operator) external onlyRole(BLACKLIST_ROLE) {
+    function ejectNode(address operator) external override onlyRole(BLACKLIST_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
         if (!ejected[operator]) {
             ejected[operator] = true;
@@ -1085,7 +1094,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     // Settlement reporter callback (FeeRouter)
     // -----------------------------------------------------------------
 
-    function recordSettlement(address operator) external onlyRole(SETTLEMENT_REPORTER_ROLE) {
+    function recordSettlement(address operator) external override onlyRole(SETTLEMENT_REPORTER_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
         lastSettlementAt[operator] = block.timestamp;
         emit SettlementRecorded(operator);
@@ -1110,6 +1119,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     }
 
     function setSafetyReserve(ISafetyReserve newSafetyReserve) external onlyRole(GOVERNANCE_ROLE) {
+        if (address(newSafetyReserve) == address(0)) revert ZeroAddress();
         address oldAddr = address(safetyReserve);
         safetyReserve = newSafetyReserve;
         emit SafetyReserveUpdated(oldAddr, address(newSafetyReserve));
@@ -1119,6 +1129,7 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     ///         operator-initiated unbond (ADR 026 § Genesis Bond Credits —
     ///         exit clause). May be `address(0)`; in that case forfeit is
     ///         burned as a safe fallback.
+    // slither-disable-next-line missing-zero-check
     function setTreasury(address newTreasury) external onlyRole(GOVERNANCE_ROLE) {
         address oldTreasury = treasury;
         treasury = newTreasury;

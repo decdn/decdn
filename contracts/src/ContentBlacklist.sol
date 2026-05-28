@@ -7,10 +7,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
-/// @notice Minimal CapacityBond surface used by ContentBlacklist.
-interface ICapacityBondEjector {
-    function ejectNode(address operator) external;
-}
+import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 
 /// @title ContentBlacklist
 /// @notice Global + regional hash blacklist, operator-level blacklist, and
