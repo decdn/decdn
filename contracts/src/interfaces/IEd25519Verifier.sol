@@ -3,10 +3,11 @@ pragma solidity 0.8.28;
 
 /// @title IEd25519Verifier
 /// @notice Stable surface for verifying an ed25519 signature against a 32-byte
-///         message digest. Used by `StakingRegistry.registerNode` (and by
-///         `reclaimNodeId` in a later PR) to prove ownership of the iroh NodeId's
-///         private key without taking an audit-time dependency on the concrete
-///         ed25519 library — see ADR 003 § NodeId Ownership Verification.
+///         message digest. Used by `CapacityBond.registerNode` /
+///         `bindNodeId` / `reclaimNodeId` to prove ownership of the iroh
+///         NodeId's private key without taking an audit-time dependency on
+///         the concrete ed25519 library (ADR 019 § Node Onboarding —
+///         operator self-attestation flow).
 /// @dev    The implementation is a separate audit boundary; swap it out if
 ///         RIP-7212 ever lands on Arbitrum and a precompile becomes available.
 ///         Until then the production implementation wraps a vetted Solidity
@@ -20,7 +21,7 @@ interface IEd25519Verifier {
     ///                     for `messageHash` under `publicKey`.
     /// @dev    `view`: ed25519 verification is a pure computation. Declaring
     ///         it `view` means callers reach it via `STATICCALL`, which
-    ///         cannot reenter — so `StakingRegistry.registerNode` is free of
+    ///         cannot reenter — so `CapacityBond.registerNode` is free of
     ///         the external-call-before-state-write reentrancy class even
     ///         though it commits the binding after verifying. Test mocks
     ///         assert call arguments via `vm.expectCall` rather than storing

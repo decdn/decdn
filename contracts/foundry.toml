@@ -57,4 +57,17 @@ int_types = "long"
 quote_style = "double"
 number_underscore = "thousands"
 
+[lint]
+# `unsafe-typecast` fires on every `bytes32("literal")` event-key cast and
+# every `uint64(block.timestamp / EPOCH_LENGTH)` epoch derivation. All
+# literal casts are short strings (≤ 23 chars, no truncation possible) and
+# the timestamp downcasts are safe for ~290 billion years.
+#
+# `erc20-unchecked-transfer` fires on `token.transfer(...)` calls in
+# test files (against the project's own OZ ERC20 which always returns true).
+# Tests don't need to assert the return.
+#
+# Suppressing globally avoids ~60 per-line waivers across src/ and test/.
+exclude_lints = ["unsafe-typecast", "erc20-unchecked-transfer"]
+
 # Issue: https://github.com/decdn/decdn/issues/452 — full 14-contract surface.
