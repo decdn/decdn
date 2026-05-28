@@ -174,6 +174,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error ZeroHash();
     error MissingRegion();
     error EntryNotBlacklisted(bytes32 region, bytes32 hash);
+    /// @notice Raised by `openBlacklistAppeal` when the (region, hash) entry
+    ///         exists but its 14-day appeal filing window has elapsed.
+    ///         Distinct from `EntryNotBlacklisted` so off-chain callers can
+    ///         tell "never blacklisted" from "too late to appeal."
+    error AppealFilingWindowClosed(bytes32 region, bytes32 hash);
     error AppealNotOpen(uint256 appealId);
     error AppealNotFastTracked(uint256 appealId);
     error ReviewWindowOpen(uint64 readyAt);
@@ -213,7 +218,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         `REGIONAL_BODY_ROLE` — granted per-region in
     ///         `registerRegionalBody` per ADR 016 § Post-Deployment, step 8.
     function addHashRegional(bytes32 region, bytes32 hash) external onlyRole(REGIONAL_BODY_ROLE) {
-        if (region == bytes32(0) || region == GLOBAL_REGION) revert ZeroHash();
+        if (region == bytes32(0) || region == GLOBAL_REGION) revert MissingRegion();
         _addHash(region, hash);
     }
 
@@ -221,7 +226,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         _removeHashRegional(GLOBAL_REGION, hash);
     }
 
+    /// @dev `REGIONAL_BODY_ROLE` must NOT be able to remove `GLOBAL_REGION`
+    ///      entries — that would let any regional body bypass governance and
+    ///      delete a global blacklist. Mirrors the guard on `addHashRegional`.
     function removeHashRegional(bytes32 region, bytes32 hash) external onlyRole(REGIONAL_BODY_ROLE) {
+        if (region == bytes32(0) || region == GLOBAL_REGION) revert MissingRegion();
         _removeHashRegional(region, hash);
     }
 
@@ -278,7 +287,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (entry.addedAt == 0) revert EntryNotBlacklisted(region, hash);
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp > uint256(entry.addedAt) + APPEAL_FILING_WINDOW) {
-            revert EntryNotBlacklisted(region, hash);
+            revert AppealFilingWindowClosed(region, hash);
         }
         if (regionActiveReliefCount[region] >= BODY_CONCURRENT_APPEAL_CAP) {
             revert RegionalCapHit(region, BODY_CONCURRENT_APPEAL_CAP);

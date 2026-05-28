@@ -96,7 +96,9 @@ contract DecdnGovernorTest is Test {
         vm.warp(BASE + 2);
         bond.setFirstBondedAt(operator, uint64(BASE - 180 days));
         _setBytesAtTimepoint(operator, 100_000, 1_000_000);
-        bond.setSlashedAtEpoch(operator, uint64(tp / EPOCH));
+        // Mock stores the raw encoded value; pass `actualEpoch + 1` to mirror
+        // the real CapacityBond's +1 stamp convention.
+        bond.setSlashedAtEpoch(operator, uint64(tp / EPOCH) + 1);
         assertEq(gov.getVotes(operator, tp), 0);
     }
 
@@ -105,9 +107,10 @@ contract DecdnGovernorTest is Test {
         bond.setFirstBondedAt(operator, uint64(BASE - 365 days));
         _setBytesAtTimepoint(operator, 100_000, 1_000_000);
 
-        // Slash at epoch 5; current window of 13 ends near (BASE / EPOCH) ≈ 104.
+        // Slash at actual epoch 5; current window of 13 ends near (BASE / EPOCH) ≈ 104.
         // Slash falls well before windowStart, so vote weight is non-zero.
-        bond.setSlashedAtEpoch(operator, 5);
+        // Pass `actualEpoch + 1` per the +1-offset convention.
+        bond.setSlashedAtEpoch(operator, 5 + 1);
         assertGt(gov.getVotes(operator, tp), 0);
     }
 
@@ -195,9 +198,10 @@ contract DecdnGovernorTest is Test {
         uint256 historicalWeight = gov.getVotes(operator, tp);
         assertGt(historicalWeight, 0);
 
-        // Now a slash happens at a LATER epoch than the timepoint's window.
-        // `tp / EPOCH` ≈ 104; pick a slash epoch strictly greater.
-        bond.setSlashedAtEpoch(operator, uint64(tp / EPOCH) + 1);
+        // Now a slash happens at a LATER actual epoch than the timepoint's
+        // window. `tp / EPOCH` ≈ 104; pick actual slash epoch `tp/EPOCH + 1`,
+        // then add the +1 stamp offset → store `tp/EPOCH + 2`.
+        bond.setSlashedAtEpoch(operator, uint64(tp / EPOCH) + 2);
 
         // The historical snapshot weight must NOT change — the slash is
         // beyond `endEpoch` of the historical window.

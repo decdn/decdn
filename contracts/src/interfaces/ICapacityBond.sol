@@ -19,13 +19,16 @@ interface ICapacityBond {
     ///         Returns 0 if the operator has never bonded.
     function firstBondedAt(address operator) external view returns (uint64);
 
-    /// @notice Epoch index at which the operator was most recently slashed, or
-    ///         0 if they are not currently in the slash-zero-out window. Set by
-    ///         `slash()` to `uint64(block.timestamp / EPOCH_LENGTH)`; cleared
-    ///         to 0 by `clearSlashedAtEpoch` (called only via the
-    ///         `reverseAppeal` path of `SafetyReserve` per ADR 028 § Contract
-    ///         surface). Consumed by `DecdnGovernor._getVotes` per
-    ///         ADR 036 § Slashing zero-out.
+    /// @notice Encoded slash-epoch stamp: returns `0` when the operator is
+    ///         not currently in the slash-zero-out window; otherwise returns
+    ///         `actualEpoch + 1`. The +1 offset exists so a slash in epoch 0
+    ///         (the first `EPOCH_LENGTH` after deploy) is not collapsed with
+    ///         the unslashed sentinel. Consumers MUST decode (`value - 1`)
+    ///         before doing epoch arithmetic. Set by `slash()`; cleared to 0
+    ///         by `clearSlashedAtEpoch` (called only via the `reverseAppeal`
+    ///         path of `SafetyReserve` per ADR 028 § Contract surface).
+    ///         Consumed by `DecdnGovernor._getVotes` per ADR 036 § Slashing
+    ///         zero-out.
     function slashedAtEpoch(address operator) external view returns (uint64);
 
     /// @notice Clear `slashedAtEpoch[operator]` back to 0. Restricted to

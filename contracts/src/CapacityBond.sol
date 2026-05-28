@@ -180,9 +180,12 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     ///         lifts the operator's `activeStake` above zero; never overwritten.
     mapping(address operator => uint64) internal _firstBondedAt;
 
-    /// @notice Epoch index at which the operator was most recently slashed,
-    ///         or 0 if not currently in a slash-zero-out window
-    ///         (ADR 036 § Slashing zero-out).
+    /// @notice Encoded slash-epoch stamp: `0` means "never slashed in the
+    ///         current window"; any non-zero value is `actualEpoch + 1`.
+    ///         The +1 offset exists so a genuine slash in epoch 0 (the first
+    ///         `EPOCH_LENGTH` after deploy) is not collapsed with the
+    ///         "unslashed" sentinel. Consumers MUST decode (`slashed - 1`)
+    ///         before doing epoch arithmetic. (ADR 036 § Slashing zero-out.)
     mapping(address operator => uint64) internal _slashedAtEpoch;
 
     /// @notice Operator-asserted serving capacity in Mbps (ADR 026
@@ -670,8 +673,10 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         // forever bug from the prior `!= 0` check). The window length is
         // governance-tunable via `setClaimSlashGateEpochs` so it can be
         // kept in lock-step with `FeeRouter.windowEpochs`.
-        uint64 slashEpoch = _slashedAtEpoch[msg.sender];
-        if (slashEpoch != 0) {
+        uint64 slashStamp = _slashedAtEpoch[msg.sender];
+        if (slashStamp != 0) {
+            // Decode the +1-offset stamp before doing epoch arithmetic.
+            uint64 slashEpoch = slashStamp - 1;
             uint64 currentEpoch = uint64(block.timestamp / EPOCH_LENGTH);
             if (currentEpoch < slashEpoch + claimSlashGateEpochs) {
                 revert SlashedInWindowForClaim(msg.sender);
@@ -907,9 +912,11 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         lifetimeOffenseCount[operator] = newCount;
         uint256 tierBps = newCount == 1 ? SLASH_BPS_TIER_1 : newCount == 2 ? SLASH_BPS_TIER_2 : SLASH_BPS_TIER_3;
 
-        // ADR 026 § Genesis Bond Credits — the unvested portion of pending
-        // credit is added to the stake-slash amount and routed through the
-        // SAME 50% challenger / 30% safety / 20% burn split (C1 fix).
+        // ADR 026 § Genesis Bond Credits — the full at-risk pending credit
+        // pool (`originalGrant - claimed`, covering BOTH unvested and
+        // vested-but-unclaimed) is added to the stake-slash amount and
+        // routed through the SAME 50% challenger / 30% safety / 20% burn
+        // split (C1 fix + the vested-unclaimed loophole closure).
         uint256 creditSlash = _slashPendingCreditAtTier(operator, tierBps);
         uint256 stakeSlash = _reduceStakeAtTier(operator, tierBps);
         totalSlash = stakeSlash + creditSlash;
@@ -921,7 +928,10 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
     /// @dev Reduce active + unbonding stake at `tierBps`. Active first, then
     ///      unbonding (prevents slash-then-run per ADR 003). The defensive
     ///      `min(remainder, req.amount)` cap (C2 fix) guards against future
-    ///      tier-bps schedules above 50% silently underflowing the subtraction.
+    ///      tier-bps schedules above 50% silently underflowing the
+    ///      subtraction; when the cap clips, `slashAmount` is reduced to the
+    ///      amount actually subtracted from the operator's balances so the
+    ///      caller's distribution math does not over-transfer / over-burn.
     function _reduceStakeAtTier(address operator, uint256 tierBps) internal returns (uint256 slashAmount) {
         UnbondingRequest memory req = unbondingOf[operator];
         uint256 totalAtRisk = activeStake[operator] + uint256(req.amount);
@@ -929,30 +939,39 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         if (slashAmount <= activeStake[operator]) {
             activeStake[operator] -= slashAmount;
         } else {
-            uint256 remainder = slashAmount - activeStake[operator];
-            if (remainder > req.amount) remainder = req.amount;
+            uint256 active = activeStake[operator];
+            uint256 remainder = slashAmount - active;
+            if (remainder > req.amount) {
+                remainder = req.amount;
+                slashAmount = active + remainder;
+            }
             activeStake[operator] = 0;
             unbondingOf[operator].amount = req.amount - remainder;
         }
     }
 
-    /// @dev Reduce the operator's unvested `PendingCredit` by `tierBps`. The
-    ///      "unvested" portion is computed against the curve (not against a
-    ///      stored `vested` counter) so partial claims don't skew the slash
-    ///      basis. `originalGrant` is reduced by the slashed amount so the
-    ///      operator's future curve naturally shrinks.
+    /// @dev Reduce the operator's at-risk `PendingCredit` by `tierBps`. The
+    ///      "at-risk" portion is the full unclaimed grant pool
+    ///      (`originalGrant - claimed`) — i.e., both the unvested portion
+    ///      AND the vested-but-unclaimed portion. Slashing both closes the
+    ///      loophole where an operator could shield earned credit from
+    ///      slashing simply by delaying `claimVestedCredit` calls. Already-
+    ///      claimed credit lives in `activeStake` and is slashed by
+    ///      `_reduceStakeAtTier`, so the two functions partition the at-risk
+    ///      pool with no double-counting. `originalGrant` is reduced by the
+    ///      slashed amount so the operator's future curve naturally shrinks.
     function _slashPendingCreditAtTier(address operator, uint256 tierBps) internal returns (uint256 slashed) {
         PendingCredit storage pc = _pendingCredit[operator];
         if (pc.originalGrant == 0) return 0;
-        uint256 vested = _curveVested(operator);
-        uint256 unvested = uint256(pc.originalGrant) - vested;
-        // slither-disable-next-line incorrect-equality
-        if (unvested == 0) return 0;
+        uint256 originalGrant = uint256(pc.originalGrant);
+        uint256 claimed = uint256(pc.claimed);
+        if (claimed >= originalGrant) return 0;
+        uint256 atRisk = originalGrant - claimed;
         // slither-disable-next-line divide-before-multiply
-        slashed = (unvested * tierBps) / BPS_DENOMINATOR;
+        slashed = (atRisk * tierBps) / BPS_DENOMINATOR;
         // slither-disable-next-line incorrect-equality
         if (slashed == 0) return 0;
-        pc.originalGrant = uint128(uint256(pc.originalGrant) - slashed);
+        pc.originalGrant = uint128(originalGrant - slashed);
     }
 
     /// @dev Persist the slash record so `SafetyReserve.openSlashAppeal` can
@@ -987,7 +1006,9 @@ contract CapacityBond is ICapacityBond, AccessControl, ReentrancyGuard, Pausable
         uint256 safetyShare = (totalSlash * SAFETY_BPS) / BPS_DENOMINATOR;
         uint256 burnShare = totalSlash - challengerShare - safetyShare;
 
-        _slashedAtEpoch[operator] = uint64(block.timestamp / EPOCH_LENGTH);
+        // Store `actualEpoch + 1` so an epoch-0 slash is not confused with
+        // the "unslashed" sentinel. Decoders subtract 1.
+        _slashedAtEpoch[operator] = uint64(block.timestamp / EPOCH_LENGTH) + 1;
         emit SlashedAtEpochStamped(operator, _slashedAtEpoch[operator]);
 
         _maybeAutoEject(operator);

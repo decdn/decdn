@@ -88,7 +88,9 @@ contract CapacityBondTest is Test {
         vm.warp(2_000_000);
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
-        uint64 expected = uint64(uint256(2_000_000) / bond.EPOCH_LENGTH());
+        // `slashedAtEpoch` stores `actualEpoch + 1` so an epoch-0 slash isn't
+        // confused with the unslashed sentinel; expect the +1-offset stamp.
+        uint64 expected = uint64(uint256(2_000_000) / bond.EPOCH_LENGTH()) + 1;
         assertEq(bond.slashedAtEpoch(operator), expected);
     }
 
@@ -243,8 +245,72 @@ contract CapacityBondTest is Test {
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
         uint128 grantAfter = bond.pendingCredit(operator).originalGrant;
-        // tier 1 = 5% of unvested 100k = 5k.
+        // Tier 1 = 5% of the at-risk pool (originalGrant − claimed = 100k − 0
+        // = 100k) = 5k. Pre-fix this was 5% of just the unvested 100k → also
+        // 5k for this no-claim case, but the regression test below covers the
+        // case where it actually differs.
         assertEq(grantBefore - grantAfter, 5000e18);
+    }
+
+    /// @notice Closes the vested-but-unclaimed loophole — slashing must hit
+    ///         the full `originalGrant - claimed` pool, not just the unvested
+    ///         portion. An operator who claims partway and then is slashed
+    ///         MUST see their unclaimed-vested portion slashed too. Pre-fix,
+    ///         only the unvested portion was slashed; the vested-but-
+    ///         unclaimed sat in the contract escaping the slash entirely.
+    function test_slashHitsVestedButUnclaimed() public {
+        _setupGenesisGrant(100_000e18);
+        vm.prank(operator);
+        bond.stake(MIN_STAKE * 2);
+
+        // Half-vest: vested = 50k, unvested = 50k.
+        vm.warp(block.timestamp + 365 days);
+        // Claim the full vested (50k); claimed = 50k, activeStake += 50k.
+        vm.prank(operator);
+        bond.claimVestedCredit();
+        assertEq(bond.pendingCredit(operator).claimed, 50_000e18);
+
+        // At-risk pool = originalGrant − claimed = 100k − 50k = 50k (= the
+        // unvested portion, since the vested-claimed amount is now in
+        // activeStake and slashed there).
+        uint128 grantBefore = bond.pendingCredit(operator).originalGrant;
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        uint128 grantAfter = bond.pendingCredit(operator).originalGrant;
+        // Tier 1 = 5% of 50k = 2.5k slashed from originalGrant.
+        assertEq(grantBefore - grantAfter, 2500e18);
+    }
+
+    /// @notice Inverse of the prior test: operator never claims, half-vests,
+    ///         then is slashed. The at-risk pool is the FULL 100k (unvested
+    ///         50k + vested-unclaimed 50k). Pre-fix only the unvested 50k
+    ///         was slashed; post-fix the slash basis is the entire 100k.
+    function test_slashHitsVestedAndUnvestedTogether() public {
+        address op2 = address(0xB0B2);
+        // Provision + grant BEFORE any warp so we stay inside the
+        // GENESIS_CREDIT_WINDOW (default 30 days from construction).
+        vm.prank(admin);
+        token.transfer(op2, 200_000e18);
+        vm.prank(op2);
+        token.approve(address(bond), type(uint256).max);
+        vm.prank(op2);
+        bond.stake(MIN_STAKE);
+
+        vm.startPrank(admin);
+        token.approve(address(bond), 100_000e18);
+        bond.grantRole(bond.GENESIS_GRANTOR_ROLE(), admin);
+        bond.grantGenesisCredit(op2, 100_000e18);
+        vm.stopPrank();
+
+        // Half-vest. Operator claims nothing.
+        vm.warp(block.timestamp + 365 days);
+        // originalGrant=100k, claimed=0 → at-risk = 100k.
+        uint128 op2Before = bond.pendingCredit(op2).originalGrant;
+        vm.prank(admin);
+        bond.slash(op2, challenger, 1);
+        uint128 op2After = bond.pendingCredit(op2).originalGrant;
+        // Tier 1 = 5% × 100k = 5k. Pre-fix would have been 5% × 50k unvested = 2.5k.
+        assertEq(op2Before - op2After, 5000e18);
     }
 
     function test_creditSlash_routesThroughChallengerAndSafety() public {
@@ -282,16 +348,16 @@ contract CapacityBondTest is Test {
         assertEq(bond.pendingCredit(operator).originalGrant, 50_000e18);
     }
 
-    /// @notice Regression for the retroactive clawback bug — after forfeit,
-    ///         the operator MUST still be able to claim the vested-but-
-    ///         unclaimed portion of their (now-truncated) credit. The pre-
-    ///         fix `_forfeitUnvestedCredit` set `originalGrant = vested` but
+    /// @notice Regression for the retroactive clawback bug. After forfeit,
+    ///         `curveVested` MUST return the truncated principal directly
+    ///         and MUST NOT shrink below `claimed`. The pre-fix
+    ///         `_forfeitUnvestedCredit` set `originalGrant = vested` but
     ///         left `grantedAt` untouched, so the curve re-stretched the
-    ///         smaller principal and returned `vested × elapsed/duration`
-    ///         instead of `vested` — clawing back claims the operator had
-    ///         already legitimately earned. The fix stamps
-    ///         `FULLY_VESTED_SENTINEL` so the curve immediately returns the
-    ///         truncated principal.
+    ///         smaller principal over the original timeline and returned
+    ///         `vested × elapsed/duration` < vested at the forfeit instant —
+    ///         clawing back claims an operator had already legitimately
+    ///         vested. The fix stamps `FULLY_VESTED_SENTINEL` so the curve
+    ///         immediately returns the truncated principal.
     function test_forfeitUnvestedCredit_doesNotClawBackVestedUnclaimed() public {
         _setupGenesisGrant(100_000e18);
         // Stake well above MIN_STAKE so a partial unbond leaves activeStake
@@ -301,34 +367,25 @@ contract CapacityBondTest is Test {
 
         // Wait halfway through the vest (vested = 50k, unvested = 50k).
         vm.warp(block.timestamp + 365 days);
-        // Claim 30k of the 50k vested so 20k is vested-but-unclaimed.
+        // Claim the full currently-claimable amount (50k at half-vest).
         vm.prank(operator);
         bond.claimVestedCredit();
-        // Sanity: full curve was 50k, so initial claim moved 50k.
         assertEq(bond.pendingCredit(operator).claimed, 50_000e18);
 
-        // Re-anchor the test scenario: pretend the operator only claimed 30k
-        // by direct test-write (simulating a partial claim from a prior
-        // session). Easier: take a smaller grant so vested=50k → claim=50k,
-        // then partial-unstake to drive forfeit. The forfeit must NOT cause
-        // the next claim to revert with NothingVested / underflow.
-
-        // Partial unstake to trigger forfeit while leaving activeStake > 0.
+        // Partial unstake triggers forfeit while leaving activeStake > 0.
+        // Pre-fix: post-forfeit `curveVested` would return 50k × 365/730 = 25k
+        // and `claimableCredit` would saturate at 0 even though the math
+        // implies a 25k retroactive shrink below `claimed`. With the
+        // sentinel fix, `curveVested` returns the truncated 50k principal
+        // directly — `claimed` is preserved at 50k, claimable settles to 0
+        // by exhaustion (50k − 50k), not by silent clawback.
         vm.prank(operator);
         bond.requestUnstake(MIN_STAKE);
 
-        // Post-forfeit state:
-        //   originalGrant truncated to 50k (the vested portion),
-        //   claimed still 50k (preserved from earlier claim),
-        //   grantedAt stamped to the sentinel → curveVested returns 50k now.
         CapacityBond.PendingCredit memory pc = bond.pendingCredit(operator);
         assertEq(pc.originalGrant, 50_000e18);
         assertEq(pc.claimed, 50_000e18);
-        // curveVested immediately returns the truncated principal — no more
-        // re-stretching.
         assertEq(bond.curveVested(operator), 50_000e18);
-        // claimableCredit = 50k - 50k = 0 (nothing left to claim) — the
-        // key invariant is NO retroactive shrink below `claimed`.
         assertEq(bond.claimableCredit(operator), 0);
     }
 

@@ -189,8 +189,11 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     }
 
     function _slashedInWindow(address account, uint256 timepoint) internal view returns (bool) {
-        uint64 slashed = capacityBond.slashedAtEpoch(account);
-        if (slashed == 0) return false;
+        uint64 slashStamp = capacityBond.slashedAtEpoch(account);
+        if (slashStamp == 0) return false;
+        // `slashedAtEpoch` returns `actualEpoch + 1` (or 0 if unslashed) so
+        // an epoch-0 slash isn't collapsed with the unslashed sentinel.
+        uint64 slashed = slashStamp - 1;
         uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
         uint64 endEpoch = uint64(timepoint / feeRouter.epochLength());
         uint64 windowStart = endEpoch + 1 > n ? endEpoch + 1 - n : 0;

@@ -257,9 +257,11 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     {
         if (recipient == address(0)) revert ZeroAddress();
         if (usdcAmount == 0) revert ZeroAmount();
-        if (availableUsdc() < usdcAmount) {
-            // Insufficient liquidity — queue rather than revert. Permissionless
-            // `disbursePending` drains insertion-FIFO when balance refills.
+        // Queue if liquidity is short OR if any prior claim is still pending —
+        // otherwise a fresh payout could jump ahead of an older queued claim
+        // when its inflow happens to refill the reserve, breaking FIFO. The
+        // pending-queue head MUST drain before any new immediate payout.
+        if (availableUsdc() < usdcAmount || _pendingHead < _pendingQueue.length) {
             claimId = _pendingQueue.length;
             _pendingQueue.push(
                 PendingClaim({
@@ -361,6 +363,7 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
         whenNotPaused
         onlyRole(KEEPER_ROLE)
     {
+        if (amountIn == 0) revert ZeroAmount();
         if (balancerPool == address(0)) revert PoolNotWired();
         _doSwap(amountIn, minOut);
     }
@@ -547,17 +550,23 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
             return;
         }
         // Branch 2: FastTracked at Governor, ratification window elapsed.
+        // Bond is REFUNDED, not burned: the emergency multisig already
+        // validated the appeal at fast-track, so the appellant cleared the
+        // anti-spam gate. A lapse at the ratification stage is governance
+        // inactivity, not the appellant's fault — burning their bond here
+        // would unfairly penalize honest filers for system delay.
         if (a.status == AppealStatus.FastTracked) {
             uint64 readyAt = a.fastTrackedAt + uint64(APPEAL_RATIFICATION_WINDOW);
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp < readyAt) revert RatificationWindowOpen(readyAt);
             uint256 escrow = a.escrowAmount;
-            uint256 bondBurned = a.bond;
+            uint256 bondRefund = a.bond;
+            address appellant = a.appellant;
             totalEscrowLien -= escrow;
             a.bond = 0;
             a.escrowAmount = 0;
             a.status = AppealStatus.Lapsed;
-            if (bondBurned != 0) token.burn(bondBurned);
+            if (bondRefund != 0) IERC20(address(token)).safeTransfer(appellant, bondRefund);
             emit SlashAppealLapsed(appealId, 2);
             return;
         }

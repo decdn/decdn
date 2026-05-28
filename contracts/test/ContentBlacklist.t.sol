@@ -121,9 +121,8 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId = blacklist.openBlacklistAppeal(
-            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
-        );
+        uint256 appealId =
+            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
 
         uint256 supplyBefore = token.totalSupply();
         vm.prank(multisig);
@@ -135,9 +134,8 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId = blacklist.openBlacklistAppeal(
-            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
-        );
+        uint256 appealId =
+            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(appealId);
         // Suspended → not enforced.
@@ -201,9 +199,8 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId = blacklist.openBlacklistAppeal(
-            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
-        );
+        uint256 appealId =
+            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
         vm.prank(multisig);
         blacklist.rejectBlacklistAppeal(appealId);
 
@@ -221,9 +218,8 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId = blacklist.openBlacklistAppeal(
-            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
-        );
+        uint256 appealId =
+            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(appealId);
         vm.prank(admin);
@@ -237,9 +233,8 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId = blacklist.openBlacklistAppeal(
-            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
-        );
+        uint256 appealId =
+            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
         vm.warp(block.timestamp + 15 days);
         blacklist.cleanupExpiredBlacklistAppeal(appealId);
         assertFalse(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));

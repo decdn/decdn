@@ -152,8 +152,8 @@ contract TestnetFaucet is AccessControl, ReentrancyGuard, Pausable {
         if (block.chainid == 1) revert MainnetForbidden();
 
         if (
-            address(token_) == address(0) || treasury == address(0) || admin == address(0)
-                || governance == address(0) || pauser == address(0)
+            address(token_) == address(0) || treasury == address(0) || admin == address(0) || governance == address(0)
+                || pauser == address(0)
         ) {
             revert ZeroAddress();
         }
