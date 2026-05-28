@@ -29,18 +29,25 @@ import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 ///         share one source of truth.
 ///
 /// @dev    Phases:
-///           1. `_deployTargets`         — Token, CapacityBond, SafetyReserve,
-///                                         FeeRouter (buyback bucket dormant —
-///                                         see BuybackBurner note below),
+///           1. `_deployTimelock`        — TimelockController (deployer as admin;
+///                                         empty proposers; open executor).
+///                                         Deployed first (ADR 016 § Deployment
+///                                         Order step 3) so its address is the
+///                                         FeeRouter treasury bucket destination
+///                                         (the treasury is Timelock-custodied per
+///                                         ADR 016) and the eventual
+///                                         DEFAULT_ADMIN_ROLE holder of every target.
+///           2. `_deployTargets`         — Token, CapacityBond, SafetyReserve,
+///                                         FeeRouter (treasury bucket = the
+///                                         TimelockController; buyback bucket
+///                                         dormant — see BuybackBurner note below),
 ///                                         ContentBlacklist, PublisherRegistry.
 ///                                         Deployer is admin of every
 ///                                         AccessControl-bearing target.
-///           2. `_deployGovernance`      — TimelockController (deployer as admin;
-///                                         empty proposers; open executor) and
-///                                         DecdnGovernor; grant Timelock's
+///           3. `_deployGovernor`        — DecdnGovernor; grant Timelock's
 ///                                         PROPOSER + CANCELLER roles to the
 ///                                         Governor.
-///           3. `_wireCrossContractRoles` — peer role grants (settlement reporter,
+///           4. `_wireCrossContractRoles` — peer role grants (settlement reporter,
 ///                                          slash-inflow reporter, appeal reversal,
 ///                                          blacklist, emergency multisig) plus
 ///                                          deployer-only setters (setSafetyReserve,
@@ -48,14 +55,14 @@ import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 ///                                          run before the GOVERNANCE_ROLE handoff
 ///                                          because the same setters become
 ///                                          Timelock-gated post-handoff.
-///           4. `_handOffGovernance`      — grant-before-revoke loop over every
+///           5. `_handOffGovernance`      — grant-before-revoke loop over every
 ///                                          target for both GOVERNANCE_ROLE and
 ///                                          DEFAULT_ADMIN_ROLE, then renounce the
 ///                                          deployer's admin on the Timelock
 ///                                          itself. Grant-before-revoke ordering
 ///                                          is mandatory; reversing it strands
 ///                                          the contract ungoverned mid-tx.
-///           5. `_assertNoBackDoors`      — reverts if deployer still holds
+///           6. `_assertNoBackDoors`      — reverts if deployer still holds
 ///                                          GOVERNANCE_ROLE or DEFAULT_ADMIN_ROLE
 ///                                          on any target. Runs in-script (not
 ///                                          just in tests) so a mainnet deploy
@@ -77,9 +84,10 @@ abstract contract BaseProtocolDeploy is Script {
         // External dependencies
         IERC20 usdc;
         IEd25519Verifier ed25519Verifier;
-        // Roles + recipients
+        // Roles + recipients. The FeeRouter treasury bucket is not a config
+        // field: it is always the TimelockController deployed by this script
+        // (Timelock-custodied treasury per ADR 016 § Deployment Order step 7).
         address deployer;
-        address treasury;
         address emergencyMultisig;
         address initialTokenHolder;
         address challengerIncentivePool;
@@ -125,25 +133,45 @@ abstract contract BaseProtocolDeploy is Script {
     error DeployerStillHoldsRole(address target, bytes32 role);
 
     function _runFullDeploy(DeployConfig memory cfg) internal returns (Deployment memory d) {
-        d = _deployTargets(cfg);
-        _deployGovernance(cfg, d);
+        TimelockController timelock = _deployTimelock(cfg);
+        d = _deployTargets(cfg, timelock);
+        _deployGovernor(cfg, d);
         _wireCrossContractRoles(cfg, d);
         _handOffGovernance(cfg, d);
         _assertNoBackDoors(cfg, d);
     }
 
-    // Phase 1 — deploy targets with deployer as admin.
-    function _deployTargets(DeployConfig memory cfg) internal returns (Deployment memory d) {
-        // Fail-fast on the seven fields whose absence either reverts a
+    // Phase 1 — TimelockController. Deployed before the targets so its address
+    // is available to FeeRouter as the treasury bucket destination (ADR 016
+    // § Deployment Order step 3). Deployer is the initial admin; `proposers` is
+    // empty (PROPOSER_ROLE granted to the Governor in phase 3) and `executors`
+    // is `[address(0)]` (anyone may execute after the delay).
+    function _deployTimelock(DeployConfig memory cfg) internal returns (TimelockController) {
+        if (cfg.deployer == address(0)) revert ZeroAddress("deployer");
+        address[] memory emptyProposers = new address[](0);
+        address[] memory openExecutor = new address[](1);
+        openExecutor[0] = address(0);
+        return new TimelockController(cfg.timelockDelay, emptyProposers, openExecutor, cfg.deployer);
+    }
+
+    // Phase 2 — deploy targets with deployer as admin. `timelock` is the
+    // FeeRouter treasury bucket destination (Timelock-custodied per ADR 016).
+    function _deployTargets(DeployConfig memory cfg, TimelockController timelock)
+        internal
+        returns (Deployment memory d)
+    {
+        d.timelock = timelock;
+
+        // Fail-fast on the six fields whose absence either reverts a
         // constructor with an opaque error (`usdc`, `ed25519Verifier`,
-        // `treasury`, `initialTokenHolder`) or silently no-ops a role grant
-        // downstream (`emergencyMultisig` skips SafetyReserve's constructor
-        // grant; `challengerIncentivePool` would brick `reverseAppeal`;
-        // ContentBlacklist would grant EMERGENCY_MULTISIG_ROLE to `address(0)`).
+        // `initialTokenHolder`) or silently no-ops a role grant downstream
+        // (`emergencyMultisig` skips SafetyReserve's constructor grant;
+        // `challengerIncentivePool` would brick `reverseAppeal`; ContentBlacklist
+        // would grant EMERGENCY_MULTISIG_ROLE to `address(0)`). The treasury is
+        // not validated here: it is `address(timelock)`, always non-zero.
         if (address(cfg.usdc) == address(0)) revert ZeroAddress("usdc");
         if (address(cfg.ed25519Verifier) == address(0)) revert ZeroAddress("ed25519Verifier");
         if (cfg.deployer == address(0)) revert ZeroAddress("deployer");
-        if (cfg.treasury == address(0)) revert ZeroAddress("treasury");
         if (cfg.emergencyMultisig == address(0)) revert ZeroAddress("emergencyMultisig");
         if (cfg.initialTokenHolder == address(0)) revert ZeroAddress("initialTokenHolder");
         if (cfg.challengerIncentivePool == address(0)) revert ZeroAddress("challengerIncentivePool");
@@ -175,7 +203,7 @@ abstract contract BaseProtocolDeploy is Script {
         d.router = new FeeRouter({
             usdc_: cfg.usdc,
             capacityBond_: ICapacityBondReporter(address(d.bond)),
-            treasury_: cfg.treasury,
+            treasury_: address(timelock),
             epochLength_: cfg.feeRouterEpochLength,
             windowEpochs_: cfg.feeRouterWindowEpochs,
             admin: cfg.deployer,
@@ -194,20 +222,17 @@ abstract contract BaseProtocolDeploy is Script {
         d.registry = new PublisherRegistry({ admin: cfg.deployer });
     }
 
-    // Phase 2 — Timelock + Governor; Timelock proposer/canceller wiring.
-    function _deployGovernance(DeployConfig memory cfg, Deployment memory d) internal {
-        address[] memory emptyProposers = new address[](0);
-        address[] memory openExecutor = new address[](1);
-        openExecutor[0] = address(0);
-        d.timelock = new TimelockController(cfg.timelockDelay, emptyProposers, openExecutor, cfg.deployer);
-
+    // Phase 3 — Governor; Timelock proposer/canceller wiring. The Timelock
+    // itself is already deployed (phase 1) so its address could seed FeeRouter's
+    // treasury bucket.
+    function _deployGovernor(DeployConfig memory, Deployment memory d) internal {
         d.governor = new DecdnGovernor(d.router, d.bond, d.timelock);
 
         d.timelock.grantRole(d.timelock.PROPOSER_ROLE(), address(d.governor));
         d.timelock.grantRole(d.timelock.CANCELLER_ROLE(), address(d.governor));
     }
 
-    // Phase 3 — cross-contract peer roles + deployer-only state setters.
+    // Phase 4 — cross-contract peer roles + deployer-only state setters.
     //
     // These calls all require the deployer to still hold `GOVERNANCE_ROLE` or
     // `DEFAULT_ADMIN_ROLE` on the target. They are the last opportunity to
@@ -240,7 +265,7 @@ abstract contract BaseProtocolDeploy is Script {
     ///      the role-grant surface behind the Timelock. No-op in production.
     function _postWiringHook(DeployConfig memory cfg, Deployment memory d) internal virtual { }
 
-    // Phase 4 — atomic role handoff to Timelock.
+    // Phase 5 — atomic role handoff to Timelock.
     //
     // Grant-before-revoke ordering is mandatory: revoking GOVERNANCE_ROLE or
     // DEFAULT_ADMIN_ROLE from the deployer before granting it to the Timelock
@@ -260,7 +285,7 @@ abstract contract BaseProtocolDeploy is Script {
         d.timelock.renounceRole(d.timelock.DEFAULT_ADMIN_ROLE(), cfg.deployer);
     }
 
-    // Phase 5 — post-deploy invariant.
+    // Phase 6 — post-deploy invariant.
     function _assertNoBackDoors(DeployConfig memory cfg, Deployment memory d) internal view {
         IAccessControl[5] memory targets =
             [IAccessControl(address(d.router)), d.bond, d.blacklist, d.reserve, d.registry];

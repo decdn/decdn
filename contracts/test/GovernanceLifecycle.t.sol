@@ -92,7 +92,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     address internal proposer = address(0xAAAA);
     address internal voter1 = address(0xBBBB);
     address internal voter2 = address(0xCCCC);
-    address internal treasuryEoa = address(0xD7);
     address internal multisig = address(0xC0DE);
     address internal challengerPool = address(0xCCEE);
 
@@ -112,7 +111,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             usdc: usdc,
             ed25519Verifier: ed25519,
             deployer: address(this),
-            treasury: treasuryEoa,
             emergencyMultisig: multisig,
             // Token is minted entirely to the test harness so it can fund
             // operators + FeeRouter bucket destinations downstream.

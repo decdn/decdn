@@ -33,7 +33,6 @@ contract DeployUSDC is ERC20 {
 ///         own context so we can assert state without relying on a fork.
 contract DeployProtocolTest is Test, BaseProtocolDeploy {
     address internal emergencyMultisig = address(0xC0DE);
-    address internal treasury = address(0xD7);
     address internal initialTokenHolder = address(0xBEEF);
     address internal challengerPool = address(0xCCEE);
 
@@ -52,7 +51,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             usdc: usdc,
             ed25519Verifier: ed,
             deployer: address(this),
-            treasury: treasury,
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: initialTokenHolder,
             challengerIncentivePool: challengerPool,
@@ -165,6 +163,13 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertEq(d.router.buybackBurner(), address(0), "buybackBurner unwired at launch");
     }
 
+    function test_feeRouter_treasuryIsTimelock() public view {
+        // ADR 016 § Deployment Order step 7: the treasury bucket is
+        // Timelock-custodied. The script deploys the Timelock first precisely so
+        // its address can seed FeeRouter's treasury, not an external EOA.
+        assertEq(d.router.treasury(), address(d.timelock), "router.treasury == timelock");
+    }
+
     function test_feeRouter_safetyBucketWiredAtLaunch() public view {
         // SafetyReserve is concrete and deployable, so the safety bucket
         // ships active from day one (unlike the buyback bucket).
@@ -184,8 +189,8 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     function test_assertNoBackDoors_revertsWhenHandoffIncomplete() public {
         DeployConfig memory cfg2 = _testConfig();
         // Run deploy + governance + wiring, but DELIBERATELY skip the handoff.
-        Deployment memory d2 = _deployTargets(cfg2);
-        _deployGovernance(cfg2, d2);
+        Deployment memory d2 = _deployTargets(cfg2, _deployTimelock(cfg2));
+        _deployGovernor(cfg2, d2);
         _wireCrossContractRoles(cfg2, d2);
         // Sanity: deployer still holds GOVERNANCE_ROLE on router (handoff skipped).
         assertTrue(d2.router.hasRole(GOVERNANCE_ROLE, cfg2.deployer), "precondition gov");
@@ -212,7 +217,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // is zero, or ContentBlacklist granting that role to `address(0)`).
 
     function externalDeployTargets(DeployConfig calldata cfgIn) external returns (Deployment memory) {
-        return _deployTargets(cfgIn);
+        return _deployTargets(cfgIn, _deployTimelock(cfgIn));
     }
 
     function _expectZeroAddressRevert(DeployConfig memory bad, string memory field) internal {
@@ -236,12 +241,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         DeployConfig memory bad = _testConfig();
         bad.deployer = address(0);
         _expectZeroAddressRevert(bad, "deployer");
-    }
-
-    function test_deployTargets_revertsOnZeroTreasury() public {
-        DeployConfig memory bad = _testConfig();
-        bad.treasury = address(0);
-        _expectZeroAddressRevert(bad, "treasury");
     }
 
     function test_deployTargets_revertsOnZeroEmergencyMultisig() public {

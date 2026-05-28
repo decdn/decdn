@@ -26,7 +26,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     address internal constant TEST_USDC = address(0xa55D);
     address internal constant TEST_ED25519 = address(0xeD25);
     address internal constant TEST_MULTISIG = address(0xC0DE);
-    address internal constant TEST_TREASURY = address(0xD75a);
     address internal constant TEST_INITIAL_HOLDER = address(0xbEEF);
     address internal constant TEST_CHALLENGER_POOL = address(0xccEE);
 
@@ -43,7 +42,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         vm.setEnv("USDC_ADDRESS", vm.toString(TEST_USDC));
         vm.setEnv("ED25519_VERIFIER_ADDRESS", vm.toString(TEST_ED25519));
         vm.setEnv("EMERGENCY_MULTISIG", vm.toString(TEST_MULTISIG));
-        vm.setEnv("TREASURY_ADDRESS", vm.toString(TEST_TREASURY));
         vm.setEnv("INITIAL_TOKEN_HOLDER", vm.toString(TEST_INITIAL_HOLDER));
         vm.setEnv("CHALLENGER_INCENTIVE_POOL", vm.toString(TEST_CHALLENGER_POOL));
         vm.setEnv("FORCE_OVERWRITE_MANIFEST", "false");
@@ -74,7 +72,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(address(cfg.usdc), TEST_USDC, "usdc");
         assertEq(address(cfg.ed25519Verifier), TEST_ED25519, "ed25519");
         assertEq(cfg.emergencyMultisig, TEST_MULTISIG, "multisig");
-        assertEq(cfg.treasury, TEST_TREASURY, "treasury");
         assertEq(cfg.initialTokenHolder, TEST_INITIAL_HOLDER, "holder");
         assertEq(cfg.challengerIncentivePool, TEST_CHALLENGER_POOL, "challenger");
         assertEq(cfg.timelockDelay, DEFAULT_TIMELOCK_DELAY, "timelockDelay");
@@ -161,7 +158,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".externalDeps.usdc"), TEST_USDC, "usdc");
         assertEq(json.readAddress(".externalDeps.ed25519Verifier"), TEST_ED25519, "ed25519");
         assertEq(json.readAddress(".externalDeps.emergencyMultisig"), TEST_MULTISIG, "multisig");
-        assertEq(json.readAddress(".externalDeps.treasury"), TEST_TREASURY, "treasury");
 
         assertEq(json.readUint(".chainId"), CHAIN_ID_WRITE, "chainId");
         assertEq(json.readUint(".config.timelockDelay"), DEFAULT_TIMELOCK_DELAY, "timelockDelay");

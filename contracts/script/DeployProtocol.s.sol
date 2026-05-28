@@ -35,10 +35,14 @@ import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 ///                                            Sepolia USDC `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d`)
 ///           - `ED25519_VERIFIER_ADDRESS`  — operator-deployed verifier
 ///           - `EMERGENCY_MULTISIG`        — 3-of-5 multisig per ADR 009
-///           - `TREASURY_ADDRESS`          — FeeRouter treasury bucket recipient
-///                                            (often == the Timelock per ADR 016)
 ///           - `INITIAL_TOKEN_HOLDER`      — 1B TOKEN recipient at genesis
 ///           - `CHALLENGER_INCENTIVE_POOL` — SafetyReserve appeal-bond pool
+///
+///         The FeeRouter treasury bucket is NOT an env var: it is the
+///         `TimelockController` this script deploys, so the 10% treasury leg is
+///         Timelock-custodied and disbursed only by governance proposal per
+///         ADR 016 § Deployment Order step 7. Re-pointing it post-deploy requires
+///         a `FeeRouter.setTreasury` proposal through the 48h Timelock.
 ///
 ///         Optional env vars (defaults from ADR 026 / ADR 028 / ADR 009):
 ///           - `TIMELOCK_DELAY`             (default 48h)
@@ -108,7 +112,6 @@ contract DeployProtocol is BaseProtocolDeploy {
         cfg.usdc = IERC20(vm.envAddress("USDC_ADDRESS"));
         cfg.ed25519Verifier = IEd25519Verifier(vm.envAddress("ED25519_VERIFIER_ADDRESS"));
         cfg.emergencyMultisig = vm.envAddress("EMERGENCY_MULTISIG");
-        cfg.treasury = vm.envAddress("TREASURY_ADDRESS");
         cfg.initialTokenHolder = vm.envAddress("INITIAL_TOKEN_HOLDER");
         cfg.challengerIncentivePool = vm.envAddress("CHALLENGER_INCENTIVE_POOL");
         // `--sender` on the command line becomes `tx.origin` for the script;
@@ -161,10 +164,12 @@ contract DeployProtocol is BaseProtocolDeploy {
         vm.serializeAddress(contracts, "TimelockController", address(d.timelock));
         string memory contractsJson = vm.serializeAddress(contracts, "Token", address(d.token));
 
+        // Treasury is intentionally absent: it is the TimelockController above
+        // (Timelock-custodied per ADR 016), recorded under `contracts`, not an
+        // external dependency.
         string memory deps = "externalDeps";
         vm.serializeAddress(deps, "ed25519Verifier", address(cfg.ed25519Verifier));
         vm.serializeAddress(deps, "emergencyMultisig", cfg.emergencyMultisig);
-        vm.serializeAddress(deps, "treasury", cfg.treasury);
         string memory depsJson = vm.serializeAddress(deps, "usdc", address(cfg.usdc));
 
         string memory params = "config";
