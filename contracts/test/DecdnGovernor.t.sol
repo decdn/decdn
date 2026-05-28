@@ -147,14 +147,15 @@ contract DecdnGovernorTest is Test {
         assertEq(gov.proposalThreshold(), 1000);
     }
 
-    function test_setVoteCapBps_enforcesBounds() public {
-        // Calling without governance role (we're not the executor) reverts
-        // with the explicit `GovernorOnlyExecutor` selector. Asserting the
-        // typed selector (not a bare expectRevert) catches a regression
-        // that re-orders the bounds check before the `onlyGovernance`
-        // modifier: with bare expectRevert, an out-of-bounds value like
-        // `500` could trip `ParamOutOfBounds` and silently pass this test
-        // for the wrong reason.
+    /// @notice `setVoteCapBps` is gated on `onlyGovernance` (timelock
+    ///         executor). A direct call from the test contract must revert
+    ///         with the explicit `GovernorOnlyExecutor` selector. The arg
+    ///         `500` is intentionally inside the `[VOTE_CAP_BPS_FLOOR=100,
+    ///         VOTE_CAP_BPS_CEILING=2500]` range so the only reachable
+    ///         revert path is the role guard; bounds enforcement on the
+    ///         executor path is out of scope for this test (would require
+    ///         a full timelock propose/queue/execute dance).
+    function test_setVoteCapBps_revertsWithoutTimelockCaller() public {
         vm.expectRevert(abi.encodeWithSelector(IGovernor.GovernorOnlyExecutor.selector, address(this)));
         gov.setVoteCapBps(500);
     }

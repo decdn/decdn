@@ -231,6 +231,18 @@ contract FeeRouterTest is Test {
         router.pause();
     }
 
+    function test_unpause_revertsWithoutRole() public {
+        bytes32 pauserRole = router.PAUSER_ROLE();
+        vm.startPrank(admin);
+        router.grantRole(pauserRole, admin);
+        router.pause();
+        vm.stopPrank();
+
+        _expectMissingRole(operator, pauserRole);
+        vm.prank(operator);
+        router.unpause();
+    }
+
     /// @dev See `CapacityBond.t.sol:_expectMissingRole` for the rationale on
     ///      reading the role bytes32 outside the helper (prank-consumption
     ///      avoidance). The helper is local to each test file rather than

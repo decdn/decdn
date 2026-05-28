@@ -577,6 +577,18 @@ contract CapacityBondTest is Test {
         bond.pause();
     }
 
+    function test_unpause_revertsWithoutRole() public {
+        bytes32 pauserRole = bond.PAUSER_ROLE();
+        vm.prank(admin);
+        bond.grantRole(pauserRole, admin);
+        vm.prank(admin);
+        bond.pause();
+
+        _expectMissingRole(operator, pauserRole);
+        vm.prank(operator);
+        bond.unpause();
+    }
+
     /// @dev Helper for AccessControl revert assertion. Reading the role
     ///      bytes32 BEFORE calling this helper is required so the
     ///      cheat-resolved STATICCALL doesn't consume the subsequent

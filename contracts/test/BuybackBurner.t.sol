@@ -228,7 +228,9 @@ contract BuybackBurnerTest is Test {
         uint256 supplyBefore = token.totalSupply();
         uint256 bbBalanceBefore = token.balanceOf(address(bb));
 
-        vm.expectEmit(true, true, false, true, address(bb));
+        // `BuybackExecuted(uint256 usdcIn, uint256 tokenOut)` has zero indexed
+        // params, so all three topic checks are false; only data is checked.
+        vm.expectEmit(false, false, false, true, address(bb));
         emit BuybackBurner.BuybackExecuted(USDC_AMOUNT, TOKEN_OUT);
         vm.prank(keeper);
         uint256 tokenOut = bb.executeBuyback(USDC_AMOUNT, 0);
