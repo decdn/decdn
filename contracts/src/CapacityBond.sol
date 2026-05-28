@@ -32,10 +32,8 @@ import { ISafetyReserve } from "./interfaces/ISafetyReserve.sol";
 ///           - `slashedAtEpoch[op]` — stamped in `slash()`, cleared by
 ///                                    `clearSlashedAtEpoch` via
 ///                                    `APPEAL_REVERSAL_ROLE` (ADR 028 / 036)
-///           - `regionLastChanged[op]` + `updateRegion`
-///                                    (ADR 030 § Node Region Self-Attestation;
-///                                    prior region is exposed via the
-///                                    `RegionUpdated` event)
+///           - `regionPrev[op]` + `regionLastChanged[op]` + `updateRegion`
+///                                    (ADR 030 § Node Region Self-Attestation)
 ///           - `declaredMbps[op]`   — operator-asserted capacity (ADR 026
 ///                                    § Capacity-bond curve; bond enforcement
 ///                                    against the curve `bond = k × Mbps^α`
@@ -223,12 +221,20 @@ contract CapacityBond is
     // Storage — region attestation (ADR 030)
     // -----------------------------------------------------------------
 
+    /// @notice Previous-region snapshot taken on each `updateRegion` call.
+    ///         Pre-positioned for the ADR 030 § 52 blacklist-scope ripening
+    ///         predicate (*"a node is in scope iff entry.region == regionHint,
+    ///         OR (block.timestamp - effective < REGION_STABILITY_WINDOW AND
+    ///         entry.region == regionPrev)"*), which is an on-chain check that
+    ///         must consult this slot at scope-test / slash-eligibility time.
+    ///         No contract reads it in this revision — ContentBlacklist's
+    ///         scope test currently covers only GLOBAL ∪ region; the ripening
+    ///         leg lands with the ADR 030 enforcement PR.
+    mapping(address operator => string) public regionPrev;
+
     /// @notice Last `updateRegion` timestamp; 0 means region has never been
     ///         changed (initial value from `registerNode` is final until the
-    ///         first explicit update). The previous region value lives in the
-    ///         `RegionUpdated(nodeId, oldRegion, newRegion)` event stream — no
-    ///         on-chain consumer reads the prior region back, so it isn't
-    ///         persisted in storage.
+    ///         first explicit update).
     mapping(address operator => uint64) public regionLastChanged;
 
     /// @notice Cooldown enforced between `updateRegion` calls per ADR 030
@@ -587,10 +593,11 @@ contract CapacityBond is
     ///         every subsequent call is gated by `regionStabilityWindow`.
     /// @dev    The new region is stored in the operator's `NodeInfo.regionHint`
     ///         so all downstream readers (`getActiveNodes`, off-chain DHT)
-    ///         see the same source of truth. The prior region is surfaced by
-    ///         the `RegionUpdated` event, so the ADR 030 ripening predicate
-    ///         ("blacklist scope applies previous region's entries until
-    ///         window ripens") is satisfied without on-chain snapshot storage.
+    ///         see the same source of truth. `regionPrev` retains the prior
+    ///         value for the ADR 030 § 52 blacklist-scope ripening predicate
+    ///         ("the previous region's entries keep applying until the change
+    ///         ripens"); the on-chain enforcement of that predicate lands with
+    ///         the ADR 030 implementation PR and is not active in this revision.
     function updateRegion(string calldata newRegion) external whenNotPaused {
         if (bytes(newRegion).length > MAX_REGION_HINT_BYTES) {
             revert RegionHintTooLong({ size: bytes(newRegion).length, ceiling: MAX_REGION_HINT_BYTES });
@@ -606,6 +613,7 @@ contract CapacityBond is
         }
 
         string memory oldRegion = info.regionHint;
+        regionPrev[msg.sender] = oldRegion;
         info.regionHint = newRegion;
         regionLastChanged[msg.sender] = uint64(block.timestamp);
 

@@ -464,11 +464,10 @@ contract CapacityBondTest is Test {
     /// @notice ADR 030 § Region-stability window: the first `updateRegion`
     ///         call has no cooldown (operators may correct their initial
     ///         `registerNode` region); every subsequent call is gated by
-    ///         `regionStabilityWindow`. The prior region is emitted in
-    ///         `RegionUpdated`; no on-chain snapshot is kept. Uses a
-    ///         key-derived operator so the EIP-712 binding signature for
-    ///         `registerNode` is forge-signable.
-    function test_updateRegion_cooldownAndEvent() public {
+    ///         `regionStabilityWindow` and snapshots the prior value into
+    ///         `regionPrev`. Uses a key-derived operator so the EIP-712
+    ///         binding signature for `registerNode` is forge-signable.
+    function test_updateRegion_cooldownAndPrevSnapshot() public {
         uint256 opPk = 0xC0FFEE;
         address opAddr = vm.addr(opPk);
 
@@ -494,12 +493,12 @@ contract CapacityBondTest is Test {
         vm.prank(opAddr);
         bond.registerNode(nodeId, hex"", "us-east", bindingSig, edSig);
 
-        // First updateRegion has no cooldown (lastChanged == 0 branch);
-        // emits the prior region carried over from `registerNode`.
+        // First updateRegion has no cooldown (lastChanged == 0 branch).
         vm.expectEmit(true, false, false, true, address(bond));
         emit CapacityBond.RegionUpdated(nodeId, "us-east", "eu-west");
         vm.prank(opAddr);
         bond.updateRegion("eu-west");
+        assertEq(bond.regionPrev(opAddr), "us-east");
         assertEq(bond.regionLastChanged(opAddr), uint64(block.timestamp));
 
         // Second call inside `regionStabilityWindow` (7 days) reverts.
@@ -508,13 +507,14 @@ contract CapacityBondTest is Test {
         vm.expectRevert();
         bond.updateRegion("ap-south");
 
-        // After the window elapses, the call succeeds and the event carries
-        // the now-prior region in its `oldRegion` slot.
+        // After the window elapses, the call succeeds and `regionPrev`
+        // captures the now-prior region.
         vm.warp(block.timestamp + 7 days + 1);
         vm.expectEmit(true, false, false, true, address(bond));
         emit CapacityBond.RegionUpdated(nodeId, "eu-west", "ap-south");
         vm.prank(opAddr);
         bond.updateRegion("ap-south");
+        assertEq(bond.regionPrev(opAddr), "eu-west");
     }
 
     // ----------------------------------------------------------------------
