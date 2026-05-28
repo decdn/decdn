@@ -69,7 +69,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     // cheatcode, not our code — so testing the defaults branch is sufficient
     // to prove the plumbing.
 
-    function test_readConfig_appliesDefaultsForOptionalVars() public {
+    function test_readConfig_appliesDefaultsForOptionalVars() public view {
         DeployConfig memory cfg = this.externalReadConfig();
         assertEq(address(cfg.usdc), TEST_USDC, "usdc");
         assertEq(address(cfg.ed25519Verifier), TEST_ED25519, "ed25519");
