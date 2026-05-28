@@ -60,9 +60,11 @@ contract GovernanceLifecycleTest is Test {
     uint64 internal constant EPOCH = 7 days;
     uint64 internal constant WINDOW_EPOCHS = 13;
     uint64 internal constant FINAL_EPOCH = 60;
+    // Timelock min-delay used at constructor time. Production is 48h; we use
+    // 2 days here to keep the unit ≥ the prod minimum while staying explicit.
+    // The lifecycle helpers read the live `timelock.getMinDelay()` so a future
+    // delay change in DecdnGovernor doesn't silently desync this test.
     uint256 internal constant TIMELOCK_DELAY = 2 days;
-    uint256 internal constant VOTING_DELAY = 1 days;
-    uint256 internal constant VOTING_PERIOD = 7 days;
 
     uint256 internal constant MIN_STAKE = 50_000e18;
     uint256 internal constant UNBONDING_PERIOD = 7 days;
@@ -210,15 +212,30 @@ contract GovernanceLifecycleTest is Test {
     ///      Timelock), not an external `GOVERNANCE_ROLE` — there is no role to
     ///      grant or revoke on the Governor.
     ///
+    ///      Two roles need handing off per target:
+    ///        - `GOVERNANCE_ROLE` — direct setter authority
+    ///        - `DEFAULT_ADMIN_ROLE` — OZ AccessControl meta-admin; a holder
+    ///          can re-grant any role on the contract. Without handing this
+    ///          off too, the deployer keeps a back door (could re-grant itself
+    ///          `GOVERNANCE_ROLE` at any time), defeating the purpose of the
+    ///          Timelock.
+    ///
     ///      Grant-before-revoke is mandatory: reversing the order leaves the
     ///      target ungoverned mid-tx and (for a future upgradeable build)
     ///      would brick the contract until a recovery script.
     function _handOffGovernanceToTimelock() internal {
         address[5] memory targets =
             [address(router), address(bond), address(blacklist), address(reserve), address(registry)];
+        bytes32 defaultAdmin = 0x00;
         for (uint256 i = 0; i < targets.length; i++) {
             _grantGovernance(targets[i], address(timelock));
+            _accessControlCall(
+                targets[i], abi.encodeWithSignature("grantRole(bytes32,address)", defaultAdmin, address(timelock))
+            );
             _revokeGovernance(targets[i], address(this));
+            _accessControlCall(
+                targets[i], abi.encodeWithSignature("revokeRole(bytes32,address)", defaultAdmin, address(this))
+            );
         }
     }
 
@@ -297,15 +314,42 @@ contract GovernanceLifecycleTest is Test {
 
     function test_canary_governanceRoleHandoff() public view {
         address tl = address(timelock);
-        assertTrue(router.hasRole(GOVERNANCE_ROLE, tl), "router");
-        assertTrue(bond.hasRole(GOVERNANCE_ROLE, tl), "bond");
-        assertTrue(blacklist.hasRole(GOVERNANCE_ROLE, tl), "blacklist");
-        assertTrue(reserve.hasRole(GOVERNANCE_ROLE, tl), "reserve");
-        assertTrue(registry.hasRole(GOVERNANCE_ROLE, tl), "registry");
-        // Test contract must NOT retain the role — closes the "deployer keeps
-        // a back door" failure mode in #694's deploy script.
-        assertFalse(router.hasRole(GOVERNANCE_ROLE, address(this)), "router back door");
-        assertFalse(bond.hasRole(GOVERNANCE_ROLE, address(this)), "bond back door");
+        bytes32 defaultAdmin = 0x00;
+
+        // Timelock holds GOVERNANCE_ROLE on every target.
+        assertTrue(router.hasRole(GOVERNANCE_ROLE, tl), "router gov");
+        assertTrue(bond.hasRole(GOVERNANCE_ROLE, tl), "bond gov");
+        assertTrue(blacklist.hasRole(GOVERNANCE_ROLE, tl), "blacklist gov");
+        assertTrue(reserve.hasRole(GOVERNANCE_ROLE, tl), "reserve gov");
+        assertTrue(registry.hasRole(GOVERNANCE_ROLE, tl), "registry gov");
+
+        // Timelock holds DEFAULT_ADMIN_ROLE on every target (the meta-admin
+        // that can re-grant any role). Without this, the deployer would still
+        // be able to bypass the Timelock by re-granting itself GOVERNANCE_ROLE.
+        assertTrue(router.hasRole(defaultAdmin, tl), "router admin");
+        assertTrue(bond.hasRole(defaultAdmin, tl), "bond admin");
+        assertTrue(blacklist.hasRole(defaultAdmin, tl), "blacklist admin");
+        assertTrue(reserve.hasRole(defaultAdmin, tl), "reserve admin");
+        assertTrue(registry.hasRole(defaultAdmin, tl), "registry admin");
+
+        // Test contract must NOT retain either role on any target — closes the
+        // "deployer keeps a back door" failure mode in #694's deploy script.
+        assertFalse(router.hasRole(GOVERNANCE_ROLE, address(this)), "router gov back door");
+        assertFalse(bond.hasRole(GOVERNANCE_ROLE, address(this)), "bond gov back door");
+        assertFalse(blacklist.hasRole(GOVERNANCE_ROLE, address(this)), "blacklist gov back door");
+        assertFalse(reserve.hasRole(GOVERNANCE_ROLE, address(this)), "reserve gov back door");
+        assertFalse(registry.hasRole(GOVERNANCE_ROLE, address(this)), "registry gov back door");
+
+        assertFalse(router.hasRole(defaultAdmin, address(this)), "router admin back door");
+        assertFalse(bond.hasRole(defaultAdmin, address(this)), "bond admin back door");
+        assertFalse(blacklist.hasRole(defaultAdmin, address(this)), "blacklist admin back door");
+        assertFalse(reserve.hasRole(defaultAdmin, address(this)), "reserve admin back door");
+        assertFalse(registry.hasRole(defaultAdmin, address(this)), "registry admin back door");
+
+        // Same back-door check on the Timelock itself. OZ v5's TimelockController
+        // uses DEFAULT_ADMIN_ROLE as the meta-admin (the v4 name TIMELOCK_ADMIN_ROLE
+        // was removed in v5).
+        assertFalse(timelock.hasRole(defaultAdmin, address(this)), "timelock admin back door");
     }
 
     function test_canary_executorIsTimelock() public view {
@@ -340,7 +384,7 @@ contract GovernanceLifecycleTest is Test {
         vm.prank(proposer);
         proposalId = gov.propose(targets, values, calldatas, desc);
 
-        vm.warp(block.timestamp + VOTING_DELAY + 1);
+        vm.warp(block.timestamp + gov.votingDelay() + 1);
 
         vm.prank(proposer);
         gov.castVote(proposalId, 1);
@@ -349,13 +393,13 @@ contract GovernanceLifecycleTest is Test {
         vm.prank(voter2);
         gov.castVote(proposalId, 1);
 
-        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+        vm.warp(block.timestamp + gov.votingPeriod() + 1);
         assertEq(uint256(gov.state(proposalId)), uint256(IGovernor.ProposalState.Succeeded), "vote did not pass");
 
         bytes32 descHash = keccak256(bytes(desc));
         gov.queue(targets, values, calldatas, descHash);
 
-        vm.warp(block.timestamp + TIMELOCK_DELAY + 1);
+        vm.warp(block.timestamp + timelock.getMinDelay() + 1);
 
         gov.execute(targets, values, calldatas, descHash);
     }
@@ -375,7 +419,7 @@ contract GovernanceLifecycleTest is Test {
         vm.prank(proposer);
         uint256 proposalId = gov.propose(targets, values, calldatas, desc);
 
-        vm.warp(block.timestamp + VOTING_DELAY + 1);
+        vm.warp(block.timestamp + gov.votingDelay() + 1);
 
         vm.prank(proposer);
         gov.castVote(proposalId, 1);
@@ -384,13 +428,13 @@ contract GovernanceLifecycleTest is Test {
         vm.prank(voter2);
         gov.castVote(proposalId, 1);
 
-        vm.warp(block.timestamp + VOTING_PERIOD + 1);
+        vm.warp(block.timestamp + gov.votingPeriod() + 1);
         assertEq(uint256(gov.state(proposalId)), uint256(IGovernor.ProposalState.Succeeded), "vote did not pass");
 
         bytes32 descHash = keccak256(bytes(desc));
         gov.queue(targets, values, calldatas, descHash);
 
-        vm.warp(block.timestamp + TIMELOCK_DELAY + 1);
+        vm.warp(block.timestamp + timelock.getMinDelay() + 1);
 
         vm.expectRevert(expectedRevert);
         gov.execute(targets, values, calldatas, descHash);
