@@ -47,7 +47,7 @@ mod sol_types {
                 bytes32 nodeId;
                 address ethAddress;
                 bool active;
-                uint256 lastMultiaddrUpdate;
+                uint64 lastMultiaddrUpdate;
                 bytes multiaddrs;
                 string regionHint;
             }

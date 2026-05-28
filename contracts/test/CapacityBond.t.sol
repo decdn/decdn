@@ -465,8 +465,11 @@ contract CapacityBondTest is Test {
     ///         call has no cooldown (operators may correct their initial
     ///         `registerNode` region); every subsequent call is gated by
     ///         `regionStabilityWindow` and snapshots the prior value into
-    ///         `regionPrev`. Uses a key-derived operator so the EIP-712
-    ///         binding signature for `registerNode` is forge-signable.
+    ///         `regionPrev`. Also asserts the `RegionUpdated` event payload
+    ///         on both successful calls so a future emit-arg rename or
+    ///         omission lands as a test failure. Uses a key-derived operator
+    ///         so the EIP-712 binding signature for `registerNode` is
+    ///         forge-signable.
     function test_updateRegion_cooldownAndPrevSnapshot() public {
         uint256 opPk = 0xC0FFEE;
         address opAddr = vm.addr(opPk);

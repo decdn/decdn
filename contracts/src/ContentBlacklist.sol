@@ -118,6 +118,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         uint256 bond;
         uint64 openedAt;
         uint64 fastTrackedAt;
+        StandingPath standingPath;
         AppealStatus status;
     }
 
@@ -298,11 +299,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             if (block.timestamp < nextAvailable) revert FrequencyCapHit(nextAvailable);
         }
 
-        // StandingPath is only enum-range validated at filing; synthetic-
-        // standing clawback (TokenHolder balance check) is deferred per the
-        // contract header note. The filer's claimed standing is surfaced by
-        // `BlacklistAppealOpened` for off-chain consumers — no on-chain
-        // consumer reads it back, so it isn't persisted in the appeal struct.
+        // StandingPath is recorded but only enum-range validated; the
+        // synthetic-standing clawback (admissibility condition (c) per
+        // ADR 031 § 216 — `status == Open && standingPath == TokenHolder &&
+        // ...`) is deferred per the contract header note. The field is
+        // persisted so the future on-chain clawback check can read it from
+        // the appeal record without re-deriving it from event history.
         if (uint8(standingPath) > uint8(StandingPath.TokenHolder)) revert UnauthorizedStanding(standingPath);
 
         IERC20(address(token)).safeTransferFrom(msg.sender, address(this), appealBond);
@@ -317,6 +319,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
                 bond: appealBond,
                 openedAt: uint64(block.timestamp),
                 fastTrackedAt: 0,
+                standingPath: standingPath,
                 status: AppealStatus.Open
             })
         );

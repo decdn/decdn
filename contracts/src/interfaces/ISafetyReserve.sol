@@ -18,12 +18,13 @@ interface ISafetyReserve {
 
     struct Incident {
         bytes32 bundle;
-        // `recipient` (20B) and `paidAt` (8B) share one storage slot — 28
-        // bytes ≤ 32. Don't reorder these two without re-checking the
-        // packing or the per-incident storage cost regresses.
         address recipient;
-        uint64 paidAt;
         uint256 usdcAmount;
+        // `paidAt` (8B) and `paidBy` (20B) share one storage slot — 28 bytes
+        // ≤ 32. Don't separate this pair without re-checking the packing or
+        // the per-incident storage cost regresses (ADR 033 § 87 layout).
+        uint64 paidAt;
+        address paidBy;
         bytes32 reason;
     }
 

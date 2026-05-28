@@ -223,13 +223,14 @@ contract CapacityBond is
 
     /// @notice Previous-region snapshot taken on each `updateRegion` call.
     ///         Pre-positioned for the ADR 030 § 52 blacklist-scope ripening
-    ///         predicate (*"a node is in scope iff entry.region == regionHint,
-    ///         OR (block.timestamp - effective < REGION_STABILITY_WINDOW AND
-    ///         entry.region == regionPrev)"*), which is an on-chain check that
-    ///         must consult this slot at scope-test / slash-eligibility time.
-    ///         No contract reads it in this revision — ContentBlacklist's
-    ///         scope test currently covers only GLOBAL ∪ region; the ripening
-    ///         leg lands with the ADR 030 enforcement PR.
+    ///         predicate (*"a node is in scope iff the entry is global, OR
+    ///         entry.region == regionHint, OR (block.timestamp - effective <
+    ///         REGION_STABILITY_WINDOW AND entry.region == regionPrev)"*),
+    ///         which is an on-chain check that must consult this slot at
+    ///         scope-test / slash-eligibility time. No contract reads it in
+    ///         this revision — ContentBlacklist's scope test currently
+    ///         covers only GLOBAL ∪ region; the ripening leg lands with the
+    ///         ADR 030 enforcement PR.
     mapping(address operator => string) public regionPrev;
 
     /// @notice Last `updateRegion` timestamp; 0 means region has never been
@@ -298,9 +299,13 @@ contract CapacityBond is
 
     struct NodeInfo {
         bytes32 nodeId;
+        // `ethAddress` (20B) + `active` (1B) + `lastMultiaddrUpdate` (8B) =
+        // 29 bytes — pack into one storage slot. Don't separate or widen
+        // any of these three without re-checking the packing or every
+        // `_writeNodeInfo` pays an extra SSTORE.
         address ethAddress;
         bool active;
-        uint256 lastMultiaddrUpdate;
+        uint64 lastMultiaddrUpdate;
         bytes multiaddrs;
         string regionHint;
     }
@@ -820,7 +825,7 @@ contract CapacityBond is
         info.nodeId = nodeId;
         info.ethAddress = msg.sender;
         info.active = true;
-        info.lastMultiaddrUpdate = block.timestamp;
+        info.lastMultiaddrUpdate = uint64(block.timestamp);
         info.multiaddrs = multiaddrs;
         info.regionHint = regionHint;
     }
@@ -900,7 +905,7 @@ contract CapacityBond is
         if (block.timestamp < readyAt) revert MultiaddrCooldownActive(readyAt);
 
         info.multiaddrs = multiaddrs;
-        info.lastMultiaddrUpdate = block.timestamp;
+        info.lastMultiaddrUpdate = uint64(block.timestamp);
 
         emit NodeMultiaddrUpdated(info.nodeId, multiaddrs);
     }

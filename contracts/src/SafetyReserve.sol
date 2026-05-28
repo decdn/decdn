@@ -631,6 +631,7 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
                 recipient: recipient,
                 usdcAmount: usdcAmount,
                 paidAt: uint64(block.timestamp),
+                paidBy: msg.sender,
                 reason: reason
             })
         );
