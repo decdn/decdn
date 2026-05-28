@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
@@ -178,6 +179,64 @@ contract FeeRouterTest is Test {
         uint64 epoch = uint64((EPOCH + 1) / EPOCH);
         assertEq(router.bytesPerEpoch(operator, epoch), 0);
         assertEq(router.totalBytesPerEpoch(epoch), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Access-control guards on governance setters
+    // -----------------------------------------------------------------
+
+    function test_setShares_revertsWithoutRole() public {
+        uint256[4] memory shares = [uint256(6000), uint256(2500), uint256(1000), uint256(500)];
+        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        router.setShares(shares);
+    }
+
+    function test_setSharesAndDestinations_revertsWithoutRole() public {
+        uint256[4] memory shares = [uint256(6000), uint256(2500), uint256(1000), uint256(500)];
+        FeeRouter.ShareDestinations memory dests =
+            FeeRouter.ShareDestinations({ safetyReserve: safety, buybackBurner: buyback, treasury: treasury });
+        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        router.setSharesAndDestinations(shares, dests);
+    }
+
+    function test_setSafetyReserve_revertsWithoutRole() public {
+        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        router.setSafetyReserve(address(0x9999));
+    }
+
+    function test_setBuybackBurner_revertsWithoutRole() public {
+        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        router.setBuybackBurner(address(0x9999));
+    }
+
+    function test_setTreasury_revertsWithoutRole() public {
+        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        router.setTreasury(address(0x9999));
+    }
+
+    function test_setWindowEpochs_revertsWithoutRole() public {
+        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        router.setWindowEpochs(20);
+    }
+
+    function test_pause_revertsWithoutRole() public {
+        _expectMissingRole(operator, router.PAUSER_ROLE());
+        vm.prank(operator);
+        router.pause();
+    }
+
+    /// @dev See `CapacityBond.t.sol:_expectMissingRole` for the rationale on
+    ///      reading the role bytes32 outside the helper (prank-consumption
+    ///      avoidance). The helper is local to each test file rather than
+    ///      shared via a base contract to keep test deps shallow.
+    function _expectMissingRole(address caller, bytes32 role) internal {
+        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, caller, role));
     }
 
     /// @notice T-1 — `opShare` absorbs the rounding remainder so a 1-wei

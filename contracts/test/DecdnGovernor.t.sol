@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { IGovernor } from "@openzeppelin/contracts/governance/IGovernor.sol";
 import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
 import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 
@@ -28,6 +29,16 @@ contract TestableDecdnGovernor is DecdnGovernor {
     function pushVoteCapBpsForTest(uint208 value) external {
         // slither-disable-next-line unused-return
         _voteCapBpsHistory.push(clock(), value);
+    }
+
+    /// @notice Companion to `pushVoteCapBpsForTest` — exposes the
+    ///         `_ageRampMonthsHistory` Trace208 so we can stage two distinct
+    ///         age-ramp values at two distinct timepoints and verify the
+    ///         historical-read invariant without the full propose/queue/
+    ///         execute timelock dance.
+    function pushAgeRampMonthsForTest(uint208 value) external {
+        // slither-disable-next-line unused-return
+        _ageRampMonthsHistory.push(clock(), value);
     }
 }
 
@@ -137,9 +148,58 @@ contract DecdnGovernorTest is Test {
     }
 
     function test_setVoteCapBps_enforcesBounds() public {
-        // Calling without governance role (we're not the executor) reverts.
-        vm.expectRevert();
+        // Calling without governance role (we're not the executor) reverts
+        // with the explicit `GovernorOnlyExecutor` selector. Asserting the
+        // typed selector (not a bare expectRevert) catches a regression
+        // that re-orders the bounds check before the `onlyGovernance`
+        // modifier: with bare expectRevert, an out-of-bounds value like
+        // `500` could trip `ParamOutOfBounds` and silently pass this test
+        // for the wrong reason.
+        vm.expectRevert(abi.encodeWithSelector(IGovernor.GovernorOnlyExecutor.selector, address(this)));
         gov.setVoteCapBps(500);
+    }
+
+    /// @notice Companion access-control test — `setAgeRampMonths` is gated
+    ///         on `onlyGovernance` (timelock executor). A direct call from
+    ///         the test contract must revert with the explicit
+    ///         `GovernorOnlyExecutor` selector; see the rationale on
+    ///         `test_setVoteCapBps_enforcesBounds`.
+    function test_setAgeRampMonths_revertsWithoutTimelockCaller() public {
+        vm.expectRevert(abi.encodeWithSelector(IGovernor.GovernorOnlyExecutor.selector, address(this)));
+        gov.setAgeRampMonths(6);
+    }
+
+    /// @notice I4 companion — a later `setAgeRampMonths` push must NOT shift
+    ///         the vote weight read at an earlier `timepoint`. Mirrors the
+    ///         `voteCapBps` historical-read invariant: in-flight proposals
+    ///         must read the age-ramp value that was canonical at their
+    ///         snapshot timepoint, not the live value.
+    function test_ageRampMonthsAt_preservesPriorReadAfterLaterPush() public {
+        TestableDecdnGovernor t =
+            new TestableDecdnGovernor(IFeeRouter(address(feeRouter)), ICapacityBond(address(bond)), timelock);
+
+        // Half-age operator: 90 days bonded under the default 6-month
+        // (180-day) ramp = 0.5 multiplier on 10k served = 5k weight.
+        vm.warp(BASE + 2);
+        bond.setFirstBondedAt(operator, uint64(BASE - 90 days));
+        _setBytesAtTimepoint(operator, 10_000, 1_000_000);
+
+        uint48 historicalTp = uint48(block.timestamp);
+        uint256 historicalWeight = t.getVotes(operator, historicalTp);
+        assertEq(historicalWeight, 5000);
+        assertEq(t.ageRampMonthsAt(historicalTp), 6);
+
+        // Warp forward and push a tighter age-ramp (12 months — operator
+        // would no longer be at half ramp at 90 days, would drop to 0.25).
+        vm.warp(block.timestamp + 30 days);
+        t.pushAgeRampMonthsForTest(12);
+
+        assertEq(t.ageRampMonths(), 12);
+        assertEq(t.ageRampMonthsAt(historicalTp), 6);
+
+        // Vote weight at the historical timepoint must still see the 6-month
+        // ramp (half multiplier on 10k = 5k), not the new 12-month ramp.
+        assertEq(t.getVotes(operator, historicalTp), historicalWeight);
     }
 
     /// @notice I4 regression — a later `setVoteCapBps` push must NOT shift

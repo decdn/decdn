@@ -7,6 +7,8 @@ import { CapacityBond } from "../src/CapacityBond.sol";
 import { Token } from "../src/Token.sol";
 import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 import { MockSafetyReserve } from "./mocks/MockSafetyReserve.sol";
 
@@ -509,6 +511,176 @@ contract CapacityBondTest is Test {
         vm.prank(opAddr);
         bond.updateRegion("ap-south");
         assertEq(bond.regionPrev(opAddr), "eu-west");
+    }
+
+    // ----------------------------------------------------------------------
+    // Access-control guards on governance setters
+    //
+    // None of the setters below were previously covered for role enforcement.
+    // A regression that drops `onlyRole(GOVERNANCE_ROLE)` would otherwise
+    // pass CI silently, so each setter gets a "reverts when called by a
+    // non-governance address" test. The PAUSER_ROLE-gated pause/unpause
+    // pair gets the same treatment.
+    // ----------------------------------------------------------------------
+
+    function test_setMinStake_revertsWithoutRole() public {
+        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        bond.setMinStake(MIN_STAKE);
+    }
+
+    function test_setUnbondingPeriod_revertsWithoutRole() public {
+        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        bond.setUnbondingPeriod(UNBONDING);
+    }
+
+    function test_setSafetyReserve_revertsWithoutRole() public {
+        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        bond.setSafetyReserve(ISafetyReserve(address(safety)));
+    }
+
+    function test_setTreasury_revertsWithoutRole() public {
+        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        bond.setTreasury(address(0xDEAD));
+    }
+
+    function test_setMultiaddrUpdateCooldown_revertsWithoutRole() public {
+        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        bond.setMultiaddrUpdateCooldown(0);
+    }
+
+    function test_setMaxMultiaddrSize_revertsWithoutRole() public {
+        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        bond.setMaxMultiaddrSize(512);
+    }
+
+    function test_setRegionStabilityWindow_revertsWithoutRole() public {
+        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        bond.setRegionStabilityWindow(7 days);
+    }
+
+    function test_setClaimSlashGateEpochs_revertsWithoutRole() public {
+        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        bond.setClaimSlashGateEpochs(13);
+    }
+
+    function test_pause_revertsWithoutRole() public {
+        _expectMissingRole(operator, bond.PAUSER_ROLE());
+        vm.prank(operator);
+        bond.pause();
+    }
+
+    /// @dev Helper for AccessControl revert assertion. Reading the role
+    ///      bytes32 BEFORE calling this helper is required so the
+    ///      cheat-resolved STATICCALL doesn't consume the subsequent
+    ///      `vm.prank` (the bug fixed in `test_setMinStake_revertsWithoutRole`
+    ///      pre-merge). The helper itself only invokes a cheat code, which
+    ///      does NOT consume the prank.
+    function _expectMissingRole(address caller, bytes32 role) internal {
+        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, caller, role));
+    }
+
+    function test_setSafetyReserve_revertsOnZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(CapacityBond.ZeroAddress.selector);
+        bond.setSafetyReserve(ISafetyReserve(address(0)));
+    }
+
+    // ----------------------------------------------------------------------
+    // slash() preconditions
+    // ----------------------------------------------------------------------
+
+    /// @notice `slash()` must revert when `safetyReserve` has not been wired
+    ///         (ADR 016 § Post-Deployment Initialization, step 6). Without
+    ///         this guard the 30% safety leg would `safeTransfer` to
+    ///         `address(0)` and revert mid-flow, leaving inconsistent state.
+    function test_slash_revertsWhenSafetyReserveUnset() public {
+        // Fresh CapacityBond without `setSafetyReserve` wired.
+        CapacityBond fresh = new CapacityBond({
+            token_: token,
+            ed25519Verifier_: ed25519,
+            admin: admin,
+            minStake_: MIN_STAKE,
+            unbondingPeriod_: UNBONDING,
+            multiaddrUpdateCooldown_: 0,
+            maxMultiaddrSize_: 1024,
+            regionStabilityWindow_: 7 days,
+            genesisCreditWindow_: 30 days
+        });
+        bytes32 slashRole = fresh.SLASH_ROLE();
+        vm.startPrank(admin);
+        fresh.grantRole(slashRole, admin);
+        vm.expectRevert(CapacityBond.SafetyReserveNotWired.selector);
+        fresh.slash(operator, challenger, 1);
+        vm.stopPrank();
+    }
+
+    // ----------------------------------------------------------------------
+    // registerNode preconditions
+    // ----------------------------------------------------------------------
+
+    function test_registerNode_revertsOnInvalidEd25519Sig() public {
+        uint256 opPk = 0xDEADBEEF;
+        address opAddr = vm.addr(opPk);
+        vm.prank(admin);
+        token.transfer(opAddr, MIN_STAKE);
+        vm.prank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        vm.prank(opAddr);
+        bond.stake(MIN_STAKE);
+
+        // Flip the verifier to reject mode.
+        ed25519.setAccept(false);
+
+        bytes32 nodeId = bytes32(uint256(0xDEADBEEFDEADBEEF));
+        bytes memory bindingSig = _signBindNode(opPk, opAddr, nodeId);
+        vm.prank(opAddr);
+        vm.expectRevert(CapacityBond.InvalidEd25519Signature.selector);
+        bond.registerNode(nodeId, hex"", "us-east", bindingSig, hex"01");
+    }
+
+    function test_registerNode_revertsWhenAlreadyActive() public {
+        uint256 opPk = 0xC0FFEE2;
+        address opAddr = vm.addr(opPk);
+        vm.prank(admin);
+        token.transfer(opAddr, MIN_STAKE);
+        vm.prank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        vm.prank(opAddr);
+        bond.stake(MIN_STAKE);
+
+        bytes32 nodeId = bytes32(uint256(0xC0FFEE2C0FFEE2));
+        bytes memory bindingSig = _signBindNode(opPk, opAddr, nodeId);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "us-east", bindingSig, hex"01");
+
+        // Second registration without deregistering — bindingNonce has moved
+        // on, so we re-sign with the new nonce to isolate the failure to the
+        // `NodeAlreadyRegistered` guard rather than `InvalidBindingSignature`.
+        bytes memory bindingSig2 = _signBindNode(opPk, opAddr, nodeId);
+        vm.prank(opAddr);
+        vm.expectRevert(CapacityBond.NodeAlreadyRegistered.selector);
+        bond.registerNode(nodeId, hex"", "us-east", bindingSig2, hex"01");
+    }
+
+    function test_updateMultiaddrs_revertsWhenNodeNotActive() public {
+        // Operator never registered a node — `_nodes[op].active` is false.
+        vm.prank(operator);
+        vm.expectRevert(CapacityBond.NodeNotActive.selector);
+        bond.updateMultiaddrs(hex"deadbeef");
+    }
+
+    function test_updateRegion_revertsWhenNodeNotActive() public {
+        vm.prank(operator);
+        vm.expectRevert(CapacityBond.NodeNotActive.selector);
+        bond.updateRegion("eu-west");
     }
 
     /// @dev Construct the EIP-712 `BindNode(bytes32 nodeId, uint64 nonce)`
