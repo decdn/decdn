@@ -2,6 +2,8 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 
 contract PublisherRegistryTest is Test {
@@ -317,6 +319,15 @@ contract PublisherRegistryTest is Test {
         vm.prank(admin);
         vm.expectRevert();
         reg.setNamespaceTransferTimelock(60 days); // > 30 days
+    }
+
+    function test_setTransferTimelock_revertsWithoutRole() public {
+        bytes32 govRole = reg.GOVERNANCE_ROLE();
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, alice, govRole)
+        );
+        vm.prank(alice);
+        reg.setNamespaceTransferTimelock(7 days);
     }
 
     // -----------------------------------------------------------------

@@ -3,6 +3,8 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 import { Token } from "../src/Token.sol";
@@ -226,6 +228,58 @@ contract ContentBlacklistTest is Test {
         vm.prank(admin);
         blacklist.reverseBlacklistAppeal(appealId);
         assertFalse(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+    }
+
+    // -----------------------------------------------------------------
+    // Access-control guards on governance / regional-body setters
+    // -----------------------------------------------------------------
+
+    function test_addHashGlobal_revertsWithoutGovernanceRole() public {
+        _expectMissingRole(filer, blacklist.GOVERNANCE_ROLE());
+        vm.prank(filer);
+        blacklist.addHashGlobal(SAMPLE_HASH);
+    }
+
+    function test_addHashRegional_revertsWithoutRegionalBodyRole() public {
+        _expectMissingRole(filer, blacklist.REGIONAL_BODY_ROLE());
+        vm.prank(filer);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+    }
+
+    function test_registerRegionalBody_revertsWithoutGovernanceRole() public {
+        _expectMissingRole(filer, blacklist.GOVERNANCE_ROLE());
+        vm.prank(filer);
+        blacklist.registerRegionalBody(address(0xBEEF));
+    }
+
+    function test_setAppealBond_revertsWithoutGovernanceRole() public {
+        _expectMissingRole(filer, blacklist.GOVERNANCE_ROLE());
+        vm.prank(filer);
+        blacklist.setAppealBond(APPEAL_BOND * 2);
+    }
+
+    /// @dev See `CapacityBond.t.sol:_expectMissingRole` for rationale.
+    function _expectMissingRole(address caller, bytes32 role) internal {
+        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, caller, role));
+    }
+
+    /// @notice `REGIONAL_BODY_ROLE` must NOT be able to remove `GLOBAL_REGION`
+    ///         entries — that would let any regional body bypass governance.
+    ///         Mirrors the contract comment on `removeHashRegional`.
+    function test_removeHashRegional_blocksGlobalRegionEntries() public {
+        // Seed a global entry.
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH);
+
+        // Regional body tries to delete via removeHashRegional with the
+        // GLOBAL_REGION sentinel (must revert with MissingRegion).
+        bytes32 globalRegion = bytes32("GLOBAL");
+        vm.prank(regionalBody);
+        vm.expectRevert(ContentBlacklist.MissingRegion.selector);
+        blacklist.removeHashRegional(globalRegion, SAMPLE_HASH);
+
+        // Entry remains live.
+        assertTrue(blacklist.isHashBlacklisted(SAMPLE_HASH));
     }
 
     /// @notice T-3 — `hasActiveAppeal` clears on lapse from Open and

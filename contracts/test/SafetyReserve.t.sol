@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { SafetyReserve } from "../src/SafetyReserve.sol";
 import { Token } from "../src/Token.sol";
@@ -234,6 +235,130 @@ contract SafetyReserveTest is Test {
         reserve.fastTrackAppeal(appealId);
 
         assertEq(reserve.availableUsdc(), before - MAX_RESTITUTION);
+    }
+
+    // -----------------------------------------------------------------
+    // Access-control guards on governance setters (none were previously
+    // exercised; a refactor that dropped `onlyRole(GOVERNANCE_ROLE)` would
+    // otherwise pass CI silently).
+    // -----------------------------------------------------------------
+
+    function test_setBalancerPool_revertsWithoutRole() public {
+        _expectMissingRole(operator, reserve.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        reserve.setBalancerPool(address(0x1234));
+    }
+
+    function test_setChallengerIncentivePool_revertsWithoutRole() public {
+        _expectMissingRole(operator, reserve.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        reserve.setChallengerIncentivePool(address(0x1234));
+    }
+
+    function test_setAppealBond_revertsWithoutRole() public {
+        _expectMissingRole(operator, reserve.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        reserve.setAppealBond(APPEAL_BOND * 2);
+    }
+
+    function test_setMaxAppealRestitution_revertsWithoutRole() public {
+        _expectMissingRole(operator, reserve.GOVERNANCE_ROLE());
+        vm.prank(operator);
+        reserve.setMaxAppealRestitution(MAX_RESTITUTION * 2);
+    }
+
+    /// @dev See `CapacityBond.t.sol:_expectMissingRole` for rationale.
+    function _expectMissingRole(address caller, bytes32 role) internal {
+        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, caller, role));
+    }
+
+    // -----------------------------------------------------------------
+    // openSlashAppeal — window and frequency-cap guards
+    // -----------------------------------------------------------------
+
+    /// @notice ADR 028 § Filing window — appeals filed more than 30 days
+    ///         after the slash event must revert. Without this guard,
+    ///         stale slashes could be challenged indefinitely.
+    function test_openSlashAppeal_revertsWhenFilingWindowClosed() public {
+        uint64 slashedAt = uint64(block.timestamp);
+        bond.setSlashRecord(0, operator, slashedAt, 50_000e18);
+
+        vm.warp(uint256(slashedAt) + 30 days + 1);
+        vm.prank(appellant);
+        vm.expectRevert(abi.encodeWithSelector(SafetyReserve.FilingWindowClosed.selector, slashedAt));
+        reserve.openSlashAppeal(0, bytes32("e"));
+    }
+
+    /// @notice ADR 028 § Frequency cap — once an operator has had a
+    ///         successful (ratified) appeal, a follow-up appeal within
+    ///         365 days must revert. Rejected/lapsed appeals do NOT consume
+    ///         the slot — see `test_hasActiveAppeal_clearedOnReject` etc.
+    function test_openSlashAppeal_revertsAtFrequencyCap() public {
+        // Slash #0, appeal, fast-track, ratify — fills the frequency slot.
+        bond.setSlashRecord(0, operator, uint64(block.timestamp), 50_000e18);
+        vm.prank(appellant);
+        uint256 appealId = reserve.openSlashAppeal(0, bytes32("e1"));
+        vm.prank(multisig);
+        reserve.fastTrackAppeal(appealId);
+        vm.prank(admin);
+        reserve.ratifyAppeal(appealId);
+
+        // Slash #1 for the SAME operator a few days later.
+        vm.warp(block.timestamp + 10 days);
+        bond.setSlashRecord(1, operator, uint64(block.timestamp), 50_000e18);
+        uint64 lastAccepted = reserve.lastAcceptedAppealAt(operator);
+        uint64 nextAvailable = lastAccepted + 365 days;
+
+        vm.prank(appellant);
+        vm.expectRevert(abi.encodeWithSelector(SafetyReserve.FrequencyCapHit.selector, nextAvailable));
+        reserve.openSlashAppeal(1, bytes32("e2"));
+    }
+
+    // -----------------------------------------------------------------
+    // ADR 036 § Slashing zero-out — reverse clears, ratify does NOT
+    // -----------------------------------------------------------------
+
+    /// @notice Companion to `test_fullAppealFlow_reverseClearsSlashedAtEpoch`:
+    ///         the ratify path MUST leave `slashedAtEpoch` set. Operator gets
+    ///         USDC restitution but keeps the reputation hit — the slash is
+    ///         not retroactively wiped from history.
+    function test_ratifyAppeal_doesNotClearSlashedAtEpoch() public {
+        bond.setSlashRecord(0, operator, uint64(block.timestamp), 50_000e18);
+        bond.setSlashedAtEpoch(operator, 42);
+
+        vm.prank(appellant);
+        uint256 appealId = reserve.openSlashAppeal(0, bytes32("e"));
+        vm.prank(multisig);
+        reserve.fastTrackAppeal(appealId);
+        vm.prank(admin);
+        reserve.ratifyAppeal(appealId);
+
+        assertEq(bond.slashedAtEpoch(operator), 42, "ratify must NOT clear slashedAtEpoch");
+    }
+
+    // -----------------------------------------------------------------
+    // fastTrackAppeal — insufficient-reserve guard
+    // -----------------------------------------------------------------
+
+    /// @notice ADR 032 § Escrow lien invariant — `fastTrackAppeal` must
+    ///         revert when reserve liquidity (minus existing liens) cannot
+    ///         cover the new restitution. Without this guard, the reserve
+    ///         could be over-committed and a subsequent ratify would fail.
+    function test_fastTrackAppeal_revertsWhenReserveInsufficient() public {
+        // Drain the reserve via a queued payout that pulls almost everything.
+        // Reserve balance is 500k; pay out 499k so only 1k remains. The
+        // restitution cap is 100k, so fastTrack must revert.
+        vm.prank(admin);
+        reserve.payout(bytes32("drain"), address(0xDEAD), 499_000e6);
+
+        bond.setSlashRecord(0, operator, uint64(block.timestamp), 50_000e18);
+        vm.prank(appellant);
+        uint256 appealId = reserve.openSlashAppeal(0, bytes32("e"));
+
+        uint256 available = reserve.availableUsdc();
+        vm.prank(multisig);
+        vm.expectRevert(abi.encodeWithSelector(SafetyReserve.InsufficientReserve.selector, available, MAX_RESTITUTION));
+        reserve.fastTrackAppeal(appealId);
     }
 
     /// @notice T-2 — Duplicate `openSlashAppeal(slashId)` must revert with
