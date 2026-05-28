@@ -32,8 +32,10 @@ import { ISafetyReserve } from "./interfaces/ISafetyReserve.sol";
 ///           - `slashedAtEpoch[op]` — stamped in `slash()`, cleared by
 ///                                    `clearSlashedAtEpoch` via
 ///                                    `APPEAL_REVERSAL_ROLE` (ADR 028 / 036)
-///           - `regionPrev[op]` + `regionLastChanged[op]` + `updateRegion`
-///                                    (ADR 030 § Node Region Self-Attestation)
+///           - `regionLastChanged[op]` + `updateRegion`
+///                                    (ADR 030 § Node Region Self-Attestation;
+///                                    prior region is exposed via the
+///                                    `RegionUpdated` event)
 ///           - `declaredMbps[op]`   — operator-asserted capacity (ADR 026
 ///                                    § Capacity-bond curve; bond enforcement
 ///                                    against the curve `bond = k × Mbps^α`
@@ -182,7 +184,6 @@ contract CapacityBond is
     mapping(address operator => uint256 amount) public activeStake;
     mapping(address operator => UnbondingRequest) public unbondingOf;
     mapping(address operator => uint32) public lifetimeOffenseCount;
-    mapping(address operator => uint256) public lastSettlementAt;
     mapping(address operator => bool) public ejected;
 
     /// @notice First-bond-time stamp per operator (ADR 036 § Formula —
@@ -222,12 +223,12 @@ contract CapacityBond is
     // Storage — region attestation (ADR 030)
     // -----------------------------------------------------------------
 
-    /// @notice Previous-region snapshot taken on each `updateRegion` call.
-    mapping(address operator => string) public regionPrev;
-
     /// @notice Last `updateRegion` timestamp; 0 means region has never been
     ///         changed (initial value from `registerNode` is final until the
-    ///         first explicit update).
+    ///         first explicit update). The previous region value lives in the
+    ///         `RegionUpdated(nodeId, oldRegion, newRegion)` event stream — no
+    ///         on-chain consumer reads the prior region back, so it isn't
+    ///         persisted in storage.
     mapping(address operator => uint64) public regionLastChanged;
 
     /// @notice Cooldown enforced between `updateRegion` calls per ADR 030
@@ -293,8 +294,6 @@ contract CapacityBond is
         bytes32 nodeId;
         address ethAddress;
         bool active;
-        uint256 registeredAt;
-        uint256 firstRegisteredAt;
         uint256 lastMultiaddrUpdate;
         bytes multiaddrs;
         string regionHint;
@@ -588,9 +587,10 @@ contract CapacityBond is
     ///         every subsequent call is gated by `regionStabilityWindow`.
     /// @dev    The new region is stored in the operator's `NodeInfo.regionHint`
     ///         so all downstream readers (`getActiveNodes`, off-chain DHT)
-    ///         see the same source of truth. `regionPrev` retains the prior
-    ///         value for the ADR 030 ripening predicate ("blacklist scope
-    ///         applies previous region's entries until window ripens").
+    ///         see the same source of truth. The prior region is surfaced by
+    ///         the `RegionUpdated` event, so the ADR 030 ripening predicate
+    ///         ("blacklist scope applies previous region's entries until
+    ///         window ripens") is satisfied without on-chain snapshot storage.
     function updateRegion(string calldata newRegion) external whenNotPaused {
         if (bytes(newRegion).length > MAX_REGION_HINT_BYTES) {
             revert RegionHintTooLong({ size: bytes(newRegion).length, ceiling: MAX_REGION_HINT_BYTES });
@@ -606,7 +606,6 @@ contract CapacityBond is
         }
 
         string memory oldRegion = info.regionHint;
-        regionPrev[msg.sender] = oldRegion;
         info.regionHint = newRegion;
         regionLastChanged[msg.sender] = uint64(block.timestamp);
 
@@ -813,11 +812,6 @@ contract CapacityBond is
         info.nodeId = nodeId;
         info.ethAddress = msg.sender;
         info.active = true;
-        info.registeredAt = block.timestamp;
-        // slither-disable-next-line incorrect-equality
-        if (info.firstRegisteredAt == 0) {
-            info.firstRegisteredAt = block.timestamp;
-        }
         info.lastMultiaddrUpdate = block.timestamp;
         info.multiaddrs = multiaddrs;
         info.regionHint = regionHint;
@@ -1096,7 +1090,6 @@ contract CapacityBond is
 
     function recordSettlement(address operator) external override onlyRole(SETTLEMENT_REPORTER_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
-        lastSettlementAt[operator] = block.timestamp;
         emit SettlementRecorded(operator);
     }
 
@@ -1248,10 +1241,6 @@ contract CapacityBond is
         address ethAddress = nodeIdToAddress[nodeId];
         if (ethAddress == address(0)) return false;
         return isActive(ethAddress);
-    }
-
-    function getFirstRegisteredAt(address operator) external view returns (uint256) {
-        return _nodes[operator].firstRegisteredAt;
     }
 
     function getActiveNodeCount() external view returns (uint256) {

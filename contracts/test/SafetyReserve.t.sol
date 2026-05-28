@@ -216,13 +216,14 @@ contract SafetyReserveTest is Test {
         assertEq(uint8(reserve.getAppeal(appealId).status), uint8(ISafetyReserve.AppealStatus.Lapsed));
     }
 
-    function test_recordSlashInflow_attributesToOperator() public {
+    function test_recordSlashInflow_emitsAttribution() public {
         bytes32 reporterRole = reserve.SLASH_INFLOW_REPORTER_ROLE();
         vm.prank(admin);
         reserve.grantRole(reporterRole, admin);
+        vm.expectEmit(true, false, false, true, address(reserve));
+        emit SafetyReserve.SlashInflowRecorded(operator, 1500e18);
         vm.prank(admin);
         reserve.recordSlashInflow(operator, 1500e18);
-        assertEq(reserve.slashInflowOf(operator), 1500e18);
     }
 
     function test_availableUsdc_subtractsEscrowLien() public {

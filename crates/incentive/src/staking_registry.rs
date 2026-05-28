@@ -41,14 +41,12 @@ mod sol_types {
             // -----------------------------------------------------------------
 
             /// Per-operator registration record. Mirrors the on-chain
-            /// struct at `contracts/src/StakingRegistry.sol`. Field
+            /// struct at `contracts/src/CapacityBond.sol`. Field
             /// order is part of the ABI; do not rearrange.
             struct NodeInfo {
                 bytes32 nodeId;
                 address ethAddress;
                 bool active;
-                uint256 registeredAt;
-                uint256 firstRegisteredAt;
                 uint256 lastMultiaddrUpdate;
                 bytes multiaddrs;
                 string regionHint;

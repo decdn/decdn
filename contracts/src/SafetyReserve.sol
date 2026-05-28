@@ -101,9 +101,6 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
     PendingClaim[] internal _pendingQueue;
     uint256 internal _pendingHead;
 
-    /// @notice Slash inflow attribution — used by appeal-pinning per ADR 028.
-    mapping(address operator => uint256 totalReceived) public slashInflowOf;
-
     // -----------------------------------------------------------------
     // Appeals (ADR 028 § Contract surface)
     // -----------------------------------------------------------------
@@ -341,7 +338,6 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
         onlyRole(SLASH_INFLOW_REPORTER_ROLE)
     {
         if (operator == address(0)) revert ZeroAddress();
-        slashInflowOf[operator] += amount;
         emit SlashInflowRecorded(operator, amount);
     }
 
@@ -635,7 +631,6 @@ contract SafetyReserve is ISafetyReserve, AccessControl, ReentrancyGuard, Pausab
                 recipient: recipient,
                 usdcAmount: usdcAmount,
                 paidAt: uint64(block.timestamp),
-                paidBy: msg.sender,
                 reason: reason
             })
         );

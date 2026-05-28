@@ -21,7 +21,6 @@ interface ISafetyReserve {
         address recipient;
         uint256 usdcAmount;
         uint64 paidAt;
-        address paidBy;
         bytes32 reason;
     }
 
