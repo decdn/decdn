@@ -1066,7 +1066,7 @@ contract CapacityBond is
     // Slash-zero-out clearing (APPEAL_REVERSAL_ROLE — held by SafetyReserve)
     // -----------------------------------------------------------------
 
-    function clearSlashedAtEpoch(address operator) external onlyRole(APPEAL_REVERSAL_ROLE) {
+    function clearSlashedAtEpoch(address operator) external override onlyRole(APPEAL_REVERSAL_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
         if (_slashedAtEpoch[operator] != 0) {
             _slashedAtEpoch[operator] = 0;
@@ -1205,12 +1205,12 @@ contract CapacityBond is
     }
 
     /// @inheritdoc ICapacityBond
-    function firstBondedAt(address operator) external view returns (uint64) {
+    function firstBondedAt(address operator) external view override returns (uint64) {
         return _firstBondedAt[operator];
     }
 
     /// @inheritdoc ICapacityBond
-    function slashedAtEpoch(address operator) external view returns (uint64) {
+    function slashedAtEpoch(address operator) external view override returns (uint64) {
         return _slashedAtEpoch[operator];
     }
 
@@ -1218,6 +1218,7 @@ contract CapacityBond is
     function slashRecords(uint256 slashId)
         external
         view
+        override
         returns (address operator, uint64 slashedAt_, uint256 slashAmount)
     {
         if (slashId >= slashCounter) revert UnknownSlash(slashId);

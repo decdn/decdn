@@ -10,5 +10,10 @@ pragma solidity 0.8.28;
 ///         arithmetic, which mixes epoch indices from both contracts.
 interface ICapacityBondReporter {
     function recordSettlement(address operator) external;
+    /// @dev Declared `view` (not `pure`) so test mocks can return a
+    ///      constructor-stored value per instance. The production implementor
+    ///      `CapacityBond.epochLength()` narrows to `pure` since `EPOCH_LENGTH`
+    ///      is a `constant`; the FeeRouter constructor's `bondEpoch ==
+    ///      epochLength_` assertion catches deploy-time mismatches regardless.
     function epochLength() external view returns (uint64);
 }
