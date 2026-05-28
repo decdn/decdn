@@ -600,16 +600,21 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     let server_ep_bg = server_ep.clone();
     let handler_bg = Arc::clone(&handler);
     let accept_task = tokio::spawn(async move {
-        let Some(incoming) = server_ep_bg.accept().await else {
-            return;
-        };
-        let Ok(connecting) = incoming.accept() else {
-            return;
-        };
-        let Ok(conn) = connecting.await else {
-            return;
-        };
-        let _ = handler_bg.accept(conn).await;
+        let incoming = server_ep_bg
+            .accept()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no incoming connection"))?;
+        let connecting = incoming
+            .accept()
+            .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+        let conn = connecting
+            .await
+            .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+        handler_bg
+            .accept(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok::<_, anyhow::Error>(())
     });
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -632,7 +637,9 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     }
 
     client_ep.close().await;
-    let _ = accept_task.await;
+    accept_task
+        .await
+        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
     server_ep.close().await;
     Ok(())
 }
