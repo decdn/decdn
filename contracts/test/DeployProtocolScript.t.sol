@@ -37,6 +37,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     uint256 internal constant CHAIN_ID_WRITE = 31_337_694;
     uint256 internal constant CHAIN_ID_REVERT = 31_337_695;
     uint256 internal constant CHAIN_ID_OVERWRITE = 31_337_696;
+    uint256 internal constant CHAIN_ID_RUN_GUARD = 31_337_697;
 
     function setUp() public {
         vm.setEnv("USDC_ADDRESS", vm.toString(TEST_USDC));
@@ -81,7 +82,9 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(cfg.maxMultiaddrSize, DEFAULT_MAX_MULTIADDR_SIZE, "maxMultiaddrSize");
         assertEq(cfg.regionStabilityWindow, DEFAULT_REGION_STABILITY_WINDOW, "regionStability");
         assertEq(cfg.genesisCreditWindow, DEFAULT_GENESIS_CREDIT_WINDOW, "genesisCreditWindow");
-        assertEq(uint256(cfg.feeRouterEpochLength), uint256(DEFAULT_FEE_ROUTER_EPOCH_LENGTH), "epochLen");
+        // Epoch length is fixed (not env-tunable); the deploy suites assert it
+        // matches CapacityBond.EPOCH_LENGTH via the FeeRouter constructor check.
+        assertEq(uint256(cfg.feeRouterEpochLength), uint256(FEE_ROUTER_EPOCH_LENGTH), "epochLen");
         assertEq(uint256(cfg.feeRouterWindowEpochs), uint256(DEFAULT_FEE_ROUTER_WINDOW_EPOCHS), "windowEpochs");
         assertEq(cfg.safetyAppealBond, DEFAULT_SAFETY_APPEAL_BOND, "safetyAppealBond");
         assertEq(cfg.maxAppealRestitution, DEFAULT_MAX_APPEAL_RESTITUTION, "maxAppealRestitution");
@@ -160,6 +163,8 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".externalDeps.emergencyMultisig"), TEST_MULTISIG, "multisig");
 
         assertEq(json.readUint(".chainId"), CHAIN_ID_WRITE, "chainId");
+        assertEq(json.readAddress(".deployer"), cfg.deployer, "deployer");
+        assertEq(json.readUint(".deployBlock"), block.number, "deployBlock");
         assertEq(json.readUint(".config.timelockDelay"), DEFAULT_TIMELOCK_DELAY, "timelockDelay");
         assertEq(json.readUint(".config.minStake"), DEFAULT_MIN_STAKE, "minStake");
 
@@ -231,5 +236,23 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         );
         this.run();
         vm.stopPrank();
+    }
+
+    function test_run_abortsBeforeBroadcastWhenManifestExists() public {
+        // The manifest-overwrite guard must fire BEFORE `vm.startBroadcast`, so a
+        // stale manifest aborts the run without an irreversible on-chain deploy +
+        // governance handoff that would then leave the addresses unrecorded. We
+        // pre-create a manifest and assert `run()` reverts at the writability
+        // check (reached before broadcast, so no prank/broadcast conflict).
+        vm.chainId(CHAIN_ID_RUN_GUARD);
+        string memory path = _manifestPath(CHAIN_ID_RUN_GUARD);
+        vm.writeFile(path, "{}");
+        // tx.origin must be a non-default sender or the forge-default guard trips
+        // first; the prank is consumed before `startBroadcast` is ever reached.
+        vm.startPrank(address(this), address(0xCAFE));
+        vm.expectRevert(abi.encodeWithSelector(DeployProtocol.ManifestAlreadyExists.selector, path));
+        this.run();
+        vm.stopPrank();
+        _cleanupManifest(CHAIN_ID_RUN_GUARD);
     }
 }

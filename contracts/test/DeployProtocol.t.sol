@@ -135,6 +135,19 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertEq(d.reserve.challengerIncentivePool(), challengerPool, "reserve.challengerIncentivePool");
     }
 
+    function test_crossContractWiring_genesisGrantorIsTimelock() public view {
+        // ADR 016 § Post-Deployment Init step 7: the Timelock (treasury custodian)
+        // holds GENESIS_GRANTOR_ROLE so genesis credits are issuable during the
+        // window without a role-grant proposal first. Granted in phase 4 — the
+        // deployer must not retain it after handoff.
+        assertTrue(
+            d.bond.hasRole(d.bond.GENESIS_GRANTOR_ROLE(), address(d.timelock)), "timelock holds GENESIS_GRANTOR_ROLE"
+        );
+        assertFalse(
+            d.bond.hasRole(d.bond.GENESIS_GRANTOR_ROLE(), cfg.deployer), "deployer retains no GENESIS_GRANTOR_ROLE"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Governor / Timelock binding
     // -----------------------------------------------------------------
@@ -209,6 +222,24 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
 
     function externalAssertNoBackDoors(DeployConfig calldata cfg2, Deployment calldata d2) external view {
         _assertNoBackDoors(cfg2, d2);
+    }
+
+    // Negative test for the OTHER half of the symmetric guard: a handoff that
+    // revoked the deployer but failed to grant the Timelock leaves a contract
+    // ungoverned. `setUp` already ran a full, correct handoff (`d`), so we strip
+    // the Timelock's GOVERNANCE_ROLE on the router to simulate that gap. The
+    // deployer holds nothing, so the back-door checks pass and `GovernanceNotHandedOff`
+    // must fire — proving the positive assertion is real, not a no-op.
+    function test_assertNoBackDoors_revertsWhenTimelockMissingRole() public {
+        vm.prank(address(d.timelock));
+        d.router.revokeRole(GOVERNANCE_ROLE, address(d.timelock));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.GovernanceNotHandedOff.selector, address(d.router), GOVERNANCE_ROLE
+            )
+        );
+        this.externalAssertNoBackDoors(cfg, d);
     }
 
     // ZeroAddress fail-fast checks in `_deployTargets`. One test per validated

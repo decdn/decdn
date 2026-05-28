@@ -39,34 +39,48 @@ import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 ///           - `CHALLENGER_INCENTIVE_POOL` — SafetyReserve appeal-bond pool
 ///
 ///         The FeeRouter treasury bucket is NOT an env var: it is the
-///         `TimelockController` this script deploys, so the 10% treasury leg is
-///         Timelock-custodied and disbursed only by governance proposal per
-///         ADR 016 § Deployment Order step 7. Re-pointing it post-deploy requires
-///         a `FeeRouter.setTreasury` proposal through the 48h Timelock.
+///         `TimelockController` this script deploys (step 7 sets it as the
+///         FeeRouter treasury destination), so the 10% treasury leg is
+///         Timelock-custodied and disbursed only by governance proposal (ADR 016
+///         § Deployment Order step 3 / § Contracts Holding Funds). Re-pointing it
+///         post-deploy requires a `FeeRouter.setTreasury` proposal through the
+///         48h Timelock.
 ///
-///         Optional env vars (defaults from ADR 026 / ADR 028 / ADR 009):
-///           - `TIMELOCK_DELAY`             (default 48h)
+///         The FeeRouter epoch length is also NOT an env var: it must equal
+///         `CapacityBond.EPOCH_LENGTH` (a compile-time `7 days` constant the
+///         FeeRouter constructor cross-checks), so it is read from there rather
+///         than a tunable that could only ever be 7 days.
+///
+///         Optional env vars (defaults from ADR 026 / ADR 028 / ADR 009 / 036):
+///           - `TIMELOCK_DELAY`             (default 48h; floor MIN_TIMELOCK_DELAY)
 ///           - `MIN_STAKE`                  (default 50_000e18)
 ///           - `UNBONDING_PERIOD`           (default 14 days)
 ///           - `MULTIADDR_UPDATE_COOLDOWN`  (default 0)
 ///           - `MAX_MULTIADDR_SIZE`         (default 1024)
 ///           - `REGION_STABILITY_WINDOW`    (default 7 days)
 ///           - `GENESIS_CREDIT_WINDOW`      (default 30 days)
-///           - `FEE_ROUTER_EPOCH_LENGTH`    (default 7 days)
-///           - `FEE_ROUTER_WINDOW_EPOCHS`   (default 13)
+///           - `FEE_ROUTER_WINDOW_EPOCHS`   (default 13; bounded [4, 26] per ADR 036)
 ///           - `SAFETY_APPEAL_BOND`         (default 1000e18)
 ///           - `MAX_APPEAL_RESTITUTION`     (default 100_000e6)
 ///           - `BLACKLIST_APPEAL_BOND`      (default 100e18)
 contract DeployProtocol is BaseProtocolDeploy {
     // Defaults — ADR 026 / 028 / 009 values.
     uint256 internal constant DEFAULT_TIMELOCK_DELAY = 48 hours;
+    // Floor below which a Timelock has no meaningful reaction window against a
+    // malicious proposal — guards against an accidental `TIMELOCK_DELAY=0` (which
+    // OZ's TimelockController silently accepts). Production should use the 48h
+    // default per ADR 009; the floor only blocks footgun values.
+    uint256 internal constant MIN_TIMELOCK_DELAY = 1 hours;
     uint256 internal constant DEFAULT_MIN_STAKE = 50_000e18;
     uint256 internal constant DEFAULT_UNBONDING_PERIOD = 14 days;
     uint256 internal constant DEFAULT_MULTIADDR_UPDATE_COOLDOWN = 0;
     uint256 internal constant DEFAULT_MAX_MULTIADDR_SIZE = 1024;
     uint256 internal constant DEFAULT_REGION_STABILITY_WINDOW = 7 days;
     uint256 internal constant DEFAULT_GENESIS_CREDIT_WINDOW = 30 days;
-    uint64 internal constant DEFAULT_FEE_ROUTER_EPOCH_LENGTH = 7 days;
+    // Fixed, NOT env-tunable: must equal `CapacityBond.EPOCH_LENGTH` (also 7 days).
+    // The FeeRouter constructor reverts `EpochLengthMismatch` if they ever drift,
+    // so this constant + that cross-check is the single enforced source of truth.
+    uint64 internal constant FEE_ROUTER_EPOCH_LENGTH = 7 days;
     uint64 internal constant DEFAULT_FEE_ROUTER_WINDOW_EPOCHS = 13;
     uint256 internal constant DEFAULT_SAFETY_APPEAL_BOND = 1000e18;
     uint256 internal constant DEFAULT_MAX_APPEAL_RESTITUTION = 100_000e6;
@@ -93,6 +107,14 @@ contract DeployProtocol is BaseProtocolDeploy {
     ///         intend to broadcast from forge's deterministic fallback EOA.
     error DeployerIsForgeDefaultSender(address sender);
 
+    /// @notice `TIMELOCK_DELAY` was below `MIN_TIMELOCK_DELAY` — a delay that
+    ///         short defeats the governance reaction window (ADR 009).
+    error TimelockDelayTooShort(uint256 provided, uint256 floor);
+
+    /// @notice An optional `uint64` parameter env var exceeded `type(uint64).max`
+    ///         and would have silently truncated on the narrowing cast.
+    error ParamOverflowsUint64(string field, uint256 provided);
+
     /// @dev forge's default `tx.origin` when `--sender` is omitted. Pinned to
     ///      forge-std v1.x's `DEFAULT_SENDER` constant; bump if forge changes it.
     address internal constant FORGE_DEFAULT_SENDER = 0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38;
@@ -100,6 +122,11 @@ contract DeployProtocol is BaseProtocolDeploy {
     function run() external returns (Deployment memory d) {
         DeployConfig memory cfg = _readConfig();
         if (cfg.deployer == FORGE_DEFAULT_SENDER) revert DeployerIsForgeDefaultSender(cfg.deployer);
+        // Fail BEFORE spending gas: a stale manifest with no FORCE_OVERWRITE_MANIFEST
+        // must abort here, not after `_runFullDeploy` has already broadcast the
+        // irreversible deploy + governance handoff (which would leave the deployed
+        // contracts with no recorded address manifest).
+        _assertManifestWritable();
 
         vm.startBroadcast(cfg.deployer);
         d = _runFullDeploy(cfg);
@@ -121,6 +148,9 @@ contract DeployProtocol is BaseProtocolDeploy {
         cfg.deployer = tx.origin;
 
         cfg.timelockDelay = vm.envOr("TIMELOCK_DELAY", DEFAULT_TIMELOCK_DELAY);
+        if (cfg.timelockDelay < MIN_TIMELOCK_DELAY) {
+            revert TimelockDelayTooShort(cfg.timelockDelay, MIN_TIMELOCK_DELAY);
+        }
         cfg.minStake = vm.envOr("MIN_STAKE", DEFAULT_MIN_STAKE);
         cfg.unbondingPeriod = vm.envOr("UNBONDING_PERIOD", DEFAULT_UNBONDING_PERIOD);
         cfg.multiaddrUpdateCooldown = vm.envOr("MULTIADDR_UPDATE_COOLDOWN", DEFAULT_MULTIADDR_UPDATE_COOLDOWN);
@@ -128,10 +158,12 @@ contract DeployProtocol is BaseProtocolDeploy {
         cfg.regionStabilityWindow = vm.envOr("REGION_STABILITY_WINDOW", DEFAULT_REGION_STABILITY_WINDOW);
         cfg.genesisCreditWindow = vm.envOr("GENESIS_CREDIT_WINDOW", DEFAULT_GENESIS_CREDIT_WINDOW);
 
-        uint256 epochLen = vm.envOr("FEE_ROUTER_EPOCH_LENGTH", uint256(DEFAULT_FEE_ROUTER_EPOCH_LENGTH));
-        cfg.feeRouterEpochLength = uint64(epochLen);
-        cfg.feeRouterWindowEpochs =
-            uint64(vm.envOr("FEE_ROUTER_WINDOW_EPOCHS", uint256(DEFAULT_FEE_ROUTER_WINDOW_EPOCHS)));
+        // Epoch length is fixed (see FEE_ROUTER_EPOCH_LENGTH) rather than a
+        // "tunable" env var that could only ever be 7 days.
+        cfg.feeRouterEpochLength = FEE_ROUTER_EPOCH_LENGTH;
+        uint256 windowEpochs = vm.envOr("FEE_ROUTER_WINDOW_EPOCHS", uint256(DEFAULT_FEE_ROUTER_WINDOW_EPOCHS));
+        if (windowEpochs > type(uint64).max) revert ParamOverflowsUint64("FEE_ROUTER_WINDOW_EPOCHS", windowEpochs);
+        cfg.feeRouterWindowEpochs = uint64(windowEpochs);
         cfg.feeRouterShares = [LAUNCH_OPERATOR_SHARE, uint256(0), LAUNCH_TREASURY_SHARE, LAUNCH_SAFETY_SHARE];
         cfg.buybackBurner = address(0);
 
@@ -143,16 +175,30 @@ contract DeployProtocol is BaseProtocolDeploy {
     // -----------------------------------------------------------------
     // Manifest — `deployments/<chainId>.json`.
     //
-    // Schema is intentionally flat + sorted alphabetically within each section
-    // so downstream tooling can read a deterministic structure without needing
-    // a Solidity-side type. `BuybackBurner` is recorded as `address(0)` to
-    // signal "unwired at launch" (see contract header).
+    // Schema is intentionally flat with stable, deterministic keys so downstream
+    // tooling can read it without needing a Solidity-side type. `BuybackBurner`
+    // is recorded as `address(0)` to signal "unwired at launch" (see header).
 
-    function _writeManifest(DeployConfig memory cfg, Deployment memory d) internal {
-        string memory path = string.concat("./deployments/", vm.toString(block.chainid), ".json");
+    /// @dev Manifest path for the active chain. Single source of truth shared by
+    ///      the early writability check (`run`) and the writer.
+    function _manifestPath() internal view returns (string memory) {
+        return string.concat("./deployments/", vm.toString(block.chainid), ".json");
+    }
+
+    /// @dev Reverts if a manifest already exists for this chain and
+    ///      `FORCE_OVERWRITE_MANIFEST` is not set. Called both before broadcast
+    ///      (fail-fast, no gas spent) and inside `_writeManifest` (so direct
+    ///      callers and tests still get the guard).
+    function _assertManifestWritable() internal view {
+        string memory path = _manifestPath();
         if (vm.exists(path) && !vm.envOr("FORCE_OVERWRITE_MANIFEST", false)) {
             revert ManifestAlreadyExists(path);
         }
+    }
+
+    function _writeManifest(DeployConfig memory cfg, Deployment memory d) internal {
+        _assertManifestWritable();
+        string memory path = _manifestPath();
         string memory contracts = "contracts";
         vm.serializeAddress(contracts, "BuybackBurner", address(0));
         vm.serializeAddress(contracts, "CapacityBond", address(d.bond));

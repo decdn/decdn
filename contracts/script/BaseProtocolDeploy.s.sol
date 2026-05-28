@@ -21,7 +21,7 @@ import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 
 /// @title BaseProtocolDeploy
 /// @notice Abstract deploy primitive for the v3 contract surface. Performs the
-///         five-phase deploy described in ADR 016 § Deployment Order and
+///         six-phase deploy described in ADR 016 § Deployment Order and
 ///         Initialization Dependencies + § Post-Deployment Initialization, then
 ///         asserts the deployer EOA holds no role on any target. Inherited by
 ///         `DeployProtocol.s.sol` (the env-var production script) and
@@ -31,8 +31,12 @@ import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 /// @dev    Phases:
 ///           1. `_deployTimelock`        — TimelockController (deployer as admin;
 ///                                         empty proposers; open executor).
-///                                         Deployed first (ADR 016 § Deployment
-///                                         Order step 3) so its address is the
+///                                         ADR 016 § Deployment Order step 3
+///                                         (TOKEN/USDC precede it in the ADR, but
+///                                         TOKEN is co-deployed in phase 2 and
+///                                         USDC is an external input — so the
+///                                         Timelock is first among this script's
+///                                         deploys) so its address is the
 ///                                         FeeRouter treasury bucket destination
 ///                                         (the treasury is Timelock-custodied per
 ///                                         ADR 016) and the eventual
@@ -85,8 +89,9 @@ abstract contract BaseProtocolDeploy is Script {
         IERC20 usdc;
         IEd25519Verifier ed25519Verifier;
         // Roles + recipients. The FeeRouter treasury bucket is not a config
-        // field: it is always the TimelockController deployed by this script
-        // (Timelock-custodied treasury per ADR 016 § Deployment Order step 7).
+        // field: it is always the TimelockController deployed by this script —
+        // the FeeRouter treasury destination (ADR 016 § Deployment Order step 7),
+        // which is Timelock-custodied (step 3 / § Contracts Holding Funds).
         address deployer;
         address emergencyMultisig;
         address initialTokenHolder;
@@ -131,6 +136,13 @@ abstract contract BaseProtocolDeploy is Script {
     ///         the deployer EOA retaining god-mode on production contracts,
     ///         which is exactly the failure mode #694 closes.
     error DeployerStillHoldsRole(address target, bytes32 role);
+    /// @notice Post-deploy invariant — the Timelock does NOT hold `role` on
+    ///         `target` (or the Timelock does not self-administer). Catches the
+    ///         mirror failure of `DeployerStillHoldsRole`: a handoff that revoked
+    ///         the deployer but never granted the Timelock would strand the
+    ///         contract ungoverned. Asserting both directions makes the in-script
+    ///         guard symmetric with the test role matrix.
+    error GovernanceNotHandedOff(address target, bytes32 role);
 
     function _runFullDeploy(DeployConfig memory cfg) internal returns (Deployment memory d) {
         TimelockController timelock = _deployTimelock(cfg);
@@ -257,6 +269,14 @@ abstract contract BaseProtocolDeploy is Script {
         // such constructor path, so grant explicitly.
         d.blacklist.grantRole(d.blacklist.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
 
+        // GENESIS_GRANTOR_ROLE → the Timelock (treasury custodian), which issues
+        // Genesis Bond Credits during GENESIS_CREDIT_WINDOW (ADR 016 § Post-
+        // Deployment Init step 7). CapacityBond's window clock starts at
+        // construction, so granting here — before the handoff — avoids burning
+        // ~10 days of a 30-day window on a governance proposal just to enable the
+        // grantor. Governance may revoke the role after the window for hygiene.
+        d.bond.grantRole(d.bond.GENESIS_GRANTOR_ROLE(), address(d.timelock));
+
         _postWiringHook(cfg, d);
     }
 
@@ -272,8 +292,7 @@ abstract contract BaseProtocolDeploy is Script {
     // strands the contract (no holder of either role) and locks out every
     // governance setter until a recovery deploy.
     function _handOffGovernance(DeployConfig memory cfg, Deployment memory d) internal {
-        IAccessControl[5] memory targets =
-            [IAccessControl(address(d.router)), d.bond, d.blacklist, d.reserve, d.registry];
+        IAccessControl[5] memory targets = _governedTargets(d);
         address tl = address(d.timelock);
         for (uint256 i = 0; i < targets.length; i++) {
             targets[i].grantRole(GOVERNANCE_ROLE, tl);
@@ -285,20 +304,42 @@ abstract contract BaseProtocolDeploy is Script {
         d.timelock.renounceRole(d.timelock.DEFAULT_ADMIN_ROLE(), cfg.deployer);
     }
 
-    // Phase 6 — post-deploy invariant.
+    // Phase 6 — post-deploy invariant. Symmetric check: the deployer holds
+    // neither privileged role on any target (no back door), AND the Timelock
+    // holds both on every target plus self-administers (governance is live, not
+    // stranded). A handoff that revoked the deployer but skipped a Timelock grant
+    // would pass the back-door half yet leave a contract ungoverned.
     function _assertNoBackDoors(DeployConfig memory cfg, Deployment memory d) internal view {
-        IAccessControl[5] memory targets =
-            [IAccessControl(address(d.router)), d.bond, d.blacklist, d.reserve, d.registry];
+        IAccessControl[5] memory targets = _governedTargets(d);
+        address tl = address(d.timelock);
         for (uint256 i = 0; i < targets.length; i++) {
+            address target = address(targets[i]);
             if (targets[i].hasRole(GOVERNANCE_ROLE, cfg.deployer)) {
-                revert DeployerStillHoldsRole(address(targets[i]), GOVERNANCE_ROLE);
+                revert DeployerStillHoldsRole(target, GOVERNANCE_ROLE);
             }
             if (targets[i].hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
-                revert DeployerStillHoldsRole(address(targets[i]), DEFAULT_ADMIN_ROLE);
+                revert DeployerStillHoldsRole(target, DEFAULT_ADMIN_ROLE);
+            }
+            if (!targets[i].hasRole(GOVERNANCE_ROLE, tl)) {
+                revert GovernanceNotHandedOff(target, GOVERNANCE_ROLE);
+            }
+            if (!targets[i].hasRole(DEFAULT_ADMIN_ROLE, tl)) {
+                revert GovernanceNotHandedOff(target, DEFAULT_ADMIN_ROLE);
             }
         }
         if (d.timelock.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
-            revert DeployerStillHoldsRole(address(d.timelock), DEFAULT_ADMIN_ROLE);
+            revert DeployerStillHoldsRole(tl, DEFAULT_ADMIN_ROLE);
         }
+        // The Timelock must self-administer, or its own role surface is stranded.
+        if (!d.timelock.hasRole(DEFAULT_ADMIN_ROLE, tl)) {
+            revert GovernanceNotHandedOff(tl, DEFAULT_ADMIN_ROLE);
+        }
+    }
+
+    /// @dev The five GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE-bearing targets handed
+    ///      off to the Timelock — single source of truth for `_handOffGovernance`
+    ///      and `_assertNoBackDoors` so the governed set can't drift between them.
+    function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[5] memory) {
+        return [IAccessControl(address(d.router)), d.bond, d.blacklist, d.reserve, d.registry];
     }
 }
