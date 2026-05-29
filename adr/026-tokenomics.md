@@ -73,9 +73,9 @@ Eleven groups summing to 100%.
 | Public Sale | 5% |
 | **Total fully unlocked at TGE** | **25%** |
 
-This is the *unlock* set, not the *circulating sell-side float*. Of the 25% unlocked, only ~5–10% is circulating float — POL sits as a non-circulating treasury-owned LP position (removable only by governance) and the Market-Making allocation is a market-neutral two-sided position; both are "Not a seller" per [§ Sell-pressure profile](#sell-pressure-profile). Public Sale (≤5%) is the only fully-unlocked group that is a net seller.
+This is the *unlock* set, not the *circulating sell-side float*. Of the 25% unlocked, only ~5–10% is circulating float — POL sits as a non-circulating treasury-owned LP position (removable only by governance) and the Market Making allocation is a market-neutral two-sided position; both are "Not a seller" per [§ Sell-pressure profile](#sell-pressure-profile). Public Sale (≤5%) is the only fully-unlocked group that is a net seller.
 
-The two remaining groups with no formal cliff/linear schedule — Misc. Marketing, PR, and KOLs (ad-hoc Treasury spend within the annual budget cap) and Exchange Partnerships (milestone-gated to CEX listings) — are **not** part of the TGE unlock set: neither is dumped at genesis. Misc Marketing releases only as it is spent; Exchange Partnerships releases only as milestones are met. Hence three fully-unlocked groups, not five.
+The two remaining groups with no formal cliff/linear schedule — Misc. Marketing, PR, and KOLs (ad-hoc Treasury spend within the annual budget cap) and Exchange Partnerships (milestone-gated to CEX listings) — are **not** part of the TGE unlock set. "Fully unlocked" here means tokens enter external/circulating hands at genesis, not merely the absence of a vesting schedule: both stay in Treasury custody and leave it only as spent (Misc. Marketing) or as milestones are met (Exchange Partnerships), so neither is dumped at genesis. Hence three fully-unlocked groups, not five.
 
 **Genesis liquid float (TGE Day 1).**
 
@@ -105,7 +105,7 @@ A qualitative economic-modeling lens over the [§ Allocation](#allocation) table
 | Advisors | 3% | Aggressive | Yes |
 | Exchange Partnerships | 3% | Not a seller | No |
 
-**Rollup.** Potential sellers = 72% (7 groups: Core Contributors, DAO Treasury, App Incentives, Seed, Private, Public Sale, Advisors); not-a-seller = 28% (4 groups: POL, Market Making, Misc Marketing, Exchange Partnerships). The Aggressive groups are the investor, advisor, and public-sale allocations whose tokens reach the holder fastest — short-cliff (Seed/Private 6mo, Advisors 6mo) or genesis-liquid (Public Sale) — relative to their cost basis; the not-a-seller groups are protocol-owned or market-neutral positions (POL is governance-locked liquidity; Market Making is two-sided; Misc Marketing and Exchange Partnerships are spent into the ecosystem rather than sold).
+**Rollup.** Potential sellers = 72% (7 groups: Core Contributors, DAO Treasury, App Incentives, Seed, Private, Public Sale, Advisors); not-a-seller = 28% (4 groups: POL, Market Making, Misc. Marketing, Exchange Partnerships). The Aggressive groups are the investor, advisor, and public-sale allocations whose tokens reach the holder fastest — short-cliff (Seed/Private 6mo, Advisors 6mo) or genesis-liquid (Public Sale) — relative to their cost basis; the not-a-seller groups are protocol-owned or market-neutral positions (POL is governance-locked liquidity; Market Making is two-sided; Misc. Marketing and Exchange Partnerships are spent into the ecosystem rather than sold).
 
 #### No auto-bond on vest
 
