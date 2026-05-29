@@ -6,11 +6,59 @@ import { Test } from "forge-std/Test.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { Token } from "../src/Token.sol";
 import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
+import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 
+import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 import { MockSafetyReserve } from "./mocks/MockSafetyReserve.sol";
+
+/// @notice Test-only `CapacityBond` subclass exposing the internal
+///         stake-reduction logic so the C2 defensive remainder-clip branch in
+///         `_reduceStakeAtTier` (`CapacityBond.sol:960-963`) can be exercised
+///         directly. That branch is unreachable through the public `slash()`
+///         API: it fires only when `slashAmount > totalAtRisk`, i.e.
+///         `tierBps > 10_000` (>100%), and the immutable slash ladder maxes at
+///         5_000 (50%). It exists as a forward-guard for a hypothetical future
+///         tier schedule, so the only honest way to cover it is to drive the
+///         internal call with an out-of-ladder `tierBps`.
+contract TestableCapacityBond is CapacityBond {
+    constructor(
+        ERC20Burnable token_,
+        IEd25519Verifier ed25519Verifier_,
+        address admin,
+        uint256 minStake_,
+        uint256 unbondingPeriod_,
+        uint256 multiaddrUpdateCooldown_,
+        uint256 maxMultiaddrSize_,
+        uint256 regionStabilityWindow_,
+        uint256 genesisCreditWindow_
+    )
+        CapacityBond(
+            token_,
+            ed25519Verifier_,
+            admin,
+            minStake_,
+            unbondingPeriod_,
+            multiaddrUpdateCooldown_,
+            maxMultiaddrSize_,
+            regionStabilityWindow_,
+            genesisCreditWindow_
+        )
+    { }
+
+    /// @dev Write active + unbonding stake directly so the clip test needn't
+    ///      plumb tokens and the unbonding period through the public API.
+    function setStakeState(address operator, uint256 active, uint256 unbonding) external {
+        activeStake[operator] = active;
+        unbondingOf[operator].amount = unbonding;
+    }
+
+    function exposed_reduceStakeAtTier(address operator, uint256 tierBps) external returns (uint256) {
+        return _reduceStakeAtTier(operator, tierBps);
+    }
+}
 
 /// @title CapacityBond smoke tests
 /// @notice Minimal coverage of the new ADR 036/028/030/026-v2.2 surface:
@@ -116,6 +164,134 @@ contract CapacityBondTest is Test {
         bond.clearSlashedAtEpoch(operator);
         vm.stopPrank();
         assertEq(bond.slashedAtEpoch(operator), 0);
+    }
+
+    // ── Slashing-lifecycle coverage (issue #703) ────────────────────────────
+
+    /// Slash the same operator 3× and assert the tier ladder escalates
+    /// 5% → 15% → 50% (`SLASH_BPS_TIER_1/2/3`) driven by `lifetimeOffenseCount`.
+    /// No genesis credit, so `creditSlash == 0` and the reductions are pure
+    /// active-stake math. Start at 160k so even after the 50% tier the active
+    /// balance (64.6k) stays above the `minStake/2` (25k) auto-eject floor.
+    function test_slash_tierEscalation_15then50pct() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.stake(160_000e18);
+
+        // Tier 1: 5% of 160k = 8k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 1);
+        assertEq(bond.activeStake(operator), 152_000e18);
+
+        // Tier 2: 15% of 152k = 22.8k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 2);
+        assertEq(bond.activeStake(operator), 129_200e18);
+
+        // Tier 3 (3rd+ offense): 50% of 129.2k = 64.6k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 3);
+        assertEq(bond.activeStake(operator), 64_600e18);
+    }
+
+    /// Tier-3 slash against an operator holding BOTH active and unbonding stake
+    /// where `unbonding > active`, so the slash exhausts active first and taps
+    /// unbonding for the remainder (the reachable `else` branch of
+    /// `_reduceStakeAtTier`). The literal remainder-clip inside that branch is
+    /// unreachable here (it needs `tierBps > 100%`); see
+    /// `test_reduceStakeAtTier_remainderClip` for that path.
+    function test_slash_tier3_mixedStake_exhaustsActiveTapsUnbonding() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.stake(100_000e18);
+
+        // Bump lifetimeOffenseCount to 2 so the next slash lands at tier 3.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1); // 5% → 95k active
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1); // 15% of 95k → 80.75k active
+        assertEq(bond.activeStake(operator), 80_750e18);
+
+        // Move most stake into unbonding so unbonding (60k) > active (20.75k).
+        vm.prank(operator);
+        bond.requestUnstake(60_000e18);
+        assertEq(bond.activeStake(operator), 20_750e18);
+
+        // Tier 3: totalAtRisk = 80.75k, slashAmount = 40.375k > active 20.75k.
+        // Active is zeroed; remainder (19.625k) comes out of unbonding, leaving
+        // 60k − 19.625k = 40.375k. No underflow, no clip.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 3);
+        assertEq(bond.activeStake(operator), 0);
+        (uint256 unbondingAmt,) = bond.unbondingOf(operator);
+        assertEq(unbondingAmt, 40_375e18);
+    }
+
+    /// Directly exercise the C2 defensive remainder-clip in `_reduceStakeAtTier`
+    /// (`CapacityBond.sol:960-963`). It is unreachable through `slash()` — the
+    /// clip fires only when `slashAmount > totalAtRisk`, i.e. `tierBps > 10_000`
+    /// (>100%), and the immutable ladder maxes at 5_000 (50%). Drive it via the
+    /// harness with `tierBps = 12_000` to prove it caps `slashAmount` to the
+    /// at-risk total (no over-transfer) and never underflows the unbonding pool.
+    function test_reduceStakeAtTier_remainderClip() public {
+        TestableCapacityBond harness = new TestableCapacityBond({
+            token_: token,
+            ed25519Verifier_: ed25519,
+            admin: admin,
+            minStake_: MIN_STAKE,
+            unbondingPeriod_: UNBONDING,
+            multiaddrUpdateCooldown_: 0,
+            maxMultiaddrSize_: 1024,
+            regionStabilityWindow_: 7 days,
+            genesisCreditWindow_: 30 days
+        });
+
+        harness.setStakeState(operator, 100e18, 100e18);
+        // totalAtRisk = 200e18; 120% → slashAmount would be 240e18 > totalAtRisk
+        // → clip clamps remainder to req.amount and re-derives slashAmount.
+        uint256 slashed = harness.exposed_reduceStakeAtTier(operator, 12_000);
+        assertEq(slashed, 200e18); // capped to at-risk, not 240e18
+        assertEq(harness.activeStake(operator), 0);
+        (uint256 unbondingAmt,) = harness.unbondingOf(operator);
+        assertEq(unbondingAmt, 0);
+    }
+
+    /// A successful appeal reversal (`SafetyReserve.reverseAppeal` →
+    /// `clearSlashedAtEpoch`) must re-enable `claimVestedCredit` IMMEDIATELY,
+    /// inside the original slash gate window — without waiting for the
+    /// 13-epoch gate to expire naturally. This is the cross-contract recovery
+    /// semantics ADR 028/036 promise.
+    function test_appealReversal_unlocksClaimBeforeGateExpiry() public {
+        vm.warp(2 * 7 days);
+        _setupGenesisGrant(100_000e18);
+        vm.prank(operator);
+        bond.stake(MIN_STAKE);
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertGt(bond.slashedAtEpoch(operator), 0);
+
+        // Inside the gate window the claim is blocked.
+        vm.warp(block.timestamp + 4 weeks);
+        vm.prank(operator);
+        vm.expectRevert();
+        bond.claimVestedCredit();
+
+        // Appeal reversal clears the stamp (simulating SafetyReserve).
+        bytes32 reversalRole = bond.APPEAL_REVERSAL_ROLE();
+        vm.startPrank(admin);
+        bond.grantRole(reversalRole, admin);
+        bond.clearSlashedAtEpoch(operator);
+        vm.stopPrank();
+        assertEq(bond.slashedAtEpoch(operator), 0);
+
+        // Without advancing past the gate, the claim now succeeds.
+        vm.prank(operator);
+        bond.claimVestedCredit();
+        assertGt(bond.pendingCredit(operator).claimed, 0);
     }
 
     function test_declaredMbps_storesValue() public {
