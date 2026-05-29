@@ -18,6 +18,9 @@
 /contracts/broadcast/
 /contracts/docs/
 
+# solc compiler blob (downloaded for local Solidity builds)
+/soljson-latest.js
+
 # ADR PDF build output
 /adr/adrs.pdf
 /adr/adrs-book.pdf
