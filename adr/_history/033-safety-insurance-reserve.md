@@ -1,7 +1,9 @@
 # ADR 033: Safety and Insurance Reserve
 
+> **Status:** Retired 2026-05-29 under the SafetyReserve removal. The standing USDC insurance pool, the four payout gates, the `payout()` interface, the pending-claim queue, and the TOKEN→USDC swap are all removed. Slash restitution is now handled by **escrow-on-slash** in [ADR 026 § Slashing and burn](../026-tokenomics.md#slashing-and-burn) (the slashed TOKEN is escrowed in `CapacityBond` and refunded to the operator on a successful appeal — no pool needed); the slash-appeal state machine moves to the `SlashAppeal` contract per [ADR 028](../028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation). The freed 5% FeeRouter bucket folds into buyback-and-burn (25%→30%). Downtime / bad-data user recourse is no longer a protocol contract surface — it is handled, if ever needed, via DAO Treasury governance. Original ADR body preserved verbatim below for historical reference; do not link to from canonical ADRs.
+
 **Date:** 2026-04-25
-**Status:** Draft
+**Status (pre-retirement):** Draft
 
 ## Context
 

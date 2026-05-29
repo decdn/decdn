@@ -96,7 +96,7 @@ interface ISlashJudge {
     /// per offense type in the "`Slashed` event and `slashId` allocation" sub-section
     /// below). Signatures excluded — the typed-data digests they sign already
     /// uniquely determine the evidence.
-    /// Consumed by `SafetyReserve.openSlashAppeal(slashId, evidenceBundleHash)` per ADR 028 § Contract surface.
+    /// Consumed by `SlashAppeal.openSlashAppeal(slashId, evidenceBundleHash)` per ADR 028 § Contract surface.
     event Slashed(
         uint256 indexed slashId,
         address indexed operator,
@@ -207,7 +207,7 @@ Every slash that reduces operator stake emits `Slashed(slashId, operator, offens
   Each `*StructHash` is the EIP-712 struct hash of the corresponding `*Response` per [§ Slash Signatures — secp256k1 EIP-712](#slash-signatures--secp256k1-eip-712) (head-only `bytes32` — `abi.encode` adds no padding to a fixed-width 32-byte value). Appeals reference `evidenceHash` to prove they challenge the same evidence the slash relied on; [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface) `openSlashAppeal(slashId, evidenceBundleHash)` requires `evidenceBundleHash == evidenceHash` of the referenced `Slashed` event.
 - **Emission sites.** All three offenses are immediate: `Slashed` is emitted from the synchronous `submit*Challenge` paths immediately after the inline `CapacityBond.slash()` returns. The "`CapacityBond.slash()` then `emit Slashed`" sequence is contract-enforced atomic (single transaction); a slash without a matching event is impossible.
 
-The companion `SafetyReserve` events (`SlashAppealOpened`, `SlashAppealRatified`, etc.) remain forward-referenced to a future contract-implementation ADR per [ADR 028 § Cross-ADR Impact](028-slashing-appeals.md#cross-adr-impact); only `Slashed` itself is canonicalised here.
+The companion `SlashAppeal` events (`AppealOpened`, `AppealGranted`, etc.) are specified in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface); only `Slashed` itself is canonicalised here.
 
 #### Gas Estimates
 
@@ -234,7 +234,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 
 **CapacityBond ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 003](003-payments.md#adr-003-payment-model), [ADR 026 § Operator economics](026-tokenomics.md#operator-economics)):**
 
-- Adds `slash(address operator, address challenger, uint8 offenseType) external returns (uint256 slashAmount)` callable only by the `SlashJudge` contract address (`SLASH_ROLE`). Implements the escalating schedule from [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5% / 15% / 50% indexed by a `uint32` monotonic lifetime offense counter. The slashed amount is split inline as 50% to `challenger` / 30% to `SafetyReserve` / 20% burn; the SafetyReserve leg calls `safeTransfer` then `SafetyReserve.recordSlashInflow(operator, share)`, which requires `SLASH_INFLOW_REPORTER_ROLE` on the reserve per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization) step 3. Reverts if the SafetyReserve address has not been wired. Checks auto-ejection threshold (50% of the minimum bond for the operator's declared tier per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) on the post-slash bonded balance; the returned `slashAmount` is the canonical figure consumed by the `Slashed` event on `SlashJudge`.
+- Adds `slash(address operator, address challenger, uint8 offenseType) external returns (uint256 slashId, uint256 slashAmount)` callable only by the `SlashJudge` contract address (`SLASH_ROLE`). Implements the escalating schedule from [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5% / 15% / 50% indexed by a `uint32` monotonic lifetime offense counter. Under escrow-on-slash the slashed amount is moved into a per-`slashId` escrow held by `CapacityBond` — nothing is transferred or burned inline. The escrow is distributed (50% challenger / 50% burn) by `finalizeUnappealedSlash` after the filing window, or resolved by the `SlashAppeal` settle hooks. Checks auto-ejection threshold (50% of the minimum bond for the operator's declared tier per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) on the post-slash bonded balance; the returned `slashAmount` is the canonical figure consumed by the `Slashed` event on `SlashJudge`.
 - No new fields in `NodeInfo` for PoC — the existing `msg.sender` Ethereum address serves as the slash key.
 
 **PaymentChannel ([ADR 003](003-payments.md#adr-003-payment-model)):**
@@ -261,4 +261,4 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - The `slash_sig` field adds ~65 bytes per `ProbeResponse` and `StreamResponse`. For probe messages this is meaningful overhead; for stream responses preceding multi-MB deliveries, it is negligible.
 - Off-chain verifiers (clients, requesting nodes, third-party fraud detectors) must `ecrecover` and look up `CapacityBond.nodeIdOf(recovered)` to attribute a message to a NodeId, rather than verifying directly against the iroh key. These parties already maintain the binding cache for voucher attribution, so the marginal cost is one extra map lookup per verification.
 - Cross-contract replay is prevented by per-contract EIP-712 domains, but implementers must configure domain separators correctly at deployment.
-- The [§ SlashJudge Contract](#slashjudge-contract) `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface — small but real: every slash path emits the event atomically with `CapacityBond.slash()`, and the `OffenseType` ordering is contract-canonical (any reordering requires coordinated migration of `SafetyReserve` per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)).
+- The [§ SlashJudge Contract](#slashjudge-contract) `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface — small but real: every slash path emits the event atomically with `CapacityBond.slash()`, and the `OffenseType` ordering is contract-canonical (any reordering requires coordinated migration of `SlashAppeal` per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)).

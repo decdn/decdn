@@ -157,9 +157,9 @@ These are the canonical forms of the identical names in [ADR 015](015-zero-rtt.m
 
 #### Tokenomics Metrics
 
-Per [ADR 026](026-tokenomics.md#adr-026-tokenomics). These metrics expose the `FeeRouter`, `CapacityBond`, and `SafetyReserve` contract surfaces to operator dashboards, keeper monitoring, governance dashboards, and the public reporting required by the `SafetyReserve` transparency rules ([ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket), [ADR 009](009-governance.md#adr-009-governance-model)).
+Per [ADR 026](026-tokenomics.md#adr-026-tokenomics). These metrics expose the `FeeRouter`, `CapacityBond`, and `SlashAppeal` contract surfaces to operator dashboards, keeper monitoring, and governance dashboards ([ADR 009](009-governance.md#adr-009-governance-model)).
 
-A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `SafetyReserve`, `BuybackBurner`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
+A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `SlashAppeal`, `BuybackBurner`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
 
 ##### FeeRouter Metrics
 
@@ -196,14 +196,13 @@ Per [ADR 026 § Genesis Bond Credits](026-tokenomics.md#genesis-bond-credits): a
 | `decdn_fee_router_total_bytes_in_window` | Gauge | R | `window={windowEpochs}` | `FeeRouter.totalBytesInWindow(currentEpoch, windowEpochs)` (RPC) | Governance dashboard | Network-wide sum of served bytes over the trailing `windowEpochs` window — the quorum / proposal-threshold denominator per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). |
 | `decdn_capacity_bond_active_operator_count` | Gauge | R | — | `CapacityBond.getActiveNodeCount()` (RPC) | Governance dashboard, bootstrap-multisig transition tracking | Active operator count; gates the bootstrap-multisig → DAO transition (≥30 operators AND ≥100 Gbps per [ADR 009](009-governance.md#bootstrap-multisig-phase)). The NodeId↔Ethereum-address binding is 1:1 ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)), so active-node count and active-operator count coincide. |
 
-##### SafetyReserve Metrics
+##### Slash-Escrow / SlashAppeal Metrics
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_safety_reserve_balance_usdc` | Gauge | R | — | `SafetyReserve.balance()` (RPC) | Public dashboard, governance, enterprise-tier credibility | Current USDC balance of the `SafetyReserve` contract. Public-transparency requirement per [ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket). |
-| `decdn_safety_reserve_incidents` | Gauge | R | `state={pending,approved,disputed}` | `SafetyReserve` incident-registry (RPC) | Public incident registry, governance dashboard | Incident count per registry state. `pending` = bundle filed, awaiting governance/multisig action; `approved` = approved for payout (within or after 48h appeal window); `disputed` = under on-chain challenge. |
-| `decdn_safety_reserve_payouts_total` | Counter | R | — | `SafetyReserve.payout` events | Public registry, governance reporting | Cumulative executed payouts across the reserve's lifetime. |
-| `decdn_safety_reserve_outflow_usdc_total` | Counter | R | — | `SafetyReserve.payout` events | Public registry, governance reporting | Cumulative USDC paid out across all approved incidents. |
+| `decdn_slash_escrow_total_token` | Gauge | R | — | `CapacityBond.escrowedTotal()` (RPC) | Governance dashboard, keeper monitoring | Total slashed TOKEN currently held in escrow (status `Escrowed` or `AppealOpen`), awaiting finality or appeal resolution per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn). |
+| `decdn_slash_appeals` | Gauge | R | `state={open,fastTracked,resolved}` | `SlashAppeal` records (RPC) | Public dashboard, governance | Slash-appeal count per state. `open` = filed, awaiting multisig review; `fastTracked` = multisig granted interim relief, awaiting Governor; `resolved` = granted/upheld/lapsed. |
+| `decdn_slash_finalized_total` | Counter | R | `outcome={upheld,granted}` | `CapacityBond` `SlashUpheld` / `SlashReversed` events | Public dashboard, governance reporting | Cumulative finalized slashes by outcome (upheld → 50/50 distributed; granted → refunded to operator). |
 
 #### DHT / Content-Discovery Metrics
 

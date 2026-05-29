@@ -48,7 +48,6 @@ contract FeeRouterTest is Test {
     address internal channel = address(0xCAFE);
     address internal operator = address(0xB0B);
     address internal treasury = address(0xD7);
-    address internal safety = address(0x5A);
     address internal buyback = address(0xBB);
 
     uint64 internal constant EPOCH = 7 days;
@@ -57,8 +56,8 @@ contract FeeRouterTest is Test {
         usdc = new MockUSDC();
         bondReporter = new MockBondReporter(EPOCH);
 
-        // 6000 / 2500 / 1000 / 500 — ADR 026 steady-state default.
-        uint256[4] memory shares = [uint256(6000), uint256(2500), uint256(1000), uint256(500)];
+        // 6000 / 3000 / 1000 — ADR 026 steady-state default.
+        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
 
         router = new FeeRouter({
             usdc_: usdc,
@@ -68,7 +67,6 @@ contract FeeRouterTest is Test {
             windowEpochs_: 13,
             admin: admin,
             initialShares: shares,
-            safetyReserve_: safety,
             buybackBurner_: buyback
         });
 
@@ -82,7 +80,7 @@ contract FeeRouterTest is Test {
         usdc.approve(address(router), type(uint256).max);
     }
 
-    function test_routeSettlement_distributesFourLegs() public {
+    function test_routeSettlement_distributesThreeLegs() public {
         uint256 amount = 1000e6;
         uint256 bytesDelivered = 100_000_000;
 
@@ -90,11 +88,10 @@ contract FeeRouterTest is Test {
         vm.prank(channel);
         router.routeSettlement(operator, bytesDelivered, amount);
 
-        // Shares: 6000/2500/1000/500.
+        // Shares: 6000/3000/1000.
         assertEq(usdc.balanceOf(operator), 600e6);
-        assertEq(usdc.balanceOf(buyback), 250e6);
+        assertEq(usdc.balanceOf(buyback), 300e6);
         assertEq(usdc.balanceOf(treasury), 100e6);
-        assertEq(usdc.balanceOf(safety), 50e6);
 
         // Settlement reporter invoked.
         assertEq(bondReporter.reportedCount(), 1);
@@ -143,17 +140,17 @@ contract FeeRouterTest is Test {
     }
 
     function test_setShares_rejectsSumNot10000() public {
-        uint256[4] memory bad = [uint256(5000), uint256(2500), uint256(1000), uint256(500)];
+        uint256[3] memory bad = [uint256(5000), uint256(3000), uint256(1000)];
         vm.prank(admin);
         vm.expectRevert();
         router.setShares(bad);
     }
 
     function test_setShares_rejectsNonZeroShareWithoutDestination() public {
-        // Clear safety reserve while non-zero share — should revert.
+        // Clear buyback burner while its share is non-zero — should revert.
         vm.startPrank(admin);
         vm.expectRevert();
-        router.setSafetyReserve(address(0));
+        router.setBuybackBurner(address(0));
         vm.stopPrank();
     }
 
@@ -186,25 +183,19 @@ contract FeeRouterTest is Test {
     // -----------------------------------------------------------------
 
     function test_setShares_revertsWithoutRole() public {
-        uint256[4] memory shares = [uint256(6000), uint256(2500), uint256(1000), uint256(500)];
+        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
         _expectMissingRole(operator, router.GOVERNANCE_ROLE());
         vm.prank(operator);
         router.setShares(shares);
     }
 
     function test_setSharesAndDestinations_revertsWithoutRole() public {
-        uint256[4] memory shares = [uint256(6000), uint256(2500), uint256(1000), uint256(500)];
+        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
         FeeRouter.ShareDestinations memory dests =
-            FeeRouter.ShareDestinations({ safetyReserve: safety, buybackBurner: buyback, treasury: treasury });
+            FeeRouter.ShareDestinations({ buybackBurner: buyback, treasury: treasury });
         _expectMissingRole(operator, router.GOVERNANCE_ROLE());
         vm.prank(operator);
         router.setSharesAndDestinations(shares, dests);
-    }
-
-    function test_setSafetyReserve_revertsWithoutRole() public {
-        _expectMissingRole(operator, router.GOVERNANCE_ROLE());
-        vm.prank(operator);
-        router.setSafetyReserve(address(0x9999));
     }
 
     function test_setBuybackBurner_revertsWithoutRole() public {
@@ -252,23 +243,21 @@ contract FeeRouterTest is Test {
     }
 
     /// @notice T-1 — `opShare` absorbs the rounding remainder so a 1-wei
-    ///         settlement with zero safety share + zero safetyReserve does
+    ///         settlement with zero buyback share + zero buybackBurner does
     ///         NOT attempt `safeTransfer(address(0), 1)` and revert.
     ///         Regression test for the dust-to-address(0) bug that would
     ///         brick settlements.
-    function test_routeSettlement_dustRoutesToOperatorWhenSafetyUnset() public {
-        // Valid bps split with safety = 0 so safetyReserve can be address(0).
-        // Operator floor is 4000, buyback floor (when non-zero) 500, treasury
-        // ceiling 3000, safety ceiling 2000. Pick 9000/500/500/0.
-        uint256[4] memory split = [uint256(9000), uint256(500), uint256(500), uint256(0)];
+    function test_routeSettlement_dustRoutesToOperatorWhenBuybackUnset() public {
+        // Valid bps split with buyback = 0 so buybackBurner can be address(0).
+        // Operator floor is 4000, treasury ceiling 3000. Pick 9000/0/1000.
+        uint256[3] memory split = [uint256(9000), uint256(0), uint256(1000)];
         FeeRouter.ShareDestinations memory dests =
-            FeeRouter.ShareDestinations({ safetyReserve: address(0), buybackBurner: buyback, treasury: treasury });
+            FeeRouter.ShareDestinations({ buybackBurner: address(0), treasury: treasury });
         vm.prank(admin);
         router.setSharesAndDestinations(split, dests);
 
-        // Settle 1 wei. With these shares all four computed legs round to
-        // zero except the operator remainder; opShare = 1 - 0 - 0 - 0 = 1.
-        // Pre-fix the remainder went to safetyShare → safeTransfer(0, 1) → revert.
+        // Settle 1 wei. With these shares all computed legs round to
+        // zero except the operator remainder; opShare = 1 - 0 - 0 = 1.
         uint256 opBefore = usdc.balanceOf(operator);
         vm.warp(EPOCH + 1);
         vm.prank(channel);

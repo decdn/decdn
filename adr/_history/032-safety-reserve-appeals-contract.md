@@ -1,7 +1,9 @@
 # ADR 032: SafetyReserve appeal-surface contract surface
 
+> **Status:** Retired 2026-05-29 under the SafetyReserve removal. The `SafetyReserve` contract no longer exists. The slash-appeal state machine it pinned (storage layout, escrow lien accounting, six event signatures, the permissionless `cleanupExpiredAppeal` lapse handler) is re-homed to the standalone `SlashAppeal` contract under the escrow-on-slash model; the canonical contract surface is now pinned in [ADR 028 § Contract surface](../028-slashing-appeals.md#contract-surface). Restitution is paid in escrowed TOKEN by `CapacityBond`, not USDC by a reserve, so the escrow-lien / `MAX_APPEAL_RESTITUTION` / TWAP machinery is gone. Original ADR body preserved verbatim below for historical reference; do not link to from canonical ADRs.
+
 **Date:** 2026-05-14
-**Status:** Draft
+**Status (pre-retirement):** Draft
 
 ## Context
 

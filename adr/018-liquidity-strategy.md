@@ -5,7 +5,7 @@
 
 ## Context
 
-> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) alignment.** `BuybackBurner` is router-driven: it receives 25% of routed USDC same-tx from `FeeRouter` at every settlement. The pool design is Balancer V3, 80/20 TOKEN/USDC, 1% swap fee, MEV protection via TWAP + `minTokenOut` + Flashbots-style private-RPC routing + per-epoch liquidity cap, POL custody by the Timelock. **The combined Liquidity-Provision category is 20% of supply** (5pp Market-Maker partner / group 7 + 15pp Protocol-Owned Liquidity / group 3 per [ADR 026 § Allocation](026-tokenomics.md#allocation)).
+> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) alignment.** `BuybackBurner` is router-driven: it receives 30% of routed USDC same-tx from `FeeRouter` at every settlement. The pool design is Balancer V3, 80/20 TOKEN/USDC, 1% swap fee, MEV protection via TWAP + `minTokenOut` + Flashbots-style private-RPC routing + per-epoch liquidity cap, POL custody by the Timelock. **The combined Liquidity-Provision category is 20% of supply** (5pp Market-Maker partner / group 7 + 15pp Protocol-Owned Liquidity / group 3 per [ADR 026 § Allocation](026-tokenomics.md#allocation)).
 
 Buyback execution is deferred to production because thin TOKEN/USDC pool liquidity at genesis cannot absorb buyback flow without unacceptable slippage. [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model) recommends TWAP execution as MEV mitigation but does not specify how pool depth is created.
 
@@ -78,12 +78,12 @@ Permitted operations within these bounds:
 
 ### Buyback inflow source and rate (router-driven per [ADR 026](026-tokenomics.md#adr-026-tokenomics))
 
-`BuybackBurner` is router-fed. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` at every settlement and atomically forwards **25% of routed USDC directly to `BuybackBurner` in the same transaction**, alongside the other three buckets (60% operator, 10% treasury, 5% safety). The full router split is in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split).
+`BuybackBurner` is router-fed. The `FeeRouter` contract receives the full operator USDC balance from `PaymentChannel.settleChannel` at every settlement and atomically forwards **30% of routed USDC directly to `BuybackBurner` in the same transaction**, alongside the other two buckets (60% operator, 10% treasury). The full router split is in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split).
 
 **Implications for this ADR:**
 
 - **Inflow source.** USDC arrives at the `BuybackBurner` address from the `FeeRouter` via a same-transaction `transfer` inside `routeSettlement`. No manual treasury transfers.
-- **Inflow rate is 25% of routed USDC.** The per-epoch liquidity cap below must be sized against this — at this rate the cap is binding under sustained network revenue and the operator must size `maxBuybackAmount`, `subSwapCount`, and the cap fraction accordingly. The keeper schedule (TWAP cadence) is calibrated against this rate.
+- **Inflow rate is 30% of routed USDC.** The per-epoch liquidity cap below must be sized against this — at this rate the cap is binding under sustained network revenue and the operator must size `maxBuybackAmount`, `subSwapCount`, and the cap fraction accordingly. The keeper schedule (TWAP cadence) is calibrated against this rate.
 - **Pool and execution mechanics.** Balancer V3 80/20 pool, swap call pattern, TWAP + `minTokenOut` defense, POL custody model, and per-transaction `maxBuybackAmount` cap — all specified below.
 
 ### Buyback execution via Balancer V3
@@ -184,4 +184,4 @@ Criteria 1–4 are quantitative; governance voters verify them off-chain before 
 - [ADR 003 — Payment Channels (IBuybackBurner interface)](003-payments.md#buybackburner)
 - [ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)
 - [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model)
-- [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics) — source of the four-bucket FeeRouter split (60/25/10/5), the 25% buyback share, the 15% POL allocation (group 3) within the 20% combined Liquidity-Provision category, and the POL governance bounds
+- [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics) — source of the three-bucket FeeRouter split (60/30/10), the 30% buyback share, the 15% POL allocation (group 3) within the 20% combined Liquidity-Provision category, and the POL governance bounds

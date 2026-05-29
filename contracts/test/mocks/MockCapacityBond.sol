@@ -26,12 +26,8 @@ contract MockCapacityBond is ICapacityBond {
         return slashedAtEpochOf[operator];
     }
 
-    function clearSlashedAtEpoch(address operator) external override {
-        slashedAtEpochOf[operator] = 0;
-    }
-
     /// @notice Per-slashId record. Tests configure via `setSlashRecord` then
-    ///         pass `slashId` to `SafetyReserve.openSlashAppeal`.
+    ///         pass `slashId` to `SlashAppeal.openSlashAppeal`.
     struct SlashRecord {
         address operator;
         uint64 slashedAt;
