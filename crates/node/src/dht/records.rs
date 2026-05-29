@@ -374,9 +374,13 @@ impl RecordStore {
         if entries.is_empty() {
             self.by_hash.remove(&hash);
         }
+        // Source every entry-derived key field from `removed` (it equals
+        // `holder` by construction — `position` matched on `e.holder ==
+        // holder` — but keeping them uniform avoids a future mismatch if
+        // the lookup predicate ever changes).
         self.global_lru
-            .remove(&(removed.receive_us, removed.sequence, hash, holder));
-        Self::decrement_publisher_count(&mut self.by_publisher_count, &holder);
+            .remove(&(removed.receive_us, removed.sequence, hash, removed.holder));
+        Self::decrement_publisher_count(&mut self.by_publisher_count, &removed.holder);
         Some(removed)
     }
 
