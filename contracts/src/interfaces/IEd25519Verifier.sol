@@ -11,9 +11,9 @@ pragma solidity 0.8.28;
 /// @dev    The implementation is a separate audit boundary; swap it out if
 ///         RIP-6565 / a ed25519 precompile ever lands on Arbitrum. Until then
 ///         the production implementation (`Ed25519Verifier`) wraps the audited
-///         Smoo.th Crypto Lib EIP-6565 verifier, vendored under
-///         `lib/crypto-lib` (see `lib/crypto-lib/VENDORING.md`). Tests use a
-///         stub from `test/mocks/MockEd25519Verifier.sol`.
+///         Smoo.th Crypto Lib EIP-6565 verifier, pinned as a git submodule
+///         at `lib/crypto-lib`. Tests use a stub from
+///         `test/mocks/MockEd25519Verifier.sol`.
 interface IEd25519Verifier {
     /// @param publicKey    32-byte ed25519 public key (the iroh NodeId).
     /// @param messageHash  32-byte digest the signature was produced over.

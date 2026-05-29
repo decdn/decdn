@@ -11,8 +11,8 @@ import { p, d, pMINUS_1, pp3div8, sqrtm1 } from "@solidity/fields/SCL_wei25519.s
 /// @notice Production RFC 8032 PureEdDSA (ed25519) signature verifier behind the
 ///         frozen {IEd25519Verifier} surface.
 /// @dev Verification of `[S]B == R + [k]A` is delegated to the audited Smoo.th
-///      Crypto Lib EIP-6565 routine (`Verify_LE`), vendored under
-///      `lib/crypto-lib` (see `lib/crypto-lib/VENDORING.md`). SCL takes a
+///      Crypto Lib EIP-6565 routine (`Verify_LE`), pinned as a git
+///      submodule at `lib/crypto-lib`. SCL takes a
 ///      pre-expanded key, so this contract first performs the RFC 8032 §5.1.3
 ///      point decompression of the 32-byte NodeId together with the
 ///      strict-verification guards — reject small-order `A`/`R`, non-canonical
