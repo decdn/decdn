@@ -249,5 +249,14 @@ since project inception and will roll into the first tagged release.
 - `rustls-webpki` → 0.103.12 (RUSTSEC-2026-0098, RUSTSEC-2026-0099) (#253).
 - `rustls-webpki` → 0.103.13 (RUSTSEC-2026-0104: reachable panic in CRL
   parsing) (#286).
+- **DHT rate-limiter keyspace bounded (#645).** The `cdn/dht/v1` per-IP and
+  per-peer keyed token-bucket maps grew unboundedly under churning sources;
+  same DoS shape that #440 fixed for the connection-level dispatcher. Adds
+  `[dht.rate_limit] max_tracked_per_ip` / `max_tracked_per_peer` knobs
+  (default 4096, `0` = unbounded with a `tracing::warn!` on resolve), an
+  opportunistic prune from `check` at `cap + cap/10`, and a periodic GC
+  task at 60s that calls `retain_recent` on both keyed maps. New metrics:
+  `decdn_dht_rate_limit_prune_sweeps_{per_ip,per_peer}_total` and
+  `decdn_dht_rate_limit_tracked_{per_ip,per_peer}`.
 
 [Unreleased]: https://github.com/decdn/decdn/commits/main
