@@ -14,6 +14,7 @@ import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
+import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 
 /// @title DeployProtocolScriptTest — covers the script-shaped behavior of
 ///        `DeployProtocol.s.sol` itself: env-var → `DeployConfig` plumbing and
@@ -25,6 +26,10 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     using stdJson for string;
 
     address internal constant TEST_USDC = address(0xa55D);
+    // Manifest sentinel for the script-deployed verifier. NOT an env var any
+    // more: `run()` deploys the production `Ed25519Verifier` itself (#669), so
+    // `_readConfig` leaves `cfg.ed25519Verifier` zero and the manifest writer is
+    // fed the deployed address directly.
     address internal constant TEST_ED25519 = address(0xeD25);
     address internal constant TEST_MULTISIG = address(0xC0DE);
     address internal constant TEST_INITIAL_HOLDER = address(0xbEEF);
@@ -42,7 +47,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
 
     function setUp() public {
         vm.setEnv("USDC_ADDRESS", vm.toString(TEST_USDC));
-        vm.setEnv("ED25519_VERIFIER_ADDRESS", vm.toString(TEST_ED25519));
         vm.setEnv("EMERGENCY_MULTISIG", vm.toString(TEST_MULTISIG));
         vm.setEnv("INITIAL_TOKEN_HOLDER", vm.toString(TEST_INITIAL_HOLDER));
         vm.setEnv("CHALLENGER_INCENTIVE_POOL", vm.toString(TEST_CHALLENGER_POOL));
@@ -72,7 +76,9 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     function test_readConfig_appliesDefaultsForOptionalVars() public view {
         DeployConfig memory cfg = this.externalReadConfig();
         assertEq(address(cfg.usdc), TEST_USDC, "usdc");
-        assertEq(address(cfg.ed25519Verifier), TEST_ED25519, "ed25519");
+        // `_readConfig` no longer resolves the verifier — `run()` deploys it
+        // in-broadcast (#669), so the config field is left zero here.
+        assertEq(address(cfg.ed25519Verifier), address(0), "ed25519 resolved at deploy time");
         assertEq(cfg.emergencyMultisig, TEST_MULTISIG, "multisig");
         assertEq(cfg.initialTokenHolder, TEST_INITIAL_HOLDER, "holder");
         assertEq(cfg.challengerIncentivePool, TEST_CHALLENGER_POOL, "challenger");
@@ -141,6 +147,9 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     function test_writeManifest_writesAllAddresses() public {
         _cleanupManifest(CHAIN_ID_WRITE);
         DeployConfig memory cfg = this.externalReadConfig();
+        // `run()` populates this from the in-broadcast deploy; mimic it so the
+        // manifest writer has a non-zero verifier address to record.
+        cfg.ed25519Verifier = IEd25519Verifier(TEST_ED25519);
         Deployment memory d = _stubDeployment();
         vm.chainId(CHAIN_ID_WRITE);
 
@@ -156,9 +165,10 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".contracts.TimelockController"), address(0x07), "Timelock");
         assertEq(json.readAddress(".contracts.DecdnGovernor"), address(0x08), "Governor");
         assertEq(json.readAddress(".contracts.BuybackBurner"), address(0), "BuybackBurner unwired");
+        // The verifier is script-deployed (#669), so it lives under `contracts`.
+        assertEq(json.readAddress(".contracts.Ed25519Verifier"), TEST_ED25519, "ed25519");
 
         assertEq(json.readAddress(".externalDeps.usdc"), TEST_USDC, "usdc");
-        assertEq(json.readAddress(".externalDeps.ed25519Verifier"), TEST_ED25519, "ed25519");
         assertEq(json.readAddress(".externalDeps.emergencyMultisig"), TEST_MULTISIG, "multisig");
 
         assertEq(json.readUint(".chainId"), CHAIN_ID_WRITE, "chainId");

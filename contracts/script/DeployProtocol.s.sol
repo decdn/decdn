@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "./BaseProtocolDeploy.s.sol";
-import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
+import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 
 /// @title DeployProtocol — production v3 contract surface deployer (issue #694)
 /// @notice Single `forge script` entry point that deploys every production
@@ -24,16 +24,19 @@ import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 ///         subclass is deployed — that path runs through the 48h Timelock and
 ///         is fully observable in advance.
 ///
-/// @dev    The Ed25519 verifier is supplied via `ED25519_VERIFIER_ADDRESS`
-///         because no production verifier ships in this repo yet (only the
-///         test mock under `test/mocks/`). The operator deploys their chosen
-///         implementation (real precompile shim, audited mock, etc.) ahead of
-///         time and passes its address here.
+/// @dev    The production `Ed25519Verifier` (issue #669) is deployed in-script
+///         as the first broadcast step — no operator-supplied address. It wraps
+///         the audited Smoo.th Crypto Lib EIP-6565 verifier (vendored under
+///         `lib/crypto-lib`); forge deploys + links the `SCL_EIP6565` library
+///         automatically as part of the broadcast. If a native ed25519
+///         precompile ever lands on Arbitrum (RIP-6565), swap the concrete
+///         implementation here — a one-line code change gated by an ADR, per
+///         the `IEd25519Verifier` swap-out note — rather than re-introducing a
+///         deploy-time address knob.
 ///
 ///         Required env vars:
 ///           - `USDC_ADDRESS`              — settlement token (e.g. Arbitrum
 ///                                            Sepolia USDC `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d`)
-///           - `ED25519_VERIFIER_ADDRESS`  — operator-deployed verifier
 ///           - `EMERGENCY_MULTISIG`        — 3-of-5 multisig per ADR 009
 ///           - `INITIAL_TOKEN_HOLDER`      — 1B TOKEN recipient at genesis
 ///           - `CHALLENGER_INCENTIVE_POOL` — SlashAppeal failed-appeal-bond pool
@@ -127,6 +130,12 @@ contract DeployProtocol is BaseProtocolDeploy {
         _assertManifestWritable();
 
         vm.startBroadcast(cfg.deployer);
+        // Deploy the production verifier first, inside the broadcast, so it
+        // persists on-chain and forge links its `SCL_EIP6565` library. The base
+        // pipeline then consumes it like any other dependency (test harnesses
+        // inject a mock by populating `cfg.ed25519Verifier` and calling
+        // `_runFullDeploy` directly, bypassing this path).
+        cfg.ed25519Verifier = new Ed25519Verifier();
         d = _runFullDeploy(cfg);
         vm.stopBroadcast();
 
@@ -135,7 +144,10 @@ contract DeployProtocol is BaseProtocolDeploy {
 
     function _readConfig() internal view returns (DeployConfig memory cfg) {
         cfg.usdc = IERC20(vm.envAddress("USDC_ADDRESS"));
-        cfg.ed25519Verifier = IEd25519Verifier(vm.envAddress("ED25519_VERIFIER_ADDRESS"));
+        // `cfg.ed25519Verifier` is intentionally left zero here: `run()` deploys
+        // the production verifier inside the broadcast and populates it before
+        // `_runFullDeploy`. `_deployTargets`' zero-address guard still protects
+        // any caller that forgets to set it.
         cfg.emergencyMultisig = vm.envAddress("EMERGENCY_MULTISIG");
         cfg.initialTokenHolder = vm.envAddress("INITIAL_TOKEN_HOLDER");
         cfg.challengerIncentivePool = vm.envAddress("CHALLENGER_INCENTIVE_POOL");
@@ -201,6 +213,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         vm.serializeAddress(contracts, "CapacityBond", address(d.bond));
         vm.serializeAddress(contracts, "ContentBlacklist", address(d.blacklist));
         vm.serializeAddress(contracts, "DecdnGovernor", address(d.governor));
+        vm.serializeAddress(contracts, "Ed25519Verifier", address(cfg.ed25519Verifier));
         vm.serializeAddress(contracts, "FeeRouter", address(d.router));
         vm.serializeAddress(contracts, "PublisherRegistry", address(d.registry));
         vm.serializeAddress(contracts, "SlashAppeal", address(d.slashAppeal));
@@ -209,9 +222,9 @@ contract DeployProtocol is BaseProtocolDeploy {
 
         // Treasury is intentionally absent: it is the TimelockController above
         // (Timelock-custodied per ADR 016), recorded under `contracts`, not an
-        // external dependency.
+        // external dependency. The Ed25519Verifier is likewise under `contracts`
+        // (this script deploys it — issue #669), not here.
         string memory deps = "externalDeps";
-        vm.serializeAddress(deps, "ed25519Verifier", address(cfg.ed25519Verifier));
         vm.serializeAddress(deps, "emergencyMultisig", cfg.emergencyMultisig);
         string memory depsJson = vm.serializeAddress(deps, "usdc", address(cfg.usdc));
 

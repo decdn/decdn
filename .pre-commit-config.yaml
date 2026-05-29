@@ -1,3 +1,10 @@
+# Vendored third-party deps under contracts/lib/ are kept byte-faithful to
+# their upstream pin (see contracts/lib/crypto-lib/VENDORING.md); never let the
+# hygiene hooks (trailing-whitespace, end-of-file-fixer, markdownlint) rewrite
+# them. The Solidity hooks already skip lib/ via their own configs, and git
+# submodules (openzeppelin-contracts, forge-std) are not in the file list.
+exclude: '^contracts/lib/'
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
