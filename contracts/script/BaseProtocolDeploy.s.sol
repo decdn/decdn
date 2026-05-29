@@ -13,10 +13,17 @@ import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
+import { PaymentChannel } from "../src/PaymentChannel.sol";
+import { SlashJudge } from "../src/SlashJudge.sol";
+import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
+import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.sol";
+import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol";
+import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
+import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistryOwnership.sol";
 
 /// @title BaseProtocolDeploy
 /// @notice Abstract deploy primitive for the v3 contract surface. Performs the
@@ -88,6 +95,19 @@ abstract contract BaseProtocolDeploy is Script {
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 internal constant DEFAULT_ADMIN_ROLE = 0x00;
 
+    // PaymentChannel launch params (ADR 003 § Initial deployment values). All
+    // governance-tunable post-deploy within the contract's safety bounds.
+    uint256 internal constant PAYMENT_DISPUTE_WINDOW = 48 hours;
+    uint256 internal constant PAYMENT_MAX_CHANNEL_DURATION = 90 days;
+    uint256 internal constant PAYMENT_DELIVERY_FLOOR = 1;
+    uint256 internal constant PAYMENT_DELIVERY_CEILING = 1000;
+
+    // SlashJudge launch params (ADR 014 § Governable Parameters). `maxEvidenceAge`
+    // (5 days) must stay `< unbondingPeriod` (14 days default) — the SlashJudge
+    // constructor enforces it.
+    uint256 internal constant SLASH_CHALLENGE_BOND = 100e18;
+    uint256 internal constant SLASH_MAX_EVIDENCE_AGE_US = 5 days * 1_000_000;
+
     struct DeployConfig {
         // External dependencies
         IERC20 usdc;
@@ -132,6 +152,9 @@ abstract contract BaseProtocolDeploy is Script {
         PublisherRegistry registry;
         TimelockController timelock;
         DecdnGovernor governor;
+        PaymentChannel paymentChannel;
+        SlashJudge slashJudge;
+        OriginAssignment originAssignment;
     }
 
     error ZeroAddress(string field);
@@ -234,6 +257,40 @@ abstract contract BaseProtocolDeploy is Script {
         });
 
         d.registry = new PublisherRegistry({ admin: cfg.deployer });
+
+        // PaymentChannel (ADR 003): USDC settlement gateway. `feeRouter` must be
+        // a deployed contract (constructor checks code size) — `d.router` above.
+        d.paymentChannel = new PaymentChannel({
+            usdc_: cfg.usdc,
+            capacityBond_: ICapacityBondActivity(address(d.bond)),
+            feeRouter_: address(d.router),
+            disputeWindow_: PAYMENT_DISPUTE_WINDOW,
+            maxChannelDuration_: PAYMENT_MAX_CHANNEL_DURATION,
+            deliveryFloor_: PAYMENT_DELIVERY_FLOOR,
+            deliveryCeiling_: PAYMENT_DELIVERY_CEILING,
+            admin: cfg.deployer
+        });
+
+        // SlashJudge (ADR 014): evidence verification + challenge bonds. The
+        // constructor enforces `maxEvidenceAge < CapacityBond.unbondingPeriod`.
+        d.slashJudge = new SlashJudge({
+            capacityBond_: ICapacityBondSlasher(address(d.bond)),
+            token_: IERC20(address(d.token)),
+            contentBlacklist_: IContentBlacklistHashView(address(d.blacklist)),
+            challengeBond_: SLASH_CHALLENGE_BOND,
+            maxEvidenceAgeUs_: SLASH_MAX_EVIDENCE_AGE_US,
+            admin: cfg.deployer
+        });
+
+        // OriginAssignment (ADR 011): deployed with a zero ContentBlacklist binding;
+        // `_wireCrossContractRoles` calls `setContentBlacklist` post-deploy (ADR 016
+        // § Post-Deployment Initialization step 2).
+        d.originAssignment = new OriginAssignment({
+            capacityBond_: ICapacityBondActivity(address(d.bond)),
+            publisherRegistry_: IPublisherRegistryOwnership(address(d.registry)),
+            contentBlacklist_: address(0),
+            admin: cfg.deployer
+        });
     }
 
     // Phase 3 — Governor; Timelock proposer/canceller wiring. The Timelock
@@ -281,6 +338,17 @@ abstract contract BaseProtocolDeploy is Script {
         // grantor. Governance may revoke the role after the window for hygiene.
         d.bond.grantRole(d.bond.GENESIS_GRANTOR_ROLE(), address(d.timelock));
 
+        // PaymentChannel.settleChannel / withdraw call FeeRouter.routeSettlement
+        // (ADR 016 § Post-Deployment Init step 4) — without this the settlement
+        // path reverts.
+        d.router.grantRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentChannel));
+        // SlashJudge is the sole holder of SLASH_ROLE on CapacityBond (step 3) —
+        // the only on-chain slash trigger.
+        d.bond.grantRole(d.bond.SLASH_ROLE(), address(d.slashJudge));
+        // Wire the OriginAssignment → ContentBlacklist read direction (step 2);
+        // deployer still holds GOVERNANCE_ROLE on OriginAssignment here.
+        d.originAssignment.setContentBlacklist(address(d.blacklist));
+
         _postWiringHook(cfg, d);
     }
 
@@ -296,7 +364,7 @@ abstract contract BaseProtocolDeploy is Script {
     // strands the contract (no holder of either role) and locks out every
     // governance setter until a recovery deploy.
     function _handOffGovernance(DeployConfig memory cfg, Deployment memory d) internal {
-        IAccessControl[5] memory targets = _governedTargets(d);
+        IAccessControl[8] memory targets = _governedTargets(d);
         address tl = address(d.timelock);
         for (uint256 i = 0; i < targets.length; i++) {
             targets[i].grantRole(GOVERNANCE_ROLE, tl);
@@ -314,7 +382,7 @@ abstract contract BaseProtocolDeploy is Script {
     // stranded). A handoff that revoked the deployer but skipped a Timelock grant
     // would pass the back-door half yet leave a contract ungoverned.
     function _assertNoBackDoors(DeployConfig memory cfg, Deployment memory d) internal view {
-        IAccessControl[5] memory targets = _governedTargets(d);
+        IAccessControl[8] memory targets = _governedTargets(d);
         address tl = address(d.timelock);
         for (uint256 i = 0; i < targets.length; i++) {
             address target = address(targets[i]);
@@ -343,7 +411,16 @@ abstract contract BaseProtocolDeploy is Script {
     /// @dev The five GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE-bearing targets handed
     ///      off to the Timelock — single source of truth for `_handOffGovernance`
     ///      and `_assertNoBackDoors` so the governed set can't drift between them.
-    function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[5] memory) {
-        return [IAccessControl(address(d.router)), d.bond, d.blacklist, d.slashAppeal, d.registry];
+    function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[8] memory) {
+        return [
+            IAccessControl(address(d.router)),
+            d.bond,
+            d.blacklist,
+            d.slashAppeal,
+            d.registry,
+            d.paymentChannel,
+            d.slashJudge,
+            d.originAssignment
+        ];
     }
 }
