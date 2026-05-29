@@ -1739,3 +1739,97 @@ mod batch_store_fallback_negotiation {
         Ok(())
     }
 }
+
+// A receiver that accepts the connection and every bi-stream but never
+// answers can't pin one `per_hash_fallback` publish task for the full
+// `n × DHT_CLIENT_TIMEOUT` (~34 min at 256 / 8s): the loop abandons the
+// set after `MAX_CONSECUTIVE_FALLBACK_TIMEOUTS` back-to-back read timeouts.
+mod per_hash_fallback_timeout_bail {
+    use super::*;
+    use decdn_node::dht::client;
+    use iroh::endpoint::Connection;
+    use iroh::protocol::AcceptError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Accepts every inbound bi-stream, counts it, drains the request, then
+    /// holds the send half open **without responding or resetting** so the
+    /// client's read blocks until its per-hash timeout fires. Holding the
+    /// `SendStream`s alive (rather than dropping them) is what makes the
+    /// client see a timeout instead of a stream reset.
+    #[derive(Debug)]
+    struct HangingStub {
+        streams_seen: Arc<AtomicUsize>,
+    }
+
+    impl ProtocolHandler for HangingStub {
+        async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+            let mut held = Vec::new();
+            while let Ok((send, mut recv)) = conn.accept_bi().await {
+                self.streams_seen.fetch_add(1, Ordering::SeqCst);
+                let _ = read_frame(&mut recv).await;
+                held.push(send);
+            }
+            drop(held);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bails_after_consecutive_timeouts_instead_of_attempting_all() -> anyhow::Result<()> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let streams_seen = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(HangingStub {
+            streams_seen: Arc::clone(&streams_seen),
+        });
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Some(incoming) = server_ep_bg.accept().await {
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let Ok(connecting) = incoming.accept() else {
+                        return;
+                    };
+                    let Ok(conn) = connecting.await else {
+                        return;
+                    };
+                    let _ = handler.accept(conn).await;
+                });
+            }
+        });
+
+        let client_sk = fresh_key();
+        let holder = *client_sk.public().as_bytes();
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+        // Eight hashes, but the peer never answers. Each read times out;
+        // the loop must give up after K consecutive timeouts rather than
+        // burn one timeout per hash. A short per-hash timeout keeps the
+        // test near `K × 300ms`; the connect shares the same (generous on
+        // loopback) budget.
+        let hashes: Vec<[u8; 32]> = (1u8..=8).map(|i| [i; 32]).collect();
+        let results = client::per_hash_fallback(
+            &client_ep,
+            target,
+            &hashes,
+            holder,
+            Duration::from_millis(300),
+        )
+        .await;
+
+        assert_eq!(results, vec![false; 8], "a wedged peer defers every hash");
+        assert_eq!(
+            streams_seen.load(Ordering::SeqCst),
+            client::MAX_CONSECUTIVE_FALLBACK_TIMEOUTS,
+            "loop must abandon the set after K consecutive timeouts, not attempt all 8"
+        );
+
+        client_ep.close().await;
+        server_ep.close().await;
+        accept_task.abort();
+        Ok(())
+    }
+}
