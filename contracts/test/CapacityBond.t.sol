@@ -190,11 +190,41 @@ contract CapacityBondTest is Test {
         assertEq(bond.lifetimeOffenseCount(operator), 2);
         assertEq(bond.activeStake(operator), 129_200e18);
 
-        // Tier 3 (3rd+ offense): 50% of 129.2k = 64.6k.
+        // Tier 3 (3rd+ offense): 50% of 129.2k = 64.6k. Assert the Slashed
+        // event carries the tier-3 offense count and the 50/30/20 split of the
+        // 64.6k total (32.3k challenger / 19.38k safety / 12.92k burn).
+        vm.expectEmit(true, true, false, true);
+        emit CapacityBond.Slashed(operator, challenger, 1, 3, 64_600e18, 32_300e18, 19_380e18, 12_920e18);
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
         assertEq(bond.lifetimeOffenseCount(operator), 3);
         assertEq(bond.activeStake(operator), 64_600e18);
+    }
+
+    /// The credit-slash helper (`_slashPendingCreditAtTier`) must escalate with
+    /// the SAME tier ladder as the stake slash. Every other credit-slash test
+    /// uses a single tier-1 slash; this drives tiers 2 and 3 against the at-risk
+    /// genesis-credit pool (`originalGrant - claimed`, claimed == 0 here).
+    function test_slash_creditSlash_escalatesAcrossTiers() public {
+        _setupGenesisGrant(100_000e18);
+
+        // Tier 1: 5% of 100k at-risk = 5k → originalGrant 95k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 1);
+        assertEq(bond.pendingCredit(operator).originalGrant, 95_000e18);
+
+        // Tier 2: 15% of 95k at-risk = 14.25k → originalGrant 80.75k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 2);
+        assertEq(bond.pendingCredit(operator).originalGrant, 80_750e18);
+
+        // Tier 3: 50% of 80.75k at-risk = 40.375k → originalGrant 40.375k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 3);
+        assertEq(bond.pendingCredit(operator).originalGrant, 40_375e18);
     }
 
     /// Tier-3 slash against an operator holding BOTH active and unbonding stake
@@ -222,13 +252,15 @@ contract CapacityBondTest is Test {
 
         // Tier 3: totalAtRisk = 80.75k, slashAmount = 40.375k > active 20.75k.
         // Active is zeroed; remainder (19.625k) comes out of unbonding, leaving
-        // 60k − 19.625k = 40.375k. No underflow, no clip.
+        // 60k - 19.625k = 40.375k. No underflow, no clip.
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
         assertEq(bond.lifetimeOffenseCount(operator), 3);
         assertEq(bond.activeStake(operator), 0);
         (uint256 unbondingAmt,) = bond.unbondingOf(operator);
         assertEq(unbondingAmt, 40_375e18);
+        // Active fell to 0 (< minStake/2 = 25k), so the slash auto-ejected.
+        assertTrue(bond.ejected(operator));
     }
 
     /// Directly exercise the C2 defensive remainder-clip in
@@ -238,26 +270,35 @@ contract CapacityBondTest is Test {
     /// harness with `tierBps = 12_000` to prove it caps `slashAmount` to the
     /// at-risk total (no over-transfer) and never underflows the unbonding pool.
     function test_reduceStakeAtTier_remainderClip() public {
-        TestableCapacityBond harness = new TestableCapacityBond({
-            token_: token,
-            ed25519Verifier_: ed25519,
-            admin: admin,
-            minStake_: MIN_STAKE,
-            unbondingPeriod_: UNBONDING,
-            multiaddrUpdateCooldown_: 0,
-            maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: 7 days,
-            genesisCreditWindow_: 30 days
-        });
+        TestableCapacityBond harness = _newHarness();
 
-        harness.setStakeState(operator, 100e18, 100e18);
-        // totalAtRisk = 200e18; 120% → slashAmount would be 240e18 > totalAtRisk
-        // → clip clamps remainder to req.amount and re-derives slashAmount.
+        // Asymmetric split so `slashAmount` isn't a coincidental round multiple:
+        // totalAtRisk = 110e18; 120% → slashAmount would be 132e18 > totalAtRisk
+        // → clip clamps remainder to req.amount (100e18) and re-derives
+        // slashAmount to active + req.amount = 110e18 (the full at-risk pool).
+        harness.setStakeState(operator, 10e18, 100e18);
         uint256 slashed = harness.exposed_reduceStakeAtTier(operator, 12_000);
-        assertEq(slashed, 200e18); // capped to at-risk, not 240e18
+        assertEq(slashed, 110e18); // capped to at-risk (10 + 100), not 132e18
         assertEq(harness.activeStake(operator), 0);
         (uint256 unbondingAmt,) = harness.unbondingOf(operator);
         assertEq(unbondingAmt, 0);
+    }
+
+    /// `_reduceStakeAtTier` against an operator with NO active stake — the whole
+    /// slash comes out of the unbonding bucket. Reachable in production when an
+    /// operator fully unbonds and is then slashed, so an in-ladder tier (50%)
+    /// is used. Active stays 0; unbonding is halved.
+    function test_reduceStakeAtTier_unbondingOnly() public {
+        TestableCapacityBond harness = _newHarness();
+
+        // totalAtRisk = 100e18; 50% = 50e18. active is already 0, so the entire
+        // 50e18 comes from unbonding via the else branch (no clip).
+        harness.setStakeState(operator, 0, 100e18);
+        uint256 slashed = harness.exposed_reduceStakeAtTier(operator, 5000);
+        assertEq(slashed, 50e18);
+        assertEq(harness.activeStake(operator), 0);
+        (uint256 unbondingAmt,) = harness.unbondingOf(operator);
+        assertEq(unbondingAmt, 50e18);
     }
 
     /// A successful appeal reversal (`SafetyReserve.reverseAppeal` →
@@ -632,6 +673,22 @@ contract CapacityBondTest is Test {
         bond.grantRole(grantorRole, admin);
         bond.grantGenesisCredit(operator, amount);
         vm.stopPrank();
+    }
+
+    /// Deploy a `TestableCapacityBond` mirroring `setUp`'s `CapacityBond`
+    /// parameters, for tests that drive the exposed internal stake-reduction.
+    function _newHarness() internal returns (TestableCapacityBond) {
+        return new TestableCapacityBond({
+            token_: token,
+            ed25519Verifier_: ed25519,
+            admin: admin,
+            minStake_: MIN_STAKE,
+            unbondingPeriod_: UNBONDING,
+            multiaddrUpdateCooldown_: 0,
+            maxMultiaddrSize_: 1024,
+            regionStabilityWindow_: 7 days,
+            genesisCreditWindow_: 30 days
+        });
     }
 
     // ----------------------------------------------------------------------
