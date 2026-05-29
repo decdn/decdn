@@ -584,13 +584,17 @@ mod adr_013_error_codes {
         Ok(())
     }
 
-    /// `BatchStore` request → `APP_ERR_UNSUPPORTED_MESSAGE` (0x01). Per
-    /// ADR 022 §STORE Flow line 138 + §Schema Evolution the unsupported
-    /// signal MUST be stream-close-without-ack — an all-`false`
-    /// `BatchStoreAck` would NOT trigger publisher fallback. This test
-    /// guards against a regression that returns a well-formed ack.
+    /// `BatchStore` whose batch-level `holder` does not equal the
+    /// authenticated QUIC `NodeId` → `APP_ERR_MALFORMED_MESSAGE` (0x03),
+    /// stream-close-without-ack. Per ADR 022 §Batch token accounting
+    /// step 2 the receiver rejects the **entire** batch with
+    /// `MALFORMED_MESSAGE` on a holder mismatch (distinct from the
+    /// per-hash `Store` path, which acks `accepted: false`): a batch
+    /// claiming an identity the connection cannot prove is malformed.
+    /// `spin_up_dht_server` uses `AllStaked`, so the staker filter would
+    /// pass — the holder check is what fires.
     #[tokio::test(flavor = "multi_thread")]
-    async fn batch_store_returns_unsupported_code_not_ack() -> anyhow::Result<()> {
+    async fn batch_store_holder_mismatch_returns_malformed_code() -> anyhow::Result<()> {
         let (server_ep, server_addr, server_id, accept_task) = spin_up_dht_server().await?;
         let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
         let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -604,13 +608,51 @@ mod adr_013_error_codes {
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
             hashes: vec![[0x01u8; 32], [0x02u8; 32], [0x03u8; 32]],
+            // Claim a holder that is NOT the authenticated client id.
+            holder: [0xAB; 32],
+        });
+        let payload = encode_message(&req)?;
+        write_frame(&mut send, &payload).await?;
+        send.finish()?;
+        let r = recv.read_to_end(64).await;
+        assert_close_code(r, APP_ERR_MALFORMED_MESSAGE);
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        let _ = accept_task.await;
+        server_ep.close().await;
+        Ok(())
+    }
+
+    /// A `BatchStore` carrying more than `MAX_BATCH_STORE_HASHES` (256)
+    /// hashes → `APP_ERR_MALFORMED_MESSAGE` (0x03), stream-close-without-
+    /// ack (ADR 022 §STORE Flow / AC 19). The oversize `hashes` vec is
+    /// rejected at the wire-decode boundary
+    /// (`deserialize_batch_hashes`), which `frame_err_code` maps to
+    /// `MALFORMED_MESSAGE`. The publisher is expected to split the set,
+    /// not back off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_store_over_cap_returns_malformed_code() -> anyhow::Result<()> {
+        let (server_ep, server_addr, server_id, accept_task) = spin_up_dht_server().await?;
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        // 257 hashes > the 256 wire cap.
+        let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
+            hashes: vec![[0x07u8; 32]; decdn_protocol::dht::MAX_BATCH_STORE_HASHES + 1],
             holder: *client_ep.id().as_bytes(),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut send, &payload).await?;
         send.finish()?;
         let r = recv.read_to_end(64).await;
-        assert_close_code(r, APP_ERR_UNSUPPORTED_MESSAGE);
+        assert_close_code(r, APP_ERR_MALFORMED_MESSAGE);
         conn.close(0u32.into(), b"bye");
         client_ep.close().await;
         let _ = accept_task.await;
@@ -1012,6 +1054,609 @@ mod store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
         server_ep.close().await;
+        Ok(())
+    }
+}
+
+// ADR 022 §STORE Flow Batched STORE + §Batch token accounting (#648,
+// ACs 17-18). The handler admits `BatchStore`: a single batch-level
+// holder check, then per-hash admission (rate limit + staker filter +
+// record-store insert) matching what `n` separate `Store`s would do,
+// with one `bool` per hash in request order.
+mod batch_store_admission {
+    use super::*;
+
+    /// Drive one `BatchStore` from `client_sk` against a freshly spun-up
+    /// server whose active-staker set is exactly `{client}` and whose
+    /// rate limiter is `rate_cfg`. Returns the decoded ack plus the
+    /// server's record store so the caller can assert on inserted state.
+    #[allow(clippy::too_many_lines)]
+    async fn run_batch_store(
+        client_sk: SecretKey,
+        hashes: Vec<[u8; 32]>,
+        rate_cfg: DhtRateLimitConfig,
+    ) -> anyhow::Result<(wire::BatchStoreAck, Arc<Mutex<RecordStore>>, Arc<Metrics>)> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let metrics = Arc::new(Metrics::new());
+        let limiter = permissive_limiter(&metrics);
+        let rate_limiter = Arc::new(DhtRateLimiter::new(&rate_cfg, Arc::clone(&metrics)));
+        let metrics_handle = Arc::clone(&metrics);
+        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let records = empty_record_store();
+
+        let client_id = client_sk.public();
+        let mut active = std::collections::HashSet::new();
+        active.insert(*client_id.as_bytes());
+        let staker_set: Arc<dyn StakerSet> =
+            Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::new(active));
+
+        let handler = Arc::new(DhtHandler::with_routing(
+            server_id,
+            routing,
+            rate_limiter,
+            limiter,
+            Arc::clone(&metrics),
+            staker_set,
+            Arc::clone(&records),
+        ));
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Some(incoming) = server_ep_bg.accept().await {
+                let connecting = incoming
+                    .accept()
+                    .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+                let conn = connecting
+                    .await
+                    .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+                handler
+                    .accept(conn)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut s, mut r) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
+            hashes,
+            holder: *client_id.as_bytes(),
+        });
+        let payload = encode_message(&req)?;
+        write_frame(&mut s, &payload).await?;
+        s.finish()?;
+        let frame = read_frame(&mut r).await?;
+        let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
+        let ack = match msg {
+            wire::DhtMessage::BatchStoreAck(a) => a,
+            other => anyhow::bail!("expected BatchStoreAck, got {other:?}"),
+        };
+
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        accept_task
+            .await
+            .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
+        server_ep.close().await;
+        Ok((ack, records, metrics_handle))
+    }
+
+    fn permissive_rate_cfg() -> DhtRateLimitConfig {
+        DhtRateLimitConfig {
+            per_peer_rate_per_sec: 1e6,
+            per_peer_burst: u32::MAX,
+            per_ip_rate_per_sec: 1e6,
+            per_ip_burst: u32::MAX,
+            global_rate_per_sec: 1e6,
+            global_burst: u32::MAX,
+            trusted_ips: std::collections::HashSet::new(),
+            max_tracked_per_ip: 4096,
+            max_tracked_per_peer: 4096,
+        }
+    }
+
+    /// AC 17: a `BatchStore` of `n` hashes from a staked publisher gets a
+    /// `BatchStoreAck` with one `true` per hash, in request order, and
+    /// every hash lands in the record store (a subsequent `FindValue`
+    /// would find the holder).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_store_all_admitted_for_staked_publisher() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let holder = *client_sk.public().as_bytes();
+        let hashes: Vec<[u8; 32]> = (1u8..=5).map(|i| [i; 32]).collect();
+        let (ack, records, _metrics) =
+            run_batch_store(client_sk, hashes.clone(), permissive_rate_cfg()).await?;
+        assert_eq!(
+            ack.results,
+            vec![true; 5],
+            "every hash from a staked publisher under permissive limits must be admitted, in order"
+        );
+        let mut store = records.lock().expect("records lock");
+        for h in &hashes {
+            assert!(
+                store.providers_at(h, 0).contains(&holder),
+                "hash {h:?} must be in the record store after a batch admit"
+            );
+        }
+        Ok(())
+    }
+
+    /// AC 17/18 boundary: a 1-hash batch (`extra = n - 1 = 0`, no stage-2
+    /// tokens) admits exactly the single hash — the `n == 1` edge of the
+    /// `k = 1 + min(b, n-1)` arithmetic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_store_single_hash_admitted() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let holder = *client_sk.public().as_bytes();
+        let (ack, records, _metrics) =
+            run_batch_store(client_sk, vec![[0x42u8; 32]], permissive_rate_cfg()).await?;
+        assert_eq!(ack.results, vec![true]);
+        assert!(
+            records
+                .lock()
+                .expect("records lock")
+                .providers_at(&[0x42u8; 32], 0)
+                .contains(&holder)
+        );
+        Ok(())
+    }
+
+    /// AC 17: per-hash admission matches a single `Store` — a non-staked
+    /// publisher's whole batch is acked `false` (the active-staker filter
+    /// is applied per-hash; the batch-level holder is valid here).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_store_non_staked_publisher_all_rejected() -> anyhow::Result<()> {
+        // Server's staker set is `{a_random_other}` ≠ the publisher, so
+        // the publisher (whose holder == its authenticated id) passes the
+        // holder check but fails the per-hash staker filter.
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let metrics = Arc::new(Metrics::new());
+        let limiter = permissive_limiter(&metrics);
+        let rate_limiter = permissive_dht_rate_limiter(&metrics);
+        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let records = empty_record_store();
+        // Staker set deliberately does NOT contain the client.
+        let staker_set: Arc<dyn StakerSet> =
+            Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::empty());
+        let handler = Arc::new(DhtHandler::with_routing(
+            server_id,
+            routing,
+            rate_limiter,
+            limiter,
+            Arc::clone(&metrics),
+            staker_set,
+            Arc::clone(&records),
+        ));
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Some(incoming) = server_ep_bg.accept().await {
+                let connecting = incoming
+                    .accept()
+                    .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+                let conn = connecting
+                    .await
+                    .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+                handler
+                    .accept(conn)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let client_sk = fresh_key();
+        let (client_ep, _) = local_endpoint(client_sk.clone(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut s, mut r) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
+            hashes: vec![[0x01u8; 32], [0x02u8; 32]],
+            holder: *client_sk.public().as_bytes(),
+        });
+        let payload = encode_message(&req)?;
+        write_frame(&mut s, &payload).await?;
+        s.finish()?;
+        let frame = read_frame(&mut r).await?;
+        let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
+        let ack = match msg {
+            wire::DhtMessage::BatchStoreAck(a) => a,
+            other => anyhow::bail!("expected BatchStoreAck, got {other:?}"),
+        };
+        assert_eq!(
+            ack.results,
+            vec![false, false],
+            "a non-staked publisher's batch must be fully rejected per-hash"
+        );
+        assert!(records.lock().expect("records lock").is_empty());
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        accept_task
+            .await
+            .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
+        server_ep.close().await;
+        Ok(())
+    }
+
+    /// AC 18: a `BatchStore` whose size exceeds the remaining per-peer
+    /// rate-limit budget is partially admitted — the first `k` hashes are
+    /// `true`, the over-budget tail is `false` (and not inserted). With
+    /// per-peer burst 4: stage 1 charges 1 (3 left), stage 2 charges 3
+    /// more, so `k = 4` of the 6 hashes are admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_store_partial_admit_when_over_rate_budget() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let holder = *client_sk.public().as_bytes();
+        let hashes: Vec<[u8; 32]> = (1u8..=6).map(|i| [i; 32]).collect();
+        let rate_cfg = DhtRateLimitConfig {
+            // per-peer is the binding layer: burst 4, slow refill so no
+            // tokens come back mid-test.
+            per_peer_rate_per_sec: 1.0,
+            per_peer_burst: 4,
+            per_ip_rate_per_sec: 1e9,
+            per_ip_burst: u32::MAX,
+            global_rate_per_sec: 1e9,
+            global_burst: u32::MAX,
+            trusted_ips: std::collections::HashSet::new(),
+            max_tracked_per_ip: 4096,
+            max_tracked_per_peer: 4096,
+        };
+        let (ack, records, metrics) = run_batch_store(client_sk, hashes.clone(), rate_cfg).await?;
+        assert_eq!(
+            ack.results,
+            vec![true, true, true, true, false, false],
+            "first k=4 hashes admitted (1 stage-1 + 3 stage-2), tail deferred"
+        );
+        // The 2 deferred-tail hashes bump the deferred counter (and are NOT
+        // counted as per-hash rejections — that invariant is unit-tested).
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_dht_batch_store_hashes_deferred_rate_limit_total 2"),
+            "2 deferred hashes must be reflected in the deferred counter:\n{text}"
+        );
+        let mut store = records.lock().expect("records lock");
+        // Admitted hashes present; deferred ones absent.
+        for h in hashes.iter().take(4) {
+            assert!(store.providers_at(h, 0).contains(&holder));
+        }
+        for h in hashes.iter().skip(4) {
+            assert!(
+                !store.providers_at(h, 0).contains(&holder),
+                "deferred hash {h:?} must NOT be inserted"
+            );
+        }
+        Ok(())
+    }
+}
+
+// Publisher-side `client::batch_store` primitive + `batch_store_with_fallback`
+// fallback negotiation (#648 / AC 20). These drive the outbound client
+// against a real handler over loopback.
+mod batch_store_client {
+    use super::*;
+    use decdn_node::dht::batch_fallback::BatchStoreFallback;
+    use decdn_node::dht::client;
+    use std::time::Duration;
+
+    /// Spin up a staked-publisher DHT server whose accept loop serves an
+    /// arbitrary number of inbound connections (the per-hash fallback
+    /// opens one connection per hash). Returns the server endpoint, its
+    /// connect target, the publisher's key, the shared metrics handle,
+    /// and the accept-loop join handle.
+    #[allow(clippy::type_complexity)]
+    async fn spin_up_looping_staked_server(
+        client_id: [u8; 32],
+    ) -> anyhow::Result<(
+        Endpoint,
+        EndpointAddr,
+        iroh::PublicKey,
+        Arc<Metrics>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let metrics = Arc::new(Metrics::new());
+        let limiter = permissive_limiter(&metrics);
+        let rate_limiter = permissive_dht_rate_limiter(&metrics);
+        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let mut active = std::collections::HashSet::new();
+        active.insert(client_id);
+        let staker_set: Arc<dyn StakerSet> =
+            Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::new(active));
+        let handler = Arc::new(DhtHandler::with_routing(
+            server_id,
+            routing,
+            rate_limiter,
+            limiter,
+            Arc::clone(&metrics),
+            staker_set,
+            empty_record_store(),
+        ));
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Some(incoming) = server_ep_bg.accept().await {
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let Ok(connecting) = incoming.accept() else {
+                        return;
+                    };
+                    let Ok(conn) = connecting.await else {
+                        return;
+                    };
+                    let _ = handler.accept(conn).await;
+                });
+            }
+        });
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        Ok((server_ep, target, server_id, metrics, accept_task))
+    }
+
+    /// AC 17 over the real outbound primitive: `client::batch_store`
+    /// against a handler that supports batching returns one `accepted`
+    /// per hash, all `true` for a staked publisher.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_store_primitive_roundtrip() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let holder = *client_sk.public().as_bytes();
+        let (server_ep, target, _sid, _metrics, accept_task) =
+            spin_up_looping_staked_server(holder).await?;
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let hashes: Vec<[u8; 32]> = (1u8..=4).map(|i| [i; 32]).collect();
+        let ack = client::batch_store(&client_ep, target, hashes.clone(), holder).await?;
+        assert_eq!(ack.results, vec![true; 4]);
+        client_ep.close().await;
+        server_ep.close().await;
+        accept_task.abort();
+        Ok(())
+    }
+
+    /// AC 20 happy path: with an empty fallback cache,
+    /// `batch_store_with_fallback` takes the batch path — the handler
+    /// records exactly one `BatchStore` and accepts every hash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fallback_helper_uses_batch_when_supported() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let holder = *client_sk.public().as_bytes();
+        let (server_ep, target, server_id, metrics, accept_task) =
+            spin_up_looping_staked_server(holder).await?;
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let hashes: Vec<[u8; 32]> = (1u8..=3).map(|i| [i; 32]).collect();
+        let fallback = BatchStoreFallback::new(Duration::from_mins(10));
+
+        let results = client::batch_store_with_fallback(
+            &client_ep,
+            target,
+            *server_id.as_bytes(),
+            hashes.clone(),
+            holder,
+            &fallback,
+        )
+        .await;
+        assert_eq!(results, vec![true; 3]);
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_dht_batch_store_received_total 1"),
+            "exactly one BatchStore must have reached the handler:\n{text}"
+        );
+        client_ep.close().await;
+        server_ep.close().await;
+        accept_task.abort();
+        Ok(())
+    }
+
+    /// AC 20 fallback: a receiver already cached as batch-unsupported is
+    /// published to per-hash — the handler sees zero `BatchStore`s and
+    /// three accepted per-hash `Store`s.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fallback_helper_skips_batch_when_cached_unsupported() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let holder = *client_sk.public().as_bytes();
+        let (server_ep, target, server_id, metrics, accept_task) =
+            spin_up_looping_staked_server(holder).await?;
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let hashes: Vec<[u8; 32]> = (1u8..=3).map(|i| [i; 32]).collect();
+        let fallback = BatchStoreFallback::new(Duration::from_mins(10));
+        // Pre-mark the receiver unsupported so the helper skips batching.
+        fallback.mark_unsupported(*server_id.as_bytes());
+
+        let results = client::batch_store_with_fallback(
+            &client_ep,
+            target,
+            *server_id.as_bytes(),
+            hashes.clone(),
+            holder,
+            &fallback,
+        )
+        .await;
+        assert_eq!(results, vec![true; 3], "per-hash fallback still delivers");
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_dht_batch_store_received_total 0"),
+            "no BatchStore should reach the handler when cached unsupported:\n{text}"
+        );
+        assert!(
+            text.contains("decdn_dht_store_accepted_total 3"),
+            "three per-hash Stores must have been accepted:\n{text}"
+        );
+        client_ep.close().await;
+        server_ep.close().await;
+        accept_task.abort();
+        Ok(())
+    }
+}
+
+// AC 20 end-to-end: a receiver that does NOT implement BatchStore (closes
+// the stream with `APP_ERR_UNSUPPORTED_MESSAGE`, the pre-#648 deCDN
+// behaviour) must drive the publisher to (a) fall back to per-hash Store,
+// (b) cache the negative result, and (c) skip the batch attempt on the
+// next publish. This crosses the real iroh stream-close →
+// `extract_app_error_code` → `classify_batch_error` seam that the
+// classifier unit tests can't reach.
+mod batch_store_fallback_negotiation {
+    use super::*;
+    use decdn_node::dht::batch_fallback::BatchStoreFallback;
+    use decdn_node::dht::client;
+    use iroh::endpoint::{Connection, VarInt};
+    use iroh::protocol::AcceptError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
+
+    /// A receiver that rejects `BatchStore` with `APP_ERR_UNSUPPORTED_MESSAGE`
+    /// (pre-#648 behaviour) but serves per-hash `Store` normally (always
+    /// accepts). Counts batch attempts + per-hash accepts so the test can
+    /// prove the publisher stops re-attempting batches once cached.
+    #[derive(Debug)]
+    struct LegacyNoBatchStub {
+        batch_attempts: Arc<AtomicUsize>,
+        store_accepts: Arc<AtomicUsize>,
+    }
+
+    impl ProtocolHandler for LegacyNoBatchStub {
+        async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+            // One outbound DHT exchange opens one bi-stream then closes the
+            // connection; `accept_bi` erroring means the peer is done.
+            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                let Ok(frame) = read_frame(&mut recv).await else {
+                    break;
+                };
+                let Ok((msg, _)) = decode_message::<wire::DhtMessage>(&frame) else {
+                    let _ = send.reset(VarInt::from_u32(0x03));
+                    continue;
+                };
+                match msg {
+                    wire::DhtMessage::BatchStore(_) => {
+                        self.batch_attempts.fetch_add(1, Ordering::SeqCst);
+                        let code = VarInt::from_u32(APP_ERR_UNSUPPORTED_MESSAGE);
+                        let _ = send.reset(code);
+                        let _ = recv.stop(code);
+                    }
+                    wire::DhtMessage::Store(req) => {
+                        self.store_accepts.fetch_add(1, Ordering::SeqCst);
+                        let ack = wire::DhtMessage::StoreAck(wire::StoreAck {
+                            hash: req.hash,
+                            accepted: true,
+                        });
+                        if let Ok(payload) = encode_message(&ack) {
+                            let _ = write_frame(&mut send, &payload).await;
+                            let _ = send.finish();
+                        }
+                    }
+                    _ => {
+                        let _ = send.reset(VarInt::from_u32(APP_ERR_UNSUPPORTED_MESSAGE));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsupported_close_caches_and_falls_back_then_skips_batch() -> anyhow::Result<()> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let batch_attempts = Arc::new(AtomicUsize::new(0));
+        let store_accepts = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(LegacyNoBatchStub {
+            batch_attempts: Arc::clone(&batch_attempts),
+            store_accepts: Arc::clone(&store_accepts),
+        });
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Some(incoming) = server_ep_bg.accept().await {
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let Ok(connecting) = incoming.accept() else {
+                        return;
+                    };
+                    let Ok(conn) = connecting.await else {
+                        return;
+                    };
+                    let _ = handler.accept(conn).await;
+                });
+            }
+        });
+
+        let client_sk = fresh_key();
+        let holder = *client_sk.public().as_bytes();
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let target_id = *server_id.as_bytes();
+        let fallback = BatchStoreFallback::new(Duration::from_mins(10));
+        let hashes: Vec<[u8; 32]> = (1u8..=3).map(|i| [i; 32]).collect();
+
+        // First publish: batch attempted → UNSUPPORTED close → per-hash
+        // fallback delivers, and the receiver is cached unsupported.
+        let r1 = client::batch_store_with_fallback(
+            &client_ep,
+            target.clone(),
+            target_id,
+            hashes.clone(),
+            holder,
+            &fallback,
+        )
+        .await;
+        assert_eq!(r1, vec![true; 3], "per-hash fallback must deliver all 3");
+        assert_eq!(
+            batch_attempts.load(Ordering::SeqCst),
+            1,
+            "one batch attempt"
+        );
+        assert_eq!(
+            store_accepts.load(Ordering::SeqCst),
+            3,
+            "three per-hash stores"
+        );
+        assert!(
+            !fallback.supports_batch(&target_id),
+            "receiver must be cached as batch-unsupported after the 0x01 close"
+        );
+
+        // Second publish: cache says unsupported → batch is NOT re-attempted.
+        let r2 = client::batch_store_with_fallback(
+            &client_ep,
+            target,
+            target_id,
+            hashes.clone(),
+            holder,
+            &fallback,
+        )
+        .await;
+        assert_eq!(r2, vec![true; 3]);
+        assert_eq!(
+            batch_attempts.load(Ordering::SeqCst),
+            1,
+            "second publish must skip the batch attempt (still 1)"
+        );
+        assert_eq!(
+            store_accepts.load(Ordering::SeqCst),
+            6,
+            "three more per-hash stores on the second publish"
+        );
+
+        client_ep.close().await;
+        server_ep.close().await;
+        accept_task.abort();
         Ok(())
     }
 }

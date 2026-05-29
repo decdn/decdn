@@ -199,11 +199,38 @@ impl DhtRateLimiter {
         peer_node_id: &NodeId,
         peer_ip: Option<IpAddr>,
     ) -> Result<(), DhtRejectLayer> {
+        // Charge one unit cheapest-first; bump the per-layer rejection
+        // counter for the layer that drained the budget. The accounting
+        // itself lives in `try_admit_one` so the batch stage-2 path
+        // (`admit_batch_extra`) can reuse it without the metric bump — a
+        // partial-admit boundary is not a request rejection.
+        match self.try_admit_one(peer_node_id, peer_ip) {
+            Ok(()) => Ok(()),
+            Err(layer) => {
+                match layer {
+                    DhtRejectLayer::Global => self.metrics.dht_rate_limit_rejected_global(),
+                    DhtRejectLayer::PerIp => self.metrics.dht_rate_limit_rejected_per_ip(),
+                    DhtRejectLayer::PerPeer => self.metrics.dht_rate_limit_rejected_per_peer(),
+                }
+                Err(layer)
+            }
+        }
+    }
+
+    /// Charge exactly one unit from each enabled layer, cheapest-first
+    /// (global → per-IP → per-peer) with short-circuit on the first
+    /// exhausted layer. Does **not** touch any metric — callers decide
+    /// whether a failure is a rejection ([`Self::check`]) or a
+    /// partial-admit boundary ([`Self::admit_batch_extra`]).
+    fn try_admit_one(
+        &self,
+        peer_node_id: &NodeId,
+        peer_ip: Option<IpAddr>,
+    ) -> Result<(), DhtRejectLayer> {
         // Layer 1 — global.
         if let Some(g) = self.global.as_ref()
             && g.check().is_err()
         {
-            self.metrics.dht_rate_limit_rejected_global();
             return Err(DhtRejectLayer::Global);
         }
 
@@ -215,7 +242,6 @@ impl DhtRateLimiter {
             let result = limiter.check_key(&ip);
             self.maybe_prune_per_ip(limiter);
             if result.is_err() {
-                self.metrics.dht_rate_limit_rejected_per_ip();
                 return Err(DhtRejectLayer::PerIp);
             }
         }
@@ -225,12 +251,47 @@ impl DhtRateLimiter {
             let result = limiter.check_key(peer_node_id);
             self.maybe_prune_per_peer(limiter);
             if result.is_err() {
-                self.metrics.dht_rate_limit_rejected_per_peer();
                 return Err(DhtRejectLayer::PerPeer);
             }
         }
 
         Ok(())
+    }
+
+    /// Stage 2 of the two-stage batch admission (ADR 022 §Batch token
+    /// accounting). After [`Self::check`] has charged the stage-1 frame
+    /// token, this consumes up to `extra` (= `n - 1` for a batch of `n`
+    /// hashes) more units cheapest-first, each unit identical to what one
+    /// separate `StoreRequest` admission would charge — so the per-second
+    /// work ceiling is the same whether the publisher sends `n` separate
+    /// `Store`s or one `BatchStore` of size `n` (ADR 022 AC 17).
+    ///
+    /// Returns the number of extra units granted; the first
+    /// `1 + returned` hashes of the batch pass through per-hash
+    /// processing, the remainder are acked `false`. Returns `0` when
+    /// `extra == 0` or the budget is already exhausted.
+    ///
+    /// No rejection counter is bumped: the inbound frame was already
+    /// admitted at stage 1, and the over-budget tail is deferred work the
+    /// publisher retries, not a rejected request. Because the per-unit
+    /// charge short-circuits cheapest-first, the terminating unit may
+    /// consume a global (and per-IP) token without a per-peer token —
+    /// byte-for-byte what the `(k+1)`-th separate `Store` would have done.
+    #[must_use]
+    pub fn admit_batch_extra(
+        &self,
+        peer_node_id: &NodeId,
+        peer_ip: Option<IpAddr>,
+        extra: usize,
+    ) -> usize {
+        let mut granted = 0usize;
+        while granted < extra {
+            if self.try_admit_one(peer_node_id, peer_ip).is_err() {
+                break;
+            }
+            granted = granted.saturating_add(1);
+        }
+        granted
     }
 
     /// Opportunistic prune of the per-IP keyed map when it exceeds
@@ -547,6 +608,100 @@ mod tests {
         let lim = DhtRateLimiter::new(&cfg, metrics());
         for _ in 0..1000 {
             assert_eq!(lim.check(&peer(1), Some(ip(10, 0, 0, 1))), Ok(()));
+        }
+    }
+
+    // ---- #648: two-stage batch token accounting (ADR 022 §Batch token
+    // accounting). `admit_batch_extra` is stage 2: after `check` has
+    // charged the stage-1 frame token, it consumes up to `extra` (= n-1)
+    // more units cheapest-first with short-circuit, exactly as `extra`
+    // separate `StoreRequest` admissions would. ----
+
+    #[test]
+    fn admit_batch_extra_grants_full_budget_when_permissive() {
+        let lim = DhtRateLimiter::new(&DhtRateLimitConfig::default(), metrics());
+        let p = peer(1);
+        let i = Some(ip(10, 0, 0, 1));
+        // Stage 1: the frame token (matches `serve`).
+        assert_eq!(lim.check(&p, i), Ok(()));
+        // Stage 2: a batch of n=10 wants n-1=9 extra; all granted under
+        // the default burst caps (per-peer burst 40).
+        assert_eq!(lim.admit_batch_extra(&p, i, 9), 9);
+    }
+
+    #[test]
+    fn admit_batch_extra_returns_zero_for_zero_extra() {
+        // n=1 batch: extra = 0, nothing more to charge.
+        let lim = DhtRateLimiter::new(&DhtRateLimitConfig::default(), metrics());
+        assert_eq!(lim.admit_batch_extra(&peer(1), Some(ip(10, 0, 0, 1)), 0), 0);
+    }
+
+    #[test]
+    fn admit_batch_extra_bounded_by_per_peer_remaining() {
+        // per-peer burst 5, everything else loose. Stage 1 burns 1
+        // (4 left); a batch wanting 10 extra gets only the 4 remaining.
+        let mut cfg = strict_cfg();
+        cfg.per_peer_rate_per_sec = 1.0;
+        cfg.per_peer_burst = 5;
+        cfg.per_ip_burst = u32::MAX;
+        cfg.per_ip_rate_per_sec = 1e9;
+        cfg.global_burst = u32::MAX;
+        cfg.global_rate_per_sec = 1e9;
+        let lim = DhtRateLimiter::new(&cfg, metrics());
+        let p = peer(1);
+        let i = Some(ip(10, 0, 0, 1));
+        assert_eq!(lim.check(&p, i), Ok(()));
+        assert_eq!(lim.admit_batch_extra(&p, i, 10), 4);
+        // Bucket now empty — a second batch gets nothing more.
+        assert_eq!(lim.admit_batch_extra(&p, i, 10), 0);
+    }
+
+    #[test]
+    fn admit_batch_extra_bounded_by_min_across_layers() {
+        // per-IP is the tightest layer (burst 3). Stage 1 burns 1 from
+        // each (per-IP 2 left); the batch gets min remaining = 2.
+        let mut cfg = strict_cfg();
+        cfg.per_peer_rate_per_sec = 1e9;
+        cfg.per_peer_burst = u32::MAX;
+        cfg.per_ip_rate_per_sec = 1.0;
+        cfg.per_ip_burst = 3;
+        cfg.global_rate_per_sec = 1e9;
+        cfg.global_burst = u32::MAX;
+        let lim = DhtRateLimiter::new(&cfg, metrics());
+        let p = peer(1);
+        let i = Some(ip(10, 0, 0, 1));
+        assert_eq!(lim.check(&p, i), Ok(()));
+        assert_eq!(lim.admit_batch_extra(&p, i, 8), 2);
+    }
+
+    #[test]
+    fn admit_batch_extra_does_not_bump_rejection_counters() {
+        // The partial-admit boundary is NOT a request rejection — the
+        // frame was already admitted at stage 1. Draining the budget in
+        // stage 2 must leave the rate-limit rejection counters at 0 so
+        // operators don't see phantom rejections for a partially-admitted
+        // batch.
+        let mut cfg = strict_cfg();
+        cfg.per_peer_rate_per_sec = 1.0;
+        cfg.per_peer_burst = 2;
+        cfg.per_ip_burst = u32::MAX;
+        cfg.per_ip_rate_per_sec = 1e9;
+        cfg.global_burst = u32::MAX;
+        cfg.global_rate_per_sec = 1e9;
+        let metrics = metrics();
+        let lim = DhtRateLimiter::new(&cfg, Arc::clone(&metrics));
+        let p = peer(1);
+        let i = Some(ip(10, 0, 0, 1));
+        assert_eq!(lim.check(&p, i), Ok(()));
+        // extra=5 but only 1 token left after stage 1 → grants 1, then
+        // the budget is exhausted for the rest (no counter bump).
+        assert_eq!(lim.admit_batch_extra(&p, i, 5), 1);
+        let text = metrics.encode().unwrap();
+        for layer in ["per_peer", "per_ip", "global"] {
+            assert!(
+                text.contains(&format!("decdn_dht_rate_limit_rejected_{layer}_total 0")),
+                "stage-2 partial admit must not bump the {layer} rejection counter:\n{text}"
+            );
         }
     }
 

@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use decdn_protocol::{
-    ALPN_DHT, FrameError, decode_message, dht as wire, encode_message, read_frame, write_frame,
+    ALPN_DHT, decode_message, dht as wire, encode_message, read_frame, write_frame,
 };
 use iroh::endpoint::{ConnectOptions, Connection, ConnectionError, ReadError, ReadToEndError};
 use iroh::{Endpoint, EndpointAddr};
@@ -84,11 +84,170 @@ pub async fn store(
     }
 }
 
+/// ADR 013 application error code a receiver closes the stream with when
+/// it does not implement `BatchStore` admission (the pre-#648 deCDN
+/// handler arm). It is the canonical "fall back to per-hash" signal:
+/// `APP_ERR_UNSUPPORTED_MESSAGE` (also defined in the handlers; the codes
+/// are protocol-wide). See [`batch_store_with_fallback`].
+const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
+
+/// Send a single `BatchStore` request to `target` and return the ack
+/// (ADR 022 §STORE Flow Batched STORE, #648). One `bool` per request
+/// hash comes back in request order. Callers that need automatic
+/// fallback to per-hash `Store` against receivers that don't implement
+/// batching use [`batch_store_with_fallback`] instead of calling this
+/// directly.
+///
+/// `hashes` MUST be ≤ [`decdn_protocol::dht::MAX_BATCH_STORE_HASHES`];
+/// an oversize batch is rejected by the receiver at wire decode with
+/// `MALFORMED_MESSAGE` and surfaces here as an error (the caller must
+/// split the set, not retry).
+pub async fn batch_store(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    hashes: Vec<[u8; 32]>,
+    holder: [u8; 32],
+) -> anyhow::Result<wire::BatchStoreAck> {
+    let request = wire::DhtMessage::BatchStore(wire::BatchStoreRequest { hashes, holder });
+    let response = exchange(endpoint, target, &request).await?;
+    match response {
+        wire::DhtMessage::BatchStoreAck(a) => Ok(a),
+        other => anyhow::bail!(
+            "dht client: expected BatchStoreAck, got {} variant",
+            variant_name(&other)
+        ),
+    }
+}
+
+/// What a failed [`batch_store`] attempt means for fallback (ADR 022
+/// §STORE Flow / AC 20). Decided purely from the receiver's close code so
+/// the policy is unit-testable without a network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchAttemptOutcome {
+    /// Receiver doesn't speak `BatchStore` (closed with
+    /// `APP_ERR_UNSUPPORTED_MESSAGE`). Cache the negative result and fall
+    /// back to per-hash `Store` — this is the AC 20 trigger.
+    Unsupported,
+    /// A failure that is NOT a "doesn't support batching" signal:
+    /// `MALFORMED_MESSAGE` / `MESSAGE_TOO_LARGE` (a publisher-side bug —
+    /// e.g. an over-cap batch — that per-hash retry would only mask),
+    /// `RATE_LIMITED` (receiver overloaded; per-hash would add load), or
+    /// a transport-level error where we never reached a stream close
+    /// (`None` — connect/handshake/timeout). Surface the failure; the
+    /// caller's normal republish cycle retries.
+    HardFail,
+}
+
+/// Classify a [`batch_store`] error for fallback. Only the explicit
+/// `APP_ERR_UNSUPPORTED_MESSAGE` close — the signal a pre-#648 deCDN node
+/// emits for an unimplemented `BatchStore` — is treated as "fall back to
+/// per-hash and cache". Everything else is a hard failure so a transient
+/// blip or a client bug doesn't trigger an `n`-deep per-hash retry storm
+/// against an unreachable or overloaded receiver.
+const fn classify_batch_error(code: Option<u32>) -> BatchAttemptOutcome {
+    match code {
+        Some(APP_ERR_UNSUPPORTED_MESSAGE) => BatchAttemptOutcome::Unsupported,
+        _ => BatchAttemptOutcome::HardFail,
+    }
+}
+
+/// Publish `hashes` to `target` as a single [`batch_store`], falling back
+/// to per-hash [`store`] when the receiver doesn't support batching
+/// (ADR 022 §STORE Flow / AC 20). Returns one `bool` per hash in request
+/// order (`accepted` for each).
+///
+/// Fallback negotiation:
+/// - If `fallback` already records `target_id` as batch-unsupported
+///   (within its bounded window), skip the batch attempt and go straight
+///   to per-hash — no wasted drop-and-fallback round-trip.
+/// - On an `UNSUPPORTED` close, mark `target_id` unsupported in
+///   `fallback` and retry the whole set per-hash.
+/// - On any other failure (malformed/too-large/rate-limited/transport),
+///   return all-`false` without a per-hash storm; the caller retries on
+///   its next cycle.
+///
+/// A receiver that returns a `BatchStoreAck` whose length doesn't match
+/// the request is treated as non-conformant and the set is retried
+/// per-hash (we don't trust a mis-sized ack to map onto our hashes).
+//
+// Linear negotiation ladder (cache → batch → classify → fall back); the
+// branches are the spec's distinct outcomes, not incidental complexity.
+#[allow(clippy::cognitive_complexity)]
+pub async fn batch_store_with_fallback(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    target_id: [u8; 32],
+    hashes: Vec<[u8; 32]>,
+    holder: [u8; 32],
+    fallback: &crate::dht::batch_fallback::BatchStoreFallback,
+) -> Vec<bool> {
+    let n = hashes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if !fallback.supports_batch(&target_id) {
+        return per_hash_fallback(endpoint, target, &hashes, holder).await;
+    }
+    match batch_store(endpoint, target.clone(), hashes.clone(), holder).await {
+        Ok(ack) if ack.results.len() == n => ack.results,
+        Ok(ack) => {
+            // A conformant receiver MUST return one bool per request hash;
+            // a mis-sized ack is a protocol violation. Warn (not debug) so
+            // a broken/non-conformant peer is visible on a default-level
+            // scrape, then retry per-hash rather than trust the mapping.
+            tracing::warn!(
+                expected = n,
+                got = ack.results.len(),
+                "dht batch_store: receiver returned mis-sized ack; retrying per-hash"
+            );
+            per_hash_fallback(endpoint, target, &hashes, holder).await
+        }
+        Err(e) => match classify_batch_error(extract_app_error_code(&e)) {
+            BatchAttemptOutcome::Unsupported => {
+                tracing::debug!(
+                    peer = ?target_id,
+                    "dht batch_store: receiver does not support batching; \
+                     caching + falling back to per-hash Store"
+                );
+                fallback.mark_unsupported(target_id);
+                per_hash_fallback(endpoint, target, &hashes, holder).await
+            }
+            BatchAttemptOutcome::HardFail => {
+                tracing::debug!(error = %e, "dht batch_store failed; no per-hash fallback this cycle");
+                vec![false; n]
+            }
+        },
+    }
+}
+
+/// Issue one per-hash [`store`] for each hash and collect `accepted`
+/// flags in order. A failed exchange for a hash maps to `false` (the
+/// caller retries on its next republish cycle).
+async fn per_hash_fallback(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    hashes: &[[u8; 32]],
+    holder: [u8; 32],
+) -> Vec<bool> {
+    let mut out = Vec::with_capacity(hashes.len());
+    for &hash in hashes {
+        let accepted = match store(endpoint, target.clone(), hash, holder).await {
+            Ok(ack) => ack.accepted,
+            Err(e) => {
+                tracing::debug!(hash = ?hash, error = %e, "dht per-hash fallback Store failed");
+                false
+            }
+        };
+        out.push(accepted);
+    }
+    out
+}
+
 /// Send a single `FindValue` request to `target` and return the response.
 ///
-/// Used by the requester-side iterative lookup (PR 5 of #320). Exposed
-/// here so the same connect/encode/decode plumbing isn't duplicated
-/// across the bootstrap / republish / lookup call sites.
+/// Used by the requester-side iterative lookup ([`crate::dht::lookup`]).
+/// Exposed here so the same connect/encode/decode plumbing isn't
+/// duplicated across the bootstrap / republish / lookup call sites.
 pub async fn find_value(
     endpoint: &Endpoint,
     target: EndpointAddr,
@@ -159,14 +318,29 @@ async fn exchange_on(conn: &Connection, payload: &[u8]) -> anyhow::Result<wire::
         .map_err(|e| anyhow::anyhow!("dht client: write request: {e}"))?;
     send.finish()
         .map_err(|e| anyhow::anyhow!("dht client: finish send: {e}"))?;
-    let frame = read_frame(&mut recv).await.map_err(|e| map_frame_err(&e))?;
+    let frame = match read_frame(&mut recv).await {
+        Ok(frame) => frame,
+        Err(frame_err) => {
+            // A peer that signals via a *stream reset* (e.g.
+            // `APP_ERR_UNSUPPORTED_MESSAGE` for an unimplemented
+            // `BatchStore`, or `RATE_LIMITED`) is invisible to
+            // `extract_app_error_code` through this path: iroh's
+            // `AsyncRead` adapter collapses the reset into an `io::Error`
+            // with no typed source, so the `ReadError::Reset(code)` is
+            // lost (only its Display text survives). Probe the stream
+            // directly for the reset code and re-surface it *typed* so
+            // `extract_app_error_code` can recover the ADR 013 code and
+            // callers (e.g. `batch_store_with_fallback`) can negotiate.
+            if let Ok(Some(code)) = recv.received_reset().await {
+                return Err(anyhow::Error::new(ReadError::Reset(code))
+                    .context("dht client: peer reset response stream"));
+            }
+            return Err(anyhow::Error::new(frame_err).context("dht client: read response"));
+        }
+    };
     let (msg, _tail) = decode_message::<wire::DhtMessage>(&frame)
         .map_err(|e| anyhow::anyhow!("dht client: decode response: {e}"))?;
     Ok(msg)
-}
-
-fn map_frame_err(e: &FrameError) -> anyhow::Error {
-    anyhow::anyhow!("dht client: read response: {e}")
 }
 
 const fn variant_name(msg: &wire::DhtMessage) -> &'static str {
@@ -230,5 +404,53 @@ fn read_error_code(re: &ReadError) -> Option<u32> {
             c.error_code.into_inner().try_into().ok()
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    // ADR 013 application error codes (protocol-wide constants).
+    const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
+    const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
+    const APP_ERR_RATE_LIMITED: u32 = 0x10;
+
+    #[test]
+    fn unsupported_close_triggers_fallback() {
+        // The canonical "I don't speak BatchStore" signal a pre-#648 node
+        // emits — the only outcome that should cache + fall back per-hash.
+        assert_eq!(
+            classify_batch_error(Some(APP_ERR_UNSUPPORTED_MESSAGE)),
+            BatchAttemptOutcome::Unsupported
+        );
+    }
+
+    #[test]
+    fn client_bug_and_overload_codes_are_hard_failures() {
+        // Over-cap batch (MALFORMED) / oversize frame (TOO_LARGE) are
+        // publisher bugs; per-hash retry would only mask them.
+        // RATE_LIMITED means the receiver is overloaded — per-hash would
+        // add load. None of these should fall back per-hash.
+        for code in [
+            APP_ERR_MALFORMED_MESSAGE,
+            APP_ERR_MESSAGE_TOO_LARGE,
+            APP_ERR_RATE_LIMITED,
+        ] {
+            assert_eq!(
+                classify_batch_error(Some(code)),
+                BatchAttemptOutcome::HardFail,
+                "code {code:#x} must be a hard fail, not a batch-unsupported signal"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_error_without_app_code_is_a_hard_failure() {
+        // `None` = connect/handshake/timeout (never reached a stream
+        // close). Not a "stream-close-without-ack", so it must NOT poison
+        // the fallback cache or trigger an n-deep per-hash timeout storm.
+        assert_eq!(classify_batch_error(None), BatchAttemptOutcome::HardFail);
     }
 }
