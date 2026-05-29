@@ -14,10 +14,10 @@ import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
 import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 
 /// @title FeeRouter
-/// @notice Four-bucket settlement distributor + canonical served-bytes
+/// @notice Three-bucket settlement distributor + canonical served-bytes
 ///         accountant. Per ADR 026 § FeeRouter split, every settlement
-///         transfers `amount` USDC as 60% operator base / 25% buyback /
-///         10% treasury / 5% safety in the same transaction. Per ADR 036,
+///         transfers `amount` USDC as 60% operator base / 30% buyback /
+///         10% treasury in the same transaction. Per ADR 036,
 ///         `bytesPerEpoch[op][e]` and `totalBytesPerEpoch[e]` are
 ///         incremented inline on every settlement and consumed by
 ///         `DecdnGovernor._getVotes` over the trailing `windowEpochs` window.
@@ -25,7 +25,7 @@ import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 ///         under the `setShares` / `set*` setters with a cross-validation
 ///         invariant (any non-zero share ⇒ non-zero destination — note the
 ///         one-way implication: a non-zero destination with a zero share is
-///         allowed during launch wiring). Buyback / treasury / safety
+///         allowed during launch wiring). Buyback / treasury
 ///         buckets short-circuit before the `safeTransfer` when their share
 ///         is 0; the operator share is bounded away from 0 by
 ///         `OPERATOR_BPS_FLOOR` and absorbs the rounding remainder so dust
@@ -50,7 +50,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     uint256 internal constant BUCKET_OPERATOR = 0;
     uint256 internal constant BUCKET_BUYBACK = 1;
     uint256 internal constant BUCKET_TREASURY = 2;
-    uint256 internal constant BUCKET_SAFETY = 3;
 
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
@@ -60,7 +59,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     uint256 internal constant BUYBACK_BPS_FLOOR = 500;
     uint256 internal constant BUYBACK_BPS_CEILING = 5000;
     uint256 internal constant TREASURY_BPS_CEILING = 3000;
-    uint256 internal constant SAFETY_BPS_CEILING = 2000;
 
     // Window bounds (ADR 036 § Governable parameters with safety bounds).
     uint64 internal constant WINDOW_EPOCHS_FLOOR = 4;
@@ -85,11 +83,10 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     // Storage — shares + destinations
     // -----------------------------------------------------------------
 
-    /// @dev Layout `[operatorBase, buyback, treasury, safety]`, in bps.
+    /// @dev Layout `[operatorBase, buyback, treasury]`, in bps.
     ///      Sum-to-10_000 invariant enforced by every setter.
-    uint256[4] internal _shares;
+    uint256[3] internal _shares;
 
-    address public safetyReserve;
     address public buybackBurner;
     address public treasury;
 
@@ -112,8 +109,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     // -----------------------------------------------------------------
 
     event Settled(address indexed operator, uint256 bytesDelivered, uint256 amount, uint64 indexed epoch);
-    event SharesUpdated(uint256[4] newShares);
-    event SafetyReserveUpdated(address indexed oldAddr, address indexed newAddr);
+    event SharesUpdated(uint256[3] newShares);
     event BuybackBurnerUpdated(address indexed oldAddr, address indexed newAddr);
     event TreasuryUpdated(address indexed oldAddr, address indexed newAddr);
     event WindowEpochsUpdated(uint64 oldValue, uint64 newValue);
@@ -143,12 +139,10 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     /// @param windowEpochs_      Initial trailing-window length (default 13;
     ///                           bounded `[4, 26]`).
     /// @param admin              `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder.
-    /// @param initialShares      Initial bucket shares `[op, bb, tr, safety]`
+    /// @param initialShares      Initial bucket shares `[op, bb, tr]`
     ///                           in bps. Must sum to 10_000 and satisfy the
     ///                           cross-validation invariant against
-    ///                           `safetyReserve_` / `buybackBurner_`.
-    /// @param safetyReserve_     Initial `SafetyReserve` address. May be 0
-    ///                           iff `initialShares[BUCKET_SAFETY] == 0`.
+    ///                           `buybackBurner_`.
     /// @param buybackBurner_     Initial `BuybackBurner` address. May be 0
     ///                           iff `initialShares[BUCKET_BUYBACK] == 0`.
     constructor(
@@ -158,9 +152,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
         uint64 epochLength_,
         uint64 windowEpochs_,
         address admin,
-        uint256[4] memory initialShares,
-        // slither-disable-next-line missing-zero-check
-        address safetyReserve_,
+        uint256[3] memory initialShares,
         // slither-disable-next-line missing-zero-check
         address buybackBurner_
     ) {
@@ -188,7 +180,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
         // Destinations first, then shares — the cross-validation check inside
         // `_setShares` reads the destination state and requires both to be
         // consistent at the end of construction.
-        safetyReserve = safetyReserve_;
         buybackBurner = buybackBurner_;
         _setShares(initialShares);
 
@@ -212,7 +203,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
         if (amount == 0) revert ZeroAmount();
 
         // Pull USDC from the caller (PaymentChannel) once, then push out the
-        // four legs. Pulls + pushes share the same token, so we avoid the
+        // three legs. Pulls + pushes share the same token, so we avoid the
         // approve-from-channel race by transferring in here. PaymentChannel
         // must `approve(this, amount)` before calling.
         usdc.safeTransferFrom(msg.sender, address(this), amount);
@@ -224,26 +215,19 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
             _totalBytesPerEpoch[epoch] += bytesDelivered;
         }
 
-        uint256[4] memory s = _shares;
+        uint256[3] memory s = _shares;
 
         uint256 buybackShare = (amount * s[BUCKET_BUYBACK]) / BPS_DENOMINATOR;
         uint256 treasuryShare = (amount * s[BUCKET_TREASURY]) / BPS_DENOMINATOR;
-        uint256 safetyShare = (amount * s[BUCKET_SAFETY]) / BPS_DENOMINATOR;
-        // Operator leg absorbs the rounding remainder. Two reasons:
-        // (a) operator share is bounded ≥ `OPERATOR_BPS_FLOOR` (4000 bps) and
-        //     its destination is the per-call operator argument (always
-        //     non-zero by the entry guard) — so the dust transfer never
-        //     targets `address(0)`.
-        // (b) avoids the bug where dust ended up in the safety leg even when
-        //     `safetyShare` was 0; that would attempt a transfer to
-        //     `safetyReserve == address(0)` (allowed when share is 0) and
-        //     revert, bricking settlements.
-        uint256 opShare = amount - buybackShare - treasuryShare - safetyShare;
+        // Operator leg absorbs the rounding remainder: operator share is
+        // bounded ≥ `OPERATOR_BPS_FLOOR` (4000 bps) and its destination is the
+        // per-call operator argument (always non-zero by the entry guard) — so
+        // the dust transfer never targets `address(0)`.
+        uint256 opShare = amount - buybackShare - treasuryShare;
 
         if (opShare != 0) usdc.safeTransfer(operator, opShare);
         if (buybackShare != 0) usdc.safeTransfer(buybackBurner, buybackShare);
         if (treasuryShare != 0) usdc.safeTransfer(treasury, treasuryShare);
-        if (safetyShare != 0) usdc.safeTransfer(safetyReserve, safetyShare);
 
         capacityBond.recordSettlement(operator);
 
@@ -286,7 +270,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     // Views — shares + destinations
     // -----------------------------------------------------------------
 
-    function getShares() external view returns (uint256[4] memory) {
+    function getShares() external view returns (uint256[3] memory) {
         return _shares;
     }
 
@@ -294,12 +278,11 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     // Governance — shares + destinations + windowEpochs
     // -----------------------------------------------------------------
 
-    function setShares(uint256[4] calldata newShares) external onlyRole(GOVERNANCE_ROLE) {
+    function setShares(uint256[3] calldata newShares) external onlyRole(GOVERNANCE_ROLE) {
         _setShares(newShares);
     }
 
     struct ShareDestinations {
-        address safetyReserve;
         address buybackBurner;
         address treasury;
     }
@@ -308,22 +291,14 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     ///         activation. Sets destinations first (zero-share buckets may
     ///         have any address), then shares (cross-validation enforces
     ///         non-zero share ⇒ non-zero destination).
-    function setSharesAndDestinations(uint256[4] calldata newShares, ShareDestinations calldata dests)
+    function setSharesAndDestinations(uint256[3] calldata newShares, ShareDestinations calldata dests)
         external
         onlyRole(GOVERNANCE_ROLE)
     {
         if (dests.treasury == address(0)) revert ZeroAddress();
-        _setSafetyReserve(dests.safetyReserve);
         _setBuybackBurner(dests.buybackBurner);
         _setTreasury(dests.treasury);
         _setShares(newShares);
-    }
-
-    function setSafetyReserve(address newAddr) external onlyRole(GOVERNANCE_ROLE) {
-        if (newAddr == address(0) && _shares[BUCKET_SAFETY] != 0) {
-            revert NonZeroShareNeedsDestination(BUCKET_SAFETY);
-        }
-        _setSafetyReserve(newAddr);
     }
 
     function setBuybackBurner(address newAddr) external onlyRole(GOVERNANCE_ROLE) {
@@ -372,8 +347,8 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     // Internal — shares + destinations
     // -----------------------------------------------------------------
 
-    function _setShares(uint256[4] memory newShares) internal {
-        uint256 sum = newShares[0] + newShares[1] + newShares[2] + newShares[3];
+    function _setShares(uint256[3] memory newShares) internal {
+        uint256 sum = newShares[0] + newShares[1] + newShares[2];
         if (sum != BPS_DENOMINATOR) revert SharesDoNotSum(sum);
 
         if (newShares[BUCKET_OPERATOR] < OPERATOR_BPS_FLOOR || newShares[BUCKET_OPERATOR] > OPERATOR_BPS_CEILING) {
@@ -401,11 +376,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
                 bucket: BUCKET_TREASURY, value: newShares[BUCKET_TREASURY], floor: 0, ceiling: TREASURY_BPS_CEILING
             });
         }
-        if (newShares[BUCKET_SAFETY] > SAFETY_BPS_CEILING) {
-            revert ShareOutOfBounds({
-                bucket: BUCKET_SAFETY, value: newShares[BUCKET_SAFETY], floor: 0, ceiling: SAFETY_BPS_CEILING
-            });
-        }
 
         // Cross-validation invariant: non-zero share ⇒ non-zero destination.
         if (newShares[BUCKET_BUYBACK] != 0 && buybackBurner == address(0)) {
@@ -414,18 +384,9 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
         if (newShares[BUCKET_TREASURY] != 0 && treasury == address(0)) {
             revert NonZeroShareNeedsDestination(BUCKET_TREASURY);
         }
-        if (newShares[BUCKET_SAFETY] != 0 && safetyReserve == address(0)) {
-            revert NonZeroShareNeedsDestination(BUCKET_SAFETY);
-        }
 
         _shares = newShares;
         emit SharesUpdated(newShares);
-    }
-
-    function _setSafetyReserve(address newAddr) internal {
-        address old = safetyReserve;
-        safetyReserve = newAddr;
-        emit SafetyReserveUpdated(old, newAddr);
     }
 
     function _setBuybackBurner(address newAddr) internal {

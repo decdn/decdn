@@ -11,27 +11,34 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
+import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.sol";
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
-import { ISafetyReserve } from "./interfaces/ISafetyReserve.sol";
 
 /// @title CapacityBond — operator-registry contract
-/// @notice Custodies operator TOKEN bond, executes the 50/30/20 slash split
-///         from ADR 026 § Slashing and burn, is the canonical settlement
-///         reporter sink for `FeeRouter`, is the registry for iroh-NodeId ↔
-///         Ethereum-address bindings, holds the 50M TOKEN Genesis Bond
-///         Credit allocation in per-operator `PendingCredit` positions
-///         (ADR 026 § Genesis Bond Credits), and is the source of
-///         `firstBondedAt` / `slashedAtEpoch` for `DecdnGovernor`'s
-///         served-bytes voting weight per ADR 036.
+/// @notice Custodies operator TOKEN bond, executes the escrow-on-slash flow
+///         from ADR 026 § Slashing and burn (the slashed TOKEN is held in
+///         per-slashId escrow until the appeal window resolves, then either
+///         distributed 50% challenger / 50% burn or refunded to the operator
+///         on a successful appeal), is the canonical settlement reporter sink
+///         for `FeeRouter`, is the registry for iroh-NodeId ↔ Ethereum-address
+///         bindings, holds the 50M TOKEN Genesis Bond Credit allocation in
+///         per-operator `PendingCredit` positions (ADR 026 § Genesis Bond
+///         Credits), and is the source of `firstBondedAt` / `slashedAtEpoch`
+///         for `DecdnGovernor`'s served-bytes voting weight per ADR 036.
 /// @dev    Renamed from `StakingRegistry` per ADR 026 v2.2 vocabulary. The
-///         stake / unstake / slash / node-registry primitives are unchanged
-///         from the prior contract; this revision adds:
+///         stake / unstake / node-registry primitives are unchanged from the
+///         prior contract; this revision adds:
 ///           - `firstBondedAt[op]`  — set on first successful `stake` (ADR 036)
-///           - `slashedAtEpoch[op]` — stamped in `slash()`, cleared by
-///                                    `clearSlashedAtEpoch` via
-///                                    `APPEAL_REVERSAL_ROLE` (ADR 028 / 036)
+///           - `slashedAtEpoch[op]` — stamped in `slash()`, cleared by the
+///                                    `settleAppealGranted` escrow hook on a
+///                                    successful appeal (ADR 028 / 036)
+///           - escrow-on-slash: the slashed TOKEN is parked in `_slashRecords`
+///                                    (`escrowedTotal` accounting) until
+///                                    `finalizeUnappealedSlash` (no appeal) or
+///                                    one of the `SLASH_APPEAL_ROLE` settle
+///                                    hooks resolves it (ADR 028)
 ///           - `regionPrev[op]` + `regionLastChanged[op]` + `updateRegion`
 ///                                    (ADR 030 § Node Region Self-Attestation)
 ///           - `declaredMbps[op]`   — operator-asserted capacity (ADR 026
@@ -44,11 +51,11 @@ import { ISafetyReserve } from "./interfaces/ISafetyReserve.sol";
 ///                                    (ADR 026 § Genesis Bond Credits)
 ///         Slash math also applies to the unvested portion of
 ///         `pendingCredit[op]`: that portion is added to `slashAmount` and
-///         routed through the same 50% challenger / 30% SafetyReserve / 20%
-///         burn split (ADR 026 § Genesis Bond Credits — "same terms as
-///         voluntary bond").
+///         escrowed under the same terms as voluntary bond (ADR 026
+///         § Genesis Bond Credits — "same terms as voluntary bond").
 contract CapacityBond is
     ICapacityBond,
+    ICapacityBondSlashEscrow,
     ICapacityBondEjector,
     ICapacityBondReporter,
     AccessControl,
@@ -73,10 +80,12 @@ contract CapacityBond is
     ///         Deployment Initialization, step 7).
     bytes32 public constant GENESIS_GRANTOR_ROLE = keccak256("GENESIS_GRANTOR_ROLE");
 
-    /// @notice Authority to call `clearSlashedAtEpoch`. Granted to `SafetyReserve`
-    ///         (ADR 016 § Post-Deployment Initialization, step 6); consumed by
-    ///         `SafetyReserve.reverseAppeal` per ADR 028 § Contract surface.
-    bytes32 public constant APPEAL_REVERSAL_ROLE = keccak256("APPEAL_REVERSAL_ROLE");
+    /// @notice Authority to drive the escrow-on-slash appeal hooks
+    ///         (`markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted`).
+    ///         Granted to the `SlashAppeal` contract (ADR 016 § Post-Deployment
+    ///         Initialization); consumed by the `SlashAppeal` state machine per
+    ///         ADR 028 § Contract surface.
+    bytes32 public constant SLASH_APPEAL_ROLE = keccak256("SLASH_APPEAL_ROLE");
 
     // -----------------------------------------------------------------
     // Slash schedule constants (ADR 026 § Slashing and burn)
@@ -86,9 +95,18 @@ contract CapacityBond is
     uint256 internal constant SLASH_BPS_TIER_1 = 500;
     uint256 internal constant SLASH_BPS_TIER_2 = 1500;
     uint256 internal constant SLASH_BPS_TIER_3 = 5000;
+    /// @notice Challenger share of an upheld slash at finality (ADR 026
+    ///         § Slashing and burn — 50% challenger / 50% burn). The burn
+    ///         share is the implicit remainder so the two legs sum exactly.
     uint256 internal constant CHALLENGER_BPS = 5000;
-    uint256 internal constant SAFETY_BPS = 3000;
-    // 20% burn share is the implicit remainder so legs sum exactly.
+
+    /// @notice Window after a slash during which the operator may file an
+    ///         appeal (ADR 028 § Hard caps and frequency limits). Also gates
+    ///         the permissionless `finalizeUnappealedSlash` path: escrow can
+    ///         only be distributed as upheld once this window lapses with no
+    ///         appeal. Shared with `SlashAppeal` via `markAppealOpen`, which is
+    ///         the single on-chain enforcer of the filing deadline.
+    uint64 internal constant APPEAL_FILING_WINDOW = 30 days;
 
     // -----------------------------------------------------------------
     // Governable-parameter safety bounds
@@ -207,10 +225,6 @@ contract CapacityBond is
     uint256 public minStake;
     uint256 public unbondingPeriod;
 
-    /// @notice SafetyReserve sink for the 30% slash leg. Zero at construction;
-    ///         must be wired post-deploy before any `slash` can fire.
-    ISafetyReserve public safetyReserve;
-
     /// @notice Treasury destination for unvested Genesis Bond Credit forfeited
     ///         by an operator who initiates `requestUnstake` before 24mo of
     ///         vesting (ADR 026 § Genesis Bond Credits — exit clause). If zero
@@ -276,14 +290,33 @@ contract CapacityBond is
     // Storage — slash records (ADR 028 § Contract surface)
     // -----------------------------------------------------------------
 
-    /// @notice On-chain slash event record consumed by `SafetyReserve.openSlashAppeal`
-    ///         to validate appeals against a specific slash without trusting the
-    ///         appellant's `operator` parameter (ADR 028 — closes the unverified-
-    ///         operator hole).
+    /// @notice Lifecycle of a slash's escrowed TOKEN (ADR 028 escrow-on-slash).
+    ///         `Escrowed` → either `Upheld` (distributed 50/50) or `Reversed`
+    ///         (refunded to the operator). `AppealOpen` locks the escrow while
+    ///         the `SlashAppeal` state machine runs, so the permissionless
+    ///         `finalizeUnappealedSlash` path cannot race an open appeal.
+    enum SlashStatus {
+        None,
+        Escrowed,
+        AppealOpen,
+        Upheld,
+        Reversed
+    }
+
+    /// @notice On-chain slash event record. The slashed TOKEN is held in escrow
+    ///         by this contract (`escrowedTotal`) until the slash resolves.
+    ///         `SlashAppeal.openSlashAppeal` reads this record to validate
+    ///         appeals against a specific slash without trusting the appellant's
+    ///         `operator` parameter (ADR 028 — closes the unverified-operator
+    ///         hole).
     struct SlashRecord {
-        address operator;
-        uint64 slashedAt;
-        uint256 slashAmount;
+        address operator; // slot 0: 20 bytes
+        uint64 slashedAt; // slot 0: +8 = 28 bytes
+        SlashStatus status; // slot 0: +1 = 29 bytes
+        address challenger; // slot 1: 20 bytes — paid the 50% leg at finality
+        uint64 appealWindowClose; // slot 1: +8 = 28 bytes
+        uint256 slashAmount; // slot 2: escrowed TOKEN amount (stake + credit)
+        uint256 creditPortion; // slot 3: the Genesis-credit share of slashAmount
     }
 
     /// @notice Monotonic slash counter — next slash receives this index, then
@@ -291,6 +324,25 @@ contract CapacityBond is
     uint256 public slashCounter;
 
     mapping(uint256 slashId => SlashRecord) internal _slashRecords;
+
+    /// @notice Sum of all TOKEN currently held in slash escrow (status
+    ///         `Escrowed` or `AppealOpen`). Invariant anchor: the contract's
+    ///         TOKEN balance must cover `escrowedTotal` plus active stake,
+    ///         unbonding stake, and unclaimed Genesis credit. Incremented in
+    ///         `slash()`, decremented at every terminal escrow transition.
+    uint256 public escrowedTotal;
+
+    /// @notice Cumulative time (seconds) this contract has spent paused, plus
+    ///         the in-progress interval if currently paused. Added to the
+    ///         filing-window deadline checks so a pause never silently consumes
+    ///         an operator's appeal window (ADR 028 §5). Conservative: a pause
+    ///         that predates a slash still extends that slash's window, which
+    ///         only ever favors the operator.
+    uint64 public pausedTotal;
+
+    /// @notice `block.timestamp` at which the current pause began; 0 when not
+    ///         paused.
+    uint64 internal _pausedAt;
 
     // -----------------------------------------------------------------
     // Storage — node registry (ADR 019 § Node Onboarding;
@@ -334,10 +386,7 @@ contract CapacityBond is
         address indexed challenger,
         uint8 offenseType,
         uint32 lifetimeOffenseCount,
-        uint256 slashAmount,
-        uint256 challengerShare,
-        uint256 safetyShare,
-        uint256 burnShare
+        uint256 slashAmount
     );
     event AutoEjected(address indexed operator, uint256 remainingStake);
     event EjectedByBlacklist(address indexed operator);
@@ -345,7 +394,6 @@ contract CapacityBond is
     event SettlementRecorded(address indexed operator);
     event MinStakeUpdated(uint256 oldValue, uint256 newValue);
     event UnbondingPeriodUpdated(uint256 oldValue, uint256 newValue);
-    event SafetyReserveUpdated(address indexed oldAddr, address indexed newAddr);
     event MultiaddrUpdateCooldownUpdated(uint256 oldValue, uint256 newValue);
     event MaxMultiaddrSizeUpdated(uint256 oldValue, uint256 newValue);
     event RegionStabilityWindowUpdated(uint256 oldValue, uint256 newValue);
@@ -381,11 +429,12 @@ contract CapacityBond is
     // ADR 026 — declared capacity.
     event MbpsDeclared(address indexed operator, uint256 oldMbps, uint256 newMbps);
 
-    // ADR 028 — slash record minting.
+    // ADR 028 — slash record minting + escrow lifecycle.
     event SlashRecorded(uint256 indexed slashId, address indexed operator, uint64 slashedAt, uint256 slashAmount);
-
-    // I3 — best-effort slash inflow callback.
-    event SlashInflowReportFailed(uint256 indexed slashId, address indexed operator, uint256 amount, bytes reason);
+    event SlashEscrowed(uint256 indexed slashId, address indexed operator, uint256 amount, uint64 appealWindowClose);
+    event SlashAppealOpened(uint256 indexed slashId, address indexed operator);
+    event SlashUpheld(uint256 indexed slashId, bool viaAppeal, uint256 challengerShare, uint256 burnShare);
+    event SlashReversed(uint256 indexed slashId, address indexed operator, uint256 refund);
 
     // Treasury wiring (C3).
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
@@ -401,7 +450,6 @@ contract CapacityBond is
     error UnbondingInProgress();
     error UnbondingNotComplete(uint256 unlockAt);
     error NoUnbondingRequest();
-    error SafetyReserveNotWired();
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error NodeAlreadyRegistered();
     error NodeIdAlreadyBound(address currentOwner);
@@ -426,8 +474,12 @@ contract CapacityBond is
     error NotActiveForClaim(address operator);
     error SlashedInWindowForClaim(address operator);
 
-    // ADR 028 — slash record lookup
+    // ADR 028 — slash record lookup + escrow lifecycle
     error UnknownSlash(uint256 slashId);
+    error SlashNotEscrowed(uint256 slashId);
+    error SlashAppealNotOpen(uint256 slashId);
+    error FilingWindowStillOpen(uint64 readyAt);
+    error FilingWindowClosed(uint64 closedAt);
 
     // -----------------------------------------------------------------
     // Constructor
@@ -922,7 +974,6 @@ contract CapacityBond is
         returns (uint256 slashId, uint256 totalSlash)
     {
         if (operator == address(0) || challenger == address(0)) revert ZeroAddress();
-        if (address(safetyReserve) == address(0)) revert SafetyReserveNotWired();
 
         uint32 newCount = lifetimeOffenseCount[operator] + 1;
         lifetimeOffenseCount[operator] = newCount;
@@ -931,14 +982,20 @@ contract CapacityBond is
         // ADR 026 § Genesis Bond Credits — the full at-risk pending credit
         // pool (`originalGrant - claimed`, covering BOTH unvested and
         // vested-but-unclaimed) is added to the stake-slash amount and
-        // routed through the SAME 50% challenger / 30% safety / 20% burn
-        // split (C1 fix + the vested-unclaimed loophole closure).
+        // escrowed under the SAME terms as voluntary bond (C1 fix + the
+        // vested-unclaimed loophole closure).
         uint256 creditSlash = _slashPendingCreditAtTier(operator, tierBps);
         uint256 stakeSlash = _reduceStakeAtTier(operator, tierBps);
         totalSlash = stakeSlash + creditSlash;
-        slashId = _mintSlashRecord(operator, totalSlash);
+        // Escrow-on-slash (ADR 028): nothing is transferred or burned here.
+        // The slashed TOKEN stays in this contract under `_slashRecords` until
+        // `finalizeUnappealedSlash` (no appeal) or a `SLASH_APPEAL_ROLE` settle
+        // hook resolves it. The challenger is recorded for the 50% leg paid at
+        // finality; `creditSlash` is recorded so a granted appeal can restore
+        // the Genesis-credit vesting position rather than refunding it liquid.
+        slashId = _mintSlashRecord(operator, challenger, totalSlash, creditSlash);
         if (creditSlash != 0) emit GenesisCreditSlashed(operator, creditSlash);
-        _distributeAndStamp(slashId, operator, challenger, offenseType, totalSlash, newCount);
+        _stampSlash(operator, challenger, offenseType, totalSlash, newCount);
     }
 
     /// @dev Reduce active + unbonding stake at `tierBps`. Active first, then
@@ -985,52 +1042,62 @@ contract CapacityBond is
         uint256 atRisk = originalGrant - claimed;
         // slither-disable-next-line divide-before-multiply
         slashed = (atRisk * tierBps) / BPS_DENOMINATOR;
+        // Defensive clip, symmetric with `_reduceStakeAtTier`'s C2 cap: the
+        // slashed amount can never exceed the at-risk pool. A no-op for the
+        // immutable tier ladder (≤ 50%), but if a future tier constant is ever
+        // set above 100% this keeps `escrowedTotal` from booking more credit
+        // than was actually removed (which would later underflow a
+        // distribute/burn). INVARIANT: the stake leg and credit leg together
+        // never exceed the operator's at-risk balances.
+        if (slashed > atRisk) slashed = atRisk;
         // slither-disable-next-line incorrect-equality
         if (slashed == 0) return 0;
         pc.originalGrant = uint128(originalGrant - slashed);
     }
 
-    /// @dev Persist the slash record so `SafetyReserve.openSlashAppeal` can
-    ///      validate appeals without trusting the appellant's `operator`
-    ///      claim (I2 fix).
-    function _mintSlashRecord(address operator, uint256 totalSlashAmount) internal returns (uint256 slashId) {
+    /// @dev Persist the slash record (status `Escrowed`) and book the slashed
+    ///      TOKEN into `escrowedTotal`. The record lets
+    ///      `SlashAppeal.openSlashAppeal` validate appeals without trusting the
+    ///      appellant's `operator` claim (I2 fix), and pins the challenger +
+    ///      filing-window deadline for the eventual finality distribution.
+    function _mintSlashRecord(address operator, address challenger, uint256 totalSlashAmount, uint256 creditPortion)
+        internal
+        returns (uint256 slashId)
+    {
         slashId = slashCounter;
         unchecked {
             slashCounter = slashId + 1;
         }
-        _slashRecords[slashId] =
-            SlashRecord({ operator: operator, slashedAt: uint64(block.timestamp), slashAmount: totalSlashAmount });
-        emit SlashRecorded(slashId, operator, uint64(block.timestamp), totalSlashAmount);
+        uint64 nowTs = uint64(block.timestamp);
+        uint64 windowClose = nowTs + uint64(APPEAL_FILING_WINDOW);
+        _slashRecords[slashId] = SlashRecord({
+            operator: operator,
+            slashedAt: nowTs,
+            status: SlashStatus.Escrowed,
+            challenger: challenger,
+            appealWindowClose: windowClose,
+            slashAmount: totalSlashAmount,
+            creditPortion: creditPortion
+        });
+        escrowedTotal += totalSlashAmount;
+        emit SlashRecorded(slashId, operator, nowTs, totalSlashAmount);
+        emit SlashEscrowed(slashId, operator, totalSlashAmount, windowClose);
     }
 
     /// @dev Stamp `slashedAtEpoch`, fire auto-eject if post-slash active stake
-    ///      falls below `minStake / 2`, distribute the combined stake+credit
-    ///      slash through the 50/30/20 split (C1), and emit `Slashed` +
-    ///      ejection events. `recordSlashInflow` is best-effort (I3): a
-    ///      faulty SafetyReserve cannot brick the slash path.
-    function _distributeAndStamp(
-        uint256 slashId,
-        address operator,
-        address challenger,
-        uint8 offenseType,
-        uint256 totalSlash,
-        uint32 newCount
-    ) internal {
-        // slither-disable-next-line divide-before-multiply
-        uint256 challengerShare = (totalSlash * CHALLENGER_BPS) / BPS_DENOMINATOR;
-        // slither-disable-next-line divide-before-multiply
-        uint256 safetyShare = (totalSlash * SAFETY_BPS) / BPS_DENOMINATOR;
-        uint256 burnShare = totalSlash - challengerShare - safetyShare;
-
+    ///      falls below `minStake / 2`, and emit `Slashed`. Under escrow-on-
+    ///      slash no TOKEN moves here — distribution happens at finality.
+    function _stampSlash(address operator, address challenger, uint8 offenseType, uint256 totalSlash, uint32 newCount)
+        internal
+    {
         // Store `actualEpoch + 1` so an epoch-0 slash is not confused with
         // the "unslashed" sentinel. Decoders subtract 1.
         _slashedAtEpoch[operator] = uint64(block.timestamp / EPOCH_LENGTH) + 1;
         emit SlashedAtEpochStamped(operator, _slashedAtEpoch[operator]);
 
         _maybeAutoEject(operator);
-        _routeSlashShares(slashId, operator, challenger, challengerShare, safetyShare, burnShare);
 
-        emit Slashed(operator, challenger, offenseType, newCount, totalSlash, challengerShare, safetyShare, burnShare);
+        emit Slashed(operator, challenger, offenseType, newCount, totalSlash);
     }
 
     /// @dev Auto-eject if post-slash active stake fell below minStake/2.
@@ -1042,39 +1109,110 @@ contract CapacityBond is
         if (nodeId != bytes32(0)) emit NodeAutoEjected(nodeId, activeStake[operator]);
     }
 
-    /// @dev Route the three shares (challenger / safety / burn) and emit the
-    ///      best-effort `recordSlashInflow` callback per I3. Stack-isolated
-    ///      from `_distributeAndStamp` to keep both fns under the 16-slot limit.
-    ///      On callback failure, surfaces the revert reason in the event so
-    ///      off-chain reconcilers can distinguish OOG / pause / role-revoked
-    ///      causes without correlating by tx hash.
-    function _routeSlashShares(
-        uint256 slashId,
-        address operator,
-        address challenger,
-        uint256 challengerShare,
-        uint256 safetyShare,
-        uint256 burnShare
-    ) internal {
-        if (challengerShare != 0) {
-            IERC20(address(token)).safeTransfer(challenger, challengerShare);
-        }
-        if (safetyShare != 0) {
-            IERC20(address(token)).safeTransfer(address(safetyReserve), safetyShare);
-            try safetyReserve.recordSlashInflow(operator, safetyShare) { }
-            catch (bytes memory reason) {
-                emit SlashInflowReportFailed(slashId, operator, safetyShare, reason);
-            }
-        }
-        if (burnShare != 0) token.burn(burnShare);
+    // -----------------------------------------------------------------
+    // Escrow finality + appeal settle hooks (ADR 028 escrow-on-slash)
+    // -----------------------------------------------------------------
+
+    /// @notice Permissionless: distribute a slash whose filing window lapsed
+    ///         with no appeal. 50% to the recorded challenger, 50% burned.
+    ///         Reverts if the slash is not `Escrowed` or the window is still
+    ///         open (an opened appeal flips the status to `AppealOpen`, so this
+    ///         path can never race a live appeal).
+    function finalizeUnappealedSlash(uint256 slashId) external nonReentrant whenNotPaused {
+        if (slashId >= slashCounter) revert UnknownSlash(slashId);
+        SlashRecord storage r = _slashRecords[slashId];
+        if (r.status != SlashStatus.Escrowed) revert SlashNotEscrowed(slashId);
+        // Filing window extended by the cumulative paused duration so a pause
+        // never silently consumes the operator's window (ADR 028 §5).
+        uint64 closeAt = r.appealWindowClose + pausedTotal;
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp <= closeAt) revert FilingWindowStillOpen(closeAt);
+        _distributeUpheld(slashId, false);
     }
 
-    // -----------------------------------------------------------------
-    // Slash-zero-out clearing (APPEAL_REVERSAL_ROLE — held by SafetyReserve)
-    // -----------------------------------------------------------------
+    /// @inheritdoc ICapacityBondSlashEscrow
+    function markAppealOpen(uint256 slashId) external override whenNotPaused onlyRole(SLASH_APPEAL_ROLE) {
+        if (slashId >= slashCounter) revert UnknownSlash(slashId);
+        SlashRecord storage r = _slashRecords[slashId];
+        if (r.status != SlashStatus.Escrowed) revert SlashNotEscrowed(slashId);
+        // Filing window extended by the cumulative paused duration (ADR 028 §5).
+        uint64 closeAt = r.appealWindowClose + pausedTotal;
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > closeAt) revert FilingWindowClosed(closeAt);
+        r.status = SlashStatus.AppealOpen;
+        emit SlashAppealOpened(slashId, r.operator);
+    }
 
-    function clearSlashedAtEpoch(address operator) external override onlyRole(APPEAL_REVERSAL_ROLE) {
-        if (operator == address(0)) revert ZeroAddress();
+    /// @inheritdoc ICapacityBondSlashEscrow
+    function settleAppealUpheld(uint256 slashId)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        onlyRole(SLASH_APPEAL_ROLE)
+    {
+        if (slashId >= slashCounter) revert UnknownSlash(slashId);
+        if (_slashRecords[slashId].status != SlashStatus.AppealOpen) revert SlashAppealNotOpen(slashId);
+        _distributeUpheld(slashId, true);
+    }
+
+    /// @inheritdoc ICapacityBondSlashEscrow
+    function settleAppealGranted(uint256 slashId)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        onlyRole(SLASH_APPEAL_ROLE)
+    {
+        if (slashId >= slashCounter) revert UnknownSlash(slashId);
+        SlashRecord storage r = _slashRecords[slashId];
+        if (r.status != SlashStatus.AppealOpen) revert SlashAppealNotOpen(slashId);
+        uint256 refund = r.slashAmount;
+        uint256 creditPortion = r.creditPortion;
+        address operator = r.operator;
+        r.status = SlashStatus.Reversed;
+        escrowedTotal -= refund;
+
+        // Conditional zero-out clear (ADR 028 §2): only clear when the current
+        // per-operator stamp belongs to THIS slash. If a later slash overwrote
+        // it (that slash still stands), leave the stamp so vote weight stays
+        // zeroed for the unresolved slash.
+        if (_slashedAtEpoch[operator] == uint64(r.slashedAt / EPOCH_LENGTH) + 1) {
+            _clearSlashedAtEpoch(operator);
+        }
+
+        // Genesis-credit portion is restored to the vesting position
+        // (`grantedAt` is untouched, so the vest curve resumes) rather than
+        // refunded as liquid TOKEN — a wrongly-slashed operator is made exactly
+        // whole, not handed accelerated credit (ADR 028 §7). The TOKEN backing
+        // it never left the contract. Only the stake portion is refunded liquid.
+        if (creditPortion != 0) {
+            _pendingCredit[operator].originalGrant += uint128(creditPortion);
+        }
+        uint256 stakePortion = refund - creditPortion;
+        if (stakePortion != 0) IERC20(address(token)).safeTransfer(operator, stakePortion);
+        emit SlashReversed(slashId, operator, refund);
+    }
+
+    /// @dev Distribute an upheld slash's escrow: 50% challenger / 50% burn.
+    function _distributeUpheld(uint256 slashId, bool viaAppeal) internal {
+        SlashRecord storage r = _slashRecords[slashId];
+        uint256 amount = r.slashAmount;
+        address challenger = r.challenger;
+        r.status = SlashStatus.Upheld;
+        escrowedTotal -= amount;
+
+        uint256 challengerShare = (amount * CHALLENGER_BPS) / BPS_DENOMINATOR;
+        uint256 burnShare = amount - challengerShare;
+        if (challengerShare != 0) IERC20(address(token)).safeTransfer(challenger, challengerShare);
+        if (burnShare != 0) token.burn(burnShare);
+        emit SlashUpheld(slashId, viaAppeal, challengerShare, burnShare);
+    }
+
+    /// @dev Clear `slashedAtEpoch[operator]` back to 0 (ADR 036 slash zero-out
+    ///      recovery). Internal — invoked only by the successful-appeal escrow
+    ///      settle path; there is no external clearer.
+    function _clearSlashedAtEpoch(address operator) internal {
         if (_slashedAtEpoch[operator] != 0) {
             _slashedAtEpoch[operator] = 0;
             emit SlashedAtEpochCleared(operator);
@@ -1122,13 +1260,6 @@ contract CapacityBond is
         uint256 oldPeriod = unbondingPeriod;
         unbondingPeriod = newPeriod;
         emit UnbondingPeriodUpdated(oldPeriod, newPeriod);
-    }
-
-    function setSafetyReserve(ISafetyReserve newSafetyReserve) external onlyRole(GOVERNANCE_ROLE) {
-        if (address(newSafetyReserve) == address(0)) revert ZeroAddress();
-        address oldAddr = address(safetyReserve);
-        safetyReserve = newSafetyReserve;
-        emit SafetyReserveUpdated(oldAddr, address(newSafetyReserve));
     }
 
     /// @notice Treasury sink for forfeited unvested Genesis Bond Credit on
@@ -1192,6 +1323,22 @@ contract CapacityBond is
         _unpause();
     }
 
+    /// @dev Stamp the pause start so `_unpause` can accumulate the duration
+    ///      into `pausedTotal` (ADR 028 §5 window extension).
+    function _pause() internal override {
+        // forge-lint: disable-next-line(block-timestamp)
+        _pausedAt = uint64(block.timestamp);
+        super._pause();
+    }
+
+    /// @dev Accumulate the just-ended pause interval into `pausedTotal`.
+    function _unpause() internal override {
+        // forge-lint: disable-next-line(block-timestamp)
+        pausedTotal += uint64(block.timestamp) - _pausedAt;
+        _pausedAt = 0;
+        super._unpause();
+    }
+
     // -----------------------------------------------------------------
     // Views — stake / governor surface
     // -----------------------------------------------------------------
@@ -1230,6 +1377,14 @@ contract CapacityBond is
         if (slashId >= slashCounter) revert UnknownSlash(slashId);
         SlashRecord memory r = _slashRecords[slashId];
         return (r.operator, r.slashedAt, r.slashAmount);
+    }
+
+    /// @notice Full slash record including escrow status and the recorded
+    ///         challenger / filing-window deadline. Convenience view for
+    ///         indexers, keepers, and `SlashAppeal`.
+    function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory) {
+        if (slashId >= slashCounter) revert UnknownSlash(slashId);
+        return _slashRecords[slashId];
     }
 
     // -----------------------------------------------------------------

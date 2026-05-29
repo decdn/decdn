@@ -11,7 +11,7 @@
 
 This ADR is that contract-implementation ADR. It pins the per-appeal storage layout, canonical event topic ordering, gas-packed struct layout, and surface-level integration with the rest of `ContentBlacklist` (suspension flag manipulation, internal `_removeHashRegional` call, `cleanupExpiredAppeal` admissibility checks), giving the implementation in `contracts/` a single canonical reference.
 
-It is the blacklist-side analogue of [ADR 032](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface), which does the same for [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s slash-appeal entry points on `SafetyReserve`.
+It is the blacklist-side analogue of the slash-appeal entry points on the `SlashAppeal` contract pinned in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface).
 
 This ADR does **not** re-litigate [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting).
 
@@ -274,7 +274,7 @@ stateDiagram-v2
 
 ### Multisig capability scope
 
-`fastTrackAppeal`, `unFastTrackAppeal`, `rejectAppeal`, and `rejectAppealAsPerjury` are sub-modes of [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)'s existing `suspendRegionalBody` capability — same 3-of-5 threshold, same signing semantics, same post-incident reporting obligations. They do **not** introduce a new multisig power. [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig) enumerates these appeal-specific entry points as sub-modes of the regional-body-suspension capability (capability 3), alongside the analogous SafetyReserve appeal sub-modes under capability 4.
+`fastTrackAppeal`, `unFastTrackAppeal`, `rejectAppeal`, and `rejectAppealAsPerjury` are sub-modes of [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)'s existing `suspendRegionalBody` capability — same 3-of-5 threshold, same signing semantics, same post-incident reporting obligations. They do **not** introduce a new multisig power. [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig) enumerates these appeal-specific entry points as sub-modes of the regional-body-suspension capability (capability 3), alongside the analogous slash-appeal sub-modes (`SlashAppeal.fastTrackAppeal` / `rejectAppeal`) under capability 4.
 
 ### Gas-optimization notes
 

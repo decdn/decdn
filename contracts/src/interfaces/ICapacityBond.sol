@@ -2,13 +2,14 @@
 pragma solidity 0.8.28;
 
 /// @title ICapacityBond
-/// @notice Read + appeal-reversal surface of `CapacityBond` consumed by
-///         `DecdnGovernor` (for vote weight per ADR 036) and `SafetyReserve`
-///         (for slash-appeal reversal per ADR 028).
+/// @notice Read surface of `CapacityBond` consumed by `DecdnGovernor` (for
+///         vote weight per ADR 036) and `SlashAppeal` (to validate appeals
+///         against a specific slash record per ADR 028). The escrow-mutating
+///         appeal hooks live in `ICapacityBondSlashEscrow`.
 /// @dev    The full `CapacityBond` surface (register / unbond / slash /
 ///         Genesis Bond Credit flow / region attestation) lives on the
 ///         concrete contract. This interface declares only the cross-contract
-///         entrypoints other contracts in the system need to know about.
+///         read entrypoints other contracts in the system need to know about.
 interface ICapacityBond {
     /// @notice Timestamp at which the operator's `activeStake` first became
     ///         non-zero — set by the first `stake()` call that lifts the
@@ -25,18 +26,12 @@ interface ICapacityBond {
     ///         (the first `EPOCH_LENGTH` after deploy) is not collapsed with
     ///         the unslashed sentinel. Consumers MUST decode (`value - 1`)
     ///         before doing epoch arithmetic. Set by `slash()`; cleared to 0
-    ///         by `clearSlashedAtEpoch` (called only via the `reverseAppeal`
-    ///         path of `SafetyReserve` per ADR 028 § Contract surface).
-    ///         Consumed by `DecdnGovernor._getVotes` per ADR 036 § Slashing
-    ///         zero-out.
+    ///         by the `settleAppealGranted` escrow hook on a successful appeal
+    ///         (ADR 028 § Contract surface). Consumed by
+    ///         `DecdnGovernor._getVotes` per ADR 036 § Slashing zero-out.
     function slashedAtEpoch(address operator) external view returns (uint64);
 
-    /// @notice Clear `slashedAtEpoch[operator]` back to 0. Restricted to
-    ///         `APPEAL_REVERSAL_ROLE`, granted to `SafetyReserve` post-deploy
-    ///         (ADR 016 § Post-Deployment Initialization, step 6).
-    function clearSlashedAtEpoch(address operator) external;
-
-    /// @notice On-chain slash record consumed by `SafetyReserve.openSlashAppeal`
+    /// @notice On-chain slash record consumed by `SlashAppeal.openSlashAppeal`
     ///         to validate appeals against a specific slash without trusting
     ///         the appellant's `operator` parameter (ADR 028 § Contract
     ///         surface — closes the unverified-operator hole).

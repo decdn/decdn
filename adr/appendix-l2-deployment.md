@@ -176,8 +176,8 @@ omitted — measure during integration testing on Arbitrum Sepolia, re-confirm a
 Arbitrum One fee markets at deployment. Three MUST gates:
 
 1. **`FeeRouter` per-settlement overhead.** Every `settleChannel` routes through
-   `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` — four
-   `safeTransfer` legs (60/25/10/5 same-tx per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)),
+   `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` — three
+   `safeTransfer` legs (60/30/10 same-tx per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)),
    one inline write to the FeeRouter-internal `bytesPerEpoch[operator][epoch]`
    served-bytes counter (epoch derived from `block.timestamp`) consumed by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), and a single
    `CapacityBond.recordSettlement` SSTORE updating `lastSettlementAt[operator]`.
@@ -187,7 +187,7 @@ Arbitrum One fee markets at deployment. Three MUST gates:
    affordability bounds of [ADR 026 § Operator economics](026-tokenomics.md#operator-economics).
 
 2. **Per-epoch keeper-call gas economics.** One TWAP-protected USDC→TOKEN swap
-   keeper call per epoch via `BuybackBurner` (25% buyback-and-burn flow per
+   keeper call per epoch via `BuybackBurner` (30% buyback-and-burn flow per
    [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) and
    [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) —
    at a 1-week epoch, **52+ swaps/year minimum**, via the Balancer V3 80/20

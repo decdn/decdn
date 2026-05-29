@@ -10,13 +10,12 @@ import { DecdnGovernor } from "../src/DecdnGovernor.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
-import { SafetyReserve } from "../src/SafetyReserve.sol";
+import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { Token } from "../src/Token.sol";
 import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
-import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 
@@ -36,7 +35,7 @@ contract LifecycleUSDC is ERC20 {
 /// @notice `DecdnGovernor.t.sol` deliberately skips the production governance
 ///         path and only exercises vote-weight math against mocks. This file
 ///         deploys the real `FeeRouter`, `CapacityBond`, `ContentBlacklist`,
-///         `SafetyReserve`, `PublisherRegistry`, `DecdnGovernor`, and
+///         `SlashAppeal`, `PublisherRegistry`, `DecdnGovernor`, and
 ///         `TimelockController`, hands off `GOVERNANCE_ROLE` on every target
 ///         to the Timelock to mirror the production deploy ordering (issue
 ///         #694 supplies the deploy script), and asserts that each setter's
@@ -68,8 +67,7 @@ contract GovernanceLifecycleTest is Test {
 
     uint256 internal constant MIN_STAKE = 50_000e18;
     uint256 internal constant UNBONDING_PERIOD = 7 days;
-    uint256 internal constant SAFETY_APPEAL_BOND = 1000e18;
-    uint256 internal constant MAX_RESTITUTION = 100_000e6;
+    uint256 internal constant SLASH_APPEAL_BOND = 1000e18;
     uint256 internal constant BLACKLIST_APPEAL_BOND = 100e18;
 
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
@@ -83,7 +81,7 @@ contract GovernanceLifecycleTest is Test {
     MockEd25519Verifier internal ed25519;
     CapacityBond internal bond;
     FeeRouter internal router;
-    SafetyReserve internal reserve;
+    SlashAppeal internal slashAppeal;
     ContentBlacklist internal blacklist;
     PublisherRegistry internal registry;
     TimelockController internal timelock;
@@ -135,17 +133,15 @@ contract GovernanceLifecycleTest is Test {
             genesisCreditWindow_: 30 days
         });
 
-        reserve = new SafetyReserve({
-            usdc_: usdc,
+        slashAppeal = new SlashAppeal({
             token_: token,
             capacityBond_: ICapacityBond(address(bond)),
             admin: address(this),
             emergencyMultisig: multisig,
-            appealBond_: SAFETY_APPEAL_BOND,
-            maxAppealRestitution_: MAX_RESTITUTION
+            appealBond_: SLASH_APPEAL_BOND
         });
 
-        uint256[4] memory shares = [uint256(6000), uint256(2500), uint256(1000), uint256(500)];
+        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
         router = new FeeRouter({
             usdc_: usdc,
             capacityBond_: ICapacityBondReporter(address(bond)),
@@ -154,7 +150,6 @@ contract GovernanceLifecycleTest is Test {
             windowEpochs_: WINDOW_EPOCHS,
             admin: address(this),
             initialShares: shares,
-            safetyReserve_: address(reserve),
             buybackBurner_: address(0xBB)
         });
 
@@ -186,21 +181,15 @@ contract GovernanceLifecycleTest is Test {
     function _wireCrossContractRoles() internal {
         // FeeRouter must be able to write settlement state on CapacityBond.
         bond.grantRole(bond.SETTLEMENT_REPORTER_ROLE(), address(router));
-        // CapacityBond must be able to mint slash-inflow records on
-        // SafetyReserve (ADR 026 § Slashing and burn — not exercised in this
-        // test directly, but the lifecycle test is supposed to mirror prod).
-        reserve.grantRole(reserve.SLASH_INFLOW_REPORTER_ROLE(), address(bond));
-        // SafetyReserve clears slash zero-outs on CapacityBond via
-        // `reverseAppeal` (ADR 028).
-        bond.grantRole(bond.APPEAL_REVERSAL_ROLE(), address(reserve));
+        // SlashAppeal drives the escrow-on-slash appeal hooks on CapacityBond
+        // (markAppealOpen / settleAppealUpheld / settleAppealGranted) — ADR 028.
+        bond.grantRole(bond.SLASH_APPEAL_ROLE(), address(slashAppeal));
         // ContentBlacklist ejects operators via CapacityBond on blacklist add.
         bond.grantRole(bond.BLACKLIST_ROLE(), address(blacklist));
-        // Point CapacityBond at the real SafetyReserve so the production
-        // wiring resolves end-to-end before the GOVERNANCE_ROLE hand-off.
-        bond.setSafetyReserve(ISafetyReserve(address(reserve)));
-        // SafetyReserve.reverseAppeal also needs a challenger-incentive pool;
-        // pre-wire one (otherwise the slash-appeal lifecycle is incomplete).
-        reserve.setChallengerIncentivePool(challengerPool);
+        // SlashAppeal.upholdAppeal routes the non-burn half of a failed appeal
+        // bond to a challenger-incentive pool; pre-wire one (otherwise the
+        // slash-appeal lifecycle is incomplete).
+        slashAppeal.setChallengerIncentivePool(challengerPool);
 
         // Test harness needs ROUTER_CALLER_ROLE to seed served-bytes via
         // `routeSettlement`. In production this is held by `PaymentChannel`.
@@ -225,7 +214,7 @@ contract GovernanceLifecycleTest is Test {
     ///      would brick the contract until a recovery script.
     function _handOffGovernanceToTimelock() internal {
         address[5] memory targets =
-            [address(router), address(bond), address(blacklist), address(reserve), address(registry)];
+            [address(router), address(bond), address(blacklist), address(slashAppeal), address(registry)];
         bytes32 defaultAdmin = 0x00;
         for (uint256 i = 0; i < targets.length; i++) {
             _grantGovernance(targets[i], address(timelock));
@@ -320,7 +309,7 @@ contract GovernanceLifecycleTest is Test {
         assertTrue(router.hasRole(GOVERNANCE_ROLE, tl), "router gov");
         assertTrue(bond.hasRole(GOVERNANCE_ROLE, tl), "bond gov");
         assertTrue(blacklist.hasRole(GOVERNANCE_ROLE, tl), "blacklist gov");
-        assertTrue(reserve.hasRole(GOVERNANCE_ROLE, tl), "reserve gov");
+        assertTrue(slashAppeal.hasRole(GOVERNANCE_ROLE, tl), "slashAppeal gov");
         assertTrue(registry.hasRole(GOVERNANCE_ROLE, tl), "registry gov");
 
         // Timelock holds DEFAULT_ADMIN_ROLE on every target (the meta-admin
@@ -329,7 +318,7 @@ contract GovernanceLifecycleTest is Test {
         assertTrue(router.hasRole(defaultAdmin, tl), "router admin");
         assertTrue(bond.hasRole(defaultAdmin, tl), "bond admin");
         assertTrue(blacklist.hasRole(defaultAdmin, tl), "blacklist admin");
-        assertTrue(reserve.hasRole(defaultAdmin, tl), "reserve admin");
+        assertTrue(slashAppeal.hasRole(defaultAdmin, tl), "slashAppeal admin");
         assertTrue(registry.hasRole(defaultAdmin, tl), "registry admin");
 
         // Test contract must NOT retain either role on any target — closes the
@@ -337,13 +326,13 @@ contract GovernanceLifecycleTest is Test {
         assertFalse(router.hasRole(GOVERNANCE_ROLE, address(this)), "router gov back door");
         assertFalse(bond.hasRole(GOVERNANCE_ROLE, address(this)), "bond gov back door");
         assertFalse(blacklist.hasRole(GOVERNANCE_ROLE, address(this)), "blacklist gov back door");
-        assertFalse(reserve.hasRole(GOVERNANCE_ROLE, address(this)), "reserve gov back door");
+        assertFalse(slashAppeal.hasRole(GOVERNANCE_ROLE, address(this)), "slashAppeal gov back door");
         assertFalse(registry.hasRole(GOVERNANCE_ROLE, address(this)), "registry gov back door");
 
         assertFalse(router.hasRole(defaultAdmin, address(this)), "router admin back door");
         assertFalse(bond.hasRole(defaultAdmin, address(this)), "bond admin back door");
         assertFalse(blacklist.hasRole(defaultAdmin, address(this)), "blacklist admin back door");
-        assertFalse(reserve.hasRole(defaultAdmin, address(this)), "reserve admin back door");
+        assertFalse(slashAppeal.hasRole(defaultAdmin, address(this)), "slashAppeal admin back door");
         assertFalse(registry.hasRole(defaultAdmin, address(this)), "registry admin back door");
 
         // Same back-door check on the Timelock itself. OZ v5's TimelockController
@@ -459,18 +448,17 @@ contract GovernanceLifecycleTest is Test {
     // =================================================================
 
     function test_lifecycle_FeeRouter_setShares_happy() public {
-        uint256[4] memory newShares = [uint256(5000), uint256(2500), uint256(1500), uint256(1000)];
+        uint256[3] memory newShares = [uint256(5000), uint256(3500), uint256(1500)];
         _runLifecycle(address(router), abi.encodeCall(FeeRouter.setShares, (newShares)));
-        uint256[4] memory got = router.getShares();
+        uint256[3] memory got = router.getShares();
         assertEq(got[0], 5000);
-        assertEq(got[1], 2500);
+        assertEq(got[1], 3500);
         assertEq(got[2], 1500);
-        assertEq(got[3], 1000);
     }
 
     function test_lifecycle_FeeRouter_setShares_outOfBounds() public {
         // Sum != 10_000 → SharesDoNotSum
-        uint256[4] memory bad = [uint256(5000), uint256(2500), uint256(1500), uint256(500)];
+        uint256[3] memory bad = [uint256(5000), uint256(3000), uint256(1500)];
         _runLifecycleExpectExecuteRevert(
             address(router),
             abi.encodeCall(FeeRouter.setShares, (bad)),
@@ -479,49 +467,30 @@ contract GovernanceLifecycleTest is Test {
     }
 
     function test_lifecycle_FeeRouter_setSharesAndDestinations_happy() public {
-        uint256[4] memory newShares = [uint256(4500), uint256(3000), uint256(1500), uint256(1000)];
-        FeeRouter.ShareDestinations memory dests = FeeRouter.ShareDestinations({
-            safetyReserve: address(0xBA5A), buybackBurner: address(0xBEEF), treasury: address(0xFEED)
-        });
+        uint256[3] memory newShares = [uint256(4500), uint256(4000), uint256(1500)];
+        FeeRouter.ShareDestinations memory dests =
+            FeeRouter.ShareDestinations({ buybackBurner: address(0xBEEF), treasury: address(0xFEED) });
         _runLifecycle(address(router), abi.encodeCall(FeeRouter.setSharesAndDestinations, (newShares, dests)));
-        // Assert all three destinations AND every bucket share landed —
-        // otherwise a regression that silently skipped one of the four inner
-        // setters could pass with only a subset of fields checked.
-        assertEq(router.safetyReserve(), address(0xBA5A));
+        // Assert both destinations AND every bucket share landed — otherwise a
+        // regression that silently skipped one of the inner setters could pass
+        // with only a subset of fields checked.
         assertEq(router.buybackBurner(), address(0xBEEF));
         assertEq(router.treasury(), address(0xFEED));
-        uint256[4] memory got = router.getShares();
+        uint256[3] memory got = router.getShares();
         assertEq(got[0], 4500);
-        assertEq(got[1], 3000);
+        assertEq(got[1], 4000);
         assertEq(got[2], 1500);
-        assertEq(got[3], 1000);
     }
 
     function test_lifecycle_FeeRouter_setSharesAndDestinations_outOfBounds() public {
         // Treasury == address(0) → ZeroAddress at the top of the setter.
-        uint256[4] memory newShares = [uint256(4500), uint256(3000), uint256(1500), uint256(1000)];
-        FeeRouter.ShareDestinations memory dests = FeeRouter.ShareDestinations({
-            safetyReserve: address(reserve), buybackBurner: address(0xBEEF), treasury: address(0)
-        });
+        uint256[3] memory newShares = [uint256(4500), uint256(4000), uint256(1500)];
+        FeeRouter.ShareDestinations memory dests =
+            FeeRouter.ShareDestinations({ buybackBurner: address(0xBEEF), treasury: address(0) });
         _runLifecycleExpectExecuteRevert(
             address(router),
             abi.encodeCall(FeeRouter.setSharesAndDestinations, (newShares, dests)),
             abi.encodeWithSelector(FeeRouter.ZeroAddress.selector)
-        );
-    }
-
-    function test_lifecycle_FeeRouter_setSafetyReserve_happy() public {
-        address newAddr = address(0x5A5A);
-        _runLifecycle(address(router), abi.encodeCall(FeeRouter.setSafetyReserve, (newAddr)));
-        assertEq(router.safetyReserve(), newAddr);
-    }
-
-    function test_lifecycle_FeeRouter_setSafetyReserve_outOfBounds() public {
-        // Default safety share is 500 (non-zero), so address(0) must revert.
-        _runLifecycleExpectExecuteRevert(
-            address(router),
-            abi.encodeCall(FeeRouter.setSafetyReserve, (address(0))),
-            abi.encodeWithSelector(FeeRouter.NonZeroShareNeedsDestination.selector, uint256(3))
         );
     }
 
@@ -599,32 +568,6 @@ contract GovernanceLifecycleTest is Test {
             abi.encodeWithSelector(
                 CapacityBond.ParamOutOfBounds.selector, uint256(31 days), uint256(3 days), uint256(30 days)
             )
-        );
-    }
-
-    function test_lifecycle_CapacityBond_setSafetyReserve_happy() public {
-        // Deploy a stand-in SafetyReserve so we can rewire (the contract
-        // requires the new address be non-zero).
-        SafetyReserve newReserve = new SafetyReserve({
-            usdc_: usdc,
-            token_: token,
-            capacityBond_: ICapacityBond(address(bond)),
-            admin: address(this),
-            emergencyMultisig: multisig,
-            appealBond_: SAFETY_APPEAL_BOND,
-            maxAppealRestitution_: MAX_RESTITUTION
-        });
-        _runLifecycle(
-            address(bond), abi.encodeCall(CapacityBond.setSafetyReserve, (ISafetyReserve(address(newReserve))))
-        );
-        assertEq(address(bond.safetyReserve()), address(newReserve));
-    }
-
-    function test_lifecycle_CapacityBond_setSafetyReserve_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(bond),
-            abi.encodeCall(CapacityBond.setSafetyReserve, (ISafetyReserve(address(0)))),
-            abi.encodeWithSelector(CapacityBond.ZeroAddress.selector)
         );
     }
 
@@ -823,59 +766,37 @@ contract GovernanceLifecycleTest is Test {
     // so there's no revert path to exercise.
 
     // =================================================================
-    // SafetyReserve (4 setters)
+    // SlashAppeal (2 setters)
     // =================================================================
 
-    function test_lifecycle_SafetyReserve_setBalancerPool_happy() public {
-        address pool = address(0xBA1A);
-        _runLifecycle(address(reserve), abi.encodeCall(SafetyReserve.setBalancerPool, (pool)));
-        assertEq(reserve.balancerPool(), pool);
-    }
-
-    function test_lifecycle_SafetyReserve_setBalancerPool_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(reserve),
-            abi.encodeCall(SafetyReserve.setBalancerPool, (address(0))),
-            abi.encodeWithSelector(SafetyReserve.ZeroAddress.selector)
-        );
-    }
-
-    function test_lifecycle_SafetyReserve_setChallengerIncentivePool_happy() public {
+    function test_lifecycle_SlashAppeal_setChallengerIncentivePool_happy() public {
         address pool = address(0xCC02);
-        _runLifecycle(address(reserve), abi.encodeCall(SafetyReserve.setChallengerIncentivePool, (pool)));
-        assertEq(reserve.challengerIncentivePool(), pool);
+        _runLifecycle(address(slashAppeal), abi.encodeCall(SlashAppeal.setChallengerIncentivePool, (pool)));
+        assertEq(slashAppeal.challengerIncentivePool(), pool);
     }
 
-    function test_lifecycle_SafetyReserve_setChallengerIncentivePool_outOfBounds() public {
+    function test_lifecycle_SlashAppeal_setChallengerIncentivePool_outOfBounds() public {
         _runLifecycleExpectExecuteRevert(
-            address(reserve),
-            abi.encodeCall(SafetyReserve.setChallengerIncentivePool, (address(0))),
-            abi.encodeWithSelector(SafetyReserve.ZeroAddress.selector)
+            address(slashAppeal),
+            abi.encodeCall(SlashAppeal.setChallengerIncentivePool, (address(0))),
+            abi.encodeWithSelector(SlashAppeal.ZeroAddress.selector)
         );
     }
 
-    function test_lifecycle_SafetyReserve_setAppealBond_happy() public {
-        _runLifecycle(address(reserve), abi.encodeCall(SafetyReserve.setAppealBond, (uint256(5000e18))));
-        assertEq(reserve.appealBond(), 5000e18);
+    function test_lifecycle_SlashAppeal_setAppealBond_happy() public {
+        _runLifecycle(address(slashAppeal), abi.encodeCall(SlashAppeal.setAppealBond, (uint256(5000e18))));
+        assertEq(slashAppeal.appealBond(), 5000e18);
     }
 
-    function test_lifecycle_SafetyReserve_setAppealBond_outOfBounds() public {
+    function test_lifecycle_SlashAppeal_setAppealBond_outOfBounds() public {
         _runLifecycleExpectExecuteRevert(
-            address(reserve),
-            abi.encodeCall(SafetyReserve.setAppealBond, (uint256(50e18))),
+            address(slashAppeal),
+            abi.encodeCall(SlashAppeal.setAppealBond, (uint256(50e18))),
             abi.encodeWithSelector(
-                SafetyReserve.ParamOutOfBounds.selector, uint256(50e18), uint256(100e18), uint256(10_000e18)
+                SlashAppeal.ParamOutOfBounds.selector, uint256(50e18), uint256(100e18), uint256(10_000e18)
             )
         );
     }
-
-    function test_lifecycle_SafetyReserve_setMaxAppealRestitution_happy() public {
-        _runLifecycle(address(reserve), abi.encodeCall(SafetyReserve.setMaxAppealRestitution, (uint256(200_000e6))));
-        assertEq(reserve.maxAppealRestitution(), 200_000e6);
-    }
-
-    // `setMaxAppealRestitution` is intentionally unbounded — governance sets
-    // the cap freely. No revert path.
 
     // =================================================================
     // PublisherRegistry (2 setters)

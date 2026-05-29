@@ -15,7 +15,7 @@ import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 ///         ADR 031 blacklist-entry appeal surface — operators / publishers /
 ///         token holders can post a TOKEN bond to challenge an entry; the
 ///         appeal flows through the same {open → fast-track → ratify/reverse}
-///         lifecycle as `SafetyReserve` slashing appeals.
+///         lifecycle as `SlashAppeal` slashing appeals.
 /// @dev    Simplifications vs. ADR 031 carried for this revision:
 ///           - Synthetic-standing clawback (`StandingPath.TokenHolder`
 ///             balance check) is deferred. Standing path is recorded but

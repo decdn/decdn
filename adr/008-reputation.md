@@ -88,7 +88,7 @@ Where `min_counterparties = 5` (governance-tunable; hardcoded floor: 2).
 
 #### Settled-Value Time Decay
 
-Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the `FeeRouter` non-base skim of 40% per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) — 25% burn + 10% treasury + 5% safety — plus per-cycle L2 gas, on their own USDC) to maintain reporter weight:
+Individual settlement contributions decay exponentially with age, forcing an attacker to continuously cycle capital (incurring the `FeeRouter` non-base skim of 40% per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) — 30% burn + 10% treasury — plus per-cycle L2 gas, on their own USDC) to maintain reporter weight:
 
 ```
 settlement_weight_i = exp(-lambda * age_weeks_i)

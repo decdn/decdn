@@ -9,7 +9,7 @@ DAO voting weight could be keyed on declared capacity — `declared_capacity_Mbp
 
 The on-chain raw material to fix this already exists. [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter) populates `bytesPerEpoch[operator][epoch]` inline on every `routeSettlement`. This ADR makes that counter the canonical voting-weight source.
 
-The change is governance-only — no impact on payment-channel mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), on the four-bucket fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), on the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), on `CapacityBond`'s registration / slashing semantics, or on `SafetyReserve` / `BuybackBurner`. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp.
+The change is governance-only — no impact on payment-channel mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), on the three-bucket fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), on the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), on `CapacityBond`'s registration / slashing semantics, or on `SlashAppeal` / `BuybackBurner`. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp.
 
 ## Decision
 
@@ -49,7 +49,7 @@ Where `t` is the OpenZeppelin Governor timepoint (timestamp clock per ERC-6372, 
 
 On any slash invocation (`CapacityBond.slash`), `CapacityBond` stamps `slashedAtEpoch[op] = epoch(block.timestamp)`. The Governor's `_getVotes(op, t)` returns zero whenever `slashedAtEpoch[op] >= epoch(t) - N + 1` — i.e., whenever the slash falls inside the current trailing window. Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
 
-On successful slash-appeal **reversal** via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `reverseAppeal` path (the path that determines the operator was wrongly slashed), `CapacityBond` clears `slashedAtEpoch[op]` back to zero. `ratifyAppeal` (which only authorizes SafetyReserve restitution without modifying the on-chain slash per [ADR 028 § Decision](028-slashing-appeals.md#decision)) does **not** clear the field.
+On a **granted** slash appeal via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `grantAppeal` path (the path that determines the operator was wrongly slashed), `SlashAppeal` calls `CapacityBond.settleAppealGranted`, which refunds the escrowed TOKEN and clears `slashedAtEpoch[op]` back to zero (the internal `_clearSlashedAtEpoch`). An **upheld** appeal (`upholdAppeal` / `rejectAppeal`) leaves the field stamped — the slash stands.
 
 This is one storage slot per operator on `CapacityBond` and one read on every vote-cast. It restores the immediate-vote-removal-on-slash signal that the bytes window alone cannot deliver (an active operator who is slashed today would otherwise continue voting with their accumulated window bytes for up to N weeks).
 
@@ -68,7 +68,7 @@ The full Solidity surface is documented in [ADR 016 § Contract: FeeRouter](016-
 
 **`CapacityBond` additions:**
 
-- `mapping(address => uint64) slashedAtEpoch;` — set by `slash()`, cleared by `reverseAppeal` flow per [ADR 028](028-slashing-appeals.md#contract-surface).
+- `mapping(address => uint64) slashedAtEpoch;` — set by `slash()`, cleared by the `grantAppeal` flow (`settleAppealGranted`) per [ADR 028](028-slashing-appeals.md#contract-surface).
 - `function slashedAtEpoch(address op) external view returns (uint64);` — public getter for the Governor.
 
 **`DecdnGovernor._getVotes`** (pseudocode):
@@ -109,7 +109,7 @@ Cross-parameter invariant (informational, not enforced at the contract layer): `
 
 ### Wash-trading as vote-buying
 
-Bytes-weighted voting is gameable by operators self-paying for delivery. An attacker who controls a client wallet pays themselves to serve bytes; under the four-bucket FeeRouter split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), 60% of the per-byte USDC fee returns to the operator. The remaining 40% (25% burn + 10% treasury + 5% safety) is real USDC the attacker pays into the protocol with no offsetting revenue.
+Bytes-weighted voting is gameable by operators self-paying for delivery. An attacker who controls a client wallet pays themselves to serve bytes; under the three-bucket FeeRouter split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), 60% of the per-byte USDC fee returns to the operator. The remaining 40% (30% burn + 10% treasury) is real USDC the attacker pays into the protocol with no offsetting revenue.
 
 **Attack cost to reach the 5% cap from zero.** Let `R` be the network's network-wide USDC revenue per epoch. An attacker holding `cap` share of the trailing-window bytes generates `R × cap × N` revenue across the window (assuming uniform per-byte pricing). Wash trading rate × per-byte cost is `0.40 × R × cap × N` in attacker-paid USDC across the window. At `R = $25K/week`, `cap = 5%`, `N = 13`: attacker burns `0.40 × $25K × 0.05 × 13 ≈ $6,500` per quarter to hold full 5% vote.
 
@@ -161,7 +161,7 @@ The per-operator cap (`voteCapBps`, default 5%) is the primary concentration def
 - **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** §Production: Operator-Weighted DAO Governance sources voting weight from this ADR's formula, with its clock anchored to `FeeRouter` epoch accounting and its quorum calibration reading `FeeRouter.totalBytesInWindow`. Its Governable Parameters table carries `windowEpochs`, and its Consequences > Negative notes wash-trading-as-vote-buying.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** Contract Inventory `DecdnGovernor` row reads `FeeRouter` for vote weight. `classDiagram` `FeeRouter` exposes `totalBytesPerEpoch`, `bytesInWindow`, `totalBytesInWindow`; the `Governor` vote-weight edges target `FeeRouter`. `Contract: FeeRouter` section carries the `bytesPerEpoch` / `totalBytesPerEpoch` mappings, getters, and `setWindowEpochs`. `Contract: CapacityBond` section carries `slashedAtEpoch`. Cross-Contract Call Graph + Complete Call Table list `Governor → FeeRouter: bytesInWindow / totalBytesInWindow`. Deployment Order step 13 (`DecdnGovernor`) lists `FeeRouter` as a non-zero constructor input.
 - **[ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics):** §Governance states the served-bytes `vote_weight` formula and points its `Voting source` row at `FeeRouter` + this ADR. §Governable parameters with safety bounds carries `windowEpochs`.
-- **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** the `reverseAppeal` path clears `CapacityBond.slashedAtEpoch[op]` alongside its escrow-release semantics (see [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)); no other appeal-flow change.
+- **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** the `grantAppeal` path (`settleAppealGranted`) clears `CapacityBond.slashedAtEpoch[op]` alongside refunding the operator's escrowed TOKEN (see [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)); no other appeal-flow change.
 
 ## References
 
