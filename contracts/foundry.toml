@@ -29,6 +29,12 @@ optimizer = true
 optimizer_runs = 200
 via_ir = false
 
+# `script/DeployProtocol.s.sol` writes the deploy manifest to
+# `deployments/<chainId>.json` so downstream tooling (Arbiscan verification,
+# website address injection, ops dashboards) has a deterministic source of
+# truth. Scoped to one directory so the test sandbox stays tight.
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
+
 fuzz = { runs = 256 }
 invariant = { runs = 32, depth = 25 }
 

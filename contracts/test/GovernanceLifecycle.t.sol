@@ -6,6 +6,7 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
 import { IGovernor } from "@openzeppelin/contracts/governance/IGovernor.sol";
 
+import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
@@ -13,9 +14,6 @@ import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { Token } from "../src/Token.sol";
-import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
-import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
-import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 
@@ -51,7 +49,7 @@ contract LifecycleUSDC is ERC20 {
 ///         operator's vote weight saturates at 5% of total — three operators
 ///         voting `For` clear the 4% quorum, and `proposer` alone clears the
 ///         0.1% proposal threshold by a wide margin.
-contract GovernanceLifecycleTest is Test {
+contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     // -----------------------------------------------------------------
     // Constants
     // -----------------------------------------------------------------
@@ -59,18 +57,15 @@ contract GovernanceLifecycleTest is Test {
     uint64 internal constant EPOCH = 7 days;
     uint64 internal constant WINDOW_EPOCHS = 13;
     uint64 internal constant FINAL_EPOCH = 60;
-    // Timelock min-delay used at constructor time. Production is 48h; we use
-    // 2 days here to keep the unit ≥ the prod minimum while staying explicit.
-    // The lifecycle helpers read the live `timelock.getMinDelay()` so a future
-    // delay change in DecdnGovernor doesn't silently desync this test.
-    uint256 internal constant TIMELOCK_DELAY = 2 days;
+    // Matches the ADR 009 production minimum. Lifecycle helpers read the live
+    // `timelock.getMinDelay()` so a future change in DecdnGovernor doesn't
+    // silently desync this test.
+    uint256 internal constant TIMELOCK_DELAY = 48 hours;
 
     uint256 internal constant MIN_STAKE = 50_000e18;
     uint256 internal constant UNBONDING_PERIOD = 7 days;
     uint256 internal constant SLASH_APPEAL_BOND = 1000e18;
     uint256 internal constant BLACKLIST_APPEAL_BOND = 100e18;
-
-    bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
 
     // -----------------------------------------------------------------
     // Deployments
@@ -94,7 +89,6 @@ contract GovernanceLifecycleTest is Test {
     address internal proposer = address(0xAAAA);
     address internal voter1 = address(0xBBBB);
     address internal voter2 = address(0xCCCC);
-    address internal treasuryEoa = address(0xD7);
     address internal multisig = address(0xC0DE);
     address internal challengerPool = address(0xCCEE);
 
@@ -107,151 +101,57 @@ contract GovernanceLifecycleTest is Test {
     // -----------------------------------------------------------------
 
     function setUp() public {
-        // Token is minted entirely to `address(this)` so the test harness can
-        // fund operators + the FeeRouter bucket destinations.
-        token = new Token(address(this));
         usdc = new LifecycleUSDC();
         ed25519 = new MockEd25519Verifier();
 
-        _deployTargets();
-        _deployGovernor();
-        _wireCrossContractRoles();
-        _handOffGovernanceToTimelock();
+        DeployConfig memory cfg = DeployConfig({
+            usdc: usdc,
+            ed25519Verifier: ed25519,
+            deployer: address(this),
+            emergencyMultisig: multisig,
+            // Token is minted entirely to the test harness so it can fund
+            // operators + FeeRouter bucket destinations downstream.
+            initialTokenHolder: address(this),
+            challengerIncentivePool: challengerPool,
+            timelockDelay: TIMELOCK_DELAY,
+            minStake: MIN_STAKE,
+            unbondingPeriod: UNBONDING_PERIOD,
+            multiaddrUpdateCooldown: 0,
+            maxMultiaddrSize: 1024,
+            regionStabilityWindow: 7 days,
+            genesisCreditWindow: 30 days,
+            feeRouterEpochLength: EPOCH,
+            feeRouterWindowEpochs: WINDOW_EPOCHS,
+            // Steady-state shares (60/30/10 from ADR 026 § FeeRouter split) so
+            // the setter / topology exercise covers the production-activated
+            // state, not the launch dormancy that DeployProtocol.s.sol ships.
+            feeRouterShares: [uint256(6000), uint256(3000), uint256(1000)],
+            buybackBurner: address(0xBB),
+            slashAppealBond: SLASH_APPEAL_BOND,
+            blacklistAppealBond: BLACKLIST_APPEAL_BOND
+        });
+
+        Deployment memory d = _runFullDeploy(cfg);
+        token = d.token;
+        bond = d.bond;
+        slashAppeal = d.slashAppeal;
+        router = d.router;
+        blacklist = d.blacklist;
+        registry = d.registry;
+        timelock = d.timelock;
+        gov = d.governor;
+
         _stakeOperatorsAndSeedVoteWeight();
     }
 
-    function _deployTargets() internal {
-        bond = new CapacityBond({
-            token_: token,
-            ed25519Verifier_: ed25519,
-            admin: address(this),
-            minStake_: MIN_STAKE,
-            unbondingPeriod_: UNBONDING_PERIOD,
-            multiaddrUpdateCooldown_: 0,
-            maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: 7 days,
-            genesisCreditWindow_: 30 days
-        });
-
-        slashAppeal = new SlashAppeal({
-            token_: token,
-            capacityBond_: ICapacityBond(address(bond)),
-            admin: address(this),
-            emergencyMultisig: multisig,
-            appealBond_: SLASH_APPEAL_BOND
-        });
-
-        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
-        router = new FeeRouter({
-            usdc_: usdc,
-            capacityBond_: ICapacityBondReporter(address(bond)),
-            treasury_: treasuryEoa,
-            epochLength_: EPOCH,
-            windowEpochs_: WINDOW_EPOCHS,
-            admin: address(this),
-            initialShares: shares,
-            buybackBurner_: address(0xBB)
-        });
-
-        blacklist = new ContentBlacklist({
-            capacityBond_: ICapacityBondEjector(address(bond)),
-            token_: token,
-            admin: address(this),
-            appealBond_: BLACKLIST_APPEAL_BOND
-        });
-
-        registry = new PublisherRegistry({ admin: address(this) });
-    }
-
-    function _deployGovernor() internal {
-        address[] memory emptyArr = new address[](0);
-        address[] memory openExec = new address[](1);
-        openExec[0] = address(0);
-        timelock = new TimelockController(TIMELOCK_DELAY, emptyArr, openExec, address(this));
-
-        gov = new DecdnGovernor(router, bond, timelock);
-
-        timelock.grantRole(timelock.PROPOSER_ROLE(), address(gov));
-        timelock.grantRole(timelock.CANCELLER_ROLE(), address(gov));
-        // Renounce the test contract's admin role on Timelock so the hand-off
-        // mirrors a self-administered production deploy.
-        timelock.renounceRole(timelock.DEFAULT_ADMIN_ROLE(), address(this));
-    }
-
-    function _wireCrossContractRoles() internal {
-        // FeeRouter must be able to write settlement state on CapacityBond.
-        bond.grantRole(bond.SETTLEMENT_REPORTER_ROLE(), address(router));
-        // SlashAppeal drives the escrow-on-slash appeal hooks on CapacityBond
-        // (markAppealOpen / settleAppealUpheld / settleAppealGranted) — ADR 028.
-        bond.grantRole(bond.SLASH_APPEAL_ROLE(), address(slashAppeal));
-        // ContentBlacklist ejects operators via CapacityBond on blacklist add.
-        bond.grantRole(bond.BLACKLIST_ROLE(), address(blacklist));
-        // SlashAppeal.upholdAppeal routes the non-burn half of a failed appeal
-        // bond to a challenger-incentive pool; pre-wire one (otherwise the
-        // slash-appeal lifecycle is incomplete).
-        slashAppeal.setChallengerIncentivePool(challengerPool);
-
-        // Test harness needs ROUTER_CALLER_ROLE to seed served-bytes via
-        // `routeSettlement`. In production this is held by `PaymentChannel`.
-        router.grantRole(router.ROUTER_CALLER_ROLE(), address(this));
-    }
-
-    /// @dev `DecdnGovernor` itself is intentionally absent from this list: its
-    ///      governable setters use OZ's `onlyGovernance` (self-call through
-    ///      Timelock), not an external `GOVERNANCE_ROLE` — there is no role to
-    ///      grant or revoke on the Governor.
-    ///
-    ///      Two roles need handing off per target:
-    ///        - `GOVERNANCE_ROLE` — direct setter authority
-    ///        - `DEFAULT_ADMIN_ROLE` — OZ AccessControl meta-admin; a holder
-    ///          can re-grant any role on the contract. Without handing this
-    ///          off too, the deployer keeps a back door (could re-grant itself
-    ///          `GOVERNANCE_ROLE` at any time), defeating the purpose of the
-    ///          Timelock.
-    ///
-    ///      Grant-before-revoke is mandatory: reversing the order leaves the
-    ///      target ungoverned mid-tx and (for a future upgradeable build)
-    ///      would brick the contract until a recovery script.
-    function _handOffGovernanceToTimelock() internal {
-        address[5] memory targets =
-            [address(router), address(bond), address(blacklist), address(slashAppeal), address(registry)];
-        bytes32 defaultAdmin = 0x00;
-        for (uint256 i = 0; i < targets.length; i++) {
-            _grantGovernance(targets[i], address(timelock));
-            _accessControlCall(
-                targets[i], abi.encodeWithSignature("grantRole(bytes32,address)", defaultAdmin, address(timelock))
-            );
-            _revokeGovernance(targets[i], address(this));
-            _accessControlCall(
-                targets[i], abi.encodeWithSignature("revokeRole(bytes32,address)", defaultAdmin, address(this))
-            );
-        }
-    }
-
-    function _grantGovernance(address target, address account) internal {
-        _accessControlCall(target, abi.encodeWithSignature("grantRole(bytes32,address)", GOVERNANCE_ROLE, account));
-    }
-
-    function _revokeGovernance(address target, address account) internal {
-        _accessControlCall(target, abi.encodeWithSignature("revokeRole(bytes32,address)", GOVERNANCE_ROLE, account));
-    }
-
-    /// @dev Low-level `.call` is used because the five governable targets
-    ///      don't share a single typed AccessControl interface in this file's
-    ///      import set. On failure we bubble the original returndata so the
-    ///      caller sees the actual OZ `AccessControl*` error rather than a
-    ///      bare "call failed" — closes a silent-failure footgun when a
-    ///      future refactor changes the role-grant interface.
-    function _accessControlCall(address target, bytes memory data) internal {
-        (bool ok, bytes memory ret) = target.call(data);
-        if (!ok) {
-            if (ret.length > 0) {
-                assembly {
-                    revert(add(ret, 0x20), mload(ret))
-                }
-            }
-            revert("accessControl call failed");
-        }
+    /// @dev Override the base hook to grant the test harness
+    ///      `ROUTER_CALLER_ROLE` on FeeRouter so it can call `routeSettlement`
+    ///      to seed served-bytes for vote-weight tests. In production this
+    ///      role lives on `PaymentChannel` (not yet deployed). The hook runs
+    ///      in phase 4 — before the GOVERNANCE_ROLE handoff, which would
+    ///      otherwise put `grantRole` behind the 48h Timelock.
+    function _postWiringHook(DeployConfig memory, Deployment memory dDeploy) internal override {
+        dDeploy.router.grantRole(dDeploy.router.ROUTER_CALLER_ROLE(), address(this));
     }
 
     function _stakeOperatorsAndSeedVoteWeight() internal {
@@ -335,9 +235,6 @@ contract GovernanceLifecycleTest is Test {
         assertFalse(slashAppeal.hasRole(defaultAdmin, address(this)), "slashAppeal admin back door");
         assertFalse(registry.hasRole(defaultAdmin, address(this)), "registry admin back door");
 
-        // Same back-door check on the Timelock itself. OZ v5's TimelockController
-        // uses DEFAULT_ADMIN_ROLE as the meta-admin (the v4 name TIMELOCK_ADMIN_ROLE
-        // was removed in v5).
         assertFalse(timelock.hasRole(defaultAdmin, address(this)), "timelock admin back door");
     }
 
@@ -501,7 +398,8 @@ contract GovernanceLifecycleTest is Test {
     }
 
     function test_lifecycle_FeeRouter_setBuybackBurner_outOfBounds() public {
-        // Default buyback share is 2500 (non-zero), so address(0) must revert.
+        // Buyback share is 3000 bps (non-zero, from setUp), so clearing the
+        // burner to address(0) must revert.
         _runLifecycleExpectExecuteRevert(
             address(router),
             abi.encodeCall(FeeRouter.setBuybackBurner, (address(0))),
