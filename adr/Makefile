@@ -8,7 +8,7 @@
 #                     # as raw source text — see README "Building a single PDF"
 #   make clean        # remove the generated PDFs
 #   make check-book-list   # fail if a numbered/appendix .md is missing from
-#                          # the hand-maintained reading-order list below
+#                          # the reading-order list — or listed but not on disk
 #   make check-bare-refs        # fail on any bare (un-linked) ADR reference
 #   make check-md-anchors       # fail on ADR cross-links missing a #anchor
 #   make check-no-section-numbers # fail on numeric §N refs or numbered headings
@@ -64,11 +64,11 @@ BOOK_SRCS := \
   _build/part-3-payments.md \
   003-payments.md 012-client.md 024-account-abstraction.md \
   _build/part-4-tokenomics.md \
-  026-tokenomics.md 033-safety-insurance-reserve.md 018-liquidity-strategy.md \
+  026-tokenomics.md 018-liquidity-strategy.md \
   _build/part-5-verification.md \
   014-on-chain-verification.md 008-reputation.md 011-content-takedown.md \
-  028-slashing-appeals.md 032-safety-reserve-appeals-contract.md \
-  031-content-blacklist-appeals-contract.md 030-node-region-self-attestation.md \
+  028-slashing-appeals.md 031-content-blacklist-appeals-contract.md \
+  030-node-region-self-attestation.md \
   _build/part-6-governance.md \
   009-governance.md 036-served-bytes-voting-weight.md 016-contract-interactions.md \
   _build/part-7-operations.md \
@@ -112,8 +112,10 @@ adrs-book.pdf: $(BOOK_SRCS) _build/strip-meta-sections.lua $(DENSITY_CFG)
 clean:
 	rm -f adrs.pdf adrs-book.pdf
 
-# Drift guard: every numbered ADR and appendix on disk must appear in the
-# hand-maintained BOOK_SRCS, or the reading-order book silently omits it.
+# Drift guard (bidirectional): every numbered ADR and appendix on disk must
+# appear in the hand-maintained BOOK_SRCS (else the book silently omits it),
+# AND every BOOK_SRCS entry must still exist on disk (else `make book` dies
+# with "No rule to make target" when an ADR is retired/renamed).
 check-book-list:
 	@miss=""; for f in $(NUMERIC_SRCS) $(APPENDIX_SRCS); do \
 	  case " $(BOOK_SRCS) " in *" $$f "*) ;; *) miss="$$miss $$f";; esac; \
@@ -121,7 +123,15 @@ check-book-list:
 	if [ -n "$$miss" ]; then \
 	  echo "ERROR: missing from BOOK_SRCS / architecture.md reading order:$$miss"; \
 	  exit 1; \
-	else echo "book list in sync ($(words $(NUMERIC_SRCS)) ADRs + $(words $(APPENDIX_SRCS)) appendices)"; fi
+	fi; \
+	gone=""; for f in $(BOOK_SRCS); do \
+	  [ -f "$$f" ] || gone="$$gone $$f"; \
+	done; \
+	if [ -n "$$gone" ]; then \
+	  echo "ERROR: BOOK_SRCS names file(s) not on disk (retired/renamed?):$$gone"; \
+	  exit 1; \
+	fi; \
+	echo "book list in sync ($(words $(NUMERIC_SRCS)) ADRs + $(words $(APPENDIX_SRCS)) appendices)"
 
 # Reference-hygiene guards. Basic tools only (awk/sed/grep), no perl/python.
 # Fenced ```code```, the H1 title line, inline `code`, and existing markdown
