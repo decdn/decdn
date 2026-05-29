@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
@@ -268,8 +269,11 @@ contract SlashAppealTest is Test {
     function test_fastTrack_requiresMultisig() public {
         uint256 slashId = _stakeAndSlash();
         _open(slashId);
+        bytes32 role = appeal.EMERGENCY_MULTISIG_ROLE();
         vm.prank(operator);
-        vm.expectRevert();
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, operator, role)
+        );
         appeal.fastTrackAppeal(slashId);
     }
 
@@ -278,8 +282,11 @@ contract SlashAppealTest is Test {
         _open(slashId);
         vm.prank(multisig);
         appeal.fastTrackAppeal(slashId);
+        bytes32 role = appeal.GOVERNANCE_ROLE();
         vm.prank(operator);
-        vm.expectRevert();
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, operator, role)
+        );
         appeal.grantAppeal(slashId);
     }
 }

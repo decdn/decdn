@@ -140,16 +140,17 @@ contract FeeRouterTest is Test {
     }
 
     function test_setShares_rejectsSumNot10000() public {
+        // [5000, 3000, 1000] sums to 9000 → SharesDoNotSum(9000).
         uint256[3] memory bad = [uint256(5000), uint256(3000), uint256(1000)];
         vm.prank(admin);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.SharesDoNotSum.selector, uint256(9000)));
         router.setShares(bad);
     }
 
     function test_setShares_rejectsNonZeroShareWithoutDestination() public {
-        // Clear buyback burner while its share is non-zero — should revert.
+        // Clear buyback burner (bucket index 1) while its share is non-zero.
         vm.startPrank(admin);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.NonZeroShareNeedsDestination.selector, uint256(1)));
         router.setBuybackBurner(address(0));
         vm.stopPrank();
     }

@@ -227,11 +227,15 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     }
 
     /// @inheritdoc ISlashAppeal
-    /// @dev Multisig rejection (appeal fails before ratification): burn the
-    ///      bond and uphold the slash.
+    /// @dev Multisig rejection at intake (appeal fails before any interim
+    ///      relief): burn the full bond and uphold the slash. Restricted to
+    ///      `Open` appeals — once an appeal is `FastTracked`, only the Governor
+    ///      may resolve it (`grantAppeal` / `upholdAppeal`), preserving the
+    ///      two-stage governance process. A fast-tracked appeal that fails goes
+    ///      through `upholdAppeal` (50/50 bond split), not `rejectAppeal`.
     function rejectAppeal(uint256 slashId) external override nonReentrant onlyRole(EMERGENCY_MULTISIG_ROLE) {
         Appeal storage a = _appeals[slashId];
-        if (a.status != AppealStatus.Open && a.status != AppealStatus.FastTracked) revert AppealNotOpen(slashId);
+        if (a.status != AppealStatus.Open) revert AppealNotOpen(slashId);
         uint256 bondBurned = a.bond;
         a.bond = 0;
         a.status = AppealStatus.Resolved;

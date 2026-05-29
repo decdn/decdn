@@ -1096,6 +1096,7 @@ contract CapacityBond is
     ///         open (an opened appeal flips the status to `AppealOpen`, so this
     ///         path can never race a live appeal).
     function finalizeUnappealedSlash(uint256 slashId) external nonReentrant whenNotPaused {
+        if (slashId >= slashCounter) revert UnknownSlash(slashId);
         SlashRecord storage r = _slashRecords[slashId];
         if (r.status != SlashStatus.Escrowed) revert SlashNotEscrowed(slashId);
         // forge-lint: disable-next-line(block-timestamp)
@@ -1105,6 +1106,7 @@ contract CapacityBond is
 
     /// @inheritdoc ICapacityBondSlashEscrow
     function markAppealOpen(uint256 slashId) external override onlyRole(SLASH_APPEAL_ROLE) {
+        if (slashId >= slashCounter) revert UnknownSlash(slashId);
         SlashRecord storage r = _slashRecords[slashId];
         if (r.status != SlashStatus.Escrowed) revert SlashNotEscrowed(slashId);
         // forge-lint: disable-next-line(block-timestamp)
@@ -1115,12 +1117,14 @@ contract CapacityBond is
 
     /// @inheritdoc ICapacityBondSlashEscrow
     function settleAppealUpheld(uint256 slashId) external override nonReentrant onlyRole(SLASH_APPEAL_ROLE) {
+        if (slashId >= slashCounter) revert UnknownSlash(slashId);
         if (_slashRecords[slashId].status != SlashStatus.AppealOpen) revert SlashAppealNotOpen(slashId);
         _distributeUpheld(slashId, true);
     }
 
     /// @inheritdoc ICapacityBondSlashEscrow
     function settleAppealGranted(uint256 slashId) external override nonReentrant onlyRole(SLASH_APPEAL_ROLE) {
+        if (slashId >= slashCounter) revert UnknownSlash(slashId);
         SlashRecord storage r = _slashRecords[slashId];
         if (r.status != SlashStatus.AppealOpen) revert SlashAppealNotOpen(slashId);
         uint256 refund = r.slashAmount;

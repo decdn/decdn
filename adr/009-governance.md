@@ -60,7 +60,7 @@ Quorum and proposal threshold are calibrated against `FeeRouter.totalBytesInWind
 
 #### Non-operator holder protection
 
-Non-operator value accrual is structurally guaranteed at the *contract* level, not at the governance level. Operators cannot vote to push the operator-base share above the 90% upper bound, drop burn below the 5% lower bound, or otherwise expropriate non-operator-aligned shares — see the immutable [§ Governable Parameters with Safety Bounds](#governable-parameters-with-safety-bounds) below. The cashflow invariant (40% floor on the operator base) ensures clients still receive paid delivery; the 5% floor on burn preserves the deflationary lever; the 0% floor on treasury and safety permits governance to simplify the split without dropping operator-aligned cashflow.
+Non-operator value accrual is structurally guaranteed at the *contract* level, not at the governance level. Operators cannot vote to push the operator-base share above the 90% upper bound, drop burn below the 5% lower bound, or otherwise expropriate non-operator-aligned shares — see the immutable [§ Governable Parameters with Safety Bounds](#governable-parameters-with-safety-bounds) below. The cashflow invariant (40% floor on the operator base) ensures clients still receive paid delivery; the 5% floor on burn preserves the deflationary lever; the 0% floor on treasury permits governance to simplify the split without dropping operator-aligned cashflow.
 
 #### Investor disposition (Open Q #7 resolved)
 
@@ -76,7 +76,7 @@ All economic parameters across the protocol are governable within hardcoded safe
 
 #### FeeRouter shares (per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds))
 
-The four `FeeRouter` shares are governable within the bounds below. **Sum-to-100% invariant:** every governance update that modifies any share **must** leave the four shares summing to exactly 100% (10000 bps); updates that violate the sum or that exceed any individual bound revert at the contract layer.
+The three `FeeRouter` shares are governable within the bounds below. **Sum-to-100% invariant:** every governance update that modifies any share **must** leave the three shares summing to exactly 100% (10000 bps); updates that violate the sum or that exceed any individual bound revert at the contract layer.
 
 | Parameter | Default | Min | Max |
 | --- | ---: | ---: | ---: |
@@ -84,7 +84,7 @@ The four `FeeRouter` shares are governable within the bounds below. **Sum-to-100
 | Burn share | 30% | 5% | 50% |
 | Treasury share | 10% | 0% | 30% |
 
-The 40% floor on the operator-base share is the cashflow invariant: operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals. The 5% floor on burn preserves the deflationary lever; the 0% floors on treasury and safety let governance simplify the split.
+The 40% floor on the operator-base share is the cashflow invariant: operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals. The 5% floor on burn preserves the deflationary lever; the 0% floor on treasury lets governance simplify the split.
 
 #### CapacityBond curve and governance parameters (per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve))
 
