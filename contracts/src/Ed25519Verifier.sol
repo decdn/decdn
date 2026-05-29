@@ -102,10 +102,14 @@ contract Ed25519Verifier is IEd25519Verifier {
     ///      key as off-curve without reverting.
     function _sqrt(uint256 a) private view returns (uint256 root, bool isQr) {
         root = _modexp(a, pp3div8, p);
-        if (mulmod(root, root, p) != a) {
+        // Happy path (~half of residues): the first candidate is the root, so
+        // skip re-squaring the corrected value.
+        if (mulmod(root, root, p) == a) {
+            isQr = true;
+        } else {
             root = mulmod(root, sqrtm1, p);
+            isQr = mulmod(root, root, p) == a;
         }
-        isQr = mulmod(root, root, p) == a;
     }
 
     /// @dev `base^e mod m` via the modexp precompile (0x05). STATICCALL keeps the
