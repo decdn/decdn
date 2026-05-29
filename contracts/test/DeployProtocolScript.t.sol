@@ -18,8 +18,9 @@ import { DecdnGovernor } from "../src/DecdnGovernor.sol";
 /// @title DeployProtocolScriptTest — covers the script-shaped behavior of
 ///        `DeployProtocol.s.sol` itself: env-var → `DeployConfig` plumbing and
 ///        the `deployments/<chainId>.json` manifest writer. The base-deploy
-///        pipeline (phases 1-5) is covered separately in `DeployProtocol.t.sol`
-///        and the lifecycle integration in `GovernanceLifecycle.t.sol`.
+///        pipeline (phases 1-6, including the `_assertNoBackDoors` guard) is
+///        covered separately in `DeployProtocol.t.sol` and the lifecycle
+///        integration in `GovernanceLifecycle.t.sol`.
 contract DeployProtocolScriptTest is Test, DeployProtocol {
     using stdJson for string;
 

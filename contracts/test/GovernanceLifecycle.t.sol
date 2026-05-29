@@ -398,7 +398,8 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     }
 
     function test_lifecycle_FeeRouter_setBuybackBurner_outOfBounds() public {
-        // Default buyback share is 2500 (non-zero), so address(0) must revert.
+        // Buyback share is 3000 bps (non-zero, from setUp), so clearing the
+        // burner to address(0) must revert.
         _runLifecycleExpectExecuteRevert(
             address(router),
             abi.encodeCall(FeeRouter.setBuybackBurner, (address(0))),
