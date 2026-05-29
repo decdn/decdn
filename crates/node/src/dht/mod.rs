@@ -2,21 +2,15 @@
 //!
 //! See [ADR 022](../../adr/022-content-discovery.md) for the canonical design.
 //! Wire types live in [`decdn_protocol::dht`]; this module owns the routing
-//! table, rate limiter, record store, scheduler, and iterative lookup logic
-//! that surround the handler.
-//!
-//! PR slice (#320): this module is being built incrementally. Current
-//! state: routing table, three-layer rate limiter, handler that answers
-//! `FindNode` plus real `Store`/`FindValue` against an in-memory record
-//! store with the ADR 022 admission rules (per-publisher quota, global
-//! LRU, receiver-anchored TTL, active-staker filter). Iterative
-//! requester-side `FindValue` lookup and the republish scheduler land
-//! in PR 4 of #320.
+//! table, rate limiter, record store, republish scheduler, and the
+//! requester-side iterative lookup that surround the handler.
 
 pub mod bootstrap;
 pub mod bucket_refresh;
 pub mod chain_staker_set;
 pub mod client;
+pub mod lookup;
+pub mod negative_cache;
 pub mod origin;
 pub mod publish;
 pub mod rate_limit;
@@ -26,6 +20,8 @@ pub mod staker_set;
 
 pub use bootstrap::{BootstrapOutcome, bootstrap};
 pub use chain_staker_set::ChainStakerSet;
+pub use lookup::{LookupConfig, find_providers};
+pub use negative_cache::NegativeProbeCache;
 pub use origin::{ConfigOriginDirectory, OriginDirectory};
 pub use publish::RepublishScheduler;
 pub use rate_limit::{DhtRateLimiter, DhtRejectLayer};
