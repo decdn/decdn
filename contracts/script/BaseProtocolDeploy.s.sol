@@ -9,7 +9,7 @@ import { TimelockController } from "@openzeppelin/contracts/governance/TimelockC
 import { Token } from "../src/Token.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
-import { SafetyReserve } from "../src/SafetyReserve.sol";
+import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
@@ -17,7 +17,6 @@ import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
-import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 
 /// @title BaseProtocolDeploy
 /// @notice Abstract deploy primitive for the v3 contract surface. Performs the
@@ -41,7 +40,7 @@ import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 ///                                         (the treasury is Timelock-custodied per
 ///                                         ADR 016) and the eventual
 ///                                         DEFAULT_ADMIN_ROLE holder of every target.
-///           2. `_deployTargets`         — Token, CapacityBond, SafetyReserve,
+///           2. `_deployTargets`         — Token, CapacityBond, SlashAppeal,
 ///                                         FeeRouter (treasury bucket = the
 ///                                         TimelockController; buyback bucket
 ///                                         dormant — see BuybackBurner note below),
@@ -52,13 +51,13 @@ import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 ///                                         PROPOSER + CANCELLER roles to the
 ///                                         Governor.
 ///           4. `_wireCrossContractRoles` — peer role grants (settlement reporter,
-///                                          slash-inflow reporter, appeal reversal,
-///                                          blacklist, emergency multisig) plus
-///                                          deployer-only setters (setSafetyReserve,
-///                                          setChallengerIncentivePool) that MUST
-///                                          run before the GOVERNANCE_ROLE handoff
-///                                          because the same setters become
-///                                          Timelock-gated post-handoff.
+///                                          slash-appeal driver, blacklist ejector,
+///                                          emergency multisig, genesis grantor)
+///                                          plus the deployer-only
+///                                          `setChallengerIncentivePool` setter
+///                                          that MUST run before the
+///                                          GOVERNANCE_ROLE handoff because it
+///                                          becomes Timelock-gated post-handoff.
 ///           5. `_handOffGovernance`      — grant-before-revoke loop over every
 ///                                          target for both GOVERNANCE_ROLE and
 ///                                          DEFAULT_ADMIN_ROLE, then renounce the
@@ -72,6 +71,11 @@ import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
 ///                                          just in tests) so a mainnet deploy
 ///                                          refuses to finish if any handoff
 ///                                          step failed silently.
+///
+///         Slash restitution is escrow-on-slash inside CapacityBond itself
+///         (ADR 026 § Slashing, ADR 028) — there is no standalone reserve
+///         contract. `SlashAppeal` drives the appeal state machine and is granted
+///         `SLASH_APPEAL_ROLE` on CapacityBond so it can open/settle appeals.
 ///
 ///         BuybackBurner is deliberately NOT deployed here. The contract is
 ///         abstract pending a concrete Balancer V3 Vault subclass; until that
@@ -108,21 +112,21 @@ abstract contract BaseProtocolDeploy is Script {
         // FeeRouter params (ADR 016 / ADR 026). `buybackBurner` may be
         // `address(0)` iff `feeRouterShares[1] == 0` (launch-mode dormancy
         // per ADR 016 § Tunable Economics). The cross-validation is enforced
-        // by `FeeRouter._setShares`, not re-asserted here.
+        // by `FeeRouter._setShares`, not re-asserted here. Buckets are
+        // operator / buyback / treasury (3-bucket split, ADR 026 § FeeRouter).
         uint64 feeRouterEpochLength;
         uint64 feeRouterWindowEpochs;
-        uint256[4] feeRouterShares;
+        uint256[3] feeRouterShares;
         address buybackBurner;
         // Appeal-bond params (ADR 028)
-        uint256 safetyAppealBond;
-        uint256 maxAppealRestitution;
+        uint256 slashAppealBond;
         uint256 blacklistAppealBond;
     }
 
     struct Deployment {
         Token token;
         CapacityBond bond;
-        SafetyReserve reserve;
+        SlashAppeal slashAppeal;
         FeeRouter router;
         ContentBlacklist blacklist;
         PublisherRegistry registry;
@@ -177,10 +181,11 @@ abstract contract BaseProtocolDeploy is Script {
         // Fail-fast on the six fields whose absence either reverts a
         // constructor with an opaque error (`usdc`, `ed25519Verifier`,
         // `initialTokenHolder`) or silently no-ops a role grant downstream
-        // (`emergencyMultisig` skips SafetyReserve's constructor grant;
-        // `challengerIncentivePool` would brick `reverseAppeal`; ContentBlacklist
-        // would grant EMERGENCY_MULTISIG_ROLE to `address(0)`). The treasury is
-        // not validated here: it is `address(timelock)`, always non-zero.
+        // (`emergencyMultisig` skips SlashAppeal's constructor grant;
+        // `challengerIncentivePool` would brick `setChallengerIncentivePool`;
+        // ContentBlacklist would grant EMERGENCY_MULTISIG_ROLE to `address(0)`).
+        // The treasury is not validated here: it is `address(timelock)`, always
+        // non-zero.
         if (address(cfg.usdc) == address(0)) revert ZeroAddress("usdc");
         if (address(cfg.ed25519Verifier) == address(0)) revert ZeroAddress("ed25519Verifier");
         if (cfg.deployer == address(0)) revert ZeroAddress("deployer");
@@ -202,14 +207,12 @@ abstract contract BaseProtocolDeploy is Script {
             genesisCreditWindow_: cfg.genesisCreditWindow
         });
 
-        d.reserve = new SafetyReserve({
-            usdc_: cfg.usdc,
+        d.slashAppeal = new SlashAppeal({
             token_: d.token,
             capacityBond_: ICapacityBond(address(d.bond)),
             admin: cfg.deployer,
             emergencyMultisig: cfg.emergencyMultisig,
-            appealBond_: cfg.safetyAppealBond,
-            maxAppealRestitution_: cfg.maxAppealRestitution
+            appealBond_: cfg.slashAppealBond
         });
 
         d.router = new FeeRouter({
@@ -220,7 +223,6 @@ abstract contract BaseProtocolDeploy is Script {
             windowEpochs_: cfg.feeRouterWindowEpochs,
             admin: cfg.deployer,
             initialShares: cfg.feeRouterShares,
-            safetyReserve_: address(d.reserve),
             buybackBurner_: cfg.buybackBurner
         });
 
@@ -251,20 +253,22 @@ abstract contract BaseProtocolDeploy is Script {
     // configure mutable state before the handoff puts every setter behind the
     // 48h Timelock.
     function _wireCrossContractRoles(DeployConfig memory cfg, Deployment memory d) internal {
+        // FeeRouter writes settlement state on CapacityBond.
         d.bond.grantRole(d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router));
-        d.reserve.grantRole(d.reserve.SLASH_INFLOW_REPORTER_ROLE(), address(d.bond));
-        d.bond.grantRole(d.bond.APPEAL_REVERSAL_ROLE(), address(d.reserve));
+        // SlashAppeal drives the escrow-on-slash appeal hooks on CapacityBond
+        // (markAppealOpen / settleAppealUpheld / settleAppealGranted) — ADR 028.
+        d.bond.grantRole(d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal));
+        // ContentBlacklist ejects operators via CapacityBond on blacklist add.
         d.bond.grantRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist));
 
-        // CapacityBond.slash() reverts on address(0) safetyReserve. Post-handoff
-        // this setter is governance-gated, so wiring here is the only path that
-        // doesn't require a Timelock proposal to enable slashing.
-        d.bond.setSafetyReserve(ISafetyReserve(address(d.reserve)));
+        // SlashAppeal.upholdAppeal routes the non-burn half of a failed appeal
+        // bond to a challenger-incentive pool; it reverts on address(0). Post-
+        // handoff this setter is governance-gated, so wiring here is the only
+        // path that doesn't require a Timelock proposal to complete the slash-
+        // appeal lifecycle.
+        d.slashAppeal.setChallengerIncentivePool(cfg.challengerIncentivePool);
 
-        // SafetyReserve.reverseAppeal() reverts on address(0) challengerIncentivePool.
-        d.reserve.setChallengerIncentivePool(cfg.challengerIncentivePool);
-
-        // EMERGENCY_MULTISIG_ROLE: SafetyReserve already has it from its
+        // EMERGENCY_MULTISIG_ROLE: SlashAppeal already has it from its
         // constructor (when emergencyMultisig != 0); ContentBlacklist has no
         // such constructor path, so grant explicitly.
         d.blacklist.grantRole(d.blacklist.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
@@ -340,6 +344,6 @@ abstract contract BaseProtocolDeploy is Script {
     ///      off to the Timelock — single source of truth for `_handOffGovernance`
     ///      and `_assertNoBackDoors` so the governed set can't drift between them.
     function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[5] memory) {
-        return [IAccessControl(address(d.router)), d.bond, d.blacklist, d.reserve, d.registry];
+        return [IAccessControl(address(d.router)), d.bond, d.blacklist, d.slashAppeal, d.registry];
     }
 }

@@ -550,6 +550,13 @@ pub struct DhtRateLimitConfig {
     /// apply). Format: dotted IPv4 or RFC 5952 IPv6. Absent or empty =>
     /// no trusted IPs. ADR 022 §Trusted-IP exemption.
     pub trusted_ips: Option<Vec<String>>,
+    /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
+    /// makes the map unbounded — operator opt-in (#645). Mirrors
+    /// `security.max_tracked_sources` for the dispatch layer.
+    pub max_tracked_per_ip: Option<usize>,
+    /// Hard cap on the per-peer (`NodeId`) keyed-limiter map. Absent =>
+    /// 4096. `0` makes the map unbounded (#645).
+    pub max_tracked_per_peer: Option<usize>,
 }
 
 /// Observability section of the config file.

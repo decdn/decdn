@@ -5,7 +5,7 @@
 
 ## Context
 
-[ADR 026](026-tokenomics.md#adr-026-tokenomics) defines a work-token tokenomics model. The governance-relevant primitives are: (i) a single `CapacityBond` contract that holds operator bonds proportional to declared bandwidth (`bond = k × Mbps^α`), exposes `firstBondedAt(operator)` as the source of the `age_ramp` tenure factor, and exposes `slashedAtEpoch(operator)` for the slash-aware voting-weight zero-out; (ii) a four-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds (no epoch buckets, no claim windows) and whose per-operator `bytesPerEpoch` accounting is the source of served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight); (iii) a `SafetyReserve` contract whose payouts are gated by governance-authorized rules.
+[ADR 026](026-tokenomics.md#adr-026-tokenomics) defines a work-token tokenomics model. The governance-relevant primitives are: (i) a single `CapacityBond` contract that holds operator bonds proportional to declared bandwidth (`bond = k × Mbps^α`), exposes `firstBondedAt(operator)` as the source of the `age_ramp` tenure factor, and exposes `slashedAtEpoch(operator)` for the slash-aware voting-weight zero-out; (ii) a three-bucket `FeeRouter` whose share parameters are governable within hard-coded bounds (no epoch buckets, no claim windows) and whose per-operator `bytesPerEpoch` accounting is the source of served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight); (iii) a `SlashAppeal` contract whose grant/uphold decisions on escrowed slashes are governance- and emergency-multisig-gated per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
 
 Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. The governance contracts (`DecdnGovernor`, `TimelockController`) ship in the day-one single-audit-pass surface ([ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory)); what differs by phase is the governance *process*, not the contract surface. In the PoC, parameters are changed through a single admin key. At launch, a bootstrap multisig replaces the admin key while the operator set is too thin for operator-weighted DAO voting (served-bytes-weighted per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)) to be safe. Once the operator set reaches the transition thresholds, full operator-weighted DAO governance activates.
 
@@ -14,9 +14,9 @@ This ADR covers:
 1. The PoC governance model (admin key)
 2. The bootstrap-multisig phase (first 6–12 months post-launch, until operator set is large enough)
 3. The production governance model (OpenZeppelin Governor against `CapacityBond`)
-4. Governable parameters and their hardcoded safety bounds (including the four `FeeRouter` shares and `CapacityBond` curve parameters)
+4. Governable parameters and their hardcoded safety bounds (including the three `FeeRouter` shares and `CapacityBond` curve parameters)
 5. Emergency multisig design
-6. SafetyReserve payout authorization rules
+6. Slash-appeal authorization rules (`SlashAppeal`)
 
 ## Decision
 
@@ -30,7 +30,7 @@ Post-launch, the voting set is narrow (likely <50 active operators in the first 
 
 **Composition.** 5-of-9 multisig (separate from the [emergency multisig](#emergency-multisig)) with geographically and organizationally diverse signers. Signer set publicly disclosed.
 
-**Capabilities.** All parameter updates within the safety bounds; `FeeRouter.setShares` / dependency-address setters; `CapacityBond` parameter setters (α, k, MAX_CAPACITY_PER_OPERATOR, age_ramp_months, unbonding window); `SafetyReserve.payout` authorization (subject to the four gates in [§ SafetyReserve Payout Authorization](#safetyreserve-payout-authorization)); standard 48-hour timelock on every parameter change.
+**Capabilities.** All parameter updates within the safety bounds; `FeeRouter.setShares` / dependency-address setters; `CapacityBond` parameter setters (α, k, MAX_CAPACITY_PER_OPERATOR, age_ramp_months, unbonding window); slash-appeal grant/uphold on `SlashAppeal` (per [§ Slash-Appeal Authorization](#slash-appeal-authorization)); standard 48-hour timelock on every parameter change.
 
 **Transition thresholds.** The bootstrap-multisig phase ends when **active operator count ≥ 30** AND **total declared capacity ≥ 100 Gbps**. Both thresholds are governable within bounds (operator count `[10, 200]`, capacity `[10 Gbps, 1000 Gbps]`). At the transition, governance executes a one-shot setter that revokes the bootstrap-multisig's `GOVERNANCE_ROLE` across the role-gated contracts and transfers it to the `TimelockController` controlled by `DecdnGovernor` proposals. The Governor's vote-weight source (`FeeRouter.bytesInWindow` + `CapacityBond.firstBondedAt` + `CapacityBond.slashedAtEpoch` per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula)) is wired at deployment, not at transition. The transition setter cannot be reversed; the bootstrap-multisig cannot be reinstated.
 
@@ -60,7 +60,7 @@ Quorum and proposal threshold are calibrated against `FeeRouter.totalBytesInWind
 
 #### Non-operator holder protection
 
-Non-operator value accrual is structurally guaranteed at the *contract* level, not at the governance level. Operators cannot vote to push the operator-base share above the 90% upper bound, drop burn below the 5% lower bound, or otherwise expropriate non-operator-aligned shares — see the immutable [§ Governable Parameters with Safety Bounds](#governable-parameters-with-safety-bounds) below. The cashflow invariant (40% floor on the operator base) ensures clients still receive paid delivery; the 5% floor on burn preserves the deflationary lever; the 0% floor on treasury and safety permits governance to simplify the split without dropping operator-aligned cashflow.
+Non-operator value accrual is structurally guaranteed at the *contract* level, not at the governance level. Operators cannot vote to push the operator-base share above the 90% upper bound, drop burn below the 5% lower bound, or otherwise expropriate non-operator-aligned shares — see the immutable [§ Governable Parameters with Safety Bounds](#governable-parameters-with-safety-bounds) below. The cashflow invariant (40% floor on the operator base) ensures clients still receive paid delivery; the 5% floor on burn preserves the deflationary lever; the 0% floor on treasury permits governance to simplify the split without dropping operator-aligned cashflow.
 
 #### Investor disposition (Open Q #7 resolved)
 
@@ -76,16 +76,15 @@ All economic parameters across the protocol are governable within hardcoded safe
 
 #### FeeRouter shares (per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds))
 
-The four `FeeRouter` shares are governable within the bounds below. **Sum-to-100% invariant:** every governance update that modifies any share **must** leave the four shares summing to exactly 100% (10000 bps); updates that violate the sum or that exceed any individual bound revert at the contract layer.
+The three `FeeRouter` shares are governable within the bounds below. **Sum-to-100% invariant:** every governance update that modifies any share **must** leave the three shares summing to exactly 100% (10000 bps); updates that violate the sum or that exceed any individual bound revert at the contract layer.
 
 | Parameter | Default | Min | Max |
 | --- | ---: | ---: | ---: |
 | Operator base share | 60% | 40% | 90% |
-| Burn share | 25% | 5% | 50% |
+| Burn share | 30% | 5% | 50% |
 | Treasury share | 10% | 0% | 30% |
-| Safety share | 5% | 0% | 20% |
 
-The 40% floor on the operator-base share is the cashflow invariant: operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals. The 5% floor on burn preserves the deflationary lever; the 0% floors on treasury and safety let governance simplify the split.
+The 40% floor on the operator-base share is the cashflow invariant: operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals. The 5% floor on burn preserves the deflationary lever; the 0% floor on treasury lets governance simplify the split.
 
 #### CapacityBond curve and governance parameters (per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve))
 
@@ -130,7 +129,7 @@ The 7-day voting period balances responsiveness with participation. Combined wit
 
 CapacityBond parameters are defined in [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve) and [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn); fee-routing parameters are governed by [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds). Payment channel parameters are defined in [ADR 003](003-payments.md#adr-003-payment-model). This ADR defines the governance mechanism that controls them.
 
-**Treasury disbursement:** Spending from the protocol treasury wallet (the destination of the 10% `FeeRouter` treasury share per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) — including operational expenditures, ecosystem grants, audits, and any onward transfers — requires a standard governance proposal in production. During the bootstrap-multisig phase, the multisig directs treasury spending within the safety bounds. The emergency multisig cannot withdraw treasury funds (see [Emergency Multisig](#emergency-multisig)); its only fund-movement authority is the SafetyReserve fast-track path, which is bounded by hard caps and the four payout gates.
+**Treasury disbursement:** Spending from the protocol treasury wallet (the destination of the 10% `FeeRouter` treasury share per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) — including operational expenditures, ecosystem grants, audits, any discretionary incident restitution (per [ADR 026 § Incident recourse](026-tokenomics.md#incident-recourse-no-standing-reserve)), and any onward transfers — requires a standard governance proposal in production. During the bootstrap-multisig phase, the multisig directs treasury spending within the safety bounds. The emergency multisig cannot withdraw treasury funds (see [Emergency Multisig](#emergency-multisig)); it has no fund-movement authority — its only fast-track power is deciding slash appeals on `SlashAppeal`, which moves only escrowed slash funds along the deterministic grant/uphold paths.
 
 **Safety bound rationale:**
 
@@ -151,18 +150,16 @@ CapacityBond parameters are defined in [ADR 026 § Capacity-bond curve](026-toke
 - **`windowEpochs` 4–26:** The trailing-window length over which served bytes are summed for voting weight. Below 4 epochs (~1 month) vote weight is too reactive to single-burst wash trading and statistically thin for small operators; above 26 epochs (~6 months) the trailing window lags actual operator-set composition (an operator who exited service ~5 months ago still carries half-weight) and `_getVotes` cold-SLOAD gas rises to ~55K per voter per `castVote`. Per [ADR 036 § Governable parameters with safety bounds](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds).
 - **Multisig transition thresholds:** Operator count `[10, 200]` and capacity `[10 Gbps, 1000 Gbps]` give governance flexibility to delay or advance the transition based on operator-set diversity that's not visible at deploy time.
 
-### SafetyReserve Payout Authorization
+### Slash-Appeal Authorization
 
-The 5% `SafetyReserve` bucket introduced by [ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket) is a governance-gated incident reserve, not a passive yield source. Payouts cover SLA-failure compensation, incorrect-slashing reversals, relay/sequencer/payment-channel downtime, and bad-data incidents — see [ADR 026 § Safety and insurance reserve (5% bucket)](026-tokenomics.md#safety-and-insurance-reserve-5-bucket) for the full eligibility list.
+There is no standing insurance reserve (the `SafetyReserve` contract was retired — see [ADR 026 § Incident recourse](026-tokenomics.md#incident-recourse-no-standing-reserve)). The only governance-gated incident surface is the **slash appeal**: a slashed operator's escrowed TOKEN is refunded (`grantAppeal`) or distributed 50/50 (`upholdAppeal`) by a two-stage decision. The flow lives in the `SlashAppeal` contract per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):
 
-`SafetyReserve.payout(bundle, recipient, amount)` checks all four of the following gates; absence of any of them causes the call to revert. There is no path for unattested or unreviewed payouts.
+1. **Filing.** Any party files `openSlashAppeal(slashId, evidenceBundleHash)` within the 30-day filing window, posting a TOKEN appeal bond. This locks the slash's escrow on `CapacityBond`.
+2. **Multisig review.** The emergency multisig `fastTrackAppeal`s (grants interim relief) or `rejectAppeal`s within the 14-day review window. There are no USDC hard caps because no reserve funds are at risk — the only funds in play are the operator's own escrowed slash and the appeal bond.
+3. **Governor ratification.** The Governor `grantAppeal`s (operator vindicated → escrow refunded + `slashedAtEpoch` cleared) or `upholdAppeal`s (slash stands → escrow 50% challenger / 50% burn) within the 14-day ratification window.
+4. **Lapse handling.** A permissionless `cleanupExpiredAppeal` resolves appeals the multisig or Governor let lapse (review-window lapse → upheld; ratification-window lapse → operator-favorable grant).
 
-1. **Attested incident bundle.** The caller must supply a cryptographic evidence bundle identifying the failure mode, the harmed party, and the proposed payout amount.
-2. **Authorization.** Either (a) a successful governance proposal that authorizes the specific bundle, or (b) emergency-multisig fast-track approval — the multisig may execute payouts under hard caps (per-incident and per-rolling-window USDC ceilings configured at deploy time and immutable thereafter; see [Emergency Multisig](#emergency-multisig)). Multisig fast-track is intended for time-critical incidents and does not bypass the other three gates.
-3. **48-hour appeal window.** After authorization, the bundle enters a 48-hour on-chain appeal window during which any party may submit a counter-bundle challenging the original. Successful challenges revert the authorization. The appeal window cannot be shortened.
-4. **Post-incident reporting.** On payout settlement, `SafetyReserve` writes an immutable record to its public on-chain registry (incident hash, payout amount, recipient, authorization path used, links to the evidence bundle and any successful appeals). Operators of the registry MUST publish a human-readable post-incident report referencing the on-chain record; the registry tracks completion of these reports and exposes outstanding-report counts as a public metric.
-
-The emergency multisig's fast-track authority over gate 2 is constrained by the same hard caps the multisig is bound by elsewhere in this ADR — it cannot withdraw treasury funds and cannot bypass the appeal window.
+The emergency multisig moves no protocol funds in this flow — escrow movement is performed deterministically by `CapacityBond`'s settle hooks; the multisig only decides fast-track-vs-reject.
 
 ### Emergency Multisig
 
@@ -171,8 +168,8 @@ The emergency multisig's fast-track authority over gate 2 is constrained by the 
   1. **Pause contracts** — halt all contract execution for exploit response and critical bug mitigation
   2. **Emergency content blacklisting** — add hashes and origin operators to the `ContentBlacklist` contract via `emergencyAdd` and `emergencyAddOrigin` (see [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting))
   3. **Regional body suspension** — suspend a compromised regional governance body via `suspendRegionalBody` (see [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)); must be ratified or reversed by governance within 14 days. Sub-modes for the blacklist-entry-appeal flow are `ContentBlacklist.fastTrackAppeal(appealId)` / `unFastTrackAppeal(appealId)` / `rejectAppeal(appealId)` / `rejectAppealAsPerjury(appealId)` — see [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) and [ADR 031](031-content-blacklist-appeals-contract.md#adr-031-contentblacklist-appeal-contract-surface)
-  4. **SafetyReserve fast-track authorization** — authorize gate 2 of a `SafetyReserve.payout` flow under immutable hard caps (per-incident and per-rolling-window USDC ceilings). Sub-modes for the slash-appeal flow are `SafetyReserve.fastTrackAppeal(appealId)` (grants interim relief on an open appeal) and `SafetyReserve.rejectAppeal(appealId)` (denies an open appeal); both are bounded by the same hard caps. Does **not** bypass the evidence-bundle, 48-hour appeal, or post-incident-reporting gates (see [SafetyReserve Payout Authorization](#safetyreserve-payout-authorization) and [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface))
-- Cannot change parameters, withdraw funds (other than gated SafetyReserve payouts), or bypass governance for non-emergency actions
+  4. **Slash-appeal fast-track** — `SlashAppeal.fastTrackAppeal(slashId)` (grants interim relief on an open appeal) and `SlashAppeal.rejectAppeal(slashId)` (denies an open appeal). These decide the appeal only; the escrow movement is performed deterministically by `CapacityBond` settle hooks. No fund-movement authority and no USDC hard caps (no reserve exists). See [Slash-Appeal Authorization](#slash-appeal-authorization) and [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)
+- Cannot change parameters, withdraw funds, or bypass governance for non-emergency actions
 - Used for exploit response, critical bug mitigation, and time-critical content removal (e.g., CSAM, actively-exploited material)
 - Sunset: `pauseDeadline = deployTimestamp + 365 days` is hardcoded in the constructor as an immutable value. After the deadline, `pause()` reverts with `"PauseExpired"`. Emergency blacklisting capability follows the same sunset schedule. **Extension mechanism:** governance cannot modify the immutable deadline. To extend pause/blacklist capability, governance must deploy a new contract version with a new deadline and migrate via the standard contract upgrade path (timelock + governance vote). This ensures the sunset cannot be silently extended.
 - Signers should be geographically and organizationally diverse

@@ -37,7 +37,7 @@ Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh
 | Binary | Role |
 |--------|------|
 | `decdn-node` | Daemon — runs the cache node service. Single subcommand: `decdn-node run [--config <path>]`. |
-| `decdn` | User CLI — `probe`, `node {peers,health,announce,drain,evict,reload}`, `key-gen`, `config {init,validate}`. |
+| `decdn` | User CLI — `probe`, `node {peers,health,announce,drain,evict,reload,top}`, `key-gen`, `config {init,validate}`, `bundle {create}`. |
 
 The container image ships `decdn-node` only. Publishers grab the
 `decdn-${VERSION}-${TARGET}.tar.gz` release archive; operators grab
@@ -49,14 +49,15 @@ the dockerd-style split rationale.
 ```
 crates/
   node/         — daemon binary `decdn-node`: runtime, handlers, admin server, dispatch limits
-  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config
+  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config, bundle
   common/       — shared types: config schema, identity, AdminRpc trait + DTOs
-  protocol/     — shared types, wire format, ALPN message definitions
+  protocol/     — shared types, wire format, ALPN message definitions (leaf crate)
+  config-types/ — config-vocabulary value types shared by cache + common (leaf crate, #578)
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
   gossip/       — NodeAnnounce pub/sub over iroh-gossip
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
-  reputation/   — gossip-based reputation scoring
-  contracts/    — Solidity contracts + Foundry
+  reputation/   — reputation scoring (ADR 008): local EWMA now, gossip aggregation deferred
+contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace)
 ```
 
 ### Key Design Decisions
@@ -69,7 +70,7 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **Encryption-agnostic protocol:** the CDN shuttles bytes; ciphertext vs plaintext is the publisher's choice. An optional [encrypted-content publishing](adr/appendix-encrypted-content-publishing.md) appendix documents one deployment pattern (companion app server, epoch-rotated keys).
 - **Stale-close defense:** in-process dispute monitor + permissionless `disputeChannel` submission; optional [fraud-detection layer](adr/appendix-fraud-detection.md) anyone can run for `SlashJudge`-bonded challenges
 - **Discovery:** `cdn/dht/v1` Kademlia DHT for content discovery from PoC onward; broadcast probe fan-out as bootstrap fallback
-- **Reputation:** Interaction-weighted scoring propagated via gossip
+- **Reputation:** Interaction-weighted scoring ([ADR 008](adr/008-reputation.md)); local per-peer EWMA today, gossip aggregation deferred
 - **Governance:** Admin key for PoC; token-weighted governance with safety bounds for production
 - **Multi-token payments (post-PoC):** PoC uses USDC only; production supports governance-approved ERC-20 allowlist
 - **Content takedown:** Governance-controlled hash blacklisting with regional compliance bodies

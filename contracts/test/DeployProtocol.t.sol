@@ -10,7 +10,7 @@ import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { Token } from "../src/Token.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
-import { SafetyReserve } from "../src/SafetyReserve.sol";
+import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 
@@ -63,10 +63,9 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             genesisCreditWindow: 30 days,
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
-            feeRouterShares: [uint256(8500), uint256(0), uint256(1000), uint256(500)],
+            feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
             buybackBurner: address(0),
-            safetyAppealBond: 1000e18,
-            maxAppealRestitution: 100_000e6,
+            slashAppealBond: 1000e18,
             blacklistAppealBond: 100e18
         });
     }
@@ -81,7 +80,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.router.hasRole(GOVERNANCE_ROLE, tl), "router gov");
         assertTrue(d.bond.hasRole(GOVERNANCE_ROLE, tl), "bond gov");
         assertTrue(d.blacklist.hasRole(GOVERNANCE_ROLE, tl), "blacklist gov");
-        assertTrue(d.reserve.hasRole(GOVERNANCE_ROLE, tl), "reserve gov");
+        assertTrue(d.slashAppeal.hasRole(GOVERNANCE_ROLE, tl), "slashAppeal gov");
         assertTrue(d.registry.hasRole(GOVERNANCE_ROLE, tl), "registry gov");
     }
 
@@ -90,7 +89,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.router.hasRole(DEFAULT_ADMIN_ROLE, tl), "router admin");
         assertTrue(d.bond.hasRole(DEFAULT_ADMIN_ROLE, tl), "bond admin");
         assertTrue(d.blacklist.hasRole(DEFAULT_ADMIN_ROLE, tl), "blacklist admin");
-        assertTrue(d.reserve.hasRole(DEFAULT_ADMIN_ROLE, tl), "reserve admin");
+        assertTrue(d.slashAppeal.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashAppeal admin");
         assertTrue(d.registry.hasRole(DEFAULT_ADMIN_ROLE, tl), "registry admin");
     }
 
@@ -99,20 +98,22 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertFalse(d.router.hasRole(GOVERNANCE_ROLE, dep), "router gov back door");
         assertFalse(d.bond.hasRole(GOVERNANCE_ROLE, dep), "bond gov back door");
         assertFalse(d.blacklist.hasRole(GOVERNANCE_ROLE, dep), "blacklist gov back door");
-        assertFalse(d.reserve.hasRole(GOVERNANCE_ROLE, dep), "reserve gov back door");
+        assertFalse(d.slashAppeal.hasRole(GOVERNANCE_ROLE, dep), "slashAppeal gov back door");
         assertFalse(d.registry.hasRole(GOVERNANCE_ROLE, dep), "registry gov back door");
 
         assertFalse(d.router.hasRole(DEFAULT_ADMIN_ROLE, dep), "router admin back door");
         assertFalse(d.bond.hasRole(DEFAULT_ADMIN_ROLE, dep), "bond admin back door");
         assertFalse(d.blacklist.hasRole(DEFAULT_ADMIN_ROLE, dep), "blacklist admin back door");
-        assertFalse(d.reserve.hasRole(DEFAULT_ADMIN_ROLE, dep), "reserve admin back door");
+        assertFalse(d.slashAppeal.hasRole(DEFAULT_ADMIN_ROLE, dep), "slashAppeal admin back door");
         assertFalse(d.registry.hasRole(DEFAULT_ADMIN_ROLE, dep), "registry admin back door");
 
         assertFalse(d.timelock.hasRole(DEFAULT_ADMIN_ROLE, dep), "timelock admin back door");
     }
 
     function test_roleMatrix_emergencyMultisigGrants() public view {
-        assertTrue(d.reserve.hasRole(d.reserve.EMERGENCY_MULTISIG_ROLE(), emergencyMultisig), "reserve emergency");
+        assertTrue(
+            d.slashAppeal.hasRole(d.slashAppeal.EMERGENCY_MULTISIG_ROLE(), emergencyMultisig), "slashAppeal emergency"
+        );
         assertTrue(d.blacklist.hasRole(d.blacklist.EMERGENCY_MULTISIG_ROLE(), emergencyMultisig), "blacklist emergency");
     }
 
@@ -122,17 +123,12 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
 
     function test_crossContractWiring_capacityBondPeerRoles() public view {
         assertTrue(d.bond.hasRole(d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router)), "router to bond settlement");
-        assertTrue(d.bond.hasRole(d.bond.APPEAL_REVERSAL_ROLE(), address(d.reserve)), "reserve to bond reversal");
+        assertTrue(d.bond.hasRole(d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal)), "slashAppeal to bond appeal");
         assertTrue(d.bond.hasRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist)), "blacklist to bond eject");
-        assertTrue(d.reserve.hasRole(d.reserve.SLASH_INFLOW_REPORTER_ROLE(), address(d.bond)), "bond to reserve inflow");
     }
 
-    function test_crossContractWiring_capacityBondPointsAtReserve() public view {
-        assertEq(address(d.bond.safetyReserve()), address(d.reserve), "bond.safetyReserve");
-    }
-
-    function test_crossContractWiring_reserveChallengerPool() public view {
-        assertEq(d.reserve.challengerIncentivePool(), challengerPool, "reserve.challengerIncentivePool");
+    function test_crossContractWiring_slashAppealChallengerPool() public view {
+        assertEq(d.slashAppeal.challengerIncentivePool(), challengerPool, "slashAppeal.challengerIncentivePool");
     }
 
     function test_crossContractWiring_genesisGrantorIsTimelock() public view {
@@ -170,8 +166,8 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // BuybackBurner subclass (see BaseProtocolDeploy header).
 
     function test_feeRouter_launchSharesDormantBuyback() public view {
-        uint256[4] memory shares = d.router.getShares();
-        assertEq(shares[0] + shares[1] + shares[2] + shares[3], 10_000, "shares sum to 10_000");
+        uint256[3] memory shares = d.router.getShares();
+        assertEq(shares[0] + shares[1] + shares[2], 10_000, "shares sum to 10_000");
         assertEq(shares[1], 0, "buyback share is 0 at launch (dormant)");
         assertEq(d.router.buybackBurner(), address(0), "buybackBurner unwired at launch");
     }
@@ -181,12 +177,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         // Timelock-custodied. The script deploys the Timelock first precisely so
         // its address can seed FeeRouter's treasury, not an external EOA.
         assertEq(d.router.treasury(), address(d.timelock), "router.treasury == timelock");
-    }
-
-    function test_feeRouter_safetyBucketWiredAtLaunch() public view {
-        // SafetyReserve is concrete and deployable, so the safety bucket
-        // ships active from day one (unlike the buyback bucket).
-        assertEq(d.router.safetyReserve(), address(d.reserve), "router.safetyReserve");
     }
 
     function test_token_initialHolderHoldsFullSupply() public view {
@@ -243,7 +233,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     }
 
     // ZeroAddress fail-fast checks in `_deployTargets`. One test per validated
-    // field — these guard against silent misconfiguration (e.g. SafetyReserve
+    // field — these guard against silent misconfiguration (e.g. SlashAppeal
     // silently skipping the EMERGENCY_MULTISIG_ROLE grant when the multisig
     // is zero, or ContentBlacklist granting that role to `address(0)`).
 

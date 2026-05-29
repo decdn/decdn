@@ -5,23 +5,74 @@ import { Test } from "forge-std/Test.sol";
 
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { Token } from "../src/Token.sol";
-import { ISafetyReserve } from "../src/interfaces/ISafetyReserve.sol";
+import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 
+import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
-import { MockSafetyReserve } from "./mocks/MockSafetyReserve.sol";
+
+/// @notice Test-only `CapacityBond` subclass exposing the internal
+///         stake-reduction logic so the C2 defensive remainder-clip branch in
+///         `_reduceStakeAtTier` can be exercised directly. That branch is
+///         unreachable through the public `slash()`
+///         API: it fires only when `slashAmount > totalAtRisk`, i.e.
+///         `tierBps > 10_000` (>100%), and the immutable slash ladder maxes at
+///         5_000 (50%). It exists as a forward-guard for a hypothetical future
+///         tier schedule, so the only honest way to cover it is to drive the
+///         internal call with an out-of-ladder `tierBps`.
+contract TestableCapacityBond is CapacityBond {
+    constructor(
+        ERC20Burnable token_,
+        IEd25519Verifier ed25519Verifier_,
+        address admin,
+        uint256 minStake_,
+        uint256 unbondingPeriod_,
+        uint256 multiaddrUpdateCooldown_,
+        uint256 maxMultiaddrSize_,
+        uint256 regionStabilityWindow_,
+        uint256 genesisCreditWindow_
+    )
+        CapacityBond(
+            token_,
+            ed25519Verifier_,
+            admin,
+            minStake_,
+            unbondingPeriod_,
+            multiaddrUpdateCooldown_,
+            maxMultiaddrSize_,
+            regionStabilityWindow_,
+            genesisCreditWindow_
+        )
+    { }
+
+    /// @dev Write active + unbonding stake directly so the clip test needn't
+    ///      plumb tokens and the unbonding period through the public API.
+    function setStakeState(address operator, uint256 active, uint256 unbonding) external {
+        activeStake[operator] = active;
+        unbondingOf[operator].amount = unbonding;
+    }
+
+    function exposed_reduceStakeAtTier(address operator, uint256 tierBps) external returns (uint256) {
+        return _reduceStakeAtTier(operator, tierBps);
+    }
+}
 
 /// @title CapacityBond smoke tests
 /// @notice Minimal coverage of the new ADR 036/028/030/026-v2.2 surface:
-///         `firstBondedAt`, `slashedAtEpoch` + `clearSlashedAtEpoch`,
-///         Genesis Bond Credit grant/vest/claim, and pending-credit slash
-///         burn. NodeId / region-attestation paths require a signed
-///         registration helper and land with the broader integration suite.
+///         `firstBondedAt`, `slashedAtEpoch`, escrow-on-slash (slash escrows
+///         TOKEN; `finalizeUnappealedSlash` / the `SLASH_APPEAL_ROLE` settle
+///         hooks resolve it), Genesis Bond Credit grant/vest/claim, and
+///         pending-credit slash. NodeId / region-attestation paths require a
+///         signed registration helper and land with the broader integration
+///         suite.
+/// @dev    `admin` is granted `SLASH_APPEAL_ROLE` in `setUp` so escrow-hook
+///         tests can drive `markAppealOpen` / `settleAppealUpheld` /
+///         `settleAppealGranted` directly, standing in for the `SlashAppeal`
+///         contract (whose full flow is covered in `SlashAppeal.t.sol`).
 contract CapacityBondTest is Test {
     Token internal token;
     MockEd25519Verifier internal ed25519;
-    MockSafetyReserve internal safety;
     CapacityBond internal bond;
 
     address internal admin = address(0xA11CE);
@@ -34,7 +85,6 @@ contract CapacityBondTest is Test {
     function setUp() public {
         token = new Token(admin);
         ed25519 = new MockEd25519Verifier();
-        safety = new MockSafetyReserve();
 
         bond = new CapacityBond({
             token_: token,
@@ -49,8 +99,8 @@ contract CapacityBondTest is Test {
         });
 
         vm.startPrank(admin);
-        bond.setSafetyReserve(ISafetyReserve(address(safety)));
         bond.grantRole(bond.SLASH_ROLE(), admin);
+        bond.grantRole(bond.SLASH_APPEAL_ROLE(), admin);
         token.transfer(operator, 200_000e18);
         vm.stopPrank();
 
@@ -96,26 +146,208 @@ contract CapacityBondTest is Test {
         assertEq(bond.slashedAtEpoch(operator), expected);
     }
 
-    function test_clearSlashedAtEpoch_requiresRole() public {
+    function test_escrowHooks_requireSlashAppealRole() public {
+        _expectMissingRole(operator, bond.SLASH_APPEAL_ROLE());
         vm.prank(operator);
-        vm.expectRevert();
-        bond.clearSlashedAtEpoch(operator);
+        bond.markAppealOpen(0);
     }
 
-    function test_clearSlashedAtEpoch_clears() public {
+    /// A successful appeal (markAppealOpen → settleAppealGranted) clears the
+    /// slash zero-out and refunds the operator's escrowed TOKEN.
+    function test_settleAppealGranted_clearsAndRefunds() public {
         vm.warp(1_000_000);
         vm.prank(operator);
         bond.stake(MIN_STAKE);
         vm.prank(admin);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
+        assertGt(bond.slashedAtEpoch(operator), 0);
+        assertEq(bond.escrowedTotal(), totalSlash);
+
+        uint256 opBefore = token.balanceOf(operator);
+        vm.startPrank(admin);
+        bond.markAppealOpen(slashId);
+        bond.settleAppealGranted(slashId);
+        vm.stopPrank();
+
+        assertEq(bond.slashedAtEpoch(operator), 0);
+        assertEq(token.balanceOf(operator) - opBefore, totalSlash);
+        assertEq(bond.escrowedTotal(), 0);
+    }
+
+    // ── Slashing-lifecycle coverage (issue #703) ────────────────────────────
+
+    /// Slash the same operator 3× and assert the tier ladder escalates
+    /// 5% → 15% → 50% (`SLASH_BPS_TIER_1/2/3`) driven by `lifetimeOffenseCount`.
+    /// No genesis credit, so `creditSlash == 0` and the reductions are pure
+    /// active-stake math. Start at 160k so even after the 50% tier the active
+    /// balance (64.6k) stays above the `minStake/2` (25k) auto-eject floor.
+    function test_slash_tierEscalation_15then50pct() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.stake(160_000e18);
+
+        // Tier 1: 5% of 160k = 8k.
+        vm.prank(admin);
         bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 1);
+        assertEq(bond.activeStake(operator), 152_000e18);
+
+        // Tier 2: 15% of 152k = 22.8k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 2);
+        assertEq(bond.activeStake(operator), 129_200e18);
+
+        // Tier 3 (3rd+ offense): 50% of 129.2k = 64.6k. Under escrow-on-slash
+        // nothing is distributed here — the `Slashed` event reports the
+        // escrowed total only; distribution happens at finality.
+        uint256 challengerBefore = token.balanceOf(challenger);
+        uint256 escrowBefore = bond.escrowedTotal();
+        vm.expectEmit(true, true, false, true);
+        emit CapacityBond.Slashed(operator, challenger, 1, 3, 64_600e18);
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 3);
+        assertEq(bond.activeStake(operator), 64_600e18);
+        // Escrow grew by the slashed total; challenger paid nothing yet.
+        assertEq(bond.escrowedTotal() - escrowBefore, 64_600e18);
+        assertEq(token.balanceOf(challenger), challengerBefore);
+    }
+
+    /// The credit-slash helper (`_slashPendingCreditAtTier`) must escalate with
+    /// the SAME tier ladder as the stake slash. Every other credit-slash test
+    /// uses a single tier-1 slash; this drives tiers 2 and 3 against the at-risk
+    /// genesis-credit pool (`originalGrant - claimed`, claimed == 0 here).
+    function test_slash_creditSlash_escalatesAcrossTiers() public {
+        _setupGenesisGrant(100_000e18);
+
+        // Tier 1: 5% of 100k at-risk = 5k → originalGrant 95k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 1);
+        assertEq(bond.pendingCredit(operator).originalGrant, 95_000e18);
+
+        // Tier 2: 15% of 95k at-risk = 14.25k → originalGrant 80.75k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 2);
+        assertEq(bond.pendingCredit(operator).originalGrant, 80_750e18);
+
+        // Tier 3: 50% of 80.75k at-risk = 40.375k → originalGrant 40.375k.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 3);
+        assertEq(bond.pendingCredit(operator).originalGrant, 40_375e18);
+    }
+
+    /// Tier-3 slash against an operator holding BOTH active and unbonding stake
+    /// where `unbonding > active`, so the slash exhausts active first and taps
+    /// unbonding for the remainder (the reachable `else` branch of
+    /// `_reduceStakeAtTier`). The literal remainder-clip inside that branch is
+    /// unreachable here (it needs `tierBps > 100%`); see
+    /// `test_reduceStakeAtTier_remainderClip` for that path.
+    function test_slash_tier3_mixedStake_exhaustsActiveTapsUnbonding() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.stake(100_000e18);
+
+        // Bump lifetimeOffenseCount to 2 so the next slash lands at tier 3.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1); // 5% → 95k active
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1); // 15% of 95k → 80.75k active
+        assertEq(bond.activeStake(operator), 80_750e18);
+
+        // Move most stake into unbonding so unbonding (60k) > active (20.75k).
+        vm.prank(operator);
+        bond.requestUnstake(60_000e18);
+        assertEq(bond.activeStake(operator), 20_750e18);
+
+        // Tier 3: totalAtRisk = 80.75k, slashAmount = 40.375k > active 20.75k.
+        // Active is zeroed; remainder (19.625k) comes out of unbonding, leaving
+        // 60k - 19.625k = 40.375k. No underflow, no clip.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        assertEq(bond.lifetimeOffenseCount(operator), 3);
+        assertEq(bond.activeStake(operator), 0);
+        (uint256 unbondingAmt,) = bond.unbondingOf(operator);
+        assertEq(unbondingAmt, 40_375e18);
+        // Active fell to 0 (< minStake/2 = 25k), so the slash auto-ejected.
+        assertTrue(bond.ejected(operator));
+    }
+
+    /// Directly exercise the C2 defensive remainder-clip in
+    /// `_reduceStakeAtTier`. It is unreachable through `slash()` — the
+    /// clip fires only when `slashAmount > totalAtRisk`, i.e. `tierBps > 10_000`
+    /// (>100%), and the immutable ladder maxes at 5_000 (50%). Drive it via the
+    /// harness with `tierBps = 12_000` to prove it caps `slashAmount` to the
+    /// at-risk total (no over-transfer) and never underflows the unbonding pool.
+    function test_reduceStakeAtTier_remainderClip() public {
+        TestableCapacityBond harness = _newHarness();
+
+        // Asymmetric split so `slashAmount` isn't a coincidental round multiple:
+        // totalAtRisk = 110e18; 120% → slashAmount would be 132e18 > totalAtRisk
+        // → clip clamps remainder to req.amount (100e18) and re-derives
+        // slashAmount to active + req.amount = 110e18 (the full at-risk pool).
+        harness.setStakeState(operator, 10e18, 100e18);
+        uint256 slashed = harness.exposed_reduceStakeAtTier(operator, 12_000);
+        assertEq(slashed, 110e18); // capped to at-risk (10 + 100), not 132e18
+        assertEq(harness.activeStake(operator), 0);
+        (uint256 unbondingAmt,) = harness.unbondingOf(operator);
+        assertEq(unbondingAmt, 0);
+    }
+
+    /// `_reduceStakeAtTier` against an operator with NO active stake — the whole
+    /// slash comes out of the unbonding bucket. Reachable in production when an
+    /// operator fully unbonds and is then slashed, so an in-ladder tier (50%)
+    /// is used. Active stays 0; unbonding is halved.
+    function test_reduceStakeAtTier_unbondingOnly() public {
+        TestableCapacityBond harness = _newHarness();
+
+        // totalAtRisk = 100e18; 50% = 50e18. active is already 0, so the entire
+        // 50e18 comes from unbonding via the else branch (no clip).
+        harness.setStakeState(operator, 0, 100e18);
+        uint256 slashed = harness.exposed_reduceStakeAtTier(operator, 5000);
+        assertEq(slashed, 50e18);
+        assertEq(harness.activeStake(operator), 0);
+        (uint256 unbondingAmt,) = harness.unbondingOf(operator);
+        assertEq(unbondingAmt, 50e18);
+    }
+
+    /// A successful appeal (`SlashAppeal.grantAppeal` → `settleAppealGranted`
+    /// → internal `_clearSlashedAtEpoch`) must re-enable `claimVestedCredit`
+    /// IMMEDIATELY, inside the original slash gate window — without waiting for
+    /// the 13-epoch gate to expire naturally. This is the cross-contract
+    /// recovery semantics ADR 028/036 promise.
+    function test_appealGrant_unlocksClaimBeforeGateExpiry() public {
+        vm.warp(2 * 7 days);
+        _setupGenesisGrant(100_000e18);
+        vm.prank(operator);
+        bond.stake(MIN_STAKE);
+        vm.prank(admin);
+        (uint256 slashId,) = bond.slash(operator, challenger, 1);
         assertGt(bond.slashedAtEpoch(operator), 0);
 
-        bytes32 reversalRole = bond.APPEAL_REVERSAL_ROLE();
+        // Inside the gate window the claim is blocked by the slash gate
+        // specifically (not NothingVested / NotActiveForClaim).
+        vm.warp(block.timestamp + 4 weeks);
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.SlashedInWindowForClaim.selector, operator));
+        bond.claimVestedCredit();
+
+        // Successful appeal (simulating SlashAppeal via SLASH_APPEAL_ROLE)
+        // clears the stamp. The appeal is opened before the 30-day filing
+        // window closes (we are 4 weeks < 30 days past the slash).
         vm.startPrank(admin);
-        bond.grantRole(reversalRole, admin);
-        bond.clearSlashedAtEpoch(operator);
+        bond.markAppealOpen(slashId);
+        bond.settleAppealGranted(slashId);
         vm.stopPrank();
         assertEq(bond.slashedAtEpoch(operator), 0);
+
+        // Without advancing past the gate, the claim now succeeds.
+        vm.prank(operator);
+        bond.claimVestedCredit();
+        assertGt(bond.pendingCredit(operator).claimed, 0);
     }
 
     function test_declaredMbps_storesValue() public {
@@ -315,21 +547,28 @@ contract CapacityBondTest is Test {
         assertEq(op2Before - op2After, 5000e18);
     }
 
-    function test_creditSlash_routesThroughChallengerAndSafety() public {
+    function test_creditSlash_escrowsThenDistributes5050AtFinality() public {
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
         bond.stake(MIN_STAKE);
 
         uint256 challengerBalanceBefore = token.balanceOf(challenger);
-        uint256 safetyBalanceBefore = token.balanceOf(address(safety));
+        uint256 supplyBefore = token.totalSupply();
 
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
 
         // C1: credit slash (5k) joins stake slash (5% × 50k = 2.5k) for a
-        // combined 7.5k routed through 50/30/20. Challenger gets 50% = 3.75k.
+        // combined 7.5k — all escrowed, nothing distributed yet.
+        assertEq(totalSlash, 7500e18);
+        assertEq(bond.escrowedTotal(), 7500e18);
+        assertEq(token.balanceOf(challenger), challengerBalanceBefore);
+
+        // At finality the 7.5k escrow splits 50/50: 3.75k challenger / 3.75k burn.
+        vm.warp(block.timestamp + 30 days + 1);
+        bond.finalizeUnappealedSlash(slashId);
         assertEq(token.balanceOf(challenger) - challengerBalanceBefore, 3750e18);
-        assertEq(token.balanceOf(address(safety)) - safetyBalanceBefore, 2250e18);
+        assertEq(supplyBefore - token.totalSupply(), 3750e18);
     }
 
     function test_forfeitUnvestedCredit_onUnbond() public {
@@ -417,35 +656,93 @@ contract CapacityBondTest is Test {
         assertEq(bond.slashCounter(), 1);
     }
 
-    /// @notice I3 regression — `CapacityBond.slash()` MUST succeed even when
-    ///         the wired `SafetyReserve.recordSlashInflow` reverts. Without
-    ///         the try/catch in `_routeSlashShares`, a faulty / paused
-    ///         SafetyReserve would brick every slash. Asserts the slash
-    ///         completes (counter advances, record minted) AND that no
-    ///         inflow row was recorded — proving the catch arm was reached
-    ///         (the happy path would have appended one row).
-    function test_slash_succeedsEvenWhenInflowCallbackReverts() public {
+    // ── Escrow-on-slash lifecycle (ADR 028) ─────────────────────────────────
+
+    /// Slash escrows the TOKEN without distributing it: no challenger transfer,
+    /// no burn, escrow accounting grows, status is `Escrowed`.
+    function test_slash_escrowsWithoutDistribution() public {
         vm.prank(operator);
         bond.stake(MIN_STAKE);
 
-        // Flip the mock to revert inside `recordSlashInflow`.
-        safety.setRevertOnRecordSlashInflow(true);
-
-        uint256 inflowsBefore = safety.inflowCount();
+        uint256 supplyBefore = token.totalSupply();
+        uint256 challengerBefore = token.balanceOf(challenger);
 
         vm.prank(admin);
         (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
 
-        // Slash record persisted, counter advanced — proves the slash
-        // wasn't reverted by the failing callback.
-        assertEq(slashId, 0);
-        assertEq(bond.slashCounter(), 1);
-        // Tier-1 slash on 50k active stake = 5% × 50k = 2_500e18; no
-        // genesis credit in this test, so totalSlash == stakeSlash = 2_500e18.
-        assertEq(totalSlash, 2500e18);
-        // No new inflow was recorded — confirms the catch arm executed
-        // rather than the happy path.
-        assertEq(safety.inflowCount(), inflowsBefore);
+        assertEq(totalSlash, 2500e18); // 5% of 50k
+        assertEq(bond.escrowedTotal(), totalSlash);
+        assertEq(token.balanceOf(challenger), challengerBefore); // nothing paid yet
+        assertEq(token.totalSupply(), supplyBefore); // nothing burned yet
+        CapacityBond.SlashRecord memory r = bond.getSlashRecord(slashId);
+        assertEq(uint8(r.status), uint8(CapacityBond.SlashStatus.Escrowed));
+        assertEq(r.challenger, challenger);
+    }
+
+    /// No appeal filed → after the filing window anyone can finalize, paying
+    /// 50% to the challenger and burning 50%.
+    function test_finalizeUnappealedSlash_distributes5050() public {
+        vm.prank(operator);
+        bond.stake(MIN_STAKE);
+        vm.prank(admin);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
+
+        // Too early: filing window still open.
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.FilingWindowStillOpen.selector, _windowClose(slashId)));
+        bond.finalizeUnappealedSlash(slashId);
+
+        vm.warp(block.timestamp + 30 days + 1);
+        uint256 supplyBefore = token.totalSupply();
+        uint256 challengerBefore = token.balanceOf(challenger);
+
+        // Permissionless: a random address triggers finality.
+        vm.prank(address(0xDEAD));
+        bond.finalizeUnappealedSlash(slashId);
+
+        assertEq(token.balanceOf(challenger) - challengerBefore, totalSlash / 2);
+        assertEq(supplyBefore - token.totalSupply(), totalSlash - totalSlash / 2);
+        assertEq(bond.escrowedTotal(), 0);
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(CapacityBond.SlashStatus.Upheld));
+    }
+
+    /// An opened appeal flips the escrow to `AppealOpen`, so the permissionless
+    /// finalize path can no longer race it.
+    function test_markAppealOpen_blocksFinalize() public {
+        vm.prank(operator);
+        bond.stake(MIN_STAKE);
+        vm.prank(admin);
+        (uint256 slashId,) = bond.slash(operator, challenger, 1);
+
+        vm.prank(admin);
+        bond.markAppealOpen(slashId);
+
+        vm.warp(block.timestamp + 30 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.SlashNotEscrowed.selector, slashId));
+        bond.finalizeUnappealedSlash(slashId);
+    }
+
+    /// Upheld appeal distributes the escrow 50/50 (same as the no-appeal path).
+    function test_settleAppealUpheld_distributes5050() public {
+        vm.prank(operator);
+        bond.stake(MIN_STAKE);
+        vm.prank(admin);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
+
+        uint256 supplyBefore = token.totalSupply();
+        uint256 challengerBefore = token.balanceOf(challenger);
+        vm.startPrank(admin);
+        bond.markAppealOpen(slashId);
+        bond.settleAppealUpheld(slashId);
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(challenger) - challengerBefore, totalSlash / 2);
+        assertEq(supplyBefore - token.totalSupply(), totalSlash - totalSlash / 2);
+        assertEq(bond.escrowedTotal(), 0);
+    }
+
+    /// @dev Read the recorded filing-window deadline for revert-arg assertions.
+    function _windowClose(uint256 slashId) internal view returns (uint64) {
+        return bond.getSlashRecord(slashId).appealWindowClose;
     }
 
     function _setupGenesisGrant(uint256 amount) internal {
@@ -455,6 +752,22 @@ contract CapacityBondTest is Test {
         bond.grantRole(grantorRole, admin);
         bond.grantGenesisCredit(operator, amount);
         vm.stopPrank();
+    }
+
+    /// Deploy a `TestableCapacityBond` mirroring `setUp`'s `CapacityBond`
+    /// parameters, for tests that drive the exposed internal stake-reduction.
+    function _newHarness() internal returns (TestableCapacityBond) {
+        return new TestableCapacityBond({
+            token_: token,
+            ed25519Verifier_: ed25519,
+            admin: admin,
+            minStake_: MIN_STAKE,
+            unbondingPeriod_: UNBONDING,
+            multiaddrUpdateCooldown_: 0,
+            maxMultiaddrSize_: 1024,
+            regionStabilityWindow_: 7 days,
+            genesisCreditWindow_: 30 days
+        });
     }
 
     // ----------------------------------------------------------------------
@@ -542,12 +855,6 @@ contract CapacityBondTest is Test {
         bond.setUnbondingPeriod(UNBONDING);
     }
 
-    function test_setSafetyReserve_revertsWithoutRole() public {
-        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
-        vm.prank(operator);
-        bond.setSafetyReserve(ISafetyReserve(address(safety)));
-    }
-
     function test_setTreasury_revertsWithoutRole() public {
         _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
         vm.prank(operator);
@@ -604,41 +911,6 @@ contract CapacityBondTest is Test {
     ///      does NOT consume the prank.
     function _expectMissingRole(address caller, bytes32 role) internal {
         vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, caller, role));
-    }
-
-    function test_setSafetyReserve_revertsOnZeroAddress() public {
-        vm.prank(admin);
-        vm.expectRevert(CapacityBond.ZeroAddress.selector);
-        bond.setSafetyReserve(ISafetyReserve(address(0)));
-    }
-
-    // ----------------------------------------------------------------------
-    // slash() preconditions
-    // ----------------------------------------------------------------------
-
-    /// @notice `slash()` must revert when `safetyReserve` has not been wired
-    ///         (ADR 016 § Post-Deployment Initialization, step 6). Without
-    ///         this guard the 30% safety leg would `safeTransfer` to
-    ///         `address(0)` and revert mid-flow, leaving inconsistent state.
-    function test_slash_revertsWhenSafetyReserveUnset() public {
-        // Fresh CapacityBond without `setSafetyReserve` wired.
-        CapacityBond fresh = new CapacityBond({
-            token_: token,
-            ed25519Verifier_: ed25519,
-            admin: admin,
-            minStake_: MIN_STAKE,
-            unbondingPeriod_: UNBONDING,
-            multiaddrUpdateCooldown_: 0,
-            maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: 7 days,
-            genesisCreditWindow_: 30 days
-        });
-        bytes32 slashRole = fresh.SLASH_ROLE();
-        vm.startPrank(admin);
-        fresh.grantRole(slashRole, admin);
-        vm.expectRevert(CapacityBond.SafetyReserveNotWired.selector);
-        fresh.slash(operator, challenger, 1);
-        vm.stopPrank();
     }
 
     // ----------------------------------------------------------------------

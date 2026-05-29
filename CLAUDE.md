@@ -4,21 +4,22 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation; the initial network deployment targets tens of nodes on an Arbitrum Sepolia testnet. "PoC" in code and ADR comments refers to that network-scale milestone, not contract-surface scope — the on-chain surface ships at full production shape with governance-tunable economics from day one (see [ADR 016 § Contract Inventory](adr/016-contract-interactions.md) and [§ Tunable Economics](adr/016-contract-interactions.md#tunable-economics)).
 
-**Status: Early implementation.** Cargo workspace with 9 crates. Two binaries (#421): `node` produces the `decdn-node` daemon with the runtime bring-up, admin RPC server, dispatch limiter, and probe handler; `cli` produces the user-facing `decdn` binary carrying `probe`, `node {peers,…}`, `key-gen`, `config {…}`. `common` holds the shared config schema, identity loading, and AdminRpc trait + DTOs both binaries import. `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` has implemented payment-channel, staking, and voucher logic (alloy); `reputation` has ADR-008-conformant local per-peer EWMA scoring (in-memory; network gossip aggregation and Sybil resistance deferred per ADR 008 §14a). Neither crate is a stub. ADRs in `adr/` remain the primary design artifacts.
+**Status: Early implementation.** Cargo workspace with 9 crates. Two binaries (#421): `node` produces the `decdn-node` daemon with the runtime bring-up, admin RPC server, dispatch limiter, and probe handler; `cli` produces the user-facing `decdn` binary carrying `probe`, `node {peers,…}`, `key-gen`, `config {…}`, `bundle {create}`. `common` holds the shared config schema, identity loading, and AdminRpc trait + DTOs both binaries import. `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` has implemented payment-channel, staking, and voucher logic (alloy); `reputation` has ADR-008-conformant local per-peer EWMA scoring (in-memory; network gossip aggregation and Sybil resistance deferred per ADR 008 §14a). Neither crate is a stub. ADRs in `adr/` remain the primary design artifacts.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
 **ADR note:**
 
 - **Next ADR number: 037.** File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by listing `adr/` for the highest number before creating a new ADR.
-- **Do not reuse numbers:** 004, 010, 027, 029, 034, 035 (retired or reclassified — see history below).
-- **Canonical ADRs (recent):** 028, 030, 031, 032, 033, 036.
+- **Do not reuse numbers:** 004, 010, 027, 029, 032, 033, 034, 035 (retired or reclassified — see history below).
+- **Canonical ADRs (recent):** 028, 030, 031, 036.
 - **History:**
   - 036 (`036-served-bytes-voting-weight.md`): supersedes voting-weight clauses of ADR 009 §Production and ADR 026 §Governance; promotes `FeeRouter.bytesPerEpoch` from analytics-only to governance-canonical, adds `windowEpochs` governable parameter, adds `slashedAtEpoch` zero-out on `CapacityBond`.
   - 035 (`035-delegator-pool.md`): retired under the work-token rewrite; archived in `adr/_history/035-delegator-pool.md`.
   - 034 (`034-gauge-boost-voting-escrow.md`): retired under the work-token rewrite; archived in `adr/_history/034-gauge-boost-voting-escrow.md`.
-  - 033 (`033-safety-insurance-reserve.md`): SafetyReserve split out of ADR 026 §5 per #590.
-  - 032 (`032-safety-reserve-appeals-contract.md`, #524); 031 (`031-content-blacklist-appeals-contract.md`); 030 (`030-node-region-self-attestation.md`, #400).
+  - 033 (`033-safety-insurance-reserve.md`): retired under the **SafetyReserve removal** — the `SafetyReserve` contract, its 5% FeeRouter bucket, and the 30% slash-redirect are gone; slash restitution is now **escrow-on-slash** in ADR 026 §Slashing and burn (the FeeRouter split drops to 60/30/10 and the slash distribution at finality to 50 challenger / 50 burn). Archived in `adr/_history/033-safety-insurance-reserve.md`.
+  - 032 (`032-safety-reserve-appeals-contract.md`): retired under the SafetyReserve removal — the slash-appeal state machine moved to the standalone `SlashAppeal` contract; the canonical surface is now ADR 028 §Contract surface. Archived in `adr/_history/032-safety-reserve-appeals-contract.md`.
+  - 031 (`031-content-blacklist-appeals-contract.md`); 030 (`030-node-region-self-attestation.md`, #400).
   - 029: reclassified as `appendix-peer-table-eviction.md`.
   - 028 (`028-slashing-appeals.md`): status unlocked from "Locked-for-implementation" to "Draft" pending CapacityBond rebase.
   - 027 (Distinct-Client Diversity Gating / Delivery Receipts): collapsed into ADR 026 §3 per-operator gauge-share cap (itself now retired).
@@ -70,7 +71,7 @@ The fail thresholds for the static-analysis jobs are set in their respective con
 ```
 crates/
   node/         — daemon binary `decdn-node`: runtime bring-up, handlers, admin RPC server, dispatch limiter
-  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config
+  cli/          — user CLI binary `decdn`: probe, node admin, key-gen, config, bundle
   common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   config-types/ — config-vocabulary value types (RetryPolicy, DecompressMode, OriginUrl, OriginKind, Hash, PinnedHashes) shared by cache + common (leaf crate: serde + url only, no iroh-blobs / no AWS — #578)
@@ -78,7 +79,7 @@ crates/
   gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
   reputation/   — reputation scoring (ADR 008): local EWMA now, gossip aggregation deferred
-contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, CapacityBond, FeeRouter, SafetyReserve, BuybackBurner, ContentBlacklist, PublisherRegistry, DecdnGovernor with test suites)
+contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, CapacityBond, FeeRouter, SlashAppeal, BuybackBurner, ContentBlacklist, PublisherRegistry, DecdnGovernor with test suites)
 ```
 
 **Dependency flow:** `node → cache, gossip, incentive, reputation, protocol, common`; `cli → common, protocol, incentive`; `common → config-types, protocol` (no longer `→ cache`, #578); `cache → config-types, protocol`. `config-types` is a leaf (alongside `protocol`), so the publisher CLI links no blob store / AWS SDK. The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — cache works without payment logic (useful for testing/local dev).

@@ -36,7 +36,7 @@ import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 ///           - `ED25519_VERIFIER_ADDRESS`  — operator-deployed verifier
 ///           - `EMERGENCY_MULTISIG`        — 3-of-5 multisig per ADR 009
 ///           - `INITIAL_TOKEN_HOLDER`      — 1B TOKEN recipient at genesis
-///           - `CHALLENGER_INCENTIVE_POOL` — SafetyReserve appeal-bond pool
+///           - `CHALLENGER_INCENTIVE_POOL` — SlashAppeal failed-appeal-bond pool
 ///
 ///         The FeeRouter treasury bucket is NOT an env var: it is the
 ///         `TimelockController` this script deploys (step 7 sets it as the
@@ -60,8 +60,7 @@ import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 ///           - `REGION_STABILITY_WINDOW`    (default 7 days)
 ///           - `GENESIS_CREDIT_WINDOW`      (default 30 days)
 ///           - `FEE_ROUTER_WINDOW_EPOCHS`   (default 13; bounded [4, 26] per ADR 036)
-///           - `SAFETY_APPEAL_BOND`         (default 1000e18)
-///           - `MAX_APPEAL_RESTITUTION`     (default 100_000e6)
+///           - `SLASH_APPEAL_BOND`          (default 1000e18)
 ///           - `BLACKLIST_APPEAL_BOND`      (default 100e18)
 contract DeployProtocol is BaseProtocolDeploy {
     // Defaults — ADR 026 / 028 / 009 values.
@@ -82,19 +81,18 @@ contract DeployProtocol is BaseProtocolDeploy {
     // so this constant + that cross-check is the single enforced source of truth.
     uint64 internal constant FEE_ROUTER_EPOCH_LENGTH = 7 days;
     uint64 internal constant DEFAULT_FEE_ROUTER_WINDOW_EPOCHS = 13;
-    uint256 internal constant DEFAULT_SAFETY_APPEAL_BOND = 1000e18;
-    uint256 internal constant DEFAULT_MAX_APPEAL_RESTITUTION = 100_000e6;
+    uint256 internal constant DEFAULT_SLASH_APPEAL_BOND = 1000e18;
     uint256 internal constant DEFAULT_BLACKLIST_APPEAL_BOND = 100e18;
 
-    // Launch fee-router shares: 85% operator / 0% buyback / 10% treasury / 5% safety.
-    // Buyback bucket is dormant pending a concrete BuybackBurner subclass; its
-    // 25% steady-state share (ADR 026) is temporarily routed to operators. All
-    // four values satisfy `FeeRouter._setShares` bounds:
-    // operator ∈ [4000, 9000], buyback ∈ {0} ∪ [500, 5000], treasury ∈ [0, 3000],
-    // safety ∈ [0, 2000].
-    uint256 internal constant LAUNCH_OPERATOR_SHARE = 8500;
+    // Launch fee-router shares: 90% operator / 0% buyback / 10% treasury
+    // (3-bucket split, ADR 026 § FeeRouter). The buyback bucket is dormant
+    // pending a concrete BuybackBurner subclass; its 30% steady-state share is
+    // temporarily routed to operators (operator pinned at its 9000-bps ceiling)
+    // while treasury holds its 10% target. Both values satisfy
+    // `FeeRouter._setShares` bounds: operator ∈ [4000, 9000], buyback ∈ {0} ∪
+    // [500, 5000], treasury ∈ [0, 3000].
+    uint256 internal constant LAUNCH_OPERATOR_SHARE = 9000;
     uint256 internal constant LAUNCH_TREASURY_SHARE = 1000;
-    uint256 internal constant LAUNCH_SAFETY_SHARE = 500;
 
     /// @notice The deploy refuses to overwrite an existing manifest unless
     ///         `FORCE_OVERWRITE_MANIFEST=true`. Prevents the case where a
@@ -164,11 +162,10 @@ contract DeployProtocol is BaseProtocolDeploy {
         uint256 windowEpochs = vm.envOr("FEE_ROUTER_WINDOW_EPOCHS", uint256(DEFAULT_FEE_ROUTER_WINDOW_EPOCHS));
         if (windowEpochs > type(uint64).max) revert ParamOverflowsUint64("FEE_ROUTER_WINDOW_EPOCHS", windowEpochs);
         cfg.feeRouterWindowEpochs = uint64(windowEpochs);
-        cfg.feeRouterShares = [LAUNCH_OPERATOR_SHARE, uint256(0), LAUNCH_TREASURY_SHARE, LAUNCH_SAFETY_SHARE];
+        cfg.feeRouterShares = [LAUNCH_OPERATOR_SHARE, uint256(0), LAUNCH_TREASURY_SHARE];
         cfg.buybackBurner = address(0);
 
-        cfg.safetyAppealBond = vm.envOr("SAFETY_APPEAL_BOND", DEFAULT_SAFETY_APPEAL_BOND);
-        cfg.maxAppealRestitution = vm.envOr("MAX_APPEAL_RESTITUTION", DEFAULT_MAX_APPEAL_RESTITUTION);
+        cfg.slashAppealBond = vm.envOr("SLASH_APPEAL_BOND", DEFAULT_SLASH_APPEAL_BOND);
         cfg.blacklistAppealBond = vm.envOr("BLACKLIST_APPEAL_BOND", DEFAULT_BLACKLIST_APPEAL_BOND);
     }
 
@@ -206,7 +203,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         vm.serializeAddress(contracts, "DecdnGovernor", address(d.governor));
         vm.serializeAddress(contracts, "FeeRouter", address(d.router));
         vm.serializeAddress(contracts, "PublisherRegistry", address(d.registry));
-        vm.serializeAddress(contracts, "SafetyReserve", address(d.reserve));
+        vm.serializeAddress(contracts, "SlashAppeal", address(d.slashAppeal));
         vm.serializeAddress(contracts, "TimelockController", address(d.timelock));
         string memory contractsJson = vm.serializeAddress(contracts, "Token", address(d.token));
 
@@ -221,11 +218,10 @@ contract DeployProtocol is BaseProtocolDeploy {
         string memory params = "config";
         vm.serializeUint(params, "feeRouterEpochLength", cfg.feeRouterEpochLength);
         vm.serializeUint(params, "feeRouterWindowEpochs", cfg.feeRouterWindowEpochs);
-        uint256[] memory sharesArr = new uint256[](4);
+        uint256[] memory sharesArr = new uint256[](3);
         sharesArr[0] = cfg.feeRouterShares[0];
         sharesArr[1] = cfg.feeRouterShares[1];
         sharesArr[2] = cfg.feeRouterShares[2];
-        sharesArr[3] = cfg.feeRouterShares[3];
         vm.serializeUint(params, "feeRouterShares", sharesArr);
         vm.serializeUint(params, "minStake", cfg.minStake);
         string memory paramsJson = vm.serializeUint(params, "timelockDelay", cfg.timelockDelay);

@@ -10,7 +10,7 @@ import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { Token } from "../src/Token.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
-import { SafetyReserve } from "../src/SafetyReserve.sol";
+import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
@@ -86,15 +86,13 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         // matches CapacityBond.EPOCH_LENGTH via the FeeRouter constructor check.
         assertEq(uint256(cfg.feeRouterEpochLength), uint256(FEE_ROUTER_EPOCH_LENGTH), "epochLen");
         assertEq(uint256(cfg.feeRouterWindowEpochs), uint256(DEFAULT_FEE_ROUTER_WINDOW_EPOCHS), "windowEpochs");
-        assertEq(cfg.safetyAppealBond, DEFAULT_SAFETY_APPEAL_BOND, "safetyAppealBond");
-        assertEq(cfg.maxAppealRestitution, DEFAULT_MAX_APPEAL_RESTITUTION, "maxAppealRestitution");
+        assertEq(cfg.slashAppealBond, DEFAULT_SLASH_APPEAL_BOND, "slashAppealBond");
         assertEq(cfg.blacklistAppealBond, DEFAULT_BLACKLIST_APPEAL_BOND, "blacklistAppealBond");
 
         // Launch shares are hard-coded in the script, not env-driven.
         assertEq(cfg.feeRouterShares[0], LAUNCH_OPERATOR_SHARE, "operator share");
         assertEq(cfg.feeRouterShares[1], 0, "buyback share dormant");
         assertEq(cfg.feeRouterShares[2], LAUNCH_TREASURY_SHARE, "treasury share");
-        assertEq(cfg.feeRouterShares[3], LAUNCH_SAFETY_SHARE, "safety share");
         assertEq(cfg.buybackBurner, address(0), "buybackBurner unwired");
     }
 
@@ -131,7 +129,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         // mis-mapped reads obvious in the JSON output.
         d.token = Token(address(0x01));
         d.bond = CapacityBond(address(0x02));
-        d.reserve = SafetyReserve(address(0x03));
+        d.slashAppeal = SlashAppeal(address(0x03));
         d.router = FeeRouter(address(0x04));
         d.blacklist = ContentBlacklist(address(0x05));
         d.registry = PublisherRegistry(address(0x06));
@@ -150,7 +148,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         string memory json = vm.readFile(_manifestPath(CHAIN_ID_WRITE));
         assertEq(json.readAddress(".contracts.Token"), address(0x01), "Token");
         assertEq(json.readAddress(".contracts.CapacityBond"), address(0x02), "CapacityBond");
-        assertEq(json.readAddress(".contracts.SafetyReserve"), address(0x03), "SafetyReserve");
+        assertEq(json.readAddress(".contracts.SlashAppeal"), address(0x03), "SlashAppeal");
         assertEq(json.readAddress(".contracts.FeeRouter"), address(0x04), "FeeRouter");
         assertEq(json.readAddress(".contracts.ContentBlacklist"), address(0x05), "ContentBlacklist");
         assertEq(json.readAddress(".contracts.PublisherRegistry"), address(0x06), "PublisherRegistry");
@@ -169,11 +167,10 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readUint(".config.minStake"), DEFAULT_MIN_STAKE, "minStake");
 
         uint256[] memory shares = json.readUintArray(".config.feeRouterShares");
-        assertEq(shares.length, 4, "shares length");
+        assertEq(shares.length, 3, "shares length");
         assertEq(shares[0], LAUNCH_OPERATOR_SHARE);
         assertEq(shares[1], 0);
         assertEq(shares[2], LAUNCH_TREASURY_SHARE);
-        assertEq(shares[3], LAUNCH_SAFETY_SHARE);
 
         _cleanupManifest(CHAIN_ID_WRITE);
     }

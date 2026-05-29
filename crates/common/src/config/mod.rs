@@ -96,6 +96,12 @@ const DEFAULT_DHT_PER_IP_BURST: u32 = 200;
 const DEFAULT_DHT_GLOBAL_RATE_PER_SEC: f64 = 1000.0;
 /// Default global burst capacity for `cdn/dht/v1`. ADR 022 default: 2000.
 const DEFAULT_DHT_GLOBAL_BURST: u32 = 2000;
+/// Default hard cap on tracked per-IP entries in the DHT keyed limiter
+/// (#645). Mirrors `DEFAULT_MAX_TRACKED_SOURCES` for the dispatch layer.
+const DEFAULT_DHT_MAX_TRACKED_PER_IP: usize = 4096;
+/// Default hard cap on tracked per-peer (`NodeId`) entries in the DHT
+/// keyed limiter (#645).
+const DEFAULT_DHT_MAX_TRACKED_PER_PEER: usize = 4096;
 /// Default interval between iroh-blobs GC sweeps in seconds (#518). Five
 /// minutes balances the hostile-origin amplification window against the
 /// per-sweep cost of walking the blob list. The window matters because
@@ -1587,15 +1593,18 @@ pub fn resolve_security_into(
         .and_then(|s| s.max_tracked_sources)
         .unwrap_or(DEFAULT_MAX_TRACKED_SOURCES);
 
+    // `eprintln!` not `tracing::{info,warn}!`: tracing is not initialized
+    // at `resolve_config` time (see `commands::run` and the rationale on
+    // `validate_port_layout_into`).
     if max_concurrent_handlers == 0 {
-        tracing::info!("security.max_concurrent_handlers = 0: global concurrency cap disabled");
+        eprintln!("info: security.max_concurrent_handlers = 0: global concurrency cap disabled");
     }
     if per_source_rate_per_sec == 0.0 {
-        tracing::info!("security.per_source_rate_per_sec = 0: per-source rate-limit disabled");
+        eprintln!("info: security.per_source_rate_per_sec = 0: per-source rate-limit disabled");
     }
     if max_tracked_sources == 0 {
-        tracing::warn!(
-            "security.max_tracked_sources = 0: rate-limit bookkeeping map is unbounded; \
+        eprintln!(
+            "warning: security.max_tracked_sources = 0: rate-limit bookkeeping map is unbounded; \
              an attacker churning sources can grow it without limit"
         );
     }
@@ -1678,6 +1687,28 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
 
     let trusted_ips = parse_trusted_ips(rate_limit.and_then(|r| r.trusted_ips.as_deref()), bag);
 
+    let max_tracked_per_ip = rate_limit
+        .and_then(|r| r.max_tracked_per_ip)
+        .unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_IP);
+    let max_tracked_per_peer = rate_limit
+        .and_then(|r| r.max_tracked_per_peer)
+        .unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_PEER);
+    // `eprintln!` not `tracing::warn!`: tracing is not initialized at
+    // `resolve_config` time (see `commands::run` and the rationale on
+    // `validate_port_layout_into`).
+    if max_tracked_per_ip == 0 {
+        eprintln!(
+            "warning: dht.rate_limit.max_tracked_per_ip = 0: per-IP bookkeeping map is unbounded; \
+             an attacker churning source IPs can grow it without limit"
+        );
+    }
+    if max_tracked_per_peer == 0 {
+        eprintln!(
+            "warning: dht.rate_limit.max_tracked_per_peer = 0: per-peer bookkeeping map is unbounded; \
+             an attacker churning NodeIds can grow it without limit"
+        );
+    }
+
     ResolvedDht {
         per_peer_rate_per_sec,
         per_peer_burst,
@@ -1686,6 +1717,8 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
         global_rate_per_sec,
         global_burst,
         trusted_ips,
+        max_tracked_per_ip,
+        max_tracked_per_peer,
     }
 }
 
@@ -6890,5 +6923,67 @@ bind_port = 12345
                 < f64::EPSILON
         );
         assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
+    }
+
+    // --- resolve_dht: keyspace caps (#645) -----------------------------------
+    //
+    // Mirrors the `resolve_security_max_tracked_sources_*` triple: each of
+    // the two new `[dht.rate_limit]` knobs gets a file-override, a
+    // default-when-absent, and a zero-as-unbounded test. A typo of the
+    // shape `unwrap_or(0)` instead of `unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_*)`
+    // would silently re-introduce the unbounded-keyspace DoS this PR fixes —
+    // these tests are the resolver-layer regression guard.
+
+    fn dht_rl_with(mutate: impl FnOnce(&mut types::DhtRateLimitConfig)) -> types::DhtConfig {
+        let mut r = types::DhtRateLimitConfig::default();
+        mutate(&mut r);
+        types::DhtConfig {
+            rate_limit: Some(r),
+        }
+    }
+
+    #[test]
+    fn resolve_dht_max_tracked_per_ip_file_override() {
+        let d = dht_rl_with(|r| r.max_tracked_per_ip = Some(8192));
+        let resolved = resolve_dht(Some(&d)).expect("valid override");
+        assert_eq!(resolved.max_tracked_per_ip, 8192);
+    }
+
+    #[test]
+    fn resolve_dht_max_tracked_per_ip_default_when_field_absent() {
+        let d = dht_rl_with(|r| r.per_peer_burst = Some(50));
+        let resolved = resolve_dht(Some(&d)).expect("valid partial config");
+        assert_eq!(resolved.max_tracked_per_ip, DEFAULT_DHT_MAX_TRACKED_PER_IP);
+    }
+
+    #[test]
+    fn resolve_dht_accepts_zero_max_tracked_per_ip_as_unbounded() {
+        let d = dht_rl_with(|r| r.max_tracked_per_ip = Some(0));
+        let resolved = resolve_dht(Some(&d)).expect("0 makes the map unbounded");
+        assert_eq!(resolved.max_tracked_per_ip, 0);
+    }
+
+    #[test]
+    fn resolve_dht_max_tracked_per_peer_file_override() {
+        let d = dht_rl_with(|r| r.max_tracked_per_peer = Some(8192));
+        let resolved = resolve_dht(Some(&d)).expect("valid override");
+        assert_eq!(resolved.max_tracked_per_peer, 8192);
+    }
+
+    #[test]
+    fn resolve_dht_max_tracked_per_peer_default_when_field_absent() {
+        let d = dht_rl_with(|r| r.per_ip_burst = Some(150));
+        let resolved = resolve_dht(Some(&d)).expect("valid partial config");
+        assert_eq!(
+            resolved.max_tracked_per_peer,
+            DEFAULT_DHT_MAX_TRACKED_PER_PEER
+        );
+    }
+
+    #[test]
+    fn resolve_dht_accepts_zero_max_tracked_per_peer_as_unbounded() {
+        let d = dht_rl_with(|r| r.max_tracked_per_peer = Some(0));
+        let resolved = resolve_dht(Some(&d)).expect("0 makes the map unbounded");
+        assert_eq!(resolved.max_tracked_per_peer, 0);
     }
 }

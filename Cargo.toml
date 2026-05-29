@@ -76,6 +76,7 @@ dirs = "6"
 
 # Misc
 bytes = "1"
+indexmap = "2"
 rand = "0.10"
 rpassword = "7"
 url = "2"
