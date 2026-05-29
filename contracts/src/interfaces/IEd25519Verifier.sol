@@ -9,9 +9,10 @@ pragma solidity 0.8.28;
 ///         the concrete ed25519 library (ADR 019 § Node Onboarding —
 ///         operator self-attestation flow).
 /// @dev    The implementation is a separate audit boundary; swap it out if
-///         RIP-7212 ever lands on Arbitrum and a precompile becomes available.
-///         Until then the production implementation wraps a vetted Solidity
-///         library (e.g., ed25519-sol). Tests use a stub from
+///         RIP-6565 / a ed25519 precompile ever lands on Arbitrum. Until then
+///         the production implementation (`Ed25519Verifier`) wraps the audited
+///         Smoo.th Crypto Lib EIP-6565 verifier, pinned as a git submodule
+///         at `lib/crypto-lib`. Tests use a stub from
 ///         `test/mocks/MockEd25519Verifier.sol`.
 interface IEd25519Verifier {
     /// @param publicKey    32-byte ed25519 public key (the iroh NodeId).
