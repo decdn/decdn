@@ -430,6 +430,17 @@ contract PaymentChannelTest is Test {
         assertEq(router.totalBytes(), 80_000_000);
     }
 
+    function test_close_revertsAfterExpiry() public {
+        bytes32 id = _open();
+        vm.warp(block.timestamp + MAX_DURATION);
+        // After expiry the provider must forfeit via `reclaimExpired`; closing
+        // (then settling) here would bypass the close-before-expiry obligation.
+        bytes memory sig = _sign(id, 800e6, 1, 80_000_000);
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.ChannelExpired.selector);
+        channel.closeChannel(id, 800e6, 1, 80_000_000, sig);
+    }
+
     // -----------------------------------------------------------------
     // disputeChannel
     // -----------------------------------------------------------------
@@ -536,6 +547,14 @@ contract PaymentChannelTest is Test {
         vm.prank(admin);
         vm.expectRevert(PaymentChannel.RouterUnchanged.selector);
         channel.setFeeRouter(address(router));
+    }
+
+    function test_setFeeRouter_revertsOnEoaRouter() public {
+        // `stranger` is an EOA (no code) — routing settlement there would no-op
+        // `routeSettlement` while channel state advances, stranding claimed USDC.
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterHasNoCode.selector, stranger));
+        channel.setFeeRouter(stranger);
     }
 
     function test_setDisputeWindow_enforcesBounds() public {

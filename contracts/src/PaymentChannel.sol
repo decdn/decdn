@@ -362,7 +362,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         bytes calldata signature
     ) external nonReentrant {
         Channel storage ch = channels[channelId];
-        if (ch.status != STATUS_OPEN) revert ChannelNotOpen();
+        // Must close before `expiresAt` (matches `topUp`/`withdraw`); after expiry
+        // the only path is `reclaimExpired`, which forfeits the un-withdrawn claim
+        // to the client per ADR 003 (close-before-expiry obligation).
+        _requireOpenAndUnexpired(ch);
         if (msg.sender != ch.client && msg.sender != ch.provider) revert NotChannelParty();
 
         bool zeroVoucher =
@@ -493,6 +496,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///         (ADR 003 § Governance setter: setFeeRouter).
     function setFeeRouter(address newRouter) external onlyRole(GOVERNANCE_ROLE) {
         if (newRouter == address(0)) revert ZeroAddress();
+        // Same invariant the constructor enforces: routing to an EOA would let
+        // `_route` advance channel state while `routeSettlement` no-ops, desyncing
+        // settlement accounting and stranding claimed USDC in the contract.
+        if (newRouter.code.length == 0) revert FeeRouterHasNoCode(newRouter);
         if (newRouter == feeRouter) revert RouterUnchanged();
         address old = feeRouter;
         feeRouter = newRouter;
