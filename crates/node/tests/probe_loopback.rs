@@ -16,7 +16,7 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::ProbeSlashData;
-use decdn_node::dispatch::ConnectionLimiter;
+use decdn_node::dispatch::{ConnectionLimiter, RejectReason};
 use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
@@ -548,24 +548,30 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// End-to-end check that the rate limiter rejects with `APP_ERR_RATE_LIMITED`
-/// (`0x10`) on the wire. Without this, the dispatch reject path is dead code
-/// under tests — every other test in this file uses `permissive_limiter`.
+/// End-to-end check that the per-source rate limiter rejects with
+/// `APP_ERR_RATE_LIMITED` (`0x10`) on the wire. Without this, the dispatch
+/// reject path is dead code under tests — every other test in this file uses
+/// `permissive_limiter`.
 ///
-/// Strict per-IP burst=1 limiter; the server runs `ProbeHandler::accept` in a
-/// loop so two back-to-back client connections both reach the handler. The
-/// first one drains the bucket and serves a normal probe (close code 0); the
-/// second one is rejected by `ConnectionLimiter::acquire` and observes
-/// `APP_ERR_RATE_LIMITED` on its `CONNECTION_CLOSE`.
+/// Strict per-IP burst=1 limiter. The bucket for the loopback source key is
+/// drained out-of-band via the limiter's test hook, so the single live client
+/// connection is unconditionally rejected by `ConnectionLimiter::acquire` at
+/// the top of `serve` and observes `APP_ERR_RATE_LIMITED` on its
+/// `CONNECTION_CLOSE`.
+///
+/// Draining the bucket directly — rather than via a throwaway first connection
+/// that races a second one — keeps this deterministic: the earlier
+/// two-connection form flaked under `nextest` because the second connection's
+/// establishment raced the first's teardown on the shared client endpoint, and
+/// the accept loop assumed it would receive exactly two `Incoming`s.
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
 
-    // burst=1 per-source so the second connection from the same client
-    // IP unconditionally rejects. Global is loose so it doesn't
-    // interfere.
+    // burst=1 per-source so the loopback source key rejects after a single
+    // charge. Global is loose so it doesn't interfere.
     let strict = ResolvedSecurity {
         max_concurrent_handlers: 64,
         per_source_rate_per_sec: 0.001, // negligible refill within the test window
@@ -573,78 +579,81 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
         max_tracked_sources: 32,
     };
     let limiter = Arc::new(ConnectionLimiter::new(&strict, Arc::clone(&metrics)));
+
+    // Pre-drain the per-source bucket for the loopback source key. The client
+    // endpoint binds to 127.0.0.1, so the server resolves the connection's
+    // source key to `127.0.0.1` (`source_key` leaves IPv4 unchanged); charging
+    // it here exhausts the burst-1 budget before the live connection arrives.
+    // Dropping the returned permit releases only the global semaphore slot —
+    // the consumed per-source token is time-based and stays spent for the full
+    // refill period (1 / `per_source_rate_per_sec`, ~1000s here).
+    drop(
+        limiter
+            .acquire_for_test(Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .map_err(|r| anyhow::anyhow!("pre-drain unexpectedly rejected: {r:?}"))?,
+    );
+
+    let limiter_probe = Arc::clone(&limiter);
     let (cache, _cache_tmp) = empty_cache().await?;
     let (handler, _signer, _domain) = build_handler(server_id, 1, &metrics, limiter, cache);
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
     let handler_bg = Arc::clone(&handler);
-    let accept_loop = tokio::spawn(async move {
-        // Accept up to two connections — the test only drives two clients.
-        for _ in 0..2 {
-            let Some(incoming) = server_ep_bg.accept().await else {
-                break;
-            };
-            let Ok(connecting) = incoming.accept() else {
-                continue;
-            };
-            let Ok(conn) = connecting.await else {
-                continue;
-            };
-            let h = Arc::clone(&handler_bg);
-            // Spawn so a slow first probe doesn't block the second accept.
-            tokio::spawn(async move {
-                let _ = h.accept(conn).await;
-            });
-        }
+    let accept_task = tokio::spawn(async move {
+        let incoming = server_ep_bg
+            .accept()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no incoming connection"))?;
+        let connecting = incoming
+            .accept()
+            .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+        let conn = connecting
+            .await
+            .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+        handler_bg
+            .accept(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok::<_, anyhow::Error>(())
     });
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
-    // First connection: completes a normal probe round-trip so the per-IP
-    // bucket is drained when the second client arrives.
-    let conn1 = client_ep
-        .connect(target.clone(), ALPN_PROBE)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect 1: {e}"))?;
-    let (mut s, mut r) = conn1
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi 1: {e}"))?;
-    let req = ProbeRequest {
-        hash: [1u8; 32],
-        timestamp_us: 1,
-    };
-    write_frame(&mut s, &encode_message(&ProbeMessage::Request(req))?)
-        .await
-        .map_err(|e| anyhow::anyhow!("write 1: {e}"))?;
-    s.finish().map_err(|e| anyhow::anyhow!("finish 1: {e}"))?;
-    let _ = read_frame(&mut r)
-        .await
-        .map_err(|e| anyhow::anyhow!("read 1: {e}"))?;
-    conn1.close(0u32.into(), b"bye");
-
-    // Second connection from the same client (same NodeID + IP). The
-    // limiter rejects on accept and the server closes with
-    // APP_ERR_RATE_LIMITED.
-    let conn2 = client_ep
+    // The only connection: the limiter rejects it on accept and the server
+    // closes with APP_ERR_RATE_LIMITED.
+    let conn = client_ep
         .connect(target, ALPN_PROBE)
         .await
-        .map_err(|e| anyhow::anyhow!("connect 2: {e}"))?;
-    // Wait for the connection to be closed by the server. `closed()`
-    // resolves with the application close code, which iroh exposes as
-    // ConnectionError.
-    let close_err = conn2.closed().await;
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    // `closed()` resolves with the application close code. Assert on the
+    // close reason bytes too, not just the 0x10 code: the reject path stamps
+    // `RejectReason::as_str()` into the frame, so checking it proves the
+    // *per-source* layer fired rather than the (also-0x10) global cap.
+    let close_err = conn.closed().await;
     let expected = VarInt::from_u32(APP_ERR_RATE_LIMITED);
     match close_err {
-        ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
-            if error_code == expected => {}
-        other => anyhow::bail!("expected ApplicationClosed({expected:?}), got {other:?}"),
+        ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason })
+            if error_code == expected
+                && reason.as_ref() == RejectReason::PerSource.as_str().as_bytes() => {}
+        other => {
+            anyhow::bail!("expected ApplicationClosed({expected:?}, \"per-source\"), got {other:?}")
+        }
     }
+    // The live connection must have charged the *same* pre-drained key, not a
+    // fresh one: a single tracked source confirms `peer_ip` resolved it to
+    // 127.0.0.1 (a different key would have been admitted, not rejected).
+    assert_eq!(
+        limiter_probe.per_source_tracked(),
+        1,
+        "live connection must hit the pre-drained 127.0.0.1 bucket"
+    );
 
     client_ep.close().await;
-    let _ = accept_loop.await;
+    accept_task
+        .await
+        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
     server_ep.close().await;
     Ok(())
 }
