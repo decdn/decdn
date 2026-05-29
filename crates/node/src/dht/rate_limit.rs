@@ -204,7 +204,9 @@ impl DhtRateLimiter {
         // itself lives in `try_admit_one` so the batch stage-2 path
         // (`admit_batch_extra`) can reuse it without the metric bump — a
         // partial-admit boundary is not a request rejection.
-        match self.try_admit_one(peer_node_id, peer_ip) {
+        // `prune = true`: a fresh inbound frame may have inserted a new
+        // keyed-map entry, so run the opportunistic keyspace prune.
+        match self.try_admit_one(peer_node_id, peer_ip, true) {
             Ok(()) => Ok(()),
             Err(layer) => {
                 match layer {
@@ -222,10 +224,18 @@ impl DhtRateLimiter {
     /// exhausted layer. Does **not** touch any metric — callers decide
     /// whether a failure is a rejection ([`Self::check`]) or a
     /// partial-admit boundary ([`Self::admit_batch_extra`]).
+    ///
+    /// `prune` gates the opportunistic keyspace prune (#645). Stage-1
+    /// [`Self::check`] passes `true`; the stage-2 batch loop passes
+    /// `false` because every extra unit it charges keys on the *same*
+    /// `(peer, ip)` stage-1 already inserted — so it can never grow the
+    /// keyed maps, making a per-unit prune check pure overhead (the
+    /// keyspace bound is upheld by stage-1 + the periodic GC sweep).
     fn try_admit_one(
         &self,
         peer_node_id: &NodeId,
         peer_ip: Option<IpAddr>,
+        prune: bool,
     ) -> Result<(), DhtRejectLayer> {
         // Layer 1 — global.
         if let Some(g) = self.global.as_ref()
@@ -240,7 +250,9 @@ impl DhtRateLimiter {
             && !self.trusted_ips.contains(&ip)
         {
             let result = limiter.check_key(&ip);
-            self.maybe_prune_per_ip(limiter);
+            if prune {
+                self.maybe_prune_per_ip(limiter);
+            }
             if result.is_err() {
                 return Err(DhtRejectLayer::PerIp);
             }
@@ -249,7 +261,9 @@ impl DhtRateLimiter {
         // Layer 3 — per-peer (NodeId).
         if let Some(limiter) = self.per_peer.as_ref() {
             let result = limiter.check_key(peer_node_id);
-            self.maybe_prune_per_peer(limiter);
+            if prune {
+                self.maybe_prune_per_peer(limiter);
+            }
             if result.is_err() {
                 return Err(DhtRejectLayer::PerPeer);
             }
@@ -286,7 +300,9 @@ impl DhtRateLimiter {
     ) -> usize {
         let mut granted = 0usize;
         while granted < extra {
-            if self.try_admit_one(peer_node_id, peer_ip).is_err() {
+            // `prune = false`: see `try_admit_one` — stage-2 units never
+            // add keyed-map entries, so the prune check is redundant here.
+            if self.try_admit_one(peer_node_id, peer_ip, false).is_err() {
                 break;
             }
             granted = granted.saturating_add(1);

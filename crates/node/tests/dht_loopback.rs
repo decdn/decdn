@@ -1210,6 +1210,85 @@ mod batch_store_admission {
         Ok(())
     }
 
+    /// A holder-mismatch batch is a deliberate protocol rejection: it
+    /// bumps the specific `dht_store_rejected_holder_mismatch` counter and
+    /// closes the stream (MALFORMED), but must NOT inflate
+    /// `dht_requests_failed`, which is reserved for post-admission internal
+    /// failures (decode/write/timeout). Guards the dispatch-rejection →
+    /// `Ok(())` path in `handle_one`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_store_holder_mismatch_does_not_bump_requests_failed() -> anyhow::Result<()> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let metrics = Arc::new(Metrics::new());
+        let limiter = permissive_limiter(&metrics);
+        let rate_limiter = permissive_dht_rate_limiter(&metrics);
+        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let handler = Arc::new(DhtHandler::with_routing(
+            server_id,
+            routing,
+            rate_limiter,
+            limiter,
+            Arc::clone(&metrics),
+            Arc::new(AllStaked::new()),
+            empty_record_store(),
+        ));
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let server_ep_bg = server_ep.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Some(incoming) = server_ep_bg.accept().await {
+                let connecting = incoming
+                    .accept()
+                    .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+                let conn = connecting
+                    .await
+                    .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+                handler
+                    .accept(conn)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut s, mut r) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
+            hashes: vec![[0x01u8; 32], [0x02u8; 32]],
+            holder: [0xAB; 32], // != authenticated client id
+        });
+        let payload = encode_message(&req)?;
+        write_frame(&mut s, &payload).await?;
+        s.finish()?;
+        // The handler resets the stream; the read errors (we don't care
+        // about the exact shape here, only the resulting metrics).
+        let _ = r.read_to_end(64).await;
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
+        accept_task
+            .await
+            .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
+        server_ep.close().await;
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_dht_store_rejected_holder_mismatch_total 1"),
+            "holder mismatch must bump its specific counter:\n{text}"
+        );
+        assert!(
+            text.contains("decdn_dht_requests_failed_total 0"),
+            "a deliberate protocol rejection must NOT inflate dht_requests_failed:\n{text}"
+        );
+        Ok(())
+    }
+
     /// AC 17: per-hash admission matches a single `Store` — a non-staked
     /// publisher's whole batch is acked `false` (the active-staker filter
     /// is applied per-hash; the batch-level holder is valid here).

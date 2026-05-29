@@ -185,6 +185,20 @@ pub async fn batch_store_with_fallback(
     if n == 0 {
         return Vec::new();
     }
+    // Caller bug: a batch over the wire cap can never be admitted (the
+    // receiver rejects it at decode with `MALFORMED_MESSAGE`). Fail fast
+    // with a clear error log + per-hash fallback rather than burn a
+    // doomed batch round-trip that would look like a normal all-`false`
+    // publish rejection. Splitting publish sets ≤ `MAX_BATCH_STORE_HASHES`
+    // is the caller's responsibility (ADR 022 §STORE Flow).
+    if n > decdn_protocol::dht::MAX_BATCH_STORE_HASHES {
+        tracing::error!(
+            n,
+            cap = decdn_protocol::dht::MAX_BATCH_STORE_HASHES,
+            "dht batch_store_with_fallback: over-cap batch (caller must split); using per-hash"
+        );
+        return per_hash_fallback(endpoint, target, &hashes, holder).await;
+    }
     if !fallback.supports_batch(&target_id) {
         return per_hash_fallback(endpoint, target, &hashes, holder).await;
     }
@@ -220,26 +234,66 @@ pub async fn batch_store_with_fallback(
     }
 }
 
-/// Issue one per-hash [`store`] for each hash and collect `accepted`
-/// flags in order. A failed exchange for a hash maps to `false` (the
-/// caller retries on its next republish cycle).
+/// Issue a per-hash `Store` for each hash and collect `accepted` flags in
+/// request order. A failed exchange (or the whole connection failing) maps
+/// to `false` for the affected hashes — the caller retries on its next
+/// republish cycle.
+///
+/// Reuses a **single** QUIC connection for the whole set via
+/// [`exchange_on`]: calling [`store`] per hash would open and tear down a
+/// fresh connection for each, up to [`MAX_BATCH_STORE_HASHES`] sequential
+/// handshakes for a full fallback. The per-hash exchange keeps its own
+/// [`DHT_CLIENT_TIMEOUT`] so one hung hash can't wedge the rest.
+///
+/// [`MAX_BATCH_STORE_HASHES`]: decdn_protocol::dht::MAX_BATCH_STORE_HASHES
+//
+// Linear connect → per-hash-exchange loop; the nested timeout/variant
+// matching reads as one flow (same rationale as `exchange`).
+#[allow(clippy::cognitive_complexity)]
 async fn per_hash_fallback(
     endpoint: &Endpoint,
     target: EndpointAddr,
     hashes: &[[u8; 32]],
     holder: [u8; 32],
 ) -> Vec<bool> {
-    let mut out = Vec::with_capacity(hashes.len());
-    for &hash in hashes {
-        let accepted = match store(endpoint, target.clone(), hash, holder).await {
-            Ok(ack) => ack.accepted,
+    let mut out = vec![false; hashes.len()];
+    let connect = tokio::time::timeout(DHT_CLIENT_TIMEOUT, async {
+        let connecting = endpoint
+            .connect_with_opts(target, ALPN_DHT, ConnectOptions::new())
+            .await
+            .context("dht client: connect failed")?;
+        connecting.await.context("dht client: handshake failed")
+    })
+    .await;
+    let Ok(Ok(conn)) = connect else {
+        // Connect/handshake failed or timed out — every hash stays
+        // `false`; the caller retries next cycle.
+        tracing::debug!("dht per-hash fallback: connect to target failed; all hashes deferred");
+        return out;
+    };
+    for (slot, &hash) in out.iter_mut().zip(hashes) {
+        let request = wire::DhtMessage::Store(wire::StoreRequest { hash, holder });
+        let payload = match encode_message(&request) {
+            Ok(p) => p,
             Err(e) => {
-                tracing::debug!(hash = ?hash, error = %e, "dht per-hash fallback Store failed");
-                false
+                tracing::debug!(hash = ?hash, error = %e, "dht per-hash fallback encode failed");
+                continue;
             }
         };
-        out.push(accepted);
+        match tokio::time::timeout(DHT_CLIENT_TIMEOUT, exchange_on(&conn, &payload)).await {
+            Ok(Ok(wire::DhtMessage::StoreAck(ack))) => *slot = ack.accepted,
+            Ok(Ok(other)) => tracing::debug!(
+                hash = ?hash,
+                got = variant_name(&other),
+                "dht per-hash fallback: unexpected response variant"
+            ),
+            Ok(Err(e)) => {
+                tracing::debug!(hash = ?hash, error = %e, "dht per-hash fallback Store failed");
+            }
+            Err(_) => tracing::debug!(hash = ?hash, "dht per-hash fallback Store timed out"),
+        }
     }
+    conn.close(0u32.into(), b"dht-done");
     out
 }
 

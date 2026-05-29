@@ -289,14 +289,19 @@ impl DhtHandler {
         // instead reject the whole batch with a stream-close-without-ack
         // (holder mismatch → `MALFORMED_MESSAGE`, ADR 022 §Batch token
         // accounting step 2) — `dispatch` signals that with `Err(code)`.
+        // That is a *deliberate* protocol rejection already counted by its
+        // specific counter (`dht_store_rejected_holder_mismatch`), so we
+        // close the stream and return `Ok(())`: returning `Err` would make
+        // `serve` bump `dht_requests_failed`, which is reserved for
+        // post-admission internal failures (decode/write/timeout), not
+        // intentional rejections.
         let resp = match self.dispatch(peer_node_id, peer_ip, req) {
             Ok(resp) => resp,
             Err(app_code) => {
                 let _ = send.reset(VarInt::from_u32(app_code));
                 let _ = recv.stop(VarInt::from_u32(app_code));
-                return Err(anyhow::anyhow!(
-                    "dht request rejected with app error code {app_code:#x}"
-                ));
+                tracing::debug!(app_code, "dht request rejected (stream-close-without-ack)");
+                return Ok(());
             }
         };
         let payload = encode_message(&resp)
@@ -428,6 +433,24 @@ impl DhtHandler {
             );
         }
         let now_us = now_us();
+        // Lock the record store once for the whole batch: the loop has no
+        // `.await`, so per-hash locking would just add 256× lock/unlock
+        // churn and, on a poisoned mutex, log the error once per hash.
+        // Only the active path inserts, so don't acquire the lock at all
+        // when the staker filter already rejected the batch. A poisoned
+        // mutex → `None` → every admitted hash is acked `false`.
+        let mut store_guard = if active && k > 0 {
+            if let Ok(guard) = self.records.lock() {
+                Some(guard)
+            } else {
+                tracing::error!(
+                    "dht BatchStore: record-store mutex poisoned; rejecting all hashes"
+                );
+                None
+            }
+        } else {
+            None
+        };
         let mut results = Vec::with_capacity(n);
         for (i, hash) in req.hashes.into_iter().enumerate() {
             // Tail beyond the rate-limit budget: deferred, no processing.
@@ -435,11 +458,7 @@ impl DhtHandler {
                 results.push(false);
                 continue;
             }
-            if !active {
-                results.push(false);
-                continue;
-            }
-            let accepted = if let Ok(mut store) = self.records.lock() {
+            let accepted = if let Some(store) = store_guard.as_mut() {
                 let outcome = store.insert_at(req.holder, hash, now_us);
                 if outcome.accepted() {
                     self.metrics.dht_store_accepted();
@@ -449,9 +468,8 @@ impl DhtHandler {
                     false
                 }
             } else {
-                tracing::error!(
-                    "dht BatchStore: record-store mutex poisoned; rejecting remaining hashes"
-                );
+                // Either the staker filter rejected the batch (`!active`)
+                // or the record-store mutex is poisoned — both ack `false`.
                 false
             };
             results.push(accepted);
