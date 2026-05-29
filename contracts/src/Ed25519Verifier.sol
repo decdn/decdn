@@ -2,10 +2,10 @@
 pragma solidity 0.8.28;
 
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
-import { SCL_EIP6565 } from "@solidity/lib/libSCL_EIP6565.sol";
-import { SCL_sha512 } from "@solidity/hash/SCL_sha512.sol";
-import { ModInv } from "@solidity/modular/SCL_modular.sol";
-import { p, d, pMINUS_1, pp3div8, sqrtm1 } from "@solidity/fields/SCL_wei25519.sol";
+import { SCL_EIP6565 } from "crypto-lib/lib/libSCL_EIP6565.sol";
+import { SCL_sha512 } from "crypto-lib/hash/SCL_sha512.sol";
+import { ModInv } from "crypto-lib/modular/SCL_modular.sol";
+import { p, d, pMINUS_1, pp3div8, sqrtm1 } from "crypto-lib/fields/SCL_wei25519.sol";
 
 /// @title Ed25519Verifier
 /// @notice Production RFC 8032 PureEdDSA (ed25519) signature verifier behind the

@@ -4,8 +4,8 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
-import { SCL_sha512 } from "@solidity/hash/SCL_sha512.sol";
-import { n, p } from "@solidity/fields/SCL_wei25519.sol";
+import { SCL_sha512 } from "crypto-lib/hash/SCL_sha512.sol";
+import { n, p } from "crypto-lib/fields/SCL_wei25519.sol";
 
 /// @title Ed25519VerifierTest
 /// @notice Differential test suite for {Ed25519Verifier}. Vectors are generated
