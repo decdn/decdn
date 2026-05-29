@@ -560,7 +560,7 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
 /// `CONNECTION_CLOSE`.
 ///
 /// Draining the bucket directly — rather than via a throwaway first connection
-/// that races a second one — keeps this deterministic (#691): the earlier
+/// that races a second one — keeps this deterministic: the earlier
 /// two-connection form flaked under `nextest` because the second connection's
 /// establishment raced the first's teardown on the shared client endpoint, and
 /// the accept loop assumed it would receive exactly two `Incoming`s.
