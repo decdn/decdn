@@ -81,8 +81,17 @@ impl NegativeProbeCache {
         Self::with_capacity_and_ttl(cap, DEFAULT_TTL)
     }
 
+    /// Build a cache with an explicit capacity and TTL.
+    ///
+    /// Production code uses [`Self::new`] (the ADR 001 § Probe cache
+    /// 1024-entry, 5-minute defaults); this constructor is the test /
+    /// tuning seam. Integration tests in particular need it: the TTL
+    /// is anchored on [`std::time::Instant`], so `tokio::time` pause /
+    /// advance has no effect on it, and the only way to exercise
+    /// expiry deterministically without a multi-minute wall-clock wait
+    /// is to inject a short TTL here. `cap` is clamped to ≥ 1.
     #[must_use]
-    fn with_capacity_and_ttl(cap: usize, ttl: Duration) -> Self {
+    pub fn with_capacity_and_ttl(cap: usize, ttl: Duration) -> Self {
         let cap = cap.max(1);
         Self {
             inner: Mutex::new(Inner {
