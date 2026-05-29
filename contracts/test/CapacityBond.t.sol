@@ -16,8 +16,8 @@ import { MockSafetyReserve } from "./mocks/MockSafetyReserve.sol";
 
 /// @notice Test-only `CapacityBond` subclass exposing the internal
 ///         stake-reduction logic so the C2 defensive remainder-clip branch in
-///         `_reduceStakeAtTier` (`CapacityBond.sol:960-963`) can be exercised
-///         directly. That branch is unreachable through the public `slash()`
+///         `_reduceStakeAtTier` can be exercised directly. That branch is
+///         unreachable through the public `slash()`
 ///         API: it fires only when `slashAmount > totalAtRisk`, i.e.
 ///         `tierBps > 10_000` (>100%), and the immutable slash ladder maxes at
 ///         5_000 (50%). It exists as a forward-guard for a hypothetical future
@@ -231,8 +231,8 @@ contract CapacityBondTest is Test {
         assertEq(unbondingAmt, 40_375e18);
     }
 
-    /// Directly exercise the C2 defensive remainder-clip in `_reduceStakeAtTier`
-    /// (`CapacityBond.sol:960-963`). It is unreachable through `slash()` — the
+    /// Directly exercise the C2 defensive remainder-clip in
+    /// `_reduceStakeAtTier`. It is unreachable through `slash()` — the
     /// clip fires only when `slashAmount > totalAtRisk`, i.e. `tierBps > 10_000`
     /// (>100%), and the immutable ladder maxes at 5_000 (50%). Drive it via the
     /// harness with `tierBps = 12_000` to prove it caps `slashAmount` to the
@@ -274,10 +274,11 @@ contract CapacityBondTest is Test {
         bond.slash(operator, challenger, 1);
         assertGt(bond.slashedAtEpoch(operator), 0);
 
-        // Inside the gate window the claim is blocked.
+        // Inside the gate window the claim is blocked by the slash gate
+        // specifically (not NothingVested / NotActiveForClaim).
         vm.warp(block.timestamp + 4 weeks);
         vm.prank(operator);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.SlashedInWindowForClaim.selector, operator));
         bond.claimVestedCredit();
 
         // Appeal reversal clears the stamp (simulating SafetyReserve).
