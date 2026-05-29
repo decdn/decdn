@@ -25,11 +25,13 @@
 //!
 //! # Re-publish semantics
 //!
-//! Re-publish from the same `(holder, hash)` pair refreshes `expiry_us`
-//! in place rather than creating a second record. The per-publisher
-//! count is unchanged. Per ADR 022 line 122 this is what extends record
-//! lifetime ahead of the previous expiry while the holder still has the
-//! blob.
+//! Re-publish from the same `(holder, hash)` pair refreshes the record
+//! (re-derives `expiry_us` from the new `receive_us`) rather than creating
+//! a second record. The per-publisher count nets out unchanged — the
+//! refresh removes the stale record and re-adds it, so the count is
+//! decremented then re-incremented for the same holder. Per ADR 022
+//! §Content Records and TTL this is what extends record lifetime ahead of
+//! the previous expiry while the holder still has the blob.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -45,7 +47,8 @@ pub type Hash = [u8; 32];
 pub enum InsertOutcome {
     /// Record was newly inserted.
     Inserted,
-    /// Record already existed; its `expiry_us` was refreshed in place.
+    /// Record already existed; it was refreshed (re-created at the new
+    /// `receive_us`) rather than duplicated.
     Refreshed,
     /// Publisher is at the per-publisher cap — hard reject.
     RejectedQuotaExceeded,
@@ -180,84 +183,48 @@ impl RecordStore {
         // acceptance per ADR 022 line 122.
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
-        let expiry_us = receive_us.saturating_add(self.cfg.ttl_us);
 
-        // Refresh path: holder already has a record for this hash.
-        if let Some(entries) = self.by_hash.get_mut(&hash)
-            && let Some(idx) = entries.iter().position(|e| e.holder == holder)
-        {
-            // Remove old `global_lru` key, insert refreshed.
-            let Some(slot) = entries.get_mut(idx) else {
-                // `position()` just returned `Some(idx)` and `entries`
-                // hasn't been mutated since — this branch is
-                // unreachable except under heap corruption. Report
-                // `RejectedQuotaExceeded` (NOT a fake `Refreshed`,
-                // which would map to `accepted: true` on the wire and
-                // confirm a write that never happened). The
-                // `.get_mut(idx)` keeps clippy's anti-panic policy
-                // satisfied without bare `[idx]` indexing.
-                tracing::error!(
-                    holder = ?holder,
-                    hash = ?hash,
-                    idx,
-                    "RecordStore::insert_at: position->Some but get_mut->None; \
-                     rejecting publish on corruption"
-                );
-                return InsertOutcome::RejectedQuotaExceeded;
-            };
-            let prev = *slot;
-            self.global_lru
-                .remove(&(prev.receive_us, prev.sequence, hash, holder));
-            *slot = HolderEntry {
-                holder,
-                receive_us,
-                sequence,
-                expiry_us,
-            };
-            self.global_lru.insert((receive_us, sequence, hash, holder));
+        // Refresh path: holder already has a record for this hash. Drop
+        // the stale tri-index entry and re-add at the new timestamp.
+        // `remove_entry` then `add_entry` is net-zero on the per-publisher
+        // count and keeps the tri-index update atomic, so there is no
+        // hand-rolled in-place mutation (and no `get_mut` corruption
+        // branch) to keep in sync.
+        if self.remove_entry(holder, hash).is_some() {
+            self.add_entry(holder, hash, receive_us, sequence);
             return InsertOutcome::Refreshed;
         }
 
         // New record path. Per-publisher hard cap first — this is the
         // rule that closes the exhaustion attack.
-        let publisher_count = self.publisher_record_count(&holder);
-        if publisher_count >= self.cfg.max_records_per_publisher {
+        if self.publisher_record_count(&holder) >= self.cfg.max_records_per_publisher {
             return InsertOutcome::RejectedQuotaExceeded;
         }
 
         // Per-hash provider cap, FIRST. If this hash is at the wire cap
-        // we'll evict one of its existing holders and net out at the
-        // same global count — so the global LRU below MUST NOT also
-        // fire (otherwise one insert produces two evictions and leaves
-        // the store under-full). The block scope releases the `&mut`
-        // borrow on `self.by_hash` before we re-borrow `self` for
-        // global-LRU eviction.
-        let grows_global = {
-            let entries = self.by_hash.entry(hash).or_default();
-            if entries.len() >= self.cfg.max_providers_per_hash {
-                // Find the entry with the smallest receive_us (oldest
-                // by ADR 022's receiver-anchored ordering). ADR 022
-                // doesn't mandate a specific per-hash eviction policy
-                // — we pick oldest-receive because the newcomer is the
-                // one most likely to still be live.
-                if let Some((idx, oldest)) = entries
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, e)| e.receive_us)
-                    .map(|(i, e)| (i, *e))
-                {
-                    let key = (oldest.receive_us, oldest.sequence, hash, oldest.holder);
-                    let old_holder = oldest.holder;
-                    entries.swap_remove(idx);
-                    self.global_lru.remove(&key);
-                    Self::decrement_publisher_count(&mut self.by_publisher_count, &old_holder);
-                    false
-                } else {
-                    true
-                }
-            } else {
-                true
+        // we evict its oldest holder and net out at the same global count
+        // — so the global LRU below MUST NOT also fire (otherwise one
+        // insert produces two evictions and leaves the store under-full).
+        // We only read `by_hash` here to pick the victim; the mutation
+        // goes through `remove_entry` so all three indexes move together.
+        // ADR 022 doesn't mandate a per-hash eviction policy — we pick
+        // oldest-receive because the newcomer is most likely still live.
+        let evict_holder = self.by_hash.get(&hash).and_then(|entries| {
+            (entries.len() >= self.cfg.max_providers_per_hash)
+                .then(|| {
+                    entries
+                        .iter()
+                        .min_by_key(|e| e.receive_us)
+                        .map(|e| e.holder)
+                })
+                .flatten()
+        });
+        let grows_global = match evict_holder {
+            Some(old_holder) => {
+                self.remove_entry(old_holder, hash);
+                false
             }
+            None => true,
         };
 
         // Global cap fires only when we're actually about to grow the
@@ -268,15 +235,7 @@ impl RecordStore {
             self.evict_globally_oldest();
         }
 
-        let entry = HolderEntry {
-            holder,
-            receive_us,
-            sequence,
-            expiry_us,
-        };
-        self.by_hash.entry(hash).or_default().push(entry);
-        self.global_lru.insert((receive_us, sequence, hash, holder));
-        *self.by_publisher_count.entry(holder).or_insert(0) += 1;
+        self.add_entry(holder, hash, receive_us, sequence);
         InsertOutcome::Inserted
     }
 
@@ -309,7 +268,7 @@ impl RecordStore {
     /// `O(expired × log N)` rather than the previous `O(N)` full scan.
     pub fn gc(&mut self, now_us: u64) -> usize {
         let mut removed = 0usize;
-        while let Some(&(receive_us, sequence, hash, holder)) = self.global_lru.iter().next() {
+        while let Some(&key @ (receive_us, _, hash, holder)) = self.global_lru.iter().next() {
             // `expiry_us = receive_us + ttl_us` by construction. We
             // recompute it here rather than carrying it in the key so
             // the BTreeSet ordering doesn't depend on a derived field.
@@ -317,17 +276,19 @@ impl RecordStore {
             if expiry_us > now_us {
                 break;
             }
-            self.global_lru
-                .remove(&(receive_us, sequence, hash, holder));
-            if let Some(entries) = self.by_hash.get_mut(&hash) {
-                if let Some(idx) = entries.iter().position(|e| e.holder == holder) {
-                    entries.swap_remove(idx);
-                }
-                if entries.is_empty() {
-                    self.by_hash.remove(&hash);
-                }
+            if self.remove_entry(holder, hash).is_none() {
+                // The tri-index invariant guarantees a `global_lru` key
+                // has a matching `by_hash` entry, so this is unreachable
+                // except under heap corruption. Drop the orphaned key
+                // directly so the front-walk still terminates (never
+                // spins on a key `remove_entry` can't clear).
+                self.global_lru.remove(&key);
+                tracing::error!(
+                    ?holder,
+                    ?hash,
+                    "RecordStore::gc: global_lru key with no by_hash entry; dropping orphan"
+                );
             }
-            Self::decrement_publisher_count(&mut self.by_publisher_count, &holder);
             removed += 1;
         }
         removed
@@ -338,49 +299,85 @@ impl RecordStore {
     /// holder never appears in a `FindValueResponse` even between GC
     /// ticks.
     fn scrub_hash_expired(&mut self, hash: &Hash, now_us: u64) -> usize {
-        let Some(entries) = self.by_hash.get_mut(hash) else {
+        // Collect the expired holders under an immutable borrow, then
+        // drop each through `remove_entry` so the tri-index update (and
+        // the empty-bucket cleanup) stays in one place.
+        let Some(entries) = self.by_hash.get(hash) else {
             return 0;
         };
-        let mut removed = 0usize;
-        let mut i = 0usize;
-        while i < entries.len() {
-            // `get` then unwrap_or — anti-panic policy keeps us off
-            // direct indexing even though the bound is loop-invariant.
-            let Some(e) = entries.get(i).copied() else {
-                break;
-            };
-            if e.expiry_us <= now_us {
-                self.global_lru
-                    .remove(&(e.receive_us, e.sequence, *hash, e.holder));
-                entries.swap_remove(i);
-                Self::decrement_publisher_count(&mut self.by_publisher_count, &e.holder);
-                removed += 1;
-            } else {
-                i += 1;
-            }
+        let expired: Vec<NodeId> = entries
+            .iter()
+            .filter(|e| e.expiry_us <= now_us)
+            .map(|e| e.holder)
+            .collect();
+        for holder in &expired {
+            self.remove_entry(*holder, *hash);
         }
-        if entries.is_empty() {
-            self.by_hash.remove(hash);
-        }
-        removed
+        expired.len()
     }
 
     /// Evict the globally-oldest record from every index.
     fn evict_globally_oldest(&mut self) {
-        let Some(&(receive_us, sequence, hash, holder)) = self.global_lru.iter().next() else {
+        let Some(&(_, _, hash, holder)) = self.global_lru.iter().next() else {
             return;
         };
-        self.global_lru
-            .remove(&(receive_us, sequence, hash, holder));
-        if let Some(entries) = self.by_hash.get_mut(&hash)
-            && let Some(idx) = entries.iter().position(|e| e.holder == holder)
-        {
-            entries.swap_remove(idx);
-            if entries.is_empty() {
-                self.by_hash.remove(&hash);
-            }
+        self.remove_entry(holder, hash);
+    }
+
+    /// Atomically insert `(holder, hash)` across all three indexes with
+    /// the given receive timestamp + sequence: the `by_hash` provider
+    /// list, the `global_lru` ordering, and the per-publisher count.
+    /// The caller has already verified (or, on the refresh path, ensured
+    /// by construction) that the publisher is below quota and that any
+    /// eviction owed for this insert has happened. Touching one index
+    /// without the others is the tri-index bug class this method exists to
+    /// make impossible — see [`Self::remove_entry`].
+    fn add_entry(&mut self, holder: NodeId, hash: Hash, receive_us: u64, sequence: u64) {
+        let expiry_us = receive_us.saturating_add(self.cfg.ttl_us);
+        self.by_hash.entry(hash).or_default().push(HolderEntry {
+            holder,
+            receive_us,
+            sequence,
+            expiry_us,
+        });
+        self.global_lru.insert((receive_us, sequence, hash, holder));
+        *self.by_publisher_count.entry(holder).or_insert(0) += 1;
+    }
+
+    /// Atomically remove `(holder, hash)` from all three indexes. Returns
+    /// the removed [`HolderEntry`], or `None` if no such record exists.
+    /// `(holder, hash)` is unique within a hash's provider list —
+    /// [`Self::insert_at`] removes any existing `(holder, hash)` before it
+    /// adds, so a holder never accumulates two records for one hash — so
+    /// removal by holder is unambiguous.
+    fn remove_entry(&mut self, holder: NodeId, hash: Hash) -> Option<HolderEntry> {
+        let entries = self.by_hash.get_mut(&hash)?;
+        let idx = entries.iter().position(|e| e.holder == holder)?;
+        let Some(removed) = entries.get(idx).copied() else {
+            // `position` just yielded `idx`, so `get(idx)` is `Some`
+            // except under heap corruption. The two legitimate
+            // "not a record" misses (`?` above) returned already, so a
+            // `None` here is never a normal miss — surface it loudly.
+            // This restores the error signal the pre-refactor in-place
+            // refresh branch logged, now at its true source so all
+            // callers (refresh, evictions, gc, scrub) inherit it. The
+            // `get(idx)` keeps clippy's anti-panic policy off bare `[idx]`.
+            tracing::error!(
+                ?holder,
+                ?hash,
+                idx,
+                "RecordStore::remove_entry: position->Some but get->None; tri-index corruption"
+            );
+            return None;
+        };
+        entries.swap_remove(idx);
+        if entries.is_empty() {
+            self.by_hash.remove(&hash);
         }
+        self.global_lru
+            .remove(&(removed.receive_us, removed.sequence, hash, holder));
         Self::decrement_publisher_count(&mut self.by_publisher_count, &holder);
+        Some(removed)
     }
 
     /// Decrement a publisher's record count; remove the map entry when
@@ -721,5 +718,161 @@ mod tests {
             "hash B's nid(3) must NOT be evicted by the per-hash-cap insert into hash A"
         );
         assert!(b_holders.contains(&nid(4)));
+    }
+
+    /// Assert the tri-index invariant the `add_entry`/`remove_entry`
+    /// helpers exist to enforce: `global_lru.len()` equals the total
+    /// `by_hash` entry count equals the sum of `by_publisher_count`,
+    /// every `by_hash` entry has a matching `global_lru` key, and no
+    /// empty provider bucket lingers in `by_hash`.
+    fn assert_tri_index_consistent(s: &RecordStore) {
+        let by_hash_total: usize = s.by_hash.values().map(Vec::len).sum();
+        assert_eq!(
+            by_hash_total,
+            s.global_lru.len(),
+            "by_hash total vs global_lru"
+        );
+
+        let mut counted: std::collections::HashMap<NodeId, usize> =
+            std::collections::HashMap::new();
+        for (hash, entries) in &s.by_hash {
+            assert!(!entries.is_empty(), "empty provider bucket must be pruned");
+            for e in entries {
+                assert!(
+                    s.global_lru
+                        .contains(&(e.receive_us, e.sequence, *hash, e.holder)),
+                    "by_hash entry missing from global_lru"
+                );
+                *counted.entry(e.holder).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(counted, s.by_publisher_count, "by_publisher_count drift");
+    }
+
+    /// After a deterministic sequence that fires every mutation kind —
+    /// new inserts, per-hash-cap eviction, global-cap eviction, refresh,
+    /// and a TTL GC that actually expires a cohort — the three indexes
+    /// stay in lockstep. With the mutations hand-rolled at each site the
+    /// "stale `by_publisher_count` after eviction" and "two evictions for
+    /// one insert" bug classes were defended by convention; routing every
+    /// mutation through the two helpers makes this invariant structural.
+    /// `assert_tri_index_consistent` runs after each phase, so a path that
+    /// updated only one or two of the three indexes would fail here even
+    /// though `providers_at` alone might still look right.
+    #[test]
+    fn tri_index_stays_consistent_across_mixed_operations() {
+        let cfg = RecordStoreConfig {
+            max_records_per_publisher: 5,
+            max_records_global: 8,
+            max_providers_per_hash: 3,
+            ttl_us: 1_000,
+        };
+        let mut s = RecordStore::new(cfg);
+
+        // Phase 1 — new inserts: h(1) reaches the per-hash cap (3 holders),
+        // and the store reaches the global cap (8 records).
+        for (p, hb, ts) in [
+            (1u8, 1u8, 100u64),
+            (2, 1, 110),
+            (3, 1, 120), // h(1) now at the 3-provider cap
+            (1, 2, 130),
+            (2, 2, 140),
+            (3, 2, 150),
+            (1, 3, 160),
+            (2, 3, 170), // global now at the 8-record cap
+        ] {
+            assert_eq!(s.insert_at(nid(p), h(hb), ts), InsertOutcome::Inserted);
+        }
+        assert_eq!(s.len(), 8);
+        assert_tri_index_consistent(&s);
+
+        // Phase 2 — per-hash-cap eviction: a 4th holder for h(1) evicts the
+        // oldest h(1) holder (nid(1)@100) and nets the global count out, so
+        // the global LRU must NOT also fire.
+        assert_eq!(s.insert_at(nid(4), h(1), 180), InsertOutcome::Inserted);
+        assert_eq!(s.len(), 8, "per-hash eviction must not change global count");
+        assert!(
+            !s.providers_at(&h(1), 0).contains(&nid(1)),
+            "oldest h(1) holder evicted by per-hash cap"
+        );
+        assert_tri_index_consistent(&s);
+
+        // Phase 3 — global-cap eviction: h(3) is below its per-hash cap, so
+        // this insert grows the store; at the global cap it evicts the
+        // globally-oldest record.
+        assert_eq!(s.insert_at(nid(4), h(3), 190), InsertOutcome::Inserted);
+        assert_eq!(s.len(), 8, "global cap holds the store at 8");
+        assert_tri_index_consistent(&s);
+
+        // Phase 4 — refresh (remove + re-add, net-zero on counts).
+        assert_eq!(s.insert_at(nid(3), h(1), 200), InsertOutcome::Refreshed);
+        assert_eq!(s.len(), 8);
+        assert_tri_index_consistent(&s);
+
+        // Phase 5 — GC that genuinely expires the oldest cohort. The five
+        // records with receive_us 130..=170 (expiry 1130..=1170) are dropped;
+        // 180/190/200 (expiry 1180/1190/1200) survive.
+        let removed = s.gc(1_175);
+        assert_eq!(removed, 5, "GC must drop the expired cohort, not no-op");
+        assert_eq!(s.len(), 3);
+        assert_tri_index_consistent(&s);
+
+        // Phase 6 — more inserts after GC, including further per-hash
+        // evictions on h(1).
+        for (p, ts) in [(7u8, 6_000u64), (8, 6_001), (9, 6_002)] {
+            assert_eq!(s.insert_at(nid(p), h(1), ts), InsertOutcome::Inserted);
+        }
+        assert_tri_index_consistent(&s);
+    }
+
+    /// GC must terminate and self-repair if a `global_lru` key has no
+    /// matching `by_hash` entry (the "heap corruption" case the deleted
+    /// in-place refresh branch used to guard). The front-walk must drop the
+    /// orphan directly rather than spin on a key `remove_entry` can't clear.
+    #[test]
+    fn gc_drops_orphan_global_lru_key_without_spinning() {
+        let mut cfg = small_cfg();
+        cfg.ttl_us = 100;
+        let mut s = RecordStore::new(cfg);
+        // One real record (expires at 100).
+        s.insert_at(nid(1), h(1), 0);
+        // Inject an orphaned global_lru key with no by_hash entry.
+        s.global_lru.insert((5, 999, h(0xEE), nid(2)));
+        // GC past both expiries: the real record is removed via remove_entry,
+        // the orphan via the defensive direct drop — both counted, no spin.
+        let removed = s.gc(10_000);
+        assert_eq!(removed, 2);
+        assert!(s.is_empty());
+        assert_tri_index_consistent(&s);
+    }
+
+    /// `providers_at` scrubs only the expired holders from a hash whose
+    /// bucket has a mix of expired and live records: the live holders
+    /// survive, the bucket is NOT pruned, and per-publisher counts drop
+    /// only for the expired holders. Guards the scrub rewrite from
+    /// in-place index-walk to collect-then-`remove_entry`.
+    #[test]
+    fn providers_at_scrubs_only_expired_holders_in_mixed_bucket() {
+        let mut cfg = small_cfg();
+        cfg.ttl_us = 1_000;
+        cfg.max_providers_per_hash = 10; // keep per-hash eviction out of it
+        let mut s = RecordStore::new(cfg);
+        s.insert_at(nid(1), h(1), 0); // expiry 1_000
+        s.insert_at(nid(2), h(1), 5_000); // expiry 6_000
+        s.insert_at(nid(3), h(1), 5_500); // expiry 6_500
+        // now_us between the expiries: nid(1) expired, nid(2)/nid(3) live.
+        let live: std::collections::HashSet<_> = s.providers_at(&h(1), 2_000).into_iter().collect();
+        assert_eq!(live.len(), 2);
+        assert!(!live.contains(&nid(1)), "expired holder scrubbed");
+        assert!(live.contains(&nid(2)));
+        assert!(live.contains(&nid(3)));
+        assert_eq!(
+            s.publisher_record_count(&nid(1)),
+            0,
+            "count drops for expired"
+        );
+        assert_eq!(s.publisher_record_count(&nid(2)), 1, "live count intact");
+        assert_eq!(s.len(), 2);
+        assert_tri_index_consistent(&s);
     }
 }
