@@ -1,6 +1,6 @@
 //! `cdn/dht/v1` handler (ADR 022) — Kademlia content discovery.
 //!
-//! Current slice (PR 3 of #320):
+//! Request handling:
 //!
 //! - `FindNode` honored against the in-memory routing table.
 //! - `Store` admission runs the full ADR 022 pipeline: holder ==
@@ -10,16 +10,20 @@
 //! - `FindValue` consults the record store + the routing table; per
 //!   ADR 022 §Lookup integrity the requester-side filters (XOR-distance,
 //!   active-staker, negative-probe-cache, randomisation) are the
-//!   requester's job and live in the iterative-lookup module that
-//!   lands with PR 4.
-//! - `BatchStore` is rejected at frame read with `APP_ERR_UNSUPPORTED_MESSAGE`
-//!   (`0x01`). The wire variant exists at its ADR-022 canonical
-//!   discriminant so a future handler doesn't shuffle wire positions,
-//!   but per ADR 022 §Schema Evolution + §STORE Flow line 138 the
-//!   unsupported signal MUST be **stream-close-without-ack** —
-//!   publishers detect that and fall back to per-hash `Store`.
+//!   requester's job and live in the iterative-lookup module
+//!   ([`crate::dht::lookup`]).
+//! - `BatchStore` admission (ADR 022 §Batch token accounting, #648):
+//!   one batch-level `holder == authenticated NodeId` check (mismatch
+//!   closes the stream with `MALFORMED_MESSAGE`), two-stage rate-limit
+//!   accounting (stage 1 charged the inbound frame in `serve`; stage 2
+//!   charges up to `n-1` more, partially admitting the batch under
+//!   budget), then per-hash insert sharing one receiver-anchored
+//!   `receive_us`. The reply is a `BatchStoreAck` with one bool per
+//!   request hash, in request order. An oversize batch
+//!   (> `MAX_BATCH_STORE_HASHES`) is rejected at wire decode with
+//!   `MALFORMED_MESSAGE`.
 //! - Response variants arriving on a server-accepted stream are
-//!   similarly rejected with `APP_ERR_UNSUPPORTED_MESSAGE`.
+//!   rejected with `APP_ERR_UNSUPPORTED_MESSAGE`.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -210,7 +214,7 @@ impl DhtHandler {
             // token. That's the same admission criteria ADR 022 §Routing
             // Table demands for table insertion.
             self.note_peer_seen(peer_node_id);
-            if let Err(e) = self.handle_one(peer_node_id, send, recv).await {
+            if let Err(e) = self.handle_one(peer_node_id, peer_ip, send, recv).await {
                 // The per-request error already carries the ADR 013 app
                 // error code via the stream reset inside `handle_one` /
                 // `read_dht_request`; here we surface the failure to
@@ -261,11 +265,14 @@ impl DhtHandler {
     /// Read one framed `DhtMessage`, dispatch on variant, write the
     /// response frame back. Each stream carries exactly one
     /// request/response pair. The authenticated `peer_node_id` is
-    /// threaded in so `Store` admission can compare the wire-level
-    /// `holder` against the QUIC-bound identity.
+    /// threaded in so `Store` / `BatchStore` admission can compare the
+    /// wire-level `holder` against the QUIC-bound identity; `peer_ip` is
+    /// threaded in for the `BatchStore` stage-2 rate-limit accounting
+    /// (the per-IP layer keys on it).
     async fn handle_one(
         &self,
         peer_node_id: [u8; 32],
+        peer_ip: Option<IpAddr>,
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> anyhow::Result<()> {
@@ -278,7 +285,25 @@ impl DhtHandler {
             }
         };
 
-        let resp = self.dispatch(peer_node_id, req);
+        // Most variants produce a response frame. `BatchStore` may
+        // instead reject the whole batch with a stream-close-without-ack
+        // (holder mismatch → `MALFORMED_MESSAGE`, ADR 022 §Batch token
+        // accounting step 2) — `dispatch` signals that with `Err(code)`.
+        // That is a *deliberate* protocol rejection already counted by its
+        // specific counter (`dht_store_rejected_holder_mismatch`), so we
+        // close the stream and return `Ok(())`: returning `Err` would make
+        // `serve` bump `dht_requests_failed`, which is reserved for
+        // post-admission internal failures (decode/write/timeout), not
+        // intentional rejections.
+        let resp = match self.dispatch(peer_node_id, peer_ip, req) {
+            Ok(resp) => resp,
+            Err(app_code) => {
+                let _ = send.reset(VarInt::from_u32(app_code));
+                let _ = recv.stop(VarInt::from_u32(app_code));
+                tracing::debug!(app_code, "dht request rejected (stream-close-without-ack)");
+                return Ok(());
+            }
+        };
         let payload = encode_message(&resp)
             .map_err(|e| anyhow::anyhow!("dht response encode failed: {e}"))?;
         write_frame(&mut send, &payload)
@@ -292,20 +317,28 @@ impl DhtHandler {
     /// Convert a decoded request into a response. The argument's enum
     /// shape encodes the precondition that this is one of the request
     /// variants the handler implements — `read_dht_request` filters out
-    /// responses-on-server-stream and unsupported requests (`BatchStore`)
-    /// before producing a [`DhtServerRequest`], so this match is
-    /// exhaustive over the active set without needing a panic or echo
-    /// fallback for the impossible cases.
+    /// responses-on-server-stream before producing a
+    /// [`DhtServerRequest`], so this match is exhaustive over the request
+    /// set without needing a panic or echo fallback.
+    ///
+    /// Returns `Err(app_code)` when the variant must be answered with a
+    /// stream-close-without-ack rather than a response frame — the only
+    /// such case today is a `BatchStore` whose batch-level `holder` does
+    /// not match the authenticated `NodeId` (ADR 022 §Batch token
+    /// accounting step 2: reject the whole batch with `MALFORMED_MESSAGE`).
     //
-    // `msg` is moved-in so future variants whose request payloads
-    // include `Vec` fields (e.g. a `BatchStoreRequest::hashes` once
-    // the handler-side admission lands) can take ownership without
-    // re-allocating. Every current request variant is `Copy`, so the
-    // by-value signature is a no-op at the ABI level today; it's the
-    // steady-state shape.
+    // `msg` is moved-in so the `BatchStore` arm can take ownership of
+    // `BatchStoreRequest::hashes` without re-allocating. The `Copy`
+    // request variants are a no-op at the ABI level under the by-value
+    // signature.
     #[allow(clippy::needless_pass_by_value)]
-    fn dispatch(&self, peer_node_id: [u8; 32], msg: DhtServerRequest) -> wire::DhtMessage {
-        match msg {
+    fn dispatch(
+        &self,
+        peer_node_id: [u8; 32],
+        peer_ip: Option<IpAddr>,
+        msg: DhtServerRequest,
+    ) -> Result<wire::DhtMessage, u32> {
+        Ok(match msg {
             DhtServerRequest::FindNode(req) => {
                 wire::DhtMessage::FindNodeResponse(self.handle_find_node(req))
             }
@@ -315,7 +348,133 @@ impl DhtHandler {
             DhtServerRequest::Store(req) => {
                 wire::DhtMessage::StoreAck(self.handle_store(peer_node_id, req))
             }
+            DhtServerRequest::BatchStore(req) => wire::DhtMessage::BatchStoreAck(
+                self.handle_batch_store(peer_node_id, peer_ip, req)?,
+            ),
+        })
+    }
+
+    /// `BatchStore` admission (ADR 022 §STORE Flow Batched STORE + §Batch
+    /// token accounting, #648). A single batch-level decision followed by
+    /// per-hash admission identical to `n` separate `Store`s:
+    ///
+    /// 1. **Holder check (once).** `holder == authenticated NodeId`. On
+    ///    mismatch the whole batch is rejected with `MALFORMED_MESSAGE`
+    ///    (`Err(0x03)`) — a stream-close-without-ack — because a batch
+    ///    claiming an identity the connection can't prove is malformed
+    ///    (this is stricter than the per-hash `Store` path, which acks
+    ///    `accepted: false`; see ADR 022 §Batch token accounting step 2).
+    /// 2. **Stage-2 rate limit.** Stage 1 already charged the inbound
+    ///    frame in [`Self::serve`]; here we charge up to `n - 1` more
+    ///    tokens via [`DhtRateLimiter::admit_batch_extra`]. The first
+    ///    `k = 1 + granted` hashes proceed; the `n - k` tail is acked
+    ///    `false` without per-hash processing.
+    /// 3. **Per-hash admission.** For each of the first `k` hashes: the
+    ///    active-staker filter (batch-level holder, so the result is the
+    ///    same for all hashes) then a receiver-anchored
+    ///    [`RecordStore::insert_at`] sharing one `receive_us` for the
+    ///    whole batch (ADR 022 §Content Records and TTL — a batch must
+    ///    not have internally inconsistent TTLs).
+    //
+    // Linear admission sequence; same cognitive-complexity rationale as
+    // `handle_store`.
+    #[allow(clippy::cognitive_complexity)]
+    fn handle_batch_store(
+        &self,
+        peer_node_id: [u8; 32],
+        peer_ip: Option<IpAddr>,
+        req: wire::BatchStoreRequest,
+    ) -> Result<wire::BatchStoreAck, u32> {
+        // Step 1: batch-level holder check. AC 19's size cap (≤ 256) is
+        // already enforced at wire decode (`deserialize_batch_hashes` →
+        // `MALFORMED_MESSAGE`), so by the time we're here `hashes.len()`
+        // is in range.
+        if req.holder != peer_node_id {
+            self.metrics.dht_store_rejected_holder_mismatch();
+            tracing::debug!(
+                holder = ?req.holder,
+                peer = ?peer_node_id,
+                "dht BatchStore rejected: holder != authenticated NodeId"
+            );
+            return Err(APP_ERR_MALFORMED_MESSAGE);
         }
+        self.metrics.dht_batch_store_received();
+
+        let n = req.hashes.len();
+        // Step 2: stage-2 token accounting. `k` hashes get per-hash
+        // processing; the rest are deferred (`false`) by the rate limit.
+        let extra = n.saturating_sub(1);
+        let granted = self
+            .rate_limiter
+            .admit_batch_extra(&peer_node_id, peer_ip, extra);
+        let k = granted.saturating_add(1).min(n);
+        let deferred = n.saturating_sub(k);
+        if deferred > 0 {
+            self.metrics.dht_batch_store_hashes_deferred_rate_limit(
+                u64::try_from(deferred).unwrap_or(u64::MAX),
+            );
+        }
+
+        // Step 3: per-hash admission. The active-staker filter keys on
+        // the batch-level holder, so its verdict is identical for every
+        // hash — evaluate once. `receive_us` is anchored to a single
+        // arrival timestamp for the whole batch.
+        let active = self.staker_set.is_active(&req.holder);
+        if !active {
+            // Mirrors `handle_store` step 2's counter, once per rejected
+            // hash so the per-hash dashboards see the same volume a
+            // non-staked publisher's `n` separate `Store`s would produce.
+            for _ in 0..k {
+                self.metrics.dht_store_rejected_non_staked();
+            }
+            tracing::debug!(
+                holder = ?req.holder,
+                "dht BatchStore: holder not in active-staker set; all admitted hashes rejected"
+            );
+        }
+        let now_us = now_us();
+        // Lock the record store once for the whole batch: the loop has no
+        // `.await`, so per-hash locking would just add 256× lock/unlock
+        // churn and, on a poisoned mutex, log the error once per hash.
+        // Only the active path inserts, so don't acquire the lock at all
+        // when the staker filter already rejected the batch. A poisoned
+        // mutex → `None` → every admitted hash is acked `false`.
+        let mut store_guard = if active && k > 0 {
+            if let Ok(guard) = self.records.lock() {
+                Some(guard)
+            } else {
+                tracing::error!(
+                    "dht BatchStore: record-store mutex poisoned; rejecting all hashes"
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let mut results = Vec::with_capacity(n);
+        for (i, hash) in req.hashes.into_iter().enumerate() {
+            // Tail beyond the rate-limit budget: deferred, no processing.
+            if i >= k {
+                results.push(false);
+                continue;
+            }
+            let accepted = if let Some(store) = store_guard.as_mut() {
+                let outcome = store.insert_at(req.holder, hash, now_us);
+                if outcome.accepted() {
+                    self.metrics.dht_store_accepted();
+                    true
+                } else {
+                    self.metrics.dht_store_rejected_quota();
+                    false
+                }
+            } else {
+                // Either the staker filter rejected the batch (`!active`)
+                // or the record-store mutex is poisoned — both ack `false`.
+                false
+            };
+            results.push(accepted);
+        }
+        Ok(wire::BatchStoreAck { results })
     }
 
     /// `Store` admission (ADR 022 §STORE Flow):
@@ -471,16 +630,16 @@ struct DhtReadError {
 ///
 /// The enum is the narrowed shape produced by [`read_dht_request`] — it
 /// excludes the response variants (responses belong on the client side of
-/// the stream) and any request variants the handler does not yet
-/// implement (`BatchStore` in this PR slice). Carrying the narrowing in a
-/// type, rather than a runtime match-all fallback inside `dispatch`,
-/// keeps the dispatcher exhaustive over the *active* set and prevents an
-/// accidentally-silent "I echoed a bogus `FindNodeResponse`" failure mode
-/// if the wire enum grows new request variants.
+/// the stream). Carrying the narrowing in a type, rather than a runtime
+/// match-all fallback inside `dispatch`, keeps the dispatcher exhaustive
+/// over the request set and prevents an accidentally-silent "I echoed a
+/// bogus `FindNodeResponse`" failure mode if the wire enum grows new
+/// response variants.
 enum DhtServerRequest {
     FindNode(wire::FindNodeRequest),
     FindValue(wire::FindValueRequest),
     Store(wire::StoreRequest),
+    BatchStore(wire::BatchStoreRequest),
 }
 
 async fn read_dht_request(
@@ -522,28 +681,20 @@ async fn read_dht_request(
         }
         Ok((msg, _tail)) => {
             // Narrow the full wire enum down to the handler-supported
-            // request set. Two filtering cases close the stream with
-            // `APP_ERR_UNSUPPORTED_MESSAGE`:
-            //
-            // 1. Response variants on a server-accepted stream — the
-            //    handler is a request-only endpoint; responses belong on
-            //    the client side.
-            // 2. `BatchStore` requests. Wire types are pinned at their
-            //    ADR-022 canonical discriminants so a future handler can
-            //    land without a wire shuffle, but this slice does not
-            //    implement batch admission (two-stage rate limit,
-            //    single holder check, per-hash quota). ADR 022 §STORE
-            //    Flow line 138 + §Schema Evolution specify that the
-            //    unsupported signal MUST be stream-close-without-ack
-            //    — an all-`false` `BatchStoreAck` would be read by
-            //    publishers as "your batch was processed, every hash
-            //    rejected" and trigger no fallback. Closing the stream
-            //    with `APP_ERR_UNSUPPORTED_MESSAGE` is the conformant "I
-            //    don't speak this yet" signal.
+            // request set. Response variants on a server-accepted stream
+            // close with `APP_ERR_UNSUPPORTED_MESSAGE`: the handler is a
+            // request-only endpoint; responses belong on the client side.
+            // `BatchStore` is a request the handler now implements (#648)
+            // — it routes through `handle_batch_store`. Note an oversize
+            // `BatchStore` (> `MAX_BATCH_STORE_HASHES`) never reaches this
+            // match: `deserialize_batch_hashes` rejects it at the
+            // `decode_message` step above, which maps to
+            // `APP_ERR_MALFORMED_MESSAGE` (AC 19).
             match msg {
                 wire::DhtMessage::FindNode(req) => Ok(DhtServerRequest::FindNode(req)),
                 wire::DhtMessage::FindValue(req) => Ok(DhtServerRequest::FindValue(req)),
                 wire::DhtMessage::Store(req) => Ok(DhtServerRequest::Store(req)),
+                wire::DhtMessage::BatchStore(req) => Ok(DhtServerRequest::BatchStore(req)),
                 wire::DhtMessage::FindNodeResponse(_)
                 | wire::DhtMessage::FindValueResponse(_)
                 | wire::DhtMessage::StoreAck(_)
@@ -551,16 +702,6 @@ async fn read_dht_request(
                     reset(send, recv, APP_ERR_UNSUPPORTED_MESSAGE);
                     Err(DhtReadError {
                         err: anyhow::anyhow!("peer sent dht response on server stream"),
-                        app_code: APP_ERR_UNSUPPORTED_MESSAGE,
-                    })
-                }
-                wire::DhtMessage::BatchStore(_) => {
-                    reset(send, recv, APP_ERR_UNSUPPORTED_MESSAGE);
-                    Err(DhtReadError {
-                        err: anyhow::anyhow!(
-                            "BatchStore handler not implemented (deferred to follow-up of #320); \
-                             stream-close-without-ack triggers publisher fallback to per-hash Store"
-                        ),
                         app_code: APP_ERR_UNSUPPORTED_MESSAGE,
                     })
                 }

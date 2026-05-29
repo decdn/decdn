@@ -206,6 +206,23 @@ pub struct DecdnMetrics {
     /// to compute admission rate. Operator-visible name:
     /// `decdn_dht_store_accepted_total`.
     pub dht_store_accepted: Counter,
+    /// `BatchStore` requests that passed stage-1 rate limiting and the
+    /// batch-level `holder == authenticated NodeId` check, i.e. reached
+    /// per-hash admission (ADR 022 §STORE Flow Batched STORE, #648). The
+    /// per-hash outcomes still land in the shared `dht_store_*` counters
+    /// above, so this counts batches, not hashes — pair the two to see
+    /// average admitted batch size and batch adoption. Operator-visible
+    /// name: `decdn_dht_batch_store_received_total`.
+    pub dht_batch_store_received: Counter,
+    /// Hashes in a `BatchStore` acked `false` purely because the
+    /// two-stage rate-limit budget was exhausted before reaching them
+    /// (the `n - k` tail, ADR 022 §Batch token accounting / AC 18) — NOT
+    /// counted as a per-hash `Store` rejection because they were never
+    /// processed. Sustained growth means publishers are sending batches
+    /// larger than the per-peer burst allows in one window; the publisher
+    /// retries the tail. Operator-visible name:
+    /// `decdn_dht_batch_store_hashes_deferred_rate_limit_total`.
+    pub dht_batch_store_hashes_deferred_rate_limit: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -490,6 +507,21 @@ impl Metrics {
     /// refreshed).
     pub fn dht_store_accepted(&self) {
         self.decdn.dht_store_accepted.inc();
+    }
+
+    /// Record a `BatchStore` that reached per-hash admission (passed
+    /// stage-1 rate limiting + the batch-level holder check, #648).
+    pub fn dht_batch_store_received(&self) {
+        self.decdn.dht_batch_store_received.inc();
+    }
+
+    /// Record `count` `BatchStore` hashes deferred (acked `false`)
+    /// because the two-stage rate-limit budget ran out before reaching
+    /// them (ADR 022 §Batch token accounting, #648).
+    pub fn dht_batch_store_hashes_deferred_rate_limit(&self, count: u64) {
+        self.decdn
+            .dht_batch_store_hashes_deferred_rate_limit
+            .inc_by(count);
     }
 
     /// Record a 0-RTT connection attempt (ADR 015): a cached session
