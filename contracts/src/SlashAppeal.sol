@@ -105,6 +105,16 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     /// @notice Timestamp of the operator's last GRANTED appeal (frequency cap).
     mapping(address operator => uint64) public lastAcceptedAppealAt;
 
+    /// @notice Cumulative time (seconds) this contract has spent paused. Added
+    ///         to the review / ratification window deadline checks in
+    ///         `cleanupExpiredAppeal` so a pause never silently consumes an
+    ///         appeal window (ADR 028 §5).
+    uint64 public pausedTotal;
+
+    /// @notice `block.timestamp` at which the current pause began; 0 when not
+    ///         paused.
+    uint64 internal _pausedAt;
+
     // -----------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------
@@ -132,6 +142,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
 
     error ZeroAddress();
     error UnknownSlash(uint256 slashId);
+    error CallerNotOperator(address operator);
     error FrequencyCapHit(uint64 nextAvailableAt);
     error AppealAlreadyExists(uint256 slashId);
     error AppealNotOpen(uint256 slashId);
@@ -139,7 +150,6 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     error ReviewWindowOpen(uint64 readyAt);
     error RatificationWindowOpen(uint64 readyAt);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
-    error ChallengerPoolNotWired();
 
     // -----------------------------------------------------------------
     // Constructor
@@ -178,10 +188,13 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     // -----------------------------------------------------------------
 
     /// @inheritdoc ISlashAppeal
-    /// @dev The operator is read from `CapacityBond.slashRecords` rather than
-    ///      taken from the caller — closes the unverified-operator hole.
-    ///      `markAppealOpen` enforces the filing window + the one-shot guard
-    ///      (it reverts once the slash is no longer `Escrowed`).
+    /// @dev Operator-only: `msg.sender` MUST be the slashed operator (read from
+    ///      `CapacityBond.slashRecords`, so it cannot be forged). The appeal
+    ///      slot is one-shot per `slashId` (`markAppealOpen` flips the escrow
+    ///      out of `Escrowed`), so a permissionless filer would let anyone —
+    ///      notably the challenger, who earns 50% of an upheld slash — burn the
+    ///      operator's only chance at recourse with a junk appeal. Requiring the
+    ///      operator closes that griefing/front-running vector (ADR 028 §1).
     // slither-disable-next-line reentrancy-no-eth,unused-return
     function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external override nonReentrant whenNotPaused {
         // `slashRecords` is a view on the trusted, immutable `CapacityBond`;
@@ -189,6 +202,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
         // aderyn-ignore-next-line(reentrancy-state-change)
         (address operator,,) = capacityBond.slashRecords(slashId);
         if (operator == address(0)) revert UnknownSlash(slashId);
+        if (msg.sender != operator) revert CallerNotOperator(operator);
         if (_appeals[slashId].status != AppealStatus.None) revert AppealAlreadyExists(slashId);
 
         uint64 last = lastAcceptedAppealAt[operator];
@@ -218,7 +232,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     }
 
     /// @inheritdoc ISlashAppeal
-    function fastTrackAppeal(uint256 slashId) external override onlyRole(EMERGENCY_MULTISIG_ROLE) {
+    function fastTrackAppeal(uint256 slashId) external override whenNotPaused onlyRole(EMERGENCY_MULTISIG_ROLE) {
         Appeal storage a = _appeals[slashId];
         if (a.status != AppealStatus.Open) revert AppealNotOpen(slashId);
         a.status = AppealStatus.FastTracked;
@@ -233,7 +247,13 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     ///      may resolve it (`grantAppeal` / `upholdAppeal`), preserving the
     ///      two-stage governance process. A fast-tracked appeal that fails goes
     ///      through `upholdAppeal` (50/50 bond split), not `rejectAppeal`.
-    function rejectAppeal(uint256 slashId) external override nonReentrant onlyRole(EMERGENCY_MULTISIG_ROLE) {
+    function rejectAppeal(uint256 slashId)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        onlyRole(EMERGENCY_MULTISIG_ROLE)
+    {
         Appeal storage a = _appeals[slashId];
         if (a.status != AppealStatus.Open) revert AppealNotOpen(slashId);
         uint256 bondBurned = a.bond;
@@ -249,7 +269,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     /// @dev Governor grants the appeal — the operator was wrongly slashed.
     ///      Refund the bond, stamp the frequency cap, and instruct CapacityBond
     ///      to refund the escrowed TOKEN + clear the slash zero-out.
-    function grantAppeal(uint256 slashId) external override nonReentrant onlyRole(GOVERNANCE_ROLE) {
+    function grantAppeal(uint256 slashId) external override nonReentrant whenNotPaused onlyRole(GOVERNANCE_ROLE) {
         Appeal storage a = _appeals[slashId];
         if (a.status != AppealStatus.FastTracked) revert AppealNotFastTracked(slashId);
         uint256 bondRefund = a.bond;
@@ -265,23 +285,27 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     }
 
     /// @inheritdoc ISlashAppeal
-    /// @dev Governor upholds the slash — the fast-tracked appeal fails. Split
-    ///      the bond 50% burn / 50% to the challenger-incentive pool and
-    ///      distribute the escrow 50/50.
-    function upholdAppeal(uint256 slashId) external override nonReentrant onlyRole(GOVERNANCE_ROLE) {
+    /// @dev Governor upholds the slash — the fast-tracked appeal fails.
+    ///      Distribute the escrow 50/50 and split the bond 50% burn / 50% to the
+    ///      challenger-incentive pool. If the pool is unwired (`address(0)`),
+    ///      degrade gracefully to a 100% bond burn — matching `rejectAppeal` —
+    ///      rather than reverting; otherwise a misconfiguration would block the
+    ///      uphold and let `cleanupExpiredAppeal` flip it to an operator-
+    ///      favorable grant after the ratification window (ADR 028 §3).
+    function upholdAppeal(uint256 slashId) external override nonReentrant whenNotPaused onlyRole(GOVERNANCE_ROLE) {
         Appeal storage a = _appeals[slashId];
         if (a.status != AppealStatus.FastTracked) revert AppealNotFastTracked(slashId);
-        if (challengerIncentivePool == address(0)) revert ChallengerPoolNotWired();
         uint256 bondTotal = a.bond;
         a.bond = 0;
         a.status = AppealStatus.Resolved;
 
         ICapacityBondSlashEscrow(address(capacityBond)).settleAppealUpheld(slashId);
 
-        uint256 toPool = bondTotal / 2;
+        address pool = challengerIncentivePool;
+        uint256 toPool = pool == address(0) ? 0 : bondTotal / 2;
         uint256 toBurn = bondTotal - toPool;
         if (toBurn != 0) token.burn(toBurn);
-        if (toPool != 0) IERC20(address(token)).safeTransfer(challengerIncentivePool, toPool);
+        if (toPool != 0) IERC20(address(token)).safeTransfer(pool, toPool);
         emit AppealUpheld(slashId, toBurn, toPool);
     }
 
@@ -289,10 +313,12 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     /// @dev Permissionless lapse handler. Open + review-window elapsed → uphold
     ///      (burn bond). FastTracked + ratification-window elapsed → grant
     ///      (refund bond — governance inactivity is not the appellant's fault).
-    function cleanupExpiredAppeal(uint256 slashId) external override nonReentrant {
+    function cleanupExpiredAppeal(uint256 slashId) external override nonReentrant whenNotPaused {
         Appeal storage a = _appeals[slashId];
         if (a.status == AppealStatus.Open) {
-            uint64 readyAt = a.openedAt + uint64(APPEAL_REVIEW_WINDOW);
+            // Review window extended by the cumulative paused duration so a
+            // pause never silently consumes the multisig's window (ADR 028 §5).
+            uint64 readyAt = a.openedAt + uint64(APPEAL_REVIEW_WINDOW) + pausedTotal;
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp < readyAt) revert ReviewWindowOpen(readyAt);
             uint256 bondBurned = a.bond;
@@ -304,7 +330,8 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
             return;
         }
         if (a.status == AppealStatus.FastTracked) {
-            uint64 readyAt = a.fastTrackedAt + uint64(APPEAL_RATIFICATION_WINDOW);
+            // Ratification window extended by the cumulative paused duration.
+            uint64 readyAt = a.fastTrackedAt + uint64(APPEAL_RATIFICATION_WINDOW) + pausedTotal;
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp < readyAt) revert RatificationWindowOpen(readyAt);
             uint256 bondRefund = a.bond;
@@ -353,6 +380,22 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
 
     function unpause() external onlyRole(PAUSER_ROLE) {
         _unpause();
+    }
+
+    /// @dev Stamp the pause start so `_unpause` can accumulate the duration
+    ///      into `pausedTotal` (ADR 028 §5 window extension).
+    function _pause() internal override {
+        // forge-lint: disable-next-line(block-timestamp)
+        _pausedAt = uint64(block.timestamp);
+        super._pause();
+    }
+
+    /// @dev Accumulate the just-ended pause interval into `pausedTotal`.
+    function _unpause() internal override {
+        // forge-lint: disable-next-line(block-timestamp)
+        pausedTotal += uint64(block.timestamp) - _pausedAt;
+        _pausedAt = 0;
+        super._unpause();
     }
 
     // -----------------------------------------------------------------

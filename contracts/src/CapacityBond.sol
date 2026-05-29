@@ -315,7 +315,8 @@ contract CapacityBond is
         SlashStatus status; // slot 0: +1 = 29 bytes
         address challenger; // slot 1: 20 bytes — paid the 50% leg at finality
         uint64 appealWindowClose; // slot 1: +8 = 28 bytes
-        uint256 slashAmount; // slot 2: escrowed TOKEN amount
+        uint256 slashAmount; // slot 2: escrowed TOKEN amount (stake + credit)
+        uint256 creditPortion; // slot 3: the Genesis-credit share of slashAmount
     }
 
     /// @notice Monotonic slash counter — next slash receives this index, then
@@ -330,6 +331,18 @@ contract CapacityBond is
     ///         unbonding stake, and unclaimed Genesis credit. Incremented in
     ///         `slash()`, decremented at every terminal escrow transition.
     uint256 public escrowedTotal;
+
+    /// @notice Cumulative time (seconds) this contract has spent paused, plus
+    ///         the in-progress interval if currently paused. Added to the
+    ///         filing-window deadline checks so a pause never silently consumes
+    ///         an operator's appeal window (ADR 028 §5). Conservative: a pause
+    ///         that predates a slash still extends that slash's window, which
+    ///         only ever favors the operator.
+    uint64 public pausedTotal;
+
+    /// @notice `block.timestamp` at which the current pause began; 0 when not
+    ///         paused.
+    uint64 internal _pausedAt;
 
     // -----------------------------------------------------------------
     // Storage — node registry (ADR 019 § Node Onboarding;
@@ -978,8 +991,9 @@ contract CapacityBond is
         // The slashed TOKEN stays in this contract under `_slashRecords` until
         // `finalizeUnappealedSlash` (no appeal) or a `SLASH_APPEAL_ROLE` settle
         // hook resolves it. The challenger is recorded for the 50% leg paid at
-        // finality.
-        slashId = _mintSlashRecord(operator, challenger, totalSlash);
+        // finality; `creditSlash` is recorded so a granted appeal can restore
+        // the Genesis-credit vesting position rather than refunding it liquid.
+        slashId = _mintSlashRecord(operator, challenger, totalSlash, creditSlash);
         if (creditSlash != 0) emit GenesisCreditSlashed(operator, creditSlash);
         _stampSlash(operator, challenger, offenseType, totalSlash, newCount);
     }
@@ -1028,6 +1042,14 @@ contract CapacityBond is
         uint256 atRisk = originalGrant - claimed;
         // slither-disable-next-line divide-before-multiply
         slashed = (atRisk * tierBps) / BPS_DENOMINATOR;
+        // Defensive clip, symmetric with `_reduceStakeAtTier`'s C2 cap: the
+        // slashed amount can never exceed the at-risk pool. A no-op for the
+        // immutable tier ladder (≤ 50%), but if a future tier constant is ever
+        // set above 100% this keeps `escrowedTotal` from booking more credit
+        // than was actually removed (which would later underflow a
+        // distribute/burn). INVARIANT: the stake leg and credit leg together
+        // never exceed the operator's at-risk balances.
+        if (slashed > atRisk) slashed = atRisk;
         // slither-disable-next-line incorrect-equality
         if (slashed == 0) return 0;
         pc.originalGrant = uint128(originalGrant - slashed);
@@ -1038,7 +1060,7 @@ contract CapacityBond is
     ///      `SlashAppeal.openSlashAppeal` validate appeals without trusting the
     ///      appellant's `operator` claim (I2 fix), and pins the challenger +
     ///      filing-window deadline for the eventual finality distribution.
-    function _mintSlashRecord(address operator, address challenger, uint256 totalSlashAmount)
+    function _mintSlashRecord(address operator, address challenger, uint256 totalSlashAmount, uint256 creditPortion)
         internal
         returns (uint256 slashId)
     {
@@ -1054,7 +1076,8 @@ contract CapacityBond is
             status: SlashStatus.Escrowed,
             challenger: challenger,
             appealWindowClose: windowClose,
-            slashAmount: totalSlashAmount
+            slashAmount: totalSlashAmount,
+            creditPortion: creditPortion
         });
         escrowedTotal += totalSlashAmount;
         emit SlashRecorded(slashId, operator, nowTs, totalSlashAmount);
@@ -1099,42 +1122,76 @@ contract CapacityBond is
         if (slashId >= slashCounter) revert UnknownSlash(slashId);
         SlashRecord storage r = _slashRecords[slashId];
         if (r.status != SlashStatus.Escrowed) revert SlashNotEscrowed(slashId);
+        // Filing window extended by the cumulative paused duration so a pause
+        // never silently consumes the operator's window (ADR 028 §5).
+        uint64 closeAt = r.appealWindowClose + pausedTotal;
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp <= r.appealWindowClose) revert FilingWindowStillOpen(r.appealWindowClose);
+        if (block.timestamp <= closeAt) revert FilingWindowStillOpen(closeAt);
         _distributeUpheld(slashId, false);
     }
 
     /// @inheritdoc ICapacityBondSlashEscrow
-    function markAppealOpen(uint256 slashId) external override onlyRole(SLASH_APPEAL_ROLE) {
+    function markAppealOpen(uint256 slashId) external override whenNotPaused onlyRole(SLASH_APPEAL_ROLE) {
         if (slashId >= slashCounter) revert UnknownSlash(slashId);
         SlashRecord storage r = _slashRecords[slashId];
         if (r.status != SlashStatus.Escrowed) revert SlashNotEscrowed(slashId);
+        // Filing window extended by the cumulative paused duration (ADR 028 §5).
+        uint64 closeAt = r.appealWindowClose + pausedTotal;
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp > r.appealWindowClose) revert FilingWindowClosed(r.appealWindowClose);
+        if (block.timestamp > closeAt) revert FilingWindowClosed(closeAt);
         r.status = SlashStatus.AppealOpen;
         emit SlashAppealOpened(slashId, r.operator);
     }
 
     /// @inheritdoc ICapacityBondSlashEscrow
-    function settleAppealUpheld(uint256 slashId) external override nonReentrant onlyRole(SLASH_APPEAL_ROLE) {
+    function settleAppealUpheld(uint256 slashId)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        onlyRole(SLASH_APPEAL_ROLE)
+    {
         if (slashId >= slashCounter) revert UnknownSlash(slashId);
         if (_slashRecords[slashId].status != SlashStatus.AppealOpen) revert SlashAppealNotOpen(slashId);
         _distributeUpheld(slashId, true);
     }
 
     /// @inheritdoc ICapacityBondSlashEscrow
-    function settleAppealGranted(uint256 slashId) external override nonReentrant onlyRole(SLASH_APPEAL_ROLE) {
+    function settleAppealGranted(uint256 slashId)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        onlyRole(SLASH_APPEAL_ROLE)
+    {
         if (slashId >= slashCounter) revert UnknownSlash(slashId);
         SlashRecord storage r = _slashRecords[slashId];
         if (r.status != SlashStatus.AppealOpen) revert SlashAppealNotOpen(slashId);
         uint256 refund = r.slashAmount;
+        uint256 creditPortion = r.creditPortion;
+        address operator = r.operator;
         r.status = SlashStatus.Reversed;
         escrowedTotal -= refund;
-        // The operator was wrongly slashed: return their own escrowed TOKEN and
-        // clear the slash zero-out so vote weight recovers (ADR 036).
-        _clearSlashedAtEpoch(r.operator);
-        if (refund != 0) IERC20(address(token)).safeTransfer(r.operator, refund);
-        emit SlashReversed(slashId, r.operator, refund);
+
+        // Conditional zero-out clear (ADR 028 §2): only clear when the current
+        // per-operator stamp belongs to THIS slash. If a later slash overwrote
+        // it (that slash still stands), leave the stamp so vote weight stays
+        // zeroed for the unresolved slash.
+        if (_slashedAtEpoch[operator] == uint64(r.slashedAt / EPOCH_LENGTH) + 1) {
+            _clearSlashedAtEpoch(operator);
+        }
+
+        // Genesis-credit portion is restored to the vesting position
+        // (`grantedAt` is untouched, so the vest curve resumes) rather than
+        // refunded as liquid TOKEN — a wrongly-slashed operator is made exactly
+        // whole, not handed accelerated credit (ADR 028 §7). The TOKEN backing
+        // it never left the contract. Only the stake portion is refunded liquid.
+        if (creditPortion != 0) {
+            _pendingCredit[operator].originalGrant += uint128(creditPortion);
+        }
+        uint256 stakePortion = refund - creditPortion;
+        if (stakePortion != 0) IERC20(address(token)).safeTransfer(operator, stakePortion);
+        emit SlashReversed(slashId, operator, refund);
     }
 
     /// @dev Distribute an upheld slash's escrow: 50% challenger / 50% burn.
@@ -1264,6 +1321,22 @@ contract CapacityBond is
 
     function unpause() external onlyRole(PAUSER_ROLE) {
         _unpause();
+    }
+
+    /// @dev Stamp the pause start so `_unpause` can accumulate the duration
+    ///      into `pausedTotal` (ADR 028 §5 window extension).
+    function _pause() internal override {
+        // forge-lint: disable-next-line(block-timestamp)
+        _pausedAt = uint64(block.timestamp);
+        super._pause();
+    }
+
+    /// @dev Accumulate the just-ended pause interval into `pausedTotal`.
+    function _unpause() internal override {
+        // forge-lint: disable-next-line(block-timestamp)
+        pausedTotal += uint64(block.timestamp) - _pausedAt;
+        _pausedAt = 0;
+        super._unpause();
     }
 
     // -----------------------------------------------------------------
