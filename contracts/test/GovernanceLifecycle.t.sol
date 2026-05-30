@@ -533,6 +533,36 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         );
     }
 
+    function test_lifecycle_CapacityBond_setMinCapacityMbps_happy() public {
+        _runLifecycle(address(bond), abi.encodeCall(CapacityBond.setMinCapacityMbps, (uint256(100))));
+        assertEq(bond.minCapacityMbps(), 100);
+    }
+
+    function test_lifecycle_CapacityBond_setMinCapacityMbps_outOfBounds() public {
+        // Floor = 10, ceiling = 1000; one over.
+        uint256 bad = 1001;
+        _runLifecycleExpectExecuteRevert(
+            address(bond),
+            abi.encodeCall(CapacityBond.setMinCapacityMbps, (bad)),
+            abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, bad, uint256(10), uint256(1000))
+        );
+    }
+
+    function test_lifecycle_CapacityBond_setMaxCapacityMbps_happy() public {
+        _runLifecycle(address(bond), abi.encodeCall(CapacityBond.setMaxCapacityMbps, (uint256(500_000))));
+        assertEq(bond.maxCapacityMbps(), 500_000);
+    }
+
+    function test_lifecycle_CapacityBond_setMaxCapacityMbps_outOfBounds() public {
+        // Floor = 50_000, ceiling = 1_000_000; one over.
+        uint256 bad = 1_000_001;
+        _runLifecycleExpectExecuteRevert(
+            address(bond),
+            abi.encodeCall(CapacityBond.setMaxCapacityMbps, (bad)),
+            abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, bad, uint256(50_000), uint256(1_000_000))
+        );
+    }
+
     // =================================================================
     // DecdnGovernor self-params (2)
     // =================================================================
