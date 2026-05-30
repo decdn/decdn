@@ -52,13 +52,13 @@ The only probing a probe-less client performs is the background latency sweep th
 
 ### Node serving: chunk-paced pull-through
 
-A node that receives a `cdn/client/v1` `StreamRequest` for a blob (or byte range) it does not hold fills it by pull-through, paced by incoming payment:
+A node that receives a `cdn/client/v1` `StreamRequest` for a blob (or byte range) it does not hold fills it by pull-through, pipelined against incoming payment:
 
-- The node pulls the first chunk (`pull_chunk_bytes`, default ~1 MB) from an upstream provider discovered via the normal `cdn/dht/v1` path, verifies it against the root hash, serves it to the client, and collects the first voucher.
-- Thereafter, on receipt of voucher `N`, the node pulls chunk `N+1`. The node is never more than one chunk ahead of cleared payment, so its speculative exposure on a request the client abandons is bounded to one chunk's upstream cost — not the whole blob.
+- The node pulls from an upstream provider discovered via the normal `cdn/dht/v1` path, verifying each chunk against the root hash (transfer/verification granularity `pull_chunk_bytes`, default ~1 MB) and forwarding it to the client as it arrives, collecting vouchers as the client pays.
+- The pull runs **ahead** of cleared payment — pipelined for throughput — but pauses whenever the per-request unrecouped frontier (`bytes pulled − bytes paid` for this stream) would exceed `pull_ahead_bytes`, and resumes as vouchers clear. Exposure on a request the client abandons is therefore bounded to `pull_ahead_bytes`, not the whole blob. The window is what decouples the loss bound from throughput: a strict one-chunk-ahead coupling (pull chunk `N+1` only after voucher `N`) would serialize one upstream round-trip per chunk — ≈`blob_size / pull_chunk_bytes` RTTs, tens of seconds of added latency on a 100 MB blob over an inter-continental link — so the loss bound is a *byte window*, not a one-chunk lockstep.
 - Pulled chunks are written to the local store as they arrive. iroh-blobs partial blobs and bao verified-streaming make a partially-held blob first-class: the node verifies and serves any chunk range against the root hash and records which ranges it holds. A node accumulates `H` across requests until it holds the blob in full.
 
-Because per-request speculative exposure is one chunk rather than the entire blob, implicit pull-through is cheap enough that **the `StreamRequest` itself is the trigger** — there is no warming flag, no `allow_pull_through` field, and no accept/decline handshake. A request for content the node lacks is the demand signal. This also makes the probe-to-evict race benign: a node that advertised `H`, was selected, then evicted `H` before the request arrives re-pulls a single chunk and continues serving, rather than erroring.
+Because per-request speculative exposure is a bounded window (`pull_ahead_bytes`) rather than the entire blob, implicit pull-through is cheap enough that **the `StreamRequest` itself is the trigger** — there is no warming flag, no `allow_pull_through` field, and no accept/decline handshake. A request for content the node lacks is the demand signal. This also makes the probe-to-evict race benign: a node that advertised `H`, was selected, then evicted `H` before the request arrives re-pulls the needed range and continues serving, rather than erroring.
 
 The node's own upstream pull is an ordinary cache-miss pull against actual holders, so a proxy never chains its pull through another non-holding proxy.
 
@@ -67,7 +67,7 @@ The node's own upstream pull is an ordinary cache-miss pull against actual holde
 Speculative pull-through is governed by two composing caps. The node refuses to begin or continue a speculative pull (one where it does not already hold the requested range) when either cap is breached; it never refuses to serve a range it already holds.
 
 - **Global unrecouped-leech budget.** The node maintains a rolling node-wide counter of `(bytes pulled to satisfy cache misses) − (bytes served)`. When the counter exceeds `max_unrecouped_leech_bytes`, speculative pull-through pauses and resumes as the node serves bytes and recoups. This bounds the operator's aggregate speculative loss and absorbs distributed abuse — many sources each requesting one unpopular hash — in aggregate, independent of how the requests are distributed across peers.
-- **Per-peer share ratio.** The node will not pull more than `share_ratio ×` the bytes it has already served *to that requesting peer*, with a one-chunk initial allowance so a peer with no service history can still be served the first chunk. This bounds concentrated abuse — a single peer attempting to drive the node into speculative pulls for content no real client wants — and mirrors a BitTorrent share ratio.
+- **Per-peer share ratio.** The node will not pull more than `share_ratio ×` the bytes it has already served *to that requesting peer*, with a small initial allowance (at most `pull_ahead_bytes`) so a peer with no service history can still be served the opening window. This bounds concentrated abuse — a single peer attempting to drive the node into speculative pulls for content no real client wants — and mirrors a BitTorrent share ratio.
 
 Both caps are operator-policy parameters. The optional `require_authorized_origin` gate and prefetch budget already specified for speculative acquisition in [ADR 022 § Recommended configuration](022-content-discovery.md#recommended-configuration) compose with these caps where an operator wants the additional restriction; the seed-leech caps are the load-bearing defense specific to this mechanism.
 
@@ -90,11 +90,12 @@ A node publishes a DHT STORE for `H` only when it holds the blob in full. Discov
 | `proxy_warming.margin_ms` | operator/client-set | A candidate proxy must beat the best holder's RTT by at least this margin to be chosen. |
 | `proxy_warming.max_wait_ms` | operator/client-set | Progress deadline before falling back from a proxy to the next candidate or the direct holder. |
 | `rtt_map.staleness_secs` | client-set | Age past which a per-peer RTT entry is re-sampled or evicted. |
-| `pull_chunk_bytes` | ~1 MB | Pull/voucher granularity; bounds per-request speculative exposure to one chunk. |
+| `pull_chunk_bytes` | ~1 MB | Chunk transfer/verification granularity (bao verified streaming). |
+| `pull_ahead_bytes` | operator-set, finite | Per-request pipeline window: max `pulled − paid` bytes for a single stream. Bounds per-request abandonment loss while keeping the upstream pull pipelined — decouples the loss bound from throughput. |
 | `max_unrecouped_leech_bytes` | operator-set, finite | Global circuit breaker on aggregate speculative pull spend. |
 | `share_ratio` | operator-set | Per-peer ceiling on pulled-vs-served bytes; one-chunk initial allowance. |
 
-Concrete defaults for the latency and budget parameters are modeled before locking; the load-bearing commitments are that `pull_chunk_bytes` is small relative to typical blob size, that `max_unrecouped_leech_bytes` is finite, and that `share_ratio` is bounded.
+Concrete defaults for the latency and budget parameters are modeled before locking; the load-bearing commitments are that `pull_ahead_bytes` is finite (so per-request loss is bounded) yet large enough to keep the upstream pull pipelined, that `max_unrecouped_leech_bytes` is finite, and that `share_ratio` is bounded.
 
 ## Consequences
 
@@ -108,7 +109,7 @@ Concrete defaults for the latency and budget parameters are modeled before locki
 
 ### Negative
 
-- The first client to warm a locale for a given blob pays a latency premium (one extra hop plus the cold first-chunk pull) relative to going direct. The premium is bounded by `proxy_warming.max_wait_ms` and the fallback path.
+- The first client to warm a locale for a given blob pays a latency premium (one extra hop plus the cold upstream pull's start-up latency) relative to going direct. The premium is bounded by `proxy_warming.max_wait_ms` and the fallback path.
 - A warmed node may hold `H` only partially under range-access patterns and never publish a whole-blob STORE, so such copies are discoverable only via RTT routing, not via the normal FIND_VALUE path. Range-addressed discovery is deferred.
 - The per-peer RTT map and background latency sweep are new always-on client state and traffic. The sweep is bounded by the existing probe rate budget, but it is a real cost a warming-capable client pays continuously, and a client that never runs long enough to populate the map never warms anything (it falls back to direct delivery).
 - Speculative pull-through that is throttled by the global budget or per-peer ratio leaves some warming opportunities unserved during recovery windows; this is the intended trade against operator loss.
@@ -131,7 +132,7 @@ Concrete defaults for the latency and budget parameters are modeled before locki
 
 1. A client whose probed holders all exceed `proxy_warming.rtt_threshold_ms`, and whose RTT map contains a bonded node beating the best holder by `proxy_warming.margin_ms`, routes its `StreamRequest` to that nearer non-holder; with no qualifying candidate it routes directly to the best holder.
 2. Proxy candidate ranking is invariant to peers' self-attested `region` values — selection depends only on measured RTT and the reputation floor.
-3. A node filling a request for an unheld blob pulls the first chunk to serve, then pulls chunk `N+1` only after voucher `N`; on client abandonment its unrecouped speculative spend is at most `pull_chunk_bytes` of upstream cost.
+3. A node filling a request for an unheld blob pulls ahead of cleared payment in a pipeline, pausing when `pulled − paid` for the request reaches `pull_ahead_bytes`; on client abandonment its unrecouped speculative spend is at most `pull_ahead_bytes`, and the upstream pull is not serialized to one round-trip per chunk.
 4. Speculative pull-through pauses when the global unrecouped-leech counter exceeds `max_unrecouped_leech_bytes` and resumes after the node recoups; it pauses for a peer that has exceeded its `share_ratio` (beyond the one-chunk initial allowance) while continuing to serve ranges already held.
 5. After a warming serve completes the blob, the node publishes a DHT STORE for `H`, and a subsequent regional FIND_VALUE returns the node as a holder.
 6. A proxy that declines or misses `proxy_warming.max_wait_ms` causes the client to fall back to the next candidate and then the direct holder, with no error surfaced to the caller; the client records the observed RTT regardless of outcome.
