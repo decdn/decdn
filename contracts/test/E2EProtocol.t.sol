@@ -149,11 +149,20 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         assertGt(escrowBeforeGrant, 0, "slash escrowed");
         assertGt(d.bond.slashedAtEpoch(operator), 0, "slash zero-out stamped");
 
-        // 5. Operator appeals; governance grants → escrow released for the appealed
-        //    slash + appeal bond refunded to the appellant + zero-out cleared.
+        // 5. Operator appeals the last slash; governance grants → escrow released
+        //    for the appealed slash + appeal bond refunded to the appellant. The
+        //    zero-out watermark is recomputed over the operator's still-standing
+        //    slashes (ADR 036 § Slashing zero-out — multi-slash): the other two
+        //    slashes stand, so it must NOT clear (a granted appeal of one slash
+        //    must not restore vote weight while others stand — issue #709). The
+        //    three slashes here share one epoch (no warp in `_slashToEjection`),
+        //    so this asserts persistence; the cross-epoch fall-back to an older
+        //    standing slash is covered by the unit tests in CapacityBond.t.sol /
+        //    SlashAppeal.t.sol.
+        uint256 stampBeforeGrant = d.bond.slashedAtEpoch(operator);
         uint256 operatorTokenBeforeGrant = d.token.balanceOf(operator);
         _appealAndGrant(lastSlashId);
-        assertEq(d.bond.slashedAtEpoch(operator), 0, "slash zero-out cleared on grant");
+        assertEq(d.bond.slashedAtEpoch(operator), stampBeforeGrant, "zero-out persists while other slashes stand");
 
         // Only the appealed slash's escrow is released (the other two stand).
         uint256 escrowReleased = escrowBeforeGrant - d.bond.escrowedTotal();

@@ -303,7 +303,8 @@ contract SlashAppealTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // ADR 028 §2 — conditional zero-out clear (multi-slash regression)
+    // ADR 036 § Slashing zero-out — multi-slash watermark recompute
+    // (settleAppealGranted re-derives the watermark over standing slashes)
     // -----------------------------------------------------------------
 
     /// Granting an appeal for an OLDER slash must NOT clear the per-operator
@@ -331,6 +332,34 @@ contract SlashAppealTest is Test {
         vm.prank(admin);
         appeal.grantAppeal(s1);
         assertEq(bond.slashedAtEpoch(operator), stamp2);
+    }
+
+    /// Granting an appeal for the NEWER slash must NOT clear the watermark to
+    /// zero while an OLDER slash still stands — it must fall back to the older
+    /// slash's epoch (issue #709 multi-outstanding-slash recompute).
+    function test_grant_newerAppeal_fallsBackToOlderStandingSlash() public {
+        vm.prank(operator);
+        bond.stake(MIN_STAKE);
+
+        // Slash #1 (older) — stays Escrowed/standing for the whole test.
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        uint64 stamp1 = bond.slashedAtEpoch(operator);
+
+        // Slash #2 (newer) in a later epoch — overwrites the per-operator stamp.
+        vm.warp(block.timestamp + 8 days);
+        vm.prank(admin);
+        (uint256 s2,) = bond.slash(operator, challenger, 1);
+        assertTrue(bond.slashedAtEpoch(operator) != stamp1);
+
+        // Grant the NEWER appeal — the watermark must fall back to the older
+        // still-standing slash's stamp, not clear to zero.
+        _open(s2);
+        vm.prank(multisig);
+        appeal.fastTrackAppeal(s2);
+        vm.prank(admin);
+        appeal.grantAppeal(s2);
+        assertEq(bond.slashedAtEpoch(operator), stamp1);
     }
 
     // -----------------------------------------------------------------
