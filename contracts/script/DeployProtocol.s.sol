@@ -217,6 +217,9 @@ contract DeployProtocol is BaseProtocolDeploy {
         vm.serializeAddress(contracts, "FeeRouter", address(d.router));
         vm.serializeAddress(contracts, "PublisherRegistry", address(d.registry));
         vm.serializeAddress(contracts, "SlashAppeal", address(d.slashAppeal));
+        vm.serializeAddress(contracts, "OriginAssignment", address(d.originAssignment));
+        vm.serializeAddress(contracts, "PaymentChannel", address(d.paymentChannel));
+        vm.serializeAddress(contracts, "SlashJudge", address(d.slashJudge));
         vm.serializeAddress(contracts, "TimelockController", address(d.timelock));
         string memory contractsJson = vm.serializeAddress(contracts, "Token", address(d.token));
 

@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
@@ -117,6 +118,36 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.blacklist.hasRole(d.blacklist.EMERGENCY_MULTISIG_ROLE(), emergencyMultisig), "blacklist emergency");
     }
 
+    // The emergency multisig must hold PAUSER_ROLE on every deployed Pausable
+    // target at the end of deploy (ADR 016 § Role Inventory). No constructor
+    // grants it, so a missing wiring step would leave the protocol with no live
+    // pauser until a 48h-delayed governance proposal — the failure this guards.
+    function test_roleMatrix_pauserIsEmergencyMultisig() public view {
+        assertTrue(d.bond.hasRole(d.bond.PAUSER_ROLE(), emergencyMultisig), "bond pauser");
+        assertTrue(d.router.hasRole(d.router.PAUSER_ROLE(), emergencyMultisig), "router pauser");
+        assertTrue(d.slashAppeal.hasRole(d.slashAppeal.PAUSER_ROLE(), emergencyMultisig), "slashAppeal pauser");
+        assertTrue(d.paymentChannel.hasRole(d.paymentChannel.PAUSER_ROLE(), emergencyMultisig), "paymentChannel pauser");
+        assertTrue(d.slashJudge.hasRole(d.slashJudge.PAUSER_ROLE(), emergencyMultisig), "slashJudge pauser");
+    }
+
+    // Holding PAUSER_ROLE is necessary but not sufficient — prove the deployed
+    // multisig can ACTUALLY pause and that a whenNotPaused entrypoint then
+    // reverts. A regression that gated pause() on the wrong role would still pass
+    // the hasRole matrix above but fail here. `declareMbps` is a clean
+    // whenNotPaused-only entrypoint (no token/approval prerequisites).
+    function test_emergencyMultisig_canPauseAndBlockEntrypoint() public {
+        vm.prank(emergencyMultisig);
+        d.bond.pause();
+        assertTrue(d.bond.paused(), "bond paused by multisig");
+
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        d.bond.declareMbps(100);
+
+        vm.prank(emergencyMultisig);
+        d.bond.unpause();
+        assertFalse(d.bond.paused(), "bond unpaused by multisig");
+    }
+
     // -----------------------------------------------------------------
     // Cross-contract wiring (ADR 016 § Post-Deployment Initialization)
     // -----------------------------------------------------------------
@@ -125,6 +156,18 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.bond.hasRole(d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router)), "router to bond settlement");
         assertTrue(d.bond.hasRole(d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal)), "slashAppeal to bond appeal");
         assertTrue(d.bond.hasRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist)), "blacklist to bond eject");
+    }
+
+    // Peer wiring for the three contracts added in #452. Lives in the canonical
+    // role-matrix test (not only the E2E lifecycle test) so a wiring regression
+    // fails here independently of the heavier E2E flow.
+    function test_crossContractWiring_newContractPeerRoles() public view {
+        assertTrue(
+            d.router.hasRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentChannel)),
+            "paymentChannel holds ROUTER_CALLER_ROLE on router"
+        );
+        assertTrue(d.bond.hasRole(d.bond.SLASH_ROLE(), address(d.slashJudge)), "slashJudge holds SLASH_ROLE on bond");
+        assertEq(d.originAssignment.contentBlacklist(), address(d.blacklist), "originAssignment blacklist binding");
     }
 
     function test_crossContractWiring_slashAppealChallengerPool() public view {
