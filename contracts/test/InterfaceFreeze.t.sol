@@ -8,10 +8,13 @@ import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
 
 /// @title InterfaceFreezeTest — public-surface stability snapshot (issue #452
-///        acceptance: "interface ABIs frozen for audit"). Each assertion pins a
-///        function's compiler-derived selector to its canonical signature string;
-///        any signature drift on the audited surface flips the selector and fails
-///        the test, forcing a deliberate ABI change + audit re-review.
+///        acceptance: "interface ABIs frozen for audit"). Scope is the three
+///        contracts ADDED in #452 — PaymentChannel, SlashJudge, OriginAssignment;
+///        the pre-existing surface (CapacityBond, FeeRouter, SlashAppeal,
+///        ContentBlacklist, DecdnGovernor) is not pinned here. Each assertion pins
+///        a function's compiler-derived selector to its canonical signature string;
+///        any signature drift on these three flips the selector and fails the
+///        test, forcing a deliberate ABI change + audit re-review.
 contract InterfaceFreezeTest is Test {
     function test_paymentChannel_abiFrozen() public pure {
         assertEq(PaymentChannel.openChannel.selector, bytes4(keccak256("openChannel(address,uint256)")), "openChannel");

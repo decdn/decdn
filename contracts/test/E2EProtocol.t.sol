@@ -128,23 +128,64 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         // 2. Open a channel and settle a client voucher through FeeRouter.
         uint256 epoch = _openAndSettleChannel();
 
-        // 3. Three-bucket distribution at launch shares (90 / 0 / 10).
-        assertEq(usdc.balanceOf(operator), SETTLE_AMOUNT * 9000 / 10_000, "operator base share (90%)");
-        assertEq(usdc.balanceOf(address(d.timelock)), SETTLE_AMOUNT * 1000 / 10_000, "treasury share (10%)");
+        // 3. Three-bucket distribution at the configured launch shares (read from
+        //    cfg, not re-hardcoded, so the assertion tracks the deploy config).
+        assertEq(
+            usdc.balanceOf(operator),
+            SETTLE_AMOUNT * cfg.feeRouterShares[0] / 10_000,
+            "operator base share (operator bucket)"
+        );
+        assertEq(usdc.balanceOf(address(d.timelock)), SETTLE_AMOUNT * cfg.feeRouterShares[2] / 10_000, "treasury share");
         assertEq(usdc.balanceOf(d.router.buybackBurner()), 0, "buyback dormant at launch");
         assertEq(d.router.bytesPerEpoch(operator, uint64(epoch)), SETTLE_BYTES, "served bytes stamped");
 
         // 4. Slash via the wired SLASH_ROLE holder, escrowing each slash. Three
         //    tier slashes (5/15/50%) drop the bond below minStake/2 → auto-eject.
+        //    `_slashToEjection` asserts each tier escrows a strictly larger amount.
         uint256 lastSlashId = _slashToEjection();
         assertTrue(d.bond.ejected(operator), "operator auto-ejected");
         assertFalse(d.bond.isActive(operator), "ejected operator inactive");
-        assertGt(d.bond.escrowedTotal(), 0, "slash escrowed");
+        uint256 escrowBeforeGrant = d.bond.escrowedTotal();
+        assertGt(escrowBeforeGrant, 0, "slash escrowed");
         assertGt(d.bond.slashedAtEpoch(operator), 0, "slash zero-out stamped");
 
-        // 5. Operator appeals; governance grants → escrow refund + zero-out cleared.
+        // 5. Operator appeals; governance grants → escrow released for the appealed
+        //    slash + appeal bond refunded to the appellant + zero-out cleared.
+        uint256 operatorTokenBeforeGrant = d.token.balanceOf(operator);
         _appealAndGrant(lastSlashId);
         assertEq(d.bond.slashedAtEpoch(operator), 0, "slash zero-out cleared on grant");
+
+        // Only the appealed slash's escrow is released (the other two stand).
+        uint256 escrowReleased = escrowBeforeGrant - d.bond.escrowedTotal();
+        assertGt(escrowReleased, 0, "escrow released for granted slash");
+        // A granted appeal makes the operator whole: the escrowed stake portion is
+        // refunded liquid (no genesis credit in this flow). The appeal bond round-
+        // trips within `_appealAndGrant` (paid at openSlashAppeal, refunded at
+        // grantAppeal) — so the net delta is exactly the released escrow. If the
+        // grant failed to refund the bond, the operator would be `slashAppealBond`
+        // short and this equality would fail.
+        assertEq(
+            d.token.balanceOf(operator),
+            operatorTokenBeforeGrant + escrowReleased,
+            "operator refunded escrowed stake; appeal bond round-trips to net zero"
+        );
+    }
+
+    // Blacklist → CapacityBond ejection. ContentBlacklist holds BLACKLIST_ROLE on
+    // the bond (wired in phase 4), so a governance blacklist-add ejects the
+    // operator on-chain. Exercises the cross-contract edge behaviorally — a
+    // dropped BLACKLIST_ROLE grant would make this revert/no-op rather than eject.
+    function test_e2e_blacklistEjectsOperator() public {
+        _bondAndRegister();
+        assertTrue(d.bond.isActive(operator), "operator active before blacklist");
+
+        // GOVERNANCE_ROLE on ContentBlacklist is the Timelock after handoff.
+        vm.prank(address(d.timelock));
+        d.blacklist.addOperator(operator);
+
+        assertTrue(d.blacklist.isOperatorBlacklisted(operator), "operator marked blacklisted");
+        assertTrue(d.bond.ejected(operator), "operator ejected via blacklist BLACKLIST_ROLE wiring");
+        assertFalse(d.bond.isActive(operator), "blacklisted operator inactive");
     }
 
     // -----------------------------------------------------------------
@@ -177,10 +218,21 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
 
     function _slashToEjection() internal returns (uint256 lastSlashId) {
         vm.startPrank(address(d.slashJudge));
+        uint256 e0 = d.bond.escrowedTotal();
         d.bond.slash(operator, challenger, 0);
+        uint256 e1 = d.bond.escrowedTotal();
         d.bond.slash(operator, challenger, 0);
+        uint256 e2 = d.bond.escrowedTotal();
         (lastSlashId,) = d.bond.slash(operator, challenger, 0);
+        uint256 e3 = d.bond.escrowedTotal();
         vm.stopPrank();
+
+        // Each escalating tier (5% → 15% → 50%) must escrow a strictly larger
+        // increment — proves the tier ladder and escrow accounting, not just the
+        // terminal ejected state.
+        assertGt(e1 - e0, 0, "tier-1 slash escrowed");
+        assertGt(e2 - e1, e1 - e0, "tier-2 escrow increment exceeds tier-1");
+        assertGt(e3 - e2, e2 - e1, "tier-3 escrow increment exceeds tier-2");
     }
 
     function _appealAndGrant(uint256 slashId) internal {

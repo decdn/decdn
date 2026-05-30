@@ -51,20 +51,24 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                         FeeRouter (treasury bucket = the
 ///                                         TimelockController; buyback bucket
 ///                                         dormant — see BuybackBurner note below),
-///                                         ContentBlacklist, PublisherRegistry.
-///                                         Deployer is admin of every
-///                                         AccessControl-bearing target.
+///                                         ContentBlacklist, PublisherRegistry,
+///                                         PaymentChannel, SlashJudge,
+///                                         OriginAssignment. Deployer is admin of
+///                                         every AccessControl-bearing target.
 ///           3. `_deployGovernor`        — DecdnGovernor; grant Timelock's
 ///                                         PROPOSER + CANCELLER roles to the
 ///                                         Governor.
 ///           4. `_wireCrossContractRoles` — peer role grants (settlement reporter,
 ///                                          slash-appeal driver, blacklist ejector,
-///                                          emergency multisig, genesis grantor)
-///                                          plus the deployer-only
-///                                          `setChallengerIncentivePool` setter
-///                                          that MUST run before the
-///                                          GOVERNANCE_ROLE handoff because it
-///                                          becomes Timelock-gated post-handoff.
+///                                          emergency multisig, PAUSER_ROLE on every
+///                                          Pausable target, genesis grantor,
+///                                          router-caller → PaymentChannel,
+///                                          SLASH_ROLE → SlashJudge) plus the
+///                                          deployer-only `setChallengerIncentivePool`
+///                                          and `OriginAssignment.setContentBlacklist`
+///                                          setters that MUST run before the
+///                                          GOVERNANCE_ROLE handoff because they
+///                                          become Timelock-gated post-handoff.
 ///           5. `_handOffGovernance`      — grant-before-revoke loop over every
 ///                                          target for both GOVERNANCE_ROLE and
 ///                                          DEFAULT_ADMIN_ROLE, then renounce the
@@ -78,6 +82,14 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          just in tests) so a mainnet deploy
 ///                                          refuses to finish if any handoff
 ///                                          step failed silently.
+///           7. `_assertPeerRolesWired`   — reverts if any phase-4 peer-role grant
+///                                          or address binding (slash trigger,
+///                                          router-caller, pausers, emergency
+///                                          multisig, genesis grantor, blacklist
+///                                          binding, challenger pool) did not land.
+///                                          `grantRole` to a wrong address does not
+///                                          revert, so without this a half-wired
+///                                          protocol would ship silently.
 ///
 ///         Slash restitution is escrow-on-slash inside CapacityBond itself
 ///         (ADR 026 § Slashing, ADR 028) — there is no standalone reserve
@@ -170,6 +182,18 @@ abstract contract BaseProtocolDeploy is Script {
     ///         contract ungoverned. Asserting both directions makes the in-script
     ///         guard symmetric with the test role matrix.
     error GovernanceNotHandedOff(address target, bytes32 role);
+    /// @notice Post-deploy invariant — a phase-4 peer role (e.g. `SLASH_ROLE`,
+    ///         `ROUTER_CALLER_ROLE`, `PAUSER_ROLE`) was not actually granted to
+    ///         `grantee` on `target`. OZ `grantRole` does not revert when the
+    ///         target address is wrong, so a dropped or mis-targeted peer grant is
+    ///         otherwise silent — shipping a dead slash trigger, an unroutable
+    ///         payment path, or no live pauser.
+    error PeerRoleNotWired(address target, bytes32 role, address grantee);
+    /// @notice Post-deploy invariant — a deployer-only address binding set in
+    ///         phase 4 (`OriginAssignment.contentBlacklist`, the slash-appeal
+    ///         challenger pool) does not point where wiring intended. Catches a
+    ///         skipped setter that would silently leave a security check unwired.
+    error BindingNotWired(address target, address expected, address actual);
 
     function _runFullDeploy(DeployConfig memory cfg) internal returns (Deployment memory d) {
         TimelockController timelock = _deployTimelock(cfg);
@@ -178,6 +202,7 @@ abstract contract BaseProtocolDeploy is Script {
         _wireCrossContractRoles(cfg, d);
         _handOffGovernance(cfg, d);
         _assertNoBackDoors(cfg, d);
+        _assertPeerRolesWired(cfg, d);
     }
 
     // Phase 1 — TimelockController. Deployed before the targets so its address
@@ -319,10 +344,12 @@ abstract contract BaseProtocolDeploy is Script {
         d.bond.grantRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist));
 
         // SlashAppeal.upholdAppeal routes the non-burn half of a failed appeal
-        // bond to a challenger-incentive pool; it reverts on address(0). Post-
-        // handoff this setter is governance-gated, so wiring here is the only
-        // path that doesn't require a Timelock proposal to complete the slash-
-        // appeal lifecycle.
+        // bond to a challenger-incentive pool when one is wired (otherwise that
+        // half is also burned — `upholdAppeal` degrades gracefully, it does NOT
+        // revert on an unset pool). The `setChallengerIncentivePool` setter,
+        // however, reverts on address(0), and post-handoff it is governance-gated,
+        // so wiring here is the only path that doesn't require a Timelock proposal
+        // to give the slash-appeal lifecycle a live pool.
         d.slashAppeal.setChallengerIncentivePool(cfg.challengerIncentivePool);
 
         // EMERGENCY_MULTISIG_ROLE: SlashAppeal already has it from its
@@ -423,9 +450,55 @@ abstract contract BaseProtocolDeploy is Script {
         }
     }
 
-    /// @dev The five GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE-bearing targets handed
-    ///      off to the Timelock — single source of truth for `_handOffGovernance`
-    ///      and `_assertNoBackDoors` so the governed set can't drift between them.
+    // Phase 7 — post-deploy invariant for the phase-4 peer wiring.
+    //
+    // `_assertNoBackDoors` covers only the GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE
+    // handoff. The peer grants and address bindings wired in `_wireCrossContractRoles`
+    // are security-critical (the only slash trigger, the only settlement-routing
+    // grant, the live pausers, the blacklist read binding) yet none are reverting:
+    // OZ `grantRole` to the wrong address is a silent no-op of the intended
+    // property. This phase re-reads each one so a dropped or mis-targeted grant
+    // fails the deploy loudly instead of shipping a half-wired protocol.
+    function _assertPeerRolesWired(DeployConfig memory cfg, Deployment memory d) internal view {
+        // CapacityBond peer roles.
+        _requireRole(d.bond, d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router));
+        _requireRole(d.bond, d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal));
+        _requireRole(d.bond, d.bond.BLACKLIST_ROLE(), address(d.blacklist));
+        _requireRole(d.bond, d.bond.SLASH_ROLE(), address(d.slashJudge));
+        _requireRole(d.bond, d.bond.GENESIS_GRANTOR_ROLE(), address(d.timelock));
+        // FeeRouter settlement-routing grant.
+        _requireRole(d.router, d.router.ROUTER_CALLER_ROLE(), address(d.paymentChannel));
+        // EMERGENCY_MULTISIG_ROLE on both appeal surfaces.
+        _requireRole(d.slashAppeal, d.slashAppeal.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
+        _requireRole(d.blacklist, d.blacklist.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
+        // PAUSER_ROLE on every deployed Pausable target (BuybackBurner is not deployed).
+        _requireRole(d.bond, d.bond.PAUSER_ROLE(), cfg.emergencyMultisig);
+        _requireRole(d.router, d.router.PAUSER_ROLE(), cfg.emergencyMultisig);
+        _requireRole(d.slashAppeal, d.slashAppeal.PAUSER_ROLE(), cfg.emergencyMultisig);
+        _requireRole(d.paymentChannel, d.paymentChannel.PAUSER_ROLE(), cfg.emergencyMultisig);
+        _requireRole(d.slashJudge, d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
+
+        // Address bindings from deployer-only setters.
+        address boundBlacklist = d.originAssignment.contentBlacklist();
+        if (boundBlacklist != address(d.blacklist)) {
+            revert BindingNotWired(address(d.originAssignment), address(d.blacklist), boundBlacklist);
+        }
+        address boundPool = d.slashAppeal.challengerIncentivePool();
+        if (boundPool != cfg.challengerIncentivePool) {
+            revert BindingNotWired(address(d.slashAppeal), cfg.challengerIncentivePool, boundPool);
+        }
+    }
+
+    function _requireRole(IAccessControl target, bytes32 role, address grantee) private view {
+        if (!target.hasRole(role, grantee)) revert PeerRoleNotWired(address(target), role, grantee);
+    }
+
+    /// @dev The eight GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE-bearing targets handed
+    ///      off to the Timelock (router, bond, blacklist, slashAppeal, registry,
+    ///      paymentChannel, slashJudge, originAssignment) — single source of truth
+    ///      for `_handOffGovernance` and `_assertNoBackDoors` so the governed set
+    ///      can't drift between them. The array width MUST equal the number of
+    ///      role-bearing `Deployment` members; adding a target requires widening it.
     function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[8] memory) {
         return [
             IAccessControl(address(d.router)),
