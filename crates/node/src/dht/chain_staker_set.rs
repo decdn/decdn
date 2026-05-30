@@ -208,7 +208,7 @@ where
                 .await
                 .with_context(|| format!("isActive({operator})", operator = node.ethAddress))?;
             if is_active {
-                active.insert(node.nodeId.0);
+                active.insert(NodeId::from_bytes(node.nodeId.0));
             }
         }
         offset = offset.saturating_add(page_len);
@@ -312,21 +312,21 @@ where
         tokio::select! {
             ev = node_registered.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    apply_change(active, changes_tx, StakerChange::Active(event.nodeId.0));
+                    apply_change(active, changes_tx, StakerChange::Active(event.nodeId.0.into()));
                 }
                 Some(Err(e)) => return Err(e).context("NodeRegistered stream"),
                 None => return Ok(()),
             },
             ev = node_deregistered.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    apply_change(active, changes_tx, StakerChange::Inactive(event.nodeId.0));
+                    apply_change(active, changes_tx, StakerChange::Inactive(event.nodeId.0.into()));
                 }
                 Some(Err(e)) => return Err(e).context("NodeDeregistered stream"),
                 None => return Ok(()),
             },
             ev = node_auto_ejected.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    apply_change(active, changes_tx, StakerChange::Inactive(event.nodeId.0));
+                    apply_change(active, changes_tx, StakerChange::Inactive(event.nodeId.0.into()));
                 }
                 Some(Err(e)) => return Err(e).context("NodeAutoEjected stream"),
                 None => return Ok(()),
@@ -397,9 +397,9 @@ async fn apply_operator_change<P>(
         );
     }
     let change = if now_active {
-        StakerChange::Active(node_id)
+        StakerChange::Active(node_id.into())
     } else {
-        StakerChange::Inactive(node_id)
+        StakerChange::Inactive(node_id.into())
     };
     apply_change(active, changes_tx, change);
 }
@@ -446,7 +446,7 @@ mod tests {
     use super::*;
 
     fn nid(byte: u8) -> NodeId {
-        [byte; 32]
+        NodeId::from_bytes([byte; 32])
     }
 
     fn fresh_state() -> (

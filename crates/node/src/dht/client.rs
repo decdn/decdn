@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use decdn_protocol::{
-    ALPN_DHT, decode_message, dht as wire, encode_message, read_frame, write_frame,
+    ALPN_DHT, ContentHash, NodeId, decode_message, dht as wire, encode_message, read_frame,
+    write_frame,
 };
 use iroh::endpoint::{ConnectOptions, Connection, ConnectionError, ReadError, ReadToEndError};
 use iroh::{Endpoint, EndpointAddr};
@@ -46,8 +47,8 @@ pub const DHT_CLIENT_TIMEOUT: Duration = Duration::from_secs(8);
 pub async fn find_node(
     endpoint: &Endpoint,
     target: EndpointAddr,
-    target_id: [u8; 32],
-    requester: [u8; 32],
+    target_id: NodeId,
+    requester: NodeId,
 ) -> anyhow::Result<wire::FindNodeResponse> {
     let request = wire::DhtMessage::FindNode(wire::FindNodeRequest {
         target: target_id,
@@ -70,8 +71,8 @@ pub async fn find_node(
 pub async fn store(
     endpoint: &Endpoint,
     target: EndpointAddr,
-    hash: [u8; 32],
-    holder: [u8; 32],
+    hash: ContentHash,
+    holder: NodeId,
 ) -> anyhow::Result<wire::StoreAck> {
     let request = wire::DhtMessage::Store(wire::StoreRequest { hash, holder });
     let response = exchange(endpoint, target, &request).await?;
@@ -105,8 +106,8 @@ const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
 pub async fn batch_store(
     endpoint: &Endpoint,
     target: EndpointAddr,
-    hashes: Vec<[u8; 32]>,
-    holder: [u8; 32],
+    hashes: Vec<ContentHash>,
+    holder: NodeId,
 ) -> anyhow::Result<wire::BatchStoreAck> {
     let request = wire::DhtMessage::BatchStore(wire::BatchStoreRequest { hashes, holder });
     let response = exchange(endpoint, target, &request).await?;
@@ -176,9 +177,9 @@ const fn classify_batch_error(code: Option<u32>) -> BatchAttemptOutcome {
 pub async fn batch_store_with_fallback(
     endpoint: &Endpoint,
     target: EndpointAddr,
-    target_id: [u8; 32],
-    hashes: Vec<[u8; 32]>,
-    holder: [u8; 32],
+    target_id: NodeId,
+    hashes: Vec<ContentHash>,
+    holder: NodeId,
     fallback: &crate::dht::batch_fallback::BatchStoreFallback,
 ) -> Vec<bool> {
     let n = hashes.len();
@@ -272,8 +273,8 @@ pub const MAX_CONSECUTIVE_FALLBACK_TIMEOUTS: usize = 3;
 pub async fn per_hash_fallback(
     endpoint: &Endpoint,
     target: EndpointAddr,
-    hashes: &[[u8; 32]],
-    holder: [u8; 32],
+    hashes: &[ContentHash],
+    holder: NodeId,
     per_hash_timeout: Duration,
 ) -> Vec<bool> {
     let mut out = vec![false; hashes.len()];
@@ -348,8 +349,8 @@ pub async fn per_hash_fallback(
 pub async fn find_value(
     endpoint: &Endpoint,
     target: EndpointAddr,
-    hash: [u8; 32],
-    requester: [u8; 32],
+    hash: ContentHash,
+    requester: NodeId,
 ) -> anyhow::Result<wire::FindValueResponse> {
     let request = wire::DhtMessage::FindValue(wire::FindValueRequest { hash, requester });
     let response = exchange(endpoint, target, &request).await?;

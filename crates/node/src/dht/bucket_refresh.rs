@@ -52,7 +52,7 @@ pub async fn run_bucket_refresh(
     mut stop_rx: oneshot::Receiver<()>,
     interval: Duration,
 ) {
-    let self_id_bytes = *self_id.as_bytes();
+    let self_node_id = NodeId::from_bytes(*self_id.as_bytes());
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // burn first tick — bucket refresh isn't needed at t=0
@@ -65,7 +65,7 @@ pub async fn run_bucket_refresh(
                 return;
             }
             _ = ticker.tick() => {
-                refresh_all_non_empty_buckets(&endpoint, self_id_bytes, &routing).await;
+                refresh_all_non_empty_buckets(&endpoint, self_node_id, &routing).await;
             }
         }
     }
@@ -76,7 +76,7 @@ pub async fn run_bucket_refresh(
 /// the network requests out in parallel.
 async fn refresh_all_non_empty_buckets(
     endpoint: &Endpoint,
-    self_id_bytes: [u8; 32],
+    self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
 ) {
     let picks: Vec<BucketPick> = {
@@ -94,7 +94,7 @@ async fn refresh_all_non_empty_buckets(
         let endpoint_cloned = endpoint.clone();
         let routing_cloned = Arc::clone(routing);
         handles.push(tokio::spawn(async move {
-            refresh_one_bucket(&endpoint_cloned, self_id_bytes, &routing_cloned, pick).await;
+            refresh_one_bucket(&endpoint_cloned, self_node_id, &routing_cloned, pick).await;
         }));
     }
     for h in handles {
@@ -126,7 +126,7 @@ fn all_non_empty_picks(table: &RoutingTable) -> Vec<BucketPick> {
 /// briefly under the snapshot.
 async fn refresh_one_bucket(
     endpoint: &Endpoint,
-    self_id_bytes: [u8; 32],
+    self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
     pick: BucketPick,
 ) {
@@ -135,7 +135,7 @@ async fn refresh_one_bucket(
         peer,
         target,
     } = pick;
-    let target_pk = match PublicKey::from_bytes(&peer) {
+    let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
         Ok(k) => k,
         Err(e) => {
             tracing::warn!(
@@ -147,14 +147,14 @@ async fn refresh_one_bucket(
         }
     };
     let addr = EndpointAddr::new(target_pk);
-    match client::find_node(endpoint, addr, target, self_id_bytes).await {
+    match client::find_node(endpoint, addr, target, self_node_id).await {
         Ok(resp) => {
             // Insert any new peers from the response into the routing
             // table. The bucket's freshness is updated by virtue of
             // these inserts moving entries to MRU.
             if let Ok(mut table) = routing.lock() {
-                for nid in resp.closer_nodes {
-                    if nid != self_id_bytes {
+                for nid in resp.closer_nodes.into_inner() {
+                    if nid != self_node_id {
                         table.insert(nid);
                     }
                 }
@@ -217,7 +217,7 @@ fn random_target_in_bucket(self_id: &NodeId, bucket_index: usize) -> NodeId {
     let bit_from_msb = KEYSPACE_BITS.saturating_sub(1).saturating_sub(bucket_index);
     let byte_idx = bit_from_msb / 8;
     let bit_within = bit_from_msb % 8;
-    let mut target = *self_id;
+    let mut target = *self_id.as_bytes();
     // Flip the bucket's prefix bit (guarantees the XOR distance has
     // its highest set bit at this position).
     let flip_mask = 1u8 << (7 - bit_within);
@@ -229,7 +229,7 @@ fn random_target_in_bucket(self_id: &NodeId, bucket_index: usize) -> NodeId {
     for slot in target.iter_mut().skip(byte_idx + 1) {
         *slot = rng.random();
     }
-    target
+    NodeId::from_bytes(target)
 }
 
 #[cfg(test)]
@@ -244,7 +244,7 @@ mod tests {
     use crate::dht::routing::xor_distance;
 
     fn nid(b: u8) -> NodeId {
-        [b; 32]
+        NodeId::from_bytes([b; 32])
     }
 
     /// `random_target_in_bucket` MUST produce a `NodeId` that XOR-
@@ -283,13 +283,13 @@ mod tests {
             // Force bucket 255 (high-bit set).
             let mut id = [0u8; 32];
             id[0] = 0x80;
-            id
+            NodeId::from_bytes(id)
         };
         let p2 = {
             // Force bucket 0 (only low-bit differs).
             let mut id = [0u8; 32];
             id[31] = 0x01;
-            id
+            NodeId::from_bytes(id)
         };
         table.insert(p1);
         table.insert(p2);
@@ -317,7 +317,7 @@ mod tests {
         let p = {
             let mut id = [0u8; 32];
             id[0] = 0x80;
-            id
+            NodeId::from_bytes(id)
         };
         table.insert(p);
         let pick = pick_bucket(&table, 255).expect("non-empty bucket 255");

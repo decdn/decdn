@@ -189,10 +189,10 @@ mod tests {
     use std::thread;
 
     fn nid(byte: u8) -> NodeId {
-        [byte; 32]
+        NodeId::from_bytes([byte; 32])
     }
     fn h(byte: u8) -> Hash {
-        [byte; 32]
+        Hash::from_bytes([byte; 32])
     }
 
     #[test]

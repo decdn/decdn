@@ -656,9 +656,11 @@ pub async fn run(
     // post-boot — blobs already on disk that get cache-HIT requests are NOT
     // re-scheduled until the next successful restart.
     let cold_start_count = match cache.iter_hashes().await {
-        Ok(hashes) => {
-            republish_scheduler.seed_cold_start(hashes.into_iter().map(|h| *h.as_bytes()))
-        }
+        Ok(hashes) => republish_scheduler.seed_cold_start(
+            hashes
+                .into_iter()
+                .map(|h| decdn_protocol::ContentHash::from_bytes(*h.as_bytes())),
+        ),
         Err(err) => {
             tracing::warn!(
                 error = %err,

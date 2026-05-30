@@ -26,8 +26,8 @@ use crate::dht::routing::NodeId;
 
 /// 32-byte content hash. Re-exported from [`crate::dht::records::Hash`]
 /// so origin-directory call sites don't need to import the record store
-/// crate path. Kept as a type alias to match the rest of the DHT module.
-pub type Hash = [u8; 32];
+/// crate path.
+pub use crate::dht::records::Hash;
 
 /// Read-only view of the on-chain origin directory.
 ///
@@ -116,10 +116,10 @@ mod tests {
     use super::*;
 
     fn h(b: u8) -> Hash {
-        [b; 32]
+        Hash::from_bytes([b; 32])
     }
     fn nid(b: u8) -> NodeId {
-        [b; 32]
+        NodeId::from_bytes([b; 32])
     }
 
     #[test]

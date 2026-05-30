@@ -450,7 +450,7 @@ mod tests {
     }
 
     fn peer(byte: u8) -> NodeId {
-        [byte; 32]
+        NodeId::from_bytes([byte; 32])
     }
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
@@ -907,7 +907,10 @@ mod tests {
             let mut id = [0u8; 32];
             id[0] = u8::try_from((i >> 8) & 0xff).unwrap_or(0);
             id[1] = u8::try_from(i & 0xff).unwrap_or(0);
-            assert!(lim.check(&id, Some(ip(10, 0, 0, 1))).is_ok());
+            assert!(
+                lim.check(&NodeId::from_bytes(id), Some(ip(10, 0, 0, 1)))
+                    .is_ok()
+            );
         }
         assert_eq!(lim.per_peer_tracked(), 1000);
     }
@@ -957,7 +960,7 @@ mod tests {
             let mut id = [0u8; 32];
             id[0] = u8::try_from((i >> 8) & 0xff).unwrap_or(0);
             id[1] = u8::try_from(i & 0xff).unwrap_or(0);
-            let _ = lim.check(&id, Some(ip(10, 0, 0, 1)));
+            let _ = lim.check(&NodeId::from_bytes(id), Some(ip(10, 0, 0, 1)));
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         let final_size = lim.per_peer_tracked();
@@ -999,7 +1002,7 @@ mod tests {
         for i in 0..4u8 {
             let mut id = [0u8; 32];
             id[0] = i;
-            let _ = lim.check(&id, Some(ip(10, 0, 0, i)));
+            let _ = lim.check(&NodeId::from_bytes(id), Some(ip(10, 0, 0, i)));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(lim.gc_per_ip().is_some());

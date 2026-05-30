@@ -34,7 +34,8 @@ use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
-    ALPN_DHT, decode_message, dht as wire, encode_message, read_frame, write_frame,
+    ALPN_DHT, ContentHash, NodeId, decode_message, dht as wire, encode_message, read_frame,
+    write_frame,
 };
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
@@ -76,14 +77,14 @@ impl AllStaked {
 }
 
 impl StakerSet for AllStaked {
-    fn is_active(&self, _: &[u8; 32]) -> bool {
+    fn is_active(&self, _: &NodeId) -> bool {
         true
     }
     /// Returns empty — this helper is not enumerable. Any code that
     /// reads `active_nodes()` from `AllStaked` is using the wrong
     /// helper for its test; switch to `ConfigStakerSet` with a real
     /// `HashSet` of peers instead.
-    fn active_nodes(&self) -> Vec<[u8; 32]> {
+    fn active_nodes(&self) -> Vec<NodeId> {
         Vec::new()
     }
     /// Returns 0 to stay consistent with [`Self::active_nodes`]. A
@@ -157,12 +158,14 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
     // response carries something verifiable. The handler is constructed
     // via `with_routing` so we get a shared `Arc<Mutex<RoutingTable>>`
     // for the seeding step.
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *server_id.as_bytes(),
+    ))));
     let seeded_peers: Vec<[u8; 32]> = (1u8..=3).map(|i| [i; 32]).collect();
     {
         let mut t = routing.lock().expect("routing lock poisoned");
         for p in &seeded_peers {
-            t.insert(*p);
+            t.insert(NodeId::from_bytes(*p));
         }
     }
 
@@ -212,8 +215,8 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
     // Target = one of the seeded peers, so it should appear in the
     // response along with the rest of the table.
     let req = wire::FindNodeRequest {
-        target: [1u8; 32],
-        requester: *client_id.as_bytes(),
+        target: NodeId::from_bytes([1u8; 32]),
+        requester: NodeId::from_bytes(*client_id.as_bytes()),
     };
     let payload = encode_message(&wire::DhtMessage::FindNode(req))?;
     write_frame(&mut send, &payload)
@@ -236,12 +239,15 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
         "responder seeded with 3 peers must return at least one"
     );
     assert!(
-        resp.closer_nodes.contains(&[1u8; 32]),
+        resp.closer_nodes
+            .as_slice()
+            .contains(&NodeId::from_bytes([1u8; 32])),
         "the exact target NodeId is one of the seeded peers and should appear"
     );
     // Routing table should not include the server's own id.
+    let server_node_id = NodeId::from_bytes(*server_id.as_bytes());
     assert!(
-        !resp.closer_nodes.iter().any(|n| n == server_id.as_bytes()),
+        !resp.closer_nodes.as_slice().contains(&server_node_id),
         "responder must not list itself"
     );
 
@@ -251,7 +257,7 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
     {
         let t = routing.lock().expect("routing lock poisoned");
         assert!(
-            t.contains(client_id.as_bytes()),
+            t.contains(&NodeId::from_bytes(*client_id.as_bytes())),
             "client's NodeId must be in the responder's routing table after a successful FindNode"
         );
     }
@@ -280,10 +286,12 @@ async fn find_value_with_empty_store_returns_no_providers_but_closer_nodes() -> 
     let limiter = permissive_limiter(&metrics);
     let rate_limiter = permissive_dht_rate_limiter(&metrics);
 
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *server_id.as_bytes(),
+    ))));
     {
         let mut t = routing.lock().expect("routing lock poisoned");
-        t.insert([0x42u8; 32]);
+        t.insert(NodeId::from_bytes([0x42u8; 32]));
     }
 
     let handler = Arc::new(DhtHandler::with_routing(
@@ -323,8 +331,8 @@ async fn find_value_with_empty_store_returns_no_providers_but_closer_nodes() -> 
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
     let req = wire::FindValueRequest {
-        hash: [0x99u8; 32],
-        requester: *client_ep.id().as_bytes(),
+        hash: ContentHash::from_bytes([0x99u8; 32]),
+        requester: NodeId::from_bytes(*client_ep.id().as_bytes()),
     };
     let payload = encode_message(&wire::DhtMessage::FindValue(req))?;
     write_frame(&mut send, &payload).await?;
@@ -341,7 +349,9 @@ async fn find_value_with_empty_store_returns_no_providers_but_closer_nodes() -> 
         "PR-2 FindValue returns no providers (record store lands in PR 3)"
     );
     assert!(
-        resp.closer_nodes.contains(&[0x42u8; 32]),
+        resp.closer_nodes
+            .iter()
+            .any(|n| n == &NodeId::from_bytes([0x42u8; 32])),
         "seeded peer must appear in closer_nodes"
     );
 
@@ -367,7 +377,9 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let rate_limiter = permissive_dht_rate_limiter(&metrics);
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *server_id.as_bytes(),
+    ))));
     let handler = Arc::new(DhtHandler::with_routing(
         server_id,
         Arc::clone(&routing),
@@ -413,8 +425,8 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
     // Authenticated client A sends a FindNode whose `requester` claims to
     // be the unrelated `attacker_id`.
     let req = wire::FindNodeRequest {
-        target: [0x12; 32],
-        requester: attacker_id,
+        target: NodeId::from_bytes([0x12; 32]),
+        requester: NodeId::from_bytes(attacker_id),
     };
     let payload = encode_message(&wire::DhtMessage::FindNode(req))?;
     write_frame(&mut send, &payload).await?;
@@ -431,11 +443,11 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
 
     let t = routing.lock().expect("routing lock poisoned");
     assert!(
-        t.contains(client_id.as_bytes()),
+        t.contains(&NodeId::from_bytes(*client_id.as_bytes())),
         "authenticated client must be inserted by the connection-level refresh"
     );
     assert!(
-        !t.contains(&attacker_id),
+        !t.contains(&NodeId::from_bytes(attacker_id)),
         "attacker-supplied req.requester must NOT be inserted (routing-table poisoning guard)"
     );
     Ok(())
@@ -478,7 +490,9 @@ mod adr_013_error_codes {
         let metrics = Arc::new(Metrics::new());
         let limiter = permissive_limiter(&metrics);
         let rate_limiter = permissive_dht_rate_limiter(&metrics);
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *server_id.as_bytes(),
+        ))));
         let handler = Arc::new(DhtHandler::with_routing(
             server_id,
             routing,
@@ -569,8 +583,8 @@ mod adr_013_error_codes {
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         // FindNodeResponse is a response variant; the handler rejects it.
         let resp = wire::DhtMessage::FindNodeResponse(wire::FindNodeResponse {
-            target: [0u8; 32],
-            closer_nodes: Vec::new(),
+            target: NodeId::from_bytes([0u8; 32]),
+            closer_nodes: wire::CloserNodes::default(),
         });
         let payload = encode_message(&resp)?;
         write_frame(&mut send, &payload).await?;
@@ -607,9 +621,13 @@ mod adr_013_error_codes {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes: vec![[0x01u8; 32], [0x02u8; 32], [0x03u8; 32]],
+            hashes: vec![
+                ContentHash::from_bytes([0x01u8; 32]),
+                ContentHash::from_bytes([0x02u8; 32]),
+                ContentHash::from_bytes([0x03u8; 32]),
+            ],
             // Claim a holder that is NOT the authenticated client id.
-            holder: [0xAB; 32],
+            holder: NodeId::from_bytes([0xAB; 32]),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut send, &payload).await?;
@@ -645,8 +663,11 @@ mod adr_013_error_codes {
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         // 257 hashes > the 256 wire cap.
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes: vec![[0x07u8; 32]; decdn_protocol::dht::MAX_BATCH_STORE_HASHES + 1],
-            holder: *client_ep.id().as_bytes(),
+            hashes: vec![
+                ContentHash::from_bytes([0x07u8; 32]);
+                decdn_protocol::dht::MAX_BATCH_STORE_HASHES + 1
+            ],
+            holder: NodeId::from_bytes(*client_ep.id().as_bytes()),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut send, &payload).await?;
@@ -684,7 +705,9 @@ mod adr_013_error_codes {
             max_tracked_per_peer: 4096,
         };
         let rate_limiter = Arc::new(DhtRateLimiter::new(&rate_cfg, Arc::clone(&metrics)));
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *server_id.as_bytes(),
+        ))));
         let handler = Arc::new(DhtHandler::with_routing(
             server_id,
             routing,
@@ -725,8 +748,8 @@ mod adr_013_error_codes {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi #1: {e}"))?;
         let req = wire::DhtMessage::FindNode(wire::FindNodeRequest {
-            target: [0u8; 32],
-            requester: *client_ep.id().as_bytes(),
+            target: NodeId::from_bytes([0u8; 32]),
+            requester: NodeId::from_bytes(*client_ep.id().as_bytes()),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s1, &payload).await?;
@@ -772,7 +795,9 @@ mod store_admission {
         let metrics = Arc::new(Metrics::new());
         let limiter = permissive_limiter(&metrics);
         let rate_limiter = permissive_dht_rate_limiter(&metrics);
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *server_id.as_bytes(),
+        ))));
         let records = empty_record_store();
 
         // Need the client NodeId in the active-staker set BEFORE we
@@ -780,7 +805,7 @@ mod store_admission {
         let client_sk = fresh_key();
         let client_id = client_sk.public();
         let mut active = std::collections::HashSet::new();
-        active.insert(*client_id.as_bytes());
+        active.insert(NodeId::from_bytes(*client_id.as_bytes()));
         let staker_set: Arc<dyn StakerSet> =
             Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::new(active));
 
@@ -819,7 +844,7 @@ mod store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
-        let target_hash = [0xAAu8; 32];
+        let target_hash = ContentHash::from_bytes([0xAAu8; 32]);
 
         // Store the record.
         {
@@ -829,7 +854,7 @@ mod store_admission {
                 .map_err(|e| anyhow::anyhow!("open_bi store: {e}"))?;
             let req = wire::DhtMessage::Store(wire::StoreRequest {
                 hash: target_hash,
-                holder: *client_id.as_bytes(),
+                holder: NodeId::from_bytes(*client_id.as_bytes()),
             });
             let payload = encode_message(&req)?;
             write_frame(&mut s, &payload).await?;
@@ -852,7 +877,7 @@ mod store_admission {
                 .map_err(|e| anyhow::anyhow!("open_bi find: {e}"))?;
             let req = wire::DhtMessage::FindValue(wire::FindValueRequest {
                 hash: target_hash,
-                requester: *client_id.as_bytes(),
+                requester: NodeId::from_bytes(*client_id.as_bytes()),
             });
             let payload = encode_message(&req)?;
             write_frame(&mut s, &payload).await?;
@@ -866,7 +891,7 @@ mod store_admission {
             assert_eq!(resp.hash, target_hash);
             assert_eq!(
                 resp.providers,
-                vec![*client_id.as_bytes()],
+                vec![NodeId::from_bytes(*client_id.as_bytes())],
                 "stored holder must appear in providers"
             );
         }
@@ -891,7 +916,9 @@ mod store_admission {
         let metrics = Arc::new(Metrics::new());
         let limiter = permissive_limiter(&metrics);
         let rate_limiter = permissive_dht_rate_limiter(&metrics);
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *server_id.as_bytes(),
+        ))));
 
         // Empty staker set ⇒ EVERY publisher is non-staked ⇒ every
         // Store rejects. This is the "no operator opt-in" default.
@@ -936,8 +963,8 @@ mod store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::Store(wire::StoreRequest {
-            hash: [0xCCu8; 32],
-            holder: *client_ep.id().as_bytes(),
+            hash: ContentHash::from_bytes([0xCCu8; 32]),
+            holder: NodeId::from_bytes(*client_ep.id().as_bytes()),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
@@ -977,7 +1004,9 @@ mod store_admission {
         let metrics = Arc::new(Metrics::new());
         let limiter = permissive_limiter(&metrics);
         let rate_limiter = permissive_dht_rate_limiter(&metrics);
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *server_id.as_bytes(),
+        ))));
 
         // Both the client AND the fake `holder` (B) are staked, so the
         // staker filter alone would let this through — the
@@ -986,8 +1015,8 @@ mod store_admission {
         let client_id = client_sk.public();
         let fake_holder: [u8; 32] = [0xBB; 32];
         let mut active = std::collections::HashSet::new();
-        active.insert(*client_id.as_bytes());
-        active.insert(fake_holder);
+        active.insert(NodeId::from_bytes(*client_id.as_bytes()));
+        active.insert(NodeId::from_bytes(fake_holder));
         let staker_set: Arc<dyn StakerSet> =
             Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::new(active));
         let records = empty_record_store();
@@ -1029,8 +1058,8 @@ mod store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::Store(wire::StoreRequest {
-            hash: [0xDDu8; 32],
-            holder: fake_holder, // != client_id
+            hash: ContentHash::from_bytes([0xDDu8; 32]),
+            holder: NodeId::from_bytes(fake_holder), // != client_id
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
@@ -1082,12 +1111,14 @@ mod batch_store_admission {
         let limiter = permissive_limiter(&metrics);
         let rate_limiter = Arc::new(DhtRateLimiter::new(&rate_cfg, Arc::clone(&metrics)));
         let metrics_handle = Arc::clone(&metrics);
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *server_id.as_bytes(),
+        ))));
         let records = empty_record_store();
 
         let client_id = client_sk.public();
         let mut active = std::collections::HashSet::new();
-        active.insert(*client_id.as_bytes());
+        active.insert(NodeId::from_bytes(*client_id.as_bytes()));
         let staker_set: Arc<dyn StakerSet> =
             Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::new(active));
 
@@ -1128,8 +1159,8 @@ mod batch_store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes,
-            holder: *client_id.as_bytes(),
+            hashes: hashes.into_iter().map(ContentHash::from_bytes).collect(),
+            holder: NodeId::from_bytes(*client_id.as_bytes()),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
@@ -1171,7 +1202,7 @@ mod batch_store_admission {
     #[tokio::test(flavor = "multi_thread")]
     async fn batch_store_all_admitted_for_staked_publisher() -> anyhow::Result<()> {
         let client_sk = fresh_key();
-        let holder = *client_sk.public().as_bytes();
+        let holder = NodeId::from_bytes(*client_sk.public().as_bytes());
         let hashes: Vec<[u8; 32]> = (1u8..=5).map(|i| [i; 32]).collect();
         let (ack, records, _metrics) =
             run_batch_store(client_sk, hashes.clone(), permissive_rate_cfg()).await?;
@@ -1183,7 +1214,9 @@ mod batch_store_admission {
         let mut store = records.lock().expect("records lock");
         for h in &hashes {
             assert!(
-                store.providers_at(h, 0).contains(&holder),
+                store
+                    .providers_at(&ContentHash::from_bytes(*h), 0)
+                    .contains(&holder),
                 "hash {h:?} must be in the record store after a batch admit"
             );
         }
@@ -1196,7 +1229,7 @@ mod batch_store_admission {
     #[tokio::test(flavor = "multi_thread")]
     async fn batch_store_single_hash_admitted() -> anyhow::Result<()> {
         let client_sk = fresh_key();
-        let holder = *client_sk.public().as_bytes();
+        let holder = NodeId::from_bytes(*client_sk.public().as_bytes());
         let (ack, records, _metrics) =
             run_batch_store(client_sk, vec![[0x42u8; 32]], permissive_rate_cfg()).await?;
         assert_eq!(ack.results, vec![true]);
@@ -1204,7 +1237,7 @@ mod batch_store_admission {
             records
                 .lock()
                 .expect("records lock")
-                .providers_at(&[0x42u8; 32], 0)
+                .providers_at(&ContentHash::from_bytes([0x42u8; 32]), 0)
                 .contains(&holder)
         );
         Ok(())
@@ -1223,7 +1256,9 @@ mod batch_store_admission {
         let metrics = Arc::new(Metrics::new());
         let limiter = permissive_limiter(&metrics);
         let rate_limiter = permissive_dht_rate_limiter(&metrics);
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *server_id.as_bytes(),
+        ))));
         let handler = Arc::new(DhtHandler::with_routing(
             server_id,
             routing,
@@ -1261,8 +1296,11 @@ mod batch_store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes: vec![[0x01u8; 32], [0x02u8; 32]],
-            holder: [0xAB; 32], // != authenticated client id
+            hashes: vec![
+                ContentHash::from_bytes([0x01u8; 32]),
+                ContentHash::from_bytes([0x02u8; 32]),
+            ],
+            holder: NodeId::from_bytes([0xAB; 32]), // != authenticated client id
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
@@ -1302,7 +1340,9 @@ mod batch_store_admission {
         let metrics = Arc::new(Metrics::new());
         let limiter = permissive_limiter(&metrics);
         let rate_limiter = permissive_dht_rate_limiter(&metrics);
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *server_id.as_bytes(),
+        ))));
         let records = empty_record_store();
         // Staker set deliberately does NOT contain the client.
         let staker_set: Arc<dyn StakerSet> =
@@ -1345,8 +1385,11 @@ mod batch_store_admission {
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = wire::DhtMessage::BatchStore(wire::BatchStoreRequest {
-            hashes: vec![[0x01u8; 32], [0x02u8; 32]],
-            holder: *client_sk.public().as_bytes(),
+            hashes: vec![
+                ContentHash::from_bytes([0x01u8; 32]),
+                ContentHash::from_bytes([0x02u8; 32]),
+            ],
+            holder: NodeId::from_bytes(*client_sk.public().as_bytes()),
         });
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
@@ -1380,7 +1423,7 @@ mod batch_store_admission {
     #[tokio::test(flavor = "multi_thread")]
     async fn batch_store_partial_admit_when_over_rate_budget() -> anyhow::Result<()> {
         let client_sk = fresh_key();
-        let holder = *client_sk.public().as_bytes();
+        let holder = NodeId::from_bytes(*client_sk.public().as_bytes());
         let hashes: Vec<[u8; 32]> = (1u8..=6).map(|i| [i; 32]).collect();
         let rate_cfg = DhtRateLimitConfig {
             // per-peer is the binding layer: burst 4, slow refill so no
@@ -1411,11 +1454,17 @@ mod batch_store_admission {
         let mut store = records.lock().expect("records lock");
         // Admitted hashes present; deferred ones absent.
         for h in hashes.iter().take(4) {
-            assert!(store.providers_at(h, 0).contains(&holder));
+            assert!(
+                store
+                    .providers_at(&ContentHash::from_bytes(*h), 0)
+                    .contains(&holder)
+            );
         }
         for h in hashes.iter().skip(4) {
             assert!(
-                !store.providers_at(h, 0).contains(&holder),
+                !store
+                    .providers_at(&ContentHash::from_bytes(*h), 0)
+                    .contains(&holder),
                 "deferred hash {h:?} must NOT be inserted"
             );
         }
@@ -1452,9 +1501,11 @@ mod batch_store_client {
         let metrics = Arc::new(Metrics::new());
         let limiter = permissive_limiter(&metrics);
         let rate_limiter = permissive_dht_rate_limiter(&metrics);
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*server_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *server_id.as_bytes(),
+        ))));
         let mut active = std::collections::HashSet::new();
-        active.insert(client_id);
+        active.insert(NodeId::from_bytes(client_id));
         let staker_set: Arc<dyn StakerSet> =
             Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::new(active));
         let handler = Arc::new(DhtHandler::with_routing(
@@ -1497,7 +1548,17 @@ mod batch_store_client {
             spin_up_looping_staked_server(holder).await?;
         let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
         let hashes: Vec<[u8; 32]> = (1u8..=4).map(|i| [i; 32]).collect();
-        let ack = client::batch_store(&client_ep, target, hashes.clone(), holder).await?;
+        let ack = client::batch_store(
+            &client_ep,
+            target,
+            hashes
+                .iter()
+                .copied()
+                .map(ContentHash::from_bytes)
+                .collect(),
+            NodeId::from_bytes(holder),
+        )
+        .await?;
         assert_eq!(ack.results, vec![true; 4]);
         client_ep.close().await;
         server_ep.close().await;
@@ -1521,9 +1582,13 @@ mod batch_store_client {
         let results = client::batch_store_with_fallback(
             &client_ep,
             target,
-            *server_id.as_bytes(),
-            hashes.clone(),
-            holder,
+            NodeId::from_bytes(*server_id.as_bytes()),
+            hashes
+                .iter()
+                .copied()
+                .map(ContentHash::from_bytes)
+                .collect(),
+            NodeId::from_bytes(holder),
             &fallback,
         )
         .await;
@@ -1553,14 +1618,18 @@ mod batch_store_client {
         let hashes: Vec<[u8; 32]> = (1u8..=3).map(|i| [i; 32]).collect();
         let fallback = BatchStoreFallback::new(Duration::from_mins(10));
         // Pre-mark the receiver unsupported so the helper skips batching.
-        fallback.mark_unsupported(*server_id.as_bytes());
+        fallback.mark_unsupported(NodeId::from_bytes(*server_id.as_bytes()));
 
         let results = client::batch_store_with_fallback(
             &client_ep,
             target,
-            *server_id.as_bytes(),
-            hashes.clone(),
-            holder,
+            NodeId::from_bytes(*server_id.as_bytes()),
+            hashes
+                .iter()
+                .copied()
+                .map(ContentHash::from_bytes)
+                .collect(),
+            NodeId::from_bytes(holder),
             &fallback,
         )
         .await;
@@ -1677,12 +1746,14 @@ mod batch_store_fallback_negotiation {
         });
 
         let client_sk = fresh_key();
-        let holder = *client_sk.public().as_bytes();
+        let holder = NodeId::from_bytes(*client_sk.public().as_bytes());
         let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
         let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-        let target_id = *server_id.as_bytes();
+        let target_id = NodeId::from_bytes(*server_id.as_bytes());
         let fallback = BatchStoreFallback::new(Duration::from_mins(10));
-        let hashes: Vec<[u8; 32]> = (1u8..=3).map(|i| [i; 32]).collect();
+        let hashes: Vec<ContentHash> = (1u8..=3)
+            .map(|i| ContentHash::from_bytes([i; 32]))
+            .collect();
 
         // First publish: batch attempted → UNSUPPORTED close → per-hash
         // fallback delivers, and the receiver is cached unsupported.
@@ -1810,12 +1881,14 @@ mod per_hash_fallback_timeout_bail {
         // burn one timeout per hash. A short per-hash timeout keeps the
         // test near `K × 300ms`; the connect shares the same (generous on
         // loopback) budget.
-        let hashes: Vec<[u8; 32]> = (1u8..=8).map(|i| [i; 32]).collect();
+        let hashes: Vec<ContentHash> = (1u8..=8)
+            .map(|i| ContentHash::from_bytes([i; 32]))
+            .collect();
         let results = client::per_hash_fallback(
             &client_ep,
             target,
             &hashes,
-            holder,
+            NodeId::from_bytes(holder),
             Duration::from_millis(300),
         )
         .await;

@@ -40,7 +40,10 @@ use iroh::Watcher as _;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
-use crate::dht::{DhtRateLimiter, DhtRejectLayer, RecordStore, RoutingTable, StakerSet};
+use crate::dht::{
+    AuthenticatedNodeId, DhtRateLimiter, DhtRejectLayer, NodeId, RecordStore, RoutingTable,
+    StakerSet,
+};
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 
@@ -107,7 +110,9 @@ impl DhtHandler {
         staker_set: Arc<dyn StakerSet>,
         records: Arc<Mutex<RecordStore>>,
     ) -> Self {
-        let routing = Arc::new(Mutex::new(RoutingTable::new(*self_id.as_bytes())));
+        let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *self_id.as_bytes(),
+        ))));
         Self {
             self_id,
             routing,
@@ -180,7 +185,12 @@ impl DhtHandler {
         // UDP after hole-punching) and caching the initial value would
         // permanently disable the per-IP rate-limit layer for any
         // connection that started relay-only.
-        let peer_node_id = *conn.remote_id().as_bytes();
+        // Lift the handshake-bound identity into the trust boundary. From here
+        // on the only `NodeId` the handler treats as "who is actually on the
+        // other end" flows through this `AuthenticatedNodeId`; wire-provided
+        // ids (`holder`, `requester`) are a distinct type and cannot reach the
+        // routing-table-insert path without an explicit `.node_id()`.
+        let peer = AuthenticatedNodeId::from_remote_id(&conn.remote_id());
 
         // ADR 022 §DHT Rate Limiting check fires before any deserialization
         // of the per-stream frame body — we do it per stream below since
@@ -205,7 +215,7 @@ impl DhtHandler {
             // connection's lifetime engages the per-IP layer for
             // subsequent streams.
             let peer_ip = peer_ip(&conn);
-            if let Err(layer) = self.rate_limiter.check(&peer_node_id, peer_ip) {
+            if let Err(layer) = self.rate_limiter.check(&peer.node_id(), peer_ip) {
                 Self::close_stream_with_rate_limit(send, recv, layer);
                 continue;
             }
@@ -213,8 +223,8 @@ impl DhtHandler {
             // their NodeId via QUIC and successfully spent a rate-limit
             // token. That's the same admission criteria ADR 022 §Routing
             // Table demands for table insertion.
-            self.note_peer_seen(peer_node_id);
-            if let Err(e) = self.handle_one(peer_node_id, peer_ip, send, recv).await {
+            self.note_peer_seen(peer);
+            if let Err(e) = self.handle_one(peer, peer_ip, send, recv).await {
                 // The per-request error already carries the ADR 013 app
                 // error code via the stream reset inside `handle_one` /
                 // `read_dht_request`; here we surface the failure to
@@ -250,15 +260,18 @@ impl DhtHandler {
         );
     }
 
-    /// Refresh `peer_id` in the routing table. Silently ignores the
-    /// node's own id (the table itself enforces that, but skipping the
-    /// lock-acquire is cheap).
-    fn note_peer_seen(&self, peer_id: [u8; 32]) {
-        if peer_id == *self.self_id.as_bytes() {
+    /// Refresh the peer in the routing table. Takes an
+    /// [`AuthenticatedNodeId`] — only the QUIC-bound identity may seed the
+    /// table, never a wire-provided `requester`/`holder` (the
+    /// routing-table-poisoning guard, ADR 022 §Lookup integrity). Silently
+    /// ignores the node's own id (the table itself enforces that, but
+    /// skipping the lock-acquire is cheap).
+    fn note_peer_seen(&self, peer: AuthenticatedNodeId) {
+        if peer.node_id() == NodeId::from_bytes(*self.self_id.as_bytes()) {
             return;
         }
         if let Ok(mut table) = self.routing.lock() {
-            table.insert(peer_id);
+            table.insert(peer.node_id());
         }
     }
 
@@ -271,7 +284,7 @@ impl DhtHandler {
     /// (the per-IP layer keys on it).
     async fn handle_one(
         &self,
-        peer_node_id: [u8; 32],
+        peer: AuthenticatedNodeId,
         peer_ip: Option<IpAddr>,
         mut send: SendStream,
         mut recv: RecvStream,
@@ -295,7 +308,7 @@ impl DhtHandler {
         // `serve` bump `dht_requests_failed`, which is reserved for
         // post-admission internal failures (decode/write/timeout), not
         // intentional rejections.
-        let resp = match self.dispatch(peer_node_id, peer_ip, req) {
+        let resp = match self.dispatch(peer, peer_ip, req) {
             Ok(resp) => resp,
             Err(app_code) => {
                 let _ = send.reset(VarInt::from_u32(app_code));
@@ -334,7 +347,7 @@ impl DhtHandler {
     #[allow(clippy::needless_pass_by_value)]
     fn dispatch(
         &self,
-        peer_node_id: [u8; 32],
+        peer: AuthenticatedNodeId,
         peer_ip: Option<IpAddr>,
         msg: DhtServerRequest,
     ) -> Result<wire::DhtMessage, u32> {
@@ -346,11 +359,11 @@ impl DhtHandler {
                 wire::DhtMessage::FindValueResponse(self.handle_find_value(req))
             }
             DhtServerRequest::Store(req) => {
-                wire::DhtMessage::StoreAck(self.handle_store(peer_node_id, req))
+                wire::DhtMessage::StoreAck(self.handle_store(peer, req))
             }
-            DhtServerRequest::BatchStore(req) => wire::DhtMessage::BatchStoreAck(
-                self.handle_batch_store(peer_node_id, peer_ip, req)?,
-            ),
+            DhtServerRequest::BatchStore(req) => {
+                wire::DhtMessage::BatchStoreAck(self.handle_batch_store(peer, peer_ip, req)?)
+            }
         })
     }
 
@@ -381,19 +394,20 @@ impl DhtHandler {
     #[allow(clippy::cognitive_complexity)]
     fn handle_batch_store(
         &self,
-        peer_node_id: [u8; 32],
+        peer: AuthenticatedNodeId,
         peer_ip: Option<IpAddr>,
         req: wire::BatchStoreRequest,
     ) -> Result<wire::BatchStoreAck, u32> {
         // Step 1: batch-level holder check. AC 19's size cap (≤ 256) is
         // already enforced at wire decode (`deserialize_batch_hashes` →
         // `MALFORMED_MESSAGE`), so by the time we're here `hashes.len()`
-        // is in range.
-        if req.holder != peer_node_id {
+        // is in range. `peer.node_id()` is the explicit assertion that we are
+        // comparing the wire `holder` against the authenticated identity.
+        if req.holder != peer.node_id() {
             self.metrics.dht_store_rejected_holder_mismatch();
             tracing::debug!(
                 holder = ?req.holder,
-                peer = ?peer_node_id,
+                peer = ?peer.node_id(),
                 "dht BatchStore rejected: holder != authenticated NodeId"
             );
             return Err(APP_ERR_MALFORMED_MESSAGE);
@@ -406,7 +420,7 @@ impl DhtHandler {
         let extra = n.saturating_sub(1);
         let granted = self
             .rate_limiter
-            .admit_batch_extra(&peer_node_id, peer_ip, extra);
+            .admit_batch_extra(&peer.node_id(), peer_ip, extra);
         let k = granted.saturating_add(1).min(n);
         let deferred = n.saturating_sub(k);
         if deferred > 0 {
@@ -491,18 +505,19 @@ impl DhtHandler {
     // §STORE Flow rule order across helpers; same rationale as the
     // `ProbeHandler::serve` cognitive-complexity allow upstream.
     #[allow(clippy::cognitive_complexity)]
-    fn handle_store(&self, peer_node_id: [u8; 32], req: wire::StoreRequest) -> wire::StoreAck {
+    fn handle_store(&self, peer: AuthenticatedNodeId, req: wire::StoreRequest) -> wire::StoreAck {
         // Step 1: holder must equal the QUIC-bound peer NodeId.
         // ADR 022 §STORE Flow line 140: "The receiving node MUST reject
         // any record whose `holder` does not equal the authenticated
         // NodeId of the inbound QUIC connection." Bump a dedicated
         // counter so the lying-`holder` attack rate is visible on the
-        // scrape without `RUST_LOG=debug`.
-        if req.holder != peer_node_id {
+        // scrape without `RUST_LOG=debug`. `peer.node_id()` is the explicit
+        // assertion that the comparison is against the authenticated identity.
+        if req.holder != peer.node_id() {
             self.metrics.dht_store_rejected_holder_mismatch();
             tracing::debug!(
                 holder = ?req.holder,
-                peer = ?peer_node_id,
+                peer = ?peer.node_id(),
                 "dht Store rejected: holder != authenticated NodeId"
             );
             return wire::StoreAck {
@@ -575,7 +590,10 @@ impl DhtHandler {
         wire::FindValueResponse {
             hash: req.hash,
             providers,
-            closer_nodes: self.closest_to(&req.hash),
+            // A content hash and a NodeId share the 256-bit XOR keyspace
+            // (ADR 022 §Routing Table), so the hash is the keyspace point we
+            // measure routing-table peers against.
+            closer_nodes: self.closest_to(req.hash.as_bytes()),
         }
     }
 
@@ -588,21 +606,28 @@ impl DhtHandler {
         // NodeId from the QUIC handshake is already refreshed once per
         // admitted request in `serve()`, which is the only honest signal
         // we have about who is on the other end.
-        let closer_nodes = self.closest_to(&req.target);
+        let closer_nodes = self.closest_to(req.target.as_bytes());
         wire::FindNodeResponse {
             target: req.target,
             closer_nodes,
         }
     }
 
-    fn closest_to(&self, target: &[u8; 32]) -> Vec<[u8; 32]> {
+    /// The up-to-`MAX_CLOSER_NODES` routing-table peers closest to `target` in
+    /// XOR keyspace, ready to drop into a wire `closer_nodes` field. `target`
+    /// is a raw keyspace point so both a `NodeId` (`FindNode`) and a
+    /// `ContentHash` (`FindValue`) fit.
+    fn closest_to(&self, target: &[u8; 32]) -> wire::CloserNodes {
         let Ok(table) = self.routing.lock() else {
             // Poisoned lock — return empty; the caller will treat this as
             // "responder has nothing closer", which is honest at this
             // moment regardless of the lock state.
-            return Vec::new();
+            return wire::CloserNodes::default();
         };
-        table.closest(target, MAX_CLOSER_NODES)
+        // `closest` already caps at `K_BUCKET_SIZE == MAX_CLOSER_NODES`, so the
+        // `CloserNodes` invariant always holds; `unwrap_or_default` is a
+        // belt-and-braces fallback that can't actually fire.
+        wire::CloserNodes::try_new(table.closest(target, MAX_CLOSER_NODES)).unwrap_or_default()
     }
 }
 

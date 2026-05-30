@@ -194,7 +194,7 @@ mod tests {
     use super::*;
 
     fn peer(b: u8) -> NodeId {
-        [b; 32]
+        NodeId::from_bytes([b; 32])
     }
 
     #[test]

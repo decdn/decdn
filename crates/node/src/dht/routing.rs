@@ -24,6 +24,7 @@
 //! the bucket.
 
 use decdn_protocol::MAX_CLOSER_NODES;
+pub use decdn_protocol::NodeId;
 
 /// Number of bytes in an iroh `NodeId` (32-byte Ed25519 public key).
 /// Matches the `[u8; 32]` representation used on the wire in
@@ -39,15 +40,15 @@ pub const KEYSPACE_BITS: usize = NODE_ID_LEN * 8;
 /// into a `closer_nodes` field without re-truncation.
 pub const K_BUCKET_SIZE: usize = MAX_CLOSER_NODES;
 
-/// 32-byte routing-table peer identifier. Distinct from
-/// [`iroh::PublicKey`] only so the table can be exercised without an iroh
-/// dependency; the handler layer converts at the protocol boundary.
-pub type NodeId = [u8; NODE_ID_LEN];
-
-/// Bytewise XOR distance between two `NodeId`s. Cheap (one AVX register on
-/// 64-bit) and the only function the bucket index depends on.
+/// Bytewise XOR distance between two 32-byte keyspace points. Cheap (one AVX
+/// register on 64-bit) and the only function the bucket index depends on.
+///
+/// Operates on raw bytes so it serves the cross-domain case ADR 022 relies on:
+/// a [`NodeId`] and a `ContentHash` share the same 256-bit XOR keyspace, so the
+/// `FindValue` path measures a content hash's distance to candidate node ids
+/// with this primitive. [`xor_distance`] is the `NodeId`-vs-`NodeId` wrapper.
 #[must_use]
-pub fn xor_distance(a: &NodeId, b: &NodeId) -> [u8; NODE_ID_LEN] {
+pub fn xor_distance_bytes(a: &[u8; NODE_ID_LEN], b: &[u8; NODE_ID_LEN]) -> [u8; NODE_ID_LEN] {
     let mut out = [0u8; NODE_ID_LEN];
     for i in 0..NODE_ID_LEN {
         // Indexing is bounded by the loop range; safe and the alternative
@@ -57,6 +58,13 @@ pub fn xor_distance(a: &NodeId, b: &NodeId) -> [u8; NODE_ID_LEN] {
         }
     }
     out
+}
+
+/// Bytewise XOR distance between two `NodeId`s. Thin wrapper over
+/// [`xor_distance_bytes`] for the common same-domain case.
+#[must_use]
+pub fn xor_distance(a: &NodeId, b: &NodeId) -> [u8; NODE_ID_LEN] {
+    xor_distance_bytes(a.as_bytes(), b.as_bytes())
 }
 
 /// Compare two `NodeId`s by XOR distance to `target`. `Less` means `a` is
@@ -224,7 +232,7 @@ impl RoutingTable {
     /// Callers needing more than K candidates (e.g. ADR 022 §STORE Flow
     /// "K+3 closest" republish fanout) MUST use [`Self::closest_unbounded`].
     #[must_use]
-    pub fn closest(&self, target: &NodeId, n: usize) -> Vec<NodeId> {
+    pub fn closest(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
         let cap = n.min(K_BUCKET_SIZE);
         self.closest_unbounded(target, cap)
     }
@@ -241,13 +249,14 @@ impl RoutingTable {
     /// [`MAX_CLOSER_NODES`] and a larger result would violate the
     /// ADR 022 wire-cost ceiling. Use [`Self::closest`] for that path.
     #[must_use]
-    pub fn closest_unbounded(&self, target: &NodeId, n: usize) -> Vec<NodeId> {
+    pub fn closest_unbounded(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
         let mut candidates: Vec<NodeId> = self.buckets.iter().flatten().copied().collect();
-        // `sort_unstable_by_key` computes `xor_distance` once per element
+        // `sort_unstable_by_key` computes `xor_distance_bytes` once per element
         // and reuses the result; the older `sort_unstable_by` form would
         // recompute it twice per pairwise comparison (~`n log n` extra
-        // XORs over a fully-populated table).
-        candidates.sort_unstable_by_key(|p| xor_distance(p, target));
+        // XORs over a fully-populated table). `target` is a raw keyspace point
+        // so a `ContentHash` (FindValue) or a `NodeId` (FindNode) both fit.
+        candidates.sort_unstable_by_key(|p| xor_distance_bytes(p.as_bytes(), target));
         candidates.truncate(n);
         candidates
     }
@@ -272,7 +281,7 @@ mod tests {
     use super::*;
 
     fn id(byte: u8) -> NodeId {
-        [byte; 32]
+        NodeId::from_bytes([byte; 32])
     }
 
     /// Construct a `NodeId` that XORs with `self_id` to a value with exactly
@@ -283,7 +292,7 @@ mod tests {
         let bit_from_msb = KEYSPACE_BITS - 1 - bucket_idx;
         let byte_idx = bit_from_msb / 8;
         let bit_within = bit_from_msb % 8;
-        let mut out = *self_id;
+        let mut out = *self_id.as_bytes();
         // Flip the leading bit so distance bucket index lands on `bucket_idx`.
         if let Some(b) = out.get_mut(byte_idx) {
             *b ^= 1u8 << (7 - bit_within);
@@ -293,7 +302,7 @@ mod tests {
         if let Some(last) = out.last_mut() {
             *last ^= salt;
         }
-        out
+        NodeId::from_bytes(out)
     }
 
     #[test]
@@ -432,7 +441,7 @@ mod tests {
         for b in [0_usize, 100, 200, 255] {
             rt.insert(id_in_bucket(&self_id, b, 0));
         }
-        let closest = rt.closest(&target, 4);
+        let closest = rt.closest(target.as_bytes(), 4);
         assert_eq!(closest.len(), 4);
         // Assert the whole vector is monotonically non-decreasing by XOR
         // distance. A bug that returned "first and last correct, middle
@@ -462,15 +471,15 @@ mod tests {
         for b in 0..30_usize {
             rt.insert(id_in_bucket(&self_id, b, 0));
         }
-        assert_eq!(rt.closest(&id(0xFF), 10).len(), 10);
+        assert_eq!(rt.closest(id(0xFF).as_bytes(), 10).len(), 10);
         // Cap at K_BUCKET_SIZE even when caller asks for more.
-        assert_eq!(rt.closest(&id(0xFF), 1000).len(), K_BUCKET_SIZE);
+        assert_eq!(rt.closest(id(0xFF).as_bytes(), 1000).len(), K_BUCKET_SIZE);
     }
 
     #[test]
     fn closest_on_empty_table_is_empty() {
         let rt = RoutingTable::new(id(0));
-        assert!(rt.closest(&id(0xFF), 10).is_empty());
+        assert!(rt.closest(id(0xFF).as_bytes(), 10).is_empty());
     }
 
     /// ADR 022 §STORE Flow step 1 requires publishing to **K+3 = 23**
@@ -485,11 +494,11 @@ mod tests {
             rt.insert(id_in_bucket(&self_id, b, 0));
         }
         // The bounded variant caps at K=20 (wire `MAX_CLOSER_NODES`).
-        assert_eq!(rt.closest(&id(0xFF), 1000).len(), K_BUCKET_SIZE);
+        assert_eq!(rt.closest(id(0xFF).as_bytes(), 1000).len(), K_BUCKET_SIZE);
         // The unbounded variant returns up to `n` regardless.
-        assert_eq!(rt.closest_unbounded(&id(0xFF), 23).len(), 23);
+        assert_eq!(rt.closest_unbounded(id(0xFF).as_bytes(), 23).len(), 23);
         // And caps at table size when `n > len`.
-        assert_eq!(rt.closest_unbounded(&id(0xFF), 1000).len(), 30);
+        assert_eq!(rt.closest_unbounded(id(0xFF).as_bytes(), 1000).len(), 30);
     }
 
     #[test]
