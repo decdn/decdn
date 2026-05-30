@@ -42,11 +42,12 @@ import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
 ///           - `regionPrev[op]` + `regionLastChanged[op]` + `updateRegion`
 ///                                    (ADR 030 § Node Region Self-Attestation)
 ///           - `declaredMbps[op]`   — operator-asserted capacity (ADR 026
-///                                    § Capacity-bond curve; bond enforcement
-///                                    against the curve `bond = k × Mbps^α`
-///                                    is documented in `capacityBond` view
-///                                    and intended for off-chain inspection
-///                                    + a future enforcement PR)
+///                                    § Capacity-bond curve), set via
+///                                    `declareMbps` within the governable
+///                                    `[minCapacityMbps, maxCapacityMbps]`
+///                                    band; the bond-curve coupling
+///                                    `bond = k × Mbps^α` is a future
+///                                    enforcement PR
 ///           - `pendingCredit[op]`  — Genesis Bond Credit accounting
 ///                                    (ADR 026 § Genesis Bond Credits)
 ///         Slash math also applies to the unvested portion of
@@ -114,6 +115,22 @@ contract CapacityBond is
 
     uint256 internal constant MIN_STAKE_FLOOR = 10_000e18;
     uint256 internal constant MIN_STAKE_CEILING = 1_000_000e18;
+
+    /// @notice Bounds on the governable declared-capacity band per ADR 026
+    ///         § Capacity-bond curve, expressed in Mbps. `minCapacityMbps`
+    ///         ∈ [10, 1000] (default 10 Mbps) bars sub-floor dust
+    ///         declarations; `maxCapacityMbps` ∈ [50_000, 1_000_000] (default
+    ///         200 Gbps) caps per-operator declared capacity. The two ranges
+    ///         are disjoint — `MIN_CAPACITY_CEILING_MBPS (1000) <
+    ///         MAX_CAPACITY_FLOOR_MBPS (50_000)` — so the floor is always
+    ///         strictly below the ceiling without a cross-parameter check.
+    ///         INVARIANT: keep the ranges disjoint; relaxing either into
+    ///         overlap silently breaks that guarantee. Guarded by
+    ///         `test_capacityBand_floorAlwaysBelowCeiling`.
+    uint256 internal constant MIN_CAPACITY_FLOOR_MBPS = 10;
+    uint256 internal constant MIN_CAPACITY_CEILING_MBPS = 1000;
+    uint256 internal constant MAX_CAPACITY_FLOOR_MBPS = 50_000;
+    uint256 internal constant MAX_CAPACITY_CEILING_MBPS = 1_000_000;
 
     // Deviation from ADR 009 § CapacityBond curve and governance parameters
     // (spec table is [7d, 60d]). Bounds narrowed to [3d, 30d] for the testnet
@@ -216,14 +233,21 @@ contract CapacityBond is
     mapping(address operator => uint64) internal _slashedAtEpoch;
 
     /// @notice Operator-asserted serving capacity in Mbps (ADR 026
-    ///         § Capacity-bond curve). Stored verbatim — curve enforcement
-    ///         `activeStake ≥ k × Mbps^α` is not enforced at the contract
-    ///         layer in this revision; downstream readers and the Governor
-    ///         age-ramp do not depend on it.
+    ///         § Capacity-bond curve). `declareMbps` enforces the governable
+    ///         `[minCapacityMbps, maxCapacityMbps]` band; the bond-curve
+    ///         coupling `activeStake ≥ k × Mbps^α` is not enforced at the
+    ///         contract layer in this revision; downstream readers and the
+    ///         Governor age-ramp do not depend on it.
     mapping(address operator => uint256) public declaredMbps;
 
     uint256 public minStake;
     uint256 public unbondingPeriod;
+
+    /// @notice Governable declared-capacity band (Mbps) enforced on
+    ///         `declareMbps`. Defaults: 10 Mbps floor, 200 Gbps (200_000 Mbps)
+    ///         ceiling (ADR 026 § Capacity-bond curve).
+    uint256 public minCapacityMbps;
+    uint256 public maxCapacityMbps;
 
     /// @notice Treasury destination for unvested Genesis Bond Credit forfeited
     ///         by an operator who initiates `requestUnstake` before 24mo of
@@ -398,6 +422,8 @@ contract CapacityBond is
     event MaxMultiaddrSizeUpdated(uint256 oldValue, uint256 newValue);
     event RegionStabilityWindowUpdated(uint256 oldValue, uint256 newValue);
     event ClaimSlashGateEpochsUpdated(uint64 oldValue, uint64 newValue);
+    event MinCapacityMbpsUpdated(uint256 oldValue, uint256 newValue);
+    event MaxCapacityMbpsUpdated(uint256 oldValue, uint256 newValue);
 
     event NodeRegistered(
         bytes32 indexed nodeId,
@@ -451,6 +477,7 @@ contract CapacityBond is
     error UnbondingNotComplete(uint256 unlockAt);
     error NoUnbondingRequest();
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
+    error DeclaredCapacityOutOfBand(uint256 mbps, uint256 floor, uint256 ceiling);
     error NodeAlreadyRegistered();
     error NodeIdAlreadyBound(address currentOwner);
     error AddressAlreadyBound(bytes32 currentNodeId);
@@ -534,6 +561,12 @@ contract CapacityBond is
         // initial `windowEpochs` default). Governance can retune via
         // `setClaimSlashGateEpochs` in lock-step with FeeRouter changes.
         claimSlashGateEpochs = 13;
+
+        // Declared-capacity band defaults (ADR 026 § Capacity-bond curve):
+        // 10 Mbps floor (bars sub-floor dust declarations), 200 Gbps ceiling.
+        // Governable post-deploy via setMinCapacityMbps / setMaxCapacityMbps.
+        minCapacityMbps = 10;
+        maxCapacityMbps = 200_000;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
@@ -632,10 +665,15 @@ contract CapacityBond is
     }
 
     /// @notice Self-attest serving capacity in Mbps (ADR 026 § Capacity-bond
-    ///         curve). Stored without enforcement against `activeStake` in
-    ///         this revision; off-chain consumers and a future enforcement
-    ///         PR are the consumers.
+    ///         curve). The declaration must fall within the governable
+    ///         `[minCapacityMbps, maxCapacityMbps]` band — out-of-band values
+    ///         revert (the band is validated, not silently coerced to a
+    ///         bound). The bond-curve coupling against `activeStake` is not
+    ///         enforced at the contract layer in this revision.
     function declareMbps(uint256 mbps) external whenNotPaused {
+        if (mbps < minCapacityMbps || mbps > maxCapacityMbps) {
+            revert DeclaredCapacityOutOfBand({ mbps: mbps, floor: minCapacityMbps, ceiling: maxCapacityMbps });
+        }
         uint256 old = declaredMbps[msg.sender];
         declaredMbps[msg.sender] = mbps;
         emit MbpsDeclared(msg.sender, old, mbps);
@@ -1255,6 +1293,27 @@ contract CapacityBond is
         emit MinStakeUpdated(oldMinStake, newMinStake);
     }
 
+    /// @notice Set the floor of the declared-capacity band (ADR 026
+    ///         § Capacity-bond curve). Bounded [10, 1000] Mbps; the lower
+    ///         bound equals the launch default so governance can only raise
+    ///         the floor, never reopen the sub-floor dust case.
+    function setMinCapacityMbps(uint256 newMin) external onlyRole(GOVERNANCE_ROLE) {
+        _enforceMinCapacityBounds(newMin);
+        uint256 oldMin = minCapacityMbps;
+        minCapacityMbps = newMin;
+        emit MinCapacityMbpsUpdated(oldMin, newMin);
+    }
+
+    /// @notice Set the ceiling of the declared-capacity band (ADR 026
+    ///         § Capacity-bond curve). Bounded [50_000, 1_000_000] Mbps
+    ///         (50–1000 Gbps), always strictly above the floor's range.
+    function setMaxCapacityMbps(uint256 newMax) external onlyRole(GOVERNANCE_ROLE) {
+        _enforceMaxCapacityBounds(newMax);
+        uint256 oldMax = maxCapacityMbps;
+        maxCapacityMbps = newMax;
+        emit MaxCapacityMbpsUpdated(oldMax, newMax);
+    }
+
     function setUnbondingPeriod(uint256 newPeriod) external onlyRole(GOVERNANCE_ROLE) {
         _enforceUnbondingPeriodBounds(newPeriod);
         uint256 oldPeriod = unbondingPeriod;
@@ -1469,6 +1528,22 @@ contract CapacityBond is
     function _enforceMinStakeBounds(uint256 value) internal pure {
         if (value < MIN_STAKE_FLOOR || value > MIN_STAKE_CEILING) {
             revert ParamOutOfBounds({ value: value, floor: MIN_STAKE_FLOOR, ceiling: MIN_STAKE_CEILING });
+        }
+    }
+
+    function _enforceMinCapacityBounds(uint256 value) internal pure {
+        if (value < MIN_CAPACITY_FLOOR_MBPS || value > MIN_CAPACITY_CEILING_MBPS) {
+            revert ParamOutOfBounds({
+                value: value, floor: MIN_CAPACITY_FLOOR_MBPS, ceiling: MIN_CAPACITY_CEILING_MBPS
+            });
+        }
+    }
+
+    function _enforceMaxCapacityBounds(uint256 value) internal pure {
+        if (value < MAX_CAPACITY_FLOOR_MBPS || value > MAX_CAPACITY_CEILING_MBPS) {
+            revert ParamOutOfBounds({
+                value: value, floor: MAX_CAPACITY_FLOOR_MBPS, ceiling: MAX_CAPACITY_CEILING_MBPS
+            });
         }
     }
 

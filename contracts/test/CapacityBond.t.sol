@@ -356,6 +356,151 @@ contract CapacityBondTest is Test {
         assertEq(bond.declaredMbps(operator), 1000);
     }
 
+    // ADR 026 § Capacity-bond curve — declared-capacity band on `declareMbps`.
+
+    function test_capacityBand_defaults() public view {
+        assertEq(bond.minCapacityMbps(), 10);
+        assertEq(bond.maxCapacityMbps(), 200_000);
+    }
+
+    function test_declareMbps_acceptsFloorAndCeiling() public {
+        vm.startPrank(operator);
+        bond.declareMbps(10);
+        assertEq(bond.declaredMbps(operator), 10);
+        bond.declareMbps(200_000);
+        assertEq(bond.declaredMbps(operator), 200_000);
+        vm.stopPrank();
+    }
+
+    function test_declareMbps_revertsBelowFloor() public {
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.DeclaredCapacityOutOfBand.selector, 9, 10, 200_000));
+        bond.declareMbps(9);
+    }
+
+    function test_declareMbps_revertsZero() public {
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.DeclaredCapacityOutOfBand.selector, 0, 10, 200_000));
+        bond.declareMbps(0);
+    }
+
+    function test_declareMbps_revertsAboveCeiling() public {
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.DeclaredCapacityOutOfBand.selector, 200_001, 10, 200_000));
+        bond.declareMbps(200_001);
+    }
+
+    function test_setMinCapacity_updatesBandAndEmits() public {
+        vm.expectEmit(false, false, false, true, address(bond));
+        emit CapacityBond.MinCapacityMbpsUpdated(10, 500);
+        vm.prank(admin);
+        bond.setMinCapacityMbps(500);
+        assertEq(bond.minCapacityMbps(), 500);
+
+        // 100 Mbps is now below the raised floor and reverts.
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.DeclaredCapacityOutOfBand.selector, 100, 500, 200_000));
+        bond.declareMbps(100);
+
+        vm.prank(operator);
+        bond.declareMbps(500);
+        assertEq(bond.declaredMbps(operator), 500);
+    }
+
+    function test_setMaxCapacity_updatesBandAndEmits() public {
+        vm.expectEmit(false, false, false, true, address(bond));
+        emit CapacityBond.MaxCapacityMbpsUpdated(200_000, 50_000);
+        vm.prank(admin);
+        bond.setMaxCapacityMbps(50_000);
+        assertEq(bond.maxCapacityMbps(), 50_000);
+
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.DeclaredCapacityOutOfBand.selector, 60_000, 10, 50_000));
+        bond.declareMbps(60_000);
+    }
+
+    function test_setMinCapacity_revertsOutOfBounds() public {
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, 9, 10, 1000));
+        bond.setMinCapacityMbps(9);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, 1001, 10, 1000));
+        bond.setMinCapacityMbps(1001);
+        vm.stopPrank();
+    }
+
+    function test_setMaxCapacity_revertsOutOfBounds() public {
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, 49_999, 50_000, 1_000_000));
+        bond.setMaxCapacityMbps(49_999);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, 1_000_001, 50_000, 1_000_000));
+        bond.setMaxCapacityMbps(1_000_001);
+        vm.stopPrank();
+    }
+
+    function test_setCapacity_onlyGovernance() public {
+        bytes32 role = bond.GOVERNANCE_ROLE();
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, operator, role)
+        );
+        bond.setMinCapacityMbps(500);
+
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, operator, role)
+        );
+        bond.setMaxCapacityMbps(50_000);
+    }
+
+    function test_declareMbps_emitsOldAndNewValue() public {
+        vm.startPrank(operator);
+
+        // First declaration: `old` is the zero default.
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.MbpsDeclared(operator, 0, 100);
+        bond.declareMbps(100);
+
+        // Re-declaration: `old` is the prior value, not zero.
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.MbpsDeclared(operator, 100, 500);
+        bond.declareMbps(500);
+
+        vm.stopPrank();
+        assertEq(bond.declaredMbps(operator), 500);
+    }
+
+    function test_setMinCapacity_acceptsInclusiveBounds() public {
+        vm.startPrank(admin);
+        bond.setMinCapacityMbps(10); // floor of the [10, 1000] setter range
+        assertEq(bond.minCapacityMbps(), 10);
+        bond.setMinCapacityMbps(1000); // ceiling of the setter range
+        assertEq(bond.minCapacityMbps(), 1000);
+        vm.stopPrank();
+    }
+
+    function test_setMaxCapacity_acceptsInclusiveBounds() public {
+        vm.startPrank(admin);
+        bond.setMaxCapacityMbps(50_000); // floor of the [50_000, 1_000_000] setter range
+        assertEq(bond.maxCapacityMbps(), 50_000);
+        bond.setMaxCapacityMbps(1_000_000); // ceiling of the setter range
+        assertEq(bond.maxCapacityMbps(), 1_000_000);
+        vm.stopPrank();
+    }
+
+    /// @dev Guards the disjoint-range invariant that lets `declareMbps` skip a
+    ///      cross-parameter `min < max` check: pushing the floor to its highest
+    ///      governance-reachable value (MIN_CAPACITY_CEILING_MBPS) and the
+    ///      ceiling to its lowest (MAX_CAPACITY_FLOOR_MBPS) must still leave
+    ///      `min < max`. If a future edit relaxes those constants into overlap,
+    ///      this trips.
+    function test_capacityBand_floorAlwaysBelowCeiling() public {
+        vm.startPrank(admin);
+        bond.setMinCapacityMbps(1000); // MIN_CAPACITY_CEILING_MBPS
+        bond.setMaxCapacityMbps(50_000); // MAX_CAPACITY_FLOOR_MBPS
+        vm.stopPrank();
+        assertLt(bond.minCapacityMbps(), bond.maxCapacityMbps());
+    }
+
     function test_genesisCredit_grantWithinWindow() public {
         _setupGenesisGrant(50_000e18);
         CapacityBond.PendingCredit memory pc = bond.pendingCredit(operator);
