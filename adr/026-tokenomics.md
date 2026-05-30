@@ -130,20 +130,25 @@ bond_required(Mbps) = k × Mbps^α
 | α (exponent) | 1.2 | [1.0, 1.8] | 1.0 = linear (no decentralization pressure); 1.8 = strong concentration penalty |
 | k (bond constant, TOKEN) | 12.6 | bounded by 1G tier ∈ [10K, 200K TOKEN] | Picked so `bond_required(1000) ≈ 50,000 TOKEN` |
 | `MAX_CAPACITY_PER_OPERATOR` | 200 Gbps | [50, 1000] Gbps | Prevents one operator cornering edge-tier capacity |
+| `MIN_CAPACITY_PER_OPERATOR` | 10 Mbps | [10, 1000] Mbps | Floor on declared capacity; bars sub-floor dust registration. ~200 TOKEN bond at the default. The lower bound equals the default, so governance can only raise the floor |
 
 **Worked numbers at α=1.2, k=12.6.**
 
 | Tier | Capacity | Bond | Bond per Mbps | Ratio vs 1G |
 |---|---:|---:|---:|---:|
+| Floor | 10 Mbps | 200 TOKEN | 20 | 0.4× |
 | Entry | 1 Gbps | 50,000 TOKEN | 50 | 1.0× |
 | Mid | 10 Gbps | 795,000 TOKEN | 80 | 1.6× |
 | Edge | 100 Gbps | 12,600,000 TOKEN | 126 | 2.5× |
 
 The super-linear curve makes high-capacity operators pay more per Mbps. At α=1.2 the 100G tier pays 2.5× the 1G per-Mbps rate — the curve's decentralization-pressure target.
 
+**Capacity floor.** `MIN_CAPACITY_PER_OPERATOR` bounds the curve from below, symmetric to `MAX_CAPACITY_PER_OPERATOR`. Without a floor the curve evaluates to ~13 TOKEN at 1 Mbps — far below the value of the registered-operator slot that bond buys. A slot counts toward operator-set cardinality (reputation diversity), the governance vote-cap denominator (see [§ Governance](#governance) and [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), and [§ Genesis Bond Credits](#genesis-bond-credits) eligibility, and it stamps the `firstBondedAt` that gates the [ADR 008](008-reputation.md#cold-start-bootstrap) cold-start bonus. The 10 Mbps default sets that entry bond at ~200 TOKEN: cheap enough for small and residential operators to test the waters, an order of magnitude above the sub-floor dust cost. Because the floor's governable lower bound equals its default, governance can only raise it — the sub-floor case never reopens — while the 1 Gbps ceiling on the floor keeps it far below `MAX_CAPACITY_PER_OPERATOR`'s 50 Gbps minimum, so the two bounds cannot cross.
+
 **Bond lifecycle.**
 
 - `CapacityBond.register(declaredMbps)` deposits the bond and emits `CapacityClaimed(operator, Mbps)`. Declared capacity is operator-self-attested; it is not verified at registration. Vote weight, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), is sourced from `FeeRouter.bytesInWindow` (proven delivered bytes), not from declared capacity, so over-declaration does not translate into governance influence; the bond cost is the primary structural disincentive against tier inflation.
+- Declared capacity must fall within `[MIN_CAPACITY_PER_OPERATOR, MAX_CAPACITY_PER_OPERATOR]`: `register(declaredMbps)` reverts on a declaration below the floor or above the ceiling (the band is validated, not silently coerced to a bound), so every registered slot carries at least `bond_required(MIN_CAPACITY_PER_OPERATOR)` of slashable bond.
 - Re-registration at a different tier is permitted at any time, subject to the same `bond_required(declaredMbps)` deposit/refund.
 - **Unbonding window: 14 days, slashable during unbonding.** Sized to exceed the [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) 5-day `SlashJudge` evidence-presentation window with a 9-day safety margin so misbehavior detected just before unbond initiation still has bond available to slash; the `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is enforced as a paired cross-parameter check on the `SlashJudge` and `CapacityBond` setters per [ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period).
 
@@ -378,6 +383,7 @@ Router shares and capacity-curve parameters are governable, gated by 48-hour tim
 | α (capacity-curve exponent) | 1.2 | 1.0 | 1.8 |
 | k (capacity-curve constant, TOKEN) | 12.6 | bounded by 1G bond ∈ [10K, 200K] | — |
 | `MAX_CAPACITY_PER_OPERATOR` | 200 Gbps | 50 Gbps | 1000 Gbps |
+| `MIN_CAPACITY_PER_OPERATOR` | 10 Mbps | 10 Mbps | 1000 Mbps |
 | `age_ramp_months` | 6 | 1 | 24 |
 | Per-operator voting cap | 5% | 1% | 25% |
 | `windowEpochs` (served-bytes voting window, on `FeeRouter`) | 13 | 4 | 26 |
