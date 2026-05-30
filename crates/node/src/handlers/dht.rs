@@ -190,7 +190,7 @@ impl DhtHandler {
         // other end" flows through this `AuthenticatedNodeId`; wire-provided
         // ids (`holder`, `requester`) are a distinct type and cannot reach the
         // routing-table-insert path without an explicit `.node_id()`.
-        let peer = AuthenticatedNodeId::from_remote_id(&conn.remote_id());
+        let peer = AuthenticatedNodeId::from_connection(&conn);
 
         // ADR 022 §DHT Rate Limiting check fires before any deserialization
         // of the per-stream frame body — we do it per stream below since

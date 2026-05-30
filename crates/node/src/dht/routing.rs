@@ -250,15 +250,24 @@ impl RoutingTable {
     /// ADR 022 wire-cost ceiling. Use [`Self::closest`] for that path.
     #[must_use]
     pub fn closest_unbounded(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
-        let mut candidates: Vec<NodeId> = self.buckets.iter().flatten().copied().collect();
-        // `sort_unstable_by_key` computes `xor_distance_bytes` once per element
-        // and reuses the result; the older `sort_unstable_by` form would
-        // recompute it twice per pairwise comparison (~`n log n` extra
-        // XORs over a fully-populated table). `target` is a raw keyspace point
+        // Schwartzian transform: compute `xor_distance_bytes` exactly once per
+        // candidate, then sort on the cached distance. `sort_unstable_by_key`
+        // does NOT cache its key (that is what `sort_by_cached_key` is for), so
+        // sorting directly on the closure would recompute the distance
+        // `O(n log n)` times on this hot path. `target` is a raw keyspace point,
         // so a `ContentHash` (FindValue) or a `NodeId` (FindNode) both fit.
-        candidates.sort_unstable_by_key(|p| xor_distance_bytes(p.as_bytes(), target));
-        candidates.truncate(n);
-        candidates
+        let mut scored: Vec<(NodeId, [u8; NODE_ID_LEN])> = self
+            .buckets
+            .iter()
+            .flatten()
+            .map(|p| (*p, xor_distance_bytes(p.as_bytes(), target)))
+            .collect();
+        // Sorting on the already-computed distance only re-copies the cached
+        // 32-byte key during comparisons — `xor_distance_bytes` itself still
+        // runs exactly once per element above.
+        scored.sort_unstable_by_key(|&(_, dist)| dist);
+        scored.truncate(n);
+        scored.into_iter().map(|(p, _)| p).collect()
     }
 
     /// Iterator over every peer currently held. Order is bucket-major,

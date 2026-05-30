@@ -192,14 +192,20 @@ pub enum DhtMessage {
 /// Query for providers of a specific content hash (ADR 022 §Message Types).
 ///
 /// The responder returns any known providers for `hash` and the K closest
-/// `NodeId`s it knows toward the hash in keyspace. `requester` is used by the
-/// responder to update its own routing table.
+/// `NodeId`s it knows toward the hash in keyspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindValueRequest {
     /// BLAKE3 hash of the content being sought (iroh `Hash`, 32 bytes).
     pub hash: ContentHash,
-    /// The caller's `NodeId` (32-byte Ed25519 public key) so the responder can
-    /// update its routing table with the live peer.
+    /// The caller's self-declared `NodeId` (32-byte Ed25519 public key).
+    ///
+    /// **The responder MUST NOT use this wire value to update its routing
+    /// table.** It is attacker-controlled and trusting it reintroduces the
+    /// routing-table-poisoning bug class (an authenticated peer seeding
+    /// arbitrary, possibly unreachable ids it does not own). The responder
+    /// refreshes only the *authenticated* QUIC peer id (`conn.remote_id()`);
+    /// this field is carried for protocol symmetry and possible future use
+    /// (which would require a per-request signature first).
     pub requester: NodeId,
 }
 
@@ -264,7 +270,14 @@ pub struct StoreAck {
 pub struct FindNodeRequest {
     /// `NodeId` being sought.
     pub target: NodeId,
-    /// Caller's `NodeId` for the responder's routing-table update.
+    /// The caller's self-declared `NodeId`.
+    ///
+    /// **The responder MUST NOT use this wire value to update its routing
+    /// table** — it is attacker-controlled, and trusting it reintroduces the
+    /// routing-table-poisoning bug class. The responder refreshes only the
+    /// *authenticated* QUIC peer id (`conn.remote_id()`); this field is carried
+    /// for protocol symmetry and possible future use (which would require a
+    /// per-request signature first).
     pub requester: NodeId,
 }
 

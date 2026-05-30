@@ -25,24 +25,30 @@
 //! [`AuthenticatedNodeId::node_id`] call,
 //! which documents exactly where trust is being asserted.
 //!
-//! There is intentionally **no** `From<NodeId>` / `From<[u8; 32]>` impl: the
-//! type cannot be fabricated from wire bytes.
+//! There is intentionally **no** `From<NodeId>` / `From<[u8; 32]>` impl, and the
+//! only constructor takes a live [`Connection`] (not a bare `PublicKey`, which a
+//! caller could mint from arbitrary bytes): the type cannot be fabricated from
+//! wire data.
+
+use iroh::endpoint::Connection;
 
 use super::routing::NodeId;
 
 /// A [`NodeId`] proven by the QUIC handshake to be the connected peer's
-/// identity. Constructible only from an authenticated connection's
-/// `remote_id()` — see the module docs for the trust rationale.
+/// identity. Constructible only from an authenticated [`Connection`] — see the
+/// module docs for the trust rationale.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct AuthenticatedNodeId(NodeId);
 
 impl AuthenticatedNodeId {
-    /// Lift the authenticated identity of a QUIC connection into the trust
-    /// boundary. `pk` MUST be `conn.remote_id()` (or equivalent) — the
-    /// handshake-bound key, never a value read from a request body.
+    /// Lift the authenticated identity of a live QUIC connection into the trust
+    /// boundary. Reads `conn.remote_id()` — the key iroh's handshake bound to
+    /// the connection — so there is no way to inject a peer-chosen id (a
+    /// `Connection` cannot be constructed with an arbitrary `remote_id`; only
+    /// the handshake sets it).
     #[must_use]
-    pub fn from_remote_id(pk: &iroh::PublicKey) -> Self {
-        Self(NodeId::from_bytes(*pk.as_bytes()))
+    pub fn from_connection(conn: &Connection) -> Self {
+        Self(NodeId::from_bytes(*conn.remote_id().as_bytes()))
     }
 
     /// The underlying [`NodeId`]. Calling this is the explicit, greppable
