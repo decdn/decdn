@@ -167,6 +167,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         if (operators.length > maxOriginsPerNamespace) revert TooManyOrigins(operators.length, maxOriginsPerNamespace);
 
         for (uint256 i = 0; i < operators.length; i++) {
+            // aderyn-ignore-next-line(reentrancy-state-change)
             if (!capacityBond.isActive(operators[i])) revert OperatorNotActive(operators[i]);
             for (uint256 j = 0; j < i; j++) {
                 if (operators[i] == operators[j]) revert DuplicateOperator(operators[i]);
@@ -202,6 +203,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         for (uint256 i = 0; i < operators.length; i++) {
             // aderyn-ignore-next-line(reentrancy-state-change)
             if (!capacityBond.isActive(operators[i])) revert OperatorNotActive(operators[i]);
+            // aderyn-ignore-next-line(reentrancy-state-change)
             if (blacklist != address(0) && IContentBlacklistOriginView(blacklist).isOriginBlacklisted(operators[i])) {
                 revert OperatorBlacklisted(operators[i]);
             }
