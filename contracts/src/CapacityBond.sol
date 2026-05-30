@@ -15,6 +15,7 @@ import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
+import { StakeMath } from "./StakeMath.sol";
 
 /// @title CapacityBond — operator-registry contract
 /// @notice Custodies operator TOKEN bond, executes the escrow-on-slash flow
@@ -349,6 +350,20 @@ contract CapacityBond is
 
     mapping(uint256 slashId => SlashRecord) internal _slashRecords;
 
+    /// @notice Per-operator append-only list of that operator's slashIds. Used
+    ///         to recompute the `slashedAtEpoch` watermark to the max epoch
+    ///         among still-standing (non-`Reversed`) slashes when a granted
+    ///         appeal reverses one — so reversing the most-recent slash falls
+    ///         the watermark back to an older slash that still stands rather
+    ///         than wrongly clearing it (ADR 036 § Slashing zero-out —
+    ///         multi-slash). Expected to stay small in practice — a slash drops
+    ///         active stake (auto-ejecting below `minStake / 2`), so re-slashing
+    ///         costs the operator a fresh re-bond each cycle — but this is an
+    ///         economic deterrent, not a hard cap; the recompute scan reads from
+    ///         the tail and breaks at the first standing slash, so it is cheap
+    ///         even if the list is long.
+    mapping(address operator => uint256[]) internal _operatorSlashIds;
+
     /// @notice Sum of all TOKEN currently held in slash escrow (status
     ///         `Escrowed` or `AppealOpen`). Invariant anchor: the contract's
     ///         TOKEN balance must cover `escrowedTotal` plus active stake,
@@ -442,9 +457,9 @@ contract CapacityBond is
     // ADR 030 — region self-attestation.
     event RegionUpdated(bytes32 indexed nodeId, string oldRegion, string newRegion);
 
-    // ADR 036 — slash-zero-out lifecycle.
+    // ADR 036 — slash-zero-out lifecycle. `epoch == 0` signals the cleared /
+    // unslashed sentinel (the watermark recomputed to "no standing slash").
     event SlashedAtEpochStamped(address indexed operator, uint64 epoch);
-    event SlashedAtEpochCleared(address indexed operator);
 
     // ADR 026 — Genesis Bond Credits.
     event GenesisCreditGranted(address indexed operator, uint256 amount);
@@ -1036,29 +1051,19 @@ contract CapacityBond is
         _stampSlash(operator, challenger, offenseType, totalSlash, newCount);
     }
 
-    /// @dev Reduce active + unbonding stake at `tierBps`. Active first, then
-    ///      unbonding (prevents slash-then-run per ADR 003). The defensive
-    ///      `min(remainder, req.amount)` cap (C2 fix) guards against future
-    ///      tier-bps schedules above 50% silently underflowing the
-    ///      subtraction; when the cap clips, `slashAmount` is reduced to the
-    ///      amount actually subtracted from the operator's balances so the
-    ///      caller's distribution math does not over-transfer / over-burn.
+    /// @dev Reduce active + unbonding stake at `tierBps` (active first, then
+    ///      unbonding, per ADR 003), writing back the balances `StakeMath`
+    ///      derives. The arithmetic — including the defensive clip that caps a
+    ///      >100%-of-at-risk tier (C2 fix; the current ladder maxes at 50%) —
+    ///      lives in [`StakeMath.reduceAtTier`](StakeMath.sol) so it can be
+    ///      unit-tested without a full-contract harness.
     function _reduceStakeAtTier(address operator, uint256 tierBps) internal returns (uint256 slashAmount) {
-        UnbondingRequest memory req = unbondingOf[operator];
-        uint256 totalAtRisk = activeStake[operator] + uint256(req.amount);
-        slashAmount = (totalAtRisk * tierBps) / BPS_DENOMINATOR;
-        if (slashAmount <= activeStake[operator]) {
-            activeStake[operator] -= slashAmount;
-        } else {
-            uint256 active = activeStake[operator];
-            uint256 remainder = slashAmount - active;
-            if (remainder > req.amount) {
-                remainder = req.amount;
-                slashAmount = active + remainder;
-            }
-            activeStake[operator] = 0;
-            unbondingOf[operator].amount = req.amount - remainder;
-        }
+        uint256 newActive;
+        uint256 newUnbonding;
+        (slashAmount, newActive, newUnbonding) =
+            StakeMath.reduceAtTier(activeStake[operator], unbondingOf[operator].amount, tierBps);
+        activeStake[operator] = newActive;
+        unbondingOf[operator].amount = newUnbonding;
     }
 
     /// @dev Reduce the operator's at-risk `PendingCredit` by `tierBps`. The
@@ -1117,6 +1122,7 @@ contract CapacityBond is
             slashAmount: totalSlashAmount,
             creditPortion: creditPortion
         });
+        _operatorSlashIds[operator].push(slashId);
         escrowedTotal += totalSlashAmount;
         emit SlashRecorded(slashId, operator, nowTs, totalSlashAmount);
         emit SlashEscrowed(slashId, operator, totalSlashAmount, windowClose);
@@ -1211,13 +1217,13 @@ contract CapacityBond is
         r.status = SlashStatus.Reversed;
         escrowedTotal -= refund;
 
-        // Conditional zero-out clear (ADR 028 §2): only clear when the current
-        // per-operator stamp belongs to THIS slash. If a later slash overwrote
-        // it (that slash still stands), leave the stamp so vote weight stays
-        // zeroed for the unresolved slash.
-        if (_slashedAtEpoch[operator] == uint64(r.slashedAt / EPOCH_LENGTH) + 1) {
-            _clearSlashedAtEpoch(operator);
-        }
+        // Zero-out recompute (ADR 036 § Slashing zero-out — multi-slash): the
+        // status is now `Reversed`, so re-derive the watermark as the max epoch
+        // among the operator's remaining still-standing slashes. Reversing a
+        // non-top slash leaves the max unchanged; reversing the most-recent one
+        // falls the watermark back to an older standing slash, or clears it to
+        // zero only when none remain.
+        _recomputeSlashedAtEpoch(operator);
 
         // Genesis-credit portion is restored to the vesting position
         // (`grantedAt` is untouched, so the vest curve resumes) rather than
@@ -1247,14 +1253,36 @@ contract CapacityBond is
         emit SlashUpheld(slashId, viaAppeal, challengerShare, burnShare);
     }
 
-    /// @dev Clear `slashedAtEpoch[operator]` back to 0 (ADR 036 slash zero-out
-    ///      recovery). Internal — invoked only by the successful-appeal escrow
-    ///      settle path; there is no external clearer.
-    function _clearSlashedAtEpoch(address operator) internal {
-        if (_slashedAtEpoch[operator] != 0) {
-            _slashedAtEpoch[operator] = 0;
-            emit SlashedAtEpochCleared(operator);
+    /// @dev Re-derive `slashedAtEpoch[operator]` (ADR 036 § Slashing zero-out —
+    ///      multi-slash) as the `actualEpoch + 1` of the operator's most-recent
+    ///      still-standing (non-`Reversed`) slash, or 0 when none remain (`0` is
+    ///      the unslashed sentinel; a `SlashedAtEpochStamped(op, 0)` signals the
+    ///      clear). Called on a granted appeal once the reversed record's status
+    ///      is `Reversed`, so it is excluded from the scan; reversing the
+    ///      most-recent slash falls the watermark back to an older standing
+    ///      slash rather than wrongly clearing it. This is the only writer that
+    ///      lowers the watermark, so it subsumes the former `_clearSlashedAtEpoch`
+    ///      recovery path. `_operatorSlashIds` is appended in `slash()` order,
+    ///      which is non-decreasing in epoch (`slashedAt = block.timestamp`), so
+    ///      the last non-`Reversed` entry is the max — scan from the tail and
+    ///      stop at the first hit. Scanning past a `Reversed` tail run is the
+    ///      only cost; the early break keeps the common case O(1) (see the
+    ///      `_operatorSlashIds` note on why the list stays small).
+    function _recomputeSlashedAtEpoch(address operator) internal {
+        uint256[] storage ids = _operatorSlashIds[operator];
+        uint64 newStamp = 0; // +1-encoded; 0 = no standing slash remains
+        for (uint256 i = ids.length; i > 0;) {
+            unchecked {
+                --i;
+            }
+            SlashRecord storage rec = _slashRecords[ids[i]];
+            if (rec.status != SlashStatus.Reversed) {
+                newStamp = uint64(rec.slashedAt / EPOCH_LENGTH) + 1;
+                break;
+            }
         }
+        _slashedAtEpoch[operator] = newStamp;
+        emit SlashedAtEpochStamped(operator, newStamp);
     }
 
     // -----------------------------------------------------------------

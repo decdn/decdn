@@ -13,7 +13,7 @@ Without a documented escalation path, every legitimate-outage slash (network out
 
 The slashed **operator** (and only the operator — `msg.sender` must equal the operator recorded in the slash) may file a **slashing appeal** within 30 days of a `SlashJudge` resolution. The appeal lives in the standalone **`SlashAppeal`** contract; opening one posts a TOKEN appeal bond and locks the slash's escrow on `CapacityBond` (`markAppealOpen`). The appeal slot is one-shot per `slashId`, so filing is operator-restricted: a permissionless filer would let anyone — notably the recorded challenger, who earns 50% of an upheld slash — burn the operator's only chance at recourse with a junk appeal (the bond, perjury re-slash, and frequency cap do not deter a throwaway/Sybil griefer). See [§ Eligibility and evidence standard](#eligibility-and-evidence-standard). Appeals are heard by the existing emergency multisig under a fast-track authority mirroring [ADR 011 § Regional Governance Bodies](011-content-takedown.md#regional-governance-bodies)' suspension pattern: interim relief granted by the multisig (3-of-5), then granted or upheld by the operator-weighted Governor within 14 days (post-transition; bootstrap-multisig phase rules per [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase)).
 
-A **successful** appeal (`grantAppeal`) calls `CapacityBond.settleAppealGranted`, which **refunds the full escrowed TOKEN to the operator** — their own slashed capital, in TOKEN, with no USDC conversion, no TWAP oracle, and no restitution cap — and clears the `slashedAtEpoch` zero-out ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)). A **failed** appeal (`upholdAppeal` / `rejectAppeal`, or lapse) distributes the escrow 50% challenger / 50% burn, identical to the no-appeal `finalizeUnappealedSlash` path. The operator's lifetime offense counter is **not** modified in either case (see [§ Reputation handling](#reputation-handling)) — an appeal restitutes capital, not standing.
+A **successful** appeal (`grantAppeal`) calls `CapacityBond.settleAppealGranted`, which **refunds the full escrowed TOKEN to the operator** — their own slashed capital, in TOKEN, with no USDC conversion, no TWAP oracle, and no restitution cap — and releases this slash from the `slashedAtEpoch` zero-out, recomputing the watermark over the operator's remaining still-standing slashes — cleared to zero only when none remain ([ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out)). A **failed** appeal (`upholdAppeal` / `rejectAppeal`, or lapse) distributes the escrow 50% challenger / 50% burn, identical to the no-appeal `finalizeUnappealedSlash` path. The operator's lifetime offense counter is **not** modified in either case (see [§ Reputation handling](#reputation-handling)) — an appeal restitutes capital, not standing.
 
 ### Scope
 
@@ -43,7 +43,7 @@ sequenceDiagram
             Note over SA: APPEAL_RATIFICATION_WINDOW = 14d
             alt DecdnGovernor grants (operator vindicated)
                 Gov->>SA: grantAppeal(slashId)
-                SA->>CB: settleAppealGranted — escrow refunded to operator, slashedAtEpoch cleared
+                SA->>CB: settleAppealGranted — escrow refunded to operator, slashedAtEpoch recomputed
                 SA-->>Op: APPEAL_BOND refunded
             else DecdnGovernor upholds (slash stands)
                 Gov->>SA: upholdAppeal(slashId)
@@ -128,7 +128,7 @@ function cleanupExpiredAppeal(uint256 slashId) external;                 // perm
 // On CapacityBond (SLASH_APPEAL_ROLE — held by SlashAppeal).
 function markAppealOpen(uint256 slashId) external;        // Escrowed → AppealOpen; enforces the filing window
 function settleAppealUpheld(uint256 slashId) external;    // escrow 50% challenger / 50% burn
-function settleAppealGranted(uint256 slashId) external;   // escrow refunded to operator + slashedAtEpoch cleared
+function settleAppealGranted(uint256 slashId) external;   // escrow refunded to operator + slashedAtEpoch recomputed
 // Permissionless no-appeal finality, also on CapacityBond:
 function finalizeUnappealedSlash(uint256 slashId) external; // after the filing window: escrow 50/50
 ```
