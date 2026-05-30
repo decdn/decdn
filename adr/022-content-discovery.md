@@ -252,9 +252,9 @@ Three asymptotic regimes inform protocol-level optimizations:
 
 ### Popularity Signals and Market Dynamics
 
-Content discovery in an incentive-driven network requires nodes to learn what content is in demand *before* being asked to serve it. Two complementary signals provide this.
+Content discovery in an incentive-driven network lets nodes learn what content is in demand. Speculative prefetch is driven by a single non-suppressible signal — DHT FIND_VALUE query frequency — through which a keyspace-positioned node can pre-acquire globally-hot content to monetize its routing position. Realized *local* demand is not a speculative prefetch input: a node serves a cache miss reactively by chunk-paced pull-through, warming its cache as a paid, loss-bounded side effect of delivery ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)), which supersedes any local cache-miss prefetch trigger.
 
-#### Signal 1: DHT FIND_VALUE Query Frequency (Non-Suppressible)
+#### Prefetch Demand Signal: DHT FIND_VALUE Query Frequency (Non-Suppressible)
 
 In Kademlia, `FindValueRequest` messages for hash H are routed to nodes closest to H in keyspace **regardless of whether those nodes hold H**. A node close to H receives all FIND_VALUE queries for H from the entire network without holding H and without receiving any gossip.
 
@@ -266,17 +266,17 @@ This creates a **natural popularity oracle that cannot be suppressed**:
 
 The signal is honest by construction: FIND_VALUE traffic reflects real client demand, not voluntary self-reporting, and arrives regardless of what anyone gossips.
 
-#### Signal 2: Local Cache-Miss Frequency
+#### Local cache-miss demand is reactive, not prefetched
 
-Each node tracks cache miss timestamps per hash in a bounded map (`HashMap<Hash, VecDeque<u64>>`, max 10,000 entries, LRU eviction). Each miss appends a timestamp (refreshing the entry's LRU position); entries older than 5 minutes are pruned on access. When a hash crosses a configurable threshold (default: 3 misses in 5 minutes), the node proactively pulls the blob via the DHT FIND_VALUE → probe → `cdn/client/v1` (paid) path.
+Local cache-miss frequency is **not** a speculative prefetch trigger. A node that gets a cache miss for hash H serves it reactively by chunk-paced pull-through, warming its cache incrementally as a paid side effect of delivery ([ADR 037 § Node serving: chunk-paced pull-through](037-regional-proxy-warming.md#node-serving-chunk-paced-pull-through)). This covers realized local demand on real paying requests with bounded loss, so no separate "after N misses, speculatively pull the whole blob" path is needed. Per-hash cache-miss frequency remains an observability metric (see [appendix-observability.md](appendix-observability.md#appendix-observability-and-metrics)) but does not drive acquisition.
 
 #### Prefetch Decision
 
-A node MAY prefetch hash H when either signal crosses its threshold, subject to operator-local policy. Prefetch is operator policy, not protocol behavior: the wire protocol carries no prefetch state, and the receiving end of any pull cannot distinguish a prefetch-driven pull from a regular cache-miss pull-through.
+A node MAY prefetch hash H when the FIND_VALUE demand signal crosses its threshold, subject to operator-local policy. Prefetch is operator policy, not protocol behavior: the wire protocol carries no prefetch state, and the receiving end of any pull cannot distinguish a prefetch-driven pull from a regular cache-miss pull-through.
 
 ##### Threat model
 
-Both demand signals are cheap to manufacture, since neither the FIND_VALUE wire path nor the `cdn/probe/v1` wire path requires payment or any signature beyond a QUIC NodeId. Two compositional Sybil attacks follow:
+The FIND_VALUE demand signal is cheap to manufacture, since neither the FIND_VALUE wire path nor the `cdn/probe/v1` wire path requires payment or any signature beyond a QUIC NodeId. Two compositional Sybil attacks follow:
 
 1. **Demand-only Sybil.** Attacker fans out FIND_VALUE queries or `cdn/probe/v1` requests from rotating NodeIds and IPs to drive a victim's prefetch toward content the attacker chooses. Bounded above by the DHT and probe rate limits ([ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting)), but those bounds throttle the rate, not the existence, of the attack.
 2. **Demand-supply Sybil.** Attacker also bonds a node, publishes a synthetic blob to the DHT pointing at their own node, and Sybil-triggers the victim's prefetch for that blob. The victim's DHT FIND_VALUE for the hash returns only the attacker; the attacker is paid USDC for delivering bytes no real customer demanded. The bond is recoverable on deregister + unbond, so attacker cost is the unbond opportunity cost; revenue is `delivery_rate × blob_size` per extracted blob, bounded above by `deliveryCeiling`.
@@ -289,12 +289,11 @@ A node MAY prefetch from popularity signals subject to a configuration block who
 
 | Key | Recommended default | Purpose |
 |---|---|---|
-| `prefetch.enabled` | `false` | Opt-in. Operators must affirmatively choose to take on the prefetch surface — disables both signals when false. |
+| `prefetch.enabled` | `false` | Opt-in. Operators must affirmatively choose to take on the prefetch surface — disables prefetch when false. |
 | `prefetch.require_authorized_origin` | `true` | Prefetch fires for a hash only if the DHT FIND_VALUE candidate set contains at least one operator currently authorized as origin for the hash's namespace via `OriginAssignment.getOrigins(namespaceId)`, with `namespaceId == 0` resolving to the default-open allow-list (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). Closes the demand-supply Sybil attack: an attacker has to obtain DAO-ratified origin status to bait a prefetch, which is governance-gated by timelock. The cache-tier serving role is unaffected — once any authorized origin holds the hash, cache-tier candidates compete on the unified selection score as usual. |
 | `prefetch.budget_usdc_per_hour` | operator-set, finite | Hard circuit breaker on aggregate prefetch spend over a rolling 1-hour window. Independent of the origin gate; defends the loss function even if the gate is disabled or partially defeated. The default value is operator-policy, but *some* finite cap is the load-bearing recommendation. |
-| `prefetch.find_value_threshold` | `5` queries | Signal 1 trigger: FIND_VALUE queries for hash H received within `prefetch.threshold_window_secs`. |
-| `prefetch.miss_threshold` | `3` misses | Signal 2 trigger: local cache misses for hash H within `prefetch.threshold_window_secs`. |
-| `prefetch.threshold_window_secs` | `300` | Shared rolling-window length for both trigger signals (matches the existing 5-minute LRU pruning window for the miss tracker). |
+| `prefetch.find_value_threshold` | `5` queries | Prefetch trigger: FIND_VALUE queries for hash H received within `prefetch.threshold_window_secs`. |
+| `prefetch.threshold_window_secs` | `300` | Rolling-window length for the FIND_VALUE trigger. |
 | `prefetch.demand_quality_min_ratio` | `0.1` | Auto-throttle predicate: `served_bytes / acquired_bytes` over the rolling demand-quality window. When the ratio falls below the floor, prefetch pauses until it recovers. Detects sustained signal poisoning past the origin gate. |
 | `prefetch.demand_quality_window_secs` | `3600` | Rolling-window length for the demand-quality predicate. |
 
@@ -318,7 +317,8 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 |-----------|---------------------|
 | `cdn/probe/v1` | Unchanged. DHT provides candidates; `cdn/probe/v1` confirms live availability and measures latency. Probe cache (15s TTL, [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) still prevents redundant probes for recently confirmed providers. |
 | `cdn/client/v1` | Unchanged. All delivery is paid; DHT affects only how providers are discovered. |
-| `NodeAnnounce` gossip | Unchanged. Carries node-level metadata only (region, load); demand signals are derived from DHT FIND_VALUE traffic and local cache misses. No new gossip message types. |
+| `NodeAnnounce` gossip | Unchanged. Carries node-level metadata only (region, load); the prefetch demand signal derives from DHT FIND_VALUE traffic, and local cache-miss demand is served reactively (see Proxy warming row). No new gossip message types. |
+| Proxy warming ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)) | Reactive chunk-paced pull-through warms a regional copy on real paid demand, superseding the local cache-miss prefetch trigger. STORE-on-commit makes a completed warmed copy discoverable through the normal FIND_VALUE path. |
 | Reputation system ([ADR 008](008-reputation.md#adr-008-reputation-system)) | A node publishing a false STORE record fails at probe time → reputation penalty → fewer clients selected. No new slash condition needed. |
 | Eviction hold ([ADR 005](005-protocol.md#adr-005-wire-protocol)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
 | Client discovery ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. The on-chain origin-directory fallback applies equally. |
@@ -343,8 +343,8 @@ New optional variants (e.g., `BatchStore` / `BatchStoreAck` added for publishing
 4. A stale STORE record (node evicted the blob) expires within TTL (1 hour) with no explicit retraction.
 5. A false STORE record (node claims to hold a blob it doesn't) fails at the probe step; the publishing node incurs a reputation penalty within one gossip cycle.
 6. During bootstrap (routing table < k entries), the on-chain origin directory provides the fallback.
-7. A node with `prefetch.enabled = true` observing a prefetch trigger for hash H (either ≥`prefetch.find_value_threshold` FIND_VALUE queries or ≥`prefetch.miss_threshold` local cache misses within `prefetch.threshold_window_secs`) initiates a prefetch for H, subject to the `prefetch.require_authorized_origin` gate (default `true`), the `prefetch.budget_usdc_per_hour` ceiling, and the demand-quality auto-throttle (see [§ Prefetch Decision](#prefetch-decision)).
-8. Demand signals derive from DHT FIND_VALUE traffic and local cache-miss timestamps; both are emitted as observability metrics in [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
+7. A node with `prefetch.enabled = true` observing ≥`prefetch.find_value_threshold` FIND_VALUE queries for hash H within `prefetch.threshold_window_secs` initiates a prefetch for H, subject to the `prefetch.require_authorized_origin` gate (default `true`), the `prefetch.budget_usdc_per_hour` ceiling, and the demand-quality auto-throttle (see [§ Prefetch Decision](#prefetch-decision)). Local cache-miss frequency does not trigger prefetch — realized local demand is served reactively per [ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality).
+8. The prefetch demand signal derives from DHT FIND_VALUE traffic; FIND_VALUE-query frequency and local cache-miss frequency are both emitted as observability metrics in [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
 9. An accepted `StoreRequest`'s record TTL is anchored on the receiver's wall-clock at acceptance time (`expiry_us = receive_us + record_ttl_us`), independent of any holder-supplied timestamp.
 10. A receiver enforces both a per-publisher record cap (hard reject with `StoreAck { accepted: false }` when at cap) and a per-node global cap (global LRU eviction when at cap and the inserting publisher is below its per-publisher cap). No publisher can force eviction of another publisher's records by exceeding its own cap.
 11. `cdn/dht/v1` inbound traffic is bounded by global, per-IP, and per-peer token buckets; rejected requests close the stream with `RATE_LIMITED` and are counted in `decdn_dht_rate_limit_rejections_total` labeled by layer.
