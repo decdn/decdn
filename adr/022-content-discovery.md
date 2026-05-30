@@ -276,9 +276,9 @@ A node MAY prefetch hash H when the FIND_VALUE demand signal crosses its thresho
 
 ##### Threat model
 
-The FIND_VALUE demand signal is cheap to manufacture, since neither the FIND_VALUE wire path nor the `cdn/probe/v1` wire path requires payment or any signature beyond a QUIC NodeId. Two compositional Sybil attacks follow:
+The FIND_VALUE demand signal is cheap to manufacture, since the FIND_VALUE wire path requires no payment and no signature beyond a QUIC NodeId. Two compositional Sybil attacks follow:
 
-1. **Demand-only Sybil.** Attacker fans out FIND_VALUE queries or `cdn/probe/v1` requests from rotating NodeIds and IPs to drive a victim's prefetch toward content the attacker chooses. Bounded above by the DHT and probe rate limits ([ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting)), but those bounds throttle the rate, not the existence, of the attack.
+1. **Demand-only Sybil.** Attacker fans out FIND_VALUE queries from rotating NodeIds and IPs to drive a victim's prefetch toward content the attacker chooses. Bounded above by the `cdn/dht/v1` token-bucket rate limits (global, per-IP, and per-peer; see Acceptance Criterion 11), but those bounds throttle the rate, not the existence, of the attack.
 2. **Demand-supply Sybil.** Attacker also bonds a node, publishes a synthetic blob to the DHT pointing at their own node, and Sybil-triggers the victim's prefetch for that blob. The victim's DHT FIND_VALUE for the hash returns only the attacker; the attacker is paid USDC for delivering bytes no real customer demanded. The bond is recoverable on deregister + unbond, so attacker cost is the unbond opportunity cost; revenue is `delivery_rate × blob_size` per extracted blob, bounded above by `deliveryCeiling`.
 
 Acceptance Criterion 5's reputation penalty only fires on *false* STORE records — the attacker's STORE is honest at the wire level (they really do hold the bytes they generated). The demand they manufactured is what's synthetic, and the wire protocol has no way to detect that from the publisher side.
