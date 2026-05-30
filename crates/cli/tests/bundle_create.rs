@@ -51,6 +51,20 @@ fn read_bundle(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+// Probe whether `dir` lives on a case-sensitive filesystem by writing a
+// lowercase file and checking whether the uppercase path then exists. On
+// macOS APFS (default) and NTFS this returns false, so case-only fixtures
+// can be skipped instead of failing the suite (#697).
+fn is_case_sensitive(dir: &Path) -> bool {
+    let lower = dir.join("decdn_case_probe");
+    fs::write(&lower, b"x").unwrap();
+    // On a case-insensitive FS the uppercase path resolves back to the
+    // file we just wrote; on a case-sensitive FS it does not exist.
+    let sensitive = !dir.join("DECDN_CASE_PROBE").exists();
+    fs::remove_file(&lower).unwrap();
+    sensitive
+}
+
 // Two runs against the same dir produce byte-identical output. This is
 // the single strongest check on the determinism contract.
 #[test]
@@ -87,20 +101,21 @@ fn determinism_two_runs_byte_identical() {
 }
 
 // The richer determinism fixture pins three properties at once:
-// (a) bytewise sort survives non-ASCII paths and mixed case,
+// (a) bytewise sort survives non-ASCII paths (raw UTF-8, not collation),
 // (b) the 64 KiB streaming-hash buffer correctly handles a file
 //     larger than one buffer, and
 // (c) the entries-array order is stable regardless of FS walk order.
+//
+// The mixed-case ASCII-uppercase-before-lowercase property lives in the
+// case-sensitivity-gated `determinism_mixed_case_bytewise_sort` below,
+// because a case-only `A.txt`/`a.txt` pair collapses to one entry on
+// case-insensitive filesystems (macOS APFS, NTFS) — see #697.
 #[test]
-fn determinism_with_non_ascii_mixed_case_and_large_file() {
+fn determinism_with_non_ascii_and_large_file() {
     let dir = TempDir::new().unwrap();
     let src = dir.path().join("src");
     fs::create_dir(&src).unwrap();
 
-    // Mixed case: bytewise sort puts uppercase before lowercase
-    // ('A' = 0x41, 'a' = 0x61), which a Unicode-collation sort would
-    // reorder.
-    write_files(&src, &[("A.txt", b"upper"), ("a.txt", b"lower")]);
     // Non-ASCII path (UTF-8 encoded). Bytewise sort uses raw UTF-8
     // bytes; collation-aware sort would interleave with ASCII.
     write_files(&src, &[("\u{00e9}.txt", b"e-acute")]); // é
@@ -118,8 +133,8 @@ fn determinism_with_non_ascii_mixed_case_and_large_file() {
     rt().block_on(bundle_create(&args(&src, &out2))).unwrap();
     assert_eq!(fs::read(&out1).unwrap(), fs::read(&out2).unwrap());
 
-    // Sort order: ASCII uppercase first, then ASCII lowercase, then
-    // multi-byte UTF-8 (which all start with bytes >= 0xC2).
+    // Sort order: ASCII first, then multi-byte UTF-8 (which all start
+    // with bytes >= 0xC2).
     let bundle = read_bundle(&out1);
     let paths: Vec<&str> = bundle["entries"]
         .as_array()
@@ -127,16 +142,7 @@ fn determinism_with_non_ascii_mixed_case_and_large_file() {
         .iter()
         .map(|e| e["path"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        paths,
-        vec![
-            "A.txt",
-            "a.txt",
-            "big.bin",
-            "\u{00e9}.txt",
-            "\u{00f1}/x.txt"
-        ]
-    );
+    assert_eq!(paths, vec!["big.bin", "\u{00e9}.txt", "\u{00f1}/x.txt"]);
 
     // Large-file hash matches the in-memory blake3 of the same bytes.
     let big_entry = bundle["entries"]
@@ -148,6 +154,39 @@ fn determinism_with_non_ascii_mixed_case_and_large_file() {
     let expected = format!("b3:{}", blake3::hash(&big).to_hex());
     assert_eq!(big_entry["hash"].as_str().unwrap(), expected);
     assert_eq!(big_entry["size"].as_u64().unwrap(), big.len() as u64);
+}
+
+// Bytewise sort puts ASCII uppercase before lowercase ('A' = 0x41,
+// 'a' = 0x61), which a Unicode-collation sort would reorder. Skipped on
+// case-insensitive filesystems (macOS APFS, NTFS), where `A.txt` and
+// `a.txt` collapse to a single directory entry so the pair can't be
+// observed (#697). The contract this guards still runs on case-sensitive
+// Linux CI.
+#[test]
+fn determinism_mixed_case_bytewise_sort() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    if !is_case_sensitive(&src) {
+        eprintln!(
+            "skipping determinism_mixed_case_bytewise_sort: \
+             case-insensitive filesystem collapses A.txt/a.txt"
+        );
+        return;
+    }
+
+    write_files(&src, &[("A.txt", b"upper"), ("a.txt", b"lower")]);
+    let out = dir.path().join("b.json");
+    rt().block_on(bundle_create(&args(&src, &out))).unwrap();
+
+    let bundle = read_bundle(&out);
+    let paths: Vec<&str> = bundle["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["A.txt", "a.txt"]);
 }
 
 // The bundle's own BLAKE3 is the contract publishers distribute. A
