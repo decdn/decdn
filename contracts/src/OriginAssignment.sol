@@ -217,6 +217,9 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     function cancelAssignmentProposal(uint256 namespaceId) external nonReentrant {
         // aderyn-ignore-next-line(reentrancy-state-change)
         if (publisherRegistry.ownerOf(namespaceId) != msg.sender) revert NotNamespaceOwner(namespaceId, msg.sender);
+        // The `ownerOf` external read taints the struct field for slither's
+        // strict-equality detector; the `== 0` sentinel is a presence check.
+        // slither-disable-next-line incorrect-equality
         if (_pending[namespaceId].readyAt == 0) revert NoPendingProposal(namespaceId);
         delete _pending[namespaceId];
         emit AssignmentProposalCancelled(namespaceId, msg.sender, false);
@@ -361,6 +364,8 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         EnumerableSet.AddressSet storage set = _origins[namespaceId];
         address[] memory current = set.values();
         for (uint256 i = 0; i < current.length; i++) {
+            // Clearing the set; the bool return (was-present) is irrelevant here.
+            // slither-disable-next-line unused-return
             set.remove(current[i]);
         }
         for (uint256 i = 0; i < operators.length; i++) {

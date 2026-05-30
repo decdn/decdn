@@ -215,6 +215,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     }
 
     /// @inheritdoc ISlashJudge
+    // slither-disable-next-line unused-return
     function submitBlacklistChallenge(
         address challengedNode,
         bytes32 nodeId,
@@ -352,6 +353,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     ///      challenger-supplied `nodeId` matches its on-chain binding. The binding
     ///      survives deregistration, so a deregistered-but-bonded offender stays
     ///      slashable.
+    // slither-disable-next-line unused-return
     function _checkRegistered(address challengedNode, bytes32 nodeId) internal view {
         (bytes32 bound,) = capacityBond.nodeIdOf(challengedNode);
         if (bound == bytes32(0)) revert NodeNotRegistered(challengedNode);
