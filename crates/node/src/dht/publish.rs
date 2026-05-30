@@ -39,6 +39,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::dht::client;
 use crate::dht::routing::{NodeId, RoutingTable};
+use decdn_protocol::ContentHash;
 
 /// Number of receivers per republish (ADR 022 §STORE Flow step 1:
 /// "K+3 closest nodes to H"). Three slots beyond `K=20` give the
@@ -63,7 +64,7 @@ struct Entry {
     /// Wall-clock-anchored due time in microseconds since `UNIX_EPOCH`.
     due_us: u64,
     /// Hash being republished.
-    hash: [u8; 32],
+    hash: ContentHash,
 }
 
 impl PartialOrd for Entry {
@@ -85,7 +86,7 @@ impl Ord for Entry {
 
 /// Schedule a single republish for `hash`. Used by the
 /// `subscribe_inserts` event loop and by cold-start startup.
-fn schedule_at(heap: &mut BinaryHeap<Reverse<Entry>>, hash: [u8; 32], due_us: u64) {
+fn schedule_at(heap: &mut BinaryHeap<Reverse<Entry>>, hash: ContentHash, due_us: u64) {
     heap.push(Reverse(Entry { due_us, hash }));
 }
 
@@ -119,7 +120,7 @@ pub struct RepublishScheduler {
     /// Set of hashes currently scheduled — `O(1)` dedupe on cache
     /// insert events without walking the heap. Stays in sync with the
     /// heap via every push / pop path.
-    scheduled: Arc<Mutex<HashSet<[u8; 32]>>>,
+    scheduled: Arc<Mutex<HashSet<ContentHash>>>,
 }
 
 impl RepublishScheduler {
@@ -150,14 +151,14 @@ impl RepublishScheduler {
     /// on pop via the `scheduled` set, so a hash drains at most once
     /// per due window regardless of how many stale heap entries it
     /// has.
-    pub fn schedule_steady(&self, hash: [u8; 32]) {
+    pub fn schedule_steady(&self, hash: ContentHash) {
         let offset = jitter_us(STEADY_STATE_MIN, STEADY_STATE_MAX);
         self.schedule_with_offset(hash, offset);
     }
 
     /// Schedule `hash` with the cold-start jitter window (0–40 min).
     /// Used at boot for every blob already in the cache.
-    pub fn schedule_cold_start(&self, hash: [u8; 32]) {
+    pub fn schedule_cold_start(&self, hash: ContentHash) {
         let offset = jitter_us(Duration::ZERO, COLD_START_MAX);
         self.schedule_with_offset(hash, offset);
     }
@@ -172,7 +173,7 @@ impl RepublishScheduler {
     /// the cold-start queue is.
     pub fn seed_cold_start<I>(&self, iter: I) -> usize
     where
-        I: IntoIterator<Item = [u8; 32]>,
+        I: IntoIterator<Item = ContentHash>,
     {
         let mut count = 0usize;
         for hash in iter {
@@ -182,7 +183,7 @@ impl RepublishScheduler {
         count
     }
 
-    fn schedule_with_offset(&self, hash: [u8; 32], offset_us: u64) {
+    fn schedule_with_offset(&self, hash: ContentHash, offset_us: u64) {
         let due_us = now_us().saturating_add(offset_us);
         // Add to the scheduled set first; if the hash was already
         // scheduled, the prior heap entry is left in place and
@@ -198,9 +199,9 @@ impl RepublishScheduler {
     /// Drain all entries whose `due_us <= now_us`. Returns the popped
     /// hashes after deduplicating via the `scheduled` set (a hash
     /// removed from `scheduled` since being heap-pushed is ignored).
-    fn drain_due(&self, now_us: u64) -> Vec<[u8; 32]> {
+    fn drain_due(&self, now_us: u64) -> Vec<ContentHash> {
         let mut out = Vec::new();
-        let mut seen = HashSet::<[u8; 32]>::new();
+        let mut seen = HashSet::<ContentHash>::new();
         if let (Ok(mut heap), Ok(mut s)) = (self.heap.lock(), self.scheduled.lock()) {
             while let Some(Reverse(Entry { due_us, hash })) = heap.peek().copied() {
                 if due_us > now_us {
@@ -227,7 +228,7 @@ impl RepublishScheduler {
     }
 
     /// Unschedule `hash` — used when the cache evicts the blob.
-    pub fn unschedule(&self, hash: &[u8; 32]) {
+    pub fn unschedule(&self, hash: &ContentHash) {
         if let Ok(mut s) = self.scheduled.lock() {
             s.remove(hash);
         }
@@ -262,7 +263,7 @@ pub async fn run_republish(
     mut cache_inserts: broadcast::Receiver<iroh_blobs::Hash>,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
-    let self_id_bytes = *self_id.as_bytes();
+    let self_node_id = NodeId::from_bytes(*self_id.as_bytes());
     // Use a relatively short polling interval — the driver wakes on
     // cache-insert events, on the scheduler ticking, OR on the
     // shutdown signal. A 1-second poll keeps the worst-case latency
@@ -281,7 +282,7 @@ pub async fn run_republish(
             insert = cache_inserts.recv() => {
                 match insert {
                     Ok(hash) => {
-                        let hash_bytes = *hash.as_bytes();
+                        let hash_bytes = ContentHash::from_bytes(*hash.as_bytes());
                         // ADR 022 §STORE Flow steps 2–3: publish
                         // *immediately* on cache insertion (step 2),
                         // then schedule the next republish at `T +
@@ -291,7 +292,7 @@ pub async fn run_republish(
                         // discoverable for up to 50 minutes — the
                         // exact failure mode the eager publish
                         // closes.
-                        publish_hash(&endpoint, self_id_bytes, &routing, hash_bytes).await;
+                        publish_hash(&endpoint, self_node_id, &routing, hash_bytes).await;
                         scheduler.schedule_steady(hash_bytes);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -329,7 +330,7 @@ pub async fn run_republish(
                         scheduler.unschedule(&hash);
                         continue;
                     }
-                    publish_hash(&endpoint, self_id_bytes, &routing, hash).await;
+                    publish_hash(&endpoint, self_node_id, &routing, hash).await;
                     // Re-schedule with the steady-state jitter window;
                     // ADR 022 line 130 — fresh jitter draw per record
                     // per cycle.
@@ -344,8 +345,8 @@ pub async fn run_republish(
 /// explicitly evicted it). The blob-presence check is what stops the
 /// scheduler from re-publishing content that LRU drift or an
 /// operator-evict already removed from the local store.
-async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &[u8; 32]) -> bool {
-    let h = iroh_blobs::Hash::from_bytes(*hash);
+async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash) -> bool {
+    let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
     if cache.is_evicted(h) {
         return false;
     }
@@ -357,9 +358,9 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &[u8; 32]) ->
 /// will be retried on the next cycle (or on the next cold start).
 async fn publish_hash(
     endpoint: &Endpoint,
-    self_id_bytes: [u8; 32],
+    self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
-    hash: [u8; 32],
+    hash: ContentHash,
 ) {
     let targets: Vec<NodeId> = if let Ok(table) = routing.lock() {
         // ADR 022 §STORE Flow line 128 specifies K+3 (= 23) closest
@@ -369,7 +370,7 @@ async fn publish_hash(
         // wire `MAX_CLOSER_NODES`), which we MUST NOT use here;
         // `closest_unbounded` returns up to `n` peers regardless of
         // the wire cap.
-        table.closest_unbounded(&hash, REPUBLISH_FANOUT)
+        table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT)
     } else {
         tracing::error!("dht republish: routing-table mutex poisoned");
         return;
@@ -383,7 +384,7 @@ async fn publish_hash(
     for peer in targets {
         let endpoint_cloned = endpoint.clone();
         handles.push(tokio::spawn(async move {
-            let target_pk = match PublicKey::from_bytes(&peer) {
+            let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
                 Ok(k) => k,
                 Err(e) => {
                     tracing::warn!(
@@ -395,7 +396,7 @@ async fn publish_hash(
                 }
             };
             let addr = EndpointAddr::new(target_pk);
-            match client::store(&endpoint_cloned, addr, hash, self_id_bytes).await {
+            match client::store(&endpoint_cloned, addr, hash, self_node_id).await {
                 Ok(ack) if ack.accepted => {}
                 Ok(_) => {
                     tracing::debug!(
@@ -430,8 +431,8 @@ async fn publish_hash(
 mod tests {
     use super::*;
 
-    fn h(b: u8) -> [u8; 32] {
-        [b; 32]
+    fn h(b: u8) -> ContentHash {
+        ContentHash::from_bytes([b; 32])
     }
 
     #[test]
@@ -491,15 +492,15 @@ mod tests {
         // `drain_due` rather than peeking at the heap so the test
         // survives a future switch to a different scheduling primitive.
         let s = RepublishScheduler::new();
-        let hashes: Vec<[u8; 32]> = (1u8..=5).map(h).collect();
+        let hashes: Vec<ContentHash> = (1u8..=5).map(h).collect();
         let n = s.seed_cold_start(hashes.iter().copied());
         assert_eq!(n, 5);
         assert_eq!(s.len(), 5);
         let deadline_us = now_us()
             .saturating_add(u64::try_from(COLD_START_MAX.as_micros()).unwrap())
             .saturating_add(1_000); // 1 ms slack for drift between seed and check
-        let drained: HashSet<[u8; 32]> = s.drain_due(deadline_us).into_iter().collect();
-        let expected: HashSet<[u8; 32]> = hashes.into_iter().collect();
+        let drained: HashSet<ContentHash> = s.drain_due(deadline_us).into_iter().collect();
+        let expected: HashSet<ContentHash> = hashes.into_iter().collect();
         assert_eq!(drained, expected);
         assert!(
             s.is_empty(),
@@ -510,7 +511,7 @@ mod tests {
     #[test]
     fn seed_cold_start_empty_input_is_noop() {
         let s = RepublishScheduler::new();
-        let n = s.seed_cold_start(std::iter::empty::<[u8; 32]>());
+        let n = s.seed_cold_start(std::iter::empty::<ContentHash>());
         assert_eq!(n, 0);
         assert!(s.is_empty());
     }

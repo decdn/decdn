@@ -148,7 +148,7 @@ mod tests {
     use super::*;
 
     fn nid(byte: u8) -> NodeId {
-        [byte; 32]
+        NodeId::from_bytes([byte; 32])
     }
 
     #[test]

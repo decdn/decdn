@@ -33,7 +33,7 @@ use decdn_node::dht::{
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::ALPN_DHT;
+use decdn_protocol::{ALPN_DHT, ContentHash, NodeId};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 
@@ -114,8 +114,11 @@ async fn spin_up_server(staked: HashSet<[u8; 32]>) -> anyhow::Result<TestServer>
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let rate_limiter = permissive_dht_rate_limiter(&metrics);
+    let staked: HashSet<NodeId> = staked.into_iter().map(NodeId::from_bytes).collect();
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *id.as_bytes(),
+    ))));
     let records = Arc::new(Mutex::new(RecordStore::new(RecordStoreConfig::default())));
 
     let handler = Arc::new(DhtHandler::with_routing(
@@ -162,23 +165,29 @@ async fn client_find_node_roundtrip_via_dht_client_module() -> anyhow::Result<()
     let server = spin_up_server(HashSet::new()).await?;
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
-    let target_id = [0xABu8; 32];
-    let resp = client::find_node(&client_ep, target, target_id, *client_ep.id().as_bytes()).await?;
+    let target_id = NodeId::from_bytes([0xABu8; 32]);
+    let resp = client::find_node(
+        &client_ep,
+        target,
+        target_id,
+        NodeId::from_bytes(*client_ep.id().as_bytes()),
+    )
+    .await?;
     assert_eq!(resp.target, target_id, "target echoed");
     // The server's `serve()` refreshed the authenticated client
     // NodeId into its routing table BEFORE dispatching this request,
     // so the client itself appears in the response's `closer_nodes`
     // (modulo the server's own id, which `closest()` filters).
     assert_eq!(
-        resp.closer_nodes,
-        vec![*client_ep.id().as_bytes()],
+        resp.closer_nodes.as_slice(),
+        [NodeId::from_bytes(*client_ep.id().as_bytes())],
         "the freshly-refreshed client must appear as the only closer node"
     );
     // Server should have refreshed the authenticated client NodeId
     // into its routing table (PR 2 behaviour, unchanged by PR 4).
     let in_table = {
         let t = server.routing.lock().unwrap();
-        t.contains(client_ep.id().as_bytes())
+        t.contains(&NodeId::from_bytes(*client_ep.id().as_bytes()))
     };
     assert!(in_table, "server must refresh client NodeId on FindNode");
 
@@ -204,9 +213,11 @@ async fn bootstrap_seeds_routing_and_runs_self_lookup() -> anyhow::Result<()> {
 
     // Seed: only the server's NodeId.
     let mut staked = HashSet::new();
-    staked.insert(*server.id.as_bytes());
+    staked.insert(NodeId::from_bytes(*server.id.as_bytes()));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
-    let client_routing = Arc::new(Mutex::new(RoutingTable::new(*client_id.as_bytes())));
+    let client_routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
 
     // iroh's `Endpoint::connect` without an explicit addr requires
     // discovery; loopback tests disable relay/discovery, so we
@@ -219,8 +230,8 @@ async fn bootstrap_seeds_routing_and_runs_self_lookup() -> anyhow::Result<()> {
         let _ = client::find_node(
             &client_ep,
             target,
-            *server.id.as_bytes(),
-            *client_id.as_bytes(),
+            NodeId::from_bytes(*server.id.as_bytes()),
+            NodeId::from_bytes(*client_id.as_bytes()),
         )
         .await?;
     }
@@ -233,13 +244,13 @@ async fn bootstrap_seeds_routing_and_runs_self_lookup() -> anyhow::Result<()> {
     // C's routing table now contains S.
     {
         let t = client_routing.lock().unwrap();
-        assert!(t.contains(server.id.as_bytes()));
+        assert!(t.contains(&NodeId::from_bytes(*server.id.as_bytes())));
     }
     // S's routing table now contains C — exercised by the bootstrap's
     // FindNode call against S.
     {
         let t = server.routing.lock().unwrap();
-        assert!(t.contains(client_id.as_bytes()));
+        assert!(t.contains(&NodeId::from_bytes(*client_id.as_bytes())));
     }
 
     client_ep.close().await;
@@ -260,15 +271,24 @@ async fn client_store_lands_record_at_server() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
-    let hash = [0x77u8; 32];
-    let ack = client::store(&client_ep, target, hash, *client_id.as_bytes()).await?;
+    let hash = ContentHash::from_bytes([0x77u8; 32]);
+    let ack = client::store(
+        &client_ep,
+        target,
+        hash,
+        NodeId::from_bytes(*client_id.as_bytes()),
+    )
+    .await?;
     assert!(ack.accepted, "staked publisher's Store must be accepted");
     assert_eq!(ack.hash, hash);
 
     // Server's RecordStore now has the record.
     {
         let r = server.records.lock().unwrap();
-        assert_eq!(r.publisher_record_count(client_id.as_bytes()), 1);
+        assert_eq!(
+            r.publisher_record_count(&NodeId::from_bytes(*client_id.as_bytes())),
+            1
+        );
         assert_eq!(r.len(), 1);
     }
 
@@ -301,10 +321,12 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     // server as the only known peer (so the republish fan-out targets
     // it).
     let (publisher_ep, _) = local_endpoint(publisher_sk, vec![]).await?;
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*publisher_id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *publisher_id.as_bytes(),
+    ))));
     {
         let mut t = routing.lock().unwrap();
-        t.insert(*server.id.as_bytes());
+        t.insert(NodeId::from_bytes(*server.id.as_bytes()));
     }
 
     // Pre-resolve the server's path by issuing one `FindNode`
@@ -314,8 +336,8 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     let _ = client::find_node(
         &publisher_ep,
         target,
-        *server.id.as_bytes(),
-        *publisher_id.as_bytes(),
+        NodeId::from_bytes(*server.id.as_bytes()),
+        NodeId::from_bytes(*publisher_id.as_bytes()),
     )
     .await?;
 
@@ -350,7 +372,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let n = {
             let r = server.records.lock().unwrap();
-            r.publisher_record_count(publisher_id.as_bytes())
+            r.publisher_record_count(&NodeId::from_bytes(*publisher_id.as_bytes()))
         };
         if n >= 1 {
             got_record = true;

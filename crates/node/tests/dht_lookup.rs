@@ -40,7 +40,7 @@ use decdn_node::dht::{
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::ALPN_DHT;
+use decdn_protocol::{ALPN_DHT, ContentHash, NodeId};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 
@@ -131,8 +131,11 @@ async fn spin_up_server(staked: HashSet<[u8; 32]>) -> anyhow::Result<TestServer>
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let rate_limiter = permissive_dht_rate_limiter(&metrics);
+    let staked: HashSet<NodeId> = staked.into_iter().map(NodeId::from_bytes).collect();
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *id.as_bytes(),
+    ))));
     let records = Arc::new(Mutex::new(RecordStore::new(RecordStoreConfig::default())));
 
     let handler = Arc::new(DhtHandler::with_routing(
@@ -182,7 +185,13 @@ async fn prime_iroh_cache(
     server: &TestServer,
 ) -> anyhow::Result<()> {
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
-    let _ = client::find_node(client_ep, target, *server.id.as_bytes(), *client_id).await?;
+    let _ = client::find_node(
+        client_ep,
+        target,
+        NodeId::from_bytes(*server.id.as_bytes()),
+        NodeId::from_bytes(*client_id),
+    )
+    .await?;
     Ok(())
 }
 
@@ -205,7 +214,11 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
             .map_or(0, |d| d.as_micros()),
     )
     .unwrap_or(u64::MAX);
-    let outcome = guard.insert_at(holder, hash, receive_us);
+    let outcome = guard.insert_at(
+        NodeId::from_bytes(holder),
+        ContentHash::from_bytes(hash),
+        receive_us,
+    );
     assert!(
         matches!(outcome, InsertOutcome::Inserted | InsertOutcome::Refreshed),
         "test record insert must succeed: {outcome:?}"
@@ -231,12 +244,17 @@ async fn find_providers_returns_directly_reachable_provider() -> anyhow::Result<
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &provider).await?;
 
     // Client's local routing table has the provider as its only peer.
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*client_id.as_bytes())));
-    routing.lock().unwrap().insert(*provider.id.as_bytes());
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
+    routing
+        .lock()
+        .unwrap()
+        .insert(NodeId::from_bytes(*provider.id.as_bytes()));
 
     // Client's view of the staker set: trust the provider.
     let mut client_staked = HashSet::new();
-    client_staked.insert(*provider.id.as_bytes());
+    client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
     let neg = NegativeProbeCache::new();
 
@@ -245,13 +263,13 @@ async fn find_providers_returns_directly_reachable_provider() -> anyhow::Result<
         &routing,
         &staker_set,
         &neg,
-        *client_id.as_bytes(),
-        target,
+        NodeId::from_bytes(*client_id.as_bytes()),
+        ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
     )
     .await;
 
-    assert_eq!(providers, vec![*provider.id.as_bytes()]);
+    assert_eq!(providers, vec![NodeId::from_bytes(*provider.id.as_bytes())]);
 
     client_ep.close().await;
     provider.shutdown();
@@ -273,23 +291,31 @@ async fn find_providers_drops_providers_in_negative_cache() -> anyhow::Result<()
     insert_record(&provider.records, target, *provider.id.as_bytes());
 
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &provider).await?;
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*client_id.as_bytes())));
-    routing.lock().unwrap().insert(*provider.id.as_bytes());
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
+    routing
+        .lock()
+        .unwrap()
+        .insert(NodeId::from_bytes(*provider.id.as_bytes()));
 
     let mut client_staked = HashSet::new();
-    client_staked.insert(*provider.id.as_bytes());
+    client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
     let neg = NegativeProbeCache::new();
     // Pre-record a failure for (provider, target).
-    neg.record_failure(*provider.id.as_bytes(), target);
+    neg.record_failure(
+        NodeId::from_bytes(*provider.id.as_bytes()),
+        ContentHash::from_bytes(target),
+    );
 
     let providers = find_providers(
         &client_ep,
         &routing,
         &staker_set,
         &neg,
-        *client_id.as_bytes(),
-        target,
+        NodeId::from_bytes(*client_id.as_bytes()),
+        ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
     )
     .await;
@@ -322,8 +348,13 @@ async fn find_providers_drops_non_staked_provider() -> anyhow::Result<()> {
     insert_record(&provider.records, target, *provider.id.as_bytes());
 
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &provider).await?;
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*client_id.as_bytes())));
-    routing.lock().unwrap().insert(*provider.id.as_bytes());
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
+    routing
+        .lock()
+        .unwrap()
+        .insert(NodeId::from_bytes(*provider.id.as_bytes()));
 
     // Client's staker set is empty — every peer is filtered out.
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::empty());
@@ -334,8 +365,8 @@ async fn find_providers_drops_non_staked_provider() -> anyhow::Result<()> {
         &routing,
         &staker_set,
         &neg,
-        *client_id.as_bytes(),
-        target,
+        NodeId::from_bytes(*client_id.as_bytes()),
+        ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
     )
     .await;
@@ -358,7 +389,9 @@ async fn find_providers_with_empty_routing_table_returns_empty() -> anyhow::Resu
     let client_id = client_sk.public();
     let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
 
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*client_id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::empty());
     let neg = NegativeProbeCache::new();
 
@@ -367,8 +400,8 @@ async fn find_providers_with_empty_routing_table_returns_empty() -> anyhow::Resu
         &routing,
         &staker_set,
         &neg,
-        *client_id.as_bytes(),
-        target,
+        NodeId::from_bytes(*client_id.as_bytes()),
+        ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
     )
     .await;

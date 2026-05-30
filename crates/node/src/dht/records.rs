@@ -38,9 +38,10 @@ use std::collections::{BTreeSet, HashMap};
 use crate::dht::routing::NodeId;
 use decdn_protocol::MAX_PROVIDERS_PER_HASH;
 
-/// 32-byte content hash. Distinct from `NodeId` only at the type alias
-/// level — the wire format treats both as `[u8; 32]`.
-pub type Hash = [u8; 32];
+/// 32-byte content hash. Re-exported from the protocol crate's
+/// [`decdn_protocol::ContentHash`] newtype — distinct from [`NodeId`] at the
+/// type level, identical (`[u8; 32]`) on the wire.
+pub use decdn_protocol::ContentHash as Hash;
 
 /// Outcome of a [`RecordStore::insert_at`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,10 +410,10 @@ mod tests {
     use super::*;
 
     fn nid(b: u8) -> NodeId {
-        [b; 32]
+        NodeId::from_bytes([b; 32])
     }
     fn h(b: u8) -> Hash {
-        [b; 32]
+        Hash::from_bytes([b; 32])
     }
 
     fn small_cfg() -> RecordStoreConfig {
@@ -655,7 +656,7 @@ mod tests {
         for i in 0..10_000u32 {
             let mut holder = [0u8; 32];
             holder[..4].copy_from_slice(&i.to_le_bytes());
-            s.insert_at(holder, h(0xEE), 500);
+            s.insert_at(NodeId::from_bytes(holder), h(0xEE), 500);
         }
         // Insert the record under test at wall-clock 500.
         s.insert_at(nid(0xCC), h(0xFF), 500);

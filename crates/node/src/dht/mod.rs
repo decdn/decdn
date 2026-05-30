@@ -5,6 +5,7 @@
 //! table, rate limiter, record store, republish scheduler, and the
 //! requester-side iterative lookup that surround the handler.
 
+pub mod auth;
 pub mod batch_fallback;
 pub mod bootstrap;
 pub mod bucket_refresh;
@@ -19,6 +20,7 @@ pub mod records;
 pub mod routing;
 pub mod staker_set;
 
+pub use auth::AuthenticatedNodeId;
 pub use batch_fallback::{BatchStoreFallback, DEFAULT_BATCH_UNSUPPORTED_TTL};
 pub use bootstrap::{BootstrapOutcome, bootstrap};
 pub use chain_staker_set::ChainStakerSet;

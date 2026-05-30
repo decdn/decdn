@@ -50,7 +50,7 @@ use tracing::{debug, warn};
 
 use crate::dht::client;
 use crate::dht::negative_cache::{Hash, NegativeProbeCache};
-use crate::dht::routing::{K_BUCKET_SIZE, NODE_ID_LEN, NodeId, RoutingTable, xor_distance};
+use crate::dht::routing::{K_BUCKET_SIZE, NODE_ID_LEN, NodeId, RoutingTable, xor_distance_bytes};
 use crate::dht::staker_set::StakerSet;
 
 /// Default α — parallel in-flight RPCs per round. ADR 022 § Routing Table.
@@ -189,7 +189,7 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
         let requester_id = ctx.requester_id;
         let target = ctx.target;
         tasks.spawn(async move {
-            let Ok(pk) = PublicKey::from_bytes(&peer) else {
+            let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
                 return (peer, Err(RoundRpcError::InvalidPubKey));
             };
             let addr = EndpointAddr::new(pk);
@@ -280,7 +280,7 @@ fn fold_response(
     responder: NodeId,
     state: &mut LookupState,
 ) -> bool {
-    let kept_closer = filter_xor_closer(resp.closer_nodes, target, &responder);
+    let kept_closer = filter_xor_closer(resp.closer_nodes.into_inner(), target, &responder);
     let kept_closer = filter_active_stakers(kept_closer, staker_set);
     let kept_providers = filter_active_stakers(resp.providers, staker_set);
     let kept_providers = filter_negative_cache(kept_providers, target, negative_cache);
@@ -308,10 +308,12 @@ fn fold_response(
 /// stale value.
 #[must_use]
 fn filter_xor_closer(closer_nodes: Vec<NodeId>, target: &Hash, responder: &NodeId) -> Vec<NodeId> {
-    let responder_distance = xor_distance(responder, target);
+    // Cross-domain XOR: `target` is a content hash, `responder`/`n` are node
+    // ids — they share the 256-bit keyspace (ADR 022 §Routing Table).
+    let responder_distance = xor_distance_bytes(responder.as_bytes(), target.as_bytes());
     closer_nodes
         .into_iter()
-        .filter(|n| xor_distance(n, target) < responder_distance)
+        .filter(|n| xor_distance_bytes(n.as_bytes(), target.as_bytes()) < responder_distance)
         .collect()
 }
 
@@ -392,10 +394,10 @@ impl LookupState {
         // first round has alternates if the closest few don't answer.
         let seed_count = cfg.alpha.get().saturating_mul(4);
         let seed = match routing_table.lock() {
-            Ok(t) => t.closest(target, seed_count),
+            Ok(t) => t.closest(target.as_bytes(), seed_count),
             Err(poisoned) => {
                 warn!("dht lookup: routing table mutex poisoned; recovering inner state");
-                poisoned.into_inner().closest(target, seed_count)
+                poisoned.into_inner().closest(target.as_bytes(), seed_count)
             }
         };
         for peer in seed {
@@ -413,7 +415,7 @@ impl LookupState {
         if peer == self.requester_id {
             return false;
         }
-        let dist = xor_distance(&peer, &self.target);
+        let dist = xor_distance_bytes(peer.as_bytes(), self.target.as_bytes());
         // XOR distance is bijective for a fixed target, so
         // `contains_key(&dist)` is equivalent to scanning values for
         // `peer` — but O(log N) instead of O(N).
@@ -484,10 +486,15 @@ mod tests {
     use std::collections::HashSet as StdHashSet;
 
     fn nid(byte: u8) -> NodeId {
-        [byte; 32]
+        NodeId::from_bytes([byte; 32])
     }
     fn h(byte: u8) -> Hash {
-        [byte; 32]
+        Hash::from_bytes([byte; 32])
+    }
+    /// Wrap test nodes in `CloserNodes` (all test inputs are within cap).
+    fn closer(nodes: Vec<NodeId>) -> decdn_protocol::dht::CloserNodes {
+        decdn_protocol::dht::CloserNodes::try_new(nodes)
+            .expect("test closer_nodes within MAX_CLOSER_NODES")
     }
     fn nz(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).expect("test literal is non-zero")
@@ -641,7 +648,7 @@ mod tests {
         let resp = decdn_protocol::dht::FindValueResponse {
             hash: target,
             providers: vec![nid(0x05), nid(0x10)],
-            closer_nodes: vec![nid(0x05), nid(0x10)],
+            closer_nodes: closer(vec![nid(0x05), nid(0x10)]),
         };
         fold_response(
             &target,
@@ -680,7 +687,7 @@ mod tests {
         let resp = decdn_protocol::dht::FindValueResponse {
             hash: target,
             providers: vec![nid(0x07)],
-            closer_nodes: vec![nid(0x07)],
+            closer_nodes: closer(vec![nid(0x07)]),
         };
         let observed_closer = fold_response(
             &target,
@@ -732,7 +739,7 @@ mod tests {
             // closer_nodes: [self, non-staked, neg-cached (kept!),
             //                not-strictly-closer (0x80 > 0x40),
             //                survivor]
-            closer_nodes: vec![requester, nid(0x05), nid(0x10), nid(0x80), nid(0x12)],
+            closer_nodes: closer(vec![requester, nid(0x05), nid(0x10), nid(0x80), nid(0x12)]),
         };
         fold_response(
             &target,

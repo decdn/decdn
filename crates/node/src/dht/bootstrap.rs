@@ -78,7 +78,7 @@ pub async fn bootstrap(
     routing: &Arc<Mutex<RoutingTable>>,
     staker_set: &Arc<dyn StakerSet>,
 ) -> BootstrapOutcome {
-    let self_id_bytes = *self_id.as_bytes();
+    let self_node_id = NodeId::from_bytes(*self_id.as_bytes());
     let seeds = staker_set.active_nodes();
     let mut outcome = BootstrapOutcome {
         seeds_seen: seeds.len(),
@@ -97,7 +97,7 @@ pub async fn bootstrap(
     // routes through this seed set.
     if let Ok(mut table) = routing.lock() {
         for &peer in &seeds {
-            if peer == self_id_bytes {
+            if peer == self_node_id {
                 // Self-id is rejected by `RoutingTable::insert` anyway,
                 // but skip it here so the seeds_inserted count is honest.
                 continue;
@@ -119,7 +119,7 @@ pub async fn bootstrap(
     // submits transactions can influence — so we shuffle here to keep
     // the picks unpredictable from outside the node.
     let mut seeds_shuffled: Vec<NodeId> =
-        seeds.into_iter().filter(|n| *n != self_id_bytes).collect();
+        seeds.into_iter().filter(|n| *n != self_node_id).collect();
     seeds_shuffled.shuffle(&mut rand::rng());
     let fanout: Vec<NodeId> = seeds_shuffled.into_iter().take(BOOTSTRAP_FANOUT).collect();
     let mut handles = Vec::with_capacity(fanout.len());
@@ -127,7 +127,7 @@ pub async fn bootstrap(
         let endpoint_cloned = endpoint.clone();
         let target_id = peer;
         handles.push(tokio::spawn(async move {
-            let target_pk = match PublicKey::from_bytes(&target_id) {
+            let target_pk = match PublicKey::from_bytes(target_id.as_bytes()) {
                 Ok(k) => k,
                 Err(e) => {
                     // A staker-set entry that doesn't decode as an
@@ -143,7 +143,7 @@ pub async fn bootstrap(
             };
             let addr = EndpointAddr::new(target_pk);
             let result =
-                client::find_node(&endpoint_cloned, addr, self_id_bytes, self_id_bytes).await;
+                client::find_node(&endpoint_cloned, addr, self_node_id, self_node_id).await;
             (target_id, result)
         }));
     }
@@ -154,10 +154,13 @@ pub async fn bootstrap(
                 outcome.find_node_ok += 1;
                 // Insert every peer the responder named — these are
                 // the seed's K-closest to self.node_id, exactly what
-                // we want in our k-buckets.
+                // we want in our k-buckets. Response-learned ids inserted
+                // as probe candidates by design (not authenticated peers);
+                // the `AuthenticatedNodeId` boundary covers the handler's
+                // recency refresh, not this discovery path.
                 if let Ok(mut table) = routing.lock() {
-                    for peer in resp.closer_nodes {
-                        if peer == self_id_bytes {
+                    for peer in resp.closer_nodes.into_inner() {
+                        if peer == self_node_id {
                             continue;
                         }
                         if table.insert(peer) {
@@ -197,7 +200,7 @@ mod tests {
     use std::collections::HashSet;
 
     fn nid(b: u8) -> NodeId {
-        [b; 32]
+        NodeId::from_bytes([b; 32])
     }
 
     /// Without spinning up real iroh endpoints we can't exercise the

@@ -71,7 +71,7 @@ use decdn_node::dht::{
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::ALPN_DHT;
+use decdn_protocol::{ALPN_DHT, ContentHash, NodeId};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 
@@ -172,8 +172,11 @@ async fn spin_up_server(staked: HashSet<[u8; 32]>) -> anyhow::Result<TestServer>
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let rate_limiter = permissive_dht_rate_limiter(&metrics);
+    let staked: HashSet<NodeId> = staked.into_iter().map(NodeId::from_bytes).collect();
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *id.as_bytes(),
+    ))));
     let records = Arc::new(Mutex::new(RecordStore::new(RecordStoreConfig::default())));
 
     let handler = Arc::new(DhtHandler::with_routing(
@@ -223,7 +226,13 @@ async fn prime_iroh_cache(
     server: &TestServer,
 ) -> anyhow::Result<()> {
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
-    let _ = client::find_node(client_ep, target, *server.id.as_bytes(), *client_id).await?;
+    let _ = client::find_node(
+        client_ep,
+        target,
+        NodeId::from_bytes(*server.id.as_bytes()),
+        NodeId::from_bytes(*client_id),
+    )
+    .await?;
     Ok(())
 }
 
@@ -247,7 +256,11 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
             .map_or(0, |d| d.as_micros()),
     )
     .unwrap_or(u64::MAX);
-    let outcome = guard.insert_at(holder, hash, receive_us);
+    let outcome = guard.insert_at(
+        NodeId::from_bytes(holder),
+        ContentHash::from_bytes(hash),
+        receive_us,
+    );
     assert!(
         matches!(outcome, InsertOutcome::Inserted | InsertOutcome::Refreshed),
         "test record insert must succeed: {outcome:?}"
@@ -283,10 +296,13 @@ fn ids_in_one_bucket(count: usize) -> Vec<[u8; 32]> {
 #[test]
 fn bucket_overflow_evicts_lru_and_departed_node_is_removed() {
     let self_id = [0u8; 32];
-    let mut table = RoutingTable::new(self_id);
+    let mut table = RoutingTable::new(NodeId::from_bytes(self_id));
 
     let overflow = K_BUCKET_SIZE + 2;
-    let ids = ids_in_one_bucket(overflow);
+    let ids: Vec<NodeId> = ids_in_one_bucket(overflow)
+        .into_iter()
+        .map(NodeId::from_bytes)
+        .collect();
     for id in &ids {
         table.insert(*id);
     }
@@ -337,21 +353,26 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
 
     // A second peer departs the network before the lookup. It is
     // staked and was in the routing table, but is then removed.
-    let departed_id = *fresh_key().public().as_bytes();
+    let departed_id = NodeId::from_bytes(*fresh_key().public().as_bytes());
 
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*client_id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
     {
         let mut t = routing.lock().unwrap();
-        t.insert(*provider.id.as_bytes());
+        t.insert(NodeId::from_bytes(*provider.id.as_bytes()));
         t.insert(departed_id);
         assert!(t.contains(&departed_id));
         assert!(t.remove(&departed_id), "departing peer removed");
         assert!(!t.contains(&departed_id));
-        assert!(t.contains(provider.id.as_bytes()), "provider survives");
+        assert!(
+            t.contains(&NodeId::from_bytes(*provider.id.as_bytes())),
+            "provider survives"
+        );
     }
 
     let mut client_staked = HashSet::new();
-    client_staked.insert(*provider.id.as_bytes());
+    client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     client_staked.insert(departed_id);
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
     let neg = NegativeProbeCache::new();
@@ -361,15 +382,15 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
         &routing,
         &staker_set,
         &neg,
-        *client_id.as_bytes(),
-        target,
+        NodeId::from_bytes(*client_id.as_bytes()),
+        ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
     )
     .await;
 
     assert_eq!(
         providers,
-        vec![*provider.id.as_bytes()],
+        vec![NodeId::from_bytes(*provider.id.as_bytes())],
         "lookup must converge to the surviving provider after a departure"
     );
 
@@ -404,8 +425,8 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     // peer's own id, so the dead peer is the closest possible candidate
     // (XOR distance 0) and is dialed first.
     let dead = spin_up_server(HashSet::new()).await?;
-    let dead_id = *dead.id.as_bytes();
-    let target: [u8; 32] = dead_id;
+    let target: [u8; 32] = *dead.id.as_bytes();
+    let dead_id = NodeId::from_bytes(target);
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &dead).await?;
 
     // Reachable provider holding the record for `target`. It is farther
@@ -417,15 +438,17 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
 
     dead.shutdown().await;
 
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*client_id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
     {
         let mut t = routing.lock().unwrap();
-        t.insert(*provider.id.as_bytes());
+        t.insert(NodeId::from_bytes(*provider.id.as_bytes()));
         t.insert(dead_id);
     }
 
     let mut client_staked = HashSet::new();
-    client_staked.insert(*provider.id.as_bytes());
+    client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     client_staked.insert(dead_id);
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
     let neg = NegativeProbeCache::new();
@@ -440,8 +463,8 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
             &routing,
             &staker_set,
             &neg,
-            *client_id.as_bytes(),
-            target,
+            NodeId::from_bytes(*client_id.as_bytes()),
+            ContentHash::from_bytes(target),
             lookup_cfg_for_test(),
         ),
     )
@@ -450,7 +473,7 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
 
     assert_eq!(
         providers,
-        vec![*provider.id.as_bytes()],
+        vec![NodeId::from_bytes(*provider.id.as_bytes())],
         "lookup must converge to the reachable provider despite the closest peer being dead"
     );
     assert!(
@@ -479,21 +502,24 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
     // the closest possible node to `target`, so `seed`'s referral
     // survives the XOR-closer filter (Filter 1).
     let holder = spin_up_server(HashSet::new()).await?;
-    let holder_id = *holder.id.as_bytes();
-    let target: [u8; 32] = holder_id;
-    insert_record(&holder.records, target, holder_id);
+    let holder_bytes = *holder.id.as_bytes();
+    let holder_id = NodeId::from_bytes(holder_bytes);
+    let target: [u8; 32] = holder_bytes;
+    insert_record(&holder.records, target, holder_bytes);
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &holder).await?;
 
     // The seed holds no record but knows the holder — its FindValue
     // response carries `holder` in `closer_nodes`, driving round 2.
     let seed = spin_up_server(HashSet::new()).await?;
-    let seed_id = *seed.id.as_bytes();
+    let seed_id = NodeId::from_bytes(*seed.id.as_bytes());
     seed.routing.lock().unwrap().insert(holder_id);
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &seed).await?;
 
     // The client's routing table contains only the seed — the holder is
     // reachable solely via the seed's referral.
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*client_id.as_bytes())));
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
     routing.lock().unwrap().insert(seed_id);
 
     let mut client_staked = HashSet::new();
@@ -507,8 +533,8 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
         &routing,
         &staker_set,
         &neg,
-        *client_id.as_bytes(),
-        target,
+        NodeId::from_bytes(*client_id.as_bytes()),
+        ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
     )
     .await;
@@ -540,11 +566,16 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
     insert_record(&provider.records, target, *provider.id.as_bytes());
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &provider).await?;
 
-    let routing = Arc::new(Mutex::new(RoutingTable::new(*client_id.as_bytes())));
-    routing.lock().unwrap().insert(*provider.id.as_bytes());
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
+    routing
+        .lock()
+        .unwrap()
+        .insert(NodeId::from_bytes(*provider.id.as_bytes()));
 
     let mut client_staked = HashSet::new();
-    client_staked.insert(*provider.id.as_bytes());
+    client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
 
     // Short TTL injected via the test/tuning seam. The cache is anchored
@@ -555,7 +586,10 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
     // duration.
     let ttl = Duration::from_millis(750);
     let neg = NegativeProbeCache::with_capacity_and_ttl(16, ttl);
-    neg.record_failure(*provider.id.as_bytes(), target);
+    neg.record_failure(
+        NodeId::from_bytes(*provider.id.as_bytes()),
+        ContentHash::from_bytes(target),
+    );
 
     // First lookup: the pre-recorded failure suppresses the provider.
     let suppressed = find_providers(
@@ -563,8 +597,8 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
         &routing,
         &staker_set,
         &neg,
-        *client_id.as_bytes(),
-        target,
+        NodeId::from_bytes(*client_id.as_bytes()),
+        ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
     )
     .await;
@@ -583,14 +617,14 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
         &routing,
         &staker_set,
         &neg,
-        *client_id.as_bytes(),
-        target,
+        NodeId::from_bytes(*client_id.as_bytes()),
+        ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
     )
     .await;
     assert_eq!(
         recovered,
-        vec![*provider.id.as_bytes()],
+        vec![NodeId::from_bytes(*provider.id.as_bytes())],
         "expired negative entry must not poison the follow-up lookup"
     );
 
