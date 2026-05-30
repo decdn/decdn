@@ -117,6 +117,18 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.blacklist.hasRole(d.blacklist.EMERGENCY_MULTISIG_ROLE(), emergencyMultisig), "blacklist emergency");
     }
 
+    // The emergency multisig must hold PAUSER_ROLE on every deployed Pausable
+    // target at the end of deploy (ADR 016 § Role Inventory). No constructor
+    // grants it, so a missing wiring step would leave the protocol with no live
+    // pauser until a 48h-delayed governance proposal — the failure this guards.
+    function test_roleMatrix_pauserIsEmergencyMultisig() public view {
+        assertTrue(d.bond.hasRole(d.bond.PAUSER_ROLE(), emergencyMultisig), "bond pauser");
+        assertTrue(d.router.hasRole(d.router.PAUSER_ROLE(), emergencyMultisig), "router pauser");
+        assertTrue(d.slashAppeal.hasRole(d.slashAppeal.PAUSER_ROLE(), emergencyMultisig), "slashAppeal pauser");
+        assertTrue(d.paymentChannel.hasRole(d.paymentChannel.PAUSER_ROLE(), emergencyMultisig), "paymentChannel pauser");
+        assertTrue(d.slashJudge.hasRole(d.slashJudge.PAUSER_ROLE(), emergencyMultisig), "slashJudge pauser");
+    }
+
     // -----------------------------------------------------------------
     // Cross-contract wiring (ADR 016 § Post-Deployment Initialization)
     // -----------------------------------------------------------------

@@ -330,6 +330,21 @@ abstract contract BaseProtocolDeploy is Script {
         // such constructor path, so grant explicitly.
         d.blacklist.grantRole(d.blacklist.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
 
+        // PAUSER_ROLE → the emergency multisig on every Pausable target (ADR 016
+        // § Role Inventory: `EMERGENCY_ROLE` holds `pause()` on fund-holding /
+        // Pausable contracts, a 3-of-5 multisig). No constructor grants
+        // PAUSER_ROLE, so without this wiring the system comes up with no live
+        // pauser: post-handoff the only PAUSER_ROLE admin is the Timelock, so the
+        // first emergency pause would need a 48h-delayed governance proposal —
+        // defeating the emergency path. Granted here, before the handoff, so the
+        // multisig can pause from block one. (BuybackBurner is also Pausable but
+        // is not deployed by this script — see the contract header.)
+        d.bond.grantRole(d.bond.PAUSER_ROLE(), cfg.emergencyMultisig);
+        d.router.grantRole(d.router.PAUSER_ROLE(), cfg.emergencyMultisig);
+        d.slashAppeal.grantRole(d.slashAppeal.PAUSER_ROLE(), cfg.emergencyMultisig);
+        d.paymentChannel.grantRole(d.paymentChannel.PAUSER_ROLE(), cfg.emergencyMultisig);
+        d.slashJudge.grantRole(d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
+
         // GENESIS_GRANTOR_ROLE → the Timelock (treasury custodian), which issues
         // Genesis Bond Credits during GENESIS_CREDIT_WINDOW (ADR 016 § Post-
         // Deployment Init step 7). CapacityBond's window clock starts at
