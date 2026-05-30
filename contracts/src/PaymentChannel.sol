@@ -46,9 +46,17 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     // Channel status
     // -----------------------------------------------------------------
 
-    uint8 internal constant STATUS_OPEN = 0;
-    uint8 internal constant STATUS_CLOSING = 1;
-    uint8 internal constant STATUS_CLOSED = 2;
+    /// @dev Lifecycle: `Open → Closing → Closed`, plus the `Open → Closed`
+    ///      shortcut via `reclaimExpired`. `Closed` is terminal. Matches the
+    ///      `enum`-typed state machines in `CapacityBond`/`SlashAppeal`; the
+    ///      zero default (`Open`) is harmless since a never-opened channel has
+    ///      `client == address(0)` and every entry point gates on the caller
+    ///      being a recorded party.
+    enum Status {
+        Open,
+        Closing,
+        Closed
+    }
 
     // -----------------------------------------------------------------
     // Safety bounds (ADR 003 § Safety bounds, ADR 009)
@@ -125,10 +133,12 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         uint256 claimedBytes;
         uint256 withdrawnAmount;
         uint256 withdrawnBytes;
-        uint256 openedAt;
-        uint256 expiresAt;
-        uint8 status;
-        uint256 disputeDeadline;
+        // Packed into one slot (8+8+8+1+1 = 26 bytes): timestamps fit `uint64`
+        // for ~584 billion years, matching the `SlashRecord`/`Appeal` convention.
+        uint64 openedAt;
+        uint64 expiresAt;
+        uint64 disputeDeadline;
+        Status status;
         bool extended;
     }
 
@@ -195,6 +205,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     error BytesRegression(uint256 bytesDelivered, uint256 claimedBytes);
     error AmountExceedsDeposit(uint256 amount, uint256 deposit);
     error NothingToWithdraw();
+    error ByteAdvanceWithoutPayment(uint256 byteDelta);
     error ZeroAmount();
     error RouterUnchanged();
     error RateBoundsInvalid(uint256 deliveryFloor, uint256 deliveryCeiling);
@@ -283,9 +294,9 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         ch.provider = provider;
         ch.token = address(usdc);
         ch.deposit = deposit;
-        ch.openedAt = block.timestamp;
-        ch.expiresAt = block.timestamp + maxChannelDuration;
-        ch.status = STATUS_OPEN;
+        ch.openedAt = uint64(block.timestamp);
+        ch.expiresAt = uint64(block.timestamp + maxChannelDuration);
+        ch.status = Status.Open;
 
         usdc.safeTransferFrom(msg.sender, address(this), deposit);
 
@@ -325,21 +336,15 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         if (msg.sender != ch.provider) revert NotChannelParty();
 
         _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.client, signature);
-        // Strict monotonicity against the shared watermark (invariant 4).
-        if (nonce <= ch.claimedNonce) revert NonMonotonicNonce(nonce, ch.claimedNonce);
-        if (amount < ch.claimedAmount) revert AmountRegression(amount, ch.claimedAmount);
-        if (bytesDelivered < ch.claimedBytes) revert BytesRegression(bytesDelivered, ch.claimedBytes);
-        if (amount > ch.deposit) revert AmountExceedsDeposit(amount, ch.deposit);
+        // Strict monotonicity against the shared claim watermark (invariant 4).
+        _advanceClaimWatermark(ch, amount, nonce, bytesDelivered, true);
 
-        // Capture the routed delta against the PRE-call watermark before advancing it.
+        // Capture the routed delta against the PRE-call withdrawal watermark.
         uint256 delta = amount - ch.withdrawnAmount;
         uint256 bytesDelta = bytesDelivered - ch.withdrawnBytes;
         if (delta == 0) revert NothingToWithdraw();
 
         // Effects before the FeeRouter interaction (checks-effects-interactions).
-        ch.claimedAmount = amount;
-        ch.claimedNonce = nonce;
-        ch.claimedBytes = bytesDelivered;
         ch.withdrawnAmount = amount;
         ch.withdrawnBytes = bytesDelivered;
 
@@ -373,21 +378,15 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
 
         if (!zeroVoucher) {
             _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.client, signature);
-            if (amount > ch.deposit) revert AmountExceedsDeposit(amount, ch.deposit);
-            // Non-regressing against any prior `withdraw` watermark. `nonce >=`
-            // (not strict) so a party can always close at the current watermark.
-            if (nonce < ch.claimedNonce) revert NonMonotonicNonce(nonce, ch.claimedNonce);
-            if (amount < ch.claimedAmount) revert AmountRegression(amount, ch.claimedAmount);
-            if (bytesDelivered < ch.claimedBytes) revert BytesRegression(bytesDelivered, ch.claimedBytes);
-
-            ch.claimedAmount = amount;
-            ch.claimedNonce = nonce;
-            ch.claimedBytes = bytesDelivered;
+            // `strictNonce = false`: a party can always close at the current
+            // watermark (`nonce ==`), unlike `withdraw`/`disputeChannel`.
+            _advanceClaimWatermark(ch, amount, nonce, bytesDelivered, false);
+            _requireBytesTrackPayment(ch);
         }
 
-        ch.status = STATUS_CLOSING;
+        ch.status = Status.Closing;
         ch.extended = false;
-        ch.disputeDeadline = block.timestamp + disputeWindow;
+        ch.disputeDeadline = uint64(block.timestamp + disputeWindow);
 
         emit ChannelCloseInitiated(
             channelId, msg.sender, ch.claimedAmount, ch.claimedNonce, ch.claimedBytes, ch.disputeDeadline
@@ -409,25 +408,19 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         bytes calldata signature
     ) external nonReentrant {
         Channel storage ch = channels[channelId];
-        if (ch.status != STATUS_CLOSING) revert ChannelNotClosing();
+        if (ch.status != Status.Closing) revert ChannelNotClosing();
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp >= ch.disputeDeadline) revert DisputeWindowClosed();
 
         _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.client, signature);
-        if (nonce <= ch.claimedNonce) revert NonMonotonicNonce(nonce, ch.claimedNonce);
-        if (amount < ch.claimedAmount) revert AmountRegression(amount, ch.claimedAmount);
-        if (bytesDelivered < ch.claimedBytes) revert BytesRegression(bytesDelivered, ch.claimedBytes);
-        if (amount > ch.deposit) revert AmountExceedsDeposit(amount, ch.deposit);
-
-        ch.claimedAmount = amount;
-        ch.claimedNonce = nonce;
-        ch.claimedBytes = bytesDelivered;
+        _advanceClaimWatermark(ch, amount, nonce, bytesDelivered, true);
+        _requireBytesTrackPayment(ch);
 
         if (_arrivedViaForcedInclusion() && !ch.extended) {
             // forge-lint: disable-next-line(block-timestamp)
             uint256 remaining = ch.disputeDeadline > block.timestamp ? ch.disputeDeadline - block.timestamp : 0;
             if (remaining < FORCED_INCLUSION_GUARANTEE) {
-                ch.disputeDeadline = block.timestamp + FORCED_INCLUSION_GUARANTEE;
+                ch.disputeDeadline = uint64(block.timestamp + FORCED_INCLUSION_GUARANTEE);
                 ch.extended = true;
             }
         }
@@ -440,7 +433,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///         drawn via `withdraw`).
     function settleChannel(bytes32 channelId) external nonReentrant {
         Channel storage ch = channels[channelId];
-        if (ch.status != STATUS_CLOSING) revert ChannelNotClosing();
+        if (ch.status != Status.Closing) revert ChannelNotClosing();
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < ch.disputeDeadline) revert DisputeWindowActive();
 
@@ -448,9 +441,13 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         uint256 settleBytes = ch.claimedBytes - ch.withdrawnBytes;
         uint256 clientRefund = ch.deposit - ch.claimedAmount;
 
-        ch.status = STATUS_CLOSED;
+        ch.status = Status.Closed;
 
         if (clientRefund != 0) usdc.safeTransfer(ch.client, clientRefund);
+        // `settleBytes != 0` always implies `settleAmount != 0`: `closeChannel`/
+        // `disputeChannel` reject a byte-only watermark advance via
+        // `_requireBytesTrackPayment`, so routing only on a positive amount delta
+        // never drops served-byte accounting (ADR 036 vote weight).
         if (settleAmount != 0) _route(ch.provider, settleBytes, settleAmount);
 
         emit ChannelSettled(channelId, ch.provider, settleAmount, settleBytes, clientRefund);
@@ -461,14 +458,14 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///         withdrawn bytes were already counted at `withdraw` time.
     function reclaimExpired(bytes32 channelId) external nonReentrant {
         Channel storage ch = channels[channelId];
-        if (ch.status != STATUS_OPEN) revert ChannelNotOpen();
+        if (ch.status != Status.Open) revert ChannelNotOpen();
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < ch.expiresAt) revert ChannelNotExpired();
         if (msg.sender != ch.client && msg.sender != ch.provider) revert NotChannelParty();
 
         uint256 clientRefund = ch.deposit - ch.withdrawnAmount;
 
-        ch.status = STATUS_CLOSED;
+        ch.status = Status.Closed;
 
         if (clientRefund != 0) usdc.safeTransfer(ch.client, clientRefund);
 
@@ -559,9 +556,48 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     // -----------------------------------------------------------------
 
     function _requireOpenAndUnexpired(Channel storage ch) internal view {
-        if (ch.status != STATUS_OPEN) revert ChannelNotOpen();
+        if (ch.status != Status.Open) revert ChannelNotOpen();
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp >= ch.expiresAt) revert ChannelExpired();
+    }
+
+    /// @dev Validate a voucher against the shared claim watermark and advance the
+    ///      `claimed*` fields (invariants 1, 2, 4 — ADR 003 § Settlement-path).
+    ///      `strictNonce` requires `nonce >` for `withdraw`/`disputeChannel`;
+    ///      `closeChannel` passes `false` so a party can always close at the
+    ///      current watermark (`nonce ==`), otherwise a channel with no newer
+    ///      voucher would be unclosable until `expiresAt`.
+    function _advanceClaimWatermark(
+        Channel storage ch,
+        uint256 amount,
+        uint256 nonce,
+        uint256 bytesDelivered,
+        bool strictNonce
+    ) internal {
+        if (strictNonce ? nonce <= ch.claimedNonce : nonce < ch.claimedNonce) {
+            revert NonMonotonicNonce(nonce, ch.claimedNonce);
+        }
+        if (amount < ch.claimedAmount) revert AmountRegression(amount, ch.claimedAmount);
+        if (bytesDelivered < ch.claimedBytes) revert BytesRegression(bytesDelivered, ch.claimedBytes);
+        if (amount > ch.deposit) revert AmountExceedsDeposit(amount, ch.deposit);
+
+        ch.claimedAmount = amount;
+        ch.claimedNonce = nonce;
+        ch.claimedBytes = bytesDelivered;
+    }
+
+    /// @dev Reject a recorded close/dispute voucher that advances served bytes
+    ///      without advancing the routable amount past the withdrawal watermark.
+    ///      `settleChannel` forwards bytes only alongside a positive amount delta
+    ///      (FeeRouter reverts on a zero-amount stamp), so such a voucher would
+    ///      silently drop the served-byte accounting ADR 036 uses for governance
+    ///      vote weight. `withdraw` is exempt by construction — it reverts
+    ///      `NothingToWithdraw` on a zero amount delta.
+    function _requireBytesTrackPayment(Channel storage ch) internal view {
+        uint256 byteDelta = ch.claimedBytes - ch.withdrawnBytes;
+        if (byteDelta != 0 && ch.claimedAmount == ch.withdrawnAmount) {
+            revert ByteAdvanceWithoutPayment(byteDelta);
+        }
     }
 
     /// @dev Verify a client EIP-712 voucher signature (EOA or ERC-1271) over the
