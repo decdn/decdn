@@ -6,6 +6,7 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import { PaymentChannel } from "../src/PaymentChannel.sol";
 import { IFeeRouterSettlement } from "../src/interfaces/IFeeRouterSettlement.sol";
@@ -72,6 +73,23 @@ contract MockSettlementRouter is IFeeRouterSettlement {
         for (uint256 i = 0; i < calls.length; i++) {
             sum += calls[i].bytesDelivered;
         }
+    }
+}
+
+/// @notice Minimal ERC-1271 smart-account wallet: validates a signature by
+///         recovering it to a fixed owner EOA. Exercises the SignatureChecker
+///         ERC-1271 branch of voucher verification (ADR 024 smart-account signers).
+contract MockERC1271Wallet {
+    bytes4 internal constant MAGIC = 0x1626ba7e;
+    address public immutable owner;
+
+    constructor(address owner_) {
+        owner = owner_;
+    }
+
+    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, signature);
+        return (err == ECDSA.RecoverError.NoError && recovered == owner) ? MAGIC : bytes4(0xffffffff);
     }
 }
 
@@ -203,6 +221,16 @@ contract PaymentChannelTest is Test {
         return _signFor(address(channel), channelId, amount, nonce, bytesDelivered);
     }
 
+    /// @dev Deploy a forced-inclusion harness and fund/approve the client against it.
+    function _newForcedHarness() internal returns (ForcedInclusionHarness h) {
+        h = new ForcedInclusionHarness(
+            usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin
+        );
+        usdc.transfer(client, 10_000e6);
+        vm.prank(client);
+        usdc.approve(address(h), type(uint256).max);
+    }
+
     // -----------------------------------------------------------------
     // openChannel
     // -----------------------------------------------------------------
@@ -218,7 +246,7 @@ contract PaymentChannelTest is Test {
         assertEq(ch.provider, provider);
         assertEq(ch.token, address(usdc));
         assertEq(ch.deposit, DEPOSIT);
-        assertEq(ch.expiresAt, block.timestamp + MAX_DURATION);
+        assertEq(uint256(ch.expiresAt), block.timestamp + MAX_DURATION);
         assertEq(usdc.balanceOf(address(channel)), DEPOSIT);
     }
 
@@ -364,8 +392,8 @@ contract PaymentChannelTest is Test {
         channel.closeChannel(id, amount, 1, bytesDelivered, sig);
 
         PaymentChannel.Channel memory ch = channel.getChannel(id);
-        assertEq(ch.status, 1); // Closing
-        assertEq(ch.disputeDeadline, block.timestamp + DISPUTE_WINDOW);
+        assertEq(uint8(ch.status), uint8(PaymentChannel.Status.Closing));
+        assertEq(uint256(ch.disputeDeadline), block.timestamp + DISPUTE_WINDOW);
 
         vm.warp(block.timestamp + DISPUTE_WINDOW);
         uint256 clientBefore = usdc.balanceOf(client);
@@ -374,7 +402,7 @@ contract PaymentChannelTest is Test {
         assertEq(router.totalRouted(), amount);
         assertEq(router.totalBytes(), bytesDelivered);
         assertEq(usdc.balanceOf(client) - clientBefore, DEPOSIT - amount);
-        assertEq(channel.getChannel(id).status, 2); // Closed
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closed));
     }
 
     function test_settle_revertsBeforeDisputeDeadline() public {
@@ -430,6 +458,17 @@ contract PaymentChannelTest is Test {
         assertEq(router.totalBytes(), 80_000_000);
     }
 
+    function test_close_revertsAfterExpiry() public {
+        bytes32 id = _open();
+        vm.warp(block.timestamp + MAX_DURATION);
+        // After expiry the provider must forfeit via `reclaimExpired`; closing
+        // (then settling) here would bypass the close-before-expiry obligation.
+        bytes memory sig = _sign(id, 800e6, 1, 80_000_000);
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.ChannelExpired.selector);
+        channel.closeChannel(id, 800e6, 1, 80_000_000, sig);
+    }
+
     // -----------------------------------------------------------------
     // disputeChannel
     // -----------------------------------------------------------------
@@ -477,7 +516,7 @@ contract PaymentChannelTest is Test {
         vm.prank(provider); // provider may trigger; refund still goes to client
         channel.reclaimExpired(id);
         assertEq(usdc.balanceOf(client) - clientBefore, DEPOSIT - 250e6);
-        assertEq(channel.getChannel(id).status, 2);
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closed));
     }
 
     function test_reclaimExpired_revertsBeforeExpiry() public {
@@ -515,7 +554,7 @@ contract PaymentChannelTest is Test {
 
         PaymentChannel.Channel memory ch = h.getChannel(id);
         assertTrue(ch.extended);
-        assertEq(ch.disputeDeadline, block.timestamp + 24 hours);
+        assertEq(uint256(ch.disputeDeadline), block.timestamp + 24 hours);
     }
 
     // -----------------------------------------------------------------
@@ -536,6 +575,14 @@ contract PaymentChannelTest is Test {
         vm.prank(admin);
         vm.expectRevert(PaymentChannel.RouterUnchanged.selector);
         channel.setFeeRouter(address(router));
+    }
+
+    function test_setFeeRouter_revertsOnEoaRouter() public {
+        // `stranger` is an EOA (no code) — routing settlement there would no-op
+        // `routeSettlement` while channel state advances, stranding claimed USDC.
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterHasNoCode.selector, stranger));
+        channel.setFeeRouter(stranger);
     }
 
     function test_setDisputeWindow_enforcesBounds() public {
@@ -610,5 +657,293 @@ contract PaymentChannelTest is Test {
         channel.settleChannel(id);
         assertEq(router.totalRouted(), amount);
         assertEq(usdc.balanceOf(client) - clientBefore, DEPOSIT - amount);
+    }
+
+    // -----------------------------------------------------------------
+    // Settlement-path edges (zero-remainder, watermark close, deposit boundary)
+    // -----------------------------------------------------------------
+
+    /// @dev A channel fully drawn via `withdraw` then closed at the same watermark
+    ///      settles with NO router call (zero remainder) — the real `FeeRouter`
+    ///      reverts on a zero amount, so a stray route here would brick settlement.
+    function test_settle_fullyWithdrawn_noRouterCall() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.withdraw(id, 600e6, 1, 60_000_000, _sign(id, 600e6, 1, 60_000_000));
+        uint256 callsAfterWithdraw = router.callCount();
+
+        // Close at the same nonce-1 watermark voucher (non-strict nonce).
+        vm.prank(provider);
+        channel.closeChannel(id, 600e6, 1, 60_000_000, _sign(id, 600e6, 1, 60_000_000));
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+        uint256 clientBefore = usdc.balanceOf(client);
+        channel.settleChannel(id);
+
+        assertEq(router.callCount(), callsAfterWithdraw); // no extra route
+        assertEq(usdc.balanceOf(client) - clientBefore, DEPOSIT - 600e6);
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closed));
+    }
+
+    /// @dev `closeChannel` accepts a voucher at the current watermark (`nonce ==`),
+    ///      the deliberate non-strict asymmetry vs. `withdraw`/`disputeChannel`.
+    function test_close_atWatermarkNonce_succeeds() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.withdraw(id, 300e6, 1, 30_000_000, _sign(id, 300e6, 1, 30_000_000));
+        vm.prank(provider);
+        channel.closeChannel(id, 300e6, 1, 30_000_000, _sign(id, 300e6, 1, 30_000_000));
+
+        PaymentChannel.Channel memory ch = channel.getChannel(id);
+        assertEq(uint8(ch.status), uint8(PaymentChannel.Status.Closing));
+        assertEq(ch.claimedNonce, 1);
+        assertEq(ch.claimedAmount, 300e6);
+        assertEq(ch.claimedBytes, 30_000_000);
+    }
+
+    function test_close_revertsOnAmountExceedingDeposit() public {
+        bytes32 id = _open();
+        uint256 over = DEPOSIT + 1;
+        bytes memory sig = _sign(id, over, 1, 1_000_000);
+        vm.prank(provider);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.AmountExceedsDeposit.selector, over, DEPOSIT));
+        channel.closeChannel(id, over, 1, 1_000_000, sig);
+    }
+
+    function test_dispute_revertsOnAmountExceedingDeposit() public {
+        bytes32 id = _open();
+        vm.prank(client);
+        channel.closeChannel(id, 100e6, 1, 1_000_000, _sign(id, 100e6, 1, 1_000_000));
+        uint256 over = DEPOSIT + 1;
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.AmountExceedsDeposit.selector, over, DEPOSIT));
+        channel.disputeChannel(id, over, 2, 2_000_000, _sign(id, over, 2, 2_000_000));
+    }
+
+    /// @dev `amount == deposit` is the legal boundary: settle routes the full
+    ///      deposit and refunds the client zero.
+    function test_settle_amountEqualsDeposit_zeroRefund() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.closeChannel(id, DEPOSIT, 1, 100_000_000, _sign(id, DEPOSIT, 1, 100_000_000));
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+        uint256 clientBefore = usdc.balanceOf(client);
+        channel.settleChannel(id);
+        assertEq(router.totalRouted(), DEPOSIT);
+        assertEq(usdc.balanceOf(client) - clientBefore, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Watermark regression reverts (provider/client fund protection)
+    // -----------------------------------------------------------------
+
+    function test_dispute_revertsOnAmountRegression() public {
+        bytes32 id = _open();
+        vm.prank(client);
+        channel.closeChannel(id, 500e6, 1, 50_000_000, _sign(id, 500e6, 1, 50_000_000));
+        // Higher nonce but a lower amount must not reduce the provider's payout.
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.AmountRegression.selector, 400e6, 500e6));
+        channel.disputeChannel(id, 400e6, 2, 60_000_000, _sign(id, 400e6, 2, 60_000_000));
+    }
+
+    function test_dispute_revertsOnBytesRegression() public {
+        bytes32 id = _open();
+        vm.prank(client);
+        channel.closeChannel(id, 500e6, 1, 50_000_000, _sign(id, 500e6, 1, 50_000_000));
+        // Higher nonce + higher amount but lower bytes must not cut served-byte weight.
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.BytesRegression.selector, 40_000_000, 50_000_000));
+        channel.disputeChannel(id, 600e6, 2, 40_000_000, _sign(id, 600e6, 2, 40_000_000));
+    }
+
+    function test_withdraw_revertsWhenDeltaZero() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.withdraw(id, 300e6, 1, 30_000_000, _sign(id, 300e6, 1, 30_000_000));
+        // Strictly-higher nonce but identical amount AND bytes → nothing to route.
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.NothingToWithdraw.selector);
+        channel.withdraw(id, 300e6, 2, 30_000_000, _sign(id, 300e6, 2, 30_000_000));
+    }
+
+    function test_withdraw_revertsOnBytesRegression() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.withdraw(id, 300e6, 1, 30_000_000, _sign(id, 300e6, 1, 30_000_000));
+        vm.prank(provider);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.BytesRegression.selector, 20_000_000, 30_000_000));
+        channel.withdraw(id, 400e6, 2, 20_000_000, _sign(id, 400e6, 2, 20_000_000));
+    }
+
+    /// @dev A close voucher advancing bytes without advancing amount past the
+    ///      withdrawal watermark is rejected — `settleChannel` could not route
+    ///      those bytes (zero amount delta) without silently dropping them.
+    function test_close_revertsOnByteOnlyAdvance() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.withdraw(id, 300e6, 1, 30_000_000, _sign(id, 300e6, 1, 30_000_000));
+        vm.prank(provider);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.ByteAdvanceWithoutPayment.selector, 20_000_000));
+        channel.closeChannel(id, 300e6, 2, 50_000_000, _sign(id, 300e6, 2, 50_000_000));
+    }
+
+    function test_dispute_revertsOnByteOnlyAdvance() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.withdraw(id, 300e6, 1, 30_000_000, _sign(id, 300e6, 1, 30_000_000));
+        vm.prank(provider);
+        channel.closeChannel(id, 300e6, 1, 30_000_000, _sign(id, 300e6, 1, 30_000_000));
+        // Dispute advances bytes only (amount stays at the withdrawal watermark).
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.ByteAdvanceWithoutPayment.selector, 10_000_000));
+        channel.disputeChannel(id, 300e6, 2, 40_000_000, _sign(id, 300e6, 2, 40_000_000));
+    }
+
+    // -----------------------------------------------------------------
+    // Voucher verification: ERC-1271 + replay
+    // -----------------------------------------------------------------
+
+    /// @dev A smart-account (ERC-1271) client validates vouchers via its
+    ///      `isValidSignature`, not EOA ecrecover.
+    function test_withdraw_acceptsErc1271Signature() public {
+        MockERC1271Wallet wallet = new MockERC1271Wallet(client); // owner = CLIENT_PK signer
+        usdc.transfer(address(wallet), 10_000e6);
+        vm.prank(address(wallet));
+        usdc.approve(address(channel), type(uint256).max);
+
+        vm.prank(address(wallet));
+        bytes32 id = channel.openChannel(provider, DEPOSIT);
+        assertEq(channel.getChannel(id).client, address(wallet));
+
+        // Voucher signed by the wallet's owner key; verified through ERC-1271.
+        bytes memory sig = _sign(id, 200e6, 1, 20_000_000);
+        vm.prank(provider);
+        channel.withdraw(id, 200e6, 1, 20_000_000, sig);
+
+        assertEq(router.totalRouted(), 200e6);
+        assertEq(channel.getChannel(id).withdrawnAmount, 200e6);
+    }
+
+    /// @dev A voucher validly signed for channel A must not verify on channel B —
+    ///      the `channelId` is bound into the EIP-712 digest.
+    function test_voucher_rejectedOnWrongChannelId() public {
+        bytes32 idA = _open();
+        bytes32 idB = _open();
+        bytes memory sigA = _sign(idA, 100e6, 1, 1_000_000);
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.InvalidVoucherSignature.selector);
+        channel.withdraw(idB, 100e6, 1, 1_000_000, sigA);
+    }
+
+    // -----------------------------------------------------------------
+    // Constructor validation
+    // -----------------------------------------------------------------
+
+    function test_constructor_revertsOnZeroAdmin() public {
+        vm.expectRevert(PaymentChannel.ZeroAddress.selector);
+        new PaymentChannel(
+            usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, address(0)
+        );
+    }
+
+    function test_constructor_revertsOnEoaFeeRouter() public {
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterHasNoCode.selector, stranger));
+        new PaymentChannel(usdc, bond, stranger, DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin);
+    }
+
+    function test_constructor_revertsOnDisputeWindowOutOfBounds() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PaymentChannel.ParamOutOfBounds.selector, uint256(1 hours), uint256(12 hours), uint256(72 hours)
+            )
+        );
+        new PaymentChannel(usdc, bond, address(router), 1 hours, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin);
+    }
+
+    // -----------------------------------------------------------------
+    // Pause: opens blocked, exits stay callable
+    // -----------------------------------------------------------------
+
+    /// @dev While paused, `openChannel` reverts but every existing-channel exit
+    ///      path (`withdraw`/`closeChannel`/`settleChannel`) stays callable so
+    ///      funds are never trapped (PaymentChannel pause semantics).
+    function test_paused_exitsStillCallable() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.withdraw(id, 200e6, 1, 20_000_000, _sign(id, 200e6, 1, 20_000_000));
+
+        vm.prank(pauser);
+        channel.pause();
+
+        // Exits still work.
+        vm.prank(provider);
+        channel.withdraw(id, 400e6, 2, 40_000_000, _sign(id, 400e6, 2, 40_000_000));
+        vm.prank(provider);
+        channel.closeChannel(id, 500e6, 3, 50_000_000, _sign(id, 500e6, 3, 50_000_000));
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+        channel.settleChannel(id);
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closed));
+
+        // But a fresh open is blocked.
+        vm.prank(client);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        channel.openChannel(provider, DEPOSIT);
+    }
+
+    // -----------------------------------------------------------------
+    // Forced-inclusion extension: negative branches
+    // -----------------------------------------------------------------
+
+    function test_forcedInclusion_doesNotExtendTwice() public {
+        ForcedInclusionHarness h = _newForcedHarness();
+        vm.prank(client);
+        bytes32 id = h.openChannel(provider, DEPOSIT);
+        vm.prank(client);
+        h.closeChannel(id, 100e6, 1, 1_000_000, _signFor(address(h), id, 100e6, 1, 1_000_000));
+
+        // First forced-inclusion dispute near the deadline → extends once.
+        vm.warp(block.timestamp + DISPUTE_WINDOW - 1 hours);
+        h.setForced(true);
+        vm.prank(stranger);
+        h.disputeChannel(id, 200e6, 2, 2_000_000, _signFor(address(h), id, 200e6, 2, 2_000_000));
+        assertTrue(h.getChannel(id).extended);
+        uint64 deadlineAfterFirst = h.getChannel(id).disputeDeadline;
+
+        // Second forced-inclusion dispute must NOT extend again.
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(stranger);
+        h.disputeChannel(id, 300e6, 3, 3_000_000, _signFor(address(h), id, 300e6, 3, 3_000_000));
+        assertEq(uint256(h.getChannel(id).disputeDeadline), uint256(deadlineAfterFirst));
+    }
+
+    function test_forcedInclusion_noExtendWhenAmpleTimeRemains() public {
+        ForcedInclusionHarness h = _newForcedHarness();
+        vm.prank(client);
+        bytes32 id = h.openChannel(provider, DEPOSIT);
+        vm.prank(client);
+        h.closeChannel(id, 100e6, 1, 1_000_000, _signFor(address(h), id, 100e6, 1, 1_000_000));
+        uint64 originalDeadline = h.getChannel(id).disputeDeadline;
+
+        // Forced inclusion but with > FORCED_INCLUSION_GUARANTEE (24h) remaining.
+        vm.warp(block.timestamp + 1 hours);
+        h.setForced(true);
+        vm.prank(stranger);
+        h.disputeChannel(id, 200e6, 2, 2_000_000, _signFor(address(h), id, 200e6, 2, 2_000_000));
+        assertFalse(h.getChannel(id).extended);
+        assertEq(uint256(h.getChannel(id).disputeDeadline), uint256(originalDeadline));
+    }
+
+    function test_normalDispute_doesNotExtend() public {
+        bytes32 id = _open();
+        vm.prank(client);
+        channel.closeChannel(id, 100e6, 1, 1_000_000, _sign(id, 100e6, 1, 1_000_000));
+        uint64 originalDeadline = channel.getChannel(id).disputeDeadline;
+
+        // Near the deadline, but a normal (non-forced) dispute never extends.
+        vm.warp(block.timestamp + DISPUTE_WINDOW - 1 hours);
+        vm.prank(stranger);
+        channel.disputeChannel(id, 200e6, 2, 2_000_000, _sign(id, 200e6, 2, 2_000_000));
+        assertEq(uint256(channel.getChannel(id).disputeDeadline), uint256(originalDeadline));
+        assertFalse(channel.getChannel(id).extended);
     }
 }

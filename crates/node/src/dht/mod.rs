@@ -5,6 +5,7 @@
 //! table, rate limiter, record store, republish scheduler, and the
 //! requester-side iterative lookup that surround the handler.
 
+pub mod batch_fallback;
 pub mod bootstrap;
 pub mod bucket_refresh;
 pub mod chain_staker_set;
@@ -18,6 +19,7 @@ pub mod records;
 pub mod routing;
 pub mod staker_set;
 
+pub use batch_fallback::{BatchStoreFallback, DEFAULT_BATCH_UNSUPPORTED_TTL};
 pub use bootstrap::{BootstrapOutcome, bootstrap};
 pub use chain_staker_set::ChainStakerSet;
 pub use lookup::{LookupConfig, find_providers};
