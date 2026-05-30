@@ -154,7 +154,10 @@ pub async fn bootstrap(
                 outcome.find_node_ok += 1;
                 // Insert every peer the responder named — these are
                 // the seed's K-closest to self.node_id, exactly what
-                // we want in our k-buckets.
+                // we want in our k-buckets. Response-learned ids inserted
+                // as probe candidates by design (not authenticated peers);
+                // the `AuthenticatedNodeId` boundary covers the handler's
+                // recency refresh, not this discovery path.
                 if let Ok(mut table) = routing.lock() {
                     for peer in resp.closer_nodes.into_inner() {
                         if peer == self_node_id {

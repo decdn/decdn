@@ -794,6 +794,29 @@ mod tests {
         Ok(())
     }
 
+    // `CloserNodes::try_new` enforces the same cap as the decode path, but at
+    // construction. Pins the `>` boundary directly (decode tests cover the wire
+    // side; this covers the in-memory side the type's doc advertises).
+    #[test]
+    fn closer_nodes_try_new_enforces_cap() {
+        // Exactly MAX is accepted.
+        let at_cap = CloserNodes::try_new(vec![nid(0); MAX_CLOSER_NODES])
+            .expect("exactly MAX_CLOSER_NODES must construct");
+        assert_eq!(at_cap.len(), MAX_CLOSER_NODES);
+
+        // One over MAX is rejected, and the error reports the offending length.
+        let err = CloserNodes::try_new(vec![nid(0); MAX_CLOSER_NODES + 1])
+            .expect_err("over-cap must be rejected at construction");
+        assert_eq!(err.len, MAX_CLOSER_NODES + 1);
+
+        // Empty is fine.
+        assert!(
+            CloserNodes::try_new(vec![])
+                .expect("empty is valid")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn dht_message_trailing_bytes_tolerated() -> Result<(), postcard::Error> {
         // ADR 013 Tier-1: extension bytes after the message are silently

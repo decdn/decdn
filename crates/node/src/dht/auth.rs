@@ -29,6 +29,18 @@
 //! only constructor takes a live [`Connection`] (not a bare `PublicKey`, which a
 //! caller could mint from arbitrary bytes): the type cannot be fabricated from
 //! wire data.
+//!
+//! # Scope
+//!
+//! This guards the *handler's direct trust decisions* — the per-request routing
+//! refresh (`note_peer_seen`) and the `holder` checks — against substituting a
+//! request-body id for the connected peer. It does **not** mean every routing
+//! insert requires authentication: the iterative-lookup / bucket-refresh /
+//! bootstrap paths legitimately learn peers from `FindNode` *responses* and
+//! insert those plain [`NodeId`]s as probe candidates (Kademlia by design,
+//! bounded by `MAX_CLOSER_NODES`-capped `closer_nodes` and the downstream
+//! active-staker filter). The boundary closes the requester/holder-substitution
+//! class specifically.
 
 use iroh::endpoint::Connection;
 

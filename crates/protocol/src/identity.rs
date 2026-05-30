@@ -49,8 +49,8 @@ pub struct ContentHash([u8; ID_LEN]);
 macro_rules! id_newtype_impls {
     ($t:ty) => {
         impl $t {
-            /// Wrap raw bytes. `const` so it is usable where the routing table
-            /// is built in a `const fn` context.
+            /// Wrap raw bytes. `const` to keep the newtype usable in const
+            /// contexts (and consistent with the sibling accessors below).
             #[must_use]
             pub const fn from_bytes(bytes: [u8; ID_LEN]) -> Self {
                 Self(bytes)
@@ -104,9 +104,13 @@ mod tests {
             assert_eq!(node_bytes, array_bytes);
             assert_eq!(hash_bytes, array_bytes);
 
-            // ...and decode round-trips from the array encoding.
-            let decoded: NodeId = postcard::from_bytes(&array_bytes)?;
-            assert_eq!(decoded, NodeId::from_bytes(raw));
+            // ...and both types decode from the bare-array encoding (the
+            // no-ALPN-bump claim needs byte-identity in both directions for
+            // both types — `ContentHash` is the type carried in `*.hash`).
+            let decoded_node: NodeId = postcard::from_bytes(&array_bytes)?;
+            assert_eq!(decoded_node, NodeId::from_bytes(raw));
+            let decoded_hash: ContentHash = postcard::from_bytes(&array_bytes)?;
+            assert_eq!(decoded_hash, ContentHash::from_bytes(raw));
         }
         Ok(())
     }

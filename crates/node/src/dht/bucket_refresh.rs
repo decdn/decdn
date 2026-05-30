@@ -151,7 +151,10 @@ async fn refresh_one_bucket(
         Ok(resp) => {
             // Insert any new peers from the response into the routing
             // table. The bucket's freshness is updated by virtue of
-            // these inserts moving entries to MRU.
+            // these inserts moving entries to MRU. These are
+            // response-learned ids (not the authenticated peer), inserted
+            // as Kademlia probe candidates by design — distinct from the
+            // `AuthenticatedNodeId`-gated recency refresh in the handler.
             if let Ok(mut table) = routing.lock() {
                 for nid in resp.closer_nodes.into_inner() {
                     if nid != self_node_id {

@@ -224,8 +224,9 @@ impl RoutingTable {
     /// `closer_nodes` field is itself capped at `MAX_CLOSER_NODES`.
     ///
     /// Walks every bucket; with 256 × 20 entries the worst case is 5120
-    /// XOR-compares + a partial sort — well under a microsecond on modern
-    /// hardware and dwarfed by the QUIC round-trip cost.
+    /// XOR computes (once each, cached) + a sort over those cached distances —
+    /// well under a microsecond on modern hardware and dwarfed by the QUIC
+    /// round-trip cost.
     ///
     /// The result is capped at [`K_BUCKET_SIZE`] (= [`MAX_CLOSER_NODES`])
     /// so it can be serialised directly into a wire `closer_nodes` field.
