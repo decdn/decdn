@@ -111,7 +111,7 @@ Checks fire cheapest-first (global → per-IP → per-peer) so a probe rejected 
 
 ### `cdn/client/v1` — paid delivery protocol
 
-Used for all paid delivery: client→node and node→node (cache miss pull from an origin-backed or cached node).
+Used for all paid delivery: client→node and node→node (cache miss pull from an origin-backed or cached node). A delivering node MAY satisfy a request for a blob it does not hold by pulling through from the network — not only from its own configured origin — and serving the result, governed by the seed-leech caps in [ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality); this is the mechanism that warms a regional copy. A warming proxy holds no record at probe time and answers `has_blob: false` to any probe, so serving via pull-through carries no phantom-announcement exposure (cf. § Probe interaction). `NotFound` is returned only when the node neither holds the blob nor can reach a provider for it, or declines to pull through under its seed-leech policy.
 
 ```mermaid
 sequenceDiagram
@@ -241,7 +241,7 @@ A node signals a stream failure by returning a `StreamError` code. Delivery-side
 
 ```rust
 enum StreamError {
-    NotFound,          // Node does not have the blob (cache miss, no origin)
+    NotFound,          // Node does not hold the blob and cannot reach a provider, or declines to pull through (ADR 037 seed-leech caps)
     Overloaded,        // Node is at capacity; try another node
     BlobTooLarge,      // Blob exceeds this node's configured max_blob_size; do not retry this node
     InternalError,     // Unexpected failure; do not retry this node
