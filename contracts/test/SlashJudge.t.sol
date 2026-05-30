@@ -63,14 +63,24 @@ contract MockSlasher is ICapacityBondSlasher {
 }
 
 contract MockBlacklistView is IContentBlacklistHashView {
-    mapping(bytes32 => mapping(bytes32 => uint64)) internal _addedAt;
+    struct Entry {
+        uint64 addedAt;
+        bool suspended;
+    }
+
+    mapping(bytes32 => mapping(bytes32 => Entry)) internal _entries;
 
     function setEntry(bytes32 region, bytes32 hash, uint64 addedAt) external {
-        _addedAt[region][hash] = addedAt;
+        _entries[region][hash] = Entry(addedAt, false);
+    }
+
+    function setEntrySuspended(bytes32 region, bytes32 hash, uint64 addedAt, bool suspended) external {
+        _entries[region][hash] = Entry(addedAt, suspended);
     }
 
     function getHashEntry(bytes32 region, bytes32 hash) external view override returns (uint64, bool) {
-        return (_addedAt[region][hash], false);
+        Entry memory e = _entries[region][hash];
+        return (e.addedAt, e.suspended);
     }
 }
 
@@ -269,6 +279,28 @@ contract SlashJudgeTest is Test {
         judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
     }
 
+    function test_phantom_revertsOnEvidenceReplay() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+
+        vm.prank(challenger);
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+
+        bytes32 probeHash = keccak256(abi.encode(PROBE_TYPEHASH, p.hash, p.hasBlob, p.ratePerMb, p.timestampUs));
+        bytes32 streamHash = keccak256(
+            abi.encode(STREAM_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.channelId, s.timestampUs, s.redirect)
+        );
+        bytes32 evidenceHash = keccak256(abi.encode(uint8(ISlashJudge.OffenseType.Phantom), probeHash, streamHash));
+
+        // Resubmitting the exact same signed proof must not ratchet the offense count.
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceAlreadyUsed.selector, evidenceHash));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+
+        assertEq(slasher.slashCount(), 1);
+        assertTrue(judge.usedEvidenceHash(evidenceHash));
+    }
+
     // -----------------------------------------------------------------
     // Rate manipulation
     // -----------------------------------------------------------------
@@ -321,8 +353,19 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert(
-            abi.encodeWithSelector(SlashJudge.BlacklistAfterResponse.selector, uint64(block.timestamp + 1000), streamTs)
+            abi.encodeWithSelector(
+                SlashJudge.BlacklistAfterResponse.selector, uint256(block.timestamp + 1000) * 1_000_000, streamTs
+            )
         );
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+    }
+
+    function test_blacklist_revertsWhenSuspended() public {
+        // Live (addedAt set) but fast-track-suspended → restriction lifted, not slashable.
+        blacklist.setEntrySuspended(GLOBAL_REGION, BLOB, uint64(block.timestamp - 1000), true);
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
         judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
     }
 

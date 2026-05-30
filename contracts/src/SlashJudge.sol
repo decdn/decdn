@@ -86,6 +86,12 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     uint256 public challengeBond;
     uint256 public maxEvidenceAgeUs;
 
+    /// @notice Set once an `evidenceHash` has resulted in a slash, so the exact
+    ///         same signed proof can never be replayed to ratchet an operator's
+    ///         `lifetimeOffenseCount`. `CapacityBond.slash` has no evidence-level
+    ///         dedup, so this guard lives here.
+    mapping(bytes32 => bool) public usedEvidenceHash;
+
     // -----------------------------------------------------------------
     // Decoded evidence structs (ABI layout of the `*ResponseData` args)
     // -----------------------------------------------------------------
@@ -128,7 +134,8 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     error EvidenceInFuture(uint64 evidenceTsUs);
     error EvidenceTooOld(uint256 ageUs, uint256 maxAgeUs);
     error HashNotBlacklisted(bytes32 hash);
-    error BlacklistAfterResponse(uint64 addedAtUs, uint64 responseTsUs);
+    error BlacklistAfterResponse(uint256 addedAtUs, uint64 responseTsUs);
+    error EvidenceAlreadyUsed(bytes32 evidenceHash);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error EvidenceAgeExceedsUnbonding(uint256 maxEvidenceAgeUs, uint256 unbondingUs);
 
@@ -165,6 +172,10 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         contentBlacklist = contentBlacklist_;
         challengeBond = challengeBond_;
 
+        // `unbondingPeriod()` is a view on the trusted immutable `capacityBond`;
+        // reading it during construction cannot reenter, so the following state
+        // write is not a reentrancy vector (aderyn reentrancy-state-change FP).
+        // aderyn-ignore-next-line(reentrancy-state-change)
         _enforceUnbondingInvariant(maxEvidenceAgeUs_, capacityBond_.unbondingPeriod());
         maxEvidenceAgeUs = maxEvidenceAgeUs_;
 
@@ -249,13 +260,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         if (responseHash != blobHash) revert HashMismatch(blobHash, responseHash);
         if (!servedClaim) revert NotBlacklistViolation();
         _checkStaleness(responseTsUs);
-
-        (uint64 addedAt,) = contentBlacklist.getHashEntry(GLOBAL_REGION, blobHash);
-        if (addedAt == 0) revert HashNotBlacklisted(blobHash);
-        // Effective-since (seconds → μs) must precede the served response.
-        if (uint256(addedAt) * 1_000_000 >= uint256(responseTsUs)) {
-            revert BlacklistAfterResponse(addedAt, responseTsUs);
-        }
+        _checkBlacklistedBefore(blobHash, responseTsUs);
 
         bytes32 evidenceHash = keccak256(abi.encode(uint8(OffenseType.Blacklist), structHash, isStreamResponse));
         _resolve(challengedNode, OffenseType.Blacklist, evidenceHash);
@@ -277,6 +282,10 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     ///         (ADR 014 § Interaction with unbonding period).
     function setMaxEvidenceAge(uint256 newValueUs) external onlyRole(GOVERNANCE_ROLE) {
         _enforceEvidenceAgeBounds(newValueUs);
+        // `unbondingPeriod()` is a view on the trusted immutable `capacityBond` and
+        // this setter is GOVERNANCE_ROLE-gated, so the following state write is not
+        // a reentrancy vector (aderyn reentrancy-state-change FP).
+        // aderyn-ignore-next-line(reentrancy-state-change)
         _enforceUnbondingInvariant(newValueUs, capacityBond.unbondingPeriod());
         uint256 old = maxEvidenceAgeUs;
         maxEvidenceAgeUs = newValueUs;
@@ -351,11 +360,25 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     /// @dev Confirm the challenged address is a registered operator and that the
     ///      challenger-supplied `nodeId` matches its on-chain binding. The binding
     ///      survives deregistration, so a deregistered-but-bonded offender stays
-    ///      slashable.
+    ///      slashable. The `active` flag is intentionally unused (ADR 014 — the
+    ///      `nodeId != 0` binding, not liveness, is the registration gate).
+    // slither-disable-next-line unused-return
     function _checkRegistered(address challengedNode, bytes32 nodeId) internal view {
         (bytes32 bound,) = capacityBond.nodeIdOf(challengedNode);
         if (bound == bytes32(0)) revert NodeNotRegistered(challengedNode);
         if (bound != nodeId) revert NodeIdMismatch(nodeId, bound);
+    }
+
+    /// @dev Confirm the hash was an enforceable blacklist entry strictly before the
+    ///      served response. A suspended entry (fast-tracked appeal) lifts the
+    ///      serving restriction, so it is not slashable — matching
+    ///      `ContentBlacklist._isLive` (`addedAt != 0 && !suspended`).
+    function _checkBlacklistedBefore(bytes32 blobHash, uint64 responseTsUs) internal view {
+        (uint64 addedAt, bool suspended) = contentBlacklist.getHashEntry(GLOBAL_REGION, blobHash);
+        if (addedAt == 0 || suspended) revert HashNotBlacklisted(blobHash);
+        // Effective-since (seconds → μs) must precede the served response.
+        uint256 addedAtUs = uint256(addedAt) * 1_000_000;
+        if (addedAtUs >= uint256(responseTsUs)) revert BlacklistAfterResponse(addedAtUs, responseTsUs);
     }
 
     /// @dev Skew-safe evidence-age check (ADR 014 § Evidence staleness).
@@ -366,9 +389,13 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         if (ageUs >= maxEvidenceAgeUs) revert EvidenceTooOld(ageUs, maxEvidenceAgeUs);
     }
 
-    /// @dev Pull the challenge bond, slash (records `msg.sender` as the challenger
-    ///      for the 50% finality leg), return the bond, and emit `Slashed`.
+    /// @dev Consume the evidence (replay guard), pull the challenge bond, slash
+    ///      (records `msg.sender` as the challenger for the 50% finality leg),
+    ///      return the bond, and emit `Slashed`.
     function _resolve(address operator, OffenseType offenseType, bytes32 evidenceHash) internal {
+        if (usedEvidenceHash[evidenceHash]) revert EvidenceAlreadyUsed(evidenceHash);
+        usedEvidenceHash[evidenceHash] = true;
+
         uint256 bond = challengeBond;
         token.safeTransferFrom(msg.sender, address(this), bond);
 
