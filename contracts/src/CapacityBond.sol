@@ -121,8 +121,12 @@ contract CapacityBond is
     ///         ∈ [10, 1000] (default 10 Mbps) bars sub-floor dust
     ///         declarations; `maxCapacityMbps` ∈ [50_000, 1_000_000] (default
     ///         200 Gbps) caps per-operator declared capacity. The two ranges
-    ///         are disjoint, so the floor is always strictly below the ceiling
-    ///         without a cross-parameter check.
+    ///         are disjoint — `MIN_CAPACITY_CEILING_MBPS (1000) <
+    ///         MAX_CAPACITY_FLOOR_MBPS (50_000)` — so the floor is always
+    ///         strictly below the ceiling without a cross-parameter check.
+    ///         INVARIANT: keep the ranges disjoint; relaxing either into
+    ///         overlap silently breaks that guarantee. Guarded by
+    ///         `test_capacityBand_floorAlwaysBelowCeiling`.
     uint256 internal constant MIN_CAPACITY_FLOOR_MBPS = 10;
     uint256 internal constant MIN_CAPACITY_CEILING_MBPS = 1000;
     uint256 internal constant MAX_CAPACITY_FLOOR_MBPS = 50_000;

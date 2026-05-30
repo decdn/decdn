@@ -452,6 +452,55 @@ contract CapacityBondTest is Test {
         bond.setMaxCapacityMbps(50_000);
     }
 
+    function test_declareMbps_emitsOldAndNewValue() public {
+        vm.startPrank(operator);
+
+        // First declaration: `old` is the zero default.
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.MbpsDeclared(operator, 0, 100);
+        bond.declareMbps(100);
+
+        // Re-declaration: `old` is the prior value, not zero.
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.MbpsDeclared(operator, 100, 500);
+        bond.declareMbps(500);
+
+        vm.stopPrank();
+        assertEq(bond.declaredMbps(operator), 500);
+    }
+
+    function test_setMinCapacity_acceptsInclusiveBounds() public {
+        vm.startPrank(admin);
+        bond.setMinCapacityMbps(10); // floor of the [10, 1000] setter range
+        assertEq(bond.minCapacityMbps(), 10);
+        bond.setMinCapacityMbps(1000); // ceiling of the setter range
+        assertEq(bond.minCapacityMbps(), 1000);
+        vm.stopPrank();
+    }
+
+    function test_setMaxCapacity_acceptsInclusiveBounds() public {
+        vm.startPrank(admin);
+        bond.setMaxCapacityMbps(50_000); // floor of the [50_000, 1_000_000] setter range
+        assertEq(bond.maxCapacityMbps(), 50_000);
+        bond.setMaxCapacityMbps(1_000_000); // ceiling of the setter range
+        assertEq(bond.maxCapacityMbps(), 1_000_000);
+        vm.stopPrank();
+    }
+
+    /// @dev Guards the disjoint-range invariant that lets `declareMbps` skip a
+    ///      cross-parameter `min < max` check: pushing the floor to its highest
+    ///      governance-reachable value (MIN_CAPACITY_CEILING_MBPS) and the
+    ///      ceiling to its lowest (MAX_CAPACITY_FLOOR_MBPS) must still leave
+    ///      `min < max`. If a future edit relaxes those constants into overlap,
+    ///      this trips.
+    function test_capacityBand_floorAlwaysBelowCeiling() public {
+        vm.startPrank(admin);
+        bond.setMinCapacityMbps(1000); // MIN_CAPACITY_CEILING_MBPS
+        bond.setMaxCapacityMbps(50_000); // MAX_CAPACITY_FLOOR_MBPS
+        vm.stopPrank();
+        assertLt(bond.minCapacityMbps(), bond.maxCapacityMbps());
+    }
+
     function test_genesisCredit_grantWithinWindow() public {
         _setupGenesisGrant(50_000e18);
         CapacityBond.PendingCredit memory pc = bond.pendingCredit(operator);
