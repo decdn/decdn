@@ -18,7 +18,7 @@ A demand-broadcast layer (gossiping per-region hash popularity so nearby nodes p
 
 ## Decision
 
-A client that finds only distant holders for a cache miss routes its paid `cdn/client/v1` request *through a nearby bonded node that does not yet hold the blob*. That node fills the request by chunk-paced cache-miss pull-through, serving the client while caching the blob, and thereby becomes the first regional copy. The mechanism decomposes into a client-side selection policy and a node-side serving behavior, neither of which changes the wire format.
+A client that finds only distant holders for a cache miss routes its paid `cdn/client/v1` request *through a nearby bonded node that does not yet hold the blob*. That node fills the request by window-paced cache-miss pull-through, serving the client while caching the blob, and thereby becomes the first regional copy. The mechanism decomposes into a client-side selection policy and a node-side serving behavior, neither of which changes the wire format.
 
 ### Client selection policy: latency-driven proxy preference
 
@@ -50,7 +50,7 @@ Under this mechanism, `cdn/probe/v1` serves two distinct purposes with different
 
 The only probing a probe-less client performs is the background latency sweep that maintains its RTT map (sentinel hash, no `has_blob` semantics). Per-request content confirmation is concentrated on the node-to-node path, where a full holder is genuinely required.
 
-### Node serving: chunk-paced pull-through
+### Node serving: window-paced pull-through
 
 A node that receives a `cdn/client/v1` `StreamRequest` for a blob (or byte range) it does not hold fills it by pull-through, pipelined against incoming payment:
 
@@ -93,7 +93,7 @@ A node publishes a DHT STORE for `H` only when it holds the blob in full. Discov
 | `pull_chunk_bytes` | ~1 MB | Chunk transfer/verification granularity (bao verified streaming). |
 | `pull_ahead_bytes` | operator-set, finite | Per-request pipeline window: max `pulled − paid` bytes for a single stream. Bounds per-request abandonment loss while keeping the upstream pull pipelined — decouples the loss bound from throughput. |
 | `max_unrecouped_leech_bytes` | operator-set, finite | Global circuit breaker on aggregate speculative pull spend. |
-| `share_ratio` | operator-set | Per-peer ceiling on pulled-vs-served bytes; one-chunk initial allowance. |
+| `share_ratio` | operator-set | Per-peer ceiling on pulled-vs-served bytes; small initial allowance (at most `pull_ahead_bytes`). |
 
 Concrete defaults for the latency and budget parameters are modeled before locking; the load-bearing commitments are that `pull_ahead_bytes` is finite (so per-request loss is bounded) yet large enough to keep the upstream pull pipelined, that `max_unrecouped_leech_bytes` is finite, and that `share_ratio` is bounded.
 
@@ -103,7 +103,7 @@ Concrete defaults for the latency and budget parameters are modeled before locki
 
 - Closes the regional-locality cold-start trap with no new wire surface, no new gossip message type, and no demand-broadcast layer — the warming request is ordinary paid delivery.
 - Region self-attestation ([ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)) is sidestepped entirely: proxy selection ranks by measured RTT, so a misdeclared region cannot attract warming traffic.
-- Chunk-paced pull-through bounds speculative loss for *every* cache-miss serve, not only warming requests — it is independently valuable to the node-to-node delivery path.
+- Window-paced pull-through bounds speculative loss for *every* cache-miss serve, not only warming requests — it is independently valuable to the node-to-node delivery path.
 - The self-reinforcing DHT + selection-score loop is unchanged; this mechanism only seeds it, then disengages.
 - Costs fall where the benefit lands: the first client in a locale absorbs a bounded one-request latency premium, and every subsequent local client is served from a warm nearby copy.
 
@@ -123,7 +123,7 @@ Concrete defaults for the latency and budget parameters are modeled before locki
 ## Cross-ADR Impact
 
 - [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm): selection gains a client-side proxy-warming pre-step that may route a request to a measured-nearby non-holder; the unified selection score is unchanged. The generic FIND_VALUE → probe → select content-discovery flow now carries a client-path carve-out: a client MAY skip per-request probing and route by its RTT map, taking price from `StreamResponse` (§ [Probe roles](#probe-roles-client-optional-node-to-node-load-bearing)); the node-to-node pull-through path retains the full probe flow. The per-peer RTT map and background latency sweep (§ [Client RTT map and latency discovery](#client-rtt-map-and-latency-discovery)) are new client-side state and behavior beyond the 15-second hash-keyed probe cache; this ADR is their canonical specification.
-- [ADR 005 § Wire Protocol](005-protocol.md#adr-005-wire-protocol): the `cdn/client/v1` node handler fills a request for an unheld blob/range by chunk-paced pull-through paced on vouchers. This extends the cache-miss serving behavior, where a node lacking the blob and an origin for it returns `NotFound`: under this ADR a node MAY instead pull through from the network to serve, subject to its seed-leech caps, returning `NotFound` only when no provider is reachable or it declines. No message-format change is needed — `StreamRequest.byte_offset` already expresses range/resumption and iroh-blobs verified streaming already supports incremental chunk verification. The handler does not yet exist (its bring-up is tracked separately); this ADR is the design it implements.
+- [ADR 005 § Wire Protocol](005-protocol.md#adr-005-wire-protocol): the `cdn/client/v1` node handler fills a request for an unheld blob/range by window-paced pull-through pipelined against vouchers. This extends the cache-miss serving behavior, where a node lacking the blob and an origin for it returns `NotFound`: under this ADR a node MAY instead pull through from the network to serve, subject to its seed-leech caps, returning `NotFound` only when no provider is reachable or it declines. No message-format change is needed — `StreamRequest.byte_offset` already expresses range/resumption and iroh-blobs verified streaming already supports incremental chunk verification. The handler does not yet exist (its bring-up is tracked separately); this ADR is the design it implements.
 - [ADR 012 § Client Architecture](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model): clients implement the latency-driven proxy-preference policy and the per-peer RTT map with background latency discovery (§ [Client RTT map and latency discovery](#client-rtt-map-and-latency-discovery)) that ranks candidates. Per-request probing becomes optional for clients (§ [Probe roles](#probe-roles-client-optional-node-to-node-load-bearing)): the default path is probe-less RTT-map routing with price taken from `StreamResponse`.
 - [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale): this mechanism is the locality complement to the keyspace-routed FIND_VALUE demand oracle; it reuses the STORE-on-commit loop for closure and composes with the prefetch-side `require_authorized_origin` gate and budget where configured. It supersedes the local cache-miss prefetch trigger — realized local demand is served reactively here, not by speculative prefetch — and narrows the FIND_VALUE-frequency prefetch to keyspace-position monetization; the FIND_VALUE oracle and its prefetch path are otherwise unchanged.
 - [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation): proxy selection deliberately uses measured RTT rather than the self-attested region field, so this mechanism neither relies on nor strengthens region attestation.
@@ -133,7 +133,7 @@ Concrete defaults for the latency and budget parameters are modeled before locki
 1. A client whose probed holders all exceed `proxy_warming.rtt_threshold_ms`, and whose RTT map contains a bonded node beating the best holder by `proxy_warming.margin_ms`, routes its `StreamRequest` to that nearer non-holder; with no qualifying candidate it routes directly to the best holder.
 2. Proxy candidate ranking is invariant to peers' self-attested `region` values — selection depends only on measured RTT and the reputation floor.
 3. A node filling a request for an unheld blob pulls ahead of cleared payment in a pipeline, pausing when `pulled − paid` for the request reaches `pull_ahead_bytes`; on client abandonment its unrecouped speculative spend is at most `pull_ahead_bytes`, and the upstream pull is not serialized to one round-trip per chunk.
-4. Speculative pull-through pauses when the global unrecouped-leech counter exceeds `max_unrecouped_leech_bytes` and resumes after the node recoups; it pauses for a peer that has exceeded its `share_ratio` (beyond the one-chunk initial allowance) while continuing to serve ranges already held.
+4. Speculative pull-through pauses when the global unrecouped-leech counter exceeds `max_unrecouped_leech_bytes` and resumes after the node recoups; it pauses for a peer that has exceeded its `share_ratio` (beyond the initial allowance of at most `pull_ahead_bytes`) while continuing to serve ranges already held.
 5. After a warming serve completes the blob, the node publishes a DHT STORE for `H`, and a subsequent regional FIND_VALUE returns the node as a holder.
 6. A proxy that declines or misses `proxy_warming.max_wait_ms` causes the client to fall back to the next candidate and then the direct holder, with no error surfaced to the caller; the client records the observed RTT regardless of outcome.
 7. A node's upstream pull for a warming request targets actual holders via the normal `cdn/dht/v1` path and is not itself routed through another non-holding proxy.
