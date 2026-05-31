@@ -392,10 +392,7 @@ impl ClientHandler {
         };
 
         // Build and sign the success response.
-        let rate_per_mb = self
-            .rate_per_mb
-            .load(Ordering::Relaxed)
-            .clamp(self.delivery_floor, self.delivery_ceiling);
+        let rate_per_mb = self.clamped_rate();
         let body = StreamResponseBody {
             hash: req.hash,
             ok: true,
@@ -489,9 +486,11 @@ impl ClientHandler {
 
     /// Read and apply one cumulative voucher covering `delta_bytes` of newly
     /// delivered bytes. A permanent voucher rejection writes a `StreamError` and
-    /// finishes the stream cleanly (no reset); an underpayment or transient
-    /// store failure fails the stream (no wire signal exists for either, and the
-    /// client is blocked awaiting `VoucherAck` so it cannot resend mid-stream).
+    /// finishes the stream cleanly (no reset). A transient store-write failure
+    /// is likewise surfaced cleanly as `VoucherRejectReason::RetryLater` so the
+    /// client resends the same voucher on a fresh stream (ADR 003 §332). Only an
+    /// underpayment fails the stream: no wire reason exists for it, and the
+    /// client is blocked awaiting `VoucherAck` so it cannot resend mid-stream.
     #[allow(clippy::too_many_arguments)]
     async fn collect_voucher(
         &self,
@@ -571,14 +570,38 @@ impl ClientHandler {
                     self.write_reject(send, reason).await?;
                     Ok(VoucherOutcome::Rejected)
                 } else {
-                    // Transient store failure (#527, `RetrySignal`): no wire
-                    // retry signal exists, so fail the stream — the client
-                    // retries the whole fetch rather than deadlocking on a
-                    // never-arriving `VoucherAck`.
-                    anyhow::bail!("channel store write failed: {e}")
+                    // Transient store failure (#527, `RetrySignal`): in-memory
+                    // state did not advance. Surface it in-band as `RetryLater`
+                    // and finish the stream cleanly (MUST NOT `VoucherAck`, ADR
+                    // 003 §332) so the client resends the same voucher on a
+                    // fresh stream rather than seeing an opaque connection drop.
+                    tracing::warn!(error = %e, "channel store write failed; rejecting with RetryLater");
+                    self.write_reject(send, VoucherRejectReason::RetryLater)
+                        .await?;
+                    Ok(VoucherOutcome::Rejected)
                 }
             }
         }
+    }
+
+    /// Load the configured rate and clamp it to the delivery bounds before
+    /// signing a `StreamResponse`, logging a warning and incrementing
+    /// `rate_bounds_clamp_events` on any clamp (ADR 005 §Rate bounds — the same
+    /// clamp-and-warn the probe handler applies before signing a `ProbeResponse`).
+    fn clamped_rate(&self) -> u64 {
+        let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
+        let rate_per_mb = raw_rate.clamp(self.delivery_floor, self.delivery_ceiling);
+        if rate_per_mb != raw_rate {
+            self.metrics.rate_bounds_clamped();
+            tracing::warn!(
+                raw_rate,
+                clamped = rate_per_mb,
+                floor = self.delivery_floor,
+                ceiling = self.delivery_ceiling,
+                "rate_per_mb clamped to delivery bounds before signing StreamResponse"
+            );
+        }
+        rate_per_mb
     }
 
     /// Sign a `StreamResponse` body and assemble the full message.
@@ -609,10 +632,7 @@ impl ClientHandler {
         req: &StreamRequest,
         error: StreamError,
     ) -> anyhow::Result<()> {
-        let rate_per_mb = self
-            .rate_per_mb
-            .load(Ordering::Relaxed)
-            .clamp(self.delivery_floor, self.delivery_ceiling);
+        let rate_per_mb = self.clamped_rate();
         let body = StreamResponseBody {
             hash: req.hash,
             ok: false,

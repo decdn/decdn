@@ -4,8 +4,10 @@
 //! iroh on localhost, and drives the [`stream_fetch`] requester against it. The
 //! happy path proves bytes are delivered + hash-verified and the persisted
 //! channel state advances; the error paths prove a zero-rate response is
-//! rejected on receive (#252) and an unknown channel is cleanly rejected with
-//! `VoucherRejected { WrongChannel }` (the #327 boundary).
+//! rejected on receive (#252), an unknown channel is cleanly rejected with
+//! `VoucherRejected { WrongChannel }` (the #327 boundary), and a transient
+//! persist-write failure is cleanly rejected with `VoucherRejected { RetryLater }`
+//! (ADR 003 §332) rather than dropping the connection.
 //!
 //! Delivery/authorization gates also covered: `BlobTooLarge` (size gate),
 //! `EvictedSinceProbe` (evicted between probe and stream), the client-binding
@@ -607,6 +609,100 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
     anyhow::ensure!(
         err.to_string().contains("WrongChannel") || err.to_string().contains("rejected"),
         "error should surface the voucher rejection: {err}"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// A `ChannelStateStore` that hydrates its seeded channels (so vouchers reach
+/// the apply path) but fails every `record` with a transient I/O error —
+/// exercises the `ChannelError::Store` → `RetryLater` in-band rejection.
+#[derive(Debug)]
+struct FailingRecordStore {
+    inner: MemoryChannelStateStore,
+}
+
+impl ChannelStateStore for FailingRecordStore {
+    fn load_all(&self) -> Result<Vec<ChannelState>, decdn_incentive::StoreError> {
+        self.inner.load_all()
+    }
+
+    fn record(&self, _state: &ChannelState) -> Result<(), decdn_incentive::StoreError> {
+        Err(decdn_incentive::StoreError::Io(std::io::Error::other(
+            "injected transient store failure",
+        )))
+    }
+
+    fn forget(
+        &self,
+        channel_id: decdn_incentive::ChannelId,
+    ) -> Result<(), decdn_incentive::StoreError> {
+        self.inner.forget(channel_id)
+    }
+}
+
+/// A transient persist-write failure (`ChannelError::Store`) is surfaced in-band
+/// as `VoucherRejected { RetryLater }` and the stream finishes cleanly (no QUIC
+/// reset) — the client reads the reason and can resend the same voucher rather
+/// than seeing an opaque drop (ADR 003 §332). The node must not `VoucherAck`.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 4096];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let inner = MemoryChannelStateStore::new();
+    inner.record(&ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+    let store: Arc<dyn ChannelStateStore> = Arc::new(FailingRecordStore { inner });
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(client_signer, deposit);
+
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x9abc,
+        Duration::from_secs(10),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("transient store failure must reject the voucher"))?;
+    anyhow::ensure!(
+        err.to_string().contains("RetryLater"),
+        "error should surface the RetryLater rejection: {err}"
     );
 
     client_ep.close().await;

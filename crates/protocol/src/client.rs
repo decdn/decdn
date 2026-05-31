@@ -484,11 +484,15 @@ impl StreamError {
 
 /// Why a [`Voucher`] was rejected (ADR 005 §`VoucherRejected` semantics).
 ///
-/// Mirrors `decdn_incentive::ChannelError` ∪ `VoucherError` one-to-one (minus
-/// the transient `Store` failure, which is not a rejection — the client retries
-/// the same voucher). Variant order is frozen; the handler-side conversion
-/// `voucher_reject_reason` matches exhaustively so a new `ChannelError` variant
-/// fails to compile until this enum is extended (ADR 005 §Mirror obligation).
+/// The first eight variants mirror `decdn_incentive::ChannelError` ∪
+/// `VoucherError` one-to-one; the handler-side conversion `voucher_reject_reason`
+/// matches those exhaustively so a new `ChannelError` variant fails to compile
+/// until this enum is extended (ADR 005 §Mirror obligation). The ninth,
+/// [`Self::RetryLater`], has no validation-enum counterpart: it is the wire
+/// expression of a transient persist-write failure (`ChannelError::Store`,
+/// `decdn_incentive::RetrySignal`), the one rejection where the client should
+/// resend the **same** voucher rather than treat the failure as permanent
+/// (ADR 003 §Off-chain voucher state persistence). Variant order is frozen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -512,6 +516,14 @@ pub enum VoucherRejectReason {
     /// Voucher amount exceeds the channel deposit.
     /// `ChannelError::AmountExceedsDeposit`.
     InsufficientDeposit,
+    /// Transient node-side persist-write failure (`ChannelError::Store`,
+    /// surfaced via `decdn_incentive::RetrySignal`). The voucher itself was
+    /// valid and in-memory state did not advance, so the client should resend
+    /// the **same** voucher on a fresh stream rather than refreshing state or
+    /// topping up. No validation-enum counterpart — `voucher_reject_reason`
+    /// never returns this; the `cdn/client/v1` handler emits it directly (ADR
+    /// 003 §Off-chain voucher state persistence).
+    RetryLater,
 }
 
 #[cfg(test)]
@@ -766,6 +778,7 @@ mod tests {
             VoucherRejectReason::AmountRegression,
             VoucherRejectReason::BytesRegression,
             VoucherRejectReason::InsufficientDeposit,
+            VoucherRejectReason::RetryLater,
         ]
         .into_iter()
         .enumerate()
