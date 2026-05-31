@@ -121,6 +121,7 @@ jobs:
               - 'contracts/**'
               - '.gitmodules'
               - '.github/workflows/ci.yml'
+              - '.github/actions/**'
               - '.github/scripts/post-gas-snapshot-comment.sh'
               - '.github/scripts/contracts-coverage-comment.sh'
 
