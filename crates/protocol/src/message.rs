@@ -76,21 +76,33 @@ pub const SLASH_SIG_LEN: usize = 65;
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MessageValidationError {
     /// `rate_per_mb` exceeds [`MAX_RATE_PER_MB`].
-    #[error(
-        "ProbeResponse.rate_per_mb {rate} exceeds MAX_RATE_PER_MB ({max})",
-        max = MAX_RATE_PER_MB
-    )]
+    #[error("rate_per_mb {rate} exceeds MAX_RATE_PER_MB ({max})", max = MAX_RATE_PER_MB)]
     RateTooLarge { rate: u64 },
+    /// `rate_per_mb` is zero. A zero rate trivially wins client selection
+    /// (score `rate × rtt × scale / reputation²` → 0, sorting to the top)
+    /// while earning the node nothing — an obvious misconfiguration. Nodes
+    /// reject it at config resolution; requesters MUST also reject it on
+    /// receive (#252, ADR 005 §Rate bounds validation). Enforced via
+    /// [`ProbeResponse::validate`] / `StreamResponse::validate`, not at decode
+    /// time, so a handler can still build a response before signing it.
+    #[error("rate_per_mb is zero (requesters must reject; #252)")]
+    RateIsZero,
     /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 014 §1
     /// mandates a non-empty signature on every `ProbeResponse`; the
     /// EOA-only off-chain signing path (ADR 024 §18) makes that exactly
     /// [`SLASH_SIG_LEN`], which requesters MUST reject deviations from.
     #[error(
-        "ProbeResponse.slash_sig has invalid length {len} \
+        "slash_sig has invalid length {len} \
          (ADR 014 §1: mandatory non-empty; EOA form is {expected} bytes)",
         expected = SLASH_SIG_LEN
     )]
     InvalidSlashSigLen { len: usize },
+    /// A wire [`crate::client::Voucher`]'s `signature` is not
+    /// [`crate::client::VOUCHER_SIG_LEN`] bytes. The EOA off-chain voucher
+    /// signing form (ADR 024 §18) is exactly that length; receivers reject
+    /// deviations before reconstructing the EIP-712 typed data.
+    #[error("Voucher.signature has invalid length {len} (EOA form is 65 bytes)")]
+    InvalidVoucherSigLen { len: usize },
 }
 
 /// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per
@@ -195,6 +207,12 @@ impl ProbeResponse {
                 rate: self.body.rate_per_mb,
             });
         }
+        // #252: requesters MUST reject a zero rate on receive. The decode hook
+        // only bounds the upper end (a peer-controlled overflow source, #378);
+        // zero is a legitimate `u64` the wire accepts but a requester must not.
+        if self.body.rate_per_mb == 0 {
+            return Err(MessageValidationError::RateIsZero);
+        }
         if self.slash_sig.len() != SLASH_SIG_LEN {
             return Err(MessageValidationError::InvalidSlashSigLen {
                 len: self.slash_sig.len(),
@@ -211,7 +229,7 @@ impl ProbeResponse {
 // no mirror struct to drift out of sync. The wire bytes are byte-identical
 // to what a fully-derived `Deserialize` would have read, so postcard's
 // positional layout is preserved.
-fn deserialize_rate_per_mb<'de, D>(deserializer: D) -> Result<u64, D::Error>
+pub(crate) fn deserialize_rate_per_mb<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -394,6 +412,21 @@ mod tests {
 
         let good = sample_response();
         assert_eq!(good.validate(), Ok(()));
+    }
+
+    // #252: a requester calling `validate()` must reject a zero rate. The
+    // decode path accepts it (zero is a valid u64 ≤ MAX), so the obligation
+    // lives in the requester-side `validate()` — pin it here.
+    #[test]
+    fn probe_response_validate_rejects_zero_rate() {
+        let resp = ProbeResponse {
+            body: ProbeResponseBody {
+                rate_per_mb: 0,
+                ..sample_body()
+            },
+            ..sample_response()
+        };
+        assert_eq!(resp.validate(), Err(MessageValidationError::RateIsZero));
     }
 
     #[test]
