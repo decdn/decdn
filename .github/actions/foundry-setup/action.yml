@@ -1,0 +1,50 @@
+name: Foundry setup
+description: >-
+  Install the pinned Foundry toolchain and warm the caches CI would otherwise
+  rebuild every run: the solc compiler binaries (`~/.svm`) and, optionally, the
+  forge build artifacts (`contracts/out` + `contracts/cache`). `foundry-rs/
+  foundry-toolchain` only caches RPC/fork data (`~/.foundry/cache`), not these.
+
+inputs:
+  cache-profile:
+    description: >-
+      Which forge build artifacts to cache, keyed per compiler profile. One of
+      `ci`, `coverage`, or `none`. Optimizer settings differ per profile
+      (coverage disables it), so artifacts are NOT interchangeable — each
+      profile gets its own cache key. Use `none` for jobs that run no explicit
+      `forge build` of ours (third-party analyzers that drive their own
+      compilation still benefit from the solc cache below).
+    required: false
+    default: none
+
+runs:
+  using: composite
+  steps:
+    - uses: foundry-rs/foundry-toolchain@v1.8.0
+      with:
+        version: v1.7.1
+
+    # solc binaries are profile-independent (same pinned 0.8.28 regardless of
+    # optimizer settings), so a single key serves every job. Keyed on
+    # foundry.toml, which pins `solc_version`; the bare `svm-` restore-key still
+    # recovers an older directory so only genuinely-missing versions download.
+    - name: Cache solc (svm)
+      uses: actions/cache@v4
+      with:
+        path: ~/.svm
+        key: svm-${{ hashFiles('contracts/foundry.toml') }}
+        restore-keys: svm-
+
+    # forge build artifacts. Rolling key (commit SHA) always saves a fresh
+    # entry; the per-profile restore-key warm-starts from the most recent
+    # same-profile cache, and forge re-validates source hashes — recompiling
+    # only changed files (large stable inputs like lib/ submodules are reused).
+    - name: Cache forge build artifacts
+      if: inputs.cache-profile != 'none'
+      uses: actions/cache@v4
+      with:
+        path: |
+          contracts/cache
+          contracts/out
+        key: forge-${{ inputs.cache-profile }}-${{ github.sha }}
+        restore-keys: forge-${{ inputs.cache-profile }}-
