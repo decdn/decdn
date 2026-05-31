@@ -1,0 +1,459 @@
+//! EIP-712 `slash_sig` signatures for `cdn/client/v1` `StreamResponse` messages.
+//!
+//! Every `StreamResponse` carries a mandatory, non-empty secp256k1 EIP-712
+//! signature (`slash_sig`) over its frozen signed field set. The signature
+//! makes the response cryptographically attributable to a registered node and
+//! is the on-chain evidence for phantom-announcement and rate-manipulation
+//! slashing (ADR 005 §`cdn/client/v1`, ADR 014 §1–2). This mirrors
+//! [`crate::probe_sig`] for the delivery protocol.
+//!
+//! The signed payload follows ADR 014 §EIP-712 Type Definitions exactly so an
+//! off-chain Rust signature byte-matches what the on-chain `SlashJudge`
+//! contract recovers signatures against. `hash` and `channel_id` are
+//! request-context fields (from the `StreamRequest`); in this implementation's
+//! wire shape they are echoed back in
+//! `decdn_protocol::StreamResponseBody.{hash,channel_id}` and are part of the
+//! EIP-712 signed set — a verifier reconstructs the typed data from the
+//! response body's own fields. `redirect` is `bytes32(0)` when absent.
+//!
+//! # Domain
+//!
+//! Shares the `SlashJudge` domain with [`crate::probe_sig`]
+//! ([`crate::slash_judge_domain`]) — both `ProbeResponse` and `StreamResponse`
+//! evidence are verified by the same contract, which distinguishes them by the
+//! EIP-712 struct type, not by domain.
+//!
+//! # `StreamResponse` type
+//!
+//! ```text
+//! StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,
+//!                bytes32 channelId,uint64 timestampUs,bytes32 redirect)
+//! ```
+
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::{Address, B256, Signature};
+use alloy::signers::SignerSync;
+use alloy::sol_types::SolStruct;
+
+use decdn_protocol::StreamResponseBody;
+
+// Solidity struct mirroring ADR 014 §EIP-712 Type Definitions. Field names and
+// order are part of the signed type — both must match the on-chain contract
+// verbatim, hence the camelCase. The `sol!` macro generates a `SolStruct` impl
+// whose `eip712_signing_hash` produces the same 32-byte digest the contract
+// recovers signatures against.
+//
+// Wrapped in a private module because the `sol!` macro uses the Rust struct
+// name as the on-chain Solidity type name in the EIP-712 type-string. The
+// contract's struct is `StreamResponse`, so the Rust struct must be
+// `StreamResponse` too — the wrapping module avoids a name clash with
+// `decdn_protocol::StreamResponse`.
+mod sol_types {
+    alloy::sol! {
+        #[allow(non_snake_case, missing_debug_implementations)]
+        struct StreamResponse {
+            bytes32 hash;
+            bool ok;
+            uint64 ratePerMb;
+            uint64 totalBytes;
+            bytes32 channelId;
+            uint64 timestampUs;
+            bytes32 redirect;
+        }
+    }
+}
+
+use sol_types::StreamResponse as StreamResponseSol;
+
+/// The signed field set of a `StreamResponse` (ADR 014 §1).
+///
+/// `hash` and `channel_id` are request-context fields echoed back in the
+/// response body; `timestamp_us` is the requester-generated timestamp echoed
+/// from the `StreamRequest`. Together with `ok`, `rate_per_mb`, `total_bytes`,
+/// and `redirect`, these are exactly the fields the on-chain `SlashJudge`
+/// reconstructs to verify phantom-announcement and rate-manipulation evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamSlashData {
+    /// BLAKE3 hash of the delivered blob (iroh `Hash` bytes).
+    pub hash: B256,
+    /// Whether the node committed to serving the blob.
+    pub ok: bool,
+    /// The node's quoted rate in token base units per MB.
+    pub rate_per_mb: u64,
+    /// Total blob size in bytes.
+    pub total_bytes: u64,
+    /// The payment channel this response is bound to.
+    pub channel_id: B256,
+    /// Requester-generated microsecond timestamp echoed from the request.
+    pub timestamp_us: u64,
+    /// Alternate provider `NodeId`, or `B256::ZERO` when there is no redirect.
+    pub redirect: B256,
+}
+
+impl StreamSlashData {
+    /// Build the signed-field view from a wire [`StreamResponseBody`]. Maps
+    /// `redirect: Option<NodeId>` to `B256::ZERO` (`None`) or the `NodeId` bytes
+    /// (`Some`), exactly as the on-chain verifier expects (ADR 014 §1).
+    #[must_use]
+    pub fn from_response_body(body: &StreamResponseBody) -> Self {
+        Self {
+            hash: B256::from(body.hash),
+            ok: body.ok,
+            rate_per_mb: body.rate_per_mb,
+            total_bytes: body.total_bytes,
+            channel_id: B256::from(body.channel_id),
+            timestamp_us: body.timestamp_us,
+            redirect: body
+                .redirect
+                .map_or(B256::ZERO, |id| B256::from(id.to_bytes())),
+        }
+    }
+
+    const fn to_sol(self) -> StreamResponseSol {
+        StreamResponseSol {
+            hash: self.hash,
+            ok: self.ok,
+            ratePerMb: self.rate_per_mb,
+            totalBytes: self.total_bytes,
+            channelId: self.channel_id,
+            timestampUs: self.timestamp_us,
+            redirect: self.redirect,
+        }
+    }
+
+    /// EIP-712 signing hash bound to `domain`. This is the 32-byte digest
+    /// passed into `ecrecover` on-chain; it depends only on the data and
+    /// `domain` and is independent of the signing key.
+    #[must_use]
+    pub fn signing_hash(&self, domain: &Eip712Domain) -> B256 {
+        (*self).to_sol().eip712_signing_hash(domain)
+    }
+
+    /// Sign the stream response with `signer` for the given EIP-712 `domain`,
+    /// returning the 65-byte (`r‖s‖v`) signature for the wire `slash_sig`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error returned by the underlying signer (key locked,
+    /// remote signer offline, etc.).
+    pub fn sign<S: SignerSync>(
+        &self,
+        signer: &S,
+        domain: &Eip712Domain,
+    ) -> Result<Signature, alloy::signers::Error> {
+        let hash = self.signing_hash(domain);
+        signer.sign_hash_sync(&hash)
+    }
+
+    /// Recover the address that produced `signature` over this data under
+    /// `domain`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamSlashError::InvalidSignature`] if the signature is
+    /// malformed (non-canonical `s`, invalid recovery id, etc.).
+    pub fn recover_signer(
+        &self,
+        signature: &Signature,
+        domain: &Eip712Domain,
+    ) -> Result<Address, StreamSlashError> {
+        let hash = self.signing_hash(domain);
+        signature
+            .recover_address_from_prehash(&hash)
+            .map_err(|_| StreamSlashError::InvalidSignature)
+    }
+
+    /// Verify `signature` was produced by `expected` for `domain`.
+    ///
+    /// # Errors
+    ///
+    /// - [`StreamSlashError::InvalidSignature`] — signature is malformed.
+    /// - [`StreamSlashError::WrongSigner`] — recovered address differs from
+    ///   `expected`.
+    pub fn verify_signer(
+        &self,
+        signature: &Signature,
+        expected: Address,
+        domain: &Eip712Domain,
+    ) -> Result<(), StreamSlashError> {
+        let recovered = self.recover_signer(signature, domain)?;
+        if recovered == expected {
+            Ok(())
+        } else {
+            Err(StreamSlashError::WrongSigner {
+                expected,
+                recovered,
+            })
+        }
+    }
+}
+
+/// Failure modes for stream-response signature verification.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum StreamSlashError {
+    /// The signature is malformed — non-canonical `s`, invalid recovery id, or
+    /// a corrupted byte. (Length is enforced earlier at the protocol boundary
+    /// via `decdn_protocol::SLASH_SIG_LEN` before a `Signature` is ever
+    /// constructed; this variant does not itself length-check.)
+    #[error("stream slash_sig is malformed")]
+    InvalidSignature,
+    /// The signature is well-formed but recovers to an address that does not
+    /// match the expected signer.
+    #[error("stream slash_sig signed by {recovered}, expected {expected}")]
+    WrongSigner {
+        expected: Address,
+        recovered: Address,
+    },
+}
+
+#[cfg(test)]
+#[allow(clippy::similar_names)] // signer/signed and address/addr pair up clearly here
+mod tests {
+    use super::*;
+    use crate::slash_judge_domain;
+    use alloy::primitives::address;
+    use alloy::signers::local::PrivateKeySigner;
+
+    fn sample_data() -> StreamSlashData {
+        StreamSlashData {
+            hash: B256::repeat_byte(0x7A),
+            ok: true,
+            rate_per_mb: 10_000,
+            total_bytes: 1_048_576,
+            channel_id: B256::repeat_byte(0x33),
+            timestamp_us: 1_700_000_000_000_000,
+            redirect: B256::ZERO,
+        }
+    }
+
+    fn sample_domain() -> Eip712Domain {
+        // Arbitrum Sepolia chain id; address is a deterministic test fixture.
+        slash_judge_domain(
+            421_614,
+            address!("0000000000000000000000000000000000001234"),
+        )
+    }
+
+    fn err_of<T: std::fmt::Debug, E>(r: Result<T, E>) -> anyhow::Result<E> {
+        r.err()
+            .ok_or_else(|| anyhow::anyhow!("expected error, got Ok"))
+    }
+
+    #[test]
+    fn round_trip_sign_verify() -> anyhow::Result<()> {
+        let signer = PrivateKeySigner::random();
+        let address = signer.address();
+        let domain = sample_domain();
+        let data = sample_data();
+
+        let sig = data.sign(&signer, &domain)?;
+        data.verify_signer(&sig, address, &domain)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_signer_address_rejected() -> anyhow::Result<()> {
+        let signer = PrivateKeySigner::random();
+        let other = PrivateKeySigner::random().address();
+        let domain = sample_domain();
+        let data = sample_data();
+
+        let sig = data.sign(&signer, &domain)?;
+        let err = err_of(data.verify_signer(&sig, other, &domain))?;
+        anyhow::ensure!(
+            matches!(err, StreamSlashError::WrongSigner { .. }),
+            "expected WrongSigner, got: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn different_chain_id_rejected() -> anyhow::Result<()> {
+        let signer = PrivateKeySigner::random();
+        let domain_a = slash_judge_domain(
+            421_614,
+            address!("0000000000000000000000000000000000001234"),
+        );
+        let domain_b = slash_judge_domain(1, address!("0000000000000000000000000000000000001234"));
+        let data = sample_data();
+
+        let sig = data.sign(&signer, &domain_a)?;
+        let err = err_of(data.verify_signer(&sig, signer.address(), &domain_b))?;
+        anyhow::ensure!(
+            matches!(err, StreamSlashError::WrongSigner { .. }),
+            "expected WrongSigner, got: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn different_verifying_contract_rejected() -> anyhow::Result<()> {
+        let signer = PrivateKeySigner::random();
+        let domain_a = slash_judge_domain(
+            421_614,
+            address!("0000000000000000000000000000000000001234"),
+        );
+        let domain_b = slash_judge_domain(
+            421_614,
+            address!("0000000000000000000000000000000000005678"),
+        );
+        let data = sample_data();
+
+        let sig = data.sign(&signer, &domain_a)?;
+        let err = err_of(data.verify_signer(&sig, signer.address(), &domain_b))?;
+        anyhow::ensure!(
+            matches!(err, StreamSlashError::WrongSigner { .. }),
+            "expected WrongSigner, got: {err:?}"
+        );
+        Ok(())
+    }
+
+    /// Each signed field must be covered: tampering any one must flip the
+    /// recovered signer.
+    #[test]
+    fn tampered_fields_rejected() -> anyhow::Result<()> {
+        let signer = PrivateKeySigner::random();
+        let domain = sample_domain();
+        let data = sample_data();
+        let sig = data.sign(&signer, &domain)?;
+
+        let mutations: [StreamSlashData; 7] = [
+            StreamSlashData {
+                hash: B256::ZERO,
+                ..data
+            },
+            StreamSlashData { ok: false, ..data },
+            StreamSlashData {
+                rate_per_mb: data.rate_per_mb + 1,
+                ..data
+            },
+            StreamSlashData {
+                total_bytes: data.total_bytes + 1,
+                ..data
+            },
+            StreamSlashData {
+                channel_id: B256::ZERO,
+                ..data
+            },
+            StreamSlashData {
+                timestamp_us: data.timestamp_us + 1,
+                ..data
+            },
+            StreamSlashData {
+                redirect: B256::repeat_byte(0x99),
+                ..data
+            },
+        ];
+        for (i, m) in mutations.into_iter().enumerate() {
+            let err = err_of(m.verify_signer(&sig, signer.address(), &domain))?;
+            anyhow::ensure!(
+                matches!(err, StreamSlashError::WrongSigner { .. }),
+                "mutation {i} should flip the signer, got {err:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `redirect: None` (encoded as `B256::ZERO`) and `Some(..)` must produce
+    /// different digests — the redirect field is genuinely covered.
+    #[test]
+    fn redirect_none_differs_from_some() {
+        let domain = sample_domain();
+        let none = sample_data(); // redirect == ZERO
+        let some = StreamSlashData {
+            redirect: B256::repeat_byte(0x5A),
+            ..none
+        };
+        assert_ne!(none.signing_hash(&domain), some.signing_hash(&domain));
+    }
+
+    /// Lock the EIP-712 type hash to the exact ADR 014 wording. If this breaks,
+    /// either the ADR changed or the `sol!` macro's canonical encoding shifted
+    /// — both warrant a coordinated update with the `SlashJudge` contract.
+    #[test]
+    fn stream_response_type_hash_matches_adr_014() -> anyhow::Result<()> {
+        use alloy::primitives::keccak256;
+        let canonical: &[u8] = b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs,bytes32 redirect)";
+        let expected = keccak256(canonical);
+        let actual = StreamResponseSol::eip712_type_hash(&sample_data().to_sol());
+        anyhow::ensure!(
+            actual == expected,
+            "StreamResponse type hash drifted: actual={actual} expected={expected}"
+        );
+        Ok(())
+    }
+
+    /// Independently reconstruct the EIP-712 signing digest from the canonical
+    /// `0x1901 || domainSeparator || hashStruct` preimage and pin it against
+    /// `signing_hash`. Unlike a self-consistent sign→recover, this proves the
+    /// struct field encoding and domain binding match the on-chain `SlashJudge`
+    /// computation — a real drift guard, not a tautology.
+    #[test]
+    fn signing_hash_matches_eip712_canonical() -> anyhow::Result<()> {
+        use alloy::primitives::keccak256;
+        use alloy::sol_types::SolValue;
+
+        let data = sample_data();
+        let domain = sample_domain();
+
+        let type_hash = keccak256(
+            b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs,bytes32 redirect)",
+        );
+        // EIP-712 encodeData: each field as a 32-byte ABI word, prefixed by the
+        // type hash. All fields here are static, so abi_encode of the tuple is
+        // exactly 8 × 32 bytes.
+        let struct_hash = keccak256(
+            (
+                type_hash,
+                data.hash,
+                data.ok,
+                data.rate_per_mb,
+                data.total_bytes,
+                data.channel_id,
+                data.timestamp_us,
+                data.redirect,
+            )
+                .abi_encode(),
+        );
+        let mut preimage = Vec::with_capacity(2 + 32 + 32);
+        preimage.extend_from_slice(&[0x19, 0x01]);
+        preimage.extend_from_slice(domain.separator().as_slice());
+        preimage.extend_from_slice(struct_hash.as_slice());
+        let expected = keccak256(&preimage);
+
+        anyhow::ensure!(
+            data.signing_hash(&domain) == expected,
+            "signing_hash drifted from canonical EIP-712: actual={} expected={expected}",
+            data.signing_hash(&domain)
+        );
+        Ok(())
+    }
+
+    /// `from_response_body` maps the wire body into the signed-field view,
+    /// including the `redirect: Option<NodeId>` → `bytes32` mapping.
+    #[test]
+    fn from_response_body_maps_redirect() {
+        use decdn_protocol::StreamResponseBody;
+        use decdn_protocol::identity::NodeId;
+
+        let none = StreamResponseBody {
+            hash: [0x7Au8; 32],
+            ok: true,
+            rate_per_mb: 10_000,
+            total_bytes: 1_048_576,
+            channel_id: [0x33u8; 32],
+            timestamp_us: 1_700_000_000_000_000,
+            redirect: None,
+        };
+        assert_eq!(StreamSlashData::from_response_body(&none), sample_data());
+
+        let some = StreamResponseBody {
+            redirect: Some(NodeId::from_bytes([0x5Au8; 32])),
+            ..none
+        };
+        assert_eq!(
+            StreamSlashData::from_response_body(&some).redirect,
+            B256::repeat_byte(0x5A)
+        );
+    }
+}
