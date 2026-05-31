@@ -3,25 +3,27 @@
 **Date:** 2026-05-27
 **Status:** Draft
 
+> **Amendment (2026-05-30, [#685](https://github.com/decdn/decdn/issues/685)).** POL TOKEN-side allocation lowered **15pp → 10pp (150M → 100M TOKEN)**; combined POL+MM Liquidity-Provision category drops **20% → 15%** (top of the 5–15% DeFi norm). MM unchanged at 5pp. Knock-ons reflected below: the 80/20 USDC seed scales down ~⅓ (~$300K → ~$200K nominal), and the per-epoch buyback liquidity cap loses ~⅓ of its absolute headroom because pool depth shrinks proportionally while the 30% router inflow is unchanged — see [§ Buyback per-epoch-cap headroom](#buyback-per-epoch-cap-headroom-685) and re-evaluated [Activation Criterion 7](#activation-criteria-production). The freed 5pp of TOKEN moved to App Incentives per [ADR 026 § Allocation](026-tokenomics.md#allocation).
+
 ## Context
 
-> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) alignment.** `BuybackBurner` is router-driven: it receives 30% of routed USDC same-tx from `FeeRouter` at every settlement. The pool design is Balancer V3, 80/20 TOKEN/USDC, 1% swap fee, MEV protection via TWAP + `minTokenOut` + Flashbots-style private-RPC routing + per-epoch liquidity cap, POL custody by the Timelock. **The combined Liquidity-Provision category is 20% of supply** (5pp Market-Maker partner / group 7 + 15pp Protocol-Owned Liquidity / group 3 per [ADR 026 § Allocation](026-tokenomics.md#allocation)).
+> **[ADR 026](026-tokenomics.md#adr-026-tokenomics) alignment.** `BuybackBurner` is router-driven: it receives 30% of routed USDC same-tx from `FeeRouter` at every settlement. The pool design is Balancer V3, 80/20 TOKEN/USDC, 1% swap fee, MEV protection via TWAP + `minTokenOut` + Flashbots-style private-RPC routing + per-epoch liquidity cap, POL custody by the Timelock. **The combined Liquidity-Provision category is 15% of supply** (5pp Market-Maker partner / group 7 + 10pp Protocol-Owned Liquidity / group 3 per [ADR 026 § Allocation](026-tokenomics.md#allocation)).
 
 Buyback execution is deferred to production because thin TOKEN/USDC pool liquidity at genesis cannot absorb buyback flow without unacceptable slippage. [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model) recommends TWAP execution as MEV mitigation but does not specify how pool depth is created.
 
 Questions answered by this ADR:
 
-1. How is the 20% combined Liquidity-Provision allocation ([ADR 026 § Allocation](026-tokenomics.md#allocation)) actually deployed across POL and MM?
+1. How is the 15% combined Liquidity-Provision allocation ([ADR 026 § Allocation](026-tokenomics.md#allocation)) actually deployed across POL and MM?
 2. Is liquidity mercenary (LP rewards / liquidity mining) or protocol-owned?
 3. Which venue and pool type — Uniswap V3 concentrated, Uniswap V2 full-range, Balancer weighted, or other?
 4. How does buyback execution interact with the pool to avoid self-inflicted price impact?
 5. Who can rebalance / withdraw POL, and how do POL trading-fee earnings flow?
 
-The treasury holds the 15pp Protocol-Owned Liquidity allocation (150M of the 1B supply) and is USDC-poor at PoC scale. The 5pp Market-Maker partner allocation (50M TOKEN) is distributed to vetted MM partners (e.g., GSR, Wintermute, Auros, Flowdesk) under standard MM agreements for two-sided quoting on CEXes and DEX aggregators and is genesis-liquid. The small protocol team has no bandwidth to operate a concentrated-liquidity keeper stack; this favours a venue that minimizes USDC requirements and operational burden.
+The treasury holds the 10pp Protocol-Owned Liquidity allocation (100M of the 1B supply) and is USDC-poor at PoC scale. The 5pp Market-Maker partner allocation (50M TOKEN) is distributed to vetted MM partners (e.g., GSR, Wintermute, Auros, Flowdesk) under standard MM agreements for two-sided quoting on CEXes and DEX aggregators and is genesis-liquid. The small protocol team has no bandwidth to operate a concentrated-liquidity keeper stack; this favours a venue that minimizes USDC requirements and operational burden.
 
 ## Decision
 
-Use a Balancer V3 weighted pool (80% TOKEN / 20% USDC, 1% swap fee) as the canonical TOKEN/USDC venue. Seed it as Protocol-Owned Liquidity (POL) from the 15pp Protocol-Owned Liquidity allocation. The DAO treasury holds the BPT (Balancer pool token) directly; no LP rewards, no liquidity mining, no dedicated `LiquidityManager` contract.
+Use a Balancer V3 weighted pool (80% TOKEN / 20% USDC, 1% swap fee) as the canonical TOKEN/USDC venue. Seed it as Protocol-Owned Liquidity (POL) from the 10pp Protocol-Owned Liquidity allocation. The DAO treasury holds the BPT (Balancer pool token) directly; no LP rewards, no liquidity mining, no dedicated `LiquidityManager` contract.
 
 > deCDN uses Balancer **V3** for its new Vault architecture; the affirmative security justification is in [§ Consequences](#consequences). The 80/20 weighted-POL decision is a property of weighted pools generally and is not version-specific.
 
@@ -29,7 +31,7 @@ Use a Balancer V3 weighted pool (80% TOKEN / 20% USDC, 1% swap fee) as the canon
 
 | Factor | Balancer V3 (80/20 weighted) | Uniswap V3 (concentrated) |
 | --- | --- | --- |
-| USDC required to pair 150M TOKEN at $0.01 anchor | ~$375K | ~$1.5M (50/50 range) [^v3-range] |
+| USDC required to pair 100M TOKEN at $0.01 anchor | ~$250K | ~$1M (50/50 range) [^v3-range] |
 | Operational burden | None — set weights once | Active range management, keeper infra, rebalance transactions |
 | Behavior when price exits anticipated range | Pool continues trading across full curve | Position becomes 100% one asset, earns zero fees |
 | IL for a 2× price move | ~3.3% (80/20) | ~5.7% (50/50); position may be fully converted if out of range |
@@ -48,7 +50,7 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 
 ### Protocol-Owned Liquidity mechanics
 
-- **Source:** The 15pp Protocol-Owned Liquidity allocation (150M TOKEN per [ADR 026 § Allocation](026-tokenomics.md#allocation)) funds the TOKEN side. The USDC side is drawn from the pre-seed USDC bootstrap (~30% of the $1M+ pre-seed pool, ~$300K nominal).
+- **Source:** The 10pp Protocol-Owned Liquidity allocation (100M TOKEN per [ADR 026 § Allocation](026-tokenomics.md#allocation)) funds the TOKEN side. The USDC side is drawn from the pre-seed USDC bootstrap (~20% of the $1M+ pre-seed pool, ~$200K nominal — scaled down from ~30%/~$300K with the lower POL TOKEN side at the fixed 80/20 weight).
 - **Initial pool seed:** Sized so that a single `maxBuybackAmount` swap causes less than `slippageBps` price impact, making buyback execution well-conditioned on its own pool.
 - **Custody:** BPT is held by the DAO treasury address. PoC: admin key. Production: Governor + `TimelockController`. No withdraw path to an EOA — liquidity exit requires a governance proposal through the timelock. This invariant is enforced by BPT being held at the Timelock address and the absence of any bespoke withdraw function; Balancer has no protocol-level lockup, so custody discipline is the sole enforcement mechanism.
 - **No `LiquidityManager` contract.** A weighted pool's curve handles rebalancing implicitly via arbitrage. There is no range to manage, no `rebalance()` keeper, no `KEEPER_ROLE` for liquidity operations.
@@ -56,7 +58,7 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 
 ### POL Governance
 
-The 20% combined POL+MM allocation is on the high end for general DeFi (typical 5–15%) and is large enough that governance controls on its operation are load-bearing.
+The 15% combined POL+MM allocation sits at the top of the typical 5–15% DeFi range and is large enough that governance controls on its operation are load-bearing.
 
 **Rebalance authority.** The 80/20 weight is fixed at pool creation per Balancer V3 weighted-pool semantics; the curve handles intra-pool rebalancing via arbitrage. Governance may *change the pool* (deploy a new pool with different weights, migrate POL there) only via a standard governance proposal under the 48-hour timelock. There is no per-block rebalance keeper.
 
@@ -74,7 +76,7 @@ Permitted operations within these bounds:
 
 **Trading-fee accounting.** POL earns trading fees from third-party swaps against the pool (and from the protocol's own buyback swaps). Accrued fees flow to the Timelock-custodied BPT position; they are **not** re-routed through `FeeRouter` (this preserves `FeeRouter`'s strict per-byte-settlement accounting — POL trading-fee yield is treasury-direct revenue). Governance may withdraw accrued trading fees to the treasury via the same 10%/30-day-cap proposal path. The expected baseline yield from POL trading fees at PoC scale is modest (under-trafficked pool); the strategic purpose of POL is depth and price stability, not yield.
 
-**Why POL-heavy is consistent with work-token.** POL is *protocol-owned*; it doesn't create passive yield to any external holder. Trading-fee yield flows to treasury (operator-governed); no individual holder receives passive returns. The 20% combined allocation is defensible for an infrastructure protocol focused on liquidity depth as a primary value-accrual lever, comparable to Olympus Pro / OHM-style POL-heavy strategies but without the rebase mechanics that made those problematic. Removing LM eliminates the Howey-prong-4 exposure that an LP-token-yield program would carry.
+**Why POL-heavy is consistent with work-token.** POL is *protocol-owned*; it doesn't create passive yield to any external holder. Trading-fee yield flows to treasury (operator-governed); no individual holder receives passive returns. The 15% combined allocation is defensible for an infrastructure protocol focused on liquidity depth as a primary value-accrual lever, comparable to Olympus Pro / OHM-style POL strategies but without the rebase mechanics that made those problematic. Removing LM eliminates the Howey-prong-4 exposure that an LP-token-yield program would carry.
 
 ### Buyback inflow source and rate (router-driven per [ADR 026](026-tokenomics.md#adr-026-tokenomics))
 
@@ -122,8 +124,8 @@ Balancer's smoother curve reduces the need for TWAP versus V3's concentrated ban
 | Pool identifier (`pool`, `address`) | Deployed pool contract address |
 | Pool weights | 80% TOKEN / 20% USDC |
 | Pool swap fee | 1% (100 bps) |
-| POL TOKEN-side allocation | 150M (15% of supply) |
-| Initial pool seed size | Sized so `maxBuybackAmount` causes < `slippageBps` impact (~$300K nominal USDC seed at launch) |
+| POL TOKEN-side allocation | 100M (10% of supply) |
+| Initial pool seed size | Sized so `maxBuybackAmount` causes < `slippageBps` impact (~$200K nominal USDC seed at launch) |
 | `minBuybackAmount` | 100 USDC |
 | `maxBuybackAmount` | Set so a single swap causes < `slippageBps` impact |
 | `slippageBps` | 200 bps (2%) |
@@ -148,7 +150,7 @@ Buyback execution should be enabled by governance vote only when all of the foll
 4. Accumulated USDC in the `BuybackBurner` contract exceeds `minBuybackAmount`.
 5. Either (a) a keeper with `KEEPER_ROLE` is operational and configured to call `executeBuyback()` on a schedule, or (b) governance is prepared to trigger executions manually.
 6. **Required: private-RPC routing in place.** The keeper MUST be configured to submit through Flashbots Protect or the equivalent private-bundle endpoint on the production L2 before execution is enabled. A pre-flight check that public-mempool publication is refused MUST be part of activation runbook sign-off.
-7. **Required: per-epoch liquidity cap configured.** The per-epoch liquidity cap MUST be set on-chain to a value calibrated against epoch-start in-pool USDC depth and against the 30% router inflow rate.
+7. **Required: per-epoch liquidity cap configured.** The per-epoch liquidity cap MUST be set on-chain to a value calibrated against epoch-start in-pool USDC depth and against the 30% router inflow rate. **Re-evaluated under [#685](https://github.com/decdn/decdn/issues/685):** the 10pp POL (down from 15pp) shrinks epoch-start pool depth by ~⅓, so the *absolute* USDC notional admitted per epoch at the default 10% `epochLiquidityCapFraction` falls by ~⅓ while the 30% inflow is unchanged — the cap binds sooner under sustained revenue. Calibration MUST confirm the cap clears expected per-epoch buyback inflow at the seeded depth; if it does not, governance raises `epochLiquidityCapFraction` toward its 30% ceiling (accepting more per-epoch price impact) and/or tops up POL depth before enabling execution. See [§ Buyback per-epoch-cap headroom](#buyback-per-epoch-cap-headroom-685).
 8. **(If CoW routing is used as an add-on)** The operator has verified via CoW's `/api/v1/quote` endpoint that CoW solvers route through the deployed Balancer V3 pool and that quoted prices are within `slippageBps` of the Router-direct path. If this fails, disable CoW routing and fall back to direct Router + TWAP + private-RPC; this does not block activation.
 
 Criteria 1–4 are quantitative; governance voters verify them off-chain before enabling execution. Criterion 2 is a one-time deployment check. Criteria 6 and 7 are hard structural requirements; criterion 8 is venue-integration health.
@@ -172,16 +174,30 @@ Criteria 1–4 are quantitative; governance voters verify them off-chain before 
 - Fee capture per dollar of TVL is lower than a well-managed V3 concentrated position.
 - Aggregator routing density for Balancer V3 pools on Arbitrum is lower than for Uniswap V3 (and materially lower than for Balancer V2). V3 is newer; aggregator coverage and solver integrations are still maturing. A transient concern that should improve as V3 ages.
 - **Security — realized V2 event, V3 shorter track record.** On 2025-11-03, Balancer V2 Composable Stable Pools were exploited for ~$125M across multiple chains. Root cause (per Certora, Trail of Bits, OpenZeppelin post-mortems): a rounding-direction bug in `_upscale`/`_downscale` latent since 2021. The exploit affected V2 Composable Stable Pools specifically, **not** V2 standard Weighted Pools and **not** Balancer V3. Certora explicitly cites V3's new Vault architecture as mitigating this bug class. This ADR uses V3 (not V2) and further restricts the choice to **standard V3 Weighted Pools with no hooks**. **Residual risk:** V3 has been in production materially less time than V2 and has fewer integration-hours behind its audits. The protocol team MUST track Balancer security advisories.
-- Treasury bears impermanent loss directly. At the 20% combined Liquidity-Provision allocation, absolute IL exposure is proportionate. Buyback-and-burn provides an indirect reward loop (fees → buyback → TOKEN appreciation → LP position value), which the 30% burn share supports. Worst-case IL exposure is bounded by the 15% Protocol-Owned Liquidity allocation plus the paired USDC seed.
+- Treasury bears impermanent loss directly. At the 15% combined Liquidity-Provision allocation, absolute IL exposure is proportionate (and ~⅓ smaller than at the prior 20% combined sizing). Buyback-and-burn provides an indirect reward loop (fees → buyback → TOKEN appreciation → LP position value), which the 30% burn share supports. Worst-case IL exposure is bounded by the 10% Protocol-Owned Liquidity allocation plus the paired USDC seed.
 - One new interface method (`setPool(address)`) must be added to `IBuybackBurner` — a minor extension, but must be reflected in the [ADR 003](003-payments.md#adr-003-payment-model) interface block. V3's approvals footgun must also be documented in deployment runbooks.
 - **Mandatory private-RPC dependency.** A third-party operational dependency on the chosen private-bundle provider for the production L2 — provider downtime or de-listing of the protocol's bundles is a new failure mode. Mitigated by selecting a provider with a strong uptime track record and keeping the keeper code provider-agnostic.
-- **Buyback flow drives the per-epoch liquidity cap.** Pool depth and cap sizing must scale with revenue growth or burns will queue. This is the principal operational risk introduced by the 30% burn share.
+- **Buyback flow drives the per-epoch liquidity cap.** Pool depth and cap sizing must scale with revenue growth or burns will queue. This is the principal operational risk introduced by the 30% burn share, and it is **tightened** by the [#685](https://github.com/decdn/decdn/issues/685) move to 10pp POL — see [§ Buyback per-epoch-cap headroom](#buyback-per-epoch-cap-headroom-685).
 - **Smaller external-LP base in year 1 vs an LM-enabled design.** With no LM subsidy, external LP growth depends on organic trading-fee yield alone, which is modest at PoC scale. POL provides depth. This is the deliberate cost of the cleanest regulatory posture.
-- **POL accumulation can be politically charged.** A 15pp treasury-controlled LP position is large relative to the 1B fixed supply. Governance discipline on the 10%/30-day withdraw cap matters; a supermajority intent on dismantling POL faces a months-long, externally-observable process — but the cap can in principle be reduced via the same governance path (subject to its own immutability constraint: the cap *itself* is immutable, so changing it requires a contract redeployment, which IS observable and slow).
+- **POL accumulation can be politically charged.** A 10pp treasury-controlled LP position is still sizable relative to the 1B fixed supply (lowered from 15pp per [#685](https://github.com/decdn/decdn/issues/685) partly to narrow this optics surface). Governance discipline on the 10%/30-day withdraw cap matters; a supermajority intent on dismantling POL faces a months-long, externally-observable process — but the cap can in principle be reduced via the same governance path (subject to its own immutability constraint: the cap *itself* is immutable, so changing it requires a contract redeployment, which IS observable and slow).
+
+### Buyback per-epoch-cap headroom (#685)
+
+Lowering POL from 15pp to 10pp ([#685](https://github.com/decdn/decdn/issues/685)) reduces the TOKEN side of the 80/20 pool to 100M. At the fixed 80/20 weight and a fixed anchor price, the USDC side is pinned at `(20/80) × TOKEN_value`, so epoch-start in-pool USDC depth shrinks by ~⅓ (the ~$300K → ~$200K seed). The per-epoch liquidity cap is a fraction of that depth (`epochLiquidityCapFraction`, default 10%, bounded `[1%, 30%]`), so the **absolute USDC notional the cap admits per epoch falls by ~⅓** — while buyback **inflow** (30% of routed USDC per [ADR 026](026-tokenomics.md#adr-026-tokenomics)) is independent of POL size and scales with network revenue. The "burns will queue" risk therefore binds at a lower revenue level than under the prior 15pp sizing.
+
+Levers, in order of preference:
+
+1. **Calibrate `epochLiquidityCapFraction` upward within `[1%, 30%]`.** The default 10% has 3× headroom to the 30% ceiling; raising it recovers per-epoch throughput at the cost of more per-epoch price impact. This is a timelocked governance parameter, not a redeploy.
+2. **Top up POL depth.** Permissionless add-liquidity (or a governance-authorized treasury deposit) deepens the pool and lifts the absolute cap; bounded only by available USDC.
+3. **Defer burns across epochs.** Residual USDC remains in `BuybackBurner` between executions (per [§ TWAP policy](#twap-policy-subswapcount--1) partial-execution semantics); short queues self-clear once revenue and depth re-balance.
+
+**Withdraw-cap re-check.** The 10%/30-day immutable withdraw cap ([§ POL Governance](#pol-governance)) is a *fraction* of the POL position, so it auto-scales with allocation — at 10pp it bounds a proportionally smaller absolute outflow while preserving the same months-long, externally-observable exit profile. It remains the correct immutable bound at the lower allocation; no change.
+
+**Follow-up (open).** The exact revenue level at which the default-10% cap begins to queue burns at the 10pp-seeded depth is a quantitative question for the `finance/notebooks` buyback model (issue #685 acceptance criterion). Until that is run, activation sign-off (Criterion 7) should set `epochLiquidityCapFraction` conservatively against measured epoch-start depth rather than assuming the 10% default clears inflow.
 
 ## References
 
 - [ADR 003 — Payment Channels (IBuybackBurner interface)](003-payments.md#buybackburner)
 - [ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)
 - [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model)
-- [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics) — source of the three-bucket FeeRouter split (60/30/10), the 30% buyback share, the 15% POL allocation (group 3) within the 20% combined Liquidity-Provision category, and the POL governance bounds
+- [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics) — source of the three-bucket FeeRouter split (60/30/10), the 30% buyback share, the 10% POL allocation (group 3) within the 15% combined Liquidity-Provision category, and the POL governance bounds
