@@ -238,6 +238,11 @@ pub struct ResolvedPayment {
     /// `getRateBounds().deliveryCeiling`; default
     /// [`decdn_protocol::MAX_RATE_PER_MB`].
     pub delivery_ceiling: u64,
+    /// Voucher cadence advertised in `StreamResponse` for `cdn/client/v1`
+    /// (ADR 003 §Voucher Interval Negotiation); default
+    /// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`], range
+    /// `1..=`[`decdn_protocol::MAX_VOUCHER_INTERVAL_MB`].
+    pub voucher_interval_mb: u64,
 }
 
 /// Resolved gossip fields (ADR 001).

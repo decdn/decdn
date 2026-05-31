@@ -8,6 +8,7 @@
 
 pub mod admin;
 pub mod channel_store;
+pub mod client_requester;
 pub mod commands;
 pub mod dht;
 pub mod dispatch;

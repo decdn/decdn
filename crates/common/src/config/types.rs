@@ -393,6 +393,13 @@ pub struct PaymentConfig {
     /// Absent => [`decdn_protocol::MAX_RATE_PER_MB`] (no effective ceiling;
     /// current behavior unchanged).
     pub delivery_ceiling: Option<u64>,
+    /// Voucher cadence the node advertises in `StreamResponse` for
+    /// `cdn/client/v1` delivery (ADR 003 §Voucher Interval Negotiation): the
+    /// node pauses delivery once outstanding unvouchered bytes exceed
+    /// `voucher_interval_mb * 1_048_576`. Absent =>
+    /// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`] (1 MB). Governable range
+    /// `1..=`[`decdn_protocol::MAX_VOUCHER_INTERVAL_MB`].
+    pub voucher_interval_mb: Option<u64>,
 }
 
 /// Gossip section of the config file (ADR 001).

@@ -1368,10 +1368,31 @@ pub fn resolve_payment_into(
             )
         },
     );
+    // Voucher cadence advertised in `StreamResponse` (ADR 003 §Voucher Interval
+    // Negotiation). Default 1 MB; governable range 1..=1024. File-only (no CLI
+    // override) — it is read once at handler construction, not hot-reloadable.
+    let voucher_interval_mb = file
+        .and_then(|p| p.voucher_interval_mb)
+        .unwrap_or(decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB);
+    // Lower bound is the literal minimum cadence (1 MB), not the default const:
+    // a future change to DEFAULT_VOUCHER_INTERVAL_MB must not narrow the valid
+    // governable range (ADR 003 §Voucher Interval Negotiation: 1..=1024).
+    bag.check_with(
+        (1..=decdn_protocol::MAX_VOUCHER_INTERVAL_MB).contains(&voucher_interval_mb),
+        "payment.voucher_interval_mb",
+        || {
+            format!(
+                "payment.voucher_interval_mb {voucher_interval_mb} out of range \
+                 [1, {}] (ADR 003 §Voucher Interval Negotiation)",
+                decdn_protocol::MAX_VOUCHER_INTERVAL_MB,
+            )
+        },
+    );
     ResolvedPayment {
         rate_per_mb,
         delivery_floor,
         delivery_ceiling,
+        voucher_interval_mb,
     }
 }
 
@@ -3426,6 +3447,7 @@ mod tests {
             rate_per_mb: Some(0),
             delivery_floor: None,
             delivery_ceiling: None,
+            voucher_interval_mb: None,
         };
         let err = resolve_payment(&cli, Some(&file))
             .err()
@@ -3473,6 +3495,7 @@ mod tests {
             rate_per_mb: Some(0),
             delivery_floor: None,
             delivery_ceiling: None,
+            voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         anyhow::ensure!(resolved.rate_per_mb == 42, "got: {}", resolved.rate_per_mb);
@@ -3492,6 +3515,45 @@ mod tests {
             "got: {}",
             resolved.rate_per_mb
         );
+        anyhow::ensure!(
+            resolved.voucher_interval_mb == decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
+            "voucher_interval_mb default, got: {}",
+            resolved.voucher_interval_mb
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_threads_explicit_voucher_interval() -> anyhow::Result<()> {
+        let file = types::PaymentConfig {
+            rate_per_mb: Some(10),
+            delivery_floor: None,
+            delivery_ceiling: None,
+            voucher_interval_mb: Some(64),
+        };
+        let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
+        anyhow::ensure!(resolved.voucher_interval_mb == 64);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_rejects_voucher_interval_out_of_range() -> anyhow::Result<()> {
+        for bad in [0u64, decdn_protocol::MAX_VOUCHER_INTERVAL_MB + 1] {
+            let file = types::PaymentConfig {
+                rate_per_mb: Some(10),
+                delivery_floor: None,
+                delivery_ceiling: None,
+                voucher_interval_mb: Some(bad),
+            };
+            let err = resolve_payment(&empty_payment_args(), Some(&file))
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("expected rejection for interval {bad}"))?
+                .to_string();
+            anyhow::ensure!(
+                err.contains("voucher_interval_mb"),
+                "error lacked field context for {bad}: {err}"
+            );
+        }
         Ok(())
     }
 
@@ -6066,6 +6128,7 @@ mod tests {
             rate_per_mb: Some(1),
             delivery_floor: None,
             delivery_ceiling: None,
+            voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         assert_eq!(resolved.rate_per_mb, 99);
@@ -6079,6 +6142,7 @@ mod tests {
             rate_per_mb: Some(50),
             delivery_floor: None,
             delivery_ceiling: None,
+            voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         assert_eq!(resolved.rate_per_mb, 50);

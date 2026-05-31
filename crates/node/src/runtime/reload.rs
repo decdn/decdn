@@ -791,6 +791,7 @@ impl RuntimeReloadState {
                 rate_per_mb,
                 delivery_floor: 0,
                 delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+                voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
             },
             observability: ResolvedObservability {
                 log_level: level,
@@ -1254,6 +1255,7 @@ mod tests {
                 rate_per_mb: rate,
                 delivery_floor: 0,
                 delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+                voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
             },
             observability: ResolvedObservability {
                 log_level: level,
