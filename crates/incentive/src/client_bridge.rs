@@ -79,9 +79,14 @@ pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> WireVoucher {
 /// coordinated update of [`VoucherRejectReason`] and the retry-semantics table.
 ///
 /// [`ChannelError::Store`] is the only transient failure: in-memory state did
-/// not advance, so the node keeps the stream open and the client retries the
-/// **same** voucher — it is not a `VoucherRejected` (which has no `Store`
-/// counterpart). Every other variant is a permanent rejection. "Unknown
+/// not advance, so it returns [`RetrySignal`] rather than a permanent reason.
+/// The `cdn/client/v1` handler surfaces that signal on the wire as
+/// [`VoucherRejectReason::RetryLater`] (sent in-band, then the stream is
+/// finished cleanly), so the client resends the **same** voucher on a fresh
+/// stream instead of seeing an opaque connection drop (ADR 003 §Off-chain
+/// voucher state persistence). `RetryLater` has no `ChannelError` counterpart
+/// here — it is produced by the handler from the `Err(RetrySignal)` arm, not by
+/// this mapping. Every other variant is a permanent rejection. "Unknown
 /// channel" is surfaced by the caller as [`ChannelError::WrongChannel`] →
 /// [`VoucherRejectReason::WrongChannel`].
 pub const fn voucher_reject_reason(err: &ChannelError) -> Result<VoucherRejectReason, RetrySignal> {
@@ -98,8 +103,9 @@ pub const fn voucher_reject_reason(err: &ChannelError) -> Result<VoucherRejectRe
         ChannelError::Signature(VoucherError::WrongSigner { .. }) => {
             Ok(VoucherRejectReason::WrongSigner)
         }
-        // Transient — in-memory state unchanged; client retries the same
-        // voucher. No `VoucherRejected` reason corresponds (#527).
+        // Transient — in-memory state unchanged. The handler emits this on the
+        // wire as `VoucherRejectReason::RetryLater`; the client resends the same
+        // voucher (#527, ADR 003 §332).
         ChannelError::Store(_) => Err(RetrySignal),
     }
 }
@@ -112,9 +118,11 @@ pub enum WireVoucherError {
     BadSignature,
 }
 
-/// Signals that a [`ChannelError`] was transient ([`ChannelError::Store`]): the
-/// caller must keep the stream open and let the client retry the same voucher
-/// rather than sending a `VoucherRejected` (#527).
+/// Signals that a [`ChannelError`] was transient ([`ChannelError::Store`]):
+/// in-memory state did not advance, so the caller surfaces it as a
+/// [`VoucherRejectReason::RetryLater`] in-band rejection (no `VoucherAck`) and
+/// the client resends the **same** voucher on a fresh stream (#527, ADR 003
+/// §332) — distinguishable from a permanent rejection or a network drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetrySignal;
 

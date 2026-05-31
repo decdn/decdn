@@ -263,6 +263,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             rate_per_mb: 10,
             delivery_floor: 0,
             delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+            voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
         },
         observability: ResolvedObservability {
             log_level: decdn_common::cli::common::LogLevel::Info,

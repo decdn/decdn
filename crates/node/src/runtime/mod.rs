@@ -31,6 +31,7 @@ use crate::dht::{
     rate_limit::DhtRateLimitConfig,
 };
 use crate::dispatch::ConnectionLimiter;
+use crate::handlers::client::{ClientHandler, MAX_CLIENT_STREAMS};
 use crate::handlers::dht::DhtHandler;
 use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::ProbeHandler;
@@ -466,28 +467,6 @@ pub async fn run(
     // `iroh-gossip/0` bypasses the global semaphore entirely (#433): the
     // per-task resource ceiling holds for probe but not network-wide.
     //
-    // TODO(#317): when the `cdn/client/v1` paid delivery handler is
-    // implemented, wire it up here. Required steps:
-    //
-    //   1. Construct it with `Arc::clone(&channel_state_store)`.
-    //   2. In the handler's constructor, call
-    //      `channel_state_store.load_all()` to bootstrap an in-memory
-    //      `HashMap<ChannelId, ChannelState>` (or per-channel mutex map).
-    //      An absent entry == never-seen channel (ADR 003 §Off-chain
-    //      voucher state persistence).
-    //   3. Every voucher-acceptance path MUST call
-    //      `ChannelState::apply_voucher(..., &*channel_state_store)`. Do
-    //      NOT build a fresh `ChannelState::new` on the request path
-    //      without consulting the in-memory map first — that's the
-    //      issue #527 replay window.
-    //   4. Treat `ChannelError::Store(_)` as transient (client SHOULD
-    //      retry the same voucher); treat every other `ChannelError`
-    //      variant as a permanent rejection.
-    //
-    // The runtime intentionally does NOT pre-build the in-memory map: the
-    // handler's data structures aren't fixed yet, and coupling the
-    // runtime to a not-yet-written handler signature would block #317
-    // unnecessarily.
     // `cdn/dht/v1` handler (ADR 022 / #320). FindNode + FindValue +
     // Store all wired up; iterative requester-side lookup and the
     // republish scheduler land in PR 4 of #320. Three-layer rate limiter
@@ -558,8 +537,49 @@ pub async fn run(
     // tasks can all operate on the same instance.
     let dht_routing = dht_handler.routing_table();
 
+    // `cdn/client/v1` paid-delivery handler (#317). The voucher EIP-712 domain
+    // binds to the `StablePaymentChannel` deployment; the ephemeral-binding
+    // domain to the `CapacityBond` deployment (== `staking_registry_addr`,
+    // which holds the NodeId↔address mappings). The handler hydrates per-channel
+    // voucher state from `channel_state_store` so a restart cannot replay an
+    // already-accepted voucher (#527).
+    let payment_channel_addr: Address = cfg
+        .blockchain
+        .payment_channel_address
+        .parse()
+        .with_context(|| {
+            format!(
+                "blockchain.payment_channel_address {:?} is not a valid address",
+                cfg.blockchain.payment_channel_address
+            )
+        })?;
+    let voucher_domain =
+        decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr);
+    let bind_domain =
+        decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, staking_registry_addr);
+    let client_handler = Arc::new(ClientHandler::new(
+        secret_key.public(),
+        Arc::clone(&node_metrics),
+        Arc::clone(&limiter),
+        cache.clone(),
+        Arc::clone(&eth_signer),
+        decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr),
+        voucher_domain,
+        bind_domain,
+        Arc::clone(&channel_state_store),
+        reload_state.rate_per_mb(),
+        cfg.payment.delivery_floor,
+        cfg.payment.delivery_ceiling,
+        cfg.payment.voucher_interval_mb,
+        cfg.cache
+            .max_blob_size_mb
+            .saturating_mul(decdn_protocol::MB_BYTES),
+        MAX_CLIENT_STREAMS,
+    )?);
+
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
+        .accept(ClientHandler::ALPN, client_handler)
         .accept(DhtHandler::ALPN, dht_handler)
         .accept(
             GOSSIP_ALPN,
@@ -1713,6 +1733,7 @@ mod tests {
                 rate_per_mb: 10,
                 delivery_floor: 0,
                 delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+                voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
             },
             observability: ResolvedObservability {
                 log_level: decdn_common::cli::common::LogLevel::Info,

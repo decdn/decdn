@@ -79,6 +79,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             rate_per_mb: rate,
             delivery_floor: 0,
             delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
+            voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
         },
         observability: ResolvedObservability {
             log_level: level,

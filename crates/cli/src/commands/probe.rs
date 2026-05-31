@@ -112,15 +112,15 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
         anyhow::bail!("hash mismatch: response is for a different blob");
     }
 
-    // ADR 014 §1: `slash_sig` is mandatory and non-empty; requesters MUST
-    // reject missing/wrong-length signatures. Route through
-    // `ProbeResponse::validate()` so this requester obligation has a single
-    // definition shared with the protocol layer rather than an open-coded
-    // length check that can drift. (`validate()` also re-checks the
-    // `MAX_RATE_PER_MB` bound, but for a wire-decoded response that is
-    // already enforced at decode time by `deserialize_rate_per_mb`, so the
-    // `slash_sig` length is the only live obligation on this path.) Full
-    // attribution (recover signer, confirm NodeId↔address via
+    // ADR 014 §1 / #252: `slash_sig` is mandatory and non-empty, and a
+    // `rate_per_mb` of 0 MUST be rejected on receive. Route through
+    // `ProbeResponse::validate()` so these requester obligations share one
+    // definition with the protocol layer rather than open-coded checks that
+    // can drift. The two live obligations on this path are the `slash_sig`
+    // length and the `rate_per_mb != 0` rule (#252) — the `MAX_RATE_PER_MB`
+    // upper bound is already enforced at decode time by `deserialize_rate_per_mb`,
+    // but zero is a valid wire value the decoder accepts and the requester must
+    // not. Full attribution (recover signer, confirm NodeId↔address via
     // `StakingRegistry`) is the on-chain `SlashJudge`'s job — the CLI has no
     // registry client, so it enforces presence/shape only.
     resp.validate()
@@ -212,6 +212,21 @@ mod tests {
             total_bytes,
             slash_sig: vec![0xCD; SLASH_SIG_LEN],
         }
+    }
+
+    /// #252: the requester gate (`ProbeResponse::validate`, invoked on the
+    /// receive path in `run_probe`) MUST reject a zero `rate_per_mb` — a
+    /// zero-rate node trivially wins selection while earning nothing, so it is
+    /// an obvious misconfiguration the client refuses. The upper `MAX_RATE_PER_MB`
+    /// bound is enforced at decode time; zero is the requester-side obligation.
+    #[test]
+    fn validate_rejects_zero_rate_response() {
+        let resp = fixture(0, true, Some(4096));
+        let err = resp.validate().expect_err("zero rate must be rejected");
+        assert!(
+            matches!(err, decdn_protocol::MessageValidationError::RateIsZero),
+            "expected RateIsZero, got {err:?}"
+        );
     }
 
     /// JSON wire shape: every key the operator-facing `--json` contract
