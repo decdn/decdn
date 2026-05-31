@@ -103,6 +103,41 @@ pub enum MessageValidationError {
     /// deviations before reconstructing the EIP-712 typed data.
     #[error("Voucher.signature has invalid length {len} (EOA form is 65 bytes)")]
     InvalidVoucherSigLen { len: usize },
+    /// A wire [`crate::client::ClientBinding`]'s `binding_signature` is not
+    /// [`crate::client::BINDING_SIG_LEN`] bytes. The `BindNodeId` attestation
+    /// is the same EOA off-chain signing form (ADR 024 §18); receivers reject
+    /// deviations before `decdn_incentive` recovers the bound address.
+    #[error("ClientBinding.binding_signature has invalid length {len} (EOA form is 65 bytes)")]
+    InvalidBindingSigLen { len: usize },
+    /// A negotiated `voucher_interval_mb` is outside `1..=MAX_VOUCHER_INTERVAL_MB`
+    /// (ADR 003 §Voucher Interval Negotiation). Zero would never require a
+    /// voucher; an oversized value opens an unbounded unvouchered-byte window
+    /// (and `interval * MB_BYTES` can overflow `u64`) — the inverse of #378 for
+    /// the rate field. Enforced via [`crate::client::StreamResponse::validate`]
+    /// / [`crate::client::StreamRequestExt::validate`].
+    #[error(
+        "voucher_interval_mb {interval} out of range (1..={max})",
+        max = crate::client::MAX_VOUCHER_INTERVAL_MB
+    )]
+    VoucherIntervalOutOfRange { interval: u64 },
+    /// A [`crate::client::StreamResponse`] carries `body.ok == true` yet also an
+    /// `error`. A node MUST NOT both promise to serve and report a failure
+    /// (ADR 005 §`cdn/client/v1`). Enforced via
+    /// [`crate::client::StreamResponse::validate`].
+    #[error("StreamResponse has ok=true but also carries an error")]
+    StreamErrorWithOk,
+    /// A [`crate::client::StreamResponse`] carries `body.ok == false` but no
+    /// `error` code. A refusal MUST name its reason (ADR 005
+    /// §`cdn/client/v1`). Enforced via [`crate::client::StreamResponse::validate`].
+    #[error("StreamResponse has ok=false but no error code")]
+    MissingStreamError,
+    /// A [`crate::client::StreamResponse`] carries a mid-stream-only
+    /// [`crate::client::StreamError::VoucherRejected`] in its `error` field.
+    /// That variant rides exclusively in [`crate::client::ClientMessage::StreamError`]
+    /// (ADR 005 §`VoucherRejected` semantics). Enforced via
+    /// [`crate::client::StreamResponse::validate`].
+    #[error("StreamResponse.error carries VoucherRejected (a mid-stream-only code)")]
+    VoucherRejectedInResponse,
 }
 
 /// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per

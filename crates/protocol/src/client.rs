@@ -12,7 +12,8 @@
 //! `decdn_incentive`:
 //!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
 //!     signed body fields `{hash, ok, rate_per_mb, total_bytes, channel_id,
-//!     timestamp_us, redirect}` (ADR 014 §1, `decdn_incentive::StreamSlashData`).
+//!     timestamp_us, redirect}` (ADR 014 §1), produced by the stream-response
+//!     slash signer in `decdn_incentive` (analogous to its `ProbeSlashData`).
 //!     `error` and `voucher_interval_mb` are unsigned (ADR 005 §Voucher interval
 //!     negotiation).
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
@@ -55,8 +56,11 @@ pub const MB_BYTES: u64 = 1_048_576;
 /// interval negotiation).
 pub const DEFAULT_VOUCHER_INTERVAL_MB: u64 = 1;
 
-/// Governable upper bound on a proposed `voucher_interval_mb` (ADR 003 §Voucher
-/// Interval Negotiation: range 1..=1024 MB).
+/// Hardcoded safety ceiling on `voucher_interval_mb` (ADR 003 §Voucher Interval
+/// Negotiation). The *governable* parameter is `maxVoucherIntervalMb` (default
+/// 1 MB), which MUST stay ≤ this ceiling; the negotiated range is 1..=1024 MB.
+/// Enforced at the wire boundary by [`StreamResponse::validate`] and
+/// [`StreamRequestExt::validate`].
 pub const MAX_VOUCHER_INTERVAL_MB: u64 = 1024;
 
 /// Exact byte length of an EOA secp256k1 voucher signature (`r‖s‖v`, 32+32+1).
@@ -64,6 +68,11 @@ pub const MAX_VOUCHER_INTERVAL_MB: u64 = 1024;
 /// §18). Carried as a `Vec<u8>` on the wire (serde derives array impls only up
 /// to `[T; 32]`), with the length pinned by [`Voucher::validate`].
 pub const VOUCHER_SIG_LEN: usize = 65;
+
+/// Exact byte length of a `BindNodeId` client-binding signature (`r‖s‖v`,
+/// 32+32+1). The same EOA off-chain EIP-712 signing form as [`SLASH_SIG_LEN`] /
+/// [`VOUCHER_SIG_LEN`] (ADR 024 §18); pinned by [`ClientBinding::validate`].
+pub const BINDING_SIG_LEN: usize = 65;
 
 /// Top-level protocol enum for `cdn/client/v1`. Variant order is frozen per
 /// ADR 013 — new variants MUST be appended at the end.
@@ -91,6 +100,37 @@ pub enum ClientMessage {
     /// [`StreamError::VoucherRejected`]); delivery-side errors instead ride in
     /// [`StreamResponse::error`].
     StreamError(StreamError),
+}
+
+impl ClientMessage {
+    /// Validate the payload's requester-side invariants, dispatching to the
+    /// per-variant `validate()`. This is the single decode-then-validate seam a
+    /// receive-path handler should call after [`crate::decode_message`] so the
+    /// zero-rate / signature-length / `ok`-`error` checks can't be silently
+    /// skipped (they are not enforced at decode time — see
+    /// [`StreamResponse::validate`]).
+    ///
+    /// `StreamRequest`'s optional [`StreamRequestExt`] travels as separate
+    /// trailing bytes (two-phase), so it is *not* reachable from here; validate
+    /// it via [`StreamRequestExt::validate`] after [`parse_stream_request_ext`].
+    /// Variants with no value invariants (`VoucherAck`, `StreamEnd`,
+    /// `StreamError`, `ChunkData`) return `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the [`MessageValidationError`] from the wrapped payload's
+    /// `validate()`.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+        match self {
+            Self::StreamResponse(resp) => resp.validate(),
+            Self::Voucher(voucher) => voucher.validate(),
+            Self::StreamRequest(_)
+            | Self::ChunkData(_)
+            | Self::VoucherAck
+            | Self::StreamEnd
+            | Self::StreamError(_) => Ok(()),
+        }
+    }
 }
 
 /// Payer → node request opening a paid delivery (ADR 005 §`cdn/client/v1`).
@@ -127,21 +167,79 @@ pub struct StreamRequest {
 /// Optional [`StreamRequest`] extension fields (ADR 005 §Client identity
 /// binding), carried as trailing bytes after the `StreamRequest` message via the
 /// two-phase pattern (see [`encode_stream_request`] / [`parse_stream_request_ext`]).
-/// All inner fields are independently optional.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StreamRequestExt {
     /// Proposed voucher cadence for this stream in MB; the node answers with an
     /// equal-or-smaller value in [`StreamResponse::voucher_interval_mb`]. Absent
-    /// ⇒ both sides default to [`DEFAULT_VOUCHER_INTERVAL_MB`].
+    /// ⇒ both sides default to [`DEFAULT_VOUCHER_INTERVAL_MB`]. When present it
+    /// MUST be in `1..=MAX_VOUCHER_INTERVAL_MB` ([`StreamRequestExt::validate`]).
     pub voucher_interval_mb: Option<u64>,
-    /// Ephemeral client Ethereum address (20 bytes) for vouchers issued by an
-    /// off-chain (unregistered) client. Attested by `binding_signature`.
-    pub ethereum_address: Option<[u8; 20]>,
+    /// Off-chain client identity binding (address + attesting signature). Grouped
+    /// so a half-populated state (address without signature, or vice versa) is
+    /// unrepresentable; absent ⇒ a registered/on-chain client.
+    pub binding: Option<ClientBinding>,
+}
+
+/// Off-chain ephemeral client identity binding (ADR 003 §Off-Chain Ephemeral
+/// Binding), carried inside [`StreamRequestExt`]. The address and its attesting
+/// signature are paired so neither can appear without the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientBinding {
+    /// Ephemeral client Ethereum address (20 bytes) issuing vouchers for an
+    /// off-chain (unregistered) client.
+    pub ethereum_address: [u8; 20],
     /// EIP-712 `BindNodeId(nodeId, nonce=0)` signature attesting the
-    /// NodeId↔Ethereum-address mapping for the connection's lifetime (ADR 003
-    /// §Off-Chain Ephemeral Binding). Verified by `decdn_incentive` via
-    /// `ecrecover`.
-    pub binding_signature: Option<Vec<u8>>,
+    /// `NodeId`↔`ethereum_address` mapping for the connection's lifetime. Exactly
+    /// [`BINDING_SIG_LEN`] bytes; verified by `decdn_incentive` via `ecrecover`.
+    pub binding_signature: Vec<u8>,
+}
+
+impl ClientBinding {
+    /// Validate the wire-level `binding_signature` length ([`BINDING_SIG_LEN`]).
+    /// The cryptographic attestation check (`ecrecover` over the `BindNodeId`
+    /// typed data) happens in `decdn_incentive`.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageValidationError::InvalidBindingSigLen`] if the signature is not
+    /// exactly [`BINDING_SIG_LEN`] bytes.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.binding_signature.len() != BINDING_SIG_LEN {
+            return Err(MessageValidationError::InvalidBindingSigLen {
+                len: self.binding_signature.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl StreamRequestExt {
+    /// Validate the negotiated cadence and (if present) the client binding.
+    /// Called by the node on the receive path after [`parse_stream_request_ext`];
+    /// kept separate from parsing so forward-compatible trailing bytes don't
+    /// couple to value checks.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageValidationError::VoucherIntervalOutOfRange`] if
+    /// `voucher_interval_mb` is present and outside `1..=MAX_VOUCHER_INTERVAL_MB`;
+    /// [`MessageValidationError::InvalidBindingSigLen`] if a present `binding`
+    /// has a wrong-length signature.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+        if let Some(mb) = self.voucher_interval_mb
+            && (mb == 0 || mb > MAX_VOUCHER_INTERVAL_MB)
+        {
+            return Err(MessageValidationError::VoucherIntervalOutOfRange { interval: mb });
+        }
+        if let Some(binding) = &self.binding {
+            // `?` is not yet stable in `const fn`; match-return instead.
+            match binding.validate() {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Encode a `cdn/client/v1` `StreamRequest` frame payload with an optional
@@ -200,15 +298,18 @@ pub struct StreamResponse {
     /// Delivery-side failure code when `body.ok == false` (`NotFound`,
     /// `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`).
     /// Unsigned and informational. `VoucherRejected` never rides here — it is
-    /// delivered mid-stream via [`ClientMessage::StreamError`].
+    /// delivered mid-stream via [`ClientMessage::StreamError`]. The
+    /// `ok`/`error` consistency rules and the mid-stream-only exclusion are
+    /// enforced by [`StreamResponse::validate`], not just documented.
     pub error: Option<StreamError>,
     /// The node's accepted voucher cadence in MB (≤ the proposed value).
     /// Unsigned; absent ⇒ [`DEFAULT_VOUCHER_INTERVAL_MB`] (ADR 005 §Voucher
     /// interval negotiation).
     pub voucher_interval_mb: Option<u64>,
-    /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 014 §1; see
-    /// `decdn_incentive::StreamSlashData`). Always exactly [`SLASH_SIG_LEN`]
-    /// bytes — *not* a signature over postcard bytes.
+    /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 014 §1;
+    /// produced by the `decdn_incentive` stream slash signer, analogous to its
+    /// `ProbeSlashData`). Always exactly [`SLASH_SIG_LEN`] bytes — *not* a
+    /// signature over postcard bytes.
     pub slash_sig: Vec<u8>,
 }
 
@@ -239,19 +340,25 @@ pub struct StreamResponseBody {
     /// echoed back unchanged.
     pub timestamp_us: u64,
     /// Alternate provider to retry when this node cannot serve — a `NodeId`,
-    /// never an external URL (ADR 005). Signed as `bytes32(0)` when `None`
-    /// (`decdn_incentive::StreamSlashData`).
+    /// never an external URL (ADR 005). Signed as `bytes32(0)` when `None` by the
+    /// `decdn_incentive` stream slash signer (analogous to its `ProbeSlashData`).
     pub redirect: Option<NodeId>,
 }
 
 impl StreamResponse {
     /// Validate requester-side invariants (ADR 005, ADR 014 §1, #252):
-    /// `rate_per_mb` within `(0, MAX_RATE_PER_MB]` and `slash_sig` exactly
-    /// [`SLASH_SIG_LEN`] bytes. The wire-decode path already enforces the upper
-    /// `rate_per_mb` bound via `deserialize_rate_per_mb`; this method adds the
-    /// zero-rate and `slash_sig`-length obligations and is exposed so
-    /// requesters re-check on receive and construction sites assert validity
-    /// before signing.
+    ///
+    /// - `rate_per_mb` within `(0, MAX_RATE_PER_MB]` (the decode path already
+    ///   enforces the upper bound via `deserialize_rate_per_mb`; this adds the
+    ///   zero-rate rule),
+    /// - `slash_sig` exactly [`SLASH_SIG_LEN`] bytes,
+    /// - `ok`/`error` consistency: `ok == true` ⇒ no `error`; `ok == false` ⇒
+    ///   exactly one delivery-side `error` (never the mid-stream-only
+    ///   [`StreamError::VoucherRejected`]),
+    /// - `voucher_interval_mb`, when present, within `1..=MAX_VOUCHER_INTERVAL_MB`.
+    ///
+    /// Exposed so requesters re-check on receive and construction sites assert
+    /// validity before signing.
     pub const fn validate(&self) -> Result<(), MessageValidationError> {
         if self.body.rate_per_mb > MAX_RATE_PER_MB {
             return Err(MessageValidationError::RateTooLarge {
@@ -267,6 +374,21 @@ impl StreamResponse {
             return Err(MessageValidationError::InvalidSlashSigLen {
                 len: self.slash_sig.len(),
             });
+        }
+        // ADR 005 §`cdn/client/v1`: the signed `ok` flag and the unsigned
+        // `error` code must agree, and `VoucherRejected` is mid-stream-only.
+        match (self.body.ok, &self.error) {
+            (true, Some(_)) => return Err(MessageValidationError::StreamErrorWithOk),
+            (false, None) => return Err(MessageValidationError::MissingStreamError),
+            (false, Some(StreamError::VoucherRejected { .. })) => {
+                return Err(MessageValidationError::VoucherRejectedInResponse);
+            }
+            _ => {}
+        }
+        if let Some(mb) = self.voucher_interval_mb
+            && (mb == 0 || mb > MAX_VOUCHER_INTERVAL_MB)
+        {
+            return Err(MessageValidationError::VoucherIntervalOutOfRange { interval: mb });
         }
         Ok(())
     }
@@ -344,6 +466,22 @@ pub enum StreamError {
     },
 }
 
+impl StreamError {
+    /// `true` for the delivery-side codes that ride in [`StreamResponse::error`]
+    /// alongside `ok: false` (`NotFound`..`EvictedSinceProbe`). Expresses the
+    /// enum's domain split in code rather than only in prose, and backs the
+    /// [`StreamResponse::validate`] mid-stream-only exclusion.
+    pub const fn is_delivery_side(&self) -> bool {
+        !self.is_mid_stream()
+    }
+
+    /// `true` for the mid-stream-only [`StreamError::VoucherRejected`], which
+    /// rides exclusively in [`ClientMessage::StreamError`].
+    pub const fn is_mid_stream(&self) -> bool {
+        matches!(self, Self::VoucherRejected { .. })
+    }
+}
+
 /// Why a [`Voucher`] was rejected (ADR 005 §`VoucherRejected` semantics).
 ///
 /// Mirrors `decdn_incentive::ChannelError` ∪ `VoucherError` one-to-one (minus
@@ -411,11 +549,17 @@ mod tests {
         }
     }
 
+    fn sample_binding() -> ClientBinding {
+        ClientBinding {
+            ethereum_address: [0xEEu8; 20],
+            binding_signature: vec![0x01u8; BINDING_SIG_LEN],
+        }
+    }
+
     fn sample_ext() -> StreamRequestExt {
         StreamRequestExt {
             voucher_interval_mb: Some(8),
-            ethereum_address: Some([0xEEu8; 20]),
-            binding_signature: Some(vec![0x01u8; VOUCHER_SIG_LEN]),
+            binding: Some(sample_binding()),
         }
     }
 
@@ -598,7 +742,15 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            assert_eq!(first_byte(&e)?, u8::try_from(i).unwrap_or(0xFF));
+            // Pin the discriminant AND decode-roundtrip each variant's payload —
+            // a first-byte-only check would miss a payload-shape regression.
+            let bytes = postcard::to_allocvec(&e)?;
+            assert_eq!(
+                bytes.first().copied(),
+                Some(u8::try_from(i).unwrap_or(0xFF))
+            );
+            let decoded: StreamError = postcard::from_bytes(&bytes)?;
+            assert_eq!(decoded, e);
         }
         Ok(())
     }
@@ -618,7 +770,13 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            assert_eq!(first_byte(&r)?, u8::try_from(i).unwrap_or(0xFF));
+            let bytes = postcard::to_allocvec(&r)?;
+            assert_eq!(
+                bytes.first().copied(),
+                Some(u8::try_from(i).unwrap_or(0xFF))
+            );
+            let decoded: VoucherRejectReason = postcard::from_bytes(&bytes)?;
+            assert_eq!(decoded, r);
         }
         Ok(())
     }
@@ -757,6 +915,279 @@ mod tests {
             })
         );
         assert_eq!(sample_voucher().validate(), Ok(()));
+    }
+
+    // --- Edge-case roundtrips ------------------------------------------------
+
+    #[test]
+    fn stream_request_nonzero_byte_offset_roundtrip() -> Result<(), postcard::Error> {
+        // byte_offset != 0 exercises the multi-byte varint path (resume/seek);
+        // the shared sample uses 0, a single byte.
+        let req = StreamRequest {
+            byte_offset: 1_048_576,
+            ..sample_request()
+        };
+        let bytes = postcard::to_allocvec(&req)?;
+        let decoded: StreamRequest = postcard::from_bytes(&bytes)?;
+        assert_eq!(req, decoded);
+        assert_eq!(decoded.byte_offset, 1_048_576);
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_data_empty_roundtrip() -> Result<(), postcard::Error> {
+        // A zero-length final chunk is a real on-wire case (ADR 005 §Partial
+        // final chunk); postcard's length-prefix-0 path differs from the
+        // CHUNK_SIZE case already covered.
+        let chunk = ChunkData { bytes: Vec::new() };
+        let bytes = postcard::to_allocvec(&chunk)?;
+        let decoded: ChunkData = postcard::from_bytes(&bytes)?;
+        assert_eq!(chunk, decoded);
+        assert!(decoded.bytes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn client_binding_roundtrip() -> Result<(), postcard::Error> {
+        let b = sample_binding();
+        let bytes = postcard::to_allocvec(&b)?;
+        let decoded: ClientBinding = postcard::from_bytes(&bytes)?;
+        assert_eq!(b, decoded);
+        Ok(())
+    }
+
+    /// A non-empty-but-malformed remainder MUST error, not silently degrade to
+    /// `default()`. A bare `Some` tag (0x01) for `voucher_interval_mb` with no
+    /// following varint is truncated; `take_from_bytes` rejects it on EOF. This
+    /// pins the contract a future `unwrap_or_default()` refactor would break.
+    #[test]
+    fn parse_stream_request_ext_rejects_malformed_remainder() {
+        assert!(parse_stream_request_ext(&[0x01]).is_err());
+    }
+
+    // --- Extension / binding validation --------------------------------------
+
+    #[test]
+    fn stream_request_ext_validate_accepts_sample_and_default() {
+        assert_eq!(sample_ext().validate(), Ok(()));
+        assert_eq!(StreamRequestExt::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn stream_request_ext_validate_accepts_interval_bounds() {
+        for mb in [1, MAX_VOUCHER_INTERVAL_MB] {
+            let ext = StreamRequestExt {
+                voucher_interval_mb: Some(mb),
+                binding: None,
+            };
+            assert_eq!(ext.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn stream_request_ext_validate_rejects_zero_interval() {
+        let ext = StreamRequestExt {
+            voucher_interval_mb: Some(0),
+            binding: None,
+        };
+        assert_eq!(
+            ext.validate(),
+            Err(MessageValidationError::VoucherIntervalOutOfRange { interval: 0 })
+        );
+    }
+
+    #[test]
+    fn stream_request_ext_validate_rejects_oversize_interval() {
+        let over = MAX_VOUCHER_INTERVAL_MB + 1;
+        let ext = StreamRequestExt {
+            voucher_interval_mb: Some(over),
+            binding: None,
+        };
+        assert_eq!(
+            ext.validate(),
+            Err(MessageValidationError::VoucherIntervalOutOfRange { interval: over })
+        );
+    }
+
+    #[test]
+    fn stream_request_ext_validate_rejects_wrong_len_binding_sig() {
+        let ext = StreamRequestExt {
+            voucher_interval_mb: None,
+            binding: Some(ClientBinding {
+                ethereum_address: [0u8; 20],
+                binding_signature: vec![0x01; BINDING_SIG_LEN - 1],
+            }),
+        };
+        assert_eq!(
+            ext.validate(),
+            Err(MessageValidationError::InvalidBindingSigLen {
+                len: BINDING_SIG_LEN - 1
+            })
+        );
+    }
+
+    #[test]
+    fn client_binding_validate_rejects_wrong_len() {
+        let b = ClientBinding {
+            ethereum_address: [0u8; 20],
+            binding_signature: Vec::new(),
+        };
+        assert_eq!(
+            b.validate(),
+            Err(MessageValidationError::InvalidBindingSigLen { len: 0 })
+        );
+        assert_eq!(sample_binding().validate(), Ok(()));
+    }
+
+    // --- StreamResponse ok/error consistency ---------------------------------
+
+    #[test]
+    fn stream_response_validate_rejects_error_with_ok() {
+        // sample_response has body.ok = true; an error must not accompany it.
+        let resp = StreamResponse {
+            error: Some(StreamError::NotFound),
+            ..sample_response()
+        };
+        assert_eq!(
+            resp.validate(),
+            Err(MessageValidationError::StreamErrorWithOk)
+        );
+    }
+
+    #[test]
+    fn stream_response_validate_rejects_failure_without_error() {
+        let resp = StreamResponse {
+            body: StreamResponseBody {
+                ok: false,
+                ..sample_body()
+            },
+            error: None,
+            ..sample_response()
+        };
+        assert_eq!(
+            resp.validate(),
+            Err(MessageValidationError::MissingStreamError)
+        );
+    }
+
+    #[test]
+    fn stream_response_validate_accepts_failure_with_delivery_error() {
+        let resp = StreamResponse {
+            body: StreamResponseBody {
+                ok: false,
+                ..sample_body()
+            },
+            error: Some(StreamError::Overloaded),
+            ..sample_response()
+        };
+        assert_eq!(resp.validate(), Ok(()));
+    }
+
+    #[test]
+    fn stream_response_validate_rejects_voucher_rejected_in_error() {
+        // VoucherRejected is mid-stream-only; it must never ride in the response.
+        let resp = StreamResponse {
+            body: StreamResponseBody {
+                ok: false,
+                ..sample_body()
+            },
+            error: Some(StreamError::VoucherRejected {
+                reason: VoucherRejectReason::StaleNonce,
+            }),
+            ..sample_response()
+        };
+        assert_eq!(
+            resp.validate(),
+            Err(MessageValidationError::VoucherRejectedInResponse)
+        );
+    }
+
+    #[test]
+    fn stream_response_validate_rejects_zero_interval() {
+        let resp = StreamResponse {
+            voucher_interval_mb: Some(0),
+            ..sample_response()
+        };
+        assert_eq!(
+            resp.validate(),
+            Err(MessageValidationError::VoucherIntervalOutOfRange { interval: 0 })
+        );
+    }
+
+    #[test]
+    fn stream_response_validate_rejects_oversize_interval() {
+        let over = MAX_VOUCHER_INTERVAL_MB + 1;
+        let resp = StreamResponse {
+            voucher_interval_mb: Some(over),
+            ..sample_response()
+        };
+        assert_eq!(
+            resp.validate(),
+            Err(MessageValidationError::VoucherIntervalOutOfRange { interval: over })
+        );
+    }
+
+    // --- ClientMessage dispatcher + StreamError domain split -----------------
+
+    #[test]
+    fn client_message_validate_dispatches_to_payload() {
+        // Valid payloads pass through.
+        assert_eq!(
+            ClientMessage::StreamResponse(sample_response()).validate(),
+            Ok(())
+        );
+        assert_eq!(ClientMessage::Voucher(sample_voucher()).validate(), Ok(()));
+        // Invalid payloads propagate their own error through the dispatcher.
+        let bad_resp = StreamResponse {
+            slash_sig: Vec::new(),
+            ..sample_response()
+        };
+        assert_eq!(
+            ClientMessage::StreamResponse(bad_resp).validate(),
+            Err(MessageValidationError::InvalidSlashSigLen { len: 0 })
+        );
+        let bad_voucher = Voucher {
+            signature: Vec::new(),
+            ..sample_voucher()
+        };
+        assert_eq!(
+            ClientMessage::Voucher(bad_voucher).validate(),
+            Err(MessageValidationError::InvalidVoucherSigLen { len: 0 })
+        );
+        // Variants carrying no value invariants are unconditionally Ok.
+        assert_eq!(
+            ClientMessage::StreamRequest(sample_request()).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            ClientMessage::ChunkData(ChunkData { bytes: vec![] }).validate(),
+            Ok(())
+        );
+        assert_eq!(ClientMessage::VoucherAck.validate(), Ok(()));
+        assert_eq!(ClientMessage::StreamEnd.validate(), Ok(()));
+        assert_eq!(
+            ClientMessage::StreamError(StreamError::NotFound).validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn stream_error_domain_split_matches_variants() {
+        for e in [
+            StreamError::NotFound,
+            StreamError::Overloaded,
+            StreamError::BlobTooLarge,
+            StreamError::InternalError,
+            StreamError::EvictedSinceProbe,
+        ] {
+            assert!(e.is_delivery_side(), "{e:?} is delivery-side");
+            assert!(!e.is_mid_stream(), "{e:?} is not mid-stream");
+        }
+        let v = StreamError::VoucherRejected {
+            reason: VoucherRejectReason::WrongSigner,
+        };
+        assert!(v.is_mid_stream());
+        assert!(!v.is_delivery_side());
     }
 
     // --- Full framing stack --------------------------------------------------
