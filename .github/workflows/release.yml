@@ -57,6 +57,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release
+          # Releases are dispatched from main, so only main writes this
+          # partition; a dry-run dispatched from a branch stays restore-only
+          # and won't burn a cache slot in the shared 10 GiB store.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install tools
         uses: taiki-e/install-action@v2

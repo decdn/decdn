@@ -48,6 +48,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy
+          # Restore-only except on `main`: only pushes to `main` write the
+          # shared cache. Other runs (PRs, branch dispatches) warm-start from
+          # main's entry but don't each save a ~1 GiB copy that would evict the
+          # warm baseline once GitHub's per-repo cache store (currently 10 GiB)
+          # saturates.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   deny:
@@ -70,6 +76,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: doc
+          # Restore-only except on `main`; only `main` writes it (see clippy job).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo doc --workspace --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -102,6 +110,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: public-api
+          # Restore-only except on `main`; only `main` writes it (see clippy job).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -232,6 +242,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: coverage
+          # Restore-only except on `main`; only `main` writes it (see clippy
+          # job). This is the largest partition (~1.2 GiB instrumented target),
+          # so gating its save is what most relieves the saturated cache store.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
