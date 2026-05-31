@@ -13,14 +13,15 @@
 //!   open — no dispute window), `closeChannel` (initiate close with the
 //!   latest voucher), and `settleChannel` (finalize after the window);
 //! - events: `ChannelOpened` (provider learns of a channel opened against
-//!   it → persist), `ChannelCloseInitiated` (observed-only here; the dispute
-//!   monitor is deferred per #324), and `ChannelSettled` (→ forget the
-//!   persisted channel state).
+//!   it → persist), `ChannelToppedUp` (→ raise the tracked deposit so
+//!   post-top-up vouchers are not wrongly rejected), `ChannelCloseInitiated`
+//!   (observed-only here; the dispute monitor is deferred per #324), and
+//!   `ChannelSettled` (→ forget the persisted channel state).
 //!
 //! The voucher EIP-712 domain (name `"PaymentChannel"`, version `"1"`) and
 //! the `Voucher` type hash live in [`crate::voucher`]; the close/withdraw
 //! `signature` argument is the bytes of a [`crate::voucher::SignedVoucher`]
-//! over that domain. `disputeChannel` / `reclaimExpired` / `topUp` are
+//! over that domain. `disputeChannel` / `reclaimExpired` are
 //! intentionally omitted (out of scope for the seller settlement path).
 
 // The `sol!`-generated bindings include macro-emitted code that uses
@@ -133,6 +134,16 @@ mod sol_types {
                 address indexed provider,
                 uint256 deposit,
                 uint256 expiresAt
+            );
+
+            /// Client increased the channel deposit. The watcher updates the
+            /// tracked `ChannelState.deposit` to `newDeposit` so the voucher
+            /// handler's `amount <= deposit` check accepts post-top-up
+            /// vouchers instead of rejecting them against the stale deposit.
+            event ChannelToppedUp(
+                bytes32 indexed channelId,
+                uint256 additionalDeposit,
+                uint256 newDeposit
             );
 
             /// Close initiated (dispute window open). Observed-only here —

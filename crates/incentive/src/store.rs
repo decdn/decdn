@@ -232,6 +232,7 @@ mod tests {
             last_nonce: U256::from(7u64),
             last_bytes_delivered: U256::from(4_096u64),
             last_signature: vec![0xABu8; 65],
+            expires_at: 1_900_000_000,
         }
     }
 

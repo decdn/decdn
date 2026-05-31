@@ -251,6 +251,42 @@ impl ClientHandler {
             .map_err(|e| StoreError::Backend(format!("forget_channel join: {e}")))?
     }
 
+    /// Raise a tracked channel's on-chain deposit after a `ChannelToppedUp`
+    /// event (#327). Without this, [`decdn_incentive::ChannelState::apply_voucher`]
+    /// keeps enforcing the original (lower) deposit and rejects the
+    /// otherwise-valid vouchers a client signs *after* topping up. No-op for
+    /// channels this node does not track; idempotent for a non-increasing
+    /// `new_deposit` (deposits only ever grow).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a [`StoreError`] if the durable persist fails.
+    pub async fn update_channel_deposit(
+        &self,
+        channel_id: ChannelId,
+        new_deposit: U256,
+    ) -> Result<(), StoreError> {
+        let entry = self.channels.lock().await.get(&channel_id).cloned();
+        let Some(entry) = entry else { return Ok(()) };
+        let mut guard = entry.lock().await;
+        if guard.state.deposit >= new_deposit {
+            return Ok(());
+        }
+        // Persist the raised deposit before advancing in-memory, mirroring the
+        // voucher-accept commit discipline (#527): record a clone durably and
+        // swap it in only on success. The per-channel guard is held across the
+        // blocking write so a concurrent voucher on this channel serializes.
+        let mut next = guard.state.clone();
+        next.deposit = new_deposit;
+        let to_persist = next.clone();
+        let store = Arc::clone(&self.channel_state_store);
+        tokio::task::spawn_blocking(move || store.record(&to_persist))
+            .await
+            .map_err(|e| StoreError::Backend(format!("update_channel_deposit join: {e}")))??;
+        guard.state = next;
+        Ok(())
+    }
+
     /// Accept the connection-level rate-limit permit, then serve each inbound
     /// bidi stream concurrently under a per-connection stream cap.
     ///
@@ -584,6 +620,22 @@ impl ClientHandler {
         };
 
         let mut guard = channel.lock().await;
+
+        // Expiry gate (#327): once the channel has passed its on-chain
+        // `expiresAt`, `withdraw`/`closeChannel` revert and the client can
+        // `reclaimExpired` for a full refund — any further delivery would be
+        // unpaid. Refuse rather than accept a voucher we could never redeem.
+        // (The settlement sweep normally closes + retires channels well before
+        // this; this is the defense-in-depth for a node that was down through
+        // the close window.) Fails the stream — there is no wire reason for
+        // expiry, same as the underpayment path below.
+        if guard.state.expires_at != 0
+            && crate::payment_settlement::unix_now() >= guard.state.expires_at
+        {
+            drop(guard);
+            anyhow::bail!("channel {channel_id} expired on-chain; refusing further paid delivery");
+        }
+
         let new_bytes = guard
             .bytes_delivered_cumulative
             .saturating_add(U256::from(delta_bytes));

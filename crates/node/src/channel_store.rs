@@ -13,12 +13,14 @@
 //! restart re-opens the channel at nonce zero and a client can replay a
 //! previously-accepted voucher for a second byte delivery (issue #527).
 //!
-//! Schema v2 (#327) additionally persists the latest voucher's signature so
+//! Schema v2 (#327) additionally persists the latest voucher's signature (so
 //! the seller settlement path can submit it to the on-chain
-//! `closeChannel` / `withdraw` after a restart without forfeiting the claim.
-//! The signature is encoded as a trailing postcard segment after the v1
-//! prefix; v1 records (no signature) hydrate with an empty signature and are
-//! simply unredeemable until the next voucher re-records them.
+//! `closeChannel` / `withdraw` after a restart without forfeiting the claim)
+//! and the channel's on-chain expiry (so the node can close and stop serving
+//! before `reclaimExpired` becomes available to the client). Both are encoded
+//! as trailing postcard segments after the v1 prefix (signature then expiry);
+//! v1 records hydrate with an empty signature and `0` expiry and are simply
+//! unredeemable until the next voucher re-records them.
 //!
 //! [ADR 003 §Off-chain voucher state persistence]: ../../../adr/003-payments.md
 
@@ -83,12 +85,13 @@ const CHANNEL_TABLE: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("c
 /// (field removal, field reorder, type change) still require bumping the
 /// table name to a new `channel_state_vN` and a one-shot migration on open.
 ///
-/// The schema-v2 voucher signature (#327) is NOT a field of this struct — it
-/// is encoded as its own postcard `Vec<u8>` segment appended after this
-/// prefix, so the v1 prefix shape stays byte-identical across v1 and v2 and
-/// the `take_from_bytes` prefix decode is unchanged. `load_all` decodes the
-/// signature from the remainder when `schema_version >= 2`; a v1 record (no
-/// trailing segment) hydrates with an empty signature.
+/// The schema-v2 voucher signature and channel expiry (#327) are NOT fields
+/// of this struct — they are encoded as their own postcard segments
+/// (`Vec<u8>` signature then `u64` expiry) appended after this prefix, so the
+/// v1 prefix shape stays byte-identical across v1 and v2 and the
+/// `take_from_bytes` prefix decode is unchanged. `decode_record` reads those
+/// segments when `schema_version >= 2`; a v1 record (no trailing segments)
+/// hydrates with an empty signature and `0` expiry.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredChannelState {
     schema_version: u32,
@@ -117,10 +120,15 @@ impl From<&ChannelState> for StoredChannelState {
 }
 
 impl StoredChannelState {
-    /// Reconstruct the in-memory [`ChannelState`]. `last_signature` is the
-    /// decoded trailing segment (empty for v1 records / channels with no
-    /// accepted voucher yet) — see [`StoredChannelState`]'s doc.
-    fn into_state(self, last_signature: Vec<u8>) -> Result<ChannelState, StoreError> {
+    /// Reconstruct the in-memory [`ChannelState`]. `last_signature` and
+    /// `expires_at` are the decoded v2 trailing segments (empty / `0` for v1
+    /// records and channels with no accepted voucher yet) — see
+    /// [`StoredChannelState`]'s doc.
+    fn into_state(
+        self,
+        last_signature: Vec<u8>,
+        expires_at: u64,
+    ) -> Result<ChannelState, StoreError> {
         if self.schema_version > SUPPORTED_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema {
                 found: self.schema_version,
@@ -136,6 +144,7 @@ impl StoredChannelState {
             last_nonce: U256::from_be_bytes(self.last_nonce),
             last_bytes_delivered: U256::from_be_bytes(self.last_bytes_delivered),
             last_signature,
+            expires_at,
         })
     }
 }
@@ -442,21 +451,30 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
             detail: "channel_id in value does not match table key".into(),
         });
     }
-    // Schema v2 (#327) appends the latest voucher signature as a trailing
-    // postcard `Vec<u8>`. Decode it only for a version this binary
-    // understands; a version above `SUPPORTED_SCHEMA_VERSION` is left for
-    // `into_state` to reject (its trailing layout is unknown, so parsing it
-    // as a signature would be meaningless). A v1 record has no segment and
-    // hydrates with an empty signature.
-    let (last_signature, leftover): (Vec<u8>, &[u8]) =
-        if stored.schema_version >= 2 && stored.schema_version <= SUPPORTED_SCHEMA_VERSION {
+    // Schema v2 (#327) appends two trailing postcard segments after the v1
+    // prefix: the latest voucher signature (`Vec<u8>`) then the channel
+    // expiry (`u64`). Decode them only for a version this binary understands;
+    // a version above `SUPPORTED_SCHEMA_VERSION` is left for `into_state` to
+    // reject (its trailing layout is unknown). A v1 record has no segments
+    // and hydrates with an empty signature and `0` expiry.
+    let (last_signature, expires_at, leftover): (Vec<u8>, u64, &[u8]) = if stored.schema_version
+        >= 2
+        && stored.schema_version <= SUPPORTED_SCHEMA_VERSION
+    {
+        let (sig, after_sig) =
             postcard::take_from_bytes::<Vec<u8>>(remainder).map_err(|err| StoreError::Corrupt {
                 channel_id: Some(channel_id),
                 detail: format!("postcard decode of voucher signature failed: {err}"),
-            })?
-        } else {
-            (Vec::new(), remainder)
-        };
+            })?;
+        let (exp, rest) =
+            postcard::take_from_bytes::<u64>(after_sig).map_err(|err| StoreError::Corrupt {
+                channel_id: Some(channel_id),
+                detail: format!("postcard decode of channel expiry failed: {err}"),
+            })?;
+        (sig, exp, rest)
+    } else {
+        (Vec::new(), 0, remainder)
+    };
     // Forward-compat allowance is bounded: a malicious writer could pad
     // megabytes onto every record and silently inflate every read. Log
     // (don't fail) when the trailer beyond the known fields exceeds a small
@@ -472,7 +490,7 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
             "channel state record has unusually large trailing bytes; possible malicious padding or large-additive-field schema skew",
         );
     }
-    stored.into_state(last_signature)
+    stored.into_state(last_signature, expires_at)
 }
 
 impl ChannelStateStore for PersistentChannelStateStore {
@@ -526,16 +544,20 @@ impl ChannelStateStore for PersistentChannelStateStore {
     fn record(&self, state: &ChannelState) -> Result<(), StoreError> {
         let mut encoded = postcard::to_allocvec(&StoredChannelState::from(state))
             .map_err(|err| StoreError::Codec(format!("postcard encode failed: {err}")))?;
-        // Schema v2 (#327): append the latest voucher signature as a trailing
-        // postcard `Vec<u8>` segment after the v1 prefix. Empty for channels
-        // with no accepted voucher yet — still length-prefixed (one `0x00`
-        // byte), so a v2 record always carries a decodable segment.
+        // Schema v2 (#327): append two trailing postcard segments after the
+        // v1 prefix — the latest voucher signature (`Vec<u8>`, length-prefixed
+        // so an empty signature is still one `0x00` byte) then the channel
+        // expiry (`u64`). `decode_record` reads them back in this order.
         let sig_encoded = postcard::to_allocvec(&state.last_signature).map_err(|err| {
             StoreError::Codec(format!(
                 "postcard encode of voucher signature failed: {err}"
             ))
         })?;
         encoded.extend_from_slice(&sig_encoded);
+        let expiry_encoded = postcard::to_allocvec(&state.expires_at).map_err(|err| {
+            StoreError::Codec(format!("postcard encode of channel expiry: {err}"))
+        })?;
+        encoded.extend_from_slice(&expiry_encoded);
         let key: [u8; 32] = state.channel_id.into();
 
         let mut write_txn = self
@@ -632,6 +654,7 @@ mod tests {
             last_nonce: U256::from(byte),
             last_bytes_delivered: U256::from(byte) * U256::from(1_024u64),
             last_signature: vec![byte; 65],
+            expires_at: 1_900_000_000 + u64::from(byte),
         }
     }
 
@@ -908,11 +931,12 @@ mod tests {
         let s = sample(0x42);
         let key: [u8; 32] = s.channel_id.into();
 
-        // Encode the real v2 record (prefix + signature segment), then append
-        // plausible *further* additive-field bytes (simulating what a future
-        // schema beyond v2 would write after the signature).
+        // Encode the real v2 record (prefix + signature + expiry segments),
+        // then append plausible *further* additive-field bytes (simulating
+        // what a future schema beyond v2 would write after the known segments).
         let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
         encoded.extend_from_slice(&postcard::to_allocvec(&s.last_signature)?);
+        encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
 
         let mut tx = store.db.begin_write()?;
@@ -934,8 +958,8 @@ mod tests {
     }
 
     /// **Schema-v1 backward-compat (#327).** A record written by the
-    /// pre-signature binary (`schema_version` 1, no trailing signature
-    /// segment) MUST still load — hydrating with an empty signature rather
+    /// pre-signature binary (`schema_version` 1, no trailing segments) MUST
+    /// still load — hydrating with an empty signature and `0` expiry rather
     /// than failing the decode. The channel is then unredeemable until the
     /// next voucher re-records it at v2, which is safe.
     #[test]
@@ -944,9 +968,10 @@ mod tests {
         let store = PersistentChannelStateStore::open(dir.path())?;
         let mut s = sample(0x55);
         s.last_signature.clear(); // a v1 record carried no signature
+        s.expires_at = 0; // ...nor an expiry
 
         // Hand-write a v1-shaped record: prefix only, schema_version forced
-        // to 1, NO trailing signature segment.
+        // to 1, NO trailing segments.
         let mut stored = StoredChannelState::from(&s);
         stored.schema_version = 1;
         let encoded = postcard::to_allocvec(&stored)?;
@@ -966,6 +991,7 @@ mod tests {
             only.last_signature.is_empty(),
             "v1 record → empty signature"
         );
+        anyhow::ensure!(only.expires_at == 0, "v1 record → zero expiry");
         anyhow::ensure!(*only == s, "v1 prefix fields must round-trip");
         Ok(())
     }

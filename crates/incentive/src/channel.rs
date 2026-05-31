@@ -68,6 +68,14 @@ pub struct ChannelState {
     /// pre-signature store schema). Same encoding as the
     /// [`crate::client_bridge`] wire form.
     pub last_signature: Vec<u8>,
+    /// On-chain channel expiry (Unix seconds), from the `ChannelOpened` event.
+    /// `0` means "unknown / not tracked" (channels constructed by [`Self::new`]
+    /// without a chain source, and records hydrated from a pre-expiry store
+    /// schema) and is treated as never-expiring. After expiry the contract
+    /// reverts `withdraw`/`closeChannel` and the client may `reclaimExpired`,
+    /// so the seller path uses this to close (and stop serving) beforehand
+    /// (#327). Set as a field — not advanced through [`Self::apply_voucher`].
+    pub expires_at: u64,
 }
 
 impl ChannelState {
@@ -89,6 +97,7 @@ impl ChannelState {
             last_nonce: U256::ZERO,
             last_bytes_delivered: U256::ZERO,
             last_signature: Vec::new(),
+            expires_at: 0,
         }
     }
 
