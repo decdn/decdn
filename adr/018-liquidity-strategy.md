@@ -3,7 +3,7 @@
 **Date:** 2026-05-27
 **Status:** Draft
 
-> **Amendment (2026-05-30, [#685](https://github.com/decdn/decdn/issues/685)).** POL TOKEN-side allocation lowered **15pp → 10pp (150M → 100M TOKEN)**; combined POL+MM Liquidity-Provision category drops **20% → 15%** (top of the 5–15% DeFi norm). MM unchanged at 5pp. Knock-ons reflected below: the 80/20 USDC seed scales down ~⅓ (~$300K → ~$200K nominal), and the per-epoch buyback liquidity cap loses ~⅓ of its absolute headroom because pool depth shrinks proportionally while the 30% router inflow is unchanged — see [§ Buyback per-epoch-cap headroom](#buyback-per-epoch-cap-headroom-685) and re-evaluated [Activation Criterion 7](#activation-criteria-production). The freed 5pp of TOKEN moved to App Incentives per [ADR 026 § Allocation](026-tokenomics.md#allocation).
+> **Amendment (2026-05-30, [#685](https://github.com/decdn/decdn/issues/685)).** POL TOKEN-side allocation lowered **15pp → 10pp (150M → 100M TOKEN)**; combined POL+MM Liquidity-Provision category drops **20% → 15%** (top of the 5–15% DeFi norm). MM unchanged at 5pp. Knock-ons reflected below: the 80/20 USDC seed scales down ~⅓ (~$375K → ~$250K nominal, the $0.01-anchor pairing for the smaller TOKEN side), and the per-epoch buyback liquidity cap loses ~⅓ of its absolute headroom because pool depth shrinks proportionally while the 30% router inflow is unchanged — see [§ Buyback per-epoch-cap headroom](#buyback-per-epoch-cap-headroom-685) and re-evaluated [Activation Criterion 7](#activation-criteria-production). The freed 5pp of TOKEN moved to App Incentives per [ADR 026 § Allocation](026-tokenomics.md#allocation).
 
 ## Context
 
@@ -50,7 +50,7 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 
 ### Protocol-Owned Liquidity mechanics
 
-- **Source:** The 10pp Protocol-Owned Liquidity allocation (100M TOKEN per [ADR 026 § Allocation](026-tokenomics.md#allocation)) funds the TOKEN side. The USDC side is drawn from the pre-seed USDC bootstrap (~20% of the $1M+ pre-seed pool, ~$200K nominal — scaled down from ~30%/~$300K with the lower POL TOKEN side at the fixed 80/20 weight).
+- **Source:** The 10pp Protocol-Owned Liquidity allocation (100M TOKEN per [ADR 026 § Allocation](026-tokenomics.md#allocation)) funds the TOKEN side. The USDC side is sized to the **~$250K** needed to pair the full 100M TOKEN at the $0.01 anchor in the 80/20 pool (100M × $0.01 = $1M TOKEN value = 80% of pool depth ⇒ ~$250K USDC for the remaining 20%; the venue-comparison figure above), down ~⅓ from the ~$375K required under the prior 15pp / 150M POL. It is funded from the pre-seed USDC bootstrap POL-seed bucket — ~20% of the raise per [ADR 026 § Bootstrap](026-tokenomics.md#bootstrap-mechanism--pre-seed-usdc) — which spans ~$200K at the $1M floor to ~$600K at the $3M target, covering the ~$250K requirement at any raise above ~$1.25M.
 - **Initial pool seed:** Sized so that a single `maxBuybackAmount` swap causes less than `slippageBps` price impact, making buyback execution well-conditioned on its own pool.
 - **Custody:** BPT is held by the DAO treasury address. PoC: admin key. Production: Governor + `TimelockController`. No withdraw path to an EOA — liquidity exit requires a governance proposal through the timelock. This invariant is enforced by BPT being held at the Timelock address and the absence of any bespoke withdraw function; Balancer has no protocol-level lockup, so custody discipline is the sole enforcement mechanism.
 - **No `LiquidityManager` contract.** A weighted pool's curve handles rebalancing implicitly via arbitrage. There is no range to manage, no `rebalance()` keeper, no `KEEPER_ROLE` for liquidity operations.
@@ -125,7 +125,7 @@ Balancer's smoother curve reduces the need for TWAP versus V3's concentrated ban
 | Pool weights | 80% TOKEN / 20% USDC |
 | Pool swap fee | 1% (100 bps) |
 | POL TOKEN-side allocation | 100M (10% of supply) |
-| Initial pool seed size | Sized so `maxBuybackAmount` causes < `slippageBps` impact (~$200K nominal USDC seed at launch) |
+| Initial pool seed size | Sized so `maxBuybackAmount` causes < `slippageBps` impact (~$250K nominal USDC seed at launch — the $0.01-anchor pairing for 100M TOKEN) |
 | `minBuybackAmount` | 100 USDC |
 | `maxBuybackAmount` | Set so a single swap causes < `slippageBps` impact |
 | `slippageBps` | 200 bps (2%) |
@@ -183,7 +183,7 @@ Criteria 1–4 are quantitative; governance voters verify them off-chain before 
 
 ### Buyback per-epoch-cap headroom (#685)
 
-Lowering POL from 15pp to 10pp ([#685](https://github.com/decdn/decdn/issues/685)) reduces the TOKEN side of the 80/20 pool to 100M. At the fixed 80/20 weight and a fixed anchor price, the USDC side is pinned at `(20/80) × TOKEN_value`, so epoch-start in-pool USDC depth shrinks by ~⅓ (the ~$300K → ~$200K seed). The per-epoch liquidity cap is a fraction of that depth (`epochLiquidityCapFraction`, default 10%, bounded `[1%, 30%]`), so the **absolute USDC notional the cap admits per epoch falls by ~⅓** — while buyback **inflow** (30% of routed USDC per [ADR 026](026-tokenomics.md#adr-026-tokenomics)) is independent of POL size and scales with network revenue. The "burns will queue" risk therefore binds at a lower revenue level than under the prior 15pp sizing.
+Lowering POL from 15pp to 10pp ([#685](https://github.com/decdn/decdn/issues/685)) reduces the TOKEN side of the 80/20 pool to 100M. At the fixed 80/20 weight and a fixed anchor price, the USDC side is pinned at `(20/80) × TOKEN_value`, so epoch-start in-pool USDC depth shrinks by ~⅓ (the ~$375K → ~$250K seed). The per-epoch liquidity cap is a fraction of that depth (`epochLiquidityCapFraction`, default 10%, bounded `[1%, 30%]`), so the **absolute USDC notional the cap admits per epoch falls by ~⅓** — while buyback **inflow** (30% of routed USDC per [ADR 026](026-tokenomics.md#adr-026-tokenomics)) is independent of POL size and scales with network revenue. The "burns will queue" risk therefore binds at a lower revenue level than under the prior 15pp sizing.
 
 Levers, in order of preference:
 
