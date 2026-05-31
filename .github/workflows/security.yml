@@ -17,6 +17,17 @@ on:
 permissions:
   contents: read
 
+# Coalesce rapid updates to the same ref so stale Trivy runs don't pile up.
+# This workflow has no `push` trigger; the event that actually stacks is a PR
+# being re-pushed (successive `synchronize`, e.g. fixup commits to a Cargo.lock
+# bump), where github.ref is refs/pull/<n>/merge — those collapse to the
+# latest. PR refs never collide with the weekly schedule or manual dispatch
+# (both key on refs/heads/main); note a dispatch and a scheduled run on main
+# DO share a group, so a manual run can supersede a scheduled one.
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   trivy-fs:
     name: Trivy filesystem scan
