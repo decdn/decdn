@@ -1,24 +1,29 @@
 //! Incentive layer for deCDN.
 //!
 //! Manages off-chain USDC payment channels, staking interactions via
-//! `StakingRegistry`, and voucher lifecycle (creation, validation,
+//! `CapacityBond`, and voucher lifecycle (creation, validation,
 //! on-chain settlement).
 //!
-//! Currently exposes the off-chain payment-voucher primitives — EIP-712
-//! signing/verification ([`voucher`]) — required for `cdn/client/v1`, and
-//! the keystore→signer bridge ([`eth_identity`], #406) used by both
-//! `decdn key-gen` and the runtime to load a `PrivateKeySigner`. The
-//! on-chain settlement path (open / close / dispute / settle) is tracked in
-//! issue #327.
+//! Exposes the off-chain payment-voucher primitives — EIP-712
+//! signing/verification ([`voucher`]) — required for `cdn/client/v1`, the
+//! keystore→signer bridge ([`eth_identity`], #406) used by both
+//! `decdn key-gen` and the runtime to load a `PrivateKeySigner`, and the
+//! `alloy::sol!` contract bindings for the on-chain surface the node consumes
+//! ([`capacity_bond`] reads, [`payment_channel`] reads + writes). The
+//! seller-side on-chain settlement path (#327 — `ChannelOpened` →
+//! persist, threshold/shutdown `withdraw` + `closeChannel`, `ChannelSettled`
+//! → forget) is driven by the `decdn-node` runtime against these bindings;
+//! buyer-side `openChannel` and the dispute monitor remain future work.
 
 pub mod bind_sig;
+pub mod capacity_bond;
 pub mod channel;
 pub mod client_bridge;
 pub mod client_reputation;
 pub mod eth_identity;
+pub mod payment_channel;
 pub mod probe_sig;
 pub mod rate;
-pub mod staking_registry;
 pub mod store;
 pub mod stream_sig;
 pub mod voucher;

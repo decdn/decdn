@@ -100,8 +100,8 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  staking_registry_address: {}",
-        resolved.blockchain.staking_registry_address
+        "  capacity_bond_address: {}",
+        resolved.blockchain.capacity_bond_address
     )?;
     writeln!(
         w,
@@ -202,7 +202,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rpc_url = ""                       # REQUIRED: Arbitrum Sepolia JSON-RPC URL
 # eth_keystore = "~/.decdn/keystore.json"
 # payment_channel_address = ""       # REQUIRED: 0x-prefixed hex
-# staking_registry_address = ""      # REQUIRED: 0x-prefixed hex
+# capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog

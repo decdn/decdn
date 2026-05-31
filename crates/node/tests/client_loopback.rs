@@ -642,6 +642,13 @@ impl ChannelStateStore for FailingRecordStore {
     ) -> Result<(), decdn_incentive::StoreError> {
         self.inner.forget(channel_id)
     }
+
+    fn get(
+        &self,
+        channel_id: decdn_incentive::ChannelId,
+    ) -> Result<Option<ChannelState>, decdn_incentive::StoreError> {
+        self.inner.get(channel_id)
+    }
 }
 
 /// A transient persist-write failure (`ChannelError::Store`) is surfaced in-band

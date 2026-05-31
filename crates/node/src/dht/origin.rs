@@ -7,7 +7,7 @@
 //!
 //!   `PublisherRegistry.namespaceOf(H)`
 //!     → `OriginAssignment.getOrigins(namespace_id)`
-//!     → `StakingRegistry.nodeIdOf(operator) → (NodeId, active)`
+//!     → `CapacityBond.nodeIdOf(operator) → (NodeId, active)`
 //!     → filter `active == true`
 //!
 //! This trait abstracts the directory so the iterative-lookup module
@@ -40,7 +40,7 @@ pub use crate::dht::records::Hash;
 pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
     /// Return the operator `NodeId`s authorised as origins for `hash`,
     /// already filtered to only currently-active stakers (the
-    /// `active == true` filter from `StakingRegistry.nodeIdOf` per ADR
+    /// `active == true` filter from `CapacityBond.nodeIdOf` per ADR
     /// 022 §FIND\_VALUE Flow "Origin discovery").
     ///
     /// Returns an empty vector when no namespace is registered for the

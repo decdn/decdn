@@ -121,7 +121,7 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     // upper bound is already enforced at decode time by `deserialize_rate_per_mb`,
     // but zero is a valid wire value the decoder accepts and the requester must
     // not. Full attribution (recover signer, confirm NodeId↔address via
-    // `StakingRegistry`) is the on-chain `SlashJudge`'s job — the CLI has no
+    // `CapacityBond`) is the on-chain `SlashJudge`'s job — the CLI has no
     // registry client, so it enforces presence/shape only.
     resp.validate()
         .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;

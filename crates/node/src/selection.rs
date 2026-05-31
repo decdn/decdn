@@ -254,7 +254,7 @@ fn pick_best_in_group(
 
     // Tier 2: higher stake wins. `None` is treated as the lowest possible
     // stake (since on-chain integration is deferred — see ADR 001 "Contract
-    // Interface: Node Registry" / ADR 019 for the staking-registry interface
+    // Interface: Node Registry" / ADR 019 for the capacity-bond interface
     // that will populate `Candidate.stake`).
     let max_stake = pool
         .iter()

@@ -84,13 +84,13 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
     pub keystore_password_file: Option<PathBuf>,
 
-    /// `StablePaymentChannel` contract address (0x-prefixed hex).
+    /// `PaymentChannel` contract address (0x-prefixed hex).
     #[arg(long, value_name = "ADDR", env = "DECDN_PAYMENT_CHANNEL_ADDRESS")]
     pub payment_channel_address: Option<String>,
 
-    /// `StakingRegistry` contract address (0x-prefixed hex).
-    #[arg(long, value_name = "ADDR", env = "DECDN_STAKING_REGISTRY_ADDRESS")]
-    pub staking_registry_address: Option<String>,
+    /// `CapacityBond` contract address (0x-prefixed hex).
+    #[arg(long, value_name = "ADDR", env = "DECDN_CAPACITY_BOND_ADDRESS")]
+    pub capacity_bond_address: Option<String>,
 
     /// `SlashJudge` contract address (0x-prefixed hex) — EIP-712
     /// `verifyingContract` for probe `slash_sig` (ADR 014).

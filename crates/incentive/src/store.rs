@@ -74,6 +74,19 @@ pub trait ChannelStateStore: Send + Sync {
     /// Returns a [`StoreError`] if the underlying delete or durable commit
     /// fails.
     fn forget(&self, channel_id: ChannelId) -> Result<(), StoreError>;
+
+    /// Point-lookup the persisted state for one channel, or `None` if no
+    /// record exists. Used by the on-chain seller settlement path (#327) to
+    /// read the latest accepted voucher (`last_amount` / `last_nonce` /
+    /// `last_bytes_delivered` / `last_signature`) when deciding whether an
+    /// accrued claim crosses the redemption threshold — always the freshest
+    /// committed voucher, so a redemption never submits a stale one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the backing store is unreadable or the
+    /// record is corrupt.
+    fn get(&self, channel_id: ChannelId) -> Result<Option<ChannelState>, StoreError>;
 }
 
 /// Failure modes shared by every [`ChannelStateStore`] implementation.
@@ -192,6 +205,14 @@ impl ChannelStateStore for MemoryChannelStateStore {
         guard.remove(&channel_id);
         Ok(())
     }
+
+    fn get(&self, channel_id: ChannelId) -> Result<Option<ChannelState>, StoreError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        Ok(guard.get(&channel_id).cloned())
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +231,7 @@ mod tests {
             last_amount: U256::from(1_234u64),
             last_nonce: U256::from(7u64),
             last_bytes_delivered: U256::from(4_096u64),
+            last_signature: vec![0xABu8; 65],
         }
     }
 

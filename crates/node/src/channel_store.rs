@@ -13,6 +13,13 @@
 //! restart re-opens the channel at nonce zero and a client can replay a
 //! previously-accepted voucher for a second byte delivery (issue #527).
 //!
+//! Schema v2 (#327) additionally persists the latest voucher's signature so
+//! the seller settlement path can submit it to the on-chain
+//! `closeChannel` / `withdraw` after a restart without forfeiting the claim.
+//! The signature is encoded as a trailing postcard segment after the v1
+//! prefix; v1 records (no signature) hydrate with an empty signature and are
+//! simply unredeemable until the next voucher re-records them.
+//!
 //! [ADR 003 §Off-chain voucher state persistence]: ../../../adr/003-payments.md
 
 use std::path::{Path, PathBuf};
@@ -40,7 +47,7 @@ const DB_FILE_MODE: u32 = 0o600;
 /// [`StoreError::UnsupportedSchema`]) — opening a forward-incompatible store
 /// is unsafe because we cannot honour the persistence invariant for fields
 /// we do not understand.
-const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
 /// Sanity ceiling on trailing bytes per record. Trailing bytes are tolerated
 /// (forward-compat with additive schema changes — see [`StoredChannelState`]),
@@ -75,6 +82,13 @@ const CHANNEL_TABLE: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("c
 /// ignore additive fields a newer writer appended. Breaking shape changes
 /// (field removal, field reorder, type change) still require bumping the
 /// table name to a new `channel_state_vN` and a one-shot migration on open.
+///
+/// The schema-v2 voucher signature (#327) is NOT a field of this struct — it
+/// is encoded as its own postcard `Vec<u8>` segment appended after this
+/// prefix, so the v1 prefix shape stays byte-identical across v1 and v2 and
+/// the `take_from_bytes` prefix decode is unchanged. `load_all` decodes the
+/// signature from the remainder when `schema_version >= 2`; a v1 record (no
+/// trailing segment) hydrates with an empty signature.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredChannelState {
     schema_version: u32,
@@ -103,7 +117,10 @@ impl From<&ChannelState> for StoredChannelState {
 }
 
 impl StoredChannelState {
-    fn into_state(self) -> Result<ChannelState, StoreError> {
+    /// Reconstruct the in-memory [`ChannelState`]. `last_signature` is the
+    /// decoded trailing segment (empty for v1 records / channels with no
+    /// accepted voucher yet) — see [`StoredChannelState`]'s doc.
+    fn into_state(self, last_signature: Vec<u8>) -> Result<ChannelState, StoreError> {
         if self.schema_version > SUPPORTED_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema {
                 found: self.schema_version,
@@ -118,6 +135,7 @@ impl StoredChannelState {
             last_amount: U256::from_be_bytes(self.last_amount),
             last_nonce: U256::from_be_bytes(self.last_nonce),
             last_bytes_delivered: U256::from_be_bytes(self.last_bytes_delivered),
+            last_signature,
         })
     }
 }
@@ -398,6 +416,65 @@ impl PersistentChannelStateStore {
     }
 }
 
+/// Decode one stored record (table value) into a [`ChannelState`], given its
+/// table key (`channel_id` bytes). Shared by `load_all` and `get`.
+///
+/// `take_from_bytes` instead of `from_bytes` so a newer writer's additive
+/// fields (trailing bytes to an older reader) decode cleanly — see
+/// [`StoredChannelState`]'s doc and the schema-version handshake in
+/// `into_state`.
+///
+/// What this DOES guard: forward-compat for additive schema changes, and
+/// outright structural corruption (insufficient bytes, malformed varint)
+/// which `take_from_bytes` rejects. What it does NOT guard: intra-record
+/// bit-flips inside fixed-shape fields — redb page checksums catch on-disk
+/// bit-rot one layer down before we see the value.
+fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState, StoreError> {
+    let channel_id = B256::from(key_bytes);
+    let (stored, remainder): (StoredChannelState, &[u8]) = postcard::take_from_bytes(value_bytes)
+        .map_err(|err| StoreError::Corrupt {
+        channel_id: Some(channel_id),
+        detail: format!("postcard decode failed: {err}"),
+    })?;
+    if stored.channel_id != key_bytes {
+        return Err(StoreError::Corrupt {
+            channel_id: Some(channel_id),
+            detail: "channel_id in value does not match table key".into(),
+        });
+    }
+    // Schema v2 (#327) appends the latest voucher signature as a trailing
+    // postcard `Vec<u8>`. Decode it only for a version this binary
+    // understands; a version above `SUPPORTED_SCHEMA_VERSION` is left for
+    // `into_state` to reject (its trailing layout is unknown, so parsing it
+    // as a signature would be meaningless). A v1 record has no segment and
+    // hydrates with an empty signature.
+    let (last_signature, leftover): (Vec<u8>, &[u8]) =
+        if stored.schema_version >= 2 && stored.schema_version <= SUPPORTED_SCHEMA_VERSION {
+            postcard::take_from_bytes::<Vec<u8>>(remainder).map_err(|err| StoreError::Corrupt {
+                channel_id: Some(channel_id),
+                detail: format!("postcard decode of voucher signature failed: {err}"),
+            })?
+        } else {
+            (Vec::new(), remainder)
+        };
+    // Forward-compat allowance is bounded: a malicious writer could pad
+    // megabytes onto every record and silently inflate every read. Log
+    // (don't fail) when the trailer beyond the known fields exceeds a small
+    // sanity ceiling so a future schema-skew incident is observable in
+    // operator logs without re-introducing the strict-decoding regression
+    // issue #527's reviewers warned against.
+    if leftover.len() > SANE_TRAILER_MAX_BYTES {
+        tracing::warn!(
+            %channel_id,
+            remainder = leftover.len(),
+            limit = SANE_TRAILER_MAX_BYTES,
+            event = "channel_store_excess_trailer",
+            "channel state record has unusually large trailing bytes; possible malicious padding or large-additive-field schema skew",
+        );
+    }
+    stored.into_state(last_signature)
+}
+
 impl ChannelStateStore for PersistentChannelStateStore {
     fn load_all(&self) -> Result<Vec<ChannelState>, StoreError> {
         let read_txn = self
@@ -420,60 +497,45 @@ impl ChannelStateStore for PersistentChannelStateStore {
             let (key_guard, value_guard) =
                 entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
             let key_bytes: [u8; 32] = *key_guard.value();
-            let channel_id = B256::from(key_bytes);
             let value_bytes = value_guard.value();
-            // `take_from_bytes` instead of `from_bytes` so a newer writer's
-            // additive fields (which appear as trailing bytes to an older
-            // reader) decode cleanly — see `StoredChannelState`'s doc and
-            // the schema-version handshake in `into_state`. The remainder
-            // is intentionally discarded.
-            //
-            // What this DOES guard: forward-compat for additive schema
-            // changes, and outright structural corruption (insufficient
-            // bytes, malformed varint) which `take_from_bytes` rejects.
-            //
-            // What this does NOT guard: intra-record bit-flips inside the
-            // fixed-shape fields (e.g. a single byte flipped inside
-            // `client: [u8; 20]`). The deserializer accepts any 20 bytes
-            // there and the schema_version check in `into_state` cannot
-            // catch it. The real defense for that class is one layer
-            // down: redb checksums its pages, so on-disk bit-rot is
-            // caught at the storage layer before we see the value.
-            let (stored, remainder): (StoredChannelState, &[u8]) =
-                postcard::take_from_bytes(value_bytes).map_err(|err| StoreError::Corrupt {
-                    channel_id: Some(channel_id),
-                    detail: format!("postcard decode failed: {err}"),
-                })?;
-            // Forward-compat allowance is bounded: a malicious writer could
-            // pad megabytes onto every record and silently inflate every
-            // `load_all`. Log (don't fail) when the trailer exceeds a
-            // small sanity ceiling so a future schema-skew incident is
-            // observable in operator logs without re-introducing the
-            // strict-decoding regression issue #527's reviewers warned
-            // against.
-            if remainder.len() > SANE_TRAILER_MAX_BYTES {
-                tracing::warn!(
-                    %channel_id,
-                    remainder = remainder.len(),
-                    limit = SANE_TRAILER_MAX_BYTES,
-                    event = "channel_store_excess_trailer",
-                    "channel state record has unusually large trailing bytes; possible malicious padding or large-additive-field schema skew",
-                );
-            }
-            if stored.channel_id != key_bytes {
-                return Err(StoreError::Corrupt {
-                    channel_id: Some(channel_id),
-                    detail: "channel_id in value does not match table key".into(),
-                });
-            }
-            out.push(stored.into_state()?);
+            out.push(decode_record(key_bytes, value_bytes)?);
         }
         Ok(out)
     }
 
+    fn get(&self, channel_id: ChannelId) -> Result<Option<ChannelState>, StoreError> {
+        let key: [u8; 32] = channel_id.into();
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(CHANNEL_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let Some(value_guard) = table
+            .get(&key)
+            .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(decode_record(key, value_guard.value())?))
+    }
+
     fn record(&self, state: &ChannelState) -> Result<(), StoreError> {
-        let encoded = postcard::to_allocvec(&StoredChannelState::from(state))
+        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(state))
             .map_err(|err| StoreError::Codec(format!("postcard encode failed: {err}")))?;
+        // Schema v2 (#327): append the latest voucher signature as a trailing
+        // postcard `Vec<u8>` segment after the v1 prefix. Empty for channels
+        // with no accepted voucher yet — still length-prefixed (one `0x00`
+        // byte), so a v2 record always carries a decodable segment.
+        let sig_encoded = postcard::to_allocvec(&state.last_signature).map_err(|err| {
+            StoreError::Codec(format!(
+                "postcard encode of voucher signature failed: {err}"
+            ))
+        })?;
+        encoded.extend_from_slice(&sig_encoded);
         let key: [u8; 32] = state.channel_id.into();
 
         let mut write_txn = self
@@ -569,6 +631,7 @@ mod tests {
             last_amount: U256::from(byte) * U256::from(1_000u64),
             last_nonce: U256::from(byte),
             last_bytes_delivered: U256::from(byte) * U256::from(1_024u64),
+            last_signature: vec![byte; 65],
         }
     }
 
@@ -626,6 +689,30 @@ mod tests {
         store.forget(b256!(
             "1111111111111111111111111111111111111111111111111111111111111111"
         ))?;
+        Ok(())
+    }
+
+    #[test]
+    fn get_round_trips_and_reports_unknown() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        // get on a never-written store (no table yet) is None, not an error.
+        anyhow::ensure!(store.get(sample(1).channel_id)?.is_none());
+
+        let s = sample(9);
+        store.record(&s)?;
+        let got = store
+            .get(s.channel_id)?
+            .ok_or_else(|| anyhow::anyhow!("expected Some"))?;
+        anyhow::ensure!(got == s, "get must round-trip incl. signature");
+        anyhow::ensure!(
+            store
+                .get(b256!(
+                    "2222222222222222222222222222222222222222222222222222222222222222"
+                ))?
+                .is_none(),
+            "unknown channel -> None"
+        );
         Ok(())
     }
 
@@ -821,9 +908,11 @@ mod tests {
         let s = sample(0x42);
         let key: [u8; 32] = s.channel_id.into();
 
-        // Encode the real record, then append plausible additive-field
-        // bytes (simulating what a future schema would write).
+        // Encode the real v2 record (prefix + signature segment), then append
+        // plausible *further* additive-field bytes (simulating what a future
+        // schema beyond v2 would write after the signature).
         let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
+        encoded.extend_from_slice(&postcard::to_allocvec(&s.last_signature)?);
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
 
         let mut tx = store.db.begin_write()?;
@@ -839,8 +928,45 @@ mod tests {
         let only = all.first().ok_or_else(|| anyhow::anyhow!("missing"))?;
         anyhow::ensure!(
             *only == s,
-            "decoded prefix must equal the original record despite trailing bytes",
+            "decoded prefix + signature must equal the original record despite trailing bytes",
         );
+        Ok(())
+    }
+
+    /// **Schema-v1 backward-compat (#327).** A record written by the
+    /// pre-signature binary (`schema_version` 1, no trailing signature
+    /// segment) MUST still load — hydrating with an empty signature rather
+    /// than failing the decode. The channel is then unredeemable until the
+    /// next voucher re-records it at v2, which is safe.
+    #[test]
+    fn v1_record_hydrates_with_empty_signature() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let mut s = sample(0x55);
+        s.last_signature.clear(); // a v1 record carried no signature
+
+        // Hand-write a v1-shaped record: prefix only, schema_version forced
+        // to 1, NO trailing signature segment.
+        let mut stored = StoredChannelState::from(&s);
+        stored.schema_version = 1;
+        let encoded = postcard::to_allocvec(&stored)?;
+        let key: [u8; 32] = s.channel_id.into();
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(CHANNEL_TABLE)?;
+            t.insert(&key, encoded.as_slice())?;
+        }
+        tx.commit()?;
+
+        let all = store.load_all()?;
+        anyhow::ensure!(all.len() == 1);
+        let only = all.first().ok_or_else(|| anyhow::anyhow!("missing"))?;
+        anyhow::ensure!(
+            only.last_signature.is_empty(),
+            "v1 record → empty signature"
+        );
+        anyhow::ensure!(*only == s, "v1 prefix fields must round-trip");
         Ok(())
     }
 
