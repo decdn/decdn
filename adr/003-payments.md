@@ -908,7 +908,7 @@ USDC uses 6 decimals; TOKEN uses 18 decimals. All payment amounts in the `incent
 {channelId, amount, nonce, bytesDelivered, token, signature}
 ```
 
-During delivery over `cdn/client/v1`, `{signature, amount, nonce, bytesDelivered}` are transmitted on the wire; the remaining fields (`channelId`, `token`) are derived from stream context. The `nonce` is explicit to prevent desynchronization if a `VoucherAck` is dropped (it starts at 1 for the first voucher in a channel; 0 is reserved as a sentinel). See [ADR 005](005-protocol.md#adr-005-wire-protocol) for wire protocol details.
+During delivery over `cdn/client/v1`, `{signature, amount, nonce}` are transmitted on the wire; the remaining fields (`channelId`, `token`, `bytesDelivered`) are derived from stream context — `channelId` from the `StreamRequest`, `token` fixed at channel open, and `bytesDelivered` the node's per-channel cumulative byte counter. The `nonce` is explicit to prevent desynchronization if a `VoucherAck` is dropped (it starts at 1 for the first voucher in a channel; 0 is reserved as a sentinel). See [ADR 005](005-protocol.md#adr-005-wire-protocol) for wire protocol details.
 
 The `token` field (ERC-20 address) is in the signed EIP-712 typed data to prevent cross-token replay; it is the USDC contract address, fixed at deployment. Full EIP-712 type definition and domain separator: [EIP-712 Voucher Signature](#eip-712-voucher-signature).
 
