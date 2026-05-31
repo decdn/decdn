@@ -136,6 +136,11 @@ jobs:
               - 'rustfmt.toml'
               - 'deny.toml'
               - '.cargo/**'
+              # insta snapshot baselines (e.g. the public-API surface snapshot,
+              # issue #304). Without this, a PR that hand-edits only a committed
+              # *.snap would have rust=false and skip the `public-api` job that
+              # validates it — letting a stale/incorrect baseline merge.
+              - '**/*.snap'
               - '.github/workflows/ci.yml'
               - '.github/scripts/coverage-diff.py'
               - '.github/scripts/tests/**'
