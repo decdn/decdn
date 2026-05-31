@@ -144,6 +144,31 @@ cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit (deny.toml)
 ```
 
+### Public API snapshot
+
+`decdn-protocol` carries a [`public_api`](https://crates.io/crates/public_api) +
+[`insta`](https://crates.io/crates/insta) snapshot test that guards its exported surface
+(wire types, ALPN definitions) against unintended changes — see [issue #304]. It is
+feature-gated and **not** part of `cargo nextest run --workspace`. The dedicated `public-api`
+CI job runs it and **blocks the PR** on any diff.
+
+```bash
+# Run (and update) the snapshot. Required when you intentionally change the public API:
+INSTA_UPDATE=always cargo nextest run -p decdn-protocol --features public-api-test
+# or, to review interactively:
+cargo insta review
+```
+
+- The `.snap` diff **must land in the same PR** as the API change — that's the whole point.
+- **No nightly needed.** `public-api` parses rustdoc JSON (nominally nightly-only); the test
+  emits it with the pinned **stable** toolchain via `RUSTC_BOOTSTRAP=1`, so it's deterministic
+  and runs anywhere the workspace already builds. The one coupling: a deliberate toolchain
+  bump can change rustdoc's JSON `format_version`, which may require bumping `public-api` and
+  regenerating the `.snap` in the same PR (see the header comment in
+  `crates/protocol/tests/public_api.rs`).
+
+[issue #304]: https://github.com/decdn/decdn/issues/304
+
 ## Solidity development
 
 Contracts live in `contracts/` and use [Foundry](https://book.getfoundry.sh). CI pins Foundry to `v1.7.1`; install a matching local toolchain via [`foundryup`](https://book.getfoundry.sh/getting-started/installation).

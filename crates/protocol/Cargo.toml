@@ -15,6 +15,26 @@ tokio = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+# Public-API stability snapshot (issue #304). Only exercised by the
+# `public_api` test target below, which is gated behind `public-api-test`.
+public-api = { workspace = true }
+rustdoc-json = { workspace = true }
+insta = { workspace = true }
+
+[features]
+# Gates the slow, nightly-dependent `public_api` snapshot test out of the
+# default `cargo nextest --workspace` (coverage) run. CI's dedicated
+# `public-api` job opts in with `--features public-api-test`.
+public-api-test = []
+
+# The public-API snapshot test shells out to a nightly rustdoc and is slow, so
+# it is compiled/run only when `public-api-test` is enabled (see CONTRIBUTING.md
+# § Public API snapshot). `required-features` makes Cargo skip the target
+# entirely otherwise.
+[[test]]
+name = "public_api"
+path = "tests/public_api.rs"
+required-features = ["public-api-test"]
 
 [lints]
 workspace = true

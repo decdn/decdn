@@ -166,6 +166,17 @@ aws-smithy-types = "1"
 tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
+# Public-API stability snapshot (issue #304, `decdn-protocol` only). `public-api`
+# renders the crate's exported surface from rustdoc JSON, which `rustdoc-json`
+# generates with the workspace's pinned *stable* toolchain (no nightly — the
+# test sets `RUSTC_BOOTSTRAP=1` to unlock the rustdoc-JSON flag; see
+# crates/protocol/tests/public_api.rs); `insta` snapshots the rendered surface.
+# Used only by the feature-gated `public_api` test target, which stays out of
+# the default workspace run. The `public-api` minor (0.52 → rustdoc-types 0.57)
+# must match the rustdoc-JSON `format_version` our stable toolchain emits.
+public-api = "0.52"
+rustdoc-json = "0.9"
+insta = "1"
 # Operation-level S3 mocks for the S3 origin tests (#437 PR2). The `mock!`
 # / `mock_client!` macros take the SDK through its full middleware chain
 # (signing, retry, body framing) but stub the network — exactly the
