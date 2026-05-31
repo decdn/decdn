@@ -87,6 +87,29 @@ jobs:
           shared-key: msrv
       - run: cargo check --workspace --all-targets
 
+  public-api:
+    name: public API snapshot
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    # Guards `decdn-protocol`'s exported surface (issue #304). The
+    # `public-api-test` feature-gated test renders the public API from rustdoc
+    # JSON and `insta`-snapshots it; an unintended diff fails here and blocks
+    # the PR. Runs on the same pinned stable toolchain as everything else (the
+    # test sets RUSTC_BOOTSTRAP=1 to emit rustdoc JSON without nightly). Kept a
+    # separate job (clean env, no coverage instrumentation / mold) so it never
+    # perturbs the required `test` job.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: public-api
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run -p decdn-protocol --features public-api-test
+
   changes:
     name: detect changes
     runs-on: ubuntu-latest
@@ -788,7 +811,7 @@ jobs:
     name: CI success
     if: always()
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, changes, test, deny, doc, msrv, markdownlint, adr-book-list,
+    needs: [fmt, clippy, changes, test, deny, doc, msrv, public-api, markdownlint, adr-book-list,
             pr-title,
             solidity-fmt, solidity-build-test, solidity-coverage,
             solidity-solhint, solidity-slither, solidity-aderyn,
@@ -804,7 +827,7 @@ jobs:
           # unless listed here. `changes` and `markdownlint` are
           # intentionally omitted — they always run, so a skip from either
           # signals a misconfiguration that should fail the gate.
-          allowed-skips: fmt, clippy, test, deny, doc, msrv, adr-book-list,
+          allowed-skips: fmt, clippy, test, deny, doc, msrv, public-api, adr-book-list,
                          pr-title,
                          solidity-fmt, solidity-build-test, solidity-coverage,
                          solidity-solhint, solidity-slither, solidity-aderyn,
