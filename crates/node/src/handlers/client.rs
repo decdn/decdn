@@ -308,22 +308,54 @@ impl ClientHandler {
 
         let hash = Hash::from_bytes(req.hash);
 
-        // Blob availability + size gate.
-        if !self.cache.has(hash).await.unwrap_or(false) {
-            let err = if self.cache.is_evicted(hash) {
-                StreamError::EvictedSinceProbe
-            } else {
-                StreamError::NotFound
-            };
-            return self.respond_error(&mut send, &req, err).await;
+        // Blob availability gate. A store fault is NOT an absence: `Ok(false)`
+        // means the node genuinely lacks the blob (NotFound / EvictedSinceProbe),
+        // but `Err` is a transient local store failure that must not masquerade
+        // as a signed `NotFound` — a paying client would treat that as
+        // authoritative and stop asking. Surface it as `InternalError` and log.
+        match self.cache.has(hash).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let err = if self.cache.is_evicted(hash) {
+                    StreamError::EvictedSinceProbe
+                } else {
+                    StreamError::NotFound
+                };
+                return self.respond_error(&mut send, &req, err).await;
+            }
+            Err(e) => {
+                tracing::warn!(%hash, error = %e, "cache `has` lookup failed on delivery path");
+                return self
+                    .respond_error(&mut send, &req, StreamError::InternalError)
+                    .await;
+            }
         }
-        let total_bytes = self
-            .cache
-            .inspect(hash)
-            .await
-            .ok()
-            .and_then(|p| p.size_bytes)
-            .unwrap_or(0);
+
+        // Size gate. `has` just confirmed the blob is present and complete, so an
+        // `inspect` error — or a `None` size (a `Partial`/`NotFound` status) — is
+        // a real store fault, NOT a zero-length blob. Advertising `total_bytes: 0`
+        // for a non-empty blob would sign a `StreamResponse` the delivery then
+        // contradicts, and the receiver (expecting 0 bytes) would abort on the
+        // first chunk. Surface the fault instead; only a genuinely complete,
+        // zero-length blob yields `total_bytes == 0`.
+        let size = match self.cache.inspect(hash).await {
+            Ok(preview) => preview.size_bytes,
+            Err(e) => {
+                tracing::warn!(%hash, error = %e, "cache `inspect` failed on delivery path");
+                return self
+                    .respond_error(&mut send, &req, StreamError::InternalError)
+                    .await;
+            }
+        };
+        let Some(total_bytes) = size else {
+            tracing::warn!(
+                %hash,
+                "blob present per `has` but `inspect` reports no size; treating as fault"
+            );
+            return self
+                .respond_error(&mut send, &req, StreamError::InternalError)
+                .await;
+        };
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
             return self
                 .respond_error(&mut send, &req, StreamError::BlobTooLarge)

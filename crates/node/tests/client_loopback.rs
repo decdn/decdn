@@ -6,6 +6,18 @@
 //! channel state advances; the error paths prove a zero-rate response is
 //! rejected on receive (#252) and an unknown channel is cleanly rejected with
 //! `VoucherRejected { WrongChannel }` (the #327 boundary).
+//!
+//! Delivery/authorization gates also covered: `BlobTooLarge` (size gate),
+//! `EvictedSinceProbe` (evicted between probe and stream), the client-binding
+//! mismatch reset and the binding-does-not-own-channel `NotFound` (both driven
+//! by a small [`raw_request`] client, since the honest requester never sends a
+//! binding), and per-channel voucher serialization under concurrency.
+//!
+//! Still uncovered (need a hostile client that reimplements the receive loop,
+//! tracked as follow-ups): a mid-stream underpaying voucher → stream fails; a
+//! `BadSignature`/`StaleNonce` rejection *after* an accepted voucher; the
+//! per-connection stream-cap reset-without-signing; a server over-sending or
+//! delivering hash-mismatched bytes; and the request/voucher read timeouts.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -14,18 +26,22 @@ use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
+use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::{
-    ChannelState, ChannelStateStore, MemoryChannelStateStore, bind_node_id_domain,
-    slash_judge_domain, voucher_domain,
+    ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore,
+    bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::{ALPN_CLIENT, MAX_RATE_PER_MB};
+use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
+use decdn_protocol::{
+    ALPN_CLIENT, MAX_RATE_PER_MB, decode_message, encode_stream_request, read_frame, write_frame,
+};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 
@@ -124,8 +140,8 @@ async fn local_endpoint(
     Ok((ep, addr))
 }
 
-/// Build a `ClientHandler` with the given rate and channel store.
-#[allow(clippy::too_many_arguments)]
+/// Build a `ClientHandler` with the given rate and channel store, an unlimited
+/// blob-size gate, and a 16-stream per-connection cap (the common-case setup).
 fn build_handler(
     server_id: iroh::PublicKey,
     server_eth: &Arc<PrivateKeySigner>,
@@ -134,6 +150,25 @@ fn build_handler(
     cache: CacheEngine,
     store: Arc<dyn ChannelStateStore>,
     rate: u64,
+) -> anyhow::Result<Arc<ClientHandler>> {
+    build_handler_limited(
+        server_id, server_eth, metrics, limiter, cache, store, rate, 0, 16,
+    )
+}
+
+/// Build a `ClientHandler` exposing the `max_blob_size_bytes` and
+/// `max_concurrent_streams` knobs (`0` blob size == unlimited).
+#[allow(clippy::too_many_arguments)]
+fn build_handler_limited(
+    server_id: iroh::PublicKey,
+    server_eth: &Arc<PrivateKeySigner>,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    rate: u64,
+    max_blob_size_bytes: u64,
+    max_concurrent_streams: usize,
 ) -> anyhow::Result<Arc<ClientHandler>> {
     Ok(Arc::new(ClientHandler::new(
         server_id,
@@ -149,8 +184,8 @@ fn build_handler(
         0,
         MAX_RATE_PER_MB,
         1, // voucher_interval_mb
-        0, // max_blob_size unlimited
-        16,
+        max_blob_size_bytes,
+        max_concurrent_streams,
     )?))
 }
 
@@ -572,6 +607,344 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
     anyhow::ensure!(
         err.to_string().contains("WrongChannel") || err.to_string().contains("rejected"),
         "error should surface the voucher rejection: {err}"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// A channel store seeded with one channel owned by a fresh client signer.
+/// Returns the store, that client signer, and the deposit.
+fn seeded_store() -> anyhow::Result<(Arc<dyn ChannelStateStore>, Arc<PrivateKeySigner>, U256)> {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+    Ok((store, signer, deposit))
+}
+
+/// Spin up a server endpoint running a `ClientHandler` over `cache`/`store`,
+/// returning the dialable target, the node's Ethereum signer (for `slash_sig`
+/// verification), the server endpoint, and its accept-loop handle. `max_blob`
+/// of `0` disables the size gate.
+async fn spawn_handler_server(
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    rate: u64,
+    max_blob: u64,
+    max_streams: usize,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<PrivateKeySigner>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        rate,
+        max_blob,
+        max_streams,
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth, server_ep, server_task))
+}
+
+/// Minimal raw client for the binding paths the honest `stream_fetch` requester
+/// never drives (it always sends `ext = None`): open one bidi stream, send a
+/// `StreamRequest` plus the given `ext`, and return the first decoded reply.
+/// Errors if the server reset/closed the stream before a frame arrived — which
+/// is exactly how a binding-verification failure surfaces to the peer.
+async fn raw_request(
+    client_ep: &Endpoint,
+    target: EndpointAddr,
+    req: &StreamRequest,
+    ext: Option<&StreamRequestExt>,
+) -> anyhow::Result<ClientMessage> {
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let payload = encode_stream_request(req, ext)?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    let frame = read_frame(&mut recv)
+        .await
+        .map_err(|e| anyhow::anyhow!("read frame (stream reset?): {e}"))?;
+    let (msg, _rest) =
+        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    Ok(msg)
+}
+
+/// Sign a `BindNodeId(client_node_id, nonce = EPHEMERAL_BINDING_NONCE)` under
+/// the server's binding domain, returning the wire signature bytes.
+fn sign_binding_for(signer: &PrivateKeySigner, client_node_id: B256) -> anyhow::Result<Vec<u8>> {
+    let hash = binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_domain());
+    Ok(signer.sign_hash_sync(&hash)?.as_bytes().to_vec())
+}
+
+/// Size gate: a blob larger than `max_blob_size_bytes` is refused with
+/// `ok: false` / `BlobTooLarge` before any bytes (or payment) flow.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
+    let payload = vec![0x7Eu8; 8192];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    // max_blob_size 4096 < 8192-byte payload → the size gate refuses delivery.
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 4096, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00b1,
+        Duration::from_secs(10),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("oversized blob must be refused"))?;
+    anyhow::ensure!(
+        err.to_string().contains("BlobTooLarge") || err.to_string().contains("refused"),
+        "error should surface BlobTooLarge: {err}"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// A blob evicted between probe and stream request is refused with
+/// `EvictedSinceProbe` (distinct from never-had-it `NotFound`).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
+    let payload = b"evicted between probe and stream".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    cache.evict(hash)?; // logically gone: has() now false, is_evicted() true.
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00e1,
+        Duration::from_secs(10),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("evicted blob must be refused"))?;
+    anyhow::ensure!(
+        err.to_string().contains("EvictedSinceProbe") || err.to_string().contains("refused"),
+        "error should surface EvictedSinceProbe: {err}"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// Client-identity binding gate (ADR 005 §Client identity binding): a binding
+/// whose signature recovers a DIFFERENT address than it claims is a client
+/// fault — the node resets the stream (no signed response), so the raw read
+/// fails. Covers `serve_stream`'s `recovered != claimed` arm.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
+    let payload = b"binding mismatch never delivers".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, _owner, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+
+    // A valid signature by `attacker`, but the binding CLAIMS `claimed`'s address.
+    let attacker = PrivateKeySigner::random();
+    let claimed = PrivateKeySigner::random();
+    let claimed_addr: [u8; 20] = claimed.address().into();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: claimed_addr,
+            binding_signature: sign_binding_for(&attacker, client_node_id)?,
+        }),
+        ..Default::default()
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        timestamp_us: 0x00ba_d001,
+    };
+    let res = raw_request(&client_ep, target, &req, Some(&ext)).await;
+    anyhow::ensure!(
+        res.is_err(),
+        "a binding recovering a different address must reset the stream, got {res:?}"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// Binding authorization gate: a correctly-signed binding for an address that
+/// does NOT own the requested channel is refused with `NotFound` (the leech
+/// closure for bound clients). Covers `serve_stream`'s `client != owner` arm.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
+    let payload = b"valid binding, wrong channel owner".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    // The channel is owned by `seeded_store`'s signer; the binding attests a
+    // different address (`intruder`), so it must not authorize this channel.
+    let (store, _owner, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+
+    let intruder = PrivateKeySigner::random();
+    let intruder_addr: [u8; 20] = intruder.address().into();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: intruder_addr,
+            binding_signature: sign_binding_for(&intruder, client_node_id)?,
+        }),
+        ..Default::default()
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        timestamp_us: 0x00ba_d002,
+    };
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(
+                !resp.body.ok,
+                "expected ok:false for an unauthorized binding"
+            );
+            anyhow::ensure!(
+                matches!(
+                    resp.error,
+                    Some(decdn_protocol::client::StreamError::NotFound)
+                ),
+                "expected NotFound, got {:?}",
+                resp.error
+            );
+        }
+        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
+    }
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// Per-channel serialization: two un-coordinated streams on one channel both
+/// start from `prior_nonce = 0`, so both sign voucher nonce 1. The per-channel
+/// mutex must serialize application so EXACTLY ONE is accepted (the other is a
+/// stale nonce) — guarding against a lost-update / double-accept race that
+/// would let a second voucher overwrite the first at the same nonce.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_concurrent_same_channel_accepts_one_voucher() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 4096];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx_a = channel_context(Arc::clone(&signer), deposit);
+    let ctx_b = channel_context(Arc::clone(&signer), deposit);
+    let server_addr = server_eth.address();
+    let sd = slash_domain();
+    let (ra, rb) = tokio::join!(
+        stream_fetch(
+            &client_ep,
+            target.clone(),
+            &ctx_a,
+            &sd,
+            server_addr,
+            *hash.as_bytes(),
+            0,
+            0x00aa,
+            Duration::from_secs(15),
+        ),
+        stream_fetch(
+            &client_ep,
+            target.clone(),
+            &ctx_b,
+            &sd,
+            server_addr,
+            *hash.as_bytes(),
+            0,
+            0x00bb,
+            Duration::from_secs(15),
+        ),
+    );
+    let oks = usize::from(ra.is_ok()) + usize::from(rb.is_ok());
+    anyhow::ensure!(
+        oks == 1,
+        "exactly one concurrent voucher must be accepted, got {oks} ok (a={ra:?}, b={rb:?})"
+    );
+
+    // State advanced exactly once: nonce 1, one stream's bytes, no double-apply.
+    let persisted = store.load_all()?;
+    let only = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
+    anyhow::ensure!(
+        only.last_nonce == U256::from(1u64),
+        "nonce: {}",
+        only.last_nonce
+    );
+    anyhow::ensure!(
+        only.last_bytes_delivered == U256::from(payload.len()),
+        "bytes_delivered: {}",
+        only.last_bytes_delivered
     );
 
     client_ep.close().await;
