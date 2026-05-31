@@ -40,7 +40,7 @@ Use a Balancer V3 weighted pool (80% TOKEN / 20% USDC, 1% swap fee) as the canon
 | Aggregator routing density on Arbitrum | Lower, and V3-specific (V3 ecosystem is newer than V2; aggregator coverage still maturing) | Higher |
 | Security surface | Balancer V3 Vault architecture (transient accounting via `unlock`/settle, unified scaling); standard Weighted Pools are the simplest V3 pool type with no hooks | Uniswap V3 core — extensively audited and battle-tested |
 
-[^v3-range]: The $1.5M V3 figure assumes a near-spot range of roughly equivalent effective depth to the Balancer 80/20 position at the same anchor price — an order-of-magnitude comparison, not an exact requirement. V3 USDC-side requirements depend entirely on the chosen range width, which this ADR does not fix.
+[^v3-range]: The ~$1M V3 figure assumes a near-spot range of roughly equivalent effective depth to the Balancer 80/20 position at the same anchor price — an order-of-magnitude comparison, not an exact requirement. V3 USDC-side requirements depend entirely on the chosen range width, which this ADR does not fix.
 
 The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury with a small team. Uniswap V3's wins (fee capture, routing density) presuppose active range management the team cannot provide during PoC and early production.
 
