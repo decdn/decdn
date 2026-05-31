@@ -9,10 +9,16 @@
 //!   [`ChannelState`] via [`ClientHandler::register_open_channel`] so the
 //!   voucher handler will accept vouchers for it — without this, a
 //!   freshly-opened channel is unknown to the handler and every voucher is
-//!   rejected (the #327 gap noted in [`crate::handlers`]'s client module). On
-//!   `ChannelSettled` it forgets the channel via
+//!   rejected (the #327 gap noted in [`crate::handlers`]'s client module).
+//!   `ChannelToppedUp` raises the tracked deposit via
+//!   [`ClientHandler::update_channel_deposit`] so post-top-up vouchers are not
+//!   wrongly rejected. On `ChannelSettled` it forgets the channel via
 //!   [`ClientHandler::forget_channel`]; `ChannelCloseInitiated` is
 //!   observed-only (the in-process dispute monitor is deferred — issue #324).
+//!   The watcher uses `.watch()` filters, which only deliver logs from the
+//!   current block forward — a channel opened against this node while it was
+//!   **down** is not back-filled and its vouchers are rejected until a
+//!   startup log-backfill is added (tracked separately).
 //! - **Redemption (threshold + on-shutdown).** On a redeem hint emitted by
 //!   the voucher-accept path, it reads the latest persisted voucher and the
 //!   on-chain `withdrawnAmount`, and submits `withdraw` once the accrued
@@ -67,11 +73,13 @@ const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 /// un-redeemed balance.
 const EXPIRY_CLOSE_AHEAD_SECS: u64 = 6 * 3_600;
 
-/// Minimum recovery-id byte the on-chain `ECDSA.recover` accepts. alloy's
-/// [`alloy::primitives::Signature::as_bytes`] may encode the recovery id as a
-/// raw y-parity (`0`/`1`); the contract requires the Ethereum convention
-/// (`27`/`28`). [`normalize_voucher_signature`] bridges the two without
-/// touching `r`/`s`.
+/// Ethereum recovery-id offset the on-chain `ECDSA.recover` requires (`v` ∈
+/// {`27`, `28`}). The stored signature comes from
+/// [`alloy::primitives::Signature::as_bytes`], which already encodes `v` as
+/// `27 + y_parity`, so [`normalize_voucher_signature`] is a no-op on
+/// well-formed signatures today — it exists as defense-in-depth in case the
+/// stored/wire encoding ever switches to a raw `0`/`1` y-parity (e.g. an
+/// `as_rsy`-style source).
 const ETH_V_OFFSET: u8 = 27;
 
 /// Current Unix time in seconds for on-chain expiry comparisons. A broken
@@ -82,6 +90,20 @@ pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Whether a channel has reached its on-chain expiry. `expires_at == 0` means
+/// "untracked / never expires" (v1-hydrated records, channels constructed
+/// without a chain source) and is treated as not expired — the safe direction
+/// (keep serving) when expiry is unknown.
+pub(crate) const fn is_expired(now: u64, expires_at: u64) -> bool {
+    expires_at != 0 && now >= expires_at
+}
+
+/// Whether a channel is within the pre-expiry close-ahead window and should be
+/// proactively closed. `expires_at == 0` (untracked) is never in-window.
+const fn within_close_window(now: u64, expires_at: u64) -> bool {
+    expires_at != 0 && now.saturating_add(EXPIRY_CLOSE_AHEAD_SECS) >= expires_at
 }
 
 /// Aborts the wrapped task on drop so a node-restart cycle never leaks a
@@ -101,8 +123,6 @@ impl Drop for AbortOnDrop {
 pub struct PaymentChannelService<P: Provider + Clone + 'static> {
     contract: PaymentChannel::PaymentChannelInstance<P>,
     store: Arc<dyn ChannelStateStore>,
-    self_address: Address,
-    redeem_threshold: U256,
     redeem_tx: mpsc::Sender<ChannelId>,
     _watcher: AbortOnDrop,
     _redeemer: AbortOnDrop,
@@ -167,8 +187,6 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         Ok(Self {
             contract,
             store,
-            self_address,
-            redeem_threshold,
             redeem_tx,
             _watcher: AbortOnDrop(watcher),
             _redeemer: AbortOnDrop(redeemer),
@@ -273,13 +291,24 @@ async fn send_close<P: Provider + Clone>(
     {
         Ok(pending) => Some(async move {
             match pending.get_receipt().await {
-                Ok(receipt) => {
+                // `get_receipt` returns `Ok` even for a reverted tx — a
+                // reverted close did NOT secure the claim, so report it as not
+                // landed so the caller does not retire/forget the channel.
+                Ok(receipt) if receipt.status() => {
                     info!(
                         %channel_id,
                         tx = %receipt.transaction_hash,
                         "closeChannel landed (dispute window open)"
                     );
                     true
+                }
+                Ok(receipt) => {
+                    warn!(
+                        %channel_id,
+                        tx = %receipt.transaction_hash,
+                        "closeChannel transaction reverted on-chain"
+                    );
+                    false
                 }
                 Err(err) => {
                     warn!(%err, %channel_id, "closeChannel receipt failed");
@@ -298,16 +327,16 @@ impl<P: Provider + Clone + 'static> std::fmt::Debug for PaymentChannelService<P>
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PaymentChannelService")
             .field("address", self.contract.address())
-            .field("self_address", &self.self_address)
-            .field("redeem_threshold", &self.redeem_threshold)
             .finish_non_exhaustive()
     }
 }
 
-/// Translate a stored voucher signature (`r‖s‖v`, with `v` possibly a raw
-/// `0`/`1` y-parity) into the `27`/`28` convention the on-chain
-/// `ECDSA.recover` requires. `r`/`s` (the first 64 bytes) are
-/// untouched; a malformed-length signature is passed through unchanged so the
+/// Normalize a stored voucher signature (`r‖s‖v`) so `v` is in the `27`/`28`
+/// convention the on-chain `ECDSA.recover` requires. The current source
+/// (`Signature::as_bytes`) already emits `27`/`28`, so this is a no-op in
+/// practice; it bridges a raw `0`/`1` y-parity should the encoding ever
+/// change. `r`/`s` (the first 64 bytes) are untouched; a malformed-length
+/// signature is passed through unchanged so the
 /// contract's own validation produces the authoritative error.
 fn normalize_voucher_signature(sig: &[u8]) -> Vec<u8> {
     let mut out = sig.to_vec();
@@ -567,6 +596,20 @@ async fn try_redeem<P: Provider + Clone>(
         .get_receipt()
         .await
         .context("await withdraw receipt")?;
+    // `get_receipt` resolves once the tx is mined, even if it reverted — a
+    // reverted withdraw left `withdrawnAmount` unchanged on-chain, so we MUST
+    // NOT seed the cache to `st.last_amount` (that would make every later hint
+    // short-circuit and silently never redeem this channel again). The cache
+    // already holds the correct pre-withdraw value from the getChannel read
+    // above; leave it and let the next hint retry.
+    if !receipt.status() {
+        warn!(
+            %channel_id,
+            tx = %receipt.transaction_hash,
+            "withdraw transaction reverted on-chain; leaving claim for retry"
+        );
+        return Ok(());
+    }
     // A successful withdraw advances on-chain `withdrawnAmount` to the voucher
     // amount; reflect that in the cache so the next hints short-circuit.
     withdrawn_cache.insert(channel_id, st.last_amount);
@@ -637,12 +680,13 @@ async fn try_close_for_expiry<P: Provider + Clone>(
     now: u64,
     st: &ChannelState,
 ) {
-    // Only channels with a tracked expiry, a signed claim, and that are within
-    // the close-ahead window of expiry.
-    if st.expires_at == 0 || st.last_nonce.is_zero() || st.last_signature.is_empty() {
+    // Only channels with a signed claim that are within the close-ahead window
+    // of their tracked expiry (`within_close_window` handles the untracked
+    // `expires_at == 0` case).
+    if st.last_nonce.is_zero() || st.last_signature.is_empty() {
         return;
     }
-    if now.saturating_add(EXPIRY_CLOSE_AHEAD_SECS) < st.expires_at {
+    if !within_close_window(now, st.expires_at) {
         return;
     }
     let ch = match contract.getChannel(st.channel_id).call().await {
@@ -734,5 +778,46 @@ mod tests {
         let out = normalize_voucher_signature(&[1u8, 2, 3]);
         assert_eq!(out.len(), 3);
         assert_eq!(out.last(), Some(&30u8)); // 3 -> 3+27
+    }
+
+    #[test]
+    fn normalize_empty_signature_is_empty() {
+        // The v1-hydrated / no-voucher-yet state. Callers short-circuit on
+        // `is_empty()`, but the normalizer must not panic or fabricate bytes.
+        assert!(normalize_voucher_signature(&[]).is_empty());
+    }
+
+    #[test]
+    fn is_expired_boundary() {
+        // expires_at == 0 => never expires, regardless of now.
+        assert!(!is_expired(0, 0));
+        assert!(!is_expired(u64::MAX, 0));
+        // Strictly before expiry: not expired. At/after: expired.
+        assert!(!is_expired(999, 1_000));
+        assert!(is_expired(1_000, 1_000), "now == expires_at is expired");
+        assert!(is_expired(1_001, 1_000));
+    }
+
+    #[test]
+    fn within_close_window_boundary() {
+        let expires_at = 1_000_000u64;
+        // Untracked expiry is never in-window.
+        assert!(!within_close_window(u64::MAX, 0));
+        // Just outside the window (more than CLOSE_AHEAD before expiry).
+        assert!(!within_close_window(
+            expires_at - EXPIRY_CLOSE_AHEAD_SECS - 1,
+            expires_at
+        ));
+        // Exactly at the window edge, and inside it.
+        assert!(within_close_window(
+            expires_at - EXPIRY_CLOSE_AHEAD_SECS,
+            expires_at
+        ));
+        assert!(within_close_window(expires_at - 1, expires_at));
+        // Past expiry is still "in window" (we still want to attempt a close,
+        // though the on-chain call will revert if truly expired).
+        assert!(within_close_window(expires_at + 10, expires_at));
+        // `now` near u64::MAX must not overflow the `+ CLOSE_AHEAD` add.
+        assert!(within_close_window(u64::MAX, expires_at));
     }
 }

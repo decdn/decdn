@@ -12,14 +12,15 @@
 //! # Scope (#317 / #327)
 //!
 //! This handler validates vouchers only for channels present in the persisted
-//! [`ChannelStateStore`]. Channels are populated by the on-chain
-//! `ChannelOpened` consumer in [`crate::payment_settlement`] (#327), which
-//! calls [`ClientHandler::register_open_channel`] both at startup (via store
-//! hydration) and live as new channels open. A voucher for a still-unknown
-//! `channel_id` is rejected with [`VoucherRejectReason::WrongChannel`] — the
-//! closest existing reason. After accepting a voucher the handler emits a
-//! redeem hint (see [`ClientHandler::attach_redeem_hint`]) so the settlement
-//! service can withdraw the accrued claim once it crosses its threshold.
+//! [`ChannelStateStore`]. Channels enter that set two ways: hydrated from the
+//! store at construction (see [`ClientHandler::new`]), and live as the
+//! on-chain `ChannelOpened` consumer in [`crate::payment_settlement`] (#327)
+//! calls [`ClientHandler::register_open_channel`]. A voucher for a
+//! still-unknown `channel_id` is rejected with
+//! [`VoucherRejectReason::WrongChannel`] — the closest existing reason. After
+//! accepting a voucher the handler emits a redeem hint (see
+//! [`ClientHandler::attach_redeem_hint`]) so the settlement service can
+//! withdraw the accrued claim once it crosses its threshold.
 //!
 //! # 0-RTT
 //!
@@ -629,9 +630,10 @@ impl ClientHandler {
         // this; this is the defense-in-depth for a node that was down through
         // the close window.) Fails the stream — there is no wire reason for
         // expiry, same as the underpayment path below.
-        if guard.state.expires_at != 0
-            && crate::payment_settlement::unix_now() >= guard.state.expires_at
-        {
+        if crate::payment_settlement::is_expired(
+            crate::payment_settlement::unix_now(),
+            guard.state.expires_at,
+        ) {
             drop(guard);
             anyhow::bail!("channel {channel_id} expired on-chain; refusing further paid delivery");
         }

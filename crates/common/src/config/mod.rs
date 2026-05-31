@@ -680,6 +680,19 @@ fn resolve_blockchain_into(
     let redeem_threshold_micro_usdc = file
         .and_then(|b| b.redeem_threshold_micro_usdc)
         .unwrap_or(DEFAULT_REDEEM_THRESHOLD_MICRO_USDC);
+    // A `0` threshold would withdraw on every accepted voucher — burning gas
+    // per MB and reverting on-chain (`NothingToWithdraw`) for any zero-delta
+    // re-hint. Reject it; operators wanting aggressive redemption set a small
+    // positive value (base units, µUSDC).
+    bag.check_with(
+        redeem_threshold_micro_usdc > 0,
+        "blockchain.redeem_threshold_micro_usdc",
+        || {
+            "blockchain.redeem_threshold_micro_usdc must be > 0 (a 0 threshold \
+             withdraws on every voucher, burning gas and reverting on zero-delta)"
+                .to_string()
+        },
+    );
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
@@ -5941,6 +5954,39 @@ mod tests {
         assert!(
             msg.contains("rpc_watchdog_interval_sec") && msg.contains(&expected_min),
             "error should mention the field and the {expected_min} floor: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_redeem_threshold() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            capacity_bond_address: None,
+            rpc_watchdog_interval_sec: None,
+            redeem_threshold_micro_usdc: Some(0),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when redeem threshold is 0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("redeem_threshold_micro_usdc"),
+            "error should name the field: {msg}"
         );
         Ok(())
     }
