@@ -119,6 +119,8 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       adr: ${{ steps.filter.outputs.adr }}
       solidity: ${{ steps.filter.outputs.solidity }}
+      markdown: ${{ steps.filter.outputs.markdown }}
+      scripts: ${{ steps.filter.outputs.scripts }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v4
@@ -152,6 +154,17 @@ jobs:
               - '.github/actions/**'
               - '.github/scripts/post-gas-snapshot-comment.sh'
               - '.github/scripts/contracts-coverage-comment.sh'
+            markdown:
+              - '**/*.md'
+              - '.markdownlint.yaml'
+              - '.github/workflows/ci.yml'
+            scripts:
+              # Gates `coverage-tooling-tests` (the pytest suite for
+              # coverage-diff.py). The helper itself + its test fixtures live
+              # under .github/scripts/; nothing else exercises them, so a PR
+              # that touches no scripts has nothing for that job to verify.
+              - '.github/scripts/**'
+              - '.github/workflows/ci.yml'
 
   test:
     name: test
@@ -435,6 +448,17 @@ jobs:
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
+    # pull-requests: write is for the gas-snapshot sticky comment (PR events
+    # only; fork PRs skip it — read-only token). The gas snapshot is folded
+    # into this job rather than living in a separate `solidity-gas-snapshot`
+    # job: `forge snapshot` runs the full test suite to measure gas, so a
+    # standalone job re-ran the entire ci-profile fuzz/invariant suite
+    # (1024 fuzz runs; 256 invariant runs at depth 50) a second time. Running
+    # `forge snapshot` here as the single test invocation gives both the
+    # pass/fail gate and the gas diff from one execution.
+    permissions:
+      contents: read
+      pull-requests: write
     defaults:
       run:
         working-directory: contracts
@@ -453,7 +477,25 @@ jobs:
           cache-profile: ci
       - run: forge --version
       - run: forge build --sizes --deny warnings
-      - run: forge test -vvv
+      # Single test execution: `forge snapshot` runs the whole suite (same
+      # pass/fail gate as `forge test`) AND records gas, replacing a separate
+      # gas-snapshot job that re-ran the entire ci-profile fuzz/invariant suite.
+      # --diff compares against the committed baseline and prints the delta to
+      # stdout (captured for the PR comment below); we deliberately omit --check
+      # so legitimate gas movement doesn't hard-block the PR. The explicit
+      # `set -euo pipefail` (rather than relying on the runner's default shell)
+      # makes the guarantee local and override-proof: a test failure exits
+      # non-zero and pipefail propagates it through `tee`, failing this required
+      # job. forge reports the failing test + revert reason at default
+      # verbosity; re-run locally with -vvvv for full call traces.
+      - name: Test + gas snapshot
+        run: |
+          set -euo pipefail
+          if [[ ! -f .gas-snapshot ]]; then
+            echo "::error::contracts/.gas-snapshot baseline missing; regenerate via 'FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot'"
+            exit 1
+          fi
+          forge snapshot --diff .gas-snapshot | tee /tmp/gas-diff.txt
       # Structural enforcement that `TestnetFaucet` never leaks into the
       # production audit surface (issue #636, #452). The contract lives at
       # `testnet/TestnetFaucet.sol` and is wired only from
@@ -484,6 +526,22 @@ jobs:
             echo "$leak"
             exit 1
           fi
+      # Post (or update) the sticky gas-snapshot diff comment. PR-only; skipped
+      # on fork PRs (read-only GITHUB_TOKEN would 403). continue-on-error so a
+      # transient GitHub API hiccup in this best-effort tooling never blocks the
+      # required gate — mirrors the coverage-comment steps in the `test` job.
+      # The `if` has no always()/status function, so it inherits the implicit
+      # success() gate: this step is skipped if any earlier step (build, the
+      # test+snapshot run, the faucet check) failed — no comment is posted on a
+      # red run. continue-on-error only forgives a failure of THIS step (the
+      # API call), not of the prior gate.
+      - name: Post gas snapshot comment
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ../.github/scripts/post-gas-snapshot-comment.sh /tmp/gas-diff.txt
 
   solidity-coverage:
     name: solidity coverage
@@ -675,50 +733,12 @@ jobs:
           working-directory: contracts
           fail-on: high
 
-  solidity-gas-snapshot:
-    name: solidity gas snapshot
-    runs-on: ubuntu-latest
-    needs: changes
-    if: github.event_name == 'pull_request' && needs.changes.outputs.solidity == 'true'
-    permissions:
-      contents: read
-      pull-requests: write
-    defaults:
-      run:
-        working-directory: contracts
-    env:
-      FOUNDRY_PROFILE: ci
-    steps:
-      - uses: actions/checkout@v6.0.2
-        with:
-          submodules: recursive
-      - uses: ./.github/actions/foundry-setup
-        with:
-          cache-profile: ci
-      - name: Generate diff
-        # --diff compares current run vs the committed .gas-snapshot file.
-        # We deliberately do not pass --check (which would fail CI on any
-        # delta); contract changes legitimately move gas, and the signal
-        # belongs in the PR comment, not as a hard block.
-        #
-        # Explicit baseline existence check: `forge snapshot --diff` on a
-        # missing baseline exits 0 and writes a full snapshot to stdout
-        # instead of a diff — which would post a giant fake "gas changes"
-        # comment. GH Actions bash already runs with `set -eo pipefail`,
-        # so the forge invocation aborts the step on compile/test failure.
-        run: |
-          if [[ ! -f .gas-snapshot ]]; then
-            echo "::error::contracts/.gas-snapshot baseline missing; regenerate via 'FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot'"
-            exit 1
-          fi
-          forge snapshot --diff .gas-snapshot > /tmp/gas-diff.txt
-      - name: Post comment
-        # Fork PRs have read-only GITHUB_TOKEN; createComment would 403.
-        if: github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          GH_PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ../.github/scripts/post-gas-snapshot-comment.sh /tmp/gas-diff.txt
+  # NOTE: the former standalone `solidity-gas-snapshot` job was folded into
+  # `solidity-build-test` (see its "Test + gas snapshot" step). It re-ran the
+  # full ci-profile fuzz/invariant suite a second time purely to measure gas;
+  # `forge snapshot` already runs that suite, so one invocation now serves both
+  # the test gate and the gas diff. Removed from ci-success needs/allowed-skips
+  # accordingly.
 
   pr-title:
     name: PR title
@@ -757,6 +777,13 @@ jobs:
   markdownlint:
     name: markdownlint
     runs-on: ubuntu-latest
+    needs: changes
+    # Gated on the `markdown` filter (any **/*.md or the lint config). On a
+    # PR that touches no Markdown there is nothing to lint, so the job skips
+    # and is accepted via ci-success allowed-skips. Still runs unconditionally
+    # on push/dispatch. The `changes` job remains the always-run canary that a
+    # skip here can no longer mask.
+    if: needs.changes.outputs.markdown == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v6
       - uses: DavidAnson/markdownlint-cli2-action@v23
@@ -794,6 +821,11 @@ jobs:
   coverage-tooling-tests:
     name: coverage tooling tests
     runs-on: ubuntu-latest
+    needs: changes
+    # Gated on the `scripts` filter: this only exercises .github/scripts/, so a
+    # PR that touches none has nothing to verify here. Not in ci-success.needs
+    # (non-blocking by design), so a skip needs no allowed-skips entry.
+    if: needs.changes.outputs.scripts == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -817,21 +849,19 @@ jobs:
     needs: [fmt, clippy, changes, test, deny, doc, public-api, markdownlint, adr-book-list,
             pr-title,
             solidity-fmt, solidity-build-test, solidity-coverage,
-            solidity-solhint, solidity-slither, solidity-aderyn,
-            solidity-gas-snapshot]
+            solidity-solhint, solidity-slither, solidity-aderyn]
     steps:
       - uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
           # Rust jobs are gated on `needs.changes.outputs.rust`,
-          # adr-book-list on `needs.changes.outputs.adr`, and the solidity-*
-          # jobs on `needs.changes.outputs.solidity`; each skips when its
-          # paths are untouched. alls-green treats `skipped` as failure
-          # unless listed here. `changes` and `markdownlint` are
-          # intentionally omitted — they always run, so a skip from either
-          # signals a misconfiguration that should fail the gate.
+          # adr-book-list on `needs.changes.outputs.adr`, markdownlint on
+          # `needs.changes.outputs.markdown`, and the solidity-* jobs on
+          # `needs.changes.outputs.solidity`; each skips when its paths are
+          # untouched. alls-green treats `skipped` as failure unless listed
+          # here. `changes` is intentionally omitted — it always runs, so a
+          # skip from it signals a misconfiguration that should fail the gate.
           allowed-skips: fmt, clippy, test, deny, doc, public-api, adr-book-list,
-                         pr-title,
+                         pr-title, markdownlint,
                          solidity-fmt, solidity-build-test, solidity-coverage,
-                         solidity-solhint, solidity-slither, solidity-aderyn,
-                         solidity-gas-snapshot
+                         solidity-solhint, solidity-slither, solidity-aderyn
