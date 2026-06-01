@@ -30,9 +30,9 @@ contract SlashAppealTest is Test {
     address internal multisig = address(0xC0DE);
     address internal pool = address(0xCCEE);
 
-    uint256 internal constant MIN_STAKE = 50_000e18;
+    uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant APPEAL_BOND = 1000e18;
-    uint256 internal constant SLASH_AMT = 2500e18; // 5% of MIN_STAKE
+    uint256 internal constant SLASH_AMT = 2500e18; // 5% of MIN_BOND
 
     function setUp() public {
         token = new Token(admin);
@@ -42,7 +42,7 @@ contract SlashAppealTest is Test {
             token_: token,
             ed25519Verifier_: ed25519,
             admin: admin,
-            minStake_: MIN_STAKE,
+            minBond_: MIN_BOND,
             unbondingPeriod_: 7 days,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
@@ -82,9 +82,9 @@ contract SlashAppealTest is Test {
     // Helpers
     // -----------------------------------------------------------------
 
-    function _stakeAndSlash() internal returns (uint256 slashId) {
+    function _bondAndSlash() internal returns (uint256 slashId) {
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         (slashId,) = bond.slash(operator, challenger, 1);
     }
@@ -100,7 +100,7 @@ contract SlashAppealTest is Test {
     // -----------------------------------------------------------------
 
     function test_open_locksEscrowAndPullsBond() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         uint256 bondBefore = token.balanceOf(operator);
         _open(slashId);
 
@@ -121,7 +121,7 @@ contract SlashAppealTest is Test {
     /// ADR 028 §1 — only the slashed operator may file; a third party (here the
     /// challenger, who profits from an upheld slash) cannot burn the slot.
     function test_open_revertsForNonOperator() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         vm.prank(appellant);
         vm.expectRevert(abi.encodeWithSelector(SlashAppeal.CallerNotOperator.selector, operator));
         appeal.openSlashAppeal(slashId, keccak256("e"));
@@ -131,7 +131,7 @@ contract SlashAppealTest is Test {
     }
 
     function test_open_revertsAfterFilingWindow() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         uint64 closeTs = bond.getSlashRecord(slashId).appealWindowClose;
         vm.warp(block.timestamp + 30 days + 1);
         vm.prank(operator);
@@ -140,7 +140,7 @@ contract SlashAppealTest is Test {
     }
 
     function test_open_revertsOnDoubleAppeal() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         _open(slashId);
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(SlashAppeal.AppealAlreadyExists.selector, slashId));
@@ -152,12 +152,12 @@ contract SlashAppealTest is Test {
     // -----------------------------------------------------------------
 
     function test_grant_refundsOperatorAndBondAndClearsZeroOut() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         assertGt(bond.slashedAtEpoch(operator), 0);
         _open(slashId);
 
         // Operator is the appellant, so they receive both the escrow refund
-        // (stake-only here → full SLASH_AMT liquid) and the appeal-bond refund.
+        // (bond-only here → full SLASH_AMT liquid) and the appeal-bond refund.
         uint256 opBefore = token.balanceOf(operator);
 
         vm.prank(multisig);
@@ -174,7 +174,7 @@ contract SlashAppealTest is Test {
     }
 
     function test_grant_revertsIfNotFastTracked() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         _open(slashId);
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(SlashAppeal.AppealNotFastTracked.selector, slashId));
@@ -182,7 +182,7 @@ contract SlashAppealTest is Test {
     }
 
     function test_frequencyCap_blocksSecondAppealWithinWindow() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         _open(slashId);
         vm.prank(multisig);
         appeal.fastTrackAppeal(slashId);
@@ -204,7 +204,7 @@ contract SlashAppealTest is Test {
     // -----------------------------------------------------------------
 
     function test_uphold_distributesEscrowAndSplitsBond() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         _open(slashId);
         vm.prank(multisig);
         appeal.fastTrackAppeal(slashId);
@@ -225,7 +225,7 @@ contract SlashAppealTest is Test {
     }
 
     function test_reject_burnsBondAndDistributesEscrow() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         _open(slashId);
 
         uint256 challengerBefore = token.balanceOf(challenger);
@@ -245,7 +245,7 @@ contract SlashAppealTest is Test {
     // -----------------------------------------------------------------
 
     function test_cleanup_openLapse_upholds() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         _open(slashId);
 
         vm.warp(block.timestamp + 14 days + 1);
@@ -258,7 +258,7 @@ contract SlashAppealTest is Test {
     }
 
     function test_cleanup_fastTrackedLapse_grantsOperatorFavorable() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         _open(slashId);
         vm.prank(multisig);
         appeal.fastTrackAppeal(slashId);
@@ -279,7 +279,7 @@ contract SlashAppealTest is Test {
     // -----------------------------------------------------------------
 
     function test_fastTrack_requiresMultisig() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         _open(slashId);
         bytes32 role = appeal.EMERGENCY_MULTISIG_ROLE();
         vm.prank(operator);
@@ -290,7 +290,7 @@ contract SlashAppealTest is Test {
     }
 
     function test_grant_requiresGovernance() public {
-        uint256 slashId = _stakeAndSlash();
+        uint256 slashId = _bondAndSlash();
         _open(slashId);
         vm.prank(multisig);
         appeal.fastTrackAppeal(slashId);
@@ -311,7 +311,7 @@ contract SlashAppealTest is Test {
     /// `slashedAtEpoch` stamp that belongs to a NEWER, still-standing slash.
     function test_grant_olderAppeal_preservesNewerSlashZeroOut() public {
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         // Slash #1, open + fast-track its appeal.
         vm.prank(admin);
@@ -339,7 +339,7 @@ contract SlashAppealTest is Test {
     /// slash's epoch (issue #709 multi-outstanding-slash recompute).
     function test_grant_newerAppeal_fallsBackToOlderStandingSlash() public {
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         // Slash #1 (older) — stays Escrowed/standing for the whole test.
         vm.prank(admin);
@@ -377,9 +377,9 @@ contract SlashAppealTest is Test {
         bond.grantGenesisCredit(operator, grantAmount);
         vm.stopPrank();
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
-        // Tier-1: 5% of 50k stake (2.5k) + 5% of 100k credit (5k) = 7.5k.
+        // Tier-1: 5% of 50k bond (2.5k) + 5% of 100k credit (5k) = 7.5k.
         vm.prank(admin);
         (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
         assertEq(totalSlash, 7500e18);
@@ -393,7 +393,7 @@ contract SlashAppealTest is Test {
         vm.prank(admin);
         appeal.grantAppeal(slashId);
 
-        // Liquid refund = stake portion (2.5k) + bond (1k); credit portion (5k)
+        // Liquid refund = bond portion (2.5k) + bond (1k); credit portion (5k)
         // is restored to the vesting position, not paid out.
         assertEq(token.balanceOf(operator) - opBefore, 2500e18 + APPEAL_BOND);
         assertEq(bond.pendingCredit(operator).originalGrant, 100_000e18);
@@ -420,7 +420,7 @@ contract SlashAppealTest is Test {
         token.approve(address(noPool), type(uint256).max);
 
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         (uint256 slashId,) = bond.slash(operator, challenger, 1);
         vm.prank(operator);
@@ -447,7 +447,7 @@ contract SlashAppealTest is Test {
         vm.prank(admin);
         bond.grantRole(pauserRole, admin);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         (uint256 slashId,) = bond.slash(operator, challenger, 1);
         uint256 slashTime = block.timestamp;

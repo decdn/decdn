@@ -43,7 +43,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     address internal tokenHolder = address(0x70);
     address internal challengerPool = address(0xCCEE);
 
-    uint256 internal constant MIN_STAKE = 50_000e18;
+    uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant DEPOSIT = 1000e6;
     uint256 internal constant SETTLE_AMOUNT = 800e6;
     uint256 internal constant SETTLE_BYTES = 80_000_000;
@@ -66,7 +66,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             initialTokenHolder: tokenHolder,
             challengerIncentivePool: challengerPool,
             timelockDelay: 48 hours,
-            minStake: MIN_STAKE,
+            minBond: MIN_BOND,
             unbondingPeriod: 14 days,
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
@@ -83,7 +83,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
 
         vm.warp(1_000_000);
 
-        // Fund the operator (stake + appeal bond) and the client (USDC deposit).
+        // Fund the operator (bond + appeal bond) and the client (USDC deposit).
         vm.prank(tokenHolder);
         d.token.transfer(operator, 200_000e18);
         usdc.transfer(client, 10_000e6);
@@ -140,7 +140,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         assertEq(d.router.bytesPerEpoch(operator, uint64(epoch)), SETTLE_BYTES, "served bytes stamped");
 
         // 4. Slash via the wired SLASH_ROLE holder, escrowing each slash. Three
-        //    tier slashes (5/15/50%) drop the bond below minStake/2 → auto-eject.
+        //    tier slashes (5/15/50%) drop the bond below minBond/2 → auto-eject.
         //    `_slashToEjection` asserts each tier escrows a strictly larger amount.
         uint256 lastSlashId = _slashToEjection();
         assertTrue(d.bond.ejected(operator), "operator auto-ejected");
@@ -167,7 +167,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         // Only the appealed slash's escrow is released (the other two stand).
         uint256 escrowReleased = escrowBeforeGrant - d.bond.escrowedTotal();
         assertGt(escrowReleased, 0, "escrow released for granted slash");
-        // A granted appeal makes the operator whole: the escrowed stake portion is
+        // A granted appeal makes the operator whole: the escrowed bond portion is
         // refunded liquid (no genesis credit in this flow). The appeal bond round-
         // trips within `_appealAndGrant` (paid at openSlashAppeal, refunded at
         // grantAppeal) — so the net delta is exactly the released escrow. If the
@@ -176,7 +176,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         assertEq(
             d.token.balanceOf(operator),
             operatorTokenBeforeGrant + escrowReleased,
-            "operator refunded escrowed stake; appeal bond round-trips to net zero"
+            "operator refunded escrowed bond; appeal bond round-trips to net zero"
         );
     }
 
@@ -204,7 +204,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     function _bondAndRegister() internal {
         vm.startPrank(operator);
         d.token.approve(address(d.bond), type(uint256).max);
-        d.bond.stake(MIN_STAKE);
+        d.bond.bond(MIN_BOND);
         bytes memory bindingSig = _bindingSig(NODE_ID, 0);
         d.bond.registerNode(NODE_ID, hex"01", "US", bindingSig, hex"00");
         vm.stopPrank();

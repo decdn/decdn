@@ -86,7 +86,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(cfg.initialTokenHolder, TEST_INITIAL_HOLDER, "holder");
         assertEq(cfg.challengerIncentivePool, TEST_CHALLENGER_POOL, "challenger");
         assertEq(cfg.timelockDelay, DEFAULT_TIMELOCK_DELAY, "timelockDelay");
-        assertEq(cfg.minStake, DEFAULT_MIN_STAKE, "minStake");
+        assertEq(cfg.minBond, DEFAULT_MIN_BOND, "minBond");
         assertEq(cfg.unbondingPeriod, DEFAULT_UNBONDING_PERIOD, "unbondingPeriod");
         assertEq(cfg.multiaddrUpdateCooldown, DEFAULT_MULTIADDR_UPDATE_COOLDOWN, "multiaddrCooldown");
         assertEq(cfg.maxMultiaddrSize, DEFAULT_MAX_MULTIADDR_SIZE, "maxMultiaddrSize");
@@ -184,7 +184,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".deployer"), cfg.deployer, "deployer");
         assertEq(json.readUint(".deployBlock"), block.number, "deployBlock");
         assertEq(json.readUint(".config.timelockDelay"), DEFAULT_TIMELOCK_DELAY, "timelockDelay");
-        assertEq(json.readUint(".config.minStake"), DEFAULT_MIN_STAKE, "minStake");
+        assertEq(json.readUint(".config.minBond"), DEFAULT_MIN_BOND, "minBond");
 
         uint256[] memory shares = json.readUintArray(".config.feeRouterShares");
         assertEq(shares.length, 3, "shares length");

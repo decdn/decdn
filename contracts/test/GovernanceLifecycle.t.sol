@@ -41,7 +41,7 @@ contract LifecycleUSDC is ERC20 {
 ///         → target wiring.
 ///
 /// @dev    Seeding strategy for proposal-threshold (0.1%) + quorum (4%):
-///         three test operators (`proposer`, `voter1`, `voter2`) stake at T0,
+///         three test operators (`proposer`, `voter1`, `voter2`) bond at T0,
 ///         then we walk forward 60 epochs (≈ 420 days, past the default 6-month
 ///         age ramp so `age_ramp == 1`). Across the trailing 13 epochs we
 ///         call `FeeRouter.routeSettlement` to populate `bytesPerEpoch` for
@@ -62,7 +62,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     // silently desync this test.
     uint256 internal constant TIMELOCK_DELAY = 48 hours;
 
-    uint256 internal constant MIN_STAKE = 50_000e18;
+    uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING_PERIOD = 7 days;
     uint256 internal constant SLASH_APPEAL_BOND = 1000e18;
     uint256 internal constant BLACKLIST_APPEAL_BOND = 100e18;
@@ -114,7 +114,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             initialTokenHolder: address(this),
             challengerIncentivePool: challengerPool,
             timelockDelay: TIMELOCK_DELAY,
-            minStake: MIN_STAKE,
+            minBond: MIN_BOND,
             unbondingPeriod: UNBONDING_PERIOD,
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
@@ -141,7 +141,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         timelock = d.timelock;
         gov = d.governor;
 
-        _stakeOperatorsAndSeedVoteWeight();
+        _bondOperatorsAndSeedVoteWeight();
     }
 
     /// @dev Override the base hook to grant the test harness
@@ -154,16 +154,16 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         dDeploy.router.grantRole(dDeploy.router.ROUTER_CALLER_ROLE(), address(this));
     }
 
-    function _stakeOperatorsAndSeedVoteWeight() internal {
+    function _bondOperatorsAndSeedVoteWeight() internal {
         address[3] memory ops = [proposer, voter1, voter2];
 
-        // Fund each operator with TOKEN, approve CapacityBond, and stake.
+        // Fund each operator with TOKEN, approve CapacityBond, and bond.
         for (uint256 i = 0; i < ops.length; i++) {
-            token.transfer(ops[i], MIN_STAKE * 10);
+            token.transfer(ops[i], MIN_BOND * 10);
             vm.prank(ops[i]);
             token.approve(address(bond), type(uint256).max);
             vm.prank(ops[i]);
-            bond.stake(MIN_STAKE);
+            bond.bond(MIN_BOND);
         }
 
         // Fund the test harness with USDC and approve the router. Each epoch
@@ -247,7 +247,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     function test_canary_governorVoteWeightWired() public view {
         // Proposer's snapshot weight must be strictly greater than the live
         // `proposalThreshold` for `propose()` to succeed — this guards the
-        // `_getVotes` → FeeRouter wiring + age-ramp staking pipeline.
+        // `_getVotes` → FeeRouter wiring + age-ramp bonding pipeline.
         uint256 weight = gov.getVotes(proposer, gov.clock() - 1);
         assertGt(weight, gov.proposalThreshold(), "weight below threshold");
         assertGt(gov.quorum(gov.clock() - 1), 0, "quorum read returned zero");
@@ -439,17 +439,17 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     // CapacityBond (8 setters)
     // =================================================================
 
-    function test_lifecycle_CapacityBond_setMinStake_happy() public {
-        _runLifecycle(address(bond), abi.encodeCall(CapacityBond.setMinStake, (75_000e18)));
-        assertEq(bond.minStake(), 75_000e18);
+    function test_lifecycle_CapacityBond_setMinBond_happy() public {
+        _runLifecycle(address(bond), abi.encodeCall(CapacityBond.setMinBond, (75_000e18)));
+        assertEq(bond.minBond(), 75_000e18);
     }
 
-    function test_lifecycle_CapacityBond_setMinStake_outOfBounds() public {
+    function test_lifecycle_CapacityBond_setMinBond_outOfBounds() public {
         // Ceiling = 1_000_000e18; one over.
         uint256 bad = 1_000_001e18;
         _runLifecycleExpectExecuteRevert(
             address(bond),
-            abi.encodeCall(CapacityBond.setMinStake, (bad)),
+            abi.encodeCall(CapacityBond.setMinBond, (bad)),
             abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, bad, 10_000e18, 1_000_000e18)
         );
     }

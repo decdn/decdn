@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 
 import { CapacityBond } from "../src/CapacityBond.sol";
-import { StakeMath } from "../src/StakeMath.sol";
+import { BondMath } from "../src/BondMath.sol";
 import { Token } from "../src/Token.sol";
 
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
@@ -32,7 +32,7 @@ contract CapacityBondTest is Test {
     address internal operator = address(0xB0B);
     address internal challenger = address(0xC4A11);
 
-    uint256 internal constant MIN_STAKE = 50_000e18;
+    uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING = 7 days;
 
     function setUp() public {
@@ -43,7 +43,7 @@ contract CapacityBondTest is Test {
             token_: token,
             ed25519Verifier_: ed25519,
             admin: admin,
-            minStake_: MIN_STAKE,
+            minBond_: MIN_BOND,
             unbondingPeriod_: UNBONDING,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
@@ -61,23 +61,23 @@ contract CapacityBondTest is Test {
         token.approve(address(bond), type(uint256).max);
     }
 
-    function test_firstBondedAt_setsOnFirstStake() public {
+    function test_firstBondedAt_setsOnFirstBond() public {
         assertEq(bond.firstBondedAt(operator), 0);
         vm.warp(1_000_000);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         assertEq(bond.firstBondedAt(operator), 1_000_000);
     }
 
     function test_firstBondedAt_immutableAcrossReBonds() public {
         vm.warp(1_000_000);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         uint64 first = bond.firstBondedAt(operator);
 
         vm.warp(2_000_000);
         vm.prank(operator);
-        bond.stake(10e18);
+        bond.bond(10e18);
         assertEq(bond.firstBondedAt(operator), first);
     }
 
@@ -88,7 +88,7 @@ contract CapacityBondTest is Test {
     function test_slash_stampsSlashedAtEpoch() public {
         vm.warp(1_000_000);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         vm.warp(2_000_000);
         vm.prank(admin);
@@ -110,7 +110,7 @@ contract CapacityBondTest is Test {
     function test_settleAppealGranted_clearsAndRefunds() public {
         vm.warp(1_000_000);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
         assertGt(bond.slashedAtEpoch(operator), 0);
@@ -132,24 +132,24 @@ contract CapacityBondTest is Test {
     /// Slash the same operator 3× and assert the tier ladder escalates
     /// 5% → 15% → 50% (`SLASH_BPS_TIER_1/2/3`) driven by `lifetimeOffenseCount`.
     /// No genesis credit, so `creditSlash == 0` and the reductions are pure
-    /// active-stake math. Start at 160k so even after the 50% tier the active
-    /// balance (64.6k) stays above the `minStake/2` (25k) auto-eject floor.
+    /// active-bond math. Start at 160k so even after the 50% tier the active
+    /// balance (64.6k) stays above the `minBond/2` (25k) auto-eject floor.
     function test_slash_tierEscalation_15then50pct() public {
         vm.warp(1_000_000);
         vm.prank(operator);
-        bond.stake(160_000e18);
+        bond.bond(160_000e18);
 
         // Tier 1: 5% of 160k = 8k.
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
         assertEq(bond.lifetimeOffenseCount(operator), 1);
-        assertEq(bond.activeStake(operator), 152_000e18);
+        assertEq(bond.activeBond(operator), 152_000e18);
 
         // Tier 2: 15% of 152k = 22.8k.
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
         assertEq(bond.lifetimeOffenseCount(operator), 2);
-        assertEq(bond.activeStake(operator), 129_200e18);
+        assertEq(bond.activeBond(operator), 129_200e18);
 
         // Tier 3 (3rd+ offense): 50% of 129.2k = 64.6k. Under escrow-on-slash
         // nothing is distributed here — the `Slashed` event reports the
@@ -161,14 +161,14 @@ contract CapacityBondTest is Test {
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
         assertEq(bond.lifetimeOffenseCount(operator), 3);
-        assertEq(bond.activeStake(operator), 64_600e18);
+        assertEq(bond.activeBond(operator), 64_600e18);
         // Escrow grew by the slashed total; challenger paid nothing yet.
         assertEq(bond.escrowedTotal() - escrowBefore, 64_600e18);
         assertEq(token.balanceOf(challenger), challengerBefore);
     }
 
     /// The credit-slash helper (`_slashPendingCreditAtTier`) must escalate with
-    /// the SAME tier ladder as the stake slash. Every other credit-slash test
+    /// the SAME tier ladder as the bond slash. Every other credit-slash test
     /// uses a single tier-1 slash; this drives tiers 2 and 3 against the at-risk
     /// genesis-credit pool (`originalGrant - claimed`, claimed == 0 here).
     function test_slash_creditSlash_escalatesAcrossTiers() public {
@@ -193,28 +193,28 @@ contract CapacityBondTest is Test {
         assertEq(bond.pendingCredit(operator).originalGrant, 40_375e18);
     }
 
-    /// Tier-3 slash against an operator holding BOTH active and unbonding stake
+    /// Tier-3 slash against an operator holding BOTH active and unbonding bond
     /// where `unbonding > active`, so the slash exhausts active first and taps
     /// unbonding for the remainder (the reachable `else` branch of
-    /// `_reduceStakeAtTier`). The literal remainder-clip inside that branch is
+    /// `_reduceBondAtTier`). The literal remainder-clip inside that branch is
     /// unreachable here (it needs `tierBps > 100%`); see
-    /// `test_reduceStakeAtTier_remainderClip` for that path.
-    function test_slash_tier3_mixedStake_exhaustsActiveTapsUnbonding() public {
+    /// `test_reduceBondAtTier_remainderClip` for that path.
+    function test_slash_tier3_mixedBond_exhaustsActiveTapsUnbonding() public {
         vm.warp(1_000_000);
         vm.prank(operator);
-        bond.stake(100_000e18);
+        bond.bond(100_000e18);
 
         // Bump lifetimeOffenseCount to 2 so the next slash lands at tier 3.
         vm.prank(admin);
         bond.slash(operator, challenger, 1); // 5% → 95k active
         vm.prank(admin);
         bond.slash(operator, challenger, 1); // 15% of 95k → 80.75k active
-        assertEq(bond.activeStake(operator), 80_750e18);
+        assertEq(bond.activeBond(operator), 80_750e18);
 
-        // Move most stake into unbonding so unbonding (60k) > active (20.75k).
+        // Move most bond into unbonding so unbonding (60k) > active (20.75k).
         vm.prank(operator);
-        bond.requestUnstake(60_000e18);
-        assertEq(bond.activeStake(operator), 20_750e18);
+        bond.requestUnbond(60_000e18);
+        assertEq(bond.activeBond(operator), 20_750e18);
 
         // Tier 3: totalAtRisk = 80.75k, slashAmount = 40.375k > active 20.75k.
         // Active is zeroed; remainder (19.625k) comes out of unbonding, leaving
@@ -222,49 +222,49 @@ contract CapacityBondTest is Test {
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
         assertEq(bond.lifetimeOffenseCount(operator), 3);
-        assertEq(bond.activeStake(operator), 0);
+        assertEq(bond.activeBond(operator), 0);
         (uint256 unbondingAmt,) = bond.unbondingOf(operator);
         assertEq(unbondingAmt, 40_375e18);
-        // Active fell to 0 (< minStake/2 = 25k), so the slash auto-ejected.
+        // Active fell to 0 (< minBond/2 = 25k), so the slash auto-ejected.
         assertTrue(bond.ejected(operator));
     }
 
     /// Directly exercise the C2 defensive remainder-clip in
-    /// `StakeMath.reduceAtTier` (the math behind `_reduceStakeAtTier`). It is
+    /// `BondMath.reduceAtTier` (the math behind `_reduceBondAtTier`). It is
     /// unreachable through `slash()` — the clip fires only when
     /// `slashAmount > totalAtRisk`, i.e. `tierBps > 10_000` (>100%), and the
     /// immutable ladder maxes at 5_000 (50%). Call the pure library with
     /// `tierBps = 12_000` to prove it caps `slashAmount` to the at-risk total
     /// (no over-transfer) and never underflows the unbonding pool.
-    function test_reduceStakeAtTier_remainderClip() public pure {
+    function test_reduceBondAtTier_remainderClip() public pure {
         // Asymmetric split so `slashAmount` isn't a coincidental round multiple:
         // totalAtRisk = 110e18; 120% → slashAmount would be 132e18 > totalAtRisk
         // → clip clamps remainder to unbonding (100e18) and re-derives
         // slashAmount to active + unbonding = 110e18 (the full at-risk pool).
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = StakeMath.reduceAtTier(10e18, 100e18, 12_000);
+        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(10e18, 100e18, 12_000);
         assertEq(slashed, 110e18); // capped to at-risk (10 + 100), not 132e18
         assertEq(newActive, 0);
         assertEq(newUnbonding, 0);
     }
 
-    /// `StakeMath.reduceAtTier` against an operator with NO active stake — the
+    /// `BondMath.reduceAtTier` against an operator with NO active bond — the
     /// whole slash comes out of the unbonding bucket. Reachable in production
     /// when an operator fully unbonds and is then slashed, so an in-ladder tier
     /// (50%) is used. Active stays 0; unbonding is halved.
-    function test_reduceStakeAtTier_unbondingOnly() public pure {
+    function test_reduceBondAtTier_unbondingOnly() public pure {
         // totalAtRisk = 100e18; 50% = 50e18. active is already 0, so the entire
         // 50e18 comes from unbonding via the else branch (no clip).
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = StakeMath.reduceAtTier(0, 100e18, 5000);
+        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(0, 100e18, 5000);
         assertEq(slashed, 50e18);
         assertEq(newActive, 0);
         assertEq(newUnbonding, 50e18);
     }
 
-    /// The common production path: the slash fits entirely within active stake,
+    /// The common production path: the slash fits entirely within active bond,
     /// so unbonding is untouched (the `slashAmount <= active` branch).
-    function test_reduceStakeAtTier_activeOnly() public pure {
+    function test_reduceBondAtTier_activeOnly() public pure {
         // totalAtRisk = 150e18; 50% = 75e18 ≤ active (100e18) → all from active.
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = StakeMath.reduceAtTier(100e18, 50e18, 5000);
+        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(100e18, 50e18, 5000);
         assertEq(slashed, 75e18);
         assertEq(newActive, 25e18);
         assertEq(newUnbonding, 50e18); // untouched
@@ -272,9 +272,9 @@ contract CapacityBondTest is Test {
 
     /// Boundary: `slashAmount == active` exactly takes the `<=` branch, zeroing
     /// active and leaving unbonding whole (guards a future `<=` → `<` slip).
-    function test_reduceStakeAtTier_slashEqualsActive() public pure {
+    function test_reduceBondAtTier_slashEqualsActive() public pure {
         // totalAtRisk = 200e18; 50% = 100e18 == active → active branch, exact.
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = StakeMath.reduceAtTier(100e18, 100e18, 5000);
+        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(100e18, 100e18, 5000);
         assertEq(slashed, 100e18);
         assertEq(newActive, 0);
         assertEq(newUnbonding, 100e18); // untouched
@@ -282,10 +282,10 @@ contract CapacityBondTest is Test {
 
     /// Partial spill: slash exceeds active and takes the remainder from unbonding
     /// without clipping (the `else` no-clip branch with nonzero residual both).
-    function test_reduceStakeAtTier_spillsIntoUnbonding() public pure {
+    function test_reduceBondAtTier_spillsIntoUnbonding() public pure {
         // totalAtRisk = 300e18; 50% = 150e18 > active (100e18) → 50e18 spills
         // into unbonding (200e18), leaving 150e18 unbonding, no clip.
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = StakeMath.reduceAtTier(100e18, 200e18, 5000);
+        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(100e18, 200e18, 5000);
         assertEq(slashed, 150e18);
         assertEq(newActive, 0);
         assertEq(newUnbonding, 150e18);
@@ -294,13 +294,13 @@ contract CapacityBondTest is Test {
     /// Degenerate inputs: zero balances and a zero tier are well-defined no-ops
     /// (slashAmount 0, balances unchanged) — pins the contract against a future
     /// rounding/divide change.
-    function test_reduceStakeAtTier_zeroInputs() public pure {
-        (uint256 s0, uint256 a0, uint256 u0) = StakeMath.reduceAtTier(0, 0, 5000);
+    function test_reduceBondAtTier_zeroInputs() public pure {
+        (uint256 s0, uint256 a0, uint256 u0) = BondMath.reduceAtTier(0, 0, 5000);
         assertEq(s0, 0);
         assertEq(a0, 0);
         assertEq(u0, 0);
 
-        (uint256 s1, uint256 a1, uint256 u1) = StakeMath.reduceAtTier(100e18, 100e18, 0);
+        (uint256 s1, uint256 a1, uint256 u1) = BondMath.reduceAtTier(100e18, 100e18, 0);
         assertEq(s1, 0);
         assertEq(a1, 100e18);
         assertEq(u1, 100e18);
@@ -316,7 +316,7 @@ contract CapacityBondTest is Test {
         vm.warp(2 * 7 days);
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         (uint256 slashId,) = bond.slash(operator, challenger, 1);
         assertGt(bond.slashedAtEpoch(operator), 0);
@@ -349,7 +349,7 @@ contract CapacityBondTest is Test {
     function test_settleAppealGranted_multiSlash_recomputesThenClears() public {
         vm.warp(1_000_000);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         // Slash #0 (older), then Slash #1 (newer) one epoch later.
         vm.prank(admin);
@@ -384,7 +384,7 @@ contract CapacityBondTest is Test {
     function test_settleAppealGranted_reverseMiddleSlash_keepsNewest() public {
         vm.warp(1_000_000);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         // Three slashes across distinct epochs: #0 (old), #1 (mid), #2 (new).
         vm.prank(admin);
@@ -413,7 +413,7 @@ contract CapacityBondTest is Test {
         vm.warp(2 * 7 days);
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         // Slash #0 (older), then Slash #1 (newer) one epoch later.
         vm.prank(admin);
@@ -627,26 +627,26 @@ contract CapacityBondTest is Test {
         assertEq(bond.claimableCredit(operator), 100_000e18);
     }
 
-    function test_claimVestedCredit_movesIntoActiveStake() public {
+    function test_claimVestedCredit_movesIntoActiveBond() public {
         _setupGenesisGrant(100_000e18);
-        // I5 gate: needs activeStake > 0.
+        // I5 gate: needs activeBond > 0.
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         vm.warp(block.timestamp + 365 days);
         vm.prank(operator);
         bond.claimVestedCredit();
 
-        // Stake increased by claimable (50k vested at half-curve).
-        assertEq(bond.activeStake(operator), MIN_STAKE + 50_000e18);
+        // Bond increased by claimable (50k vested at half-curve).
+        assertEq(bond.activeBond(operator), MIN_BOND + 50_000e18);
         assertEq(bond.pendingCredit(operator).claimed, 50_000e18);
         assertEq(bond.pendingCredit(operator).originalGrant, 100_000e18);
     }
 
-    function test_claimVestedCredit_revertsWhenNoActiveStake() public {
+    function test_claimVestedCredit_revertsWhenNoActiveBond() public {
         _setupGenesisGrant(100_000e18);
         vm.warp(block.timestamp + 365 days);
-        // No stake → I5 gate trips.
+        // No bond → I5 gate trips.
         vm.prank(operator);
         vm.expectRevert();
         bond.claimVestedCredit();
@@ -657,7 +657,7 @@ contract CapacityBondTest is Test {
         vm.warp(2 * 7 days);
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
         assertGt(bond.slashedAtEpoch(operator), 0);
@@ -675,7 +675,7 @@ contract CapacityBondTest is Test {
         vm.warp(2 * 7 days);
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
 
@@ -690,7 +690,7 @@ contract CapacityBondTest is Test {
     function test_claimVestedCredit_multiClaimFollowsLinearCurve() public {
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         // Total 730 days vest. Claim midway and at full vest; assert the
         // cumulative claim equals the curve target at the second timestamp.
@@ -711,7 +711,7 @@ contract CapacityBondTest is Test {
     function test_pendingCreditSlash_reducesOriginalGrant() public {
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         uint128 grantBefore = bond.pendingCredit(operator).originalGrant;
         vm.prank(admin);
@@ -733,18 +733,18 @@ contract CapacityBondTest is Test {
     function test_slashHitsVestedButUnclaimed() public {
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE * 2);
+        bond.bond(MIN_BOND * 2);
 
         // Half-vest: vested = 50k, unvested = 50k.
         vm.warp(block.timestamp + 365 days);
-        // Claim the full vested (50k); claimed = 50k, activeStake += 50k.
+        // Claim the full vested (50k); claimed = 50k, activeBond += 50k.
         vm.prank(operator);
         bond.claimVestedCredit();
         assertEq(bond.pendingCredit(operator).claimed, 50_000e18);
 
         // At-risk pool = originalGrant − claimed = 100k − 50k = 50k (= the
         // unvested portion, since the vested-claimed amount is now in
-        // activeStake and slashed there).
+        // activeBond and slashed there).
         uint128 grantBefore = bond.pendingCredit(operator).originalGrant;
         vm.prank(admin);
         bond.slash(operator, challenger, 1);
@@ -766,7 +766,7 @@ contract CapacityBondTest is Test {
         vm.prank(op2);
         token.approve(address(bond), type(uint256).max);
         vm.prank(op2);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         vm.startPrank(admin);
         token.approve(address(bond), 100_000e18);
@@ -788,7 +788,7 @@ contract CapacityBondTest is Test {
     function test_creditSlash_escrowsThenDistributes5050AtFinality() public {
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         uint256 challengerBalanceBefore = token.balanceOf(challenger);
         uint256 supplyBefore = token.totalSupply();
@@ -796,7 +796,7 @@ contract CapacityBondTest is Test {
         vm.prank(admin);
         (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
 
-        // C1: credit slash (5k) joins stake slash (5% × 50k = 2.5k) for a
+        // C1: credit slash (5k) joins bond slash (5% × 50k = 2.5k) for a
         // combined 7.5k — all escrowed, nothing distributed yet.
         assertEq(totalSlash, 7500e18);
         assertEq(bond.escrowedTotal(), 7500e18);
@@ -812,16 +812,16 @@ contract CapacityBondTest is Test {
     function test_forfeitUnvestedCredit_onUnbond() public {
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         address treasury_ = address(0xDEAD);
         vm.prank(admin);
         bond.setTreasury(treasury_);
 
         vm.warp(block.timestamp + 365 days);
-        // Vested = 50k, unvested = 50k → forfeit on requestUnstake.
+        // Vested = 50k, unvested = 50k → forfeit on requestUnbond.
         vm.prank(operator);
-        bond.requestUnstake(MIN_STAKE);
+        bond.requestUnbond(MIN_BOND);
 
         assertEq(token.balanceOf(treasury_), 50_000e18);
         assertEq(bond.pendingCredit(operator).originalGrant, 50_000e18);
@@ -839,10 +839,10 @@ contract CapacityBondTest is Test {
     ///         immediately returns the truncated principal.
     function test_forfeitUnvestedCredit_doesNotClawBackVestedUnclaimed() public {
         _setupGenesisGrant(100_000e18);
-        // Stake well above MIN_STAKE so a partial unbond leaves activeStake
-        // non-zero (I5 gate requires activeStake > 0 to claim).
+        // Bond well above MIN_BOND so a partial unbond leaves activeBond
+        // non-zero (I5 gate requires activeBond > 0 to claim).
         vm.prank(operator);
-        bond.stake(MIN_STAKE * 2);
+        bond.bond(MIN_BOND * 2);
 
         // Wait halfway through the vest (vested = 50k, unvested = 50k).
         vm.warp(block.timestamp + 365 days);
@@ -851,7 +851,7 @@ contract CapacityBondTest is Test {
         bond.claimVestedCredit();
         assertEq(bond.pendingCredit(operator).claimed, 50_000e18);
 
-        // Partial unstake triggers forfeit while leaving activeStake > 0.
+        // Partial unbond triggers forfeit while leaving activeBond > 0.
         // Pre-fix: post-forfeit `curveVested` would return 50k × 365/730 = 25k
         // and `claimableCredit` would saturate at 0 even though the math
         // implies a 25k retroactive shrink below `claimed`. With the
@@ -859,7 +859,7 @@ contract CapacityBondTest is Test {
         // directly — `claimed` is preserved at 50k, claimable settles to 0
         // by exhaustion (50k − 50k), not by silent clawback.
         vm.prank(operator);
-        bond.requestUnstake(MIN_STAKE);
+        bond.requestUnbond(MIN_BOND);
 
         CapacityBond.PendingCredit memory pc = bond.pendingCredit(operator);
         assertEq(pc.originalGrant, 50_000e18);
@@ -871,19 +871,19 @@ contract CapacityBondTest is Test {
     function test_forfeitUnvestedCredit_burnsWhenNoTreasury() public {
         _setupGenesisGrant(100_000e18);
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         // treasury unset → forfeit burns.
         uint256 supplyBefore = token.totalSupply();
         vm.warp(block.timestamp + 365 days);
         vm.prank(operator);
-        bond.requestUnstake(MIN_STAKE);
+        bond.requestUnbond(MIN_BOND);
         assertEq(supplyBefore - token.totalSupply(), 50_000e18);
     }
 
     function test_slashId_persistsRecord() public {
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         (uint256 slashId,) = bond.slash(operator, challenger, 1);
         assertEq(slashId, 0);
@@ -900,7 +900,7 @@ contract CapacityBondTest is Test {
     /// no burn, escrow accounting grows, status is `Escrowed`.
     function test_slash_escrowsWithoutDistribution() public {
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         uint256 supplyBefore = token.totalSupply();
         uint256 challengerBefore = token.balanceOf(challenger);
@@ -921,7 +921,7 @@ contract CapacityBondTest is Test {
     /// 50% to the challenger and burning 50%.
     function test_finalizeUnappealedSlash_distributes5050() public {
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
 
@@ -947,7 +947,7 @@ contract CapacityBondTest is Test {
     /// finalize path can no longer race it.
     function test_markAppealOpen_blocksFinalize() public {
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         (uint256 slashId,) = bond.slash(operator, challenger, 1);
 
@@ -962,7 +962,7 @@ contract CapacityBondTest is Test {
     /// Upheld appeal distributes the escrow 50/50 (same as the no-appeal path).
     function test_settleAppealUpheld_distributes5050() public {
         vm.prank(operator);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         vm.prank(admin);
         (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
 
@@ -1011,7 +1011,7 @@ contract CapacityBondTest is Test {
 
         // Fund + approve from the admin's TOKEN balance.
         vm.prank(admin);
-        token.transfer(opAddr, MIN_STAKE);
+        token.transfer(opAddr, MIN_BOND);
         vm.prank(opAddr);
         token.approve(address(bond), type(uint256).max);
 
@@ -1019,9 +1019,9 @@ contract CapacityBondTest is Test {
         // in this test is comfortably non-zero.
         vm.warp(1_000_000);
 
-        // Stake to satisfy the registerNode precondition.
+        // Bond to satisfy the registerNode precondition.
         vm.prank(opAddr);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         // Register node — binding signature signed with opPk; ed25519 is
         // mocked to accept any signature unconditionally.
@@ -1065,10 +1065,10 @@ contract CapacityBondTest is Test {
     // pair gets the same treatment.
     // ----------------------------------------------------------------------
 
-    function test_setMinStake_revertsWithoutRole() public {
+    function test_setMinBond_revertsWithoutRole() public {
         _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
         vm.prank(operator);
-        bond.setMinStake(MIN_STAKE);
+        bond.setMinBond(MIN_BOND);
     }
 
     function test_setUnbondingPeriod_revertsWithoutRole() public {
@@ -1128,7 +1128,7 @@ contract CapacityBondTest is Test {
     /// @dev Helper for AccessControl revert assertion. Reading the role
     ///      bytes32 BEFORE calling this helper is required so the
     ///      cheat-resolved STATICCALL doesn't consume the subsequent
-    ///      `vm.prank` (the bug fixed in `test_setMinStake_revertsWithoutRole`
+    ///      `vm.prank` (the bug fixed in `test_setMinBond_revertsWithoutRole`
     ///      pre-merge). The helper itself only invokes a cheat code, which
     ///      does NOT consume the prank.
     function _expectMissingRole(address caller, bytes32 role) internal {
@@ -1143,11 +1143,11 @@ contract CapacityBondTest is Test {
         uint256 opPk = 0xDEADBEEF;
         address opAddr = vm.addr(opPk);
         vm.prank(admin);
-        token.transfer(opAddr, MIN_STAKE);
+        token.transfer(opAddr, MIN_BOND);
         vm.prank(opAddr);
         token.approve(address(bond), type(uint256).max);
         vm.prank(opAddr);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         // Flip the verifier to reject mode.
         ed25519.setAccept(false);
@@ -1163,11 +1163,11 @@ contract CapacityBondTest is Test {
         uint256 opPk = 0xC0FFEE2;
         address opAddr = vm.addr(opPk);
         vm.prank(admin);
-        token.transfer(opAddr, MIN_STAKE);
+        token.transfer(opAddr, MIN_BOND);
         vm.prank(opAddr);
         token.approve(address(bond), type(uint256).max);
         vm.prank(opAddr);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
 
         bytes32 nodeId = bytes32(uint256(0xC0FFEE2C0FFEE2));
         bytes memory bindingSig = _signBindNode(opPk, opAddr, nodeId);
