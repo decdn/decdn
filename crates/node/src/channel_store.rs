@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
-use decdn_incentive::store::{ChannelStateStore, StoreError};
+use decdn_incentive::store::{ChannelStateStore, PendingSettle, PendingSettleStore, StoreError};
 use decdn_incentive::{ChannelId, ChannelState};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,19 @@ const SANE_TRAILER_MAX_BYTES: usize = 256;
 /// Key: raw `ChannelId` bytes (`[u8; 32]`).
 /// Value: postcard-encoded [`StoredChannelState`] (variable length).
 const CHANNEL_TABLE: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("channel_state_v1");
+
+/// redb table holding the pending-settle set (#327 / PR #743 review): channels
+/// this node closed on-chain that await a `settleChannel` finalization once
+/// their dispute window elapses. Lives in the same database file as
+/// [`CHANNEL_TABLE`] so a single open + single fsync discipline covers both.
+///
+/// Key: raw `ChannelId` bytes (`[u8; 32]`).
+/// Value: the on-chain `disputeDeadline` (Unix seconds) — `settleChannel`
+/// reverts before this, so the sweep gates submission on it. A fixed-width
+/// native `u64` value needs no postcard envelope (unlike [`CHANNEL_TABLE`]),
+/// so there is no schema-version trailer to evolve here.
+const PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
+    TableDefinition::new("pending_settle_v1");
 
 /// On-disk record. All numeric fields use fixed-size big-endian byte arrays
 /// instead of variable-length integers so the encoded value width is stable
@@ -626,6 +639,99 @@ impl ChannelStateStore for PersistentChannelStateStore {
     }
 }
 
+impl PendingSettleStore for PersistentChannelStateStore {
+    fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError> {
+        let key: [u8; 32] = entry.channel_id.into();
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        // Force fsync-on-commit, same durability discipline as `record`: a
+        // post-close crash that lost the pending entry would strand the
+        // provider's un-withdrawn remainder (the very gap this guards).
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(PENDING_SETTLE_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            table
+                .insert(&key, entry.settle_after)
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+
+    fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        // A never-written pending table is an empty set, not an error — same
+        // first-boot tolerance as `load_all`.
+        let table = match read_txn.open_table(PENDING_SETTLE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let mut out = Vec::new();
+        let iter = table
+            .iter()
+            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
+        for entry in iter {
+            let (key_guard, value_guard) =
+                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
+            out.push(PendingSettle {
+                channel_id: B256::from(*key_guard.value()),
+                settle_after: value_guard.value(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn forget_pending(&self, channel_id: ChannelId) -> Result<(), StoreError> {
+        let key: [u8; 32] = channel_id.into();
+
+        // forget on a never-written store is a no-op by contract and must not
+        // create the table as a side effect — same guard as `forget`.
+        {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+            match read_txn.open_table(PENDING_SETTLE_TABLE) {
+                Ok(_) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+            }
+        }
+
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(PENDING_SETTLE_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            table
+                .remove(&key)
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,6 +1099,79 @@ mod tests {
         );
         anyhow::ensure!(only.expires_at == 0, "v1 record → zero expiry");
         anyhow::ensure!(*only == s, "v1 prefix fields must round-trip");
+        Ok(())
+    }
+
+    /// Pending-settle entries round-trip and survive a reopen, and the
+    /// dispute-deadline value is re-stamped on a re-close (#327 / PR #743).
+    #[test]
+    fn pending_settle_round_trip_and_persist() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let a = PendingSettle {
+            channel_id: sample(1).channel_id,
+            settle_after: 1_700_000_000,
+        };
+        let b = PendingSettle {
+            channel_id: sample(2).channel_id,
+            settle_after: 1_700_000_500,
+        };
+        {
+            let store = PersistentChannelStateStore::open(dir.path())?;
+            store.record_pending(&a)?;
+            store.record_pending(&b)?;
+            // Re-close re-stamps the same channel's deadline (no extra row).
+            store.record_pending(&PendingSettle {
+                settle_after: 1_700_009_999,
+                ..a
+            })?;
+        }
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let mut all = store.load_pending()?;
+        all.sort_by_key(|p| p.channel_id);
+        anyhow::ensure!(all.len() == 2, "overwrite must not add a row");
+        let first = all.first().ok_or_else(|| anyhow::anyhow!("missing [0]"))?;
+        anyhow::ensure!(first.settle_after == 1_700_009_999, "deadline re-stamped");
+        Ok(())
+    }
+
+    #[test]
+    fn pending_settle_forget_and_empty_tolerance() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        // load/forget on a never-written pending table are no-ops, not errors.
+        anyhow::ensure!(store.load_pending()?.is_empty());
+        store.forget_pending(sample(9).channel_id)?;
+
+        let entry = PendingSettle {
+            channel_id: sample(3).channel_id,
+            settle_after: 42,
+        };
+        store.record_pending(&entry)?;
+        store.forget_pending(entry.channel_id)?;
+        anyhow::ensure!(store.load_pending()?.is_empty());
+        Ok(())
+    }
+
+    /// The pending-settle table and the voucher-state table share one
+    /// database file without colliding — a channel can carry voucher state
+    /// and a pending-settle entry simultaneously (it does, briefly, between
+    /// close and forget).
+    #[test]
+    fn pending_settle_table_is_independent_of_channel_state() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s = sample(7);
+        store.record(&s)?;
+        store.record_pending(&PendingSettle {
+            channel_id: s.channel_id,
+            settle_after: 99,
+        })?;
+        anyhow::ensure!(store.load_all()?.len() == 1);
+        anyhow::ensure!(store.load_pending()?.len() == 1);
+        // Forgetting the voucher state leaves the pending entry intact.
+        store.forget(s.channel_id)?;
+        anyhow::ensure!(store.load_all()?.is_empty());
+        anyhow::ensure!(store.load_pending()?.len() == 1, "pending row survives");
         Ok(())
     }
 

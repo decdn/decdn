@@ -43,8 +43,8 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
-use decdn_incentive::ChannelStateStore;
 use decdn_incentive::eth_identity::{self, PasswordSource};
+use decdn_incentive::{ChannelStateStore, PendingSettleStore};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger
@@ -351,7 +351,7 @@ pub async fn run(
     // Failure here MUST abort startup: continuing with a fresh in-memory
     // map silently reopens the replay window the store exists to close.
     let channel_store_data_dir = cfg.identity.data_dir.clone();
-    let channel_state_store: Arc<dyn ChannelStateStore> = Arc::new(
+    let concrete_channel_store = Arc::new(
         tokio::task::spawn_blocking(move || {
             PersistentChannelStateStore::open(&channel_store_data_dir)
         })
@@ -359,6 +359,13 @@ pub async fn run(
         .context("channel state store open task panicked")?
         .context("failed to open channel state store (issue #527 voucher replay guard)")?,
     );
+    // The one redb-backed store implements both the voucher-state trait (for
+    // the handler + #527 replay guard) and the pending-settle trait (for the
+    // on-chain settlement sweep, PR #743 review). Derive two trait-object
+    // handles from the single concrete store so both tables share one open
+    // file and one fsync discipline.
+    let channel_state_store: Arc<dyn ChannelStateStore> = concrete_channel_store.clone();
+    let pending_settle_store: Arc<dyn PendingSettleStore> = concrete_channel_store;
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema even before the
     // future cdn/client/v1 handler (#317) is constructed. The handler will
@@ -594,6 +601,7 @@ pub async fn run(
         payment_channel_addr,
         eth_signer.address(),
         Arc::clone(&channel_state_store),
+        Arc::clone(&pending_settle_store),
         Arc::clone(&client_handler),
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
     )
