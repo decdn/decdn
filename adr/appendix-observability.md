@@ -36,7 +36,7 @@ Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
 #### Slash-Safety Metrics (all Mandatory)
 
-Early warning for the three slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn). A sustained non-zero value for any of these requires immediate operator attention.
+Early warning for the three slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the slash-evidence and blacklist-lag **counters** requires immediate operator attention. The **gauges** (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_violations_total` is an availability/budget-pressure signal (raise `max_probe_holds`), not a slash risk — see its row.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
