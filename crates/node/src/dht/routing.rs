@@ -539,3 +539,273 @@ mod tests {
         assert_eq!(cmp_by_distance(&a, &a, &target), std::cmp::Ordering::Equal);
     }
 }
+
+/// Property-based tests (issue #748).
+///
+/// The example-based `tests` module above pins specific scenarios; this module
+/// asserts the *invariants* hold under random `NodeId` insertion/removal
+/// sequences and arbitrary keyspace points — the class of structural bug
+/// (a bucket overflowing K, a peer in the wrong bucket, a mis-ordered
+/// `closest()`) that silently degrades lookup correctness but is easy to miss
+/// with hand-picked cases.
+///
+/// Note on terminology: issue #748 refers to a "k-bucket *split* invariant",
+/// but this table is the fixed-256-bucket variant (see the module docs) that
+/// **never splits**. The corresponding invariants tested here are deterministic
+/// bucket *placement* by XOR-prefix length and per-bucket fill `<= K_BUCKET_SIZE`
+/// enforced by LRU eviction.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod prop_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// Strategy yielding a uniformly-random `NodeId` over the full 256-bit space.
+    fn node_id() -> impl Strategy<Value = NodeId> {
+        proptest::array::uniform32(any::<u8>()).prop_map(NodeId::from_bytes)
+    }
+
+    /// Construct a `NodeId` that lands in bucket `bucket_idx` relative to
+    /// `self_id`, varied within the bucket by `salt`. Mirrors the helper in
+    /// the sibling `tests` module.
+    ///
+    /// Callers in this module restrict `bucket_idx` to `8..16` so the
+    /// bucket-defining bit lives in byte 30 while `salt` only perturbs byte 31
+    /// (the last byte) — the two never interfere, so every id provably lands in
+    /// the intended bucket and distinct salts give distinct ids (and never the
+    /// zero distance, since the byte-30 bit is always flipped).
+    fn id_in_bucket(self_id: &NodeId, bucket_idx: usize, salt: u8) -> NodeId {
+        let bit_from_msb = KEYSPACE_BITS - 1 - bucket_idx;
+        let byte_idx = bit_from_msb / 8;
+        let bit_within = bit_from_msb % 8;
+        let mut out = *self_id.as_bytes();
+        if let Some(b) = out.get_mut(byte_idx) {
+            *b ^= 1u8 << (7 - bit_within);
+        }
+        if let Some(last) = out.last_mut() {
+            *last ^= salt;
+        }
+        NodeId::from_bytes(out)
+    }
+
+    /// Independent leading-zero-bit count over a big-endian 256-bit value,
+    /// computed without reference to `bucket_index`'s arithmetic so the two
+    /// cross-check each other. Returns `KEYSPACE_BITS` for the all-zero input.
+    fn leading_zero_bits(d: &[u8; NODE_ID_LEN]) -> usize {
+        let mut count = 0;
+        for byte in d {
+            if *byte == 0 {
+                count += 8;
+            } else {
+                count += byte.leading_zeros() as usize;
+                break;
+            }
+        }
+        count
+    }
+
+    /// Big-endian 256-bit addition over two distance vectors. Returns the sum
+    /// truncated to 256 bits plus an overflow flag. Used to check the triangle
+    /// inequality on the integer interpretation of the XOR metric.
+    fn be_add(a: &[u8; NODE_ID_LEN], b: &[u8; NODE_ID_LEN]) -> ([u8; NODE_ID_LEN], bool) {
+        let mut out = [0u8; NODE_ID_LEN];
+        let mut carry: u16 = 0;
+        for i in (0..NODE_ID_LEN).rev() {
+            let av = a.get(i).copied().unwrap_or_default();
+            let bv = b.get(i).copied().unwrap_or_default();
+            let sum = u16::from(av) + u16::from(bv) + carry;
+            if let Some(o) = out.get_mut(i) {
+                *o = u8::try_from(sum & 0xff).unwrap_or_default();
+            }
+            carry = sum >> 8;
+        }
+        (out, carry != 0)
+    }
+
+    proptest! {
+        /// `xor_distance` is a valid metric: reflexive, symmetric, discerns
+        /// identity, satisfies the XOR self-cancel identity
+        /// `d(a,b) ⊕ d(b,c) = d(a,c)`, and the triangle inequality on the
+        /// integer interpretation `d(a,c) <= d(a,b) + d(b,c)`.
+        #[test]
+        fn xor_distance_is_a_valid_metric(a in node_id(), b in node_id(), c in node_id()) {
+            // Reflexivity.
+            prop_assert_eq!(xor_distance(&a, &a), [0u8; NODE_ID_LEN]);
+            // Symmetry.
+            prop_assert_eq!(xor_distance(&a, &b), xor_distance(&b, &a));
+            // Identity of indiscernibles: distance is zero iff the ids are equal.
+            prop_assert_eq!(xor_distance(&a, &b) == [0u8; NODE_ID_LEN], a == b);
+
+            let dab = xor_distance(&a, &b);
+            let dbc = xor_distance(&b, &c);
+            let dac = xor_distance(&a, &c);
+
+            // XOR self-cancel: d(a,b) ⊕ d(b,c) == d(a,c).
+            let mut cancelled = [0u8; NODE_ID_LEN];
+            for i in 0..NODE_ID_LEN {
+                if let (Some(o), Some(p), Some(q)) =
+                    (cancelled.get_mut(i), dab.get(i), dbc.get(i))
+                {
+                    *o = p ^ q;
+                }
+            }
+            prop_assert_eq!(cancelled, dac);
+
+            // Triangle inequality on the big-endian integer interpretation.
+            // Array `Ord` compares element-wise from index 0 (most significant),
+            // i.e. exactly big-endian integer ordering. If the 256-bit sum
+            // overflows it necessarily exceeds the 256-bit `dac`, so the
+            // inequality holds trivially.
+            let (sum, overflow) = be_add(&dab, &dbc);
+            prop_assert!(overflow || dac <= sum);
+        }
+    }
+
+    proptest! {
+        /// `bucket_index` returns `None` exactly for equal ids and otherwise a
+        /// value in `[0, KEYSPACE_BITS)` that agrees with an independent
+        /// leading-zero count of the distance.
+        #[test]
+        fn bucket_index_matches_independent_prefix_count(a in node_id(), b in node_id()) {
+            let d = xor_distance(&a, &b);
+            match bucket_index(&d) {
+                None => prop_assert_eq!(a, b),
+                Some(idx) => {
+                    prop_assert!(idx < KEYSPACE_BITS);
+                    let lz = leading_zero_bits(&d);
+                    prop_assert_eq!(idx, KEYSPACE_BITS - 1 - lz);
+                }
+            }
+        }
+    }
+
+    proptest! {
+        /// Under an arbitrary insert/remove sequence the table holds its
+        /// structural invariants after every operation: no bucket exceeds K,
+        /// every held peer sits in the bucket its distance dictates, the own id
+        /// is never present, there are no duplicates, and `len()` agrees with
+        /// the set of held peers. Finally `contains()` agrees with the held set
+        /// for every id the sequence touched.
+        #[test]
+        fn table_invariants_hold_under_random_ops(
+            self_bytes in proptest::array::uniform32(any::<u8>()),
+            // Buckets restricted to a narrow 8..12 window (with the full salt
+            // range) so distinct salts collide into just four buckets: with up
+            // to 128 ops that drives per-bucket fill well past K and routinely
+            // exercises LRU eviction — which random 256-bit ids spread across
+            // 256 buckets almost never do.
+            ops in prop::collection::vec((any::<bool>(), 8usize..12, any::<u8>()), 0..128),
+        ) {
+            let self_id = NodeId::from_bytes(self_bytes);
+            let mut rt = RoutingTable::new(self_id);
+            let mut touched: BTreeSet<NodeId> = BTreeSet::new();
+
+            for (is_insert, bucket, salt) in &ops {
+                let peer = id_in_bucket(&self_id, *bucket, *salt);
+                touched.insert(peer);
+                if *is_insert {
+                    rt.insert(peer);
+                } else {
+                    rt.remove(&peer);
+                }
+
+                // Own id is never stored.
+                prop_assert!(!rt.contains(&self_id));
+
+                // Recompute placement from the outside: group held peers by the
+                // bucket their distance dictates and assert correct placement,
+                // within-K fill, and no duplicates.
+                let mut per_bucket: BTreeMap<usize, usize> = BTreeMap::new();
+                let mut held: BTreeSet<NodeId> = BTreeSet::new();
+                for p in rt.iter_peers() {
+                    prop_assert_ne!(*p, self_id);
+                    let idx = bucket_index(&xor_distance(&self_id, p));
+                    prop_assert!(idx.is_some());
+                    if let Some(i) = idx {
+                        *per_bucket.entry(i).or_default() += 1;
+                    }
+                    prop_assert!(held.insert(*p), "duplicate peer across buckets");
+                }
+                for count in per_bucket.values() {
+                    prop_assert!(*count <= K_BUCKET_SIZE);
+                }
+                prop_assert_eq!(rt.len(), held.len());
+            }
+
+            // `contains()` is consistent with the final held set for every id
+            // the sequence operated on (covers both still-present and
+            // removed/evicted ids).
+            let held: BTreeSet<NodeId> = rt.iter_peers().copied().collect();
+            for id in &touched {
+                prop_assert_eq!(rt.contains(id), held.contains(id));
+            }
+        }
+    }
+
+    proptest! {
+        /// `closest()` returns the genuinely nearest peers to an arbitrary
+        /// target: results are distance-sorted, deduplicated, a subset of the
+        /// table, correctly bounded (`min(n, K, len)` for the wire-capped
+        /// variant and `min(n, len)` for the unbounded one), and every excluded
+        /// peer is no closer than the farthest returned one.
+        #[test]
+        fn closest_is_sorted_bounded_and_truly_nearest(
+            self_bytes in proptest::array::uniform32(any::<u8>()),
+            peers in prop::collection::vec((8usize..16, any::<u8>()), 0..48),
+            target_bytes in proptest::array::uniform32(any::<u8>()),
+            n in 0usize..40,
+        ) {
+            let self_id = NodeId::from_bytes(self_bytes);
+            let mut rt = RoutingTable::new(self_id);
+            for (bucket, salt) in &peers {
+                rt.insert(id_in_bucket(&self_id, *bucket, *salt));
+            }
+            let held: BTreeSet<NodeId> = rt.iter_peers().copied().collect();
+            let len = rt.len();
+
+            let res = rt.closest(&target_bytes, n);
+            prop_assert_eq!(res.len(), n.min(K_BUCKET_SIZE).min(len));
+
+            let mut returned: BTreeSet<NodeId> = BTreeSet::new();
+            for p in &res {
+                prop_assert!(held.contains(p), "closest() returned a peer not in the table");
+                prop_assert!(returned.insert(*p), "closest() returned a duplicate");
+            }
+
+            // Distance-sorted (non-decreasing) by XOR distance to `target`.
+            let dists: Vec<[u8; NODE_ID_LEN]> = res
+                .iter()
+                .map(|p| xor_distance_bytes(p.as_bytes(), &target_bytes))
+                .collect();
+            for w in dists.windows(2) {
+                if let (Some(x), Some(y)) = (w.first(), w.get(1)) {
+                    prop_assert!(x <= y, "closest() not distance-sorted");
+                }
+            }
+
+            // Selection correctness: every peer NOT returned is at least as far
+            // as the farthest returned peer. (Only constrains when some peers
+            // were excluded — i.e. the table held more than the cap.)
+            if let Some(farthest) = dists.last() {
+                for p in &held {
+                    if !returned.contains(p) {
+                        let dp = xor_distance_bytes(p.as_bytes(), &target_bytes);
+                        prop_assert!(dp >= *farthest, "an excluded peer was closer than a returned one");
+                    }
+                }
+            }
+
+            // The unbounded variant is capped only by the request and table size.
+            let res_unbounded = rt.closest_unbounded(&target_bytes, n);
+            prop_assert_eq!(res_unbounded.len(), n.min(len));
+        }
+    }
+}
