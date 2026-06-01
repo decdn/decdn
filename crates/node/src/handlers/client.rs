@@ -693,7 +693,7 @@ impl ClientHandler {
                 // structured `tracing::warn!` already fired inside
                 // `apply_voucher`; here we surface the rate to operators via
                 // `decdn_voucher_nonce_gaps_total` for alerting.
-                if applied.nonce_gap > 0 {
+                if applied.is_gapped() {
                     self.metrics.voucher_nonce_gap();
                 }
                 // Hint the on-chain settlement service that this channel's

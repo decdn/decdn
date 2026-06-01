@@ -898,6 +898,34 @@ mod tests {
     }
 
     #[test]
+    fn voucher_nonce_gap_metric_starts_at_zero_and_increments() {
+        // #747. The struct field is `voucher_nonce_gaps`; the OpenMetrics
+        // encoder appends `_total`, so the exported name is
+        // `decdn_voucher_nonce_gaps_total` — the operator-visible name the
+        // `apply_voucher` docs and any alert reference. Asserting the suffixed
+        // form locks it in: re-naming the field to include `_total` would emit
+        // `..._total_total` (the same footgun the cache GC counters guard
+        // against above). The counter is event-scoped — `voucher_nonce_gap()`
+        // bumps it once per gapped voucher regardless of gap size — so two
+        // calls must read exactly 2.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_voucher_nonce_gaps_total", 0),
+            "voucher nonce-gap counter should be exposed at zero on a fresh registry:\n{text}"
+        );
+
+        metrics.voucher_nonce_gap();
+        metrics.voucher_nonce_gap();
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_voucher_nonce_gaps_total", 2),
+            "expected 2 gap events (one bump each, not gap-size weighted):\n{text}"
+        );
+    }
+
+    #[test]
     fn session_ticket_gauge_counts_distinct_peers_and_is_idempotent() {
         let metrics = Metrics::new();
 
