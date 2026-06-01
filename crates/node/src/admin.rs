@@ -243,7 +243,7 @@ pub struct ReloadHook {
 impl AdminState {
     // A builder would be tidier but is deferred until the next
     // signature change forces a refactor — the existing call sites
-    // are few and each already passes every field by name.
+    // are few and each already lists every argument explicitly.
     //
     // The DHT introspection handles (issue #741) are attached via the
     // separate [`with_dht`](Self::with_dht) builder rather than as another
@@ -556,22 +556,28 @@ impl AdminRpcServer for AdminRpcImpl {
             us => Some(us),
         };
 
+        // These `usize → u64` conversions are widening (no truncation
+        // lint fires), but use `try_from` rather than `as` to stay
+        // uniform with the narrowing `u16::try_from` bucket conversions
+        // above and the workspace's prefer-`try_from` convention. The
+        // `unwrap_or(u64::MAX)` arms are unreachable on every supported
+        // target but keep the code panic-free by construction.
         Ok(StatusResponse {
             node_id: alloy::primitives::hex::encode(self.state.node_id),
             routing: RoutingHealth {
-                total_peers: total_peers as u64,
-                non_empty_buckets: buckets.len() as u64,
+                total_peers: u64::try_from(total_peers).unwrap_or(u64::MAX),
+                non_empty_buckets: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
                 buckets,
                 refresh_interval_s: dht.refresh_interval.as_secs(),
                 last_refresh_us: last_refresh,
             },
-            known_stakers: dht.staker_set.len() as u64,
+            known_stakers: u64::try_from(dht.staker_set.len()).unwrap_or(u64::MAX),
             record_store: RecordStoreHealth {
-                records: records as u64,
-                capacity: records_capacity as u64,
+                records: u64::try_from(records).unwrap_or(u64::MAX),
+                capacity: u64::try_from(records_capacity).unwrap_or(u64::MAX),
             },
             republish: RepublishHealth {
-                scheduled_records: dht.republish.len() as u64,
+                scheduled_records: u64::try_from(dht.republish.len()).unwrap_or(u64::MAX),
             },
         })
     }
