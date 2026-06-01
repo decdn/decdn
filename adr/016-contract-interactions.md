@@ -54,6 +54,7 @@ classDiagram
         +bond(amount)
         +declareMbps(mbps)
         +registerNode(nodeId, ...)
+        +requestUnbond(amount)
         +unbond()
         +slash()
         +declaredMbps(op)
@@ -697,7 +698,8 @@ Every state-mutating function that makes an external call is listed below with i
 | --- | --- | --- |
 | `bond(amount)` | `IERC20.safeTransferFrom()` (TOKEN bond deposit) | `nonReentrant`, `whenNotPaused`; `amount > 0`. The bond-curve coupling (`amount ≥ k × Mbps^α`) is not enforced at the contract layer in this revision. |
 | `declareMbps(mbps)` | None | `whenNotPaused`; declared capacity within `[minCapacityMbps, maxCapacityMbps]` (out-of-band reverts) |
-| `unbond()` | `IERC20.safeTransfer()` (TOKEN, after 14-day unbonding window) | `nonReentrant`, checks-effects-interactions; slashable during the unbonding window |
+| `requestUnbond(amount)` | `token.burn()` / `IERC20.safeTransfer()` via `_forfeitUnvestedCredit` (forfeits unvested Genesis Bond Credit to Treasury, or burns if no Treasury is wired) | `nonReentrant`, `whenNotPaused`, checks-effects-interactions (bond balance is finalized before the forfeit transfer); starts the 14-day unbonding window |
+| `unbond()` | `IERC20.safeTransfer()` (TOKEN; reclaims the unbonded amount after a prior `requestUnbond(amount)` once the 14-day window has elapsed) | `nonReentrant`, checks-effects-interactions; the bonded amount remains slashable throughout the unbonding window |
 | `slash(node, offenseType)` | None at slash time — the slashed TOKEN is moved into per-`slashId` escrow (`escrowedTotal`); distribution happens at finality. Stamps `slashedAtEpoch[op] = uint64(block.timestamp / EPOCH_LENGTH)` for the served-bytes voting-weight zero-out per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out). | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
 | `finalizeUnappealedSlash(slashId)` | `IERC20.safeTransfer()` (50% challenger), `token.burn()` (50%) — after the filing window with no appeal | `nonReentrant`, `whenNotPaused`; permissionless |
 | `markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted` | escrow lock / distribute 50-50 / refund operator + `clearSlashedAtEpoch` | `nonReentrant` (settle paths), `SLASH_APPEAL_ROLE` (held by `SlashAppeal`) |
