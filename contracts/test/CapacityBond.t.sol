@@ -62,19 +62,25 @@ contract CapacityBondTest is Test {
         token.approve(address(bond), type(uint256).max);
     }
 
-    /// @dev Bond enough to satisfy the ADR 026 § Capacity-bond curve coupling
-    ///      `activeBond >= bondRequired(mbps)` so `declareMbps(mbps)` passes the
-    ///      on-chain enforcement (issue #770). Tops the operator up from `admin`
-    ///      when the required bond exceeds the operator's current balance.
+    /// @dev Bring the operator's active bond up to exactly the ADR 026
+    ///      § Capacity-bond curve requirement `bondRequired(mbps)` so
+    ///      `declareMbps(mbps)` passes the on-chain enforcement (issue #770).
+    ///      Bonds only the deficit (and tops the operator up from `admin` only
+    ///      for that deficit), so the helper is idempotent and never overshoots
+    ///      — callers asserting "exactly at curve" boundaries stay precise even
+    ///      if the operator already holds bond.
     function _bondForMbps(uint256 mbps) internal {
         uint256 need = bond.bondRequired(mbps);
+        uint256 active = bond.activeBond(operator);
+        if (active >= need) return;
+        uint256 deficit = need - active;
         uint256 bal = token.balanceOf(operator);
-        if (bal < need) {
+        if (bal < deficit) {
             vm.prank(admin);
-            token.transfer(operator, need - bal);
+            token.transfer(operator, deficit - bal);
         }
         vm.prank(operator);
-        bond.bond(need);
+        bond.bond(deficit);
     }
 
     function test_firstBondedAt_setsOnFirstBond() public {
