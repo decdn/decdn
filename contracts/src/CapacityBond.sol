@@ -15,7 +15,7 @@ import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
-import { StakeMath } from "./StakeMath.sol";
+import { BondMath } from "./BondMath.sol";
 
 /// @title CapacityBond — operator-registry contract
 /// @notice Custodies operator TOKEN bond, executes the escrow-on-slash flow
@@ -29,9 +29,9 @@ import { StakeMath } from "./StakeMath.sol";
 ///         Credits), and is the source of `firstBondedAt` / `slashedAtEpoch`
 ///         for `DecdnGovernor`'s served-bytes voting weight per ADR 036.
 /// @dev    Renamed from `StakingRegistry` per ADR 026 v2.2 vocabulary. The
-///         stake / unstake / node-registry primitives are unchanged from the
+///         bond / unbond / node-registry primitives are unchanged from the
 ///         prior contract; this revision adds:
-///           - `firstBondedAt[op]`  — set on first successful `stake` (ADR 036)
+///           - `firstBondedAt[op]`  — set on first successful `bond` (ADR 036)
 ///           - `slashedAtEpoch[op]` — stamped in `slash()`, cleared by the
 ///                                    `settleAppealGranted` escrow hook on a
 ///                                    successful appeal (ADR 028 / 036)
@@ -114,8 +114,8 @@ contract CapacityBond is
     // Governable-parameter safety bounds
     // -----------------------------------------------------------------
 
-    uint256 internal constant MIN_STAKE_FLOOR = 10_000e18;
-    uint256 internal constant MIN_STAKE_CEILING = 1_000_000e18;
+    uint256 internal constant MIN_BOND_FLOOR = 10_000e18;
+    uint256 internal constant MIN_BOND_CEILING = 1_000_000e18;
 
     /// @notice Bounds on the governable declared-capacity band per ADR 026
     ///         § Capacity-bond curve, expressed in Mbps. `minCapacityMbps`
@@ -207,7 +207,7 @@ contract CapacityBond is
     uint64 public immutable genesisCreditWindowEnd;
 
     // -----------------------------------------------------------------
-    // Storage — staking
+    // Storage — bonding
     // -----------------------------------------------------------------
 
     struct UnbondingRequest {
@@ -215,14 +215,14 @@ contract CapacityBond is
         uint256 unlockAt;
     }
 
-    mapping(address operator => uint256 amount) public activeStake;
+    mapping(address operator => uint256 amount) public activeBond;
     mapping(address operator => UnbondingRequest) public unbondingOf;
     mapping(address operator => uint32) public lifetimeOffenseCount;
     mapping(address operator => bool) public ejected;
 
     /// @notice First-bond-time stamp per operator (ADR 036 § Formula —
-    ///         `age_ramp` numerator). Set once on the first `stake` call that
-    ///         lifts the operator's `activeStake` above zero; never overwritten.
+    ///         `age_ramp` numerator). Set once on the first `bond` call that
+    ///         lifts the operator's `activeBond` above zero; never overwritten.
     mapping(address operator => uint64) internal _firstBondedAt;
 
     /// @notice Encoded slash-epoch stamp: `0` means "never slashed in the
@@ -236,12 +236,12 @@ contract CapacityBond is
     /// @notice Operator-asserted serving capacity in Mbps (ADR 026
     ///         § Capacity-bond curve). `declareMbps` enforces the governable
     ///         `[minCapacityMbps, maxCapacityMbps]` band; the bond-curve
-    ///         coupling `activeStake ≥ k × Mbps^α` is not enforced at the
+    ///         coupling `activeBond ≥ k × Mbps^α` is not enforced at the
     ///         contract layer in this revision; downstream readers and the
     ///         Governor age-ramp do not depend on it.
     mapping(address operator => uint256) public declaredMbps;
 
-    uint256 public minStake;
+    uint256 public minBond;
     uint256 public unbondingPeriod;
 
     /// @notice Governable declared-capacity band (Mbps) enforced on
@@ -251,7 +251,7 @@ contract CapacityBond is
     uint256 public maxCapacityMbps;
 
     /// @notice Treasury destination for unvested Genesis Bond Credit forfeited
-    ///         by an operator who initiates `requestUnstake` before 24mo of
+    ///         by an operator who initiates `requestUnbond` before 24mo of
     ///         vesting (ADR 026 § Genesis Bond Credits — exit clause). If zero
     ///         at unbond time, forfeited credit is burned as a safe fallback.
     address public treasury;
@@ -298,7 +298,7 @@ contract CapacityBond is
     ///         by Treasury via `grantGenesisCredit` and decreases ONLY when the
     ///         unvested portion is slashed or forfeited on unbond. `claimed`
     ///         is the monotone cumulative amount the operator has pulled into
-    ///         `activeStake` via `claimVestedCredit`. The linear vest curve
+    ///         `activeBond` via `claimVestedCredit`. The linear vest curve
     ///         is computed on demand from `originalGrant × elapsed / 24mo`,
     ///         not stored — decoupling principal from the running balance
     ///         eliminates the mid-vest claim-acceleration bug that arises
@@ -340,7 +340,7 @@ contract CapacityBond is
         SlashStatus status; // slot 0: +1 = 29 bytes
         address challenger; // slot 1: 20 bytes — paid the 50% leg at finality
         uint64 appealWindowClose; // slot 1: +8 = 28 bytes
-        uint256 slashAmount; // slot 2: escrowed TOKEN amount (stake + credit)
+        uint256 slashAmount; // slot 2: escrowed TOKEN amount (bond + credit)
         uint256 creditPortion; // slot 3: the Genesis-credit share of slashAmount
     }
 
@@ -357,7 +357,7 @@ contract CapacityBond is
     ///         the watermark back to an older slash that still stands rather
     ///         than wrongly clearing it (ADR 036 § Slashing zero-out —
     ///         multi-slash). Expected to stay small in practice — a slash drops
-    ///         active stake (auto-ejecting below `minStake / 2`), so re-slashing
+    ///         active bond (auto-ejecting below `minBond / 2`), so re-slashing
     ///         costs the operator a fresh re-bond each cycle — but this is an
     ///         economic deterrent, not a hard cap; the recompute scan reads from
     ///         the tail and breaks at the first standing slash, so it is cheap
@@ -366,8 +366,8 @@ contract CapacityBond is
 
     /// @notice Sum of all TOKEN currently held in slash escrow (status
     ///         `Escrowed` or `AppealOpen`). Invariant anchor: the contract's
-    ///         TOKEN balance must cover `escrowedTotal` plus active stake,
-    ///         unbonding stake, and unclaimed Genesis credit. Incremented in
+    ///         TOKEN balance must cover `escrowedTotal` plus active bond,
+    ///         unbonding bond, and unclaimed Genesis credit. Incremented in
     ///         `slash()`, decremented at every terminal escrow transition.
     uint256 public escrowedTotal;
 
@@ -417,9 +417,9 @@ contract CapacityBond is
     // Events
     // -----------------------------------------------------------------
 
-    event Staked(address indexed operator, uint256 amount, uint256 newActiveStake);
-    event UnbondingRequested(address indexed operator, uint256 amount, uint256 unlockAt, uint256 newActiveStake);
-    event Unstaked(address indexed operator, uint256 amount);
+    event Bonded(address indexed operator, uint256 amount, uint256 newActiveBond);
+    event UnbondingRequested(address indexed operator, uint256 amount, uint256 unlockAt, uint256 newActiveBond);
+    event Unbonded(address indexed operator, uint256 amount);
     event Slashed(
         address indexed operator,
         address indexed challenger,
@@ -427,11 +427,11 @@ contract CapacityBond is
         uint32 lifetimeOffenseCount,
         uint256 slashAmount
     );
-    event AutoEjected(address indexed operator, uint256 remainingStake);
+    event AutoEjected(address indexed operator, uint256 remainingBond);
     event EjectedByBlacklist(address indexed operator);
     event Reinstated(address indexed operator);
     event SettlementRecorded(address indexed operator);
-    event MinStakeUpdated(uint256 oldValue, uint256 newValue);
+    event MinBondUpdated(uint256 oldValue, uint256 newValue);
     event UnbondingPeriodUpdated(uint256 oldValue, uint256 newValue);
     event MultiaddrUpdateCooldownUpdated(uint256 oldValue, uint256 newValue);
     event MaxMultiaddrSizeUpdated(uint256 oldValue, uint256 newValue);
@@ -451,7 +451,7 @@ contract CapacityBond is
     event NodeIdBound(address indexed ethAddress, bytes32 indexed nodeId, uint64 bindingNonce);
     event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
     event NodeDeregistered(bytes32 indexed nodeId);
-    event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
+    event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingBond);
     event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 
     // ADR 030 — region self-attestation.
@@ -487,7 +487,7 @@ contract CapacityBond is
     error ZeroAddress();
     error ZeroAmount();
     error ZeroNodeId();
-    error InsufficientStake(uint256 requested, uint256 available);
+    error InsufficientBond(uint256 requested, uint256 available);
     error UnbondingInProgress();
     error UnbondingNotComplete(uint256 unlockAt);
     error NoUnbondingRequest();
@@ -501,7 +501,7 @@ contract CapacityBond is
     error MultiaddrsTooLarge(uint256 size, uint256 ceiling);
     error MultiaddrCooldownActive(uint256 readyAt);
     error NodeNotActive();
-    error StakeBelowMinimum(uint256 stake, uint256 required);
+    error BondBelowMinimum(uint256 bond, uint256 required);
     error OperatorEjected();
     error NodeIdNotBound(bytes32 nodeId);
     error RegionHintTooLong(uint256 size, uint256 ceiling);
@@ -530,7 +530,7 @@ contract CapacityBond is
     /// @param token_                    TOKEN contract (must implement `burn`).
     /// @param ed25519Verifier_          Verifier for `registerNode` ed25519 proof.
     /// @param admin                     Initial `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE`.
-    /// @param minStake_                 Initial minimum active stake.
+    /// @param minBond_                  Initial minimum active bond.
     /// @param unbondingPeriod_          Initial unbonding period.
     /// @param multiaddrUpdateCooldown_  Initial multiaddr-update cooldown.
     /// @param maxMultiaddrSize_         Initial multiaddrs byte-length cap.
@@ -542,7 +542,7 @@ contract CapacityBond is
         ERC20Burnable token_,
         IEd25519Verifier ed25519Verifier_,
         address admin,
-        uint256 minStake_,
+        uint256 minBond_,
         uint256 unbondingPeriod_,
         uint256 multiaddrUpdateCooldown_,
         uint256 maxMultiaddrSize_,
@@ -552,7 +552,7 @@ contract CapacityBond is
         if (address(token_) == address(0) || address(ed25519Verifier_) == address(0) || admin == address(0)) {
             revert ZeroAddress();
         }
-        _enforceMinStakeBounds(minStake_);
+        _enforceMinBondBounds(minBond_);
         _enforceUnbondingPeriodBounds(unbondingPeriod_);
         _enforceMultiaddrCooldownBounds(multiaddrUpdateCooldown_);
         _enforceMaxMultiaddrSizeBounds(maxMultiaddrSize_);
@@ -566,7 +566,7 @@ contract CapacityBond is
 
         token = token_;
         ed25519Verifier = ed25519Verifier_;
-        minStake = minStake_;
+        minBond = minBond_;
         unbondingPeriod = unbondingPeriod_;
         multiaddrUpdateCooldown = multiaddrUpdateCooldown_;
         maxMultiaddrSize = maxMultiaddrSize_;
@@ -588,43 +588,43 @@ contract CapacityBond is
     }
 
     // -----------------------------------------------------------------
-    // Staking
+    // Bonding
     // -----------------------------------------------------------------
 
-    function stake(uint256 amount) external nonReentrant whenNotPaused {
+    function bond(uint256 amount) external nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         IERC20(address(token)).safeTransferFrom(msg.sender, address(this), amount);
-        uint256 oldBalance = activeStake[msg.sender];
+        uint256 oldBalance = activeBond[msg.sender];
         uint256 newBalance = oldBalance + amount;
-        activeStake[msg.sender] = newBalance;
+        activeBond[msg.sender] = newBalance;
 
-        // First-bond timestamp is set the moment the operator's `activeStake`
+        // First-bond timestamp is set the moment the operator's `activeBond`
         // becomes non-zero, never overwritten (ADR 036 § Formula).
         if (oldBalance == 0 && _firstBondedAt[msg.sender] == 0) {
             _firstBondedAt[msg.sender] = uint64(block.timestamp);
         }
 
-        if (ejected[msg.sender] && newBalance >= minStake) {
+        if (ejected[msg.sender] && newBalance >= minBond) {
             ejected[msg.sender] = false;
             emit Reinstated(msg.sender);
         }
 
-        emit Staked(msg.sender, amount, newBalance);
+        emit Bonded(msg.sender, amount, newBalance);
     }
 
-    function requestUnstake(uint256 amount) external nonReentrant whenNotPaused {
+    function requestUnbond(uint256 amount) external nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
-        if (amount > activeStake[msg.sender]) {
-            revert InsufficientStake({ requested: amount, available: activeStake[msg.sender] });
+        if (amount > activeBond[msg.sender]) {
+            revert InsufficientBond({ requested: amount, available: activeBond[msg.sender] });
         }
         if (unbondingOf[msg.sender].amount != 0) revert UnbondingInProgress();
 
-        // CEI: finalize stake state BEFORE the external token operations in
+        // CEI: finalize bond state BEFORE the external token operations in
         // `_forfeitUnvestedCredit` (token.burn / safeTransfer). The token is
         // the protocol's own ERC20Burnable so reentrancy isn't real, but
         // ordering this way satisfies slither's reentrancy-no-eth detector
         // and keeps the contract robust against a future TOKEN swap.
-        activeStake[msg.sender] -= amount;
+        activeBond[msg.sender] -= amount;
         uint256 unlockAt = block.timestamp + unbondingPeriod;
         unbondingOf[msg.sender] = UnbondingRequest({ amount: amount, unlockAt: unlockAt });
 
@@ -632,7 +632,7 @@ contract CapacityBond is
         // forfeits any unvested credit to Treasury (burn if no Treasury wired).
         _forfeitUnvestedCredit(msg.sender);
 
-        emit UnbondingRequested(msg.sender, amount, unlockAt, activeStake[msg.sender]);
+        emit UnbondingRequested(msg.sender, amount, unlockAt, activeBond[msg.sender]);
     }
 
     /// @dev Transfers the unvested portion of `operator`'s Genesis Bond Credit
@@ -668,7 +668,7 @@ contract CapacityBond is
         }
     }
 
-    function unstake() external nonReentrant whenNotPaused {
+    function unbond() external nonReentrant whenNotPaused {
         UnbondingRequest memory req = unbondingOf[msg.sender];
         if (req.amount == 0) revert NoUnbondingRequest();
         // forge-lint: disable-next-line(block-timestamp)
@@ -676,14 +676,14 @@ contract CapacityBond is
 
         delete unbondingOf[msg.sender];
         IERC20(address(token)).safeTransfer(msg.sender, req.amount);
-        emit Unstaked(msg.sender, req.amount);
+        emit Unbonded(msg.sender, req.amount);
     }
 
     /// @notice Self-attest serving capacity in Mbps (ADR 026 § Capacity-bond
     ///         curve). The declaration must fall within the governable
     ///         `[minCapacityMbps, maxCapacityMbps]` band — out-of-band values
     ///         revert (the band is validated, not silently coerced to a
-    ///         bound). The bond-curve coupling against `activeStake` is not
+    ///         bound). The bond-curve coupling against `activeBond` is not
     ///         enforced at the contract layer in this revision.
     function declareMbps(uint256 mbps) external whenNotPaused {
         if (mbps < minCapacityMbps || mbps > maxCapacityMbps) {
@@ -781,8 +781,8 @@ contract CapacityBond is
     }
 
     /// @notice Move the currently-claimable portion (curve - alreadyClaimed)
-    ///         from `pendingCredit` into the caller's `activeStake`. Gated on
-    ///         `activeStake > 0 && !ejected` plus an unexpired slash-zero-out
+    ///         from `pendingCredit` into the caller's `activeBond`. Gated on
+    ///         `activeBond > 0 && !ejected` plus an unexpired slash-zero-out
     ///         window: while `currentEpoch < slashedAtEpoch +
     ///         claimSlashGateEpochs`, the claim reverts. Once the window
     ///         elapses (or `slashedAtEpoch` is cleared by a successful
@@ -793,7 +793,7 @@ contract CapacityBond is
     ///         the economic intent without requiring node-registry tests
     ///         to mint EIP-712 signatures.)
     function claimVestedCredit() external nonReentrant whenNotPaused {
-        if (activeStake[msg.sender] == 0 || ejected[msg.sender]) revert NotActiveForClaim(msg.sender);
+        if (activeBond[msg.sender] == 0 || ejected[msg.sender]) revert NotActiveForClaim(msg.sender);
         // Only block while the operator is still inside their slash zero-out
         // window — past that, the claim is unblocked (closes the lock-out-
         // forever bug from the prior `!= 0` check). The window length is
@@ -818,15 +818,15 @@ contract CapacityBond is
         PendingCredit storage pc = _pendingCredit[msg.sender];
         pc.claimed = uint128(uint256(pc.claimed) + claimable);
 
-        uint256 oldBalance = activeStake[msg.sender];
+        uint256 oldBalance = activeBond[msg.sender];
         uint256 newBalance = oldBalance + claimable;
-        activeStake[msg.sender] = newBalance;
+        activeBond[msg.sender] = newBalance;
         if (oldBalance == 0 && _firstBondedAt[msg.sender] == 0) {
             _firstBondedAt[msg.sender] = uint64(block.timestamp);
         }
 
         emit GenesisCreditClaimed(msg.sender, claimable);
-        emit Staked(msg.sender, claimable, newBalance);
+        emit Bonded(msg.sender, claimable, newBalance);
     }
 
     /// @notice Sentinel `grantedAt` value used by `_forfeitUnvestedCredit`
@@ -891,8 +891,8 @@ contract CapacityBond is
         if (regionHintLength > MAX_REGION_HINT_BYTES) {
             revert RegionHintTooLong({ size: regionHintLength, ceiling: MAX_REGION_HINT_BYTES });
         }
-        if (activeStake[msg.sender] < minStake) {
-            revert StakeBelowMinimum({ stake: activeStake[msg.sender], required: minStake });
+        if (activeBond[msg.sender] < minBond) {
+            revert BondBelowMinimum({ bond: activeBond[msg.sender], required: minBond });
         }
         if (ejected[msg.sender]) revert OperatorEjected();
         if (_nodes[msg.sender].active) revert NodeAlreadyRegistered();
@@ -1034,12 +1034,12 @@ contract CapacityBond is
 
         // ADR 026 § Genesis Bond Credits — the full at-risk pending credit
         // pool (`originalGrant - claimed`, covering BOTH unvested and
-        // vested-but-unclaimed) is added to the stake-slash amount and
+        // vested-but-unclaimed) is added to the bond-slash amount and
         // escrowed under the SAME terms as voluntary bond (C1 fix + the
         // vested-unclaimed loophole closure).
         uint256 creditSlash = _slashPendingCreditAtTier(operator, tierBps);
-        uint256 stakeSlash = _reduceStakeAtTier(operator, tierBps);
-        totalSlash = stakeSlash + creditSlash;
+        uint256 bondSlash = _reduceBondAtTier(operator, tierBps);
+        totalSlash = bondSlash + creditSlash;
         // Escrow-on-slash (ADR 028): nothing is transferred or burned here.
         // The slashed TOKEN stays in this contract under `_slashRecords` until
         // `finalizeUnappealedSlash` (no appeal) or a `SLASH_APPEAL_ROLE` settle
@@ -1051,18 +1051,18 @@ contract CapacityBond is
         _stampSlash(operator, challenger, offenseType, totalSlash, newCount);
     }
 
-    /// @dev Reduce active + unbonding stake at `tierBps` (active first, then
-    ///      unbonding, per ADR 003), writing back the balances `StakeMath`
+    /// @dev Reduce active + unbonding bond at `tierBps` (active first, then
+    ///      unbonding, per ADR 003), writing back the balances `BondMath`
     ///      derives. The arithmetic — including the defensive clip that caps a
     ///      >100%-of-at-risk tier (C2 fix; the current ladder maxes at 50%) —
-    ///      lives in [`StakeMath.reduceAtTier`](StakeMath.sol) so it can be
+    ///      lives in [`BondMath.reduceAtTier`](BondMath.sol) so it can be
     ///      unit-tested without a full-contract harness.
-    function _reduceStakeAtTier(address operator, uint256 tierBps) internal returns (uint256 slashAmount) {
+    function _reduceBondAtTier(address operator, uint256 tierBps) internal returns (uint256 slashAmount) {
         uint256 newActive;
         uint256 newUnbonding;
         (slashAmount, newActive, newUnbonding) =
-            StakeMath.reduceAtTier(activeStake[operator], unbondingOf[operator].amount, tierBps);
-        activeStake[operator] = newActive;
+            BondMath.reduceAtTier(activeBond[operator], unbondingOf[operator].amount, tierBps);
+        activeBond[operator] = newActive;
         unbondingOf[operator].amount = newUnbonding;
     }
 
@@ -1072,8 +1072,8 @@ contract CapacityBond is
     ///      AND the vested-but-unclaimed portion. Slashing both closes the
     ///      loophole where an operator could shield earned credit from
     ///      slashing simply by delaying `claimVestedCredit` calls. Already-
-    ///      claimed credit lives in `activeStake` and is slashed by
-    ///      `_reduceStakeAtTier`, so the two functions partition the at-risk
+    ///      claimed credit lives in `activeBond` and is slashed by
+    ///      `_reduceBondAtTier`, so the two functions partition the at-risk
     ///      pool with no double-counting. `originalGrant` is reduced by the
     ///      slashed amount so the operator's future curve naturally shrinks.
     function _slashPendingCreditAtTier(address operator, uint256 tierBps) internal returns (uint256 slashed) {
@@ -1085,12 +1085,12 @@ contract CapacityBond is
         uint256 atRisk = originalGrant - claimed;
         // slither-disable-next-line divide-before-multiply
         slashed = (atRisk * tierBps) / BPS_DENOMINATOR;
-        // Defensive clip, symmetric with `_reduceStakeAtTier`'s C2 cap: the
+        // Defensive clip, symmetric with `_reduceBondAtTier`'s C2 cap: the
         // slashed amount can never exceed the at-risk pool. A no-op for the
         // immutable tier ladder (≤ 50%), but if a future tier constant is ever
         // set above 100% this keeps `escrowedTotal` from booking more credit
         // than was actually removed (which would later underflow a
-        // distribute/burn). INVARIANT: the stake leg and credit leg together
+        // distribute/burn). INVARIANT: the bond leg and credit leg together
         // never exceed the operator's at-risk balances.
         if (slashed > atRisk) slashed = atRisk;
         // slither-disable-next-line incorrect-equality
@@ -1128,8 +1128,8 @@ contract CapacityBond is
         emit SlashEscrowed(slashId, operator, totalSlashAmount, windowClose);
     }
 
-    /// @dev Stamp `slashedAtEpoch`, fire auto-eject if post-slash active stake
-    ///      falls below `minStake / 2`, and emit `Slashed`. Under escrow-on-
+    /// @dev Stamp `slashedAtEpoch`, fire auto-eject if post-slash active bond
+    ///      falls below `minBond / 2`, and emit `Slashed`. Under escrow-on-
     ///      slash no TOKEN moves here — distribution happens at finality.
     function _stampSlash(address operator, address challenger, uint8 offenseType, uint256 totalSlash, uint32 newCount)
         internal
@@ -1144,13 +1144,13 @@ contract CapacityBond is
         emit Slashed(operator, challenger, offenseType, newCount, totalSlash);
     }
 
-    /// @dev Auto-eject if post-slash active stake fell below minStake/2.
+    /// @dev Auto-eject if post-slash active bond fell below minBond/2.
     function _maybeAutoEject(address operator) internal {
-        if (activeStake[operator] >= (minStake / 2) || ejected[operator]) return;
+        if (activeBond[operator] >= (minBond / 2) || ejected[operator]) return;
         ejected[operator] = true;
         bytes32 nodeId = _ejectNodeEffects(operator);
-        emit AutoEjected(operator, activeStake[operator]);
-        if (nodeId != bytes32(0)) emit NodeAutoEjected(nodeId, activeStake[operator]);
+        emit AutoEjected(operator, activeBond[operator]);
+        if (nodeId != bytes32(0)) emit NodeAutoEjected(nodeId, activeBond[operator]);
     }
 
     // -----------------------------------------------------------------
@@ -1229,12 +1229,12 @@ contract CapacityBond is
         // (`grantedAt` is untouched, so the vest curve resumes) rather than
         // refunded as liquid TOKEN — a wrongly-slashed operator is made exactly
         // whole, not handed accelerated credit (ADR 028 §7). The TOKEN backing
-        // it never left the contract. Only the stake portion is refunded liquid.
+        // it never left the contract. Only the bond portion is refunded liquid.
         if (creditPortion != 0) {
             _pendingCredit[operator].originalGrant += uint128(creditPortion);
         }
-        uint256 stakePortion = refund - creditPortion;
-        if (stakePortion != 0) IERC20(address(token)).safeTransfer(operator, stakePortion);
+        uint256 bondPortion = refund - creditPortion;
+        if (bondPortion != 0) IERC20(address(token)).safeTransfer(operator, bondPortion);
         emit SlashReversed(slashId, operator, refund);
     }
 
@@ -1296,7 +1296,7 @@ contract CapacityBond is
             emit EjectedByBlacklist(operator);
             bytes32 nodeId = _ejectNodeEffects(operator);
             if (nodeId != bytes32(0)) {
-                emit NodeAutoEjected(nodeId, activeStake[operator]);
+                emit NodeAutoEjected(nodeId, activeBond[operator]);
             }
         }
     }
@@ -1314,11 +1314,11 @@ contract CapacityBond is
     // Governance setters
     // -----------------------------------------------------------------
 
-    function setMinStake(uint256 newMinStake) external onlyRole(GOVERNANCE_ROLE) {
-        _enforceMinStakeBounds(newMinStake);
-        uint256 oldMinStake = minStake;
-        minStake = newMinStake;
-        emit MinStakeUpdated(oldMinStake, newMinStake);
+    function setMinBond(uint256 newMinBond) external onlyRole(GOVERNANCE_ROLE) {
+        _enforceMinBondBounds(newMinBond);
+        uint256 oldMinBond = minBond;
+        minBond = newMinBond;
+        emit MinBondUpdated(oldMinBond, newMinBond);
     }
 
     /// @notice Set the floor of the declared-capacity band (ADR 026
@@ -1427,20 +1427,20 @@ contract CapacityBond is
     }
 
     // -----------------------------------------------------------------
-    // Views — stake / governor surface
+    // Views — bond / governor surface
     // -----------------------------------------------------------------
 
-    function stakeOf(address operator) external view returns (uint256) {
-        return activeStake[operator];
+    function bondOf(address operator) external view returns (uint256) {
+        return activeBond[operator];
     }
 
-    function getStakeMultiple(address operator) external view returns (uint256) {
-        return activeStake[operator] / minStake;
+    function getBondMultiple(address operator) external view returns (uint256) {
+        return activeBond[operator] / minBond;
     }
 
     function isActive(address operator) public view returns (bool) {
         // slither-disable-next-line incorrect-equality
-        return _nodes[operator].active && activeStake[operator] >= minStake && unbondingOf[operator].amount == 0
+        return _nodes[operator].active && activeBond[operator] >= minBond && unbondingOf[operator].amount == 0
             && !ejected[operator];
     }
 
@@ -1553,9 +1553,9 @@ contract CapacityBond is
     // Internal helpers — parameter bounds
     // -----------------------------------------------------------------
 
-    function _enforceMinStakeBounds(uint256 value) internal pure {
-        if (value < MIN_STAKE_FLOOR || value > MIN_STAKE_CEILING) {
-            revert ParamOutOfBounds({ value: value, floor: MIN_STAKE_FLOOR, ceiling: MIN_STAKE_CEILING });
+    function _enforceMinBondBounds(uint256 value) internal pure {
+        if (value < MIN_BOND_FLOOR || value > MIN_BOND_CEILING) {
+            revert ParamOutOfBounds({ value: value, floor: MIN_BOND_FLOOR, ceiling: MIN_BOND_CEILING });
         }
     }
 

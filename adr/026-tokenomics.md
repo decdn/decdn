@@ -119,7 +119,7 @@ Bootstrap supply-side incentive is funded externally via $1M+ pre-seed USDC capi
 
 ### Capacity-bond curve
 
-Every operator must bond TOKEN proportional to the bandwidth capacity it declares. The bond is the only TOKEN-side requirement on operators — no separate flat minimum stake, no optional lock for additional yield.
+Every operator must bond TOKEN proportional to the bandwidth capacity it declares. The bond is the only TOKEN-side requirement on operators — no separate flat minimum bond, no optional lock for additional yield.
 
 **Bond formula.**
 
@@ -149,9 +149,9 @@ The super-linear curve makes high-capacity operators pay more per Mbps. At α=1.
 
 **Bond lifecycle.**
 
-- `CapacityBond.register(declaredMbps)` deposits the bond and emits `CapacityClaimed(operator, Mbps)`. Declared capacity is operator-self-attested; it is not verified at registration. Vote weight, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), is sourced from `FeeRouter.bytesInWindow` (proven delivered bytes), not from declared capacity, so over-declaration does not translate into governance influence; the bond cost is the primary structural disincentive against tier inflation.
-- Declared capacity must fall within `[MIN_CAPACITY_PER_OPERATOR, MAX_CAPACITY_PER_OPERATOR]`: `register(declaredMbps)` reverts on a declaration below the floor or above the ceiling (the band is validated, not silently coerced to a bound), so every registered slot carries at least `bond_required(MIN_CAPACITY_PER_OPERATOR)` of slashable bond.
-- Re-registration at a different tier is permitted at any time, subject to the same `bond_required(declaredMbps)` deposit/refund.
+- `CapacityBond.bond(amount)` deposits the bond (emitting `Bonded`) and `CapacityBond.declareMbps(declaredMbps)` self-attests capacity (emitting `MbpsDeclared`). Declared capacity is operator-self-attested; it is not verified at registration. Vote weight, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), is sourced from `FeeRouter.bytesInWindow` (proven delivered bytes), not from declared capacity, so over-declaration does not translate into governance influence; the bond cost is the primary structural disincentive against tier inflation.
+- Declared capacity must fall within `[MIN_CAPACITY_PER_OPERATOR, MAX_CAPACITY_PER_OPERATOR]`: `declareMbps(declaredMbps)` reverts on a declaration below the floor or above the ceiling (the band is validated, not silently coerced to a bound), so every registered slot carries at least `bond_required(MIN_CAPACITY_PER_OPERATOR)` of slashable bond.
+- Changing tiers is permitted at any time by re-calling `declareMbps(newMbps)`; raising bond uses `bond(...)`, lowering it uses `requestUnbond(amount)` + `unbond()` subject to the 14-day unbonding window — there is no atomic `register`-style deposit/refund on the shipped surface.
 - **Unbonding window: 14 days, slashable during unbonding.** Sized to exceed the [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) 5-day `SlashJudge` evidence-presentation window with a 9-day safety margin so misbehavior detected just before unbond initiation still has bond available to slash; the `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is enforced as a paired cross-parameter check on the `SlashJudge` and `CapacityBond` setters per [ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period).
 
 **Supply impact across scale scenarios.**
@@ -224,7 +224,7 @@ Exact normalization, minimum thresholds, and per-operator caps are open question
 
 **Vesting.** 24 months from TGE, linear by epoch. Vest accrues only if the operator is `isActive(op) && !isSlashed(op)` during the epoch. No minimum bytes-delivered threshold — non-delivery is already handled by the existing slashing pipeline.
 
-**Slashing.** The full at-risk pending-credit pool (`originalGrant − claimed`, covering BOTH the unvested portion AND any vested-but-unclaimed portion) is slashable on the same terms as the operator's voluntary bond. Slashing the vested-but-unclaimed portion closes the loophole where an operator could shield earned credit from slashing by delaying `claimVestedCredit`. Slashed credit joins the stake-slash total in escrow-on-slash and is distributed / refunded at finality per [§ Slashing and burn](#slashing-and-burn). Credit already *claimed* into `activeStake` is slashed by the stake-reduction path instead (the two partition the at-risk pool with no double-counting); this is reflected in [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
+**Slashing.** The full at-risk pending-credit pool (`originalGrant − claimed`, covering BOTH the unvested portion AND any vested-but-unclaimed portion) is slashable on the same terms as the operator's voluntary bond. Slashing the vested-but-unclaimed portion closes the loophole where an operator could shield earned credit from slashing by delaying `claimVestedCredit`. Slashed credit joins the bond-slash total in escrow-on-slash and is distributed / refunded at finality per [§ Slashing and burn](#slashing-and-burn). Credit already *claimed* into `activeBond` is slashed by the bond-reduction path instead (the two partition the at-risk pool with no double-counting); this is reflected in [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
 
 **Exit before 24mo.** On voluntary unbond, the vested portion follows the standard 14-day unbonding window; the unvested portion is transferred back to the operational Treasury via the existing Treasury reference. The grant is one-shot per operator — an exited operator who re-registers does not recover the forfeited unvested portion.
 
@@ -256,7 +256,7 @@ Group 4 (19% / 190M TOKEN) funds demand-side adoption — publishers serving con
 
 **Auto-ejection.** At 50% of minimum bond for the operator's declared tier.
 
-**Escrow-on-slash.** The slashed TOKEN is **held in escrow by `CapacityBond`** — not distributed at slash time. `slash()` reduces the operator's `activeStake`/unbonding/unclaimed-credit and books the total into a per-`slashId` escrow record (stamping `slashedAtEpoch` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) and auto-ejecting as above), but transfers nothing. The escrow resolves at finality:
+**Escrow-on-slash.** The slashed TOKEN is **held in escrow by `CapacityBond`** — not distributed at slash time. `slash()` reduces the operator's `activeBond`/unbonding/unclaimed-credit and books the total into a per-`slashId` escrow record (stamping `slashedAtEpoch` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) and auto-ejecting as above), but transfers nothing. The escrow resolves at finality:
 
 - **No appeal** — once the 30-day filing window lapses, anyone may call the permissionless `finalizeUnappealedSlash(slashId)`, which distributes the escrow **50% challenger / 50% burn**.
 - **Appeal succeeds** (operator was wrongly slashed) — the full escrowed amount is **refunded to the operator** (their own TOKEN, no USDC conversion, no restitution cap) and the `slashedAtEpoch` zero-out is cleared. No standing reserve is needed because restitution is just returning the operator's own escrowed capital.
@@ -330,7 +330,7 @@ The voting set is narrow at launch (likely <50 operators in the first 6–12 mon
 
 ### Operator economics
 
-**Bond is the only TOKEN-side requirement.** No separate flat minimum stake, no optional lock for additional yield.
+**Bond is the only TOKEN-side requirement.** No separate flat minimum bond, no optional lock for additional yield.
 
 **Revenue streams.**
 

@@ -42,10 +42,10 @@ pub struct ResolvedBlockchain {
     /// `DECDN_KEYSTORE_PASSWORD` env var, then this file, then prompts on
     /// stdin if connected to a TTY.
     pub keystore_password_file: Option<PathBuf>,
-    /// `StablePaymentChannel` contract address.
+    /// `PaymentChannel` contract address.
     pub payment_channel_address: String,
-    /// `StakingRegistry` contract address.
-    pub staking_registry_address: String,
+    /// `CapacityBond` contract address.
+    pub capacity_bond_address: String,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `slash_sig` signatures (ADR 014). Required (no default).
     pub slash_judge_address: String,
@@ -56,6 +56,20 @@ pub struct ResolvedBlockchain {
     /// watchdog entirely; otherwise the resolver enforces a minimum (see
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC`).
     pub rpc_watchdog_interval_sec: u64,
+    /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the seller
+    /// settlement path submits an on-chain `withdraw` (#327). Defaults to
+    /// 1 USDC (`1_000_000` `µUSDC`) when unset.
+    pub redeem_threshold_micro_usdc: u64,
+    /// Deposit (base units, `µUSDC`) used when the buyer path opens a new
+    /// `PaymentChannel` against an upstream provider on a cache miss (#744).
+    /// Defaults to 10 USDC (`10_000_000` `µUSDC`); clamped up to the on-chain
+    /// `minDeposit` floor at open time.
+    pub buyer_deposit_micro_usdc: u64,
+    /// Whether the buyer path issues a one-time max USDC approval for the
+    /// `PaymentChannel` contract at startup (#744, ADR 003 § Deposit
+    /// Economics). Defaults to `true`; set `false` to manage the allowance
+    /// out-of-band (e.g. a tighter per-channel approval policy).
+    pub buyer_max_approve: bool,
 }
 
 /// Resolved cache fields.
@@ -346,7 +360,7 @@ pub struct ResolvedSecurity {
 /// CLI flag > config file > built-in default.
 ///
 /// Required fields that have no default (`rpc_url`,
-/// `payment_channel_address`, `staking_registry_address`) cause
+/// `payment_channel_address`, `capacity_bond_address`) cause
 /// [`super::resolve_config`] to return an error if not provided.
 #[derive(Debug)]
 pub struct ResolvedConfig {

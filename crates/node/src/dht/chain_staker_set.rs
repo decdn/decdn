@@ -1,8 +1,8 @@
 //! Chain-backed [`StakerSet`] implementation.
 //!
-//! Reads the active-staker set from `StakingRegistry.getActiveNodes()`
+//! Reads the active-staker set from `CapacityBond.getActiveNodes()`
 //! at startup, filters each entry through `isActive(operator)` to apply
-//! the full predicate (registered + stake ≥ minStake + no unbonding +
+//! the full predicate (registered + bond ≥ minBond + no unbonding +
 //! not ejected; the `getActiveNodes` page is the un-filtered
 //! `_registeredAddrs` array per the contract's own comment), then runs
 //! a background task that follows the six membership-mutating events
@@ -12,11 +12,11 @@
 //!
 //! - ADR 022 §STORE Flow: the receiver checks `holder` is in the
 //!   cached active-staker set populated from
-//!   `StakingRegistry.getActiveNodes()`.
+//!   `CapacityBond.getActiveNodes()`.
 //! - ADR 019 § Step 3.3: bootstrap pattern (initial paginated
 //!   `getActiveNodes` + event subscription).
 //! - The event set this watcher follows is grounded in
-//!   `StakingRegistry.sol`'s own write-paths — every contract write
+//!   `CapacityBond.sol`'s own write-paths — every contract write
 //!   that flips the canonical `isActive` predicate is mirrored by an
 //!   event here.
 //!
@@ -58,7 +58,7 @@ use tracing::{debug, info, warn};
 
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::{StakerChange, StakerSet};
-use decdn_incentive::staking_registry::StakingRegistry;
+use decdn_incentive::capacity_bond::CapacityBond;
 
 /// Page size for the initial paginated `getActiveNodes` read.
 /// Matches ADR 019 § Step 3.3's worked-example limit.
@@ -100,14 +100,14 @@ impl ChainStakerSet {
     where
         P: Provider + Clone + 'static,
     {
-        let registry = StakingRegistry::new(registry_addr, provider);
+        let registry = CapacityBond::new(registry_addr, provider);
         let initial = bootstrap_active_set(&registry).await.with_context(|| {
-            format!("paginated getActiveNodes from StakingRegistry at {registry_addr}")
+            format!("paginated getActiveNodes from CapacityBond at {registry_addr}")
         })?;
         info!(
             active_count = initial.len(),
             %registry_addr,
-            "ChainStakerSet bootstrap from StakingRegistry complete"
+            "ChainStakerSet bootstrap from CapacityBond complete"
         );
 
         let (changes_tx, _) = broadcast::channel(CHANGES_CHANNEL_CAPACITY);
@@ -184,7 +184,7 @@ impl Drop for AbortOnDrop {
 /// strict active set. Returns an error if any RPC call fails — the
 /// runtime cannot bootstrap the DHT without a complete picture.
 async fn bootstrap_active_set<P>(
-    registry: &StakingRegistry::StakingRegistryInstance<P>,
+    registry: &CapacityBond::CapacityBondInstance<P>,
 ) -> Result<HashSet<NodeId>>
 where
     P: Provider + Clone,
@@ -217,7 +217,7 @@ where
 }
 
 /// Background event-subscription loop. Subscribes to the six relevant
-/// `StakingRegistry` events and updates the cached active set on each
+/// `CapacityBond` events and updates the cached active set on each
 /// observation. On stream failure (transport error, RPC timeout), the
 /// loop restarts the subscriptions with exponential backoff.
 ///
@@ -228,7 +228,7 @@ where
 /// (e.g. `Reinstated` arrived but `isActive` is false due to a more
 /// recent unbonding), the canonical `isActive` value wins.
 async fn watcher_loop<P>(
-    registry: StakingRegistry::StakingRegistryInstance<P>,
+    registry: CapacityBond::CapacityBondInstance<P>,
     active: Arc<RwLock<HashSet<NodeId>>>,
     changes_tx: broadcast::Sender<StakerChange>,
 ) where
@@ -263,7 +263,7 @@ async fn watcher_loop<P>(
 /// failure.
 #[allow(clippy::cognitive_complexity)] // 6-arm event-dispatch loop is fundamentally complex; splitting obscures the dispatch table
 async fn run_watcher_once<P>(
-    registry: &StakingRegistry::StakingRegistryInstance<P>,
+    registry: &CapacityBond::CapacityBondInstance<P>,
     active: &Arc<RwLock<HashSet<NodeId>>>,
     changes_tx: &broadcast::Sender<StakerChange>,
 ) -> Result<()>
@@ -271,7 +271,7 @@ where
     P: Provider + Clone,
 {
     // EjectedByBlacklist is deliberately NOT subscribed: every
-    // `StakingRegistry.ejectNode` call emits both `EjectedByBlacklist`
+    // `CapacityBond.ejectNode` call emits both `EjectedByBlacklist`
     // (operator-indexed) and `NodeAutoEjected` (nodeId-indexed) for
     // any operator that has a bound nodeId. The nodeId variant lets
     // us update the active set without a follow-up `nodeIdOf` RPC, so
@@ -358,7 +358,7 @@ where
 /// invariant says binding precedes activation.
 #[allow(clippy::cognitive_complexity)] // Tracing macros inflate complexity; the function body is straight-line resolve + decide + apply
 async fn apply_operator_change<P>(
-    registry: &StakingRegistry::StakingRegistryInstance<P>,
+    registry: &CapacityBond::CapacityBondInstance<P>,
     active: &Arc<RwLock<HashSet<NodeId>>>,
     changes_tx: &broadcast::Sender<StakerChange>,
     operator: Address,

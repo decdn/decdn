@@ -56,7 +56,9 @@ blacklist updates and stop being able to settle channels. Once
 - Existing alerts in `monitoring/prometheus-alerts.yml`:
   - `DecdnBlacklistSyncLagWarning` — blacklist poll lagging > 10 minutes.
   - `DecdnBlacklistSyncLagCritical` — blacklist sync stale > 30 minutes
-    (every served hash is now potentially slashable).
+    (every served hash is now potentially slashable). **Note:** these two
+    blacklist alerts cannot fire yet — the node emits no blacklist-sync
+    metrics; see [ContentBlacklist compliance](#contentblacklist-compliance).
 - Direct probe:
 
   ```bash
@@ -80,8 +82,10 @@ blacklist updates and stop being able to settle channels. Once
 2. For Arbitrum testnet, fall back to a public RPC
    (`https://sepolia-rollup.arbitrum.io/rpc`) — rate-limited; for production,
    use a paid provider.
-3. After recovery, confirm `decdn_blacklist_sync_lag_seconds` returns to
-   baseline before considering the incident closed.
+3. After recovery, confirm RPC reachability is restored before considering the
+   incident closed. (The `decdn_blacklist_sync_lag_seconds` gauge that would
+   track this is not emitted by the node yet — see
+   [ContentBlacklist compliance](#contentblacklist-compliance).)
 
 ## Slashing risk
 
@@ -107,7 +111,9 @@ blacklist updates and stop being able to settle channels. Once
   - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
     stale; serving any recently blacklisted hash is now slashable.
   - `DecdnBlacklistVersionFarBehind` (critical) — multiple blacklist
-    versions missed.
+    versions missed. (Both blacklist alerts above are pre-wired but not yet
+    emitted by the node — see
+    [ContentBlacklist compliance](#contentblacklist-compliance).)
   - `DecdnRateBoundsClamp` (warning) — `rate_per_mb` outside governance
     bounds; not directly slashable but indicates configuration drift.
 - Grafana: the slash-safety row in `monitoring/grafana-dashboard.json`.
@@ -136,6 +142,118 @@ blacklist updates and stop being able to settle channels. Once
 4. **For self-detected exposure (`DecdnSlashEvidenceExposure`):** stop the
    node immediately and file a bug — this signals a code-path defect, not an
    operator misconfiguration.
+
+## ContentBlacklist compliance
+
+**Symptoms:** governance or a regional body has published a blocked BLAKE3
+hash on-chain via `ContentBlacklist`, and this node may still be caching,
+announcing, or serving it. Serving a globally blocked hash is a slashable
+offense (see [Slashing risk](#slashing-risk)). Protocol semantics:
+[ADR 011](../adr/011-content-takedown.md),
+[ADR 031](../adr/031-content-blacklist-appeals-contract.md).
+
+**How a node is meant to learn about a blocked hash.**
+[ADR 011 § Node Behavior](../adr/011-content-takedown.md#node-behavior)
+*designs* a sync loop: poll `getBlacklistVersion()` on `blacklist_poll_interval`
+(10 minutes), fetch the new entries on a version bump, then **in order** stop
+publishing DHT records, stop serving (`StreamRequest` → `HashBlacklisted`), and
+evict. **None of this is implemented at PoC, on either side.** The deployed
+`ContentBlacklist` exposes no `getBlacklistVersion()` accessor (so even the
+delta-sync query the ADR assumes would need a contract change), and the node
+has no blacklist watcher in `crates/`. The `decdn_blacklist_sync_lag_seconds` /
+`decdn_blacklist_version_behind` metrics and their alerts exist in
+`monitoring/prometheus-alerts.yml` (and the sync-lag panel in the Grafana
+dashboard) but are **not emitted by the node** (the same situation as
+`decdn_streams_active` — pre-wired ahead of the implementation). Until both land, hash-level takedown is a
+**manual operator action** — see Remediate below.
+
+Operator-*level* blacklisting is different and **is** enforced today: when
+governance calls `ContentBlacklist.addOperator`, the contract calls
+`CapacityBond.ejectNode`, which emits both `EjectedByBlacklist` and a
+nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
+`NodeAutoEjected` and drops the node from its active set live; the
+`EjectedByBlacklist` event is deliberately not subscribed because
+`NodeAutoEjected` already carries the nodeId (see
+`crates/node/src/dht/chain_staker_set.rs`). No operator action is required.
+
+**Detect:**
+
+- Alerts in `monitoring/prometheus-alerts.yml` (verbatim names) — **note
+  these will not fire until the node emits the underlying metrics**:
+  - `DecdnBlacklistSyncLagWarning` — blacklist poll lagging > 10 minutes.
+  - `DecdnBlacklistSyncLagCritical` — sync stale > 30 minutes (every served
+    hash is now potentially slashable).
+  - `DecdnBlacklistVersionFarBehind` — multiple blacklist versions missed.
+- Manual on-chain check (works today): query `ContentBlacklist` directly with
+  the hash from the takedown notice — `isHashBlacklisted(hash)` for global
+  entries, `isHashBlacklistedInRegion(hash, region)` for a regional entry. The
+  `region` argument is `bytes32`, not a string: global scope is the sentinel
+  `bytes32("GLOBAL")` (with `cast`, pass the literal `GLOBAL` right-padded to
+  32 bytes). `getHashEntry(region, hash)` returns the raw `(addedAt, suspended)`
+  that the slashing predicate reads.
+
+**Remediate:**
+
+1. **Purge the blob.** Evict it from this node's cache:
+
+   ```bash
+   decdn node evict <hash> --dry-run   # pre-flight: size, pin status,
+                                       # already-evicted flag — no mutation
+   decdn node evict <hash>             # durable logical eviction
+   ```
+
+   The eviction is *logical*: it is recorded in `<cache_dir>/evicted.log`
+   (durable across `decdn-node run` restarts) and blocks subsequent serves;
+   the underlying bytes are reclaimed by the next GC sweep (`#518`,
+   `cache.gc_interval_sec`). `--dry-run` is the pre-flight check before a
+   DMCA/takedown action — confirm you have the right blob and catch a pinned
+   hash or an idempotent re-run.
+
+2. **There is no grace window at PoC — evict the moment you learn of a global
+   entry.** [ADR 011 § Compliance Window](../adr/011-content-takedown.md#compliance-window)
+   specifies a 24-hour (2-hour emergency) buffer after `effectiveAt`, but the
+   deployed contracts implement neither: a `ContentBlacklist` entry carries only
+   `addedAt` (no `effectiveAt`), and `SlashJudge` treats blacklist violations as
+   **global-only** at PoC and slashes any delivery whose signed response
+   timestamp is strictly after the entry's `addedAt` — a delivery timestamped at
+   `addedAt` itself is not slashable — see `_checkBlacklistedBefore` in
+   `contracts/src/SlashJudge.sol`. Practical consequences:
+   - Slash exposure today comes **only from global** (`bytes32("GLOBAL")`)
+     entries. A regional-only entry is a legal/compliance obligation but is not
+     slashable until regional scope is wired (the PoC deferral is noted in
+     `contracts/src/SlashJudge.sol`, citing ADR 014 § Blacklist violation).
+   - Treat any global entry as effective immediately; do not rely on the ADR's
+     24h/2h buffer, which is not enforced.
+   - An entry under active appeal (`suspended == true`) is not slashable —
+     `isHashBlacklisted` returns `false` and `SlashJudge` rejects the challenge —
+     but `addedAt` is preserved when the suspension clears, so re-evict before
+     serving again.
+
+3. **If you believe the entry is wrong, appeal it — don't just keep serving.**
+   `openBlacklistAppeal(hash, region, evidenceBundleHash, standingPath)` opens an
+   appeal against an `appealBond` deposit (governance-set; testnet deploy default
+   **100 TOKEN**, bounds `[50, 5000]`) within a 14-day filing window from
+   `addedAt`. The emergency multisig (`EMERGENCY_MULTISIG_ROLE`) fast-tracks —
+   suspending the entry for interim relief — or rejects; DecdnGovernor
+   (`GOVERNANCE_ROLE`) then ratifies the removal or reverses. Bond outcomes in
+   the deployed contract: **refunded only on ratification**; **burned on
+   rejection, reversal, and lapse** (`cleanupExpiredBlacklistAppeal`). PoC
+   caveats vs. the ADR 011/031 design: any non-zero `region` is appealable
+   (global included — the regional-only restriction is not enforced), and the
+   declared `standingPath` (`Publisher`/`Operator`/`TokenHolder`) is **recorded
+   but not verified** — standing enforcement and the synthetic-standing clawback
+   are deferred. Global entries also remain removable via the slow-path
+   DecdnGovernor `removeHashGlobal` override. Design intent:
+   [ADR 011 § Blacklist Entry Appeals](../adr/011-content-takedown.md#blacklist-entry-appeals),
+   [ADR 031](../adr/031-content-blacklist-appeals-contract.md).
+
+4. **A slash you already took is a separate matter.** Appealing the blacklist
+   *entry* (step 3) removes the entry; it does **not** refund a slash you
+   already incurred for serving the hash. Restitution for the slash itself —
+   e.g. you were offline during the window — is the
+   [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own
+   bond and evidence rules. Operational-failure evidence is inadmissible on
+   the content-policy path and vice versa.
 
 ## Gossip / peer table degraded
 

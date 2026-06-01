@@ -28,7 +28,7 @@ contract CapacityBondRegionE2ETest is Test {
 
     address internal admin = address(0xA11CE);
 
-    uint256 internal constant MIN_STAKE = 50_000e18;
+    uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING = 7 days;
     uint256 internal constant REGION_WINDOW = 7 days;
     uint256 internal constant APPEAL_BOND = 100e18;
@@ -69,7 +69,7 @@ contract CapacityBondRegionE2ETest is Test {
             token_: token,
             ed25519Verifier_: verifier,
             admin: admin,
-            minStake_: MIN_STAKE,
+            minBond_: MIN_BOND,
             unbondingPeriod_: UNBONDING,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
@@ -92,7 +92,7 @@ contract CapacityBondRegionE2ETest is Test {
     ///         node becomes active. Proves the off-chain signing harness and the
     ///         on-chain verifier agree on the `registerNode` ownership digest.
     function test_registerNode_realEd25519Signature_succeeds() public {
-        _stakeAndRegister();
+        _bondAndRegister();
 
         assertTrue(bond.isActive(REG_OPERATOR));
         assertTrue(bond.isActiveNode(REG_NODE_ID));
@@ -104,7 +104,7 @@ contract CapacityBondRegionE2ETest is Test {
     ///         registration path and not rubber-stamping any 64-byte blob.
     function test_registerNode_corruptEd25519Signature_reverts() public {
         vm.prank(REG_OPERATOR);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         bytes memory bindingSig = _signBindNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID);
 
         // Flip one byte of the otherwise-valid signature.
@@ -127,7 +127,7 @@ contract CapacityBondRegionE2ETest is Test {
     ///         window elapses the call succeeds and re-snapshots. Asserts the
     ///         `RegionUpdated` payload on both successful calls.
     function test_updateRegion_cooldownPrevSnapshotAndEvent() public {
-        _stakeAndRegister();
+        _bondAndRegister();
 
         // First update — no cooldown (regionLastChanged == 0 branch).
         vm.expectEmit(true, false, false, true, address(bond));
@@ -168,7 +168,7 @@ contract CapacityBondRegionE2ETest is Test {
     ///         ed25519 layer): replaying the original signature in a fresh
     ///         registration now reverts `InvalidEd25519Signature`.
     function test_registerNode_replayAfterNonceBump_reverts() public {
-        _stakeAndRegister();
+        _bondAndRegister();
 
         vm.prank(REG_OPERATOR);
         bond.deregisterNode();
@@ -201,7 +201,7 @@ contract CapacityBondRegionE2ETest is Test {
     ///         today. So this covers the only cross-contract eject path that
     ///         exists: the blacklist-driven one. See the note on issue #689.
     function test_crossContractEject_viaContentBlacklist() public {
-        _stakeAndRegister();
+        _bondAndRegister();
 
         ContentBlacklist blacklist = new ContentBlacklist(bond, token, admin, APPEAL_BOND);
         // Cache the role getter before pranking: a nested external call inside
@@ -231,11 +231,11 @@ contract CapacityBondRegionE2ETest is Test {
     // Helpers
     // ----------------------------------------------------------------------
 
-    /// @dev Stake the minimum and register `REG_NODE_ID` with a fresh EIP-712
+    /// @dev Bond the minimum and register `REG_NODE_ID` with a fresh EIP-712
     ///      binding signature and the generated ed25519 ownership signature.
-    function _stakeAndRegister() internal {
+    function _bondAndRegister() internal {
         vm.prank(REG_OPERATOR);
-        bond.stake(MIN_STAKE);
+        bond.bond(MIN_BOND);
         bytes memory bindingSig = _signBindNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID);
         vm.prank(REG_OPERATOR);
         bond.registerNode(REG_NODE_ID, hex"", "us-east", bindingSig, REG_ED25519_SIG);

@@ -232,6 +232,16 @@ pub struct DecdnMetrics {
     /// retries the tail. Operator-visible name:
     /// `decdn_dht_batch_store_hashes_deferred_rate_limit_total`.
     pub dht_batch_store_hashes_deferred_rate_limit: Counter,
+    /// Accepted vouchers whose nonce skipped one or more values past the
+    /// previously-accepted nonce (`voucher.nonce > last_nonce + 1`), counted
+    /// once per gapped voucher (#747). The voucher is still accepted —
+    /// vouchers are cumulative, so on-chain settlement is unaffected — but a
+    /// non-zero rate flags dropped vouchers (per-voucher deliveries the node
+    /// never billed) or a client resetting/forking its counter (a replay-probe
+    /// signal). The precise skipped-count rides the paired `tracing::warn!` in
+    /// `ChannelState::apply_voucher`. Operator-visible name:
+    /// `decdn_voucher_nonce_gaps_total`.
+    pub voucher_nonce_gaps: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -354,6 +364,13 @@ impl Metrics {
     /// before signing (ADR 005 §Rate bounds validation).
     pub fn rate_bounds_clamped(&self) {
         self.decdn.rate_bounds_clamp_events.inc();
+    }
+
+    /// An accepted voucher skipped one or more nonce values past
+    /// `last_nonce + 1` (#747). Counted once per gapped voucher; the precise
+    /// skip count rides the paired `tracing::warn!` in `apply_voucher`.
+    pub fn voucher_nonce_gap(&self) {
+        self.decdn.voucher_nonce_gaps.inc();
     }
 
     pub fn connection_opened(&self) {
@@ -878,6 +895,34 @@ mod tests {
         assert!(has_metric_line(&text, "decdn_quic_0rtt_attempts_total", 2));
         assert!(has_metric_line(&text, "decdn_quic_0rtt_accepted_total", 1));
         assert!(has_metric_line(&text, "decdn_quic_0rtt_rejected_total", 1));
+    }
+
+    #[test]
+    fn voucher_nonce_gap_metric_starts_at_zero_and_increments() {
+        // #747. The struct field is `voucher_nonce_gaps`; the OpenMetrics
+        // encoder appends `_total`, so the exported name is
+        // `decdn_voucher_nonce_gaps_total` — the operator-visible name the
+        // `apply_voucher` docs and any alert reference. Asserting the suffixed
+        // form locks it in: re-naming the field to include `_total` would emit
+        // `..._total_total` (the same footgun the cache GC counters guard
+        // against above). The counter is event-scoped — `voucher_nonce_gap()`
+        // bumps it once per gapped voucher regardless of gap size — so two
+        // calls must read exactly 2.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_voucher_nonce_gaps_total", 0),
+            "voucher nonce-gap counter should be exposed at zero on a fresh registry:\n{text}"
+        );
+
+        metrics.voucher_nonce_gap();
+        metrics.voucher_nonce_gap();
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_voucher_nonce_gaps_total", 2),
+            "expected 2 gap events (one bump each, not gap-size weighted):\n{text}"
+        );
     }
 
     #[test]

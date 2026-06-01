@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Payment channels, staking, and voucher management for deCDN"
+description = "Payment channels, bonding, and voucher management for deCDN"
 
 [dependencies]
 decdn-common = { workspace = true }
@@ -24,6 +24,12 @@ zeroize = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 tempfile = { workspace = true }
+# Property-based tests for EIP-712 voucher round-trips (`src/voucher.rs`,
+# `src/client_bridge.rs`): the full-U256 nonce/amount keyspace with boundary
+# values (0, u64::MAX, U256::MAX) heavily over-sampled, exercising sign/recover
+# and the wire bridge against silent truncation. Mirrors the `proptest` usage in
+# the `node` DHT routing tests (#748).
+proptest = { workspace = true }
 
 [lints]
 workspace = true

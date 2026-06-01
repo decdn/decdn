@@ -21,7 +21,7 @@ interface ISlashJudge {
         Blacklist
     }
 
-    /// @notice Emitted on every slash that reduces operator stake. `slashId` is
+    /// @notice Emitted on every slash that reduces operator bond. `slashId` is
     ///         the globally-monotonic id minted by `CapacityBond.slash`;
     ///         `evidenceHash` is `keccak256` over the per-offense canonical
     ///         preimage (prefixed by `uint8(offenseType)`). Consumed by

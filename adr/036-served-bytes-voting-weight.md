@@ -5,7 +5,7 @@
 
 ## Context
 
-DAO voting weight could be keyed on declared capacity — `declared_capacity_Mbps × age_ramp(months_bonded)`, sourced from `CapacityBond.capacityAt × age_ramp` — but declared capacity is operator-asserted at registration time and only loosely tied to actual delivery. A deeply-bonded but lightly-serving operator would then carry a vote weight that does not reflect their real contribution to the network.
+DAO voting weight could be keyed on declared capacity — `declared_capacity_Mbps × age_ramp(months_bonded)`, sourced from `CapacityBond.declaredMbps × age_ramp` — but declared capacity is operator-asserted at registration time and only loosely tied to actual delivery. A deeply-bonded but lightly-serving operator would then carry a vote weight that does not reflect their real contribution to the network.
 
 The on-chain raw material to fix this already exists. [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter) populates `bytesPerEpoch[operator][epoch]` inline on every `routeSettlement`. This ADR makes that counter the canonical voting-weight source.
 
@@ -51,7 +51,7 @@ On any slash invocation (`CapacityBond.slash`), `CapacityBond` stamps `slashedAt
 
 On a **granted** slash appeal via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `grantAppeal` path (the path that determines the operator was wrongly slashed), `SlashAppeal` calls `CapacityBond.settleAppealGranted`, which refunds the escrowed TOKEN and **recomputes** `slashedAtEpoch[op]` (the internal `_recomputeSlashedAtEpoch`), clearing it to zero only when no slash stands. An **upheld** appeal (`upholdAppeal` / `rejectAppeal`) leaves the field stamped — the slash stands.
 
-**Multi-slash watermark semantics.** `slashedAtEpoch[op]` is a single scalar but represents the **max epoch among the operator's still-standing slashes** — those NOT in the `Reversed` state (`Escrowed` / `AppealOpen` / `Upheld` all still stand). Because slashes are minted in non-decreasing epoch order, a new slash always raises the watermark to its own epoch. A granted appeal marks one record `Reversed` and re-derives the watermark as the max epoch over the operator's remaining non-`Reversed` records, clearing to zero only if none remain. This closes the multi-outstanding-slash hole where granting the appeal of one slash (e.g. the most recent) would otherwise clear the watermark while an *earlier* slash still stands — wrongly restoring vote weight and `claimVestedCredit` eligibility for the unresolved slash. The re-derivation scans the operator's own slash records; the per-operator record list is bounded in practice because a slashed operator auto-ejects below `minStake / 2`.
+**Multi-slash watermark semantics.** `slashedAtEpoch[op]` is a single scalar but represents the **max epoch among the operator's still-standing slashes** — those NOT in the `Reversed` state (`Escrowed` / `AppealOpen` / `Upheld` all still stand). Because slashes are minted in non-decreasing epoch order, a new slash always raises the watermark to its own epoch. A granted appeal marks one record `Reversed` and re-derives the watermark as the max epoch over the operator's remaining non-`Reversed` records, clearing to zero only if none remain. This closes the multi-outstanding-slash hole where granting the appeal of one slash (e.g. the most recent) would otherwise clear the watermark while an *earlier* slash still stands — wrongly restoring vote weight and `claimVestedCredit` eligibility for the unresolved slash. The re-derivation scans the operator's own slash records; the per-operator record list is bounded in practice because a slashed operator auto-ejects below `minBond / 2`.
 
 This is one storage slot per operator on `CapacityBond` and one read on every vote-cast. It restores the immediate-vote-removal-on-slash signal that the bytes window alone cannot deliver (an active operator who is slashed today would otherwise continue voting with their accumulated window bytes for up to N weeks).
 
@@ -94,7 +94,7 @@ function _getVotes(address op, uint256 timepoint, bytes memory) override returns
 
 `quorum(t)` and `proposalThreshold(t)` use `feeRouter.totalBytesInWindow(epoch(t), windowEpochs)` × 4% / 0.1% respectively. The capped-and-ramped total weight (not raw bytes) is the strictly correct denominator, but is O(active_operators × N) to compute; the Governor uses the unramped, uncapped total bytes as a tractable upper bound and accepts the resulting quorum / threshold conservativeness.
 
-`CapacityBond.totalVotingWeightAt(ts)` is no longer consumed by the Governor under this ADR. The getter remains on the contract surface — deprecated — so existing off-chain readers continue to function; flagged for removal in the next contract revision.
+The shipped `CapacityBond` exposes no `totalVotingWeightAt(ts)` aggregate getter. Under this ADR the Governor derives total voting weight from FeeRouter epoch accounting (`totalBytesInWindow`), not from a CapacityBond aggregate read.
 
 `IVotes`/IERC-5805 is not used: voting weight is derived from FeeRouter epoch accounting, not from per-account checkpoint structures, so `GovernorVotes` / `GovernorVotesQuorumFraction` are unused.
 
@@ -130,7 +130,7 @@ Defended by `age_ramp`. A fresh operator who bonds at `t=0` and serves the entir
 
 ### Slashed-but-still-voting
 
-Defended by the slashing zero-out. Without zero-out, a slashed operator continues voting with their accumulated window bytes for up to N weeks. With zero-out, slashing immediately revokes vote weight for the remainder of the window. This is a tighter response than a `capacityAt × age_ramp` mechanism, which would only reduce vote weight by the bond-reduction ratio.
+Defended by the slashing zero-out. Without zero-out, a slashed operator continues voting with their accumulated window bytes for up to N weeks. With zero-out, slashing immediately revokes vote weight for the remainder of the window. This is a tighter response than a `declaredMbps × age_ramp` mechanism, which would only reduce vote weight by the bond-reduction ratio.
 
 ### Concentration
 
@@ -143,13 +143,13 @@ The per-operator cap (`voteCapBps`, default 5%) is the primary concentration def
 - **Voting weight tracks demonstrated network contribution.** An operator who isn't serving has no vote; an operator who is serving heavily has weight proportional to that service (up to the cap).
 - **Reuses existing on-chain accounting.** No new fundamental data flow; `bytesPerEpoch` is already populated. Marginal contract surface is two integer mappings, one trailing-sum helper, one tenure-ramp lookup.
 - **Strengthens skin-in-the-game story.** Combined with [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)'s per-byte operator payment, governance influence and economic upside both scale with actual delivery.
-- **Slashing-zero-out tightens response time.** Slash → immediate vote zero, recovers naturally over `windowEpochs`. Cleaner than a capacityAt-proportional reduction.
+- **Slashing-zero-out tightens response time.** Slash → immediate vote zero, recovers naturally over `windowEpochs`. Cleaner than a declared-capacity-proportional reduction.
 
 ### Negative
 
 - **Wash-trading is bounded but not zero-cost prevented.** ~40% of attacker-paid USDC is forfeit per cycle (burn + treasury + safety legs). At cap floor (1%) and default parameters, attacker cost is non-trivial but not unaffordable. See [§ Threat Model — Wash-trading](#wash-trading-as-vote-buying).
 - **Vote weight is more volatile than capacity-weighted weight.** A heavy traffic week ramps an operator's vote in days; a quiet quarter decays it out. Governance proposers cannot assume a fixed voting set; quorum computations must re-read the FeeRouter window state.
-- **`CapacityBond.totalVotingWeightAt(ts)` becomes dead surface.** Deprecated for one revision, removed in the next. Indexers that read this getter must rebase to the FeeRouter-derived total.
+- **No on-chain aggregate vote-weight getter.** `CapacityBond` exposes no `totalVotingWeightAt(ts)`; indexers and dashboards must compute totals from the FeeRouter-derived window (`totalBytesInWindow`) rather than a single contract read.
 - **`FeeRouter` migration becomes a governance-snapshot reset.** `epochLength` is constructor-immutable per [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns), so any future `FeeRouter` migration starts with empty `bytesPerEpoch`; vote weight resets to zero for all operators until traffic refills the window. Operational consideration, not a soundness concern — the existing `FeeRouter` migration path already requires state migration.
 - **Indexer / off-chain reader impact.** Dashboards tracking `Settled` events need to add a running `totalBytesPerEpoch` aggregate to mirror the contract's new global counter. Minor.
 

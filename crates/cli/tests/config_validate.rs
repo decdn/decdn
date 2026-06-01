@@ -32,14 +32,14 @@ region = "us"
 [blockchain]
 rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
 payment_channel_address = "0x0000000000000000000000000000000000000001"
-staking_registry_address = "0x0000000000000000000000000000000000000002"
+capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
 "#;
 
 const MISSING_RPC: &str = r#"
 [blockchain]
 payment_channel_address = "0x0000000000000000000000000000000000000001"
-staking_registry_address = "0x0000000000000000000000000000000000000002"
+capacity_bond_address = "0x0000000000000000000000000000000000000002"
 "#;
 
 fn unknown_var_config(var_name: &str) -> String {
@@ -48,7 +48,7 @@ fn unknown_var_config(var_name: &str) -> String {
 [blockchain]
 rpc_url = "${{{var_name}}}"
 payment_channel_address = "0x0000000000000000000000000000000000000001"
-staking_registry_address = "0x0000000000000000000000000000000000000002"
+capacity_bond_address = "0x0000000000000000000000000000000000000002"
 "#
     )
 }
@@ -145,7 +145,7 @@ fn validate_fails_when_config_flag_points_at_missing_file() -> anyhow::Result<()
 const MULTI_ERROR: &str = r#"
 [blockchain]
 payment_channel_address = "0x0000000000000000000000000000000000000001"
-staking_registry_address = "0x0000000000000000000000000000000000000002"
+capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
 
 [cache]
@@ -243,8 +243,11 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             eth_keystore: PathBuf::from("/var/lib/decdn/keystore.json"),
             keystore_password_file: None,
             payment_channel_address: "0x0000000000000000000000000000000000000001".to_string(),
-            staking_registry_address: "0x0000000000000000000000000000000000000002".to_string(),
+            capacity_bond_address: "0x0000000000000000000000000000000000000002".to_string(),
             rpc_watchdog_interval_sec: 30,
+            redeem_threshold_micro_usdc: 1_000_000,
+            buyer_deposit_micro_usdc: 10_000_000,
+            buyer_max_approve: true,
             slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
             chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
         },
