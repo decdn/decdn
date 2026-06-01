@@ -152,25 +152,57 @@ contract ContentBlacklistTest is Test {
         assertEq(supplyBefore - token.totalSupply(), APPEAL_BOND);
     }
 
-    function test_regionalCap_blocksMoreThanThreeActiveAppeals() public {
+    /// @notice M-1 — the per-region concurrent cap counts only FAST-TRACKED
+    ///         appeals (the ones holding interim relief), not Open ones. Open
+    ///         filings no longer crowd out others, but simultaneous suspensions
+    ///         per region stay bounded.
+    function test_regionalCap_countsFastTrackedNotOpen() public {
         // Seed 4 hashes in REGION_US.
         for (uint256 i = 0; i < 4; i++) {
             vm.prank(regionalBody);
             blacklist.addHashRegional(REGION_US, bytes32(i + 1));
         }
-        // Open 3 appeals — all succeed.
-        for (uint256 i = 0; i < 3; i++) {
+        // Open 4 appeals — ALL succeed: Open appeals do not charge the cap.
+        uint256[4] memory ids;
+        for (uint256 i = 0; i < 4; i++) {
             vm.prank(filer);
-            blacklist.openBlacklistAppeal(
+            ids[i] = blacklist.openBlacklistAppeal(
                 bytes32(i + 1), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
             );
         }
-        // 4th must hit cap.
+        // Fast-track 3 — each charges the per-region relief cap.
+        for (uint256 i = 0; i < 3; i++) {
+            vm.prank(multisig);
+            blacklist.fastTrackBlacklistAppeal(ids[i]);
+        }
+        // The 4th fast-track hits the cap.
+        vm.prank(multisig);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.RegionalCapHit.selector, REGION_US, uint256(3)));
+        blacklist.fastTrackBlacklistAppeal(ids[3]);
+    }
+
+    /// @notice H-2 — re-adding a hash while an appeal is live must revert
+    ///         rather than silently un-suspend and orphan the in-flight appeal
+    ///         (and reset the slash-eligibility boundary).
+    function test_addHash_revertsWhileAppealActive() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        vm.expectRevert();
-        blacklist.openBlacklistAppeal(
-            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
-        );
+        uint256 appealId =
+            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+
+        // Re-add blocked while the appeal is live.
+        vm.prank(regionalBody);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.HashHasActiveAppeal.selector, REGION_US, SAMPLE_HASH));
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+
+        // Once the appeal terminates, the re-add is allowed again.
+        vm.prank(multisig);
+        blacklist.rejectBlacklistAppeal(appealId);
+        assertFalse(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
     }
 
     /// @notice T-3 — concurrent appeals on the same (region, hash) revert.
