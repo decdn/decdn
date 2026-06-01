@@ -812,6 +812,31 @@ contract CapacityBondTest is Test {
         assertEq(bond.alphaWad(), 1.2e18);
     }
 
+    /// @dev Locks the documented `setK`/`setAlpha` ordering hazard: each setter
+    ///      validates the 1 Gbps tier against the *live* other coefficient, so a
+    ///      valid target pair can be unreachable in the wrong order. Target
+    ///      (k=180, α=1.0) ⇒ 1 Gbps = 180_000 TOKEN (in range), but k-first
+    ///      passes through (k=180, α=1.2) ⇒ ~716K TOKEN (over the 200K ceiling).
+    function test_setKAlpha_orderingMatters() public {
+        vm.startPrank(admin);
+
+        // k-first reverts at the out-of-range intermediate (k=180, α=1.2).
+        uint256 badIntermediate = BondMath.bondRequired(1000, 180e18, 1.2e18);
+        vm.expectRevert(
+            abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, badIntermediate, 10_000e18, 200_000e18)
+        );
+        bond.setK(180e18);
+
+        // α-first reaches the same target pair: each step stays in range.
+        bond.setAlpha(1e18); // (k=12.6, α=1.0) ⇒ 12_600 TOKEN
+        bond.setK(180e18); // (k=180, α=1.0) ⇒ 180_000 TOKEN
+        vm.stopPrank();
+
+        assertEq(bond.kConstant(), 180e18);
+        assertEq(bond.alphaWad(), 1e18);
+        assertApproxEqRel(bond.bondRequired(1000), 180_000e18, 0.001e18);
+    }
+
     function test_declareMbps_emitsOldAndNewValue() public {
         _bondForMbps(500);
         vm.startPrank(operator);
