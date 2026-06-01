@@ -9,7 +9,7 @@
 //! - `getActiveNodes` returns `_registeredAddrs` unfiltered (the
 //!   contract's own comment at its definition documents this); callers
 //!   must combine with `isActive(operator)` for the strict
-//!   "registered AND stake ≥ minStake AND no unbonding AND not ejected"
+//!   "registered AND bond ≥ minBond AND no unbonding AND not ejected"
 //!   predicate.
 //! - `nodeIdOf` returns `(bytes32 nodeId, bool active)` where the bool
 //!   is the full `isActive` predicate, not a separate "registered"
@@ -56,8 +56,8 @@ mod sol_types {
             // View functions (only those consumed by the node runtime)
             // -----------------------------------------------------------------
 
-            /// Full active-staker predicate: registered AND
-            /// `activeStake ≥ minStake` AND no unbonding request in
+            /// Full active-bonder predicate: registered AND
+            /// `activeBond ≥ minBond` AND no unbonding request in
             /// flight AND not ejected.
             function isActive(address operator) external view returns (bool);
 
@@ -70,7 +70,7 @@ mod sol_types {
 
             /// Paginated snapshot of `_registeredAddrs` — every
             /// operator with a current registration, **NOT** filtered
-            /// for stake / unbonding / ejection. Callers combine with
+            /// for bond / unbonding / ejection. Callers combine with
             /// `isActive(operator)` to get the strict active set.
             function getActiveNodes(uint256 offset, uint256 limit) external view returns (NodeInfo[] memory);
 
@@ -95,15 +95,15 @@ mod sol_types {
             event NodeDeregistered(bytes32 indexed nodeId);
 
             /// Node deactivated by `slash` or `ejectNode` dropping
-            /// stake below `minStake / 2`. `nodeId`-indexed.
-            event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
+            /// bond below `minBond / 2`. `nodeId`-indexed.
+            event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingBond);
 
             /// Node deactivated by `ContentBlacklist`-role caller.
             /// **Operator-indexed** — translate via `nodeIdOf`.
             event EjectedByBlacklist(address indexed operator);
 
-            /// Previously ejected operator brought stake back to
-            /// `minStake` via `stake()`. **Operator-indexed** —
+            /// Previously ejected operator brought bond back to
+            /// `minBond` via `bond()`. **Operator-indexed** —
             /// translate via `nodeIdOf`.
             event Reinstated(address indexed operator);
 
@@ -115,7 +115,7 @@ mod sol_types {
                 address indexed operator,
                 uint256 amount,
                 uint256 unlockAt,
-                uint256 newActiveStake
+                uint256 newActiveBond
             );
         }
     }

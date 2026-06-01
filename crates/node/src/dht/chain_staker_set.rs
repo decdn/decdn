@@ -2,7 +2,7 @@
 //!
 //! Reads the active-staker set from `CapacityBond.getActiveNodes()`
 //! at startup, filters each entry through `isActive(operator)` to apply
-//! the full predicate (registered + stake ≥ minStake + no unbonding +
+//! the full predicate (registered + bond ≥ minBond + no unbonding +
 //! not ejected; the `getActiveNodes` page is the un-filtered
 //! `_registeredAddrs` array per the contract's own comment), then runs
 //! a background task that follows the six membership-mutating events

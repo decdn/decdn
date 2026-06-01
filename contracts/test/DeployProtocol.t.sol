@@ -56,7 +56,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             initialTokenHolder: initialTokenHolder,
             challengerIncentivePool: challengerPool,
             timelockDelay: 48 hours,
-            minStake: 50_000e18,
+            minBond: 50_000e18,
             unbondingPeriod: 14 days,
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,

@@ -195,7 +195,7 @@ alloy::sol! {
 
     #[sol(rpc)]
     contract CapacityBondWrite {
-        function stake(uint256 amount) external;
+        function bond(uint256 amount) external;
         function registerNode(
             bytes32 nodeId,
             bytes multiaddrs,
@@ -334,15 +334,15 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     let pc_settle = PaymentChannel::new(payment_channel, admin.clone());
     let fee_view = FeeRouterView::new(fee_router, node_provider.clone());
 
-    // ---- 4. Activate the node operator: stake + registerNode → isActive.
-    let min_stake: U256 = "50000000000000000000000".parse()?; // 50_000e18 (deploy default)
+    // ---- 4. Activate the node operator: bond + registerNode → isActive.
+    let min_bond: U256 = "50000000000000000000000".parse()?; // 50_000e18 (deploy default)
     token_erc20
-        .approve(capacity_bond, min_stake)
+        .approve(capacity_bond, min_bond)
         .send()
         .await?
         .get_receipt()
         .await?;
-    bond.stake(min_stake).send().await?.get_receipt().await?;
+    bond.bond(min_bond).send().await?.get_receipt().await?;
 
     // Binding signature: eth key over EIP-712 BindNodeId(nodeId, nonce=0).
     let bind_domain = bind_node_id_domain(CHAIN_ID, capacity_bond);
