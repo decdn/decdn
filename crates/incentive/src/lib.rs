@@ -1,6 +1,6 @@
 //! Incentive layer for deCDN.
 //!
-//! Manages off-chain USDC payment channels, staking interactions via
+//! Manages off-chain USDC payment channels, bonding interactions via
 //! `CapacityBond`, and voucher lifecycle (creation, validation,
 //! on-chain settlement).
 //!
