@@ -5,7 +5,7 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import { ERC20Permit } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 
-/// @title deCDN governance / staking TOKEN
+/// @title deCDN governance / bonding TOKEN
 /// @notice Fixed-supply (1B) ERC20 with permit and burn. The entire supply is
 ///         minted to `initialHolder` in the constructor and is the only TOKEN
 ///         that will ever exist — there is no mint path post-genesis, no
@@ -15,7 +15,7 @@ import { ERC20Permit } from "@openzeppelin/contracts/token/ERC20/extensions/ERC2
 ///             consumed by the slashing path's 20% burn leg
 ///             (ADR 026 § Slashing and burn).
 ///           - `ERC20Permit`: EIP-2612 gasless approvals. Used by
-///             `CapacityBond.stake` so operators can sign approval +
+///             `CapacityBond.bond` so operators can sign approval +
 ///             state-changing call as a single user op (ADR 024 § ERC-4337
 ///             path).
 ///

@@ -11,8 +11,8 @@ pragma solidity 0.8.28;
 ///         concrete contract. This interface declares only the cross-contract
 ///         read entrypoints other contracts in the system need to know about.
 interface ICapacityBond {
-    /// @notice Timestamp at which the operator's `activeStake` first became
-    ///         non-zero — set by the first `stake()` call that lifts the
+    /// @notice Timestamp at which the operator's `activeBond` first became
+    ///         non-zero — set by the first `bond()` call that lifts the
     ///         balance above zero, or by `claimVestedCredit()` if a Genesis
     ///         Bond Credit claim is the first thing to activate the operator.
     ///         Never overwritten by subsequent re-bonds. Source of the
@@ -35,11 +35,11 @@ interface ICapacityBond {
     ///         to validate appeals against a specific slash without trusting
     ///         the appellant's `operator` parameter (ADR 028 § Contract
     ///         surface — closes the unverified-operator hole).
-    /// @return operator The operator whose stake (and pending credit, if any)
+    /// @return operator The operator whose bond (and pending credit, if any)
     ///                  was slashed.
     /// @return slashedAt `block.timestamp` of the slash transaction (cast to
     ///                  `uint64`).
-    /// @return slashAmount Combined active-stake + unvested-credit amount
+    /// @return slashAmount Combined active-bond + unvested-credit amount
     ///                    slashed at this `slashId`.
     function slashRecords(uint256 slashId)
         external
