@@ -893,11 +893,13 @@ fn write_status(w: &mut impl io::Write, s: &StatusResponse, now_us: u64) -> io::
     if s.routing.buckets.is_empty() {
         return writeln!(w, "(routing table empty — no buckets populated)");
     }
+    // Capacity is the same K for every bucket — carried once on RoutingHealth.
+    let capacity = s.routing.bucket_capacity;
     writeln!(w)?;
     writeln!(w, "{:<8} {:<8} FILL%", "BUCKET", "FILL")?;
     for b in &s.routing.buckets {
-        let fill = format!("{}/{}", b.fill, b.capacity);
-        let pct = percent(u64::from(b.fill), u64::from(b.capacity));
+        let fill = format!("{}/{capacity}", b.fill);
+        let pct = percent(u64::from(b.fill), u64::from(capacity));
         writeln!(w, "{:<8} {fill:<8} {pct}", b.index)?;
     }
     Ok(())
@@ -915,8 +917,10 @@ fn percent(num: u64, den: u64) -> String {
 }
 
 /// Format a whole-second interval as a coarse human string (e.g. `"1h"`,
-/// `"30m"`, `"45s"`). Mirrors `format_age`'s granularity without the
-/// `"ago"` suffix; used for the bucket-refresh cadence.
+/// `"30m"`, `"45s"`). Uses the same unit set as `format_age` (s/m/h/d) but
+/// selects the coarsest unit that divides *exactly* — so a non-round
+/// interval like 90 minutes renders `"90m"`, not `"1h"` — keeping the
+/// reported bucket-refresh cadence precise.
 fn format_interval(secs: u64) -> String {
     const SEC_PER_MIN: u64 = 60;
     const SEC_PER_HOUR: u64 = 60 * SEC_PER_MIN;
@@ -1140,17 +1144,13 @@ mod tests {
                 total_peers: 21,
                 non_empty_buckets: 2,
                 buckets: vec![
-                    BucketStat {
-                        index: 0,
-                        fill: 1,
-                        capacity: 20,
-                    },
+                    BucketStat { index: 0, fill: 1 },
                     BucketStat {
                         index: 255,
                         fill: 20,
-                        capacity: 20,
                     },
                 ],
+                bucket_capacity: 20,
                 refresh_interval_s: 3_600,
                 last_refresh_us,
             },
@@ -1196,6 +1196,40 @@ mod tests {
         write_status(&mut buf, &status, 2_000_000)?;
         let s = String::from_utf8(buf)?;
         assert!(s.contains("last_refresh=never"), "{s}");
+        Ok(())
+    }
+
+    /// Cold-start: a node that has joined no buckets yet renders the
+    /// empty-table sentinel and omits the bucket table header entirely —
+    /// the precise scenario `decdn node status` exists to diagnose.
+    #[test]
+    fn write_status_empty_routing_table_renders_sentinel() -> anyhow::Result<()> {
+        let mut status = mk_status(None);
+        status.routing.buckets.clear();
+        status.routing.non_empty_buckets = 0;
+        status.routing.total_peers = 0;
+        let mut buf = Vec::<u8>::new();
+        write_status(&mut buf, &status, 2_000_000)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("(routing table empty"), "{s}");
+        assert!(
+            !s.contains("BUCKET"),
+            "empty table must omit the header: {s}"
+        );
+        assert!(!s.contains("FILL%"), "{s}");
+        Ok(())
+    }
+
+    /// Clock skew between the node's stamp and the CLI's wall clock must
+    /// render "in future" via `relative_age`, not a huge wrapped age.
+    #[test]
+    fn write_status_future_last_refresh_renders_in_future() -> anyhow::Result<()> {
+        let status = mk_status(Some(5_000_000));
+        let mut buf = Vec::<u8>::new();
+        // now_us earlier than the stamp.
+        write_status(&mut buf, &status, 1_000_000)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("last_refresh=in future"), "{s}");
         Ok(())
     }
 

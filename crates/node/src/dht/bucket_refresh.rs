@@ -87,14 +87,27 @@ pub async fn run_bucket_refresh(
     }
 }
 
-/// Wall-clock now in microseconds since `UNIX_EPOCH`. Mirrors the `now_us`
-/// helpers in [`crate::dht::publish`] / [`crate::handlers::dht`] — falls
-/// back to 0 if the host clock is mis-set (panic-free per the workspace
-/// anti-panic policy).
+/// Wall-clock now in microseconds since `UNIX_EPOCH`. Falls back to 0 if
+/// the host clock is set before the epoch (panic-free per the workspace
+/// anti-panic policy), logging at `error` level on that path — same
+/// treatment as [`crate::handlers::dht`]'s `now_us`, since a 0 stamp here
+/// makes `admin_v1_status` report `last_refresh=never` even though a pass
+/// completed, so the misconfiguration must be diagnosable from the logs.
+/// (The byte-identical-but-silent copy in [`crate::dht::publish`] only
+/// feeds scheduling, where the fallback has no operator-visible effect.)
 fn now_us() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => u64::try_from(d.as_micros()).unwrap_or(u64::MAX),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "wall-clock before UNIX_EPOCH; bucket-refresh timestamp falls back to 0, so \
+                 admin_v1_status will report last_refresh=never despite refreshes running. \
+                 Set the host clock."
+            );
+            0
+        }
+    }
 }
 
 /// Refresh every non-empty bucket once. Snapshots the (`bucket_index`,

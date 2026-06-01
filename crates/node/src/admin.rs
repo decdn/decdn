@@ -18,10 +18,10 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
     AdminRpcServer, AnnounceResponse, BucketStat, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE,
-    DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
-    HealthResponse, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE,
-    RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth, StatusResponse,
-    parse_hash_arg,
+    DHT_POISONED_CODE, DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview,
+    EvictRequest, EvictResponse, HealthResponse, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse,
+    RELOAD_ERROR_CODE, RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth,
+    StatusResponse, parse_hash_arg,
 };
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use jsonrpsee::core::{RpcResult, async_trait};
@@ -111,11 +111,12 @@ pub struct AdminState {
 }
 
 /// Read-only DHT subsystem handles the `admin_v1_status` handler snapshots
-/// (issue #741). Every field is an `Arc` clone of state the runtime already
-/// owns and shares with the DHT handler / refresh / republish tasks, so
-/// attaching this to [`AdminState`] adds no new ownership — only read
-/// access. Bundled into one struct so the `AdminState` constructor stays a
-/// single optional argument rather than five positional ones.
+/// (issue #741). Each shared-state field is an `Arc` clone of state the
+/// runtime already owns and shares with the DHT handler / refresh /
+/// republish tasks (plus the `Copy` `refresh_interval`), so attaching this
+/// to [`AdminState`] adds no new ownership — only read access. Bundled into
+/// one struct so the `AdminState` constructor stays a single optional
+/// argument rather than five positional ones.
 #[derive(Clone)]
 pub struct DhtStatusHandles {
     /// Kademlia routing table (same handle the DHT handler / bucket-refresh
@@ -332,17 +333,28 @@ fn cache_error_to_rpc(err: &CacheError) -> ErrorObjectOwned {
 }
 
 /// Lock a DHT-subsystem `std::sync::Mutex` for `admin_v1_status`,
-/// converting a poisoned lock into a [`DHT_UNAVAILABLE_CODE`] RPC error
+/// converting a poisoned lock into a [`DHT_POISONED_CODE`] RPC error
 /// rather than propagating the panic the standard `unwrap` would (the
 /// workspace anti-panic policy forbids `unwrap`/`expect`). `what` names
 /// the guarded structure for the operator-facing message.
+///
+/// A poisoned lock means a writer panicked while holding it — a severe
+/// in-process fault, distinct from the benign "no DHT wired" state
+/// ([`DHT_UNAVAILABLE_CODE`]). It is logged at `error` level so the fault
+/// is diagnosable from the node's logs even when a scripted client
+/// discards the RPC error body.
 fn lock_or_rpc_err<'a, T>(
     mutex: &'a StdMutex<T>,
     what: &str,
 ) -> Result<std::sync::MutexGuard<'a, T>, ErrorObjectOwned> {
     mutex.lock().map_err(|_| {
+        tracing::error!(
+            guard = %what,
+            "DHT mutex poisoned — a writer panicked while holding it; \
+             admin_v1_status cannot read a consistent snapshot"
+        );
         ErrorObjectOwned::owned(
-            DHT_UNAVAILABLE_CODE,
+            DHT_POISONED_CODE,
             format!("DHT {what} mutex poisoned"),
             None::<()>,
         )
@@ -536,14 +548,17 @@ impl AdminRpcServer for AdminRpcImpl {
             .into_iter()
             .map(|(index, fill)| BucketStat {
                 // Bucket indices are 0..=255 and fills 0..=K_BUCKET_SIZE
-                // (20); both fit u16 with room to spare. `try_into` keeps
-                // this lint-clean under the no-`as`-cast policy, falling
-                // back to the saturated max rather than panicking.
+                // (20), so both fit u16 with room to spare. `try_from`
+                // (not `as`) avoids the `cast_possible_truncation` lint on
+                // the narrowing `usize → u16`, saturating rather than
+                // panicking on the unreachable overflow.
                 index: u16::try_from(index).unwrap_or(u16::MAX),
                 fill: u16::try_from(fill).unwrap_or(u16::MAX),
-                capacity: u16::try_from(crate::dht::routing::K_BUCKET_SIZE).unwrap_or(u16::MAX),
             })
             .collect();
+        // Capacity is the same Kademlia K for every bucket, so report it
+        // once on RoutingHealth rather than per BucketStat.
+        let bucket_capacity = u16::try_from(crate::dht::routing::K_BUCKET_SIZE).unwrap_or(u16::MAX);
 
         let (records, records_capacity) = {
             let store = lock_or_rpc_err(&dht.record_store, "record store")?;
@@ -556,18 +571,18 @@ impl AdminRpcServer for AdminRpcImpl {
             us => Some(us),
         };
 
-        // These `usize → u64` conversions are widening (no truncation
-        // lint fires), but use `try_from` rather than `as` to stay
-        // uniform with the narrowing `u16::try_from` bucket conversions
-        // above and the workspace's prefer-`try_from` convention. The
-        // `unwrap_or(u64::MAX)` arms are unreachable on every supported
-        // target but keep the code panic-free by construction.
+        // These `usize → u64` conversions are widening, so no
+        // `cast_possible_truncation` lint fires and no policy requires
+        // `try_from` here — it's used purely for stylistic uniformity with
+        // the narrowing bucket conversions above. The `unwrap_or(u64::MAX)`
+        // arms are unreachable on every supported (≤64-bit) target.
         Ok(StatusResponse {
             node_id: alloy::primitives::hex::encode(self.state.node_id),
             routing: RoutingHealth {
                 total_peers: u64::try_from(total_peers).unwrap_or(u64::MAX),
                 non_empty_buckets: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
                 buckets,
+                bucket_capacity,
                 refresh_interval_s: dht.refresh_interval.as_secs(),
                 last_refresh_us: last_refresh,
             },
@@ -1661,8 +1676,8 @@ mod tests {
         assert_eq!(indices, vec![0, 255]);
         for b in &resp.routing.buckets {
             assert_eq!(b.fill, 1);
-            assert_eq!(b.capacity, 20);
         }
+        assert_eq!(resp.routing.bucket_capacity, 20);
         assert_eq!(resp.routing.refresh_interval_s, 3_600);
         assert_eq!(resp.routing.last_refresh_us, Some(1_700_000_000_000_000));
         assert_eq!(resp.known_stakers, 2);
@@ -1697,5 +1712,27 @@ mod tests {
             .await
             .expect_err("expected DHT-unavailable error");
         assert_eq!(err.code(), DHT_UNAVAILABLE_CODE);
+    }
+
+    /// A poisoned routing-table mutex (a writer panicked while holding it)
+    /// must surface as the distinct [`DHT_POISONED_CODE`], never panic and
+    /// never be conflated with the benign "no DHT wired" case. Exercises
+    /// the `lock_or_rpc_err` anti-panic net.
+    #[tokio::test]
+    async fn status_poisoned_routing_mutex_returns_poisoned_error() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let handles = seeded_dht_handles();
+        // Poison the routing-table mutex by panicking while holding it.
+        let routing = Arc::clone(&handles.routing);
+        std::thread::spawn(move || {
+            let _guard = routing.lock();
+            panic!("intentional poison");
+        })
+        .join()
+        .expect_err("the spawned thread must panic to poison the lock");
+
+        let rpc = AdminRpcImpl::new(state.with_dht(handles));
+        let err = rpc.status().await.expect_err("expected DHT-poisoned error");
+        assert_eq!(err.code(), DHT_POISONED_CODE);
     }
 }

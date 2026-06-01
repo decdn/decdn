@@ -547,6 +547,29 @@ mod tests {
     }
 
     #[test]
+    fn non_empty_bucket_fills_empty_table_is_empty() {
+        let rt = RoutingTable::new(id(0));
+        assert!(rt.non_empty_bucket_fills().is_empty());
+    }
+
+    #[test]
+    fn non_empty_bucket_fills_reports_counts_ascending_and_omits_empty() {
+        let self_id = id(0);
+        let mut rt = RoutingTable::new(self_id);
+        // Three distinct peers in bucket 10 (salts vary the last byte;
+        // bucket >= 8 keeps the selecting bit out of that byte) and one in
+        // bucket 200. All 254 other buckets stay empty and must be omitted.
+        rt.insert(id_in_bucket(&self_id, 10, 0));
+        rt.insert(id_in_bucket(&self_id, 10, 1));
+        rt.insert(id_in_bucket(&self_id, 10, 2));
+        rt.insert(id_in_bucket(&self_id, 200, 0));
+
+        let fills = rt.non_empty_bucket_fills();
+        // Only the two populated buckets, ascending by index, with real counts.
+        assert_eq!(fills, vec![(10, 3), (200, 1)]);
+    }
+
+    #[test]
     fn cmp_by_distance_orders_closer_first() {
         let target = id(0);
         // a is closer to target than b.

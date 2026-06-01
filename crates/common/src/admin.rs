@@ -277,26 +277,35 @@ pub struct DrainResponse {
 /// Per-bucket fill stat for `admin_v1_status` (issue #741). One entry
 /// per *non-empty* Kademlia k-bucket — empty buckets (the vast majority
 /// of the 256-bucket keyspace on a small network) are omitted so the
-/// snapshot stays compact.
+/// snapshot stays compact. The bucket capacity is the same Kademlia `K`
+/// for every bucket and so lives once on [`RoutingHealth::bucket_capacity`]
+/// rather than being repeated here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketStat {
     /// Bucket index `0..=255` (XOR-distance shell from this node's id).
     pub index: u16,
-    /// Live peers currently held in the bucket (`1..=capacity`).
+    /// Live peers currently held in the bucket
+    /// (`1..=`[`RoutingHealth::bucket_capacity`]).
     pub fill: u16,
-    /// Maximum entries the bucket can hold (Kademlia `K`, currently 20).
-    pub capacity: u16,
 }
 
 /// Routing-table health section of `admin_v1_status` (issue #741).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingHealth {
-    /// Total peers across all buckets.
+    /// Total peers across all buckets. Denormalized convenience for
+    /// `--json` consumers and the grep-stable summary line; equals the sum
+    /// of every [`BucketStat::fill`].
     pub total_peers: u64,
-    /// Number of non-empty buckets (equals `buckets.len()`).
+    /// Number of non-empty buckets. Denormalized convenience equal to
+    /// `buckets.len()`; kept as a stable `key=value` token on the summary
+    /// line so operator scripts need not sum the table.
     pub non_empty_buckets: u64,
     /// Per-bucket fill, one entry per non-empty bucket, ascending by index.
     pub buckets: Vec<BucketStat>,
+    /// Maximum entries any bucket can hold (Kademlia `K`, currently 20).
+    /// One value for the whole table — the renderer pairs it with each
+    /// [`BucketStat::fill`] to show a per-bucket fill ratio.
+    pub bucket_capacity: u16,
     /// Bucket-refresh interval in whole seconds (ADR 022 §Routing Table,
     /// default 1 hour). The refresh task refreshes *every* non-empty
     /// bucket once per interval.
@@ -378,10 +387,21 @@ pub const RELOAD_ERROR_CODE: i32 = -32_004;
 
 /// JSON-RPC error code: `admin_v1_status` was called on a node whose DHT
 /// subsystem is not wired (e.g. a future CLI-only or test invocation that
-/// brings up the admin surface without the DHT handler). Distinct from a
-/// generic failure so an operator gets "this node has no DHT to report
-/// on" rather than a confusing transport error.
+/// brings up the admin surface without the DHT handler). A benign,
+/// expected configuration state — distinct from a generic failure so an
+/// operator gets "this node has no DHT to report on" rather than a
+/// confusing transport error, and distinct from [`DHT_POISONED_CODE`] so
+/// it isn't confused with an in-process fault.
 pub const DHT_UNAVAILABLE_CODE: i32 = -32_005;
+
+/// JSON-RPC error code: `admin_v1_status` found a DHT subsystem mutex
+/// (routing table or record store) poisoned — i.e. a thread panicked
+/// while holding it, so the DHT's in-memory state may be inconsistent.
+/// This is a severe in-process fault, kept distinct from the benign
+/// [`DHT_UNAVAILABLE_CODE`] ("no DHT wired") so an operator script can
+/// tell "this node never had a DHT" from "this node's DHT just broke".
+/// The server also logs the poisoning at `error` level.
+pub const DHT_POISONED_CODE: i32 = -32_006;
 
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
@@ -586,12 +606,14 @@ mod tests {
         let legacy = r#"{
             "total_peers": 3,
             "non_empty_buckets": 2,
-            "buckets": [{"index":0,"fill":1,"capacity":20}],
+            "buckets": [{"index":0,"fill":1}],
+            "bucket_capacity": 20,
             "refresh_interval_s": 3600
         }"#;
         let resp: RoutingHealth =
             serde_json::from_str(legacy).expect("legacy RoutingHealth must deserialize");
         assert_eq!(resp.total_peers, 3);
+        assert_eq!(resp.bucket_capacity, 20);
         assert_eq!(resp.refresh_interval_s, 3600);
         assert!(
             resp.last_refresh_us.is_none(),
@@ -611,17 +633,13 @@ mod tests {
                 total_peers: 21,
                 non_empty_buckets: 2,
                 buckets: vec![
-                    BucketStat {
-                        index: 0,
-                        fill: 1,
-                        capacity: 20,
-                    },
+                    BucketStat { index: 0, fill: 1 },
                     BucketStat {
                         index: 255,
                         fill: 20,
-                        capacity: 20,
                     },
                 ],
+                bucket_capacity: 20,
                 refresh_interval_s: 3600,
                 last_refresh_us: Some(1_700_000_000_000_000),
             },
@@ -639,6 +657,7 @@ mod tests {
         assert_eq!(back.node_id, "abc");
         assert_eq!(back.routing.total_peers, 21);
         assert_eq!(back.routing.buckets.len(), 2);
+        assert_eq!(back.routing.bucket_capacity, 20);
         assert_eq!(back.routing.last_refresh_us, Some(1_700_000_000_000_000));
         assert_eq!(back.known_stakers, 7);
         assert_eq!(back.record_store.capacity, 100_000);

@@ -1019,6 +1019,7 @@ async fn status_round_trips_dht_health() -> anyhow::Result<()> {
     assert_eq!(resp.routing.non_empty_buckets, 2);
     let indices: Vec<u16> = resp.routing.buckets.iter().map(|b| b.index).collect();
     assert_eq!(indices, vec![0, 255]);
+    assert_eq!(resp.routing.bucket_capacity, 20);
     assert_eq!(resp.routing.refresh_interval_s, 3_600);
     assert_eq!(resp.routing.last_refresh_us, Some(1_700_000_000_000_000));
     assert_eq!(resp.known_stakers, 2);
