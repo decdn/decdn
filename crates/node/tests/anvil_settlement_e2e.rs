@@ -435,9 +435,11 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(node_pub).with_ip_addr(server_addr);
 
-    // Give the watcher a moment to install its event filters before the first
-    // ChannelOpened is emitted (filters only capture logs after creation).
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // No watcher-readiness sleep needed (#762): the bring-up backfill captures
+    // the head block at `bootstrap` and `get_logs`-replays ChannelOpened up to
+    // the block the live filters install at, so a channel opened before the
+    // filters are live is still registered. The `poll_until` on channel
+    // persistence below is the deterministic wait.
 
     // Client funds + approves USDC once (covers both channels).
     usdc_admin
