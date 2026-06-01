@@ -1077,9 +1077,15 @@ impl CacheEngine {
             return Ok(ProbeHoldOutcome::Unavailable);
         }
         if guard.len() >= max {
-            // Covers both budget exhaustion and the `max == 0` (holds
-            // disabled) case (ADR 005 §Hold budget).
-            return Ok(ProbeHoldOutcome::BudgetExhausted);
+            // Present-but-un-holdable splits by cause (#739): `max == 0` is an
+            // operator config decision (holds off), whereas a positive budget
+            // with every slot live is genuine pressure. Only the latter is the
+            // "increase max_probe_holds" signal (ADR 005 §Hold budget).
+            return Ok(if max == 0 {
+                ProbeHoldOutcome::HoldsDisabled
+            } else {
+                ProbeHoldOutcome::BudgetExhausted
+            });
         }
         guard.insert(hash, expiry);
         Ok(ProbeHoldOutcome::Held)
@@ -3184,8 +3190,12 @@ mod tests {
         .await?;
         let _ = engine.get(hash).await?;
         engine.set_max_probe_holds(0);
+        // `max == 0` is an operator config decision (holds turned off), not
+        // budget pressure — it must report a cause distinct from
+        // `BudgetExhausted` (#739) so the "increase max_probe_holds" alert
+        // isn't tripped by an intentional disable.
         anyhow::ensure!(
-            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::BudgetExhausted,
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::HoldsDisabled,
             "max_probe_holds=0 must disable has_blob:true entirely"
         );
         Ok(())

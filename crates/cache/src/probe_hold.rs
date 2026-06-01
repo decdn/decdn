@@ -34,8 +34,8 @@ pub use decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
 /// Outcome of [`crate::CacheEngine::try_probe_hold`]. The caller maps this to
 /// the `has_blob` it signs (ADR 005 §Probe-triggered eviction hold) — only
 /// [`ProbeHoldOutcome::Held`] permits `has_blob: true`. The variants
-/// distinguish the two `has_blob: false` cases so the probe handler can emit
-/// the `probe_hold_violations` metric without a second cache lookup.
+/// distinguish the three `has_blob: false` causes so the probe handler can
+/// emit the right metric without a second cache lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeHoldOutcome {
     /// Blob present (and not operator-evicted) **and** a hold is guaranteed
@@ -44,10 +44,18 @@ pub enum ProbeHoldOutcome {
     /// Blob absent or operator-evicted — sign `has_blob: false`. Not a
     /// degradation: the node simply does not have the content.
     Unavailable,
-    /// Blob present but a hold could not be guaranteed (budget exhausted or
-    /// `max_probe_holds == 0`) — sign `has_blob: false` and count it as a
-    /// `probe_hold_violations` availability degradation (ADR 005 §Hold
-    /// budget). Never a safety fault: the node loses revenue but is never
-    /// falsely slashed.
+    /// Blob present but **all hold slots are in use** (`max_probe_holds > 0`
+    /// and the live-hold count has reached it) — sign `has_blob: false` and
+    /// count it as a `probe_hold_violations` availability degradation (ADR
+    /// 005 §Hold budget). Genuine budget pressure: the operator-actionable
+    /// remedy is to raise `max_probe_holds`. Never a safety fault — the node
+    /// loses revenue but is never falsely slashed.
     BudgetExhausted,
+    /// Blob present but the eviction-hold path is **disabled by config**
+    /// (`max_probe_holds == 0`) — sign `has_blob: false`. Operationally
+    /// distinct from [`Self::BudgetExhausted`] (#739): this is an intentional
+    /// operator decision, not load, so it must NOT inflate
+    /// `probe_hold_violations` (whose alert remedy is "increase
+    /// `max_probe_holds`", nonsensical when holds are deliberately off).
+    HoldsDisabled,
 }

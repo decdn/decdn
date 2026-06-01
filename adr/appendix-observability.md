@@ -40,7 +40,7 @@ Early warning for the three slashable offenses in [ADR 026 § Slashing and burn]
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
-| `decdn_probe_hold_violations_total` | Counter | M | Blob evicted within `probe_hold_duration` after signing `has_blob: true`. Each increment is a signed phantom-announcement slash risk ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). |
+| `decdn_probe_hold_violations_total` | Counter | M | Blob present but un-holdable because **all** hold slots were live (`max_probe_holds` reached) — the node signs `has_blob: false` and forgoes revenue under genuine budget pressure ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). The literal "evicted after signing `has_blob: true`" case is unreachable by construction (held hashes are invisible to the LRU driver). The config-disabled case (`max_probe_holds == 0`) is counted separately as `decdn_probe_holds_disabled_total` (#739), so this counter is a clean "raise `max_probe_holds`" signal. |
 | `decdn_probe_hold_slots_used` | Gauge | M | Eviction-hold slots in use out of `max_probe_holds`. Saturation forces `has_blob: false` at probe time. |
 | `decdn_probe_hold_slots_max` | Gauge | M | Configured `max_probe_holds`. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
 | `decdn_blacklist_sync_lag_seconds` | Gauge | M | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). |
@@ -103,6 +103,7 @@ Operator-policy prefetch from popularity signals per [ADR 022 § Prefetch Decisi
 |--------|------|------|--------|-------------|
 | `decdn_probe_collection_latency_seconds` | Histogram | M | `outcome={0rtt_warm,1rtt_cold}` | Duration of a complete probe collection window, send to collection end. The `outcome` label measures 0-RTT impact per [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
 | `decdn_probe_responses_total` | Counter | R | `result={has_blob,no_blob,timeout}` | Probe responses received, by result. |
+| `decdn_probe_holds_disabled_total` | Counter | M | — | Probes answered `has_blob: false` for a *present* blob because the eviction-hold path is disabled by config (`max_probe_holds == 0`). An intentional operator decision, not budget pressure — split out from `decdn_probe_hold_violations_total` so a deliberate disable does not trip its "increase `max_probe_holds`" alert ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). |
 
 #### Payment Channel Metrics
 
@@ -280,6 +281,7 @@ Earlier ADRs used informal metric names; this table maps them to canonical repla
 |---------------------------|---------------------------|------------|
 | `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_total{reason="clock_skew"}` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
 | `probe_hold_violations` | `decdn_probe_hold_violations_total` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
+| `probe_holds_disabled` | `decdn_probe_holds_disabled_total` | [ADR 005](005-protocol.md#adr-005-wire-protocol), #739 |
 | `probe_hold_slots_used` | `decdn_probe_hold_slots_used` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
 | `rate_bounds_clamp_events` | `decdn_rate_bounds_clamp_events_total` | architecture.md |
 | `blacklist_sync_lag_seconds` | `decdn_blacklist_sync_lag_seconds` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |

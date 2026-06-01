@@ -74,6 +74,53 @@ async fn cache_with_blob(payload: &[u8]) -> anyhow::Result<(CacheEngine, Hash, t
     Ok((cache, hash, cache_dir))
 }
 
+/// Open a cache pre-seeded with two distinct blobs from a single filesystem
+/// origin (one engine per dir — iroh-blobs is single-writer). Returns the
+/// cache, both hashes, and the cache temp dir to keep alive.
+async fn cache_with_two_blobs(
+    a: &[u8],
+    b: &[u8],
+) -> anyhow::Result<(CacheEngine, Hash, Hash, tempfile::TempDir)> {
+    let origin_dir = tempfile::tempdir()?;
+    let mut hashes = Vec::with_capacity(2);
+    for payload in [a, b] {
+        let hash = Hash::new(payload);
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let dir = origin_dir.path().join(shard);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(hex.as_str()), payload)?;
+        hashes.push(hash);
+    }
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    let (ha, hb) = (Hash::new(a), Hash::new(b));
+    let _ = cache.get(ha).await?; // populate the local store
+    let _ = cache.get(hb).await?;
+    drop(origin_dir);
+    Ok((cache, ha, hb, cache_dir))
+}
+
+/// Parse the integer value of an `OpenMetrics` counter/gauge line
+/// (`<name> <value>`) out of the encoded exposition text. Returns `None` if
+/// the metric is absent — distinct from `Some(0)` so a missing counter is
+/// never mistaken for an un-incremented one.
+fn metric_value(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix(name)?.strip_prefix(' ')?;
+        rest.trim().parse().ok()
+    })
+}
+
 /// Build a `ProbeHandler` with the given delivery bounds, returning the
 /// handler plus the random signer and domain so tests can verify `slash_sig`.
 #[allow(clippy::too_many_arguments)]
@@ -745,15 +792,17 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A node that holds the blob but cannot guarantee a hold (budget
-/// exhausted / disabled) must still answer `has_blob: false` with a valid
-/// `slash_sig` over `has_blob=false` — never risk a phantom slash (ADR 005
-/// §Hold budget). Exercises the handler's `BudgetExhausted` arm end-to-end.
+/// A node with the eviction-hold path **disabled by config**
+/// (`max_probe_holds == 0`) holds the blob but cannot guarantee a hold, so it
+/// must still answer `has_blob: false` with a valid `slash_sig` over
+/// `has_blob=false` — never risk a phantom slash (ADR 005 §Hold budget).
+/// Exercises the handler's `HoldsDisabled` arm end-to-end and asserts the
+/// outcome is counted as a *disabled* event, NOT as budget pressure (#739).
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_budget_exhausted_signs_has_blob_false() -> anyhow::Result<()> {
+async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyhow::Result<()> {
     let payload = b"present but un-holdable";
     let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
-    cache.set_max_probe_holds(0); // disable holds -> BudgetExhausted
+    cache.set_max_probe_holds(0); // disable holds -> HoldsDisabled
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -769,7 +818,7 @@ async fn probe_budget_exhausted_signs_has_blob_false() -> anyhow::Result<()> {
 
     anyhow::ensure!(
         !resp.body.has_blob,
-        "budget-exhausted hold must yield has_blob=false even though the blob is cached"
+        "holds-disabled must yield has_blob=false even though the blob is cached"
     );
     anyhow::ensure!(
         resp.total_bytes.is_none(),
@@ -778,6 +827,66 @@ async fn probe_budget_exhausted_signs_has_blob_false() -> anyhow::Result<()> {
     );
     // The signature must cover has_blob=false (not a stale true).
     assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    // An intentional disable must increment the disabled counter and leave
+    // the budget-pressure counter at zero — otherwise the "increase
+    // max_probe_holds" alert fires on a config the operator chose.
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_value(&text, "decdn_probe_holds_disabled_total") == Some(1),
+        "holds-disabled probe must bump decdn_probe_holds_disabled_total:\n{text}"
+    );
+    anyhow::ensure!(
+        metric_value(&text, "decdn_probe_hold_violations_total") == Some(0),
+        "an intentional disable must NOT inflate the budget-pressure counter:\n{text}"
+    );
+    Ok(())
+}
+
+/// A node with a positive but fully-occupied hold budget answers
+/// `has_blob: false` and counts the event as genuine budget pressure
+/// (`probe_hold_violations`), NOT as a config disable (#739). This is the
+/// signal whose alert remedy is "increase `max_probe_holds`".
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_budget_exhausted_counts_violation_not_disabled() -> anyhow::Result<()> {
+    let a: &[u8] = b"first popular blob";
+    let b: &[u8] = b"second popular blob";
+    let (cache, ha, hb, _cache_tmp) = cache_with_two_blobs(a, b).await?;
+    // One slot, two distinct cached blobs: the first hold fills the budget,
+    // the second probe finds it exhausted (max > 0).
+    cache.set_max_probe_holds(1);
+    anyhow::ensure!(
+        cache.try_probe_hold(ha).await? == decdn_cache::ProbeHoldOutcome::Held,
+        "first hold should fit the budget"
+    );
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (handler, signer, domain) = build_handler(server_id, 7, &metrics, limiter, cache);
+
+    let req = ProbeRequest {
+        hash: *hb.as_bytes(),
+        timestamp_us: 0x55,
+    };
+    let resp = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        !resp.body.has_blob,
+        "budget-exhausted hold must yield has_blob=false even though the blob is cached"
+    );
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_value(&text, "decdn_probe_hold_violations_total") == Some(1),
+        "genuine budget exhaustion must bump decdn_probe_hold_violations_total:\n{text}"
+    );
+    anyhow::ensure!(
+        metric_value(&text, "decdn_probe_holds_disabled_total") == Some(0),
+        "budget pressure must NOT be counted as a config disable:\n{text}"
+    );
     Ok(())
 }
 
