@@ -16,9 +16,16 @@
 //!   [`ClientHandler::forget_channel`]; `ChannelCloseInitiated` is
 //!   observed-only (the in-process dispute monitor is deferred — issue #324).
 //!   The watcher uses `.watch()` filters, which only deliver logs from the
-//!   current block forward — a channel opened against this node while it was
-//!   **down** is not back-filled and its vouchers are rejected until a
-//!   startup log-backfill is added (tracked separately).
+//!   block the filter is installed at forward. To close the sub-millisecond
+//!   bring-up race between `bootstrap` returning and those filters installing
+//!   (#762), the first watcher cycle records the head block `S` captured at
+//!   bootstrap, installs the live filters, reads the block `F` they took over
+//!   at, and `get_logs`-backfills `ChannelOpened` over `[S, F]` — so the
+//!   backfilled `[S, F]` and the live `(F, ∞)` stream together leave no gap.
+//!   The overlap at `F` is harmless because [`ClientHandler::register_open_channel`]
+//!   is idempotent. A channel opened while this node was fully **down** (before
+//!   `S`) is still not back-filled — closing that across-restart downtime gap
+//!   needs the last-scanned block persisted across restarts (#751).
 //! - **Redemption (threshold + on-shutdown).** On a redeem hint emitted by
 //!   the voucher-accept path, it reads the latest persisted voucher and the
 //!   on-chain `withdrawnAmount`, and submits `withdraw` once the accrued
@@ -128,6 +135,13 @@ const fn ready_to_settle(now: u64, settle_after: u64) -> bool {
     now >= settle_after
 }
 
+/// Whether the bring-up backfill range `[from, to]` spans at least one block
+/// (#762). `from > to` means no blocks elapsed between the head captured at
+/// bootstrap and the block the live filters installed at — nothing to scan.
+const fn backfill_range_nonempty(from: u64, to: u64) -> bool {
+    from <= to
+}
+
 /// Aborts the wrapped task on drop so a node-restart cycle never leaks a
 /// chain-poll task. Same pattern as `chain_staker_set::AbortOnDrop`.
 #[derive(Debug)]
@@ -179,10 +193,20 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         let usdc_token = contract.usdc().call().await.with_context(|| {
             format!("PaymentChannel.usdc() self-check at {payment_channel_addr}")
         })?;
+        // Head block at bootstrap. The watcher backfills `ChannelOpened` from
+        // here up to the block its live filters install at, closing the
+        // bring-up race (#762). A read failure is fatal at bring-up, matching
+        // the `usdc()` self-check's fail-fast posture.
+        let start_block = contract
+            .provider()
+            .get_block_number()
+            .await
+            .context("read head block for watcher backfill at bootstrap")?;
         info!(
             %payment_channel_addr,
             %usdc_token,
             %self_address,
+            start_block,
             "PaymentChannel settlement service bootstrap complete"
         );
 
@@ -194,6 +218,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             usdc_token,
             Arc::clone(&handler),
             Arc::clone(&pending_store),
+            start_block,
         ));
         let redeemer = tokio::spawn(redeemer_loop(
             contract.clone(),
@@ -444,7 +469,12 @@ async fn watcher_loop<P: Provider + Clone>(
     usdc_token: Address,
     handler: Arc<ClientHandler>,
     pending_store: Arc<dyn PendingSettleStore>,
+    start_block: u64,
 ) {
+    // One-time bring-up backfill range start (#762). Stays `Some` until a
+    // backfill succeeds, so a `get_logs` error on the first cycle retries on
+    // the next resubscription; once `None`, later resubscriptions skip it.
+    let mut backfill_from = Some(start_block);
     let mut backoff = WATCHER_INITIAL_BACKOFF;
     loop {
         match run_watcher_once(
@@ -453,6 +483,7 @@ async fn watcher_loop<P: Provider + Clone>(
             usdc_token,
             &handler,
             &pending_store,
+            &mut backfill_from,
         )
         .await
         {
@@ -485,6 +516,7 @@ async fn run_watcher_once<P: Provider + Clone>(
     usdc_token: Address,
     handler: &Arc<ClientHandler>,
     pending_store: &Arc<dyn PendingSettleStore>,
+    backfill_from: &mut Option<u64>,
 ) -> Result<()> {
     let mut opened = contract
         .ChannelOpened_filter()
@@ -511,35 +543,26 @@ async fn run_watcher_once<P: Provider + Clone>(
         .context("watch ChannelCloseInitiated")?
         .into_stream();
 
+    // Bring-up backfill (#762): with the live filters now installed (they cover
+    // blocks after their install point forward), read the block they took over
+    // at and `get_logs` `ChannelOpened` over `[start, F]` so a channel opened in
+    // the window between `bootstrap` returning and these filters installing is
+    // still registered. The overlap at `F` is idempotent in the handler.
+    if let Some(start) = *backfill_from {
+        let to = contract
+            .provider()
+            .get_block_number()
+            .await
+            .context("read head block for ChannelOpened backfill")?;
+        backfill_opened_channels(contract, self_address, usdc_token, handler, start, to).await?;
+        *backfill_from = None;
+    }
+
     loop {
         tokio::select! {
             ev = opened.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    // Only channels where this node is the provider concern us.
-                    if event.provider != self_address {
-                        continue;
-                    }
-                    let mut state = ChannelState::new(
-                        event.channelId,
-                        event.client,
-                        usdc_token,
-                        event.deposit,
-                    );
-                    // Track on-chain expiry so the sweep can close (and the
-                    // handler can stop serving) before `reclaimExpired` opens.
-                    // A value past u64 is clamped to "never" — safe, since the
-                    // only effect of a too-far expiry is we never force-close.
-                    state.expires_at = u64::try_from(event.expiresAt).unwrap_or(u64::MAX);
-                    if let Err(err) = handler.register_open_channel(state).await {
-                        warn!(%err, channel_id = %event.channelId, "failed to persist opened channel");
-                    } else {
-                        info!(
-                            channel_id = %event.channelId,
-                            client = %event.client,
-                            deposit = %event.deposit,
-                            "registered channel opened against this node"
-                        );
-                    }
+                    apply_channel_opened(handler, self_address, usdc_token, &event, false).await;
                 }
                 Some(Err(e)) => return Err(e).context("ChannelOpened stream"),
                 None => return Ok(()),
@@ -597,6 +620,81 @@ async fn run_watcher_once<P: Provider + Clone>(
             },
         }
     }
+}
+
+/// Register a `ChannelOpened` event whose provider is this node so the voucher
+/// path accepts vouchers for it. Shared by the live watcher arm and the
+/// bring-up backfill (#762); `register_open_channel` is idempotent, so applying
+/// the same event from both paths (the backfill/live overlap block) is safe.
+/// `from_backfill` only varies the log line so the gap path is distinguishable.
+async fn apply_channel_opened(
+    handler: &Arc<ClientHandler>,
+    self_address: Address,
+    usdc_token: Address,
+    event: &PaymentChannel::ChannelOpened,
+    from_backfill: bool,
+) {
+    // Only channels where this node is the provider concern us.
+    if event.provider != self_address {
+        return;
+    }
+    let mut state = ChannelState::new(event.channelId, event.client, usdc_token, event.deposit);
+    // Track on-chain expiry so the sweep can close (and the handler can stop
+    // serving) before `reclaimExpired` opens. A value past u64 is clamped to
+    // "never" — safe, since the only effect of a too-far expiry is we never
+    // force-close.
+    state.expires_at = u64::try_from(event.expiresAt).unwrap_or(u64::MAX);
+    let via = if from_backfill {
+        "backfilled channel opened during watcher bring-up"
+    } else {
+        "registered channel opened against this node"
+    };
+    if let Err(err) = handler.register_open_channel(state).await {
+        warn!(%err, channel_id = %event.channelId, "failed to persist opened channel");
+    } else {
+        info!(
+            channel_id = %event.channelId,
+            client = %event.client,
+            deposit = %event.deposit,
+            "{via}"
+        );
+    }
+}
+
+/// One-time bring-up backfill (#762): `get_logs` every `ChannelOpened` in
+/// `[from_block, to_block]` and register the ones this node provides, closing
+/// the gap between `bootstrap` returning and the live `.watch()` filters
+/// installing. A `from > to` range (no blocks elapsed since bootstrap) is a
+/// no-op. Returns an error only on the `get_logs` RPC itself so the caller can
+/// retry on the next resubscription; per-channel persist failures are logged.
+async fn backfill_opened_channels<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    self_address: Address,
+    usdc_token: Address,
+    handler: &Arc<ClientHandler>,
+    from_block: u64,
+    to_block: u64,
+) -> Result<()> {
+    if !backfill_range_nonempty(from_block, to_block) {
+        return Ok(());
+    }
+    let logs = contract
+        .ChannelOpened_filter()
+        .from_block(from_block)
+        .to_block(to_block)
+        .query()
+        .await
+        .with_context(|| format!("backfill ChannelOpened over [{from_block}, {to_block}]"))?;
+    debug!(
+        from_block,
+        to_block,
+        count = logs.len(),
+        "scanned ChannelOpened logs for watcher bring-up backfill"
+    );
+    for (event, _log) in logs {
+        apply_channel_opened(handler, self_address, usdc_token, &event, true).await;
+    }
+    Ok(())
 }
 
 /// Redemption task: drain redeem hints and `withdraw` a channel's accrued
@@ -1076,6 +1174,18 @@ mod tests {
         assert!(within_close_window(expires_at + 10, expires_at));
         // `now` near u64::MAX must not overflow the `+ CLOSE_AHEAD` add.
         assert!(within_close_window(u64::MAX, expires_at));
+    }
+
+    #[test]
+    fn backfill_range_nonempty_boundary() {
+        // No blocks elapsed since bootstrap (`from == to + 1`): nothing to scan.
+        assert!(!backfill_range_nonempty(1_001, 1_000));
+        // Single block (`from == to`): scan it — a ChannelOpened could sit there.
+        assert!(backfill_range_nonempty(1_000, 1_000));
+        // Normal forward range.
+        assert!(backfill_range_nonempty(1_000, 1_005));
+        // Genesis / zero head is a valid single-block range.
+        assert!(backfill_range_nonempty(0, 0));
     }
 
     #[test]
