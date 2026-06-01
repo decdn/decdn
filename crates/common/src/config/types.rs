@@ -90,6 +90,16 @@ pub struct BlockchainConfig {
     /// smaller values bound unsettled exposure. Absent => default
     /// (1 USDC = `1_000_000` `µUSDC`).
     pub redeem_threshold_micro_usdc: Option<u64>,
+    /// Deposit (base units, `µUSDC`) the buyer path escrows when opening a
+    /// `PaymentChannel` against an upstream provider on a cache miss (#744).
+    /// Absent => default (10 USDC = `10_000_000` `µUSDC`, ADR 003 § Deposit
+    /// Economics recommended minimum). Clamped up to the on-chain `minDeposit`
+    /// floor at open time.
+    pub buyer_deposit_micro_usdc: Option<u64>,
+    /// Whether to issue a one-time max USDC approval for the `PaymentChannel`
+    /// contract at startup so the buyer path can `openChannel` (#744). Absent
+    /// => `true`. Set `false` to manage the allowance out-of-band.
+    pub buyer_max_approve: Option<bool>,
 }
 
 /// Cache section of the config file.

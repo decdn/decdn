@@ -351,7 +351,11 @@ pub async fn run(
     // Failure here MUST abort startup: continuing with a fresh in-memory
     // map silently reopens the replay window the store exists to close.
     let channel_store_data_dir = cfg.identity.data_dir.clone();
-    let channel_state_store: Arc<dyn ChannelStateStore> = Arc::new(
+    // Keep the concrete store `Arc` so it can back both the seller
+    // `ChannelStateStore` (channel_state_v1 table) and the buyer
+    // `BuyerChannelStore` (buyer_channel_state_v1 table, #744) — redb forbids a
+    // second `Database` handle to the same file, so one shared store owns both.
+    let channel_store_concrete: Arc<PersistentChannelStateStore> = Arc::new(
         tokio::task::spawn_blocking(move || {
             PersistentChannelStateStore::open(&channel_store_data_dir)
         })
@@ -359,6 +363,7 @@ pub async fn run(
         .context("channel state store open task panicked")?
         .context("failed to open channel state store (issue #527 voucher replay guard)")?,
     );
+    let channel_state_store: Arc<dyn ChannelStateStore> = channel_store_concrete.clone();
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema even before the
     // future cdn/client/v1 handler (#317) is constructed. The handler will
@@ -588,7 +593,7 @@ pub async fn run(
     // service when an accrued claim may have crossed the threshold.
     let wallet_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from((*eth_signer).clone()))
-        .connect_http(rpc_url);
+        .connect_http(rpc_url.clone());
     let payment_service = PaymentChannelService::bootstrap(
         wallet_provider,
         payment_channel_addr,
@@ -600,6 +605,54 @@ pub async fn run(
     .await
     .context("PaymentChannel settlement service bootstrap")?;
     client_handler.attach_redeem_hint(payment_service.redeem_hint_sender());
+
+    // On-chain buyer-side service (#744). When this node pulls content from an
+    // upstream provider on a cache miss it pays via the same channel mechanism,
+    // acting as the client: a separate wallet-filled provider signs `approve` /
+    // `openChannel` / `reclaimExpired`. It shares the persistent store (a
+    // distinct `buyer_channel_state_v1` table) and re-derives the voucher domain
+    // the handler consumed above. The cache-engine hook that *calls*
+    // `open_or_reuse_channel` needs provider-discovery (ADR 001/022) and is out
+    // of scope here; the service is held for the process lifetime so its reclaim
+    // sweep keeps running. `_buyer_channel_service` (leading underscore) keeps
+    // the binding — and thus its `AbortOnDrop` reclaim task — alive to shutdown.
+    //
+    // Unlike the seller service, a buyer-bootstrap failure is NON-fatal: buying
+    // is opportunistic cost-recovery (and the cache-engine hook isn't wired yet),
+    // so a failed startup `approve` tx (e.g. insufficient gas) must not block the
+    // node's core seller function. Log and continue with the buyer path disabled.
+    let buyer_wallet_provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from((*eth_signer).clone()))
+        .connect_http(rpc_url);
+    let buyer_channel_store: Arc<dyn decdn_incentive::BuyerChannelStore> = Arc::new(
+        crate::channel_store::BuyerChannelStoreHandle::new(Arc::clone(&channel_store_concrete)),
+    );
+    let _buyer_channel_service = match crate::buyer_channel::BuyerChannelService::bootstrap(
+        buyer_wallet_provider,
+        payment_channel_addr,
+        eth_signer.address(),
+        buyer_channel_store,
+        Arc::clone(&eth_signer),
+        decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr),
+        U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
+        cfg.blockchain.buyer_max_approve,
+    )
+    .await
+    {
+        Ok(service) => Some(service),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                %payment_channel_addr,
+                "buyer-side PaymentChannel bootstrap failed; node→node paid cache-miss pulls are \
+                 DISABLED for this process (seller settlement is unaffected). This condition is \
+                 sticky — restart the node to retry. Check: (1) blockchain.payment_channel_address \
+                 is correct, (2) the RPC endpoint is reachable, (3) the wallet holds gas for the \
+                 one-time USDC approve."
+            );
+            None
+        }
+    };
 
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
@@ -1749,6 +1802,8 @@ mod tests {
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
                 redeem_threshold_micro_usdc: 1_000_000,
+                buyer_deposit_micro_usdc: 10_000_000,
+                buyer_max_approve: true,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },

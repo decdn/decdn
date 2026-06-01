@@ -65,6 +65,11 @@ const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
 /// At this size the ~$0.10 `withdraw` gas is a few percent of the redeemed
 /// amount while bounding unsettled exposure to ~1 USDC per channel (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
+/// Default buyer-side channel deposit: 10 USDC (`10_000_000` `µUSDC`). ADR 003
+/// § Deposit Economics recommends a 10 USDC practical minimum (gas overhead
+/// ~2.3%); the on-chain `minDeposit` floor still applies and the resolved value
+/// is clamped up to it at open time (#744).
+const DEFAULT_BUYER_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -694,6 +699,26 @@ fn resolve_blockchain_into(
         },
     );
 
+    let buyer_deposit_micro_usdc = file
+        .and_then(|b| b.buyer_deposit_micro_usdc)
+        .unwrap_or(DEFAULT_BUYER_DEPOSIT_MICRO_USDC);
+    // A `0` buyer deposit would open dust channels (and revert below the
+    // on-chain `minDeposit` floor). Reject it; the on-chain floor is the
+    // authority on the lower bound, but a configured 0 is always an operator
+    // mistake worth catching at load time.
+    bag.check_with(
+        buyer_deposit_micro_usdc > 0,
+        "blockchain.buyer_deposit_micro_usdc",
+        || {
+            "blockchain.buyer_deposit_micro_usdc must be > 0 (a 0 deposit opens \
+             dust channels and reverts below the on-chain minDeposit floor)"
+                .to_string()
+        },
+    );
+    // Default-on: the one-time max approval is what lets the buyer path open
+    // channels without a manual approve step (ADR 003 § Deposit Economics).
+    let buyer_max_approve = file.and_then(|b| b.buyer_max_approve).unwrap_or(true);
+
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
     // the runtime loader: if the operator passes a stale path the failure
@@ -711,6 +736,8 @@ fn resolve_blockchain_into(
         chain_id,
         rpc_watchdog_interval_sec,
         redeem_threshold_micro_usdc,
+        buyer_deposit_micro_usdc,
+        buyer_max_approve,
     }
 }
 
@@ -5720,6 +5747,8 @@ mod tests {
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            buyer_deposit_micro_usdc: None,
+            buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5746,6 +5775,8 @@ mod tests {
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             rpc_watchdog_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            buyer_deposit_micro_usdc: None,
+            buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5943,6 +5974,8 @@ mod tests {
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(1),
             redeem_threshold_micro_usdc: None,
+            buyer_deposit_micro_usdc: None,
+            buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5977,6 +6010,8 @@ mod tests {
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             redeem_threshold_micro_usdc: Some(0),
+            buyer_deposit_micro_usdc: None,
+            buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6011,6 +6046,8 @@ mod tests {
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(0),
             redeem_threshold_micro_usdc: None,
+            buyer_deposit_micro_usdc: None,
+            buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6038,6 +6075,8 @@ mod tests {
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
             redeem_threshold_micro_usdc: None,
+            buyer_deposit_micro_usdc: None,
+            buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
