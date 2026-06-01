@@ -31,14 +31,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, B256, U256, keccak256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{BuyerChannelState, BuyerChannelStore};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -83,10 +82,6 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     self_address: Address,
     min_deposit: U256,
     default_deposit: U256,
-    /// Serializes `openChannel` calls so the `clientChannelNonce` read names
-    /// the nonce our open will actually consume (see
-    /// [`Self::open_or_reuse_channel`]).
-    open_lock: Mutex<()>,
     _reclaimer: AbortOnDrop,
 }
 
@@ -159,7 +154,6 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             self_address,
             min_deposit,
             default_deposit,
-            open_lock: Mutex::new(()),
             _reclaimer: AbortOnDrop(reclaimer),
         })
     }
@@ -175,9 +169,20 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// # Errors
     ///
     /// Surfaces store errors and any failure of the `openChannel` transaction
-    /// (submit, revert, or receipt).
-    // Linear guard-and-act sequence (reuse-check → derive → open → verify →
-    // persist); the early-return guards read more clearly inline than split.
+    /// (submit, revert, or receipt). Also errors if a tracked-but-expired
+    /// channel for `provider_addr` could not be reclaimed first (so its deposit
+    /// is never silently dropped — see below); retry once the reclaim sweep
+    /// clears it.
+    ///
+    /// # Concurrency
+    ///
+    /// One channel is tracked per provider, so the caller MUST NOT issue
+    /// concurrent `open_or_reuse_channel` calls for the *same* `provider_addr`:
+    /// two racing opens would each escrow a deposit and the second `record`
+    /// would orphan the first. Concurrent opens for *distinct* providers are
+    /// fine.
+    // Linear guard-and-act sequence (reuse-check → reclaim-expired → open →
+    // decode → persist); the early-return guards read more clearly inline.
     #[allow(clippy::cognitive_complexity)]
     pub async fn open_or_reuse_channel(
         &self,
@@ -202,31 +207,38 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                     self.voucher_domain.clone(),
                 ));
             }
+            // Expired: reclaim its deposit BEFORE rotating. The store is
+            // provider-keyed, so opening a replacement here would overwrite the
+            // expired record and the reclaim sweep (which iterates `load_all`)
+            // would never see it — silently abandoning a refundable deposit
+            // (10 USDC default + any top-ups). `try_reclaim` is best-effort and
+            // CAS-forgets the record on success.
             debug!(
                 provider = %provider_addr,
                 channel_id = %existing.channel_id,
-                "tracked buyer channel expired; opening a replacement"
+                "tracked buyer channel expired; reclaiming before opening a replacement"
             );
+            try_reclaim(&self.contract, &self.store, self.self_address, &existing).await;
+            // If the expired record is still present (reclaim hit an RPC error,
+            // or the chain clock has not yet reached expiry under host-clock
+            // skew), do NOT open a replacement that would overwrite and orphan
+            // it — surface an error so the caller retries after the sweep clears
+            // it. This trades a transient open failure for never dropping funds.
+            if self
+                .store
+                .get_by_provider(provider_addr)
+                .context("re-check expired channel after reclaim")?
+                .is_some_and(|s| s.channel_id == existing.channel_id)
+            {
+                anyhow::bail!(
+                    "expired buyer channel {} (provider {provider_addr}) is not yet reclaimable; \
+                     retry after the reclaim sweep clears it",
+                    existing.channel_id
+                );
+            }
         }
 
         let deposit = deposit_hint.max(self.default_deposit).max(self.min_deposit);
-
-        // Serialize opens so the `clientChannelNonce` read below names the
-        // nonce our `openChannel` will actually consume. Holding the lock
-        // across read → send → mined receipt guarantees no other open from this
-        // account increments the on-chain counter in between, so the derived
-        // `channelId` is exact (ADR 003: keccak256(client, provider, nonce)).
-        // The node never opens client channels from this account anywhere else,
-        // so this lock is the only writer of `clientChannelNonce[self]`.
-        let _guard = self.open_lock.lock().await;
-
-        let channel_nonce = self
-            .contract
-            .clientChannelNonce(self.self_address)
-            .call()
-            .await
-            .context("read clientChannelNonce before open")?;
-        let channel_id = derive_channel_id(self.self_address, provider_addr, channel_nonce);
 
         let receipt = self
             .contract
@@ -244,28 +256,30 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             );
         }
 
-        // Read back the on-chain channel for the authoritative expiry, and
-        // cross-check the derived id resolved to our just-opened channel (a
-        // mismatch would mean the serialization invariant above was violated).
-        let ch = self
-            .contract
-            .getChannel(channel_id)
-            .call()
-            .await
-            .context("getChannel after open")?;
-        if ch.client != self.self_address || ch.provider != provider_addr {
-            anyhow::bail!(
-                "opened channel {channel_id} resolves to client {}/provider {} \
-                 (expected {}/{}) — channelId derivation race",
-                ch.client,
-                ch.provider,
-                self.self_address,
-                provider_addr
-            );
-        }
-        // `Channel.expiresAt` is `uint64` on-chain, so the binding already
-        // yields a `u64` (unlike the `ChannelOpened` event's `uint256`).
-        let expires_at = ch.expiresAt;
+        // Decode this tx's `ChannelOpened` event from the receipt for the
+        // authoritative `channelId` + `expiresAt`. This is atomic with the
+        // open: a successful tx guarantees the event is present, so we can
+        // always persist the channel — unlike a follow-up `getChannel` call,
+        // whose transient failure would leave the on-chain deposit orphaned
+        // (opened but untracked, re-opened on the next miss). Filtering on
+        // `client`/`provider` also confirms we decoded our own open.
+        let opened = receipt
+            .inner
+            .logs()
+            .iter()
+            .filter_map(|log| log.log_decode::<PaymentChannel::ChannelOpened>().ok())
+            .map(|decoded| decoded.inner.data)
+            .find(|ev| ev.client == self.self_address && ev.provider == provider_addr)
+            .with_context(|| {
+                format!(
+                    "ChannelOpened event for provider {provider_addr} not found in openChannel \
+                     receipt logs"
+                )
+            })?;
+        let channel_id = opened.channelId;
+        // The `ChannelOpened` event's `expiresAt` is `uint256`; clamp to `u64`
+        // (a too-far expiry only ever means the reclaim sweep waits longer).
+        let expires_at = u64::try_from(opened.expiresAt).unwrap_or(u64::MAX);
 
         let state =
             BuyerChannelState::new(channel_id, provider_addr, self.token, deposit, expires_at);
@@ -373,16 +387,6 @@ impl<P: Provider + Clone + 'static> std::fmt::Debug for BuyerChannelService<P> {
             .field("self_address", &self.self_address)
             .finish_non_exhaustive()
     }
-}
-
-/// `channelId = keccak256(abi.encodePacked(client, provider, channelNonce))`
-/// — the exact derivation `PaymentChannel.openChannel` performs on-chain.
-fn derive_channel_id(client: Address, provider: Address, channel_nonce: U256) -> B256 {
-    let mut packed = Vec::with_capacity(72);
-    packed.extend_from_slice(client.as_slice());
-    packed.extend_from_slice(provider.as_slice());
-    packed.extend_from_slice(&channel_nonce.to_be_bytes::<32>());
-    keccak256(&packed)
 }
 
 /// Read the current USDC allowance for the `PaymentChannel` spender and, if it
@@ -557,7 +561,7 @@ fn forget_reclaimed(store: &Arc<dyn BuyerChannelStore>, st: &BuyerChannelState, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::address;
+    use alloy::primitives::{B256, address};
 
     fn sample(byte: u8) -> BuyerChannelState {
         let mut prov = [0u8; 20];
@@ -571,25 +575,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn derive_channel_id_matches_solidity_packing() {
-        // keccak256(client ++ provider ++ uint256(nonce)). Deterministic, and
-        // distinct inputs must give distinct ids.
-        let client = address!("00000000000000000000000000000000000000aa");
-        let provider = address!("00000000000000000000000000000000000000bb");
-        let a = derive_channel_id(client, provider, U256::from(0u64));
-        let b = derive_channel_id(client, provider, U256::from(1u64));
-        let a_again = derive_channel_id(client, provider, U256::from(0u64));
-        assert_eq!(a, a_again, "same inputs → same id");
-        assert_ne!(a, b, "different nonce → different id");
-        // Hand-pack the same bytes and compare to guard the packing layout.
-        let mut packed = Vec::new();
-        packed.extend_from_slice(client.as_slice());
-        packed.extend_from_slice(provider.as_slice());
-        packed.extend_from_slice(&U256::from(0u64).to_be_bytes::<32>());
-        assert_eq!(a, keccak256(&packed));
-        assert_eq!(packed.len(), 72, "20 + 20 + 32 packed bytes");
-    }
+    // channelId derivation moved on-chain → the `ChannelOpened` event in the
+    // open receipt; the local packing helper + its test were removed with it.
 
     // `BuyerChannelState::advance` monotonicity is unit-tested in the incentive
     // crate (crates/incentive/src/buyer_channel.rs) where the method lives.

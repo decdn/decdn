@@ -9,8 +9,8 @@
 //!   [`crate::channel::ChannelState::token`] since `ChannelOpened` does not
 //!   carry it) and `getChannel(channelId)` (to read the on-chain
 //!   `withdrawnAmount` watermark when deciding whether a redemption delta
-//!   crosses the threshold), plus `minDeposit()` and `clientChannelNonce()`
-//!   for the buyer path (deposit floor + channel-id derivation);
+//!   crosses the threshold), plus `minDeposit()` (the buyer-path deposit
+//!   floor);
 //! - seller writes: `withdraw` (redeem accrued earnings while the channel
 //!   stays open — no dispute window), `closeChannel` (initiate close with the
 //!   latest voucher), and `settleChannel` (finalize after the window);
@@ -19,8 +19,8 @@
 //!   channel's deposit), and `reclaimExpired` (recover the deposit of an
 //!   abandoned channel after expiry);
 //! - events: `ChannelOpened` (the seller filters on `provider == self` to
-//!   persist; the buyer does NOT consume this event — it derives its
-//!   `channelId` locally and confirms via `getChannel`), `ChannelToppedUp`
+//!   persist; the buyer decodes it from its own `openChannel` tx receipt to
+//!   learn the `channelId` + `expiresAt`), `ChannelToppedUp`
 //!   (→ raise the tracked deposit
 //!   so post-top-up vouchers are not wrongly rejected),
 //!   `ChannelCloseInitiated` (observed-only here; the dispute monitor is
@@ -106,11 +106,6 @@ mod sol_types {
             /// deposit up to the on-chain floor before opening.
             function minDeposit() external view returns (uint256);
 
-            /// Per-client monotonic channel counter. `channelId` for the next
-            /// open is `keccak256(client, provider, clientChannelNonce[client])`;
-            /// exposed for the buyer path to predict / cross-check the id.
-            function clientChannelNonce(address client) external view returns (uint256);
-
             // -----------------------------------------------------------------
             // Write functions (provider/seller path)
             // -----------------------------------------------------------------
@@ -148,10 +143,9 @@ mod sol_types {
 
             /// Open a channel against `provider`, escrowing `deposit` USDC
             /// (pulled via `safeTransferFrom`, so the caller MUST have an
-            /// allowance). Caller becomes `channel.client`. Returns the
-            /// derived `channelId` — the buyer predicts it locally from
-            /// `clientChannelNonce` and cross-checks it via `getChannel`
-            /// (it does not parse the `ChannelOpened` log).
+            /// allowance). Caller becomes `channel.client`. The buyer learns the
+            /// `channelId` + `expiresAt` by decoding the `ChannelOpened` event
+            /// from this tx's receipt (atomic with the open — no follow-up read).
             function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
 
             /// Client-only: add `additionalDeposit` USDC to an open channel.
