@@ -181,6 +181,32 @@ mod tests {
     }
 
     #[test]
+    fn valid_length_invalid_parity_rejected() -> anyhow::Result<()> {
+        // A correctly-sized (65-byte) signature whose recovery-id byte is not a
+        // valid parity is rejected by `Signature::from_raw`, exercising the
+        // bridge's `from_raw` error arm — distinct from the length check above.
+        // Guards against a regression that trusts the length alone and drops the
+        // `from_raw` call.
+        let mut signature = vec![0u8; decdn_protocol::VOUCHER_SIG_LEN];
+        // Set the recovery-id (last) byte to an invalid parity: 2 is neither a
+        // legacy parity (0/1/27/28) nor a valid EIP-155 `v`. `last_mut` avoids
+        // indexing (denied outside the `prop_tests` allow block).
+        if let Some(v) = signature.last_mut() {
+            *v = 2;
+        }
+        let wire = WireVoucher {
+            signature,
+            amount: [0u8; 32],
+            nonce: [0u8; 32],
+        };
+        let err = wire_voucher_to_signed(&wire, B256::ZERO, TOKEN, U256::ZERO)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected BadSignature, got Ok"))?;
+        anyhow::ensure!(matches!(err, WireVoucherError::BadSignature));
+        Ok(())
+    }
+
+    #[test]
     fn amount_nonce_big_endian_preserved() -> anyhow::Result<()> {
         let signer = PrivateKeySigner::random();
         let domain = voucher_domain(421_614, VERIFYING);
@@ -276,9 +302,9 @@ mod tests {
 /// Property-based tests for the wire bridge (#740). The bridge is where the
 /// `U256` money/sequence fields cross to the fixed 32-byte big-endian wire form
 /// and back — the exact spot a truncation would corrupt a payment. These sweep
-/// the full keyspace (boundaries `0`, `u64::MAX`, `U256::MAX` guaranteed) and
-/// confirm the round-trip is lossless and that malformed wire input never
-/// panics.
+/// the full keyspace (boundaries `0`, `u64::MAX`, `U256::MAX` heavily
+/// over-sampled, see [`any_u256`]) and confirm the round-trip is lossless and
+/// that malformed wire input never panics.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -296,7 +322,8 @@ mod prop_tests {
     const TOKEN: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
     const VERIFYING: Address = address!("0000000000000000000000000000000000001234");
 
-    /// `U256` sweep with the truncation-prone boundaries guaranteed-sampled.
+    /// `U256` sweep with the truncation-prone boundaries heavily over-sampled
+    /// (weight 1 each against the random arm's 8).
     fn any_u256() -> impl Strategy<Value = U256> {
         prop_oneof![
             8 => proptest::array::uniform32(any::<u8>()).prop_map(U256::from_be_bytes),

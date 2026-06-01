@@ -263,6 +263,26 @@ mod tests {
     }
 
     #[test]
+    fn unrecoverable_signature_is_invalid_signature() -> anyhow::Result<()> {
+        // A structurally well-formed signature (valid parity byte) whose `r`/`s`
+        // do not recover to any point surfaces as `InvalidSignature` — the only
+        // producer of that variant. `r = s = 0` is the canonical unrecoverable
+        // case (ECDSA recovery requires `r, s ∈ [1, n)`). This is the one
+        // negative path the tamper tests can't reach: they all start from a
+        // valid signature and only perturb the digest, yielding `WrongSigner`.
+        let signed = SignedVoucher {
+            voucher: sample_voucher(),
+            signature: Signature::new(U256::ZERO, U256::ZERO, false),
+        };
+        let err = err_of(signed.recover_signer(&sample_domain()))?;
+        anyhow::ensure!(
+            matches!(err, VoucherError::InvalidSignature),
+            "expected InvalidSignature, got: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn different_chain_id_rejected() -> anyhow::Result<()> {
         let signer = PrivateKeySigner::random();
         let domain_a = voucher_domain(
@@ -494,8 +514,9 @@ mod tests {
 /// `tests` module above pins fixed vectors and single-field tamper cases with
 /// small values; these sweep the full `U256` keyspace for `amount` / `nonce` /
 /// `bytes_delivered` with the dangerous boundaries (`0`, `u64::MAX`,
-/// `U256::MAX`) guaranteed-sampled, to catch any silent truncation or
-/// accept-invalid path before mainnet. We trust `alloy` for the EIP-712
+/// `U256::MAX`) heavily over-sampled (see [`any_u256`]), to catch any silent
+/// truncation or accept-invalid path before mainnet. We trust `alloy` for the
+/// EIP-712
 /// primitive and assert the invariants the protocol depends on: sign→recover is
 /// total over that range, the digest is deterministic and covers every field,
 /// and the domain is binding.
@@ -512,10 +533,11 @@ mod prop_tests {
     use proptest::prelude::*;
 
     /// A `U256` strategy that sweeps the full keyspace via uniform 32-byte
-    /// fills while guaranteeing the boundary values are sampled — these are
-    /// exactly where a `u64` truncation or an off-by-one would hide. The random
-    /// arm is weighted heavily so the boundaries punctuate a broad sweep rather
-    /// than dominate it.
+    /// fills while heavily over-sampling the boundary values — these are exactly
+    /// where a `u64` truncation or an off-by-one would hide. Each boundary `Just`
+    /// arm carries weight 1 against the random arm's 8, so over the default 256
+    /// cases every boundary is hit with overwhelming (not certain) probability,
+    /// while the random sweep still dominates.
     fn any_u256() -> impl Strategy<Value = U256> {
         prop_oneof![
             8 => proptest::array::uniform32(any::<u8>()).prop_map(U256::from_be_bytes),
@@ -583,17 +605,21 @@ mod prop_tests {
             prop_assert!(signed.verify_signer(signer.address(), &domain).is_ok());
         }
 
-        /// The signing hash is a pure function of `(voucher, domain)` — two
-        /// independent computations agree. Cheap, but it pins determinism
-        /// across the whole boundary-laden keyspace.
+        /// The signing hash depends only on the field *values*, not on object
+        /// identity: an independently reconstructed domain and a clone carrying
+        /// the same values produce the same digest. This is referential
+        /// transparency for `signing_hash` over the boundary-laden keyspace — a
+        /// stronger statement than calling it twice on one struct.
         #[test]
-        fn signing_hash_is_deterministic(
+        fn signing_hash_depends_only_on_field_values(
             voucher in any_voucher(),
             chain_id in any::<u64>(),
             verifying in any_address(),
         ) {
-            let domain = voucher_domain(chain_id, verifying);
-            prop_assert_eq!(voucher.signing_hash(&domain), voucher.signing_hash(&domain));
+            let domain_a = voucher_domain(chain_id, verifying);
+            let domain_b = voucher_domain(chain_id, verifying);
+            let voucher_b = voucher.clone();
+            prop_assert_eq!(voucher.signing_hash(&domain_a), voucher_b.signing_hash(&domain_b));
         }
 
         /// Changing any single field to a different value changes the digest —
@@ -656,9 +682,18 @@ mod prop_tests {
             let domain_b = voucher_domain(chain_b, verifying_b);
 
             let signed = voucher.sign(&signer, &domain_a).unwrap();
-            // A different domain yields a different digest, so recovery lands on
-            // some other address — `WrongSigner`, not `InvalidSignature` (the
-            // signature itself is well-formed, so recovery always succeeds).
+            // The two domains differ, so the digests must differ. Assert that
+            // explicitly: it makes the binding chain (different domain ⇒
+            // different digest ⇒ different recovered address) visible, and turns
+            // a cryptographically-negligible address collision into a clear
+            // digest-equality failure rather than a confusing `WrongSigner` flake.
+            prop_assert_ne!(
+                signed.voucher.signing_hash(&domain_a),
+                signed.voucher.signing_hash(&domain_b)
+            );
+            // A different digest means recovery lands on some other address —
+            // `WrongSigner`, not `InvalidSignature` (the signature itself is
+            // well-formed, so recovery always succeeds).
             let err = signed.verify_signer(signer.address(), &domain_b).unwrap_err();
             prop_assert!(
                 matches!(err, VoucherError::WrongSigner { .. }),
