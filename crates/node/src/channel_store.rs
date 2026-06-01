@@ -778,25 +778,28 @@ impl PersistentChannelStateStore {
             let (key_guard, value_guard) =
                 entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
             let key_bytes: [u8; 20] = *key_guard.value();
-            // Skip-and-warn on a single undecodable record rather than failing
-            // the whole load. Unlike the seller `load_all` — whose error aborts
-            // startup (a corrupt voucher record reopening the #527 replay window
-            // is unsafe to run past) — buyer bootstrap is *non-fatal*: a
-            // propagated error here would not just disable new buys, it would
-            // stop the reclaim sweep from ever spawning, stranding every *other*
-            // tracked channel's deposit as unreclaimable (PR #753 review,
-            // alpergundogdu). One bad row must not take the others down; its own
-            // deposit stays untracked until the row is repaired, which the
-            // `warn!` surfaces.
+            // Skip (don't fail the whole load) on a single undecodable record.
+            // Unlike the seller `load_all` — whose error aborts startup (a
+            // corrupt voucher record reopening the #527 replay window is unsafe
+            // to run past) — buyer bootstrap is *non-fatal*: a propagated error
+            // here would not just disable new buys, it would stop the reclaim
+            // sweep from ever spawning, stranding every *other* tracked
+            // channel's deposit as unreclaimable (PR #753 review, alpergundogdu).
+            // One bad row must not take the others down. Logged at `error!`, not
+            // `warn!`: the skipped row's deposit stays escrowed-but-unreclaimable
+            // until an operator repairs the record, so it warrants action (and
+            // must not be filtered out of alerting). The channel id can't be
+            // named — it lives inside the undecodable bytes — so the on-chain
+            // provider key is the only handle the operator gets.
             match decode_buyer_record(key_bytes, value_guard.value()) {
                 Ok(state) => out.push(state),
-                Err(err) => tracing::warn!(
+                Err(err) => tracing::error!(
                     provider = %Address::from(key_bytes),
                     %err,
                     event = "buyer_channel_store_skip_undecodable_record",
-                    "buyer channel hydration: skipping an undecodable record; its deposit is \
-                     untracked and unreclaimable until the record is repaired, but other channels \
-                     remain healthy",
+                    "buyer channel hydration: skipping an undecodable record; its escrowed deposit \
+                     is untracked and will not be auto-reclaimed until the record is repaired \
+                     (other channels remain healthy)",
                 ),
             }
         }

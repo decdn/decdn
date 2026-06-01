@@ -48,8 +48,9 @@ pub const NEVER_EXPIRES: u64 = 0;
 /// `last_nonce + 1` / `last_bytes_delivered + delta` / `last_amount + delta`.
 ///
 /// **Field invariant:** `provider` is the **identity key** (the store keys on
-/// it; `channel_id` is derived data cross-checked against the chain at open
-/// time). The `last_*` fields MUST only advance — through
+/// it; `channel_id` is the authoritative id decoded from the `ChannelOpened`
+/// event in the open tx receipt). The `last_*` fields MUST only advance —
+/// through
 /// [`BuyerChannelState::advance`] (the validated mutator) or hydration from a
 /// [`BuyerChannelStore`]. The fields stay `pub` because the cross-crate
 /// hydration path (`decdn-node` decoding the redb record) needs struct-literal
@@ -59,7 +60,8 @@ pub const NEVER_EXPIRES: u64 = 0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuyerChannelState {
     /// On-chain `channelId` (`keccak256(client, provider, channelNonce)`) —
-    /// derived data, cross-checked against `getChannel` at open time.
+    /// learned by decoding the `ChannelOpened` event from the open tx receipt
+    /// (atomic with the open; no follow-up `getChannel` read).
     pub channel_id: ChannelId,
     /// Upstream provider's Ethereum address — the per-provider reuse key
     /// (the channel's identity in [`BuyerChannelStore`]).

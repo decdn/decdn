@@ -40,7 +40,7 @@ use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{BuyerChannelState, BuyerChannelStore};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::client_requester::ChannelContext;
 use crate::payment_settlement::unix_now;
@@ -77,6 +77,31 @@ impl Drop for AbortOnDrop {
 struct InFlightOpenGuard {
     set: Arc<Mutex<HashSet<Address>>>,
     provider: Address,
+}
+
+impl InFlightOpenGuard {
+    /// Claim the open slot for `provider`. Returns `Ok(None)` when an open for
+    /// that provider is already in flight (the caller bails for retry), or
+    /// `Ok(Some(guard))` holding the slot until drop. Folding the set-insert and
+    /// the guard into one constructor makes the one-open-per-provider invariant
+    /// impossible to violate by construction: a guard cannot exist without a
+    /// successful claim, and a claim cannot succeed without yielding a guard.
+    fn claim(set: &Arc<Mutex<HashSet<Address>>>, provider: Address) -> Result<Option<Self>> {
+        // Acquisition treats a poisoned lock as fatal (`?`-bail) — unlike `Drop`
+        // below, which must still release the slot. The set carries no
+        // cross-element invariant, but refusing to *acquire* on a poisoned lock
+        // surfaces the prior panic instead of papering over it.
+        let mut in_flight = set
+            .lock()
+            .map_err(|err| anyhow::anyhow!("opens_in_flight mutex poisoned: {err}"))?;
+        if !in_flight.insert(provider) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            set: Arc::clone(set),
+            provider,
+        }))
+    }
 }
 
 impl Drop for InFlightOpenGuard {
@@ -259,21 +284,12 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         // Claim the per-provider open slot; if another open is already in flight
         // for this provider, bail for retry rather than escrow a second deposit
         // whose `record` would orphan the first.
-        let _open_guard = {
-            let mut in_flight = self
-                .opens_in_flight
-                .lock()
-                .map_err(|err| anyhow::anyhow!("opens_in_flight mutex poisoned: {err}"))?;
-            if !in_flight.insert(provider_addr) {
-                anyhow::bail!(
-                    "openChannel for provider {provider_addr} is already in flight; retry once it \
-                     completes (the resulting channel will be reused)"
-                );
-            }
-            InFlightOpenGuard {
-                set: Arc::clone(&self.opens_in_flight),
-                provider: provider_addr,
-            }
+        let Some(_open_guard) = InFlightOpenGuard::claim(&self.opens_in_flight, provider_addr)?
+        else {
+            anyhow::bail!(
+                "openChannel for provider {provider_addr} is already in flight; retry once it \
+                 completes (the resulting channel will be reused)"
+            );
         };
 
         // Re-check under the slot: a concurrent open may have created the channel
@@ -318,6 +334,18 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             }
         }
 
+        self.open_and_persist(provider_addr, deposit_hint).await
+    }
+
+    /// Open a fresh channel on-chain against `provider_addr` and persist it.
+    /// Called by [`Self::open_or_reuse_channel`] once it holds the per-provider
+    /// open slot and has confirmed no live channel exists. The deposit is
+    /// `max(deposit_hint, default_deposit, min_deposit)`.
+    async fn open_and_persist(
+        &self,
+        provider_addr: Address,
+        deposit_hint: U256,
+    ) -> Result<ChannelContext> {
         let deposit = deposit_hint.max(self.default_deposit).max(self.min_deposit);
 
         let receipt = self
@@ -336,6 +364,16 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             );
         }
 
+        // From here the deposit is escrowed on-chain. Until `record` persists,
+        // the channel is tracked ONLY on-chain — and the buyer path has no
+        // chain-log recovery yet (no `getChannelsByClient` reconciliation at
+        // bootstrap), so the reclaim sweep, which only iterates `load_all`, will
+        // never see an unpersisted channel. Both failure paths below therefore
+        // escalate to `error!` with the tx hash so an operator can reconcile /
+        // reclaim the deposit manually. (A bootstrap reconciliation scan that
+        // would automate this is tracked in #763, gated on the cache-miss hook.)
+        let tx = receipt.transaction_hash;
+
         // Decode this tx's `ChannelOpened` event from the receipt for the
         // authoritative `channelId` + `expiresAt`. This is atomic with the
         // open: a successful tx guarantees the event is present, so we can
@@ -343,19 +381,27 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         // whose transient failure would leave the on-chain deposit orphaned
         // (opened but untracked, re-opened on the next miss). Filtering on
         // `client`/`provider` also confirms we decoded our own open.
-        let opened = receipt
+        let Some(opened) = receipt
             .inner
             .logs()
             .iter()
             .filter_map(|log| log.log_decode::<PaymentChannel::ChannelOpened>().ok())
             .map(|decoded| decoded.inner.data)
             .find(|ev| ev.client == self.self_address && ev.provider == provider_addr)
-            .with_context(|| {
-                format!(
-                    "ChannelOpened event for provider {provider_addr} not found in openChannel \
-                     receipt logs"
-                )
-            })?;
+        else {
+            error!(
+                %tx,
+                provider = %provider_addr,
+                %deposit,
+                "openChannel tx mined but its ChannelOpened event was not found in the receipt \
+                 logs (ABI/contract skew?); the deposit is escrowed on-chain but UNTRACKED locally \
+                 and will not be auto-reclaimed — reconcile manually against the tx"
+            );
+            anyhow::bail!(
+                "ChannelOpened event for provider {provider_addr} not found in openChannel \
+                 receipt logs (tx {tx})"
+            );
+        };
         let channel_id = opened.channelId;
         // The `ChannelOpened` event's `expiresAt` is `uint256`; clamp to `u64`
         // (a too-far expiry only ever means the reclaim sweep waits longer).
@@ -363,9 +409,19 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
 
         let state =
             BuyerChannelState::new(channel_id, provider_addr, self.token, deposit, expires_at);
-        self.store
-            .record(&state)
-            .context("persist newly-opened buyer channel")?;
+        if let Err(err) = self.store.record(&state) {
+            error!(
+                %tx,
+                provider = %provider_addr,
+                %channel_id,
+                %deposit,
+                %err,
+                "buyer channel opened on-chain (deposit escrowed) but persisting the local record \
+                 failed; the deposit is UNTRACKED and will not be auto-reclaimed — reconcile \
+                 manually against the tx"
+            );
+            return Err(err).context("persist newly-opened buyer channel");
+        }
         info!(
             provider = %provider_addr,
             %channel_id,
@@ -689,28 +745,20 @@ mod tests {
     fn in_flight_open_guard_refuses_concurrent_then_releases() {
         let set: Arc<Mutex<HashSet<Address>>> = Arc::new(Mutex::new(HashSet::new()));
         let provider = sample(7).provider;
-        // Mirrors the insert-or-refuse claim in `open_or_reuse_channel`.
-        let claim = || -> Option<InFlightOpenGuard> {
-            let mut in_flight = set
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !in_flight.insert(provider) {
-                return None;
-            }
-            Some(InFlightOpenGuard {
-                set: Arc::clone(&set),
-                provider,
-            })
-        };
-
-        let guard = claim();
+        // Exercises the production `claim` constructor (the same call
+        // `open_or_reuse_channel` makes), not a re-implementation of it.
+        // `.ok().flatten()` discards the (impossible here) poison error.
+        let guard = InFlightOpenGuard::claim(&set, provider).ok().flatten();
         assert!(guard.is_some(), "first claim acquires the open slot");
         assert!(
-            claim().is_none(),
+            InFlightOpenGuard::claim(&set, provider)
+                .ok()
+                .flatten()
+                .is_none(),
             "a concurrent claim for the same provider is refused"
         );
         drop(guard);
-        let reclaimed = claim();
+        let reclaimed = InFlightOpenGuard::claim(&set, provider).ok().flatten();
         assert!(
             reclaimed.is_some(),
             "the slot is free once the prior guard drops"
