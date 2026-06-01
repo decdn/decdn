@@ -567,7 +567,7 @@ mod tests {
     clippy::indexing_slicing
 )]
 mod prop_tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use proptest::prelude::*;
 
@@ -724,58 +724,89 @@ mod prop_tests {
         /// is never present, there are no duplicates, and `len()` agrees with
         /// the set of held peers. Finally `contains()` agrees with the held set
         /// for every id the sequence touched.
+        ///
+        /// Cross-checks the table against an independent reference LRU model
+        /// after every operation. An exact state match is strictly stronger
+        /// than spot-checking invariants: it pins bucket *placement*, the
+        /// within-K fill bound, dedup, AND LRU eviction *ordering* (that the
+        /// least-recently-seen entry is the one dropped) — none of which a
+        /// `len() <= K` count check alone would catch. The `insert`/`remove`
+        /// boolean returns are asserted against the model too.
         #[test]
-        fn table_invariants_hold_under_random_ops(
+        fn table_matches_independent_lru_model_under_random_ops(
             self_bytes in proptest::array::uniform32(any::<u8>()),
-            // Buckets restricted to a narrow 8..12 window (with the full salt
-            // range) so distinct salts collide into just four buckets: with up
-            // to 128 ops that drives per-bucket fill well past K and routinely
-            // exercises LRU eviction — which random 256-bit ids spread across
-            // 256 buckets almost never do.
-            ops in prop::collection::vec((any::<bool>(), 8usize..12, any::<u8>()), 0..128),
+            // Two buckets (8..10) drawn from a deliberately small salt domain
+            // (0..40) so distinct peers routinely collide into the same bucket
+            // and drive fill past K=20 — the full `any::<u8>()` salt domain over
+            // wider bucket ranges reaches the eviction path in only ~2% of cases
+            // (measured), leaving it essentially untested. `bucket >= 8` keeps
+            // the selecting bit in byte 30, clear of the salt byte (byte 31), so
+            // every peer lands in its intended bucket. Up to 256 ops makes
+            // eviction fire in roughly a third of cases.
+            ops in prop::collection::vec((any::<bool>(), 8usize..10, 0u8..40), 0..256),
         ) {
             let self_id = NodeId::from_bytes(self_bytes);
             let mut rt = RoutingTable::new(self_id);
             let mut touched: BTreeSet<NodeId> = BTreeSet::new();
 
+            // Reference model: bucket index -> peers in LRU order (front =
+            // least-recently-seen, back = most-recently-seen). Keyed by the
+            // INDEPENDENT `leading_zero_bits` oracle, never `bucket_index`, so a
+            // placement bug in the table surfaces as a state mismatch rather
+            // than being mirrored by the model.
+            let mut model: BTreeMap<usize, Vec<NodeId>> = BTreeMap::new();
+
             for (is_insert, bucket, salt) in &ops {
                 let peer = id_in_bucket(&self_id, *bucket, *salt);
                 touched.insert(peer);
-                if *is_insert {
-                    rt.insert(peer);
+
+                let idx = KEYSPACE_BITS - 1 - leading_zero_bits(&xor_distance(&self_id, &peer));
+                let slot = model.entry(idx).or_default();
+                let present = slot.iter().position(|p| p == &peer);
+
+                // Replay the documented insert/remove semantics on the model and
+                // capture the boolean it implies.
+                let model_ret = if *is_insert {
+                    if let Some(i) = present {
+                        // Refresh: move to MRU, report "not a fresh insert".
+                        let p = slot.remove(i);
+                        slot.push(p);
+                        false
+                    } else {
+                        if slot.len() >= K_BUCKET_SIZE {
+                            slot.remove(0); // evict least-recently-seen
+                        }
+                        slot.push(peer);
+                        true
+                    }
+                } else if let Some(i) = present {
+                    slot.remove(i);
+                    true
                 } else {
-                    rt.remove(&peer);
-                }
+                    false
+                };
+
+                let rt_ret = if *is_insert {
+                    rt.insert(peer)
+                } else {
+                    rt.remove(&peer)
+                };
+                prop_assert_eq!(rt_ret, model_ret, "insert/remove return disagreed with model");
 
                 // Own id is never stored.
                 prop_assert!(!rt.contains(&self_id));
 
-                // Validate each peer against the bucket it is ACTUALLY stored in
-                // (`rt.buckets[actual_idx]`), comparing to an independent
-                // leading-zero oracle rather than `bucket_index` — the table uses
-                // `bucket_index` to place peers, so checking against it would be
-                // circular and blind to a `bucket_index` bug. Within-K is read
-                // from the real bucket length, not a recomputed grouping.
-                let mut held: BTreeSet<NodeId> = BTreeSet::new();
-                for (actual_idx, bucket) in rt.buckets.iter().enumerate() {
-                    prop_assert!(bucket.len() <= K_BUCKET_SIZE, "bucket exceeded K");
-                    for p in bucket {
-                        prop_assert_ne!(*p, self_id);
-                        let lz = leading_zero_bits(&xor_distance(&self_id, p));
-                        prop_assert_eq!(
-                            actual_idx,
-                            KEYSPACE_BITS - 1 - lz,
-                            "peer stored in the wrong bucket"
-                        );
-                        prop_assert!(held.insert(*p), "duplicate peer across buckets");
-                    }
-                }
-                prop_assert_eq!(rt.len(), held.len());
+                // Exact state match. `iter_peers` is bucket-major, MRU-last —
+                // identical to flattening the model's `BTreeMap(idx) -> Vec`.
+                // This single equality pins placement, within-K fill, dedup, and
+                // LRU eviction order.
+                let model_flat: Vec<NodeId> = model.values().flatten().copied().collect();
+                let rt_flat: Vec<NodeId> = rt.iter_peers().copied().collect();
+                prop_assert_eq!(&rt_flat, &model_flat, "table state diverged from LRU model");
             }
 
-            // `contains()` is consistent with the final held set for every id
-            // the sequence operated on (covers both still-present and
-            // removed/evicted ids).
+            // `contains()` is consistent with the held set for every id the
+            // sequence touched (covers still-present and removed/evicted ids).
             let held: BTreeSet<NodeId> = rt.iter_peers().copied().collect();
             for id in &touched {
                 prop_assert_eq!(rt.contains(id), held.contains(id));
