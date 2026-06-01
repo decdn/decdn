@@ -61,6 +61,11 @@ tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Property-based tests for the DHT routing table (`src/dht/routing.rs`):
+# xor_distance metric laws and the fixed-bucket / within-K invariants under
+# random insert/remove sequences. Mirrors the `proptest` usage already in
+# `decdn-protocol` (framing round-trip tests).
+proptest = { workspace = true }
 # `nix` provides a safe wrapper around `raise(2)` so the SIGHUP/SIGTERM
 # integration tests can deliver real signals from inside the test process
 # without violating the workspace `unsafe_code = "forbid"` lint that would
