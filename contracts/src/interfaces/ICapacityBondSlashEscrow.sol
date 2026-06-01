@@ -30,4 +30,19 @@ interface ICapacityBondSlashEscrow {
     ///         clear their `slashedAtEpoch` zero-out (ADR 036). Reverts if the
     ///         slash is not `AppealOpen`.
     function settleAppealGranted(uint256 slashId) external;
+
+    /// @notice Combined slash-path paused-seconds accumulator. `CapacityBond`
+    ///         is the single source of truth: both its own pauses and (via
+    ///         `creditPauseTime`) `SlashAppeal`'s pauses fold in here, so every
+    ///         window (filing, review, ratification) extends by the same total
+    ///         and a pause on either contract never silently consumes a window
+    ///         (ADR 028 §5).
+    function pausedTotal() external view returns (uint64);
+
+    /// @notice Add `SlashAppeal`'s just-ended pause interval to the combined
+    ///         `pausedTotal`. Called only by `SlashAppeal._unpause` so the
+    ///         filing window (enforced on `CapacityBond`) extends by the time
+    ///         `SlashAppeal` was paused — the window during which operators
+    ///         could not file. Gated by `SLASH_APPEAL_ROLE`.
+    function creditPauseTime(uint64 delta) external;
 }

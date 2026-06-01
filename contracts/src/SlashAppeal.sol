@@ -105,14 +105,12 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     /// @notice Timestamp of the operator's last GRANTED appeal (frequency cap).
     mapping(address operator => uint64) public lastAcceptedAppealAt;
 
-    /// @notice Cumulative time (seconds) this contract has spent paused. Added
-    ///         to the review / ratification window deadline checks in
-    ///         `cleanupExpiredAppeal` so a pause never silently consumes an
-    ///         appeal window (ADR 028 §5).
-    uint64 public pausedTotal;
-
     /// @notice `block.timestamp` at which the current pause began; 0 when not
-    ///         paused.
+    ///         paused. The pause duration is not accumulated locally — on
+    ///         unpause it is credited to `CapacityBond.pausedTotal` (the single
+    ///         combined counter), and the review / ratification window checks
+    ///         read that combined value, so a pause on either contract extends
+    ///         every window uniformly (ADR 028 §5).
     uint64 internal _pausedAt;
 
     // -----------------------------------------------------------------
@@ -304,8 +302,23 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
         address pool = challengerIncentivePool;
         uint256 toPool = pool == address(0) ? 0 : bondTotal / 2;
         uint256 toBurn = bondTotal - toPool;
+        if (toPool != 0) {
+            // Degrade to burn if the pool transfer fails — a reverting or
+            // blocklisting `challengerIncentivePool` must not be able to block
+            // the uphold and let `cleanupExpiredAppeal` flip it to an
+            // operator-favorable grant after the ratification window (ADR 028
+            // §3). Mirrors the `address(0)` degrade above, defensively.
+            try IERC20(address(token)).transfer(pool, toPool) returns (bool ok) {
+                if (!ok) {
+                    toBurn += toPool;
+                    toPool = 0;
+                }
+            } catch {
+                toBurn += toPool;
+                toPool = 0;
+            }
+        }
         if (toBurn != 0) token.burn(toBurn);
-        if (toPool != 0) IERC20(address(token)).safeTransfer(pool, toPool);
         emit AppealUpheld(slashId, toBurn, toPool);
     }
 
@@ -315,10 +328,12 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     ///      (refund bond — governance inactivity is not the appellant's fault).
     function cleanupExpiredAppeal(uint256 slashId) external override nonReentrant whenNotPaused {
         Appeal storage a = _appeals[slashId];
+        uint64 combinedPaused = ICapacityBondSlashEscrow(address(capacityBond)).pausedTotal();
         if (a.status == AppealStatus.Open) {
-            // Review window extended by the cumulative paused duration so a
-            // pause never silently consumes the multisig's window (ADR 028 §5).
-            uint64 readyAt = a.openedAt + uint64(APPEAL_REVIEW_WINDOW) + pausedTotal;
+            // Review window extended by the combined paused duration (this
+            // contract's pauses + CapacityBond's) so a pause on either never
+            // silently consumes the multisig's window (ADR 028 §5).
+            uint64 readyAt = a.openedAt + uint64(APPEAL_REVIEW_WINDOW) + combinedPaused;
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp < readyAt) revert ReviewWindowOpen(readyAt);
             uint256 bondBurned = a.bond;
@@ -330,8 +345,8 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
             return;
         }
         if (a.status == AppealStatus.FastTracked) {
-            // Ratification window extended by the cumulative paused duration.
-            uint64 readyAt = a.fastTrackedAt + uint64(APPEAL_RATIFICATION_WINDOW) + pausedTotal;
+            // Ratification window extended by the combined paused duration.
+            uint64 readyAt = a.fastTrackedAt + uint64(APPEAL_RATIFICATION_WINDOW) + combinedPaused;
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp < readyAt) revert RatificationWindowOpen(readyAt);
             uint256 bondRefund = a.bond;
@@ -382,20 +397,23 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
         _unpause();
     }
 
-    /// @dev Stamp the pause start so `_unpause` can accumulate the duration
-    ///      into `pausedTotal` (ADR 028 §5 window extension).
+    /// @dev Stamp the pause start so `_unpause` can credit the duration to the
+    ///      combined `CapacityBond.pausedTotal` (ADR 028 §5 window extension).
     function _pause() internal override {
         // forge-lint: disable-next-line(block-timestamp)
         _pausedAt = uint64(block.timestamp);
         super._pause();
     }
 
-    /// @dev Accumulate the just-ended pause interval into `pausedTotal`.
+    /// @dev Credit the just-ended pause interval to the combined counter on
+    ///      `CapacityBond` so the slash *filing* window (enforced there) extends
+    ///      by the time appeals could not be filed, not just the local windows.
     function _unpause() internal override {
         // forge-lint: disable-next-line(block-timestamp)
-        pausedTotal += uint64(block.timestamp) - _pausedAt;
+        uint64 delta = uint64(block.timestamp) - _pausedAt;
         _pausedAt = 0;
         super._unpause();
+        if (delta != 0) ICapacityBondSlashEscrow(address(capacityBond)).creditPauseTime(delta);
     }
 
     // -----------------------------------------------------------------
