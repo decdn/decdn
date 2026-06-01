@@ -678,7 +678,7 @@ function isActiveNode(bytes32 nodeId) external view returns (bool);
 function getActiveNodeCount() external view returns (uint256);
 function getActiveNodes(uint256 offset, uint256 limit)
     external view returns (NodeInfo[] memory);
-function getFirstBondedAt(address ethAddress) external view returns (uint256);
+function firstBondedAt(address operator) external view returns (uint64);
 
 // State — per-nodeId nonce for ed25519 registration replay protection
 mapping(bytes32 => uint64) public registrationNonce;
