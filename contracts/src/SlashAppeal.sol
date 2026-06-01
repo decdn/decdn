@@ -328,6 +328,8 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     ///      (refund bond — governance inactivity is not the appellant's fault).
     function cleanupExpiredAppeal(uint256 slashId) external override nonReentrant whenNotPaused {
         Appeal storage a = _appeals[slashId];
+        // Staticcall to the trusted CapacityBond under `nonReentrant`.
+        // aderyn-ignore-next-line(reentrancy-state-change)
         uint64 combinedPaused = ICapacityBondSlashEscrow(address(capacityBond)).pausedTotal();
         if (a.status == AppealStatus.Open) {
             // Review window extended by the combined paused duration (this

@@ -300,8 +300,11 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         // Credit the balance actually received, not the requested amount, so a
         // future fee-on-transfer USDC proxy upgrade cannot over-state this
         // channel's share of the shared pool and brick later settlements.
+        // Balance reads are staticcalls to the trusted USDC under `nonReentrant`.
+        // aderyn-ignore-next-line(reentrancy-state-change)
         uint256 balanceBefore = usdc.balanceOf(address(this));
         usdc.safeTransferFrom(msg.sender, address(this), deposit);
+        // aderyn-ignore-next-line(reentrancy-state-change)
         uint256 received = usdc.balanceOf(address(this)) - balanceBefore;
         if (received < minDeposit) revert DepositBelowMinimum(received, minDeposit);
         ch.deposit = received;
@@ -319,10 +322,16 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         if (additionalDeposit == 0) revert ZeroAmount();
 
         // Credit the measured delta (see `openChannel`) so fee-on-transfer
-        // behavior cannot over-credit the channel's deposit.
+        // behavior cannot over-credit the channel's deposit. Balance reads are
+        // staticcalls to the trusted USDC under `nonReentrant`.
+        // aderyn-ignore-next-line(reentrancy-state-change)
         uint256 balanceBefore = usdc.balanceOf(address(this));
         usdc.safeTransferFrom(msg.sender, address(this), additionalDeposit);
+        // aderyn-ignore-next-line(reentrancy-state-change)
         uint256 received = usdc.balanceOf(address(this)) - balanceBefore;
+        // `received` is a derived balance delta; the `== 0` is a presence check
+        // (a top-up that delivered nothing), not a dangerous balance equality.
+        // slither-disable-next-line incorrect-equality
         if (received == 0) revert ZeroAmount();
         ch.deposit += received;
 
