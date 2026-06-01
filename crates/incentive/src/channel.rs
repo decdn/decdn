@@ -117,10 +117,24 @@ impl ChannelState {
     /// Ordering of side effects: every check above runs first; if all pass,
     /// the candidate `last_*` tuple is sent to `store.record` and only on
     /// `Ok` is in-memory state advanced. On any check failure — including
-    /// store failure — `self` is left unchanged. This makes `Ok(())` the
+    /// store failure — `self` is left unchanged. This makes `Ok(_)` the
     /// protocol-level commit point: `VoucherAck` MUST be sent (and further
     /// bytes delivered) **only after, never before**, this method returns
     /// `Ok` (ADR 003 §Off-chain voucher state persistence, issue #527).
+    ///
+    /// On success returns a [`VoucherApplied`] reporting how many nonce values
+    /// the accepted voucher skipped past `last_nonce + 1`
+    /// ([`VoucherApplied::nonce_gap`] / [`VoucherApplied::is_gapped`], #747).
+    /// The monotonicity guard only requires nonces to *increase*, so a client
+    /// can skip sequence numbers; a non-zero gap is also logged here via
+    /// `tracing::warn!` (with the lossless `skipped` count as a `U256`). A gap
+    /// never blocks acceptance — vouchers are cumulative in
+    /// `amount`/`bytes_delivered`, so settlement is unaffected — but it flags a
+    /// dropped voucher (a per-voucher delivery the node never billed for) or a
+    /// client that reset/forked its counter (a replay-probe signal). The caller
+    /// bumps the `decdn_voucher_nonce_gaps_total` metric once per gapped
+    /// voucher via [`VoucherApplied::is_gapped`], keeping `iroh-metrics` out of
+    /// this leaf crate.
     ///
     /// # Errors
     ///
@@ -131,7 +145,7 @@ impl ChannelState {
         signed: &SignedVoucher,
         domain: &Eip712Domain,
         store: &dyn ChannelStateStore,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<VoucherApplied, ChannelError> {
         if signed.voucher.channel_id != self.channel_id {
             return Err(ChannelError::WrongChannel {
                 expected: self.channel_id,
@@ -188,8 +202,70 @@ impl ChannelState {
         // `r‖s‖v` encoding as the wire form in `client_bridge`.
         next.last_signature = signed.signature.as_bytes().to_vec();
         store.record(&next)?;
+
+        // Nonce-gap detection (#747). The monotonicity guard above rejected
+        // `voucher.nonce <= self.last_nonce`, so the step from the prior
+        // accepted nonce is at least one and `skipped` (`step - 1`) is the
+        // count of skipped values; the first voucher of a channel is measured
+        // against the `last_nonce == 0` sentinel, making its expected nonce 1.
+        // `saturating_sub` keeps this branch panic- and wrap-free regardless of
+        // that guard: alloy/ruint `U256` subtraction wraps silently (no debug
+        // panic), so a future guard regression would otherwise turn an
+        // underflow into a bogus `u64::MAX` "jump" — saturation degrades it to
+        // a harmless `0` (no gap) instead. The exact count is logged as a
+        // lossless `U256`; the returned `nonce_gap` narrows it to `u64`
+        // (saturating) only for the event-gating metric, where magnitude is
+        // not used.
+        let skipped = signed
+            .voucher
+            .nonce
+            .saturating_sub(self.last_nonce)
+            .saturating_sub(U256::from(1u64));
+        let nonce_gap = u64::try_from(skipped).unwrap_or(u64::MAX);
+        if nonce_gap > 0 {
+            tracing::warn!(
+                channel_id = %self.channel_id,
+                last_nonce = %self.last_nonce,
+                nonce = %signed.voucher.nonce,
+                skipped = %skipped,
+                "accepted voucher skips nonce values (possible dropped voucher or client counter reset)",
+            );
+        }
+
         *self = next;
-        Ok(())
+        Ok(VoucherApplied { nonce_gap })
+    }
+}
+
+/// Outcome of a successful [`ChannelState::apply_voucher`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoucherApplied {
+    /// Count of skipped nonce values past `last_nonce + 1`, saturated at
+    /// `u64::MAX`. Private so callers reach for [`Self::nonce_gap`] /
+    /// [`Self::is_gapped`] rather than feeding the saturated value straight
+    /// into a counter's `inc_by` (which a single adversarial voucher could
+    /// pin at `u64::MAX`); the metric counts gap *events*, not skipped nonces.
+    nonce_gap: u64,
+}
+
+impl VoucherApplied {
+    /// Number of nonce values the accepted voucher skipped past the expected
+    /// `last_nonce + 1` (`voucher.nonce - last_nonce - 1`). `0` for a
+    /// contiguous voucher — the normal case. Saturated at `u64::MAX`; the
+    /// exact count (lossless even past `u64::MAX`) is in the `apply_voucher`
+    /// warn's `skipped` field (#747).
+    #[must_use]
+    pub const fn nonce_gap(&self) -> u64 {
+        self.nonce_gap
+    }
+
+    /// Whether the accepted voucher skipped one or more nonce values — the
+    /// predicate the node uses to bump `decdn_voucher_nonce_gaps_total` (#747).
+    /// A gap never blocks acceptance; it is purely a dropped-voucher /
+    /// counter-reset visibility signal.
+    #[must_use]
+    pub const fn is_gapped(&self) -> bool {
+        self.nonce_gap > 0
     }
 }
 
@@ -369,6 +445,57 @@ mod tests {
             state.apply_voucher(&signed, &domain, &store)?;
         }
         anyhow::ensure!(state.last_nonce == U256::from(2u64));
+        Ok(())
+    }
+
+    #[test]
+    fn contiguous_vouchers_report_zero_gap() -> anyhow::Result<()> {
+        // The happy path: a fresh channel's first voucher is nonce 1 and each
+        // subsequent voucher increments by exactly one, so `nonce_gap` stays 0
+        // and no `tracing::warn!` fires (#747).
+        let (signer, mut state, domain, store) = fixture();
+        let v1 = build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&signer, &domain)?;
+        let applied = state.apply_voucher(&v1, &domain, &store)?;
+        anyhow::ensure!(
+            applied.nonce_gap() == 0,
+            "first voucher at nonce 1 has no gap"
+        );
+
+        let v2 = build(state.channel_id, 2_000, 2, 2_097_152, TOKEN).sign(&signer, &domain)?;
+        let applied = state.apply_voucher(&v2, &domain, &store)?;
+        anyhow::ensure!(applied.nonce_gap() == 0, "contiguous nonce 2 has no gap");
+        Ok(())
+    }
+
+    #[test]
+    fn skipped_nonce_reports_gap_but_still_advances() -> anyhow::Result<()> {
+        // last_nonce 1 → voucher nonce 4 skips 2 and 3 (#747). The voucher is
+        // still accepted (vouchers are cumulative; settlement is unaffected),
+        // but `nonce_gap` reports the two skipped values for operator
+        // visibility / the `decdn_voucher_nonce_gaps_total` metric.
+        let (signer, mut state, domain, store) = fixture();
+        let v1 = build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&signer, &domain)?;
+        state.apply_voucher(&v1, &domain, &store)?;
+
+        let v4 = build(state.channel_id, 4_000, 4, 4_194_304, TOKEN).sign(&signer, &domain)?;
+        let applied = state.apply_voucher(&v4, &domain, &store)?;
+        anyhow::ensure!(applied.nonce_gap() == 2, "nonce 1 → 4 skips 2 values");
+        anyhow::ensure!(
+            state.last_nonce == U256::from(4u64),
+            "gapped voucher still advances"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_voucher_above_one_reports_gap() -> anyhow::Result<()> {
+        // A first voucher whose nonce is above 1 is a gap relative to the
+        // `last_nonce == 0` sentinel (nonces start at 1): nonce 5 means the
+        // client's nonces 1–4 were never seen by this node (#747).
+        let (signer, mut state, domain, store) = fixture();
+        let v5 = build(state.channel_id, 5_000, 5, 5_242_880, TOKEN).sign(&signer, &domain)?;
+        let applied = state.apply_voucher(&v5, &domain, &store)?;
+        anyhow::ensure!(applied.nonce_gap() == 4, "first voucher nonce 5 skips 1–4");
         Ok(())
     }
 
@@ -589,7 +716,7 @@ mod tests {
     }
 
     /// **Strict-durability regression (#527).** The protocol-level commit
-    /// point is `apply_voucher`'s `Ok(())` return. If `store.record` fails,
+    /// point is `apply_voucher`'s `Ok(_)` return. If `store.record` fails,
     /// the in-memory `ChannelState` MUST NOT advance — otherwise a future
     /// `VoucherAck` would acknowledge a voucher that was never durably
     /// persisted. This test breaks if anyone reorders the

@@ -684,10 +684,18 @@ impl ClientHandler {
         .map_err(|e| anyhow::anyhow!("voucher apply task failed: {e}"))?;
 
         match apply_res {
-            Ok(()) => {
+            Ok(applied) => {
                 guard.state = candidate;
                 guard.bytes_delivered_cumulative = new_bytes;
                 drop(guard);
+                // Nonce-gap signal (#747): the voucher was accepted, but its
+                // nonce skipped values past the prior `last_nonce + 1`. The
+                // structured `tracing::warn!` already fired inside
+                // `apply_voucher`; here we surface the rate to operators via
+                // `decdn_voucher_nonce_gaps_total` for alerting.
+                if applied.is_gapped() {
+                    self.metrics.voucher_nonce_gap();
+                }
                 // Hint the on-chain settlement service that this channel's
                 // accrued claim advanced (#327). Best-effort: an unattached or
                 // full hint channel just skips — the next voucher re-hints, and
