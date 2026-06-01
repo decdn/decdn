@@ -56,7 +56,9 @@ blacklist updates and stop being able to settle channels. Once
 - Existing alerts in `monitoring/prometheus-alerts.yml`:
   - `DecdnBlacklistSyncLagWarning` — blacklist poll lagging > 10 minutes.
   - `DecdnBlacklistSyncLagCritical` — blacklist sync stale > 30 minutes
-    (every served hash is now potentially slashable).
+    (every served hash is now potentially slashable). **Note:** these two
+    blacklist alerts cannot fire yet — the node emits no blacklist-sync
+    metrics; see [ContentBlacklist compliance](#contentblacklist-compliance).
 - Direct probe:
 
   ```bash
@@ -80,8 +82,10 @@ blacklist updates and stop being able to settle channels. Once
 2. For Arbitrum testnet, fall back to a public RPC
    (`https://sepolia-rollup.arbitrum.io/rpc`) — rate-limited; for production,
    use a paid provider.
-3. After recovery, confirm `decdn_blacklist_sync_lag_seconds` returns to
-   baseline before considering the incident closed.
+3. After recovery, confirm RPC reachability is restored before considering the
+   incident closed. (The `decdn_blacklist_sync_lag_seconds` gauge that would
+   track this is not emitted by the node yet — see
+   [ContentBlacklist compliance](#contentblacklist-compliance).)
 
 ## Slashing risk
 
@@ -107,7 +111,9 @@ blacklist updates and stop being able to settle channels. Once
   - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
     stale; serving any recently blacklisted hash is now slashable.
   - `DecdnBlacklistVersionFarBehind` (critical) — multiple blacklist
-    versions missed.
+    versions missed. (Both blacklist alerts above are pre-wired but not yet
+    emitted by the node — see
+    [ContentBlacklist compliance](#contentblacklist-compliance).)
   - `DecdnRateBoundsClamp` (warning) — `rate_per_mb` outside governance
     bounds; not directly slashable but indicates configuration drift.
 - Grafana: the slash-safety row in `monitoring/grafana-dashboard.json`.
@@ -156,17 +162,19 @@ evict. **None of this is implemented at PoC, on either side.** The deployed
 delta-sync query the ADR assumes would need a contract change), and the node
 has no blacklist watcher in `crates/`. The `decdn_blacklist_sync_lag_seconds` /
 `decdn_blacklist_version_behind` metrics and their alerts exist in
-`monitoring/prometheus-alerts.yml` and the Grafana dashboard but are **not
-emitted by the node** (the same situation as `decdn_streams_active` — pre-wired
-ahead of the implementation). Until both land, hash-level takedown is a
+`monitoring/prometheus-alerts.yml` (and the sync-lag panel in the Grafana
+dashboard) but are **not emitted by the node** (the same situation as
+`decdn_streams_active` — pre-wired ahead of the implementation). Until both land, hash-level takedown is a
 **manual operator action** — see Remediate below.
 
 Operator-*level* blacklisting is different and **is** enforced today: when
 governance calls `ContentBlacklist.addOperator`, the contract calls
-`CapacityBond.ejectNode`, emitting `EjectedByBlacklist`. An ejected operator
-simply stops passing the `getActiveNodes` filter, so it is no longer selected
-— no node-side action is required (the event is deliberately not subscribed;
-see `crates/node/src/dht/chain_staker_set.rs`).
+`CapacityBond.ejectNode`, which emits both `EjectedByBlacklist` and a
+nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
+`NodeAutoEjected` and drops the node from its active set live; the
+`EjectedByBlacklist` event is deliberately not subscribed because
+`NodeAutoEjected` already carries the nodeId (see
+`crates/node/src/dht/chain_staker_set.rs`). No operator action is required.
 
 **Detect:**
 
@@ -207,12 +215,13 @@ see `crates/node/src/dht/chain_staker_set.rs`).
    deployed contracts implement neither: a `ContentBlacklist` entry carries only
    `addedAt` (no `effectiveAt`), and `SlashJudge` treats blacklist violations as
    **global-only** at PoC and slashes any delivery whose signed response
-   timestamp is at or after the entry's `addedAt` — see `_checkBlacklistedBefore`
-   in `contracts/src/SlashJudge.sol`. Practical consequences:
+   timestamp is strictly after the entry's `addedAt` — a delivery timestamped at
+   `addedAt` itself is not slashable — see `_checkBlacklistedBefore` in
+   `contracts/src/SlashJudge.sol`. Practical consequences:
    - Slash exposure today comes **only from global** (`bytes32("GLOBAL")`)
      entries. A regional-only entry is a legal/compliance obligation but is not
-     slashable until regional scope is wired (deferred per ADR 011 § Node
-     Behavior).
+     slashable until regional scope is wired (the PoC deferral is noted in
+     `contracts/src/SlashJudge.sol`, citing ADR 014 § Blacklist violation).
    - Treat any global entry as effective immediately; do not rely on the ADR's
      24h/2h buffer, which is not enforced.
    - An entry under active appeal (`suspended == true`) is not slashable —
