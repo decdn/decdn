@@ -141,26 +141,25 @@ blacklist updates and stop being able to settle channels. Once
 
 **Symptoms:** governance or a regional body has published a blocked BLAKE3
 hash on-chain via `ContentBlacklist`, and this node may still be caching,
-announcing, or serving it. Serving a blocked hash after its compliance
-window has elapsed is a slashable offense (see
-[Slashing risk](#slashing-risk)). Protocol semantics:
+announcing, or serving it. Serving a globally blocked hash is a slashable
+offense (see [Slashing risk](#slashing-risk)). Protocol semantics:
 [ADR 011](../adr/011-content-takedown.md),
 [ADR 031](../adr/031-content-blacklist-appeals-contract.md).
 
-**How a node is meant to learn about a blocked hash.** Per
-[ADR 011 § Node Behavior](../adr/011-content-takedown.md#node-behavior), a
-node polls `getBlacklistVersion()` on `blacklist_poll_interval` (design
-default 10 minutes); on a version bump it fetches the new entries scoped to
-its `node.region` plus global entries, then **in order**: stops publishing
-DHT records, stops serving (`StreamRequest` → `HashBlacklisted`), and evicts
-the blob within the compliance window. **This automated path is not
-implemented in the node yet** — there is no blacklist poller/watcher in
-`crates/`, and `decdn_blacklist_sync_lag_seconds` /
-`decdn_blacklist_version_behind` are defined in
+**How a node is meant to learn about a blocked hash.**
+[ADR 011 § Node Behavior](../adr/011-content-takedown.md#node-behavior)
+*designs* a sync loop: poll `getBlacklistVersion()` on `blacklist_poll_interval`
+(10 minutes), fetch the new entries on a version bump, then **in order** stop
+publishing DHT records, stop serving (`StreamRequest` → `HashBlacklisted`), and
+evict. **None of this is implemented at PoC, on either side.** The deployed
+`ContentBlacklist` exposes no `getBlacklistVersion()` accessor (so even the
+delta-sync query the ADR assumes would need a contract change), and the node
+has no blacklist watcher in `crates/`. The `decdn_blacklist_sync_lag_seconds` /
+`decdn_blacklist_version_behind` metrics and their alerts exist in
 `monitoring/prometheus-alerts.yml` and the Grafana dashboard but are **not
-emitted by the node** (the same situation as `decdn_streams_active`; the
-alerts are pre-wired ahead of the implementation). Until it lands, hash-level
-takedown is a **manual operator action** — see Remediate below.
+emitted by the node** (the same situation as `decdn_streams_active` — pre-wired
+ahead of the implementation). Until both land, hash-level takedown is a
+**manual operator action** — see Remediate below.
 
 Operator-*level* blacklisting is different and **is** enforced today: when
 governance calls `ContentBlacklist.addOperator`, the contract calls
@@ -177,9 +176,13 @@ see `crates/node/src/dht/chain_staker_set.rs`).
   - `DecdnBlacklistSyncLagCritical` — sync stale > 30 minutes (every served
     hash is now potentially slashable).
   - `DecdnBlacklistVersionFarBehind` — multiple blacklist versions missed.
-- Manual on-chain check (works today): query the contract directly with the
-  hash from the takedown notice — `isHashBlacklisted(hash)` for global
-  entries, `isHashBlacklistedInRegion(hash, region)` for your region.
+- Manual on-chain check (works today): query `ContentBlacklist` directly with
+  the hash from the takedown notice — `isHashBlacklisted(hash)` for global
+  entries, `isHashBlacklistedInRegion(hash, region)` for a regional entry. The
+  `region` argument is `bytes32`, not a string: global scope is the sentinel
+  `bytes32("GLOBAL")` (with `cast`, pass the literal `GLOBAL` right-padded to
+  32 bytes). `getHashEntry(region, hash)` returns the raw `(addedAt, suspended)`
+  that the slashing predicate reads.
 
 **Remediate:**
 
@@ -198,26 +201,42 @@ see `crates/node/src/dht/chain_staker_set.rs`).
    DMCA/takedown action — confirm you have the right blob and catch a pinned
    hash or an idempotent re-run.
 
-2. **Mind the compliance window**
-   ([ADR 011 § Compliance Window](../adr/011-content-takedown.md#compliance-window)):
-   24 hours after `effectiveAt` for standard global and regional entries,
-   **2 hours** for emergency-multisig entries. Serving the hash after that
-   window is slashable. Entries with an active appeal (`suspended == true`)
-   carry no obligation while suspended — `isBlacklisted` returns `false` —
-   but the original `effectiveAt` is preserved when the appeal resolves, so
-   re-evict before serving once the suspension clears.
+2. **There is no grace window at PoC — evict the moment you learn of a global
+   entry.** [ADR 011 § Compliance Window](../adr/011-content-takedown.md#compliance-window)
+   specifies a 24-hour (2-hour emergency) buffer after `effectiveAt`, but the
+   deployed contracts implement neither: a `ContentBlacklist` entry carries only
+   `addedAt` (no `effectiveAt`), and `SlashJudge` treats blacklist violations as
+   **global-only** at PoC and slashes any delivery whose signed response
+   timestamp is at or after the entry's `addedAt` — see `_checkBlacklistedBefore`
+   in `contracts/src/SlashJudge.sol`. Practical consequences:
+   - Slash exposure today comes **only from global** (`bytes32("GLOBAL")`)
+     entries. A regional-only entry is a legal/compliance obligation but is not
+     slashable until regional scope is wired (deferred per ADR 011 § Node
+     Behavior).
+   - Treat any global entry as effective immediately; do not rely on the ADR's
+     24h/2h buffer, which is not enforced.
+   - An entry under active appeal (`suspended == true`) is not slashable —
+     `isHashBlacklisted` returns `false` and `SlashJudge` rejects the challenge —
+     but `addedAt` is preserved when the suspension clears, so re-evict before
+     serving again.
 
 3. **If you believe the entry is wrong, appeal it — don't just keep serving.**
-   For **regional** entries, a publisher, an in-scope operator, or a TOKEN
-   holder can file `openBlacklistAppeal` within the 14-day filing window
-   against a 1,000 TOKEN bond (refunded on ratification or lapse, burned on
-   rejection or reversal). The emergency multisig fast-tracks (granting
-   interim relief by suspending the entry) or rejects; DecdnGovernor ratifies
-   the removal or reverses. **Global** and emergency entries are not
-   appealable this way — they route through the slow-path DecdnGovernor
-   `removeHashGlobal` override. Full flow and state machine:
-   [ADR 011 § Blacklist Entry Appeals](../adr/011-content-takedown.md#blacklist-entry-appeals)
-   and [ADR 031](../adr/031-content-blacklist-appeals-contract.md).
+   `openBlacklistAppeal(hash, region, evidenceBundleHash, standingPath)` opens an
+   appeal against an `appealBond` deposit (governance-set; testnet deploy default
+   **100 TOKEN**, bounds `[50, 5000]`) within a 14-day filing window from
+   `addedAt`. The emergency multisig (`EMERGENCY_MULTISIG_ROLE`) fast-tracks —
+   suspending the entry for interim relief — or rejects; DecdnGovernor
+   (`GOVERNANCE_ROLE`) then ratifies the removal or reverses. Bond outcomes in
+   the deployed contract: **refunded only on ratification**; **burned on
+   rejection, reversal, and lapse** (`cleanupExpiredBlacklistAppeal`). PoC
+   caveats vs. the ADR 011/031 design: any non-zero `region` is appealable
+   (global included — the regional-only restriction is not enforced), and the
+   declared `standingPath` (`Publisher`/`Operator`/`TokenHolder`) is **recorded
+   but not verified** — standing enforcement and the synthetic-standing clawback
+   are deferred. Global entries also remain removable via the slow-path
+   DecdnGovernor `removeHashGlobal` override. Design intent:
+   [ADR 011 § Blacklist Entry Appeals](../adr/011-content-takedown.md#blacklist-entry-appeals),
+   [ADR 031](../adr/031-content-blacklist-appeals-contract.md).
 
 4. **A slash you already took is a separate matter.** Appealing the blacklist
    *entry* (step 3) removes the entry; it does **not** refund a slash you
