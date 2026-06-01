@@ -20,7 +20,7 @@ pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateAr
 pub use key_gen::KeyGenArgs;
 pub use node::{
     AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, NodeArgs, NodeCommand, PeersArgs, ReloadArgs,
-    TopArgs,
+    StatusArgs, TopArgs,
 };
 pub use probe::ProbeArgs;
 pub use run::RunArgs;

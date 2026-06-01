@@ -278,6 +278,22 @@ impl RoutingTable {
     pub fn iter_peers(&self) -> impl Iterator<Item = &NodeId> + '_ {
         self.buckets.iter().flatten()
     }
+
+    /// Per-bucket fill counts for the **non-empty** buckets only, as
+    /// `(index, fill)` pairs ordered by bucket index ascending. Read-only
+    /// snapshot for the `admin_v1_status` routing-table health view (issue
+    /// #741); empty buckets (the vast majority of the 256-bucket keyspace
+    /// on a small network) are omitted so the snapshot stays compact. The
+    /// per-bucket capacity is the fixed Kademlia [`K_BUCKET_SIZE`].
+    #[must_use]
+    pub fn non_empty_bucket_fills(&self) -> Vec<(usize, usize)> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, bucket)| !bucket.is_empty())
+            .map(|(idx, bucket)| (idx, bucket.len()))
+            .collect()
+    }
 }
 
 /// Construct a `NodeId` that lands in bucket `bucket_idx` relative to

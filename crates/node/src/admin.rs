@@ -10,15 +10,17 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
-    AdminRpcServer, AnnounceResponse, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DrainRequest,
-    DrainResponse, EvictPreview, EvictRequest, EvictResponse, HealthResponse,
-    PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE, ReloadResponse,
+    AdminRpcServer, AnnounceResponse, BucketStat, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE,
+    DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
+    HealthResponse, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE,
+    RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth, StatusResponse,
     parse_hash_arg,
 };
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
@@ -28,6 +30,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, oneshot};
 
+use crate::dht::{RecordStore, RepublishScheduler, RoutingTable, StakerSet};
 use crate::metrics::Metrics;
 
 // Wire types live in `decdn_common::admin`. We import the server-side
@@ -98,6 +101,49 @@ pub struct AdminState {
     /// its permit RAII pair, so the value is always consistent with
     /// the live in-flight handler count.
     metrics: Arc<Metrics>,
+    /// DHT introspection handles backing `admin_v1_status` (issue #741).
+    /// `None` when the DHT subsystem isn't wired (the unit tests that
+    /// exercise the cache/peer-table methods build `AdminState` without
+    /// it; the production runtime always attaches it via
+    /// [`AdminState::with_dht`]). The `status` RPC returns
+    /// [`DHT_UNAVAILABLE_CODE`] when this is `None`.
+    dht: Option<DhtStatusHandles>,
+}
+
+/// Read-only DHT subsystem handles the `admin_v1_status` handler snapshots
+/// (issue #741). Every field is an `Arc` clone of state the runtime already
+/// owns and shares with the DHT handler / refresh / republish tasks, so
+/// attaching this to [`AdminState`] adds no new ownership — only read
+/// access. Bundled into one struct so the `AdminState` constructor stays a
+/// single optional argument rather than five positional ones.
+#[derive(Clone)]
+pub struct DhtStatusHandles {
+    /// Kademlia routing table (same handle the DHT handler / bucket-refresh
+    /// task mutate). Locked briefly to snapshot bucket fill counts.
+    pub routing: Arc<StdMutex<RoutingTable>>,
+    /// Active-staker set (chain-backed in production). Read for its count.
+    pub staker_set: Arc<dyn StakerSet>,
+    /// Provider-record store. Locked briefly to read size + capacity.
+    pub record_store: Arc<StdMutex<RecordStore>>,
+    /// Republish scheduler. Read for its scheduled-record depth.
+    pub republish: Arc<RepublishScheduler>,
+    /// Wall-clock-µs of the last completed bucket-refresh pass (0 = never),
+    /// stamped by [`crate::dht::bucket_refresh::run_bucket_refresh`].
+    pub refresh_clock: Arc<AtomicU64>,
+    /// Bucket-refresh interval, echoed so the operator sees the cadence the
+    /// last-refresh timestamp is relative to.
+    pub refresh_interval: Duration,
+}
+
+// `AdminState` derives `Debug`, so the bundled handles must too. The
+// trait-object `Arc<dyn StakerSet>` carries no `Debug` bound, so hand-roll
+// a terse impl that names the struct without formatting the handles.
+impl std::fmt::Debug for DhtStatusHandles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DhtStatusHandles")
+            .field("refresh_interval", &self.refresh_interval)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One-shot trigger that lets `admin_v1_drain` wake the runtime's main
@@ -198,6 +244,12 @@ impl AdminState {
     // A builder would be tidier but is deferred until the next
     // signature change forces a refactor — the existing call sites
     // are few and each already passes every field by name.
+    //
+    // The DHT introspection handles (issue #741) are attached via the
+    // separate [`with_dht`](Self::with_dht) builder rather than as another
+    // positional argument: `new` has ~15 call sites (mostly unit tests of
+    // the cache/peer-table methods that don't need a DHT), and `with_dht`
+    // lets the production runtime opt in without touching any of them.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         peer_table: Arc<RwLock<PeerTable>>,
@@ -220,7 +272,18 @@ impl AdminState {
             drain_trigger,
             signer,
             metrics,
+            dht: None,
         }
+    }
+
+    /// Attach DHT introspection handles so `admin_v1_status` can report
+    /// routing-table health (issue #741). The production runtime calls
+    /// this once after `new`; without it, `status` returns
+    /// [`DHT_UNAVAILABLE_CODE`].
+    #[must_use]
+    pub fn with_dht(mut self, dht: DhtStatusHandles) -> Self {
+        self.dht = Some(dht);
+        self
     }
 }
 
@@ -266,6 +329,24 @@ impl RawPeer {
 /// rather than a generic "cache failed".
 fn cache_error_to_rpc(err: &CacheError) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(CACHE_ERROR_CODE, err.to_string(), None::<()>)
+}
+
+/// Lock a DHT-subsystem `std::sync::Mutex` for `admin_v1_status`,
+/// converting a poisoned lock into a [`DHT_UNAVAILABLE_CODE`] RPC error
+/// rather than propagating the panic the standard `unwrap` would (the
+/// workspace anti-panic policy forbids `unwrap`/`expect`). `what` names
+/// the guarded structure for the operator-facing message.
+fn lock_or_rpc_err<'a, T>(
+    mutex: &'a StdMutex<T>,
+    what: &str,
+) -> Result<std::sync::MutexGuard<'a, T>, ErrorObjectOwned> {
+    mutex.lock().map_err(|_| {
+        ErrorObjectOwned::owned(
+            DHT_UNAVAILABLE_CODE,
+            format!("DHT {what} mutex poisoned"),
+            None::<()>,
+        )
+    })
 }
 
 /// Concrete server implementation backed by the live gossip peer table.
@@ -431,6 +512,68 @@ impl AdminRpcServer for AdminRpcImpl {
         // Most recently seen first — on-call use case is "is gossip alive?".
         snapshot.sort_by_key(|v| std::cmp::Reverse(v.last_seen_us));
         Ok(PeersResponse { peers: snapshot })
+    }
+
+    async fn status(&self) -> RpcResult<StatusResponse> {
+        let Some(dht) = self.state.dht.as_ref() else {
+            return Err(ErrorObjectOwned::owned(
+                DHT_UNAVAILABLE_CODE,
+                "DHT subsystem not wired on this node",
+                None::<()>,
+            ));
+        };
+
+        // Snapshot the routing table under a brief lock: copy out only the
+        // per-bucket fill counts, then release before building DTOs. A
+        // poisoned mutex (a panicking writer elsewhere) surfaces as a
+        // specific RPC error rather than propagating the panic — the
+        // workspace anti-panic policy forbids `unwrap`/`expect` here.
+        let (total_peers, bucket_fills) = {
+            let table = lock_or_rpc_err(&dht.routing, "routing table")?;
+            (table.len(), table.non_empty_bucket_fills())
+        };
+        let buckets: Vec<BucketStat> = bucket_fills
+            .into_iter()
+            .map(|(index, fill)| BucketStat {
+                // Bucket indices are 0..=255 and fills 0..=K_BUCKET_SIZE
+                // (20); both fit u16 with room to spare. `try_into` keeps
+                // this lint-clean under the no-`as`-cast policy, falling
+                // back to the saturated max rather than panicking.
+                index: u16::try_from(index).unwrap_or(u16::MAX),
+                fill: u16::try_from(fill).unwrap_or(u16::MAX),
+                capacity: u16::try_from(crate::dht::routing::K_BUCKET_SIZE).unwrap_or(u16::MAX),
+            })
+            .collect();
+
+        let (records, records_capacity) = {
+            let store = lock_or_rpc_err(&dht.record_store, "record store")?;
+            (store.len(), store.capacity())
+        };
+
+        // 0 means "no refresh pass has completed yet" → None on the wire.
+        let last_refresh = match dht.refresh_clock.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(us),
+        };
+
+        Ok(StatusResponse {
+            node_id: alloy::primitives::hex::encode(self.state.node_id),
+            routing: RoutingHealth {
+                total_peers: total_peers as u64,
+                non_empty_buckets: buckets.len() as u64,
+                buckets,
+                refresh_interval_s: dht.refresh_interval.as_secs(),
+                last_refresh_us: last_refresh,
+            },
+            known_stakers: dht.staker_set.len() as u64,
+            record_store: RecordStoreHealth {
+                records: records as u64,
+                capacity: records_capacity as u64,
+            },
+            republish: RepublishHealth {
+                scheduled_records: dht.republish.len() as u64,
+            },
+        })
     }
 }
 
@@ -1450,5 +1593,103 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             42,
         );
+    }
+
+    /// Build a `DhtStatusHandles` seeded with two peers in distinct
+    /// buckets, a fixed staker set, one provider record, one scheduled
+    /// republish, and a non-zero refresh clock — enough to exercise every
+    /// field of `StatusResponse`.
+    fn seeded_dht_handles() -> DhtStatusHandles {
+        use crate::dht::routing::NodeId;
+        use crate::dht::{ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler};
+        use decdn_protocol::ContentHash;
+
+        // self_id = all-zero; p_high lands in bucket 255 (top bit set),
+        // p_low in bucket 0 (only the lowest bit differs).
+        let self_id = NodeId::from_bytes([0u8; 32]);
+        let mut table = RoutingTable::new(self_id);
+        let mut high = [0u8; 32];
+        high[0] = 0x80;
+        let mut low = [0u8; 32];
+        low[31] = 0x01;
+        assert!(table.insert(NodeId::from_bytes(high)));
+        assert!(table.insert(NodeId::from_bytes(low)));
+
+        let mut stakers = std::collections::HashSet::new();
+        stakers.insert(NodeId::from_bytes([1u8; 32]));
+        stakers.insert(NodeId::from_bytes([2u8; 32]));
+        let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(stakers));
+
+        let mut store = RecordStore::new(RecordStoreConfig::default());
+        store.insert_at(
+            NodeId::from_bytes([5u8; 32]),
+            ContentHash::from_bytes([7u8; 32]),
+            1_000,
+        );
+
+        let republish = Arc::new(RepublishScheduler::new());
+        republish.schedule_steady(ContentHash::from_bytes([9u8; 32]));
+
+        DhtStatusHandles {
+            routing: Arc::new(StdMutex::new(table)),
+            staker_set,
+            record_store: Arc::new(StdMutex::new(store)),
+            republish,
+            refresh_clock: Arc::new(AtomicU64::new(1_700_000_000_000_000)),
+            refresh_interval: Duration::from_hours(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_routing_and_dht_health() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let state = state.with_dht(seeded_dht_handles());
+        let rpc = AdminRpcImpl::new(state);
+
+        let resp = rpc.status().await.expect("status ok");
+
+        assert_eq!(resp.routing.total_peers, 2);
+        assert_eq!(resp.routing.non_empty_buckets, 2);
+        // Buckets are reported ascending by index: bucket 0 then bucket 255.
+        let indices: Vec<u16> = resp.routing.buckets.iter().map(|b| b.index).collect();
+        assert_eq!(indices, vec![0, 255]);
+        for b in &resp.routing.buckets {
+            assert_eq!(b.fill, 1);
+            assert_eq!(b.capacity, 20);
+        }
+        assert_eq!(resp.routing.refresh_interval_s, 3_600);
+        assert_eq!(resp.routing.last_refresh_us, Some(1_700_000_000_000_000));
+        assert_eq!(resp.known_stakers, 2);
+        assert_eq!(resp.record_store.records, 1);
+        assert_eq!(resp.record_store.capacity, 100_000);
+        assert_eq!(resp.republish.scheduled_records, 1);
+    }
+
+    /// A zero refresh clock (no bucket-refresh pass has completed yet)
+    /// must surface as `last_refresh_us: None`, not `Some(0)`.
+    #[tokio::test]
+    async fn status_never_refreshed_reports_none() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let mut handles = seeded_dht_handles();
+        handles.refresh_clock = Arc::new(AtomicU64::new(0));
+        let rpc = AdminRpcImpl::new(state.with_dht(handles));
+
+        let resp = rpc.status().await.expect("status ok");
+        assert_eq!(resp.routing.last_refresh_us, None);
+    }
+
+    /// Without DHT handles attached (the `new`-only construction the other
+    /// admin tests use), `status` returns [`DHT_UNAVAILABLE_CODE`] rather
+    /// than panicking or returning a misleading empty snapshot.
+    #[tokio::test]
+    async fn status_without_dht_returns_unavailable_error() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state);
+
+        let err = rpc
+            .status()
+            .await
+            .expect_err("expected DHT-unavailable error");
+        assert_eq!(err.code(), DHT_UNAVAILABLE_CODE);
     }
 }

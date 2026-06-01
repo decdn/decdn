@@ -274,6 +274,79 @@ pub struct DrainResponse {
     pub wait_admin_honored: bool,
 }
 
+/// Per-bucket fill stat for `admin_v1_status` (issue #741). One entry
+/// per *non-empty* Kademlia k-bucket — empty buckets (the vast majority
+/// of the 256-bucket keyspace on a small network) are omitted so the
+/// snapshot stays compact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketStat {
+    /// Bucket index `0..=255` (XOR-distance shell from this node's id).
+    pub index: u16,
+    /// Live peers currently held in the bucket (`1..=capacity`).
+    pub fill: u16,
+    /// Maximum entries the bucket can hold (Kademlia `K`, currently 20).
+    pub capacity: u16,
+}
+
+/// Routing-table health section of `admin_v1_status` (issue #741).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingHealth {
+    /// Total peers across all buckets.
+    pub total_peers: u64,
+    /// Number of non-empty buckets (equals `buckets.len()`).
+    pub non_empty_buckets: u64,
+    /// Per-bucket fill, one entry per non-empty bucket, ascending by index.
+    pub buckets: Vec<BucketStat>,
+    /// Bucket-refresh interval in whole seconds (ADR 022 §Routing Table,
+    /// default 1 hour). The refresh task refreshes *every* non-empty
+    /// bucket once per interval.
+    pub refresh_interval_s: u64,
+    /// Microseconds-since-epoch the most recent bucket-refresh pass
+    /// completed, or `None` if no pass has run yet (node up less than one
+    /// interval). The refresh pass touches all non-empty buckets at once,
+    /// so this is a single network-wide timestamp rather than a per-bucket
+    /// value. `#[serde(default)]` keeps older servers round-tripping as
+    /// `None`.
+    #[serde(default)]
+    pub last_refresh_us: Option<u64>,
+}
+
+/// DHT provider-record store utilization for `admin_v1_status` (issue #741).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordStoreHealth {
+    /// Provider records currently held.
+    pub records: u64,
+    /// Global record cap (`RecordStoreConfig::max_records_global`).
+    pub capacity: u64,
+}
+
+/// Republish-scheduler health for `admin_v1_status` (issue #741).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepublishHealth {
+    /// Content hashes currently scheduled for periodic republish.
+    pub scheduled_records: u64,
+}
+
+/// Response body for `admin_v1_status` (issue #741): a single-shot
+/// snapshot of this node's DHT participation health, so an operator can
+/// diagnose cold-start / routing-table degradation without scraping
+/// Prometheus or reading logs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusResponse {
+    /// Lowercase hex of this node's iroh `PublicKey` — same encoding as
+    /// [`HealthResponse::node_id`].
+    pub node_id: String,
+    /// Kademlia routing-table health.
+    pub routing: RoutingHealth,
+    /// Active stakers known to this node (the chain-backed `StakerSet`
+    /// cardinality — the set the DHT admits records and routes from).
+    pub known_stakers: u64,
+    /// DHT provider-record store utilization.
+    pub record_store: RecordStoreHealth,
+    /// Republish-scheduler depth.
+    pub republish: RepublishHealth,
+}
+
 /// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
 /// Matches the standard JSON-RPC 2.0 `Invalid params` code.
 pub const INVALID_PARAMS_CODE: i32 = -32_602;
@@ -302,6 +375,13 @@ pub const CONFIG_PATH_UNSET_CODE: i32 = -32_003;
 /// retained" guarantee — by the time this surfaces, the running config
 /// is unchanged.
 pub const RELOAD_ERROR_CODE: i32 = -32_004;
+
+/// JSON-RPC error code: `admin_v1_status` was called on a node whose DHT
+/// subsystem is not wired (e.g. a future CLI-only or test invocation that
+/// brings up the admin surface without the DHT handler). Distinct from a
+/// generic failure so an operator gets "this node has no DHT to report
+/// on" rather than a confusing transport error.
+pub const DHT_UNAVAILABLE_CODE: i32 = -32_005;
 
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
@@ -382,6 +462,18 @@ pub trait AdminRpc {
     /// gets the original SIGTERM-equivalent shutdown order.
     #[method(name = "drain")]
     async fn drain(&self, req: Option<DrainRequest>) -> RpcResult<DrainResponse>;
+
+    /// Return a snapshot of this node's DHT participation health (issue
+    /// #741): routing-table bucket fill rates, the network-wide last
+    /// bucket-refresh timestamp, active-staker count, provider-record
+    /// store utilization, and republish-scheduler depth. Intended for
+    /// `decdn node status`, giving operators a single human-readable (or
+    /// `--json`) view to diagnose cold-start or routing-table
+    /// degradation without scraping Prometheus. Returns
+    /// [`DHT_UNAVAILABLE_CODE`] when the DHT subsystem is not wired on
+    /// this node.
+    #[method(name = "status")]
+    async fn status(&self) -> RpcResult<StatusResponse>;
 }
 
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].
@@ -482,5 +574,74 @@ mod tests {
             !req.wait_admin,
             "missing wait_admin must default to false (SIGTERM-equivalent)"
         );
+    }
+
+    /// Wire back-compat for `RoutingHealth.last_refresh_us` (issue #741):
+    /// a server that has never completed a bucket-refresh pass omits the
+    /// field (or sends `null`). `#[serde(default)]` must deserialize the
+    /// omitted field to `None` so a `decdn node status` client renders
+    /// "not yet refreshed" rather than failing the whole roundtrip.
+    #[test]
+    fn routing_health_legacy_shape_defaults_last_refresh_none() {
+        let legacy = r#"{
+            "total_peers": 3,
+            "non_empty_buckets": 2,
+            "buckets": [{"index":0,"fill":1,"capacity":20}],
+            "refresh_interval_s": 3600
+        }"#;
+        let resp: RoutingHealth =
+            serde_json::from_str(legacy).expect("legacy RoutingHealth must deserialize");
+        assert_eq!(resp.total_peers, 3);
+        assert_eq!(resp.refresh_interval_s, 3600);
+        assert!(
+            resp.last_refresh_us.is_none(),
+            "missing last_refresh_us must default to None"
+        );
+    }
+
+    /// `StatusResponse` round-trips through serde unchanged — guards the
+    /// nested DTO shapes (`RoutingHealth` / `BucketStat` /
+    /// `RecordStoreHealth` / `RepublishHealth`) the CLI and server both
+    /// (de)serialize.
+    #[test]
+    fn status_response_round_trips() {
+        let resp = StatusResponse {
+            node_id: "abc".to_string(),
+            routing: RoutingHealth {
+                total_peers: 21,
+                non_empty_buckets: 2,
+                buckets: vec![
+                    BucketStat {
+                        index: 0,
+                        fill: 1,
+                        capacity: 20,
+                    },
+                    BucketStat {
+                        index: 255,
+                        fill: 20,
+                        capacity: 20,
+                    },
+                ],
+                refresh_interval_s: 3600,
+                last_refresh_us: Some(1_700_000_000_000_000),
+            },
+            known_stakers: 7,
+            record_store: RecordStoreHealth {
+                records: 12,
+                capacity: 100_000,
+            },
+            republish: RepublishHealth {
+                scheduled_records: 5,
+            },
+        };
+        let json = serde_json::to_string(&resp).expect("serialize StatusResponse");
+        let back: StatusResponse = serde_json::from_str(&json).expect("deserialize StatusResponse");
+        assert_eq!(back.node_id, "abc");
+        assert_eq!(back.routing.total_peers, 21);
+        assert_eq!(back.routing.buckets.len(), 2);
+        assert_eq!(back.routing.last_refresh_us, Some(1_700_000_000_000_000));
+        assert_eq!(back.known_stakers, 7);
+        assert_eq!(back.record_store.capacity, 100_000);
+        assert_eq!(back.republish.scheduled_records, 5);
     }
 }
