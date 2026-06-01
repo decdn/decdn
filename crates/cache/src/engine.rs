@@ -1010,8 +1010,9 @@ impl CacheEngine {
 
     /// Set the probe-hold budget cap from `cache.max_probe_holds` (ADR 005
     /// §Hold budget, #318). Called once by the runtime at bring-up. `0`
-    /// disables the hold path so [`Self::try_probe_hold`] always returns
-    /// `false` (the node then answers `has_blob: false` to every probe).
+    /// disables the hold path so [`Self::try_probe_hold`] returns
+    /// [`ProbeHoldOutcome::HoldsDisabled`] for any present blob (the node then
+    /// answers `has_blob: false` to every probe).
     pub fn set_max_probe_holds(&self, max: usize) {
         self.inner.max_probe_holds.store(max, Ordering::Relaxed);
     }
@@ -1044,17 +1045,25 @@ impl CacheEngine {
     /// [`Self::has`] check and granting the hold — a takedown always wins
     /// (ADR appendix-blob-cache-eviction.md §4).
     pub async fn try_probe_hold(&self, hash: Hash) -> CacheResult<ProbeHoldOutcome> {
-        // `has` returns false for operator-evicted hashes too.
+        // `has` returns false for operator-evicted hashes too. This stays
+        // *before* the `max == 0` check below so an absent/evicted blob is a
+        // true negative (`Unavailable`), not a config-disable event.
         if !self.has(hash).await? {
             return Ok(ProbeHoldOutcome::Unavailable);
         }
         let max = self.inner.max_probe_holds.load(Ordering::Relaxed);
         // Holds disabled by config (#739): answer `HoldsDisabled` before
         // touching the lock. This is the unconditional "never sign
-        // has_blob:true" path — it must override an existing live hold so a
-        // runtime `set_max_probe_holds(0)` takes effect immediately rather
-        // than letting the fast path below refresh and re-sign the hold. Also
-        // skips the O(N) expiry sweep entirely while holds are off.
+        // has_blob:true" path — it must override an existing live hold so that
+        // if the budget is ever lowered to 0 while a hold is live, the disable
+        // wins instead of the fast path below refreshing and re-signing the
+        // hold. (Today only the tests lower it post-startup;
+        // `cache.max_probe_holds` is restart-required, not hot-reloaded.) Also
+        // skips the O(N) expiry sweep entirely while holds are off. Returning
+        // before the under-lock `is_evicted` re-check is slash-safe: a blob
+        // evicted concurrently here is still answered `has_blob: false` (the
+        // misclassification is `Unavailable`→`HoldsDisabled`, a metric-only
+        // miscount between two non-slash counters — never a phantom `true`).
         if max == 0 {
             return Ok(ProbeHoldOutcome::HoldsDisabled);
         }
@@ -3226,7 +3235,7 @@ mod tests {
             engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held,
             "hold should be granted while the budget is positive"
         );
-        // Disabling holds at runtime (config reload) must take effect
+        // Lowering the budget to 0 while a hold is live must take effect
         // immediately: a re-probe for the already-held blob must NOT refresh
         // the hold and re-sign has_blob:true (#739). `max == 0` means "never
         // sign has_blob:true", unconditionally.
@@ -3234,6 +3243,25 @@ mod tests {
         anyhow::ensure!(
             engine.try_probe_hold(hash).await? == ProbeHoldOutcome::HoldsDisabled,
             "a runtime disable must override an existing live hold"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_blob_is_unavailable_even_when_holds_disabled() -> anyhow::Result<()> {
+        // Precedence pin (#739): the `max == 0` early return must sit *after*
+        // the `has()` check, so an absent blob is a true negative
+        // (`Unavailable`), never a `HoldsDisabled` config-disable event. Guards
+        // against a future reorder that moves the cheap `max == 0` load above
+        // the store lookup and silently inflates `probe_holds_disabled` with
+        // probes for content the node never had.
+        let tmp = tempfile::tempdir()?;
+        let absent = Hash::new(b"never fetched");
+        let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
+        engine.set_max_probe_holds(0);
+        anyhow::ensure!(
+            engine.try_probe_hold(absent).await? == ProbeHoldOutcome::Unavailable,
+            "absent blob must win over holds-disabled"
         );
         Ok(())
     }
