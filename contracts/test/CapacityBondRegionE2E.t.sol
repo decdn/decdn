@@ -163,10 +163,10 @@ contract CapacityBondRegionE2ETest is Test {
     /// @notice The ed25519 ownership signature is bound to
     ///         `registrationNonce[nodeId]`, so it cannot be replayed once the
     ///         nonce advances. `deregisterNode` increments the nonce without
-    ///         ejecting (the eject/already-active preconditions short-circuit
-    ///         before the signature check, so deregister is the path that
-    ///         isolates the ed25519 layer): replaying the original signature in
-    ///         a fresh registration now reverts `InvalidEd25519Signature`.
+    ///         ejecting (the eject/already-active preconditions revert before
+    ///         the signature check, so deregister is the path that isolates the
+    ///         ed25519 layer): replaying the original signature in a fresh
+    ///         registration now reverts `InvalidEd25519Signature`.
     function test_registerNode_replayAfterNonceBump_reverts() public {
         _stakeAndRegister();
 
@@ -175,8 +175,10 @@ contract CapacityBondRegionE2ETest is Test {
         assertEq(bond.registrationNonce(REG_NODE_ID), 1);
         assertFalse(bond.isActive(REG_OPERATOR));
 
-        // Binding nonce advanced too, so re-sign it; the ed25519 signature is
-        // replayed verbatim and is now stale (it was signed over nonce 0).
+        // The binding nonce is at 1 (bumped by the first registerNode, not by
+        // deregister), so re-sign with the live nonce to clear the binding
+        // check; the ed25519 signature is replayed verbatim and is now stale
+        // (it was signed over registration nonce 0).
         bytes memory bindingSig = _signBindNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID);
         vm.prank(REG_OPERATOR);
         vm.expectRevert(CapacityBond.InvalidEd25519Signature.selector);
@@ -208,11 +210,18 @@ contract CapacityBondRegionE2ETest is Test {
         vm.prank(admin);
         bond.grantRole(blacklistRole, address(blacklist));
 
+        vm.expectEmit(true, false, false, false, address(bond));
+        emit CapacityBond.EjectedByBlacklist(REG_OPERATOR);
         vm.prank(admin);
         blacklist.addOperator(REG_OPERATOR);
 
         assertFalse(bond.isActive(REG_OPERATOR));
         assertFalse(bond.isActiveNode(REG_NODE_ID));
+        // The `ejected` flag must be set, not just `active` cleared: it is what
+        // the `registerNode` precondition checks, so a re-registration of the
+        // operator stays blocked (`OperatorEjected`) rather than slipping
+        // through on a cleared `active` alone.
+        assertTrue(bond.ejected(REG_OPERATOR));
         // `_ejectNodeEffects` bumps the nonce so the old NodeId can't be reclaimed
         // with a stale ownership proof.
         assertEq(bond.registrationNonce(REG_NODE_ID), 1);
