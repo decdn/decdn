@@ -21,17 +21,14 @@
 //! per-connection stream-cap reset-without-signing; a server over-sending or
 //! delivering hash-mismatched bytes; and the request/voucher read timeouts.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
-use decdn_common::config::ResolvedSecurity;
+use decdn_cache::CacheEngine;
 use decdn_incentive::{
     ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore,
     bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
@@ -41,19 +38,18 @@ use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
-use decdn_protocol::{
-    ALPN_CLIENT, MAX_RATE_PER_MB, decode_message, encode_stream_request, read_frame, write_frame,
+use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
+use iroh::{Endpoint, EndpointAddr};
+
+mod support;
+use support::{
+    HandlerDomains, build_handler_full, cache_with_blob, empty_cache, fresh_key, local_endpoint,
+    permissive_limiter, spawn_server,
 };
-use iroh::protocol::ProtocolHandler;
-use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 
 const CHAIN_ID: u64 = 421_614;
 const TOKEN: Address = Address::repeat_byte(0x22);
 const RATE_PER_MB: u64 = 10;
-
-fn fresh_key() -> SecretKey {
-    SecretKey::generate()
-}
 
 fn slash_domain() -> Eip712Domain {
     slash_judge_domain(CHAIN_ID, Address::repeat_byte(0x11))
@@ -67,79 +63,17 @@ fn binding_domain() -> Eip712Domain {
     bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99))
 }
 
+/// The loopback suite's fixed EIP-712 domains.
+fn loopback_domains() -> HandlerDomains {
+    HandlerDomains {
+        slash: slash_domain(),
+        voucher: payment_domain(),
+        binding: binding_domain(),
+    }
+}
+
 const fn channel_id() -> B256 {
     B256::repeat_byte(0xC1)
-}
-
-async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
-    let tmp = tempfile::tempdir()?;
-    let cache = CacheEngine::open(tmp.path(), vec![], 16).await?;
-    Ok((cache, tmp))
-}
-
-/// Open a cache pre-seeded with `payload` (pulled+verified via a filesystem
-/// origin, then the origin dir is dropped). Returns the cache, blob hash, and
-/// the cache temp dir to keep alive.
-async fn cache_with_blob(payload: &[u8]) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
-    let hash = Hash::new(payload);
-    let origin_dir = tempfile::tempdir()?;
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let dir = origin_dir.path().join(shard);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(hex.as_str()), payload)?;
-
-    let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(
-        cache_dir.path(),
-        vec![origin as Arc<dyn decdn_cache::Origin>],
-        16,
-    )
-    .await?;
-    let _ = cache.get(hash).await?; // populate local store
-    drop(origin_dir);
-    Ok((cache, hash, cache_dir))
-}
-
-fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
-    let cfg = ResolvedSecurity {
-        max_concurrent_handlers: u32::MAX,
-        per_source_rate_per_sec: 1_000_000.0,
-        per_source_burst: u32::MAX,
-        max_tracked_sources: 4096,
-    };
-    Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
-}
-
-async fn local_endpoint(
-    secret_key: SecretKey,
-    alpns: Vec<Vec<u8>>,
-) -> anyhow::Result<(Endpoint, SocketAddr)> {
-    let bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
-    let ep = Endpoint::builder(presets::Minimal)
-        .secret_key(secret_key)
-        .alpns(alpns)
-        .relay_mode(RelayMode::Disabled)
-        .bind_addr(bind)
-        .map_err(|e| anyhow::anyhow!("bind_addr: {e}"))?
-        .bind()
-        .await
-        .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
-    let addr = ep
-        .bound_sockets()
-        .into_iter()
-        .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| anyhow::anyhow!("no IPv4 bound socket"))?;
-    let addr = match addr {
-        SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, v4.port()))
-        }
-        other => other,
-    };
-    Ok((ep, addr))
 }
 
 /// Build a `ClientHandler` with the given rate and channel store, an unlimited
@@ -172,37 +106,18 @@ fn build_handler_limited(
     max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
 ) -> anyhow::Result<Arc<ClientHandler>> {
-    Ok(Arc::new(ClientHandler::new(
+    build_handler_full(
         server_id,
-        Arc::clone(metrics),
+        server_eth,
+        metrics,
         limiter,
         cache,
-        Arc::clone(server_eth),
-        slash_domain(),
-        payment_domain(),
-        binding_domain(),
         store,
-        Arc::new(AtomicU64::new(rate)),
-        0,
-        MAX_RATE_PER_MB,
-        1, // voucher_interval_mb
+        rate,
+        &loopback_domains(),
         max_blob_size_bytes,
         max_concurrent_streams,
-    )?))
-}
-
-/// Spawn a server endpoint running `handler`, accepting connections until the
-/// endpoint closes.
-fn spawn_server(server_ep: Endpoint, handler: Arc<ClientHandler>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(incoming) = server_ep.accept().await {
-            let Ok(connecting) = incoming.accept() else {
-                continue;
-            };
-            let Ok(conn) = connecting.await else { continue };
-            let _ = handler.accept(conn).await;
-        }
-    })
+    )
 }
 
 fn channel_context(client_signer: Arc<PrivateKeySigner>, deposit: U256) -> ChannelContext {
