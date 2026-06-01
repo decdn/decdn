@@ -190,10 +190,11 @@ impl ProbeHandler {
         // Probe-triggered eviction hold (ADR 005 §Probe-triggered eviction
         // hold). Only `Held` permits signing `has_blob: true` — the blob is
         // present, not operator-evicted, and a 35s hold is guaranteed. The
-        // outcome enum already classifies the miss (absent vs budget
-        // exhausted) so no second cache lookup is needed. The hold is taken
-        // *after* the rate limiter (ADR 005 §Probe rate limiting: hold
-        // admission occurs only after the limiter passes — do not reorder).
+        // outcome enum already classifies each `has_blob: false` cause
+        // (absent/evicted, holds disabled, budget exhausted) so no second
+        // cache lookup is needed. The hold is taken *after* the rate limiter
+        // (ADR 005 §Probe rate limiting: hold admission occurs only after the
+        // limiter passes — do not reorder).
         let (has_blob, total_bytes) = match self.cache.try_probe_hold(hash).await {
             Ok(ProbeHoldOutcome::Held) => {
                 let size = self
@@ -205,9 +206,32 @@ impl ProbeHandler {
                 (true, size)
             }
             Ok(ProbeHoldOutcome::BudgetExhausted) => {
-                // Present but un-holdable: an availability degradation, never
-                // a safety fault (ADR 005 §Hold budget). Answer false.
+                // Present but un-holdable because every hold slot is live: an
+                // availability degradation under genuine load, never a safety
+                // fault (ADR 005 §Hold budget). The actionable remedy is to
+                // raise `max_probe_holds`, so this is the counter that drives
+                // that alert (#739).
                 self.metrics.probe_hold_violation();
+                // Don't log `probe_hold_slots_used()` here: it re-acquires the
+                // `probe_holds` lock and sweeps, and on this hot refusal path
+                // the value is a foregone ~`max` anyway. The gauge is published
+                // once per probe below.
+                tracing::debug!(
+                    hash = %hash,
+                    "probe hold refused: budget exhausted; signing has_blob:false"
+                );
+                (false, None)
+            }
+            Ok(ProbeHoldOutcome::HoldsDisabled) => {
+                // Present but un-holdable because holds are disabled by config
+                // (`max_probe_holds == 0`). Counted separately from budget
+                // pressure (#739) so an intentional disable does not trip the
+                // "increase max_probe_holds" alert.
+                self.metrics.probe_holds_disabled();
+                tracing::debug!(
+                    hash = %hash,
+                    "probe hold refused: holds disabled (max_probe_holds=0); signing has_blob:false"
+                );
                 (false, None)
             }
             // Blob genuinely absent or operator-evicted — a true negative,

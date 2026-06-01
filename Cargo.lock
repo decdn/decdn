@@ -2729,6 +2729,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "postcard",
+ "proptest",
  "rand 0.10.1",
  "redb 4.1.0",
  "reqwest",

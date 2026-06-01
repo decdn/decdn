@@ -26,10 +26,22 @@
 //!   client-signed claim needs no dispute window — ADR 003 § Operator early
 //!   withdrawal). On graceful shutdown it best-effort `closeChannel`s every
 //!   tracked channel that still carries an un-redeemed claim, starting the
-//!   dispute window so a later `settleChannel` (by anyone) finalizes it.
+//!   dispute window.
+//! - **Settlement sweep.** `closeChannel` only *opens* the dispute window — it
+//!   does not pay the provider; the un-withdrawn remainder
+//!   (`claimedAmount - withdrawnAmount`) is routed only when `settleChannel`
+//!   runs after `disputeDeadline`. The client is normally incentivized to
+//!   settle (to reclaim `deposit - claimedAmount`), but when it drew the full
+//!   deposit (`clientRefund == 0`) nobody is. So every close (shutdown or
+//!   pre-expiry sweep) best-effort records a durable [`PendingSettle`] entry,
+//!   and a periodic sweep calls `settleChannel` for entries whose window has
+//!   elapsed — finalizing the provider's remainder without relying on the
+//!   client (PR #743 review). Entries survive restarts and are dropped once a
+//!   `ChannelSettled` event (from any party) confirms finalization.
 //!
-//! Buyer-side `openChannel` (node→node cache-miss pulls) and the dispute
-//! monitor are out of scope here. Structurally this mirrors
+//! Buyer-side `openChannel` (node→node cache-miss pulls) and the in-process
+//! dispute monitor (challenging a client's stale close, #324) are out of scope
+//! here. Structurally this mirrors
 //! [`crate::dht::chain_staker_set`]: a generic-over-`Provider` struct owning
 //! `AbortOnDrop` background tasks with exponential-backoff resubscription.
 
@@ -42,11 +54,13 @@ use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use anyhow::{Context, Result};
 use decdn_incentive::payment_channel::PaymentChannel;
-use decdn_incentive::{ChannelId, ChannelState, ChannelStateStore};
+use decdn_incentive::{
+    ChannelId, ChannelState, ChannelStateStore, PendingSettle, PendingSettleStore,
+};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::handlers::client::ClientHandler;
 
@@ -106,6 +120,14 @@ const fn within_close_window(now: u64, expires_at: u64) -> bool {
     expires_at != 0 && now.saturating_add(EXPIRY_CLOSE_AHEAD_SECS) >= expires_at
 }
 
+/// Whether a closed channel's dispute window has elapsed, so `settleChannel`
+/// will not revert with `DisputeWindowActive`. `settle_after` is the on-chain
+/// `disputeDeadline`; the contract requires `block.timestamp >= disputeDeadline`
+/// to finalize (`contracts/src/PaymentChannel.sol` `settleChannel`).
+const fn ready_to_settle(now: u64, settle_after: u64) -> bool {
+    now >= settle_after
+}
+
 /// Aborts the wrapped task on drop so a node-restart cycle never leaks a
 /// chain-poll task. Same pattern as `chain_staker_set::AbortOnDrop`.
 #[derive(Debug)]
@@ -123,6 +145,7 @@ impl Drop for AbortOnDrop {
 pub struct PaymentChannelService<P: Provider + Clone + 'static> {
     contract: PaymentChannel::PaymentChannelInstance<P>,
     store: Arc<dyn ChannelStateStore>,
+    pending_store: Arc<dyn PendingSettleStore>,
     redeem_tx: mpsc::Sender<ChannelId>,
     _watcher: AbortOnDrop,
     _redeemer: AbortOnDrop,
@@ -144,6 +167,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         payment_channel_addr: Address,
         self_address: Address,
         store: Arc<dyn ChannelStateStore>,
+        pending_store: Arc<dyn PendingSettleStore>,
         handler: Arc<ClientHandler>,
         redeem_threshold: U256,
     ) -> Result<Self> {
@@ -169,6 +193,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             self_address,
             usdc_token,
             Arc::clone(&handler),
+            Arc::clone(&pending_store),
         ));
         let redeemer = tokio::spawn(redeemer_loop(
             contract.clone(),
@@ -180,6 +205,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         let sweeper = tokio::spawn(sweeper_loop(
             contract.clone(),
             Arc::clone(&store),
+            Arc::clone(&pending_store),
             handler,
             self_address,
         ));
@@ -187,6 +213,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         Ok(Self {
             contract,
             store,
+            pending_store,
             redeem_tx,
             _watcher: AbortOnDrop(watcher),
             _redeemer: AbortOnDrop(redeemer),
@@ -255,7 +282,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             if !matches!(ch.status, PaymentChannel::Status::Open) || unredeemed.is_zero() {
                 continue;
             }
-            if let Some(fut) = send_close(&self.contract, &st).await {
+            if let Some(fut) = send_close(&self.contract, &self.pending_store, &st).await {
                 receipts.push(fut);
             }
         }
@@ -270,10 +297,14 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
 /// Submit `closeChannel` for `st`'s latest voucher. On a successful send,
 /// returns a future that awaits the receipt and reports whether it landed (so
 /// callers can await many concurrently); returns `None` if the send itself
-/// failed. The returned future captures only owned/`Copy` data (`use<P>`), so
-/// it borrows neither `contract` nor `st`.
+/// failed. When the close lands the future also records a durable
+/// [`PendingSettle`] entry (re-reading `disputeDeadline`) so the settle sweep
+/// finalizes the provider's remainder after the dispute window. The returned
+/// future captures only owned data (`use<P>`), so it borrows neither
+/// `contract`, `pending_store`, nor `st`.
 async fn send_close<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
+    pending_store: &Arc<dyn PendingSettleStore>,
     st: &ChannelState,
 ) -> Option<impl Future<Output = bool> + use<P>> {
     let sig = Bytes::from(normalize_voucher_signature(&st.last_signature));
@@ -289,37 +320,93 @@ async fn send_close<P: Provider + Clone>(
         .send()
         .await
     {
-        Ok(pending) => Some(async move {
-            match pending.get_receipt().await {
-                // `get_receipt` returns `Ok` even for a reverted tx — a
-                // reverted close did NOT secure the claim, so report it as not
-                // landed so the caller does not retire/forget the channel.
-                Ok(receipt) if receipt.status() => {
-                    info!(
-                        %channel_id,
-                        tx = %receipt.transaction_hash,
-                        "closeChannel landed (dispute window open)"
-                    );
-                    true
+        Ok(pending) => {
+            let contract = contract.clone();
+            let pending_store = Arc::clone(pending_store);
+            Some(async move {
+                match pending.get_receipt().await {
+                    // `get_receipt` returns `Ok` even for a reverted tx — a
+                    // reverted close did NOT secure the claim, so report it as
+                    // not landed so the caller does not retire/forget the
+                    // channel.
+                    Ok(receipt) if receipt.status() => {
+                        info!(
+                            %channel_id,
+                            tx = %receipt.transaction_hash,
+                            "closeChannel landed (dispute window open)"
+                        );
+                        record_pending_after_close(&contract, &pending_store, channel_id).await;
+                        true
+                    }
+                    Ok(receipt) => {
+                        warn!(
+                            %channel_id,
+                            tx = %receipt.transaction_hash,
+                            "closeChannel transaction reverted on-chain"
+                        );
+                        false
+                    }
+                    Err(err) => {
+                        warn!(%err, %channel_id, "closeChannel receipt failed");
+                        false
+                    }
                 }
-                Ok(receipt) => {
-                    warn!(
-                        %channel_id,
-                        tx = %receipt.transaction_hash,
-                        "closeChannel transaction reverted on-chain"
-                    );
-                    false
-                }
-                Err(err) => {
-                    warn!(%err, %channel_id, "closeChannel receipt failed");
-                    false
-                }
-            }
-        }),
+            })
+        }
         Err(err) => {
             warn!(%err, %channel_id, "closeChannel send failed");
             None
         }
+    }
+}
+
+/// After a `closeChannel` lands, re-read the channel to learn the
+/// `disputeDeadline` the close just set and persist a [`PendingSettle`] entry
+/// so the settle sweep can finalize the provider's un-withdrawn remainder once
+/// the window elapses (PR #743 review). Best-effort: a failed read or write is
+/// logged, not fatal — the close already secured the claim, and a missed entry
+/// only means the node won't auto-settle (the client still can, or the next
+/// run re-derives nothing — the remainder simply waits).
+async fn record_pending_after_close<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    channel_id: ChannelId,
+) {
+    let settle_after = match contract.getChannel(channel_id).call().await {
+        Ok(ch) => ch.disputeDeadline,
+        Err(err) => {
+            // The close landed but we couldn't record the settle obligation.
+            // For a fully-drawn channel (clientRefund == 0 — the case this
+            // whole feature targets) the client has no incentive to settle, so
+            // the remainder will NOT auto-settle: an operator must intervene.
+            error!(
+                %err, %channel_id,
+                "post-close getChannel failed; settle obligation NOT recorded — \
+                 if clientRefund==0 the remainder will not auto-settle, \
+                 call settleChannel(<channel_id>) manually after the dispute window"
+            );
+            return;
+        }
+    };
+    let entry = PendingSettle {
+        channel_id,
+        settle_after,
+    };
+    if let Err(err) = pending_store.record_pending(&entry) {
+        // Unlike the getChannel arm this is not re-derivable: the channel is
+        // forgotten right after close, so a lost write means no record this
+        // channel ever needed settling. Same operator remedy.
+        error!(
+            %err, %channel_id, settle_after,
+            "failed to persist pending-settle entry — \
+             if clientRefund==0 the remainder will not auto-settle, \
+             call settleChannel(<channel_id>) manually after the dispute window"
+        );
+    } else {
+        info!(
+            %channel_id, settle_after,
+            "recorded channel for post-dispute settlement"
+        );
     }
 }
 
@@ -356,10 +443,19 @@ async fn watcher_loop<P: Provider + Clone>(
     self_address: Address,
     usdc_token: Address,
     handler: Arc<ClientHandler>,
+    pending_store: Arc<dyn PendingSettleStore>,
 ) {
     let mut backoff = WATCHER_INITIAL_BACKOFF;
     loop {
-        match run_watcher_once(&contract, self_address, usdc_token, &handler).await {
+        match run_watcher_once(
+            &contract,
+            self_address,
+            usdc_token,
+            &handler,
+            &pending_store,
+        )
+        .await
+        {
             Ok(()) => {
                 debug!("PaymentChannel watcher stream ended cleanly; resubscribing");
                 backoff = WATCHER_INITIAL_BACKOFF;
@@ -377,16 +473,18 @@ async fn watcher_loop<P: Provider + Clone>(
     }
 }
 
-/// One watcher cycle: open the three event filters and drain them until one
+/// One watcher cycle: open the four event filters and drain them until one
 /// errors (transport failure) or ends (filter expiry / provider rotation).
-// 3-arm event-dispatch loop is fundamentally complex; splitting obscures the
-// dispatch table (same posture as `chain_staker_set::run_watcher_once`).
-#[allow(clippy::cognitive_complexity)]
+// 4-arm event-dispatch loop is fundamentally complex; splitting obscures the
+// dispatch table (same posture as `chain_staker_set::run_watcher_once`). The
+// line budget is likewise over by a hair for the same reason.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn run_watcher_once<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     self_address: Address,
     usdc_token: Address,
     handler: &Arc<ClientHandler>,
+    pending_store: &Arc<dyn PendingSettleStore>,
 ) -> Result<()> {
     let mut opened = contract
         .ChannelOpened_filter()
@@ -475,6 +573,11 @@ async fn run_watcher_once<P: Provider + Clone>(
                         warn!(%err, channel_id = %event.channelId, "failed to forget settled channel");
                     } else {
                         info!(channel_id = %event.channelId, "channel settled; dropped tracked state");
+                    }
+                    // Settlement is final (by us or by the client) — drop any
+                    // pending-settle obligation so the sweep stops retrying.
+                    if let Err(err) = pending_store.forget_pending(event.channelId) {
+                        warn!(%err, channel_id = %event.channelId, "failed to drop pending-settle entry on settle");
                     }
                 }
                 Some(Err(e)) => return Err(e).context("ChannelSettled stream"),
@@ -632,16 +735,23 @@ async fn try_redeem<P: Provider + Clone>(
 async fn sweeper_loop<P: Provider + Clone>(
     contract: PaymentChannel::PaymentChannelInstance<P>,
     store: Arc<dyn ChannelStateStore>,
+    pending_store: Arc<dyn PendingSettleStore>,
     handler: Arc<ClientHandler>,
     self_address: Address,
 ) {
     let mut ticker = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
-    // Skip the immediate first tick — bootstrap just ran; nothing is near
-    // expiry yet, and it avoids a redundant load_all at startup.
+    // Skip the immediate first tick — the expiry pass has nothing to do right
+    // after bootstrap. The settle pass DOES run on the first real tick (a
+    // channel closed before the last shutdown may already be past its dispute
+    // window), but waiting one interval avoids racing the watcher's startup
+    // and keeps startup I/O light.
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        sweep_once(&contract, &store, &handler, self_address).await;
+        sweep_once(&contract, &store, &pending_store, &handler, self_address).await;
+        // Read `now` here rather than before `sweep_once` (which does network
+        // I/O) so the settle gate uses a fresh timestamp.
+        settle_pass(&contract, &pending_store, unix_now()).await;
     }
 }
 
@@ -650,6 +760,7 @@ async fn sweeper_loop<P: Provider + Clone>(
 async fn sweep_once<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn ChannelStateStore>,
+    pending_store: &Arc<dyn PendingSettleStore>,
     handler: &Arc<ClientHandler>,
     self_address: Address,
 ) {
@@ -662,7 +773,7 @@ async fn sweep_once<P: Provider + Clone>(
     };
     let now = unix_now();
     for st in states {
-        try_close_for_expiry(contract, handler, self_address, now, &st).await;
+        try_close_for_expiry(contract, pending_store, handler, self_address, now, &st).await;
     }
 }
 
@@ -675,6 +786,7 @@ async fn sweep_once<P: Provider + Clone>(
 #[allow(clippy::cognitive_complexity)]
 async fn try_close_for_expiry<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
+    pending_store: &Arc<dyn PendingSettleStore>,
     handler: &Arc<ClientHandler>,
     self_address: Address,
     now: u64,
@@ -702,7 +814,7 @@ async fn try_close_for_expiry<P: Provider + Clone>(
     {
         return;
     }
-    let Some(receipt) = send_close(contract, st).await else {
+    let Some(receipt) = send_close(contract, pending_store, st).await else {
         return;
     };
     if !receipt.await {
@@ -718,6 +830,151 @@ async fn try_close_for_expiry<P: Provider + Clone>(
             channel_id = %st.channel_id,
             expires_at = st.expires_at,
             "closed channel ahead of expiry and retired it"
+        );
+    }
+}
+
+/// One settlement-sweep pass: finalize every closed channel whose dispute
+/// window has elapsed (PR #743 review). `closeChannel` only opens the window;
+/// `settleChannel` is what routes the provider's un-withdrawn remainder, so
+/// without this pass a fully-drawn channel (`clientRefund == 0`, no client
+/// incentive to settle) would strand the provider's sub-threshold tail. Errors
+/// are logged per channel and never abort the sweep.
+async fn settle_pass<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    now: u64,
+) {
+    let entries = match pending_store.load_pending() {
+        Ok(e) => e,
+        Err(err) => {
+            warn!(%err, "settle sweep: failed to load pending-settle set");
+            return;
+        }
+    };
+    for entry in entries {
+        // Gate on the stored `disputeDeadline` so we never submit a
+        // guaranteed-revert `settleChannel` (and burn gas) before the window.
+        if !ready_to_settle(now, entry.settle_after) {
+            continue;
+        }
+        try_settle(contract, pending_store, entry.channel_id).await;
+    }
+}
+
+/// Submit `settleChannel` for one closed channel past its dispute window and,
+/// on success, drop its pending-settle entry. A revert almost always means
+/// another party already settled (status left `Closing`): confirm via
+/// `getChannel` and drop the entry if the channel is now `Closed`, otherwise
+/// leave it for the next sweep (e.g. local-clock skew ahead of the chain).
+// Linear guard-and-act sequence (send → receipt → status → confirm); the
+// early-return guards read more clearly inline than split across helpers,
+// same posture as `try_redeem` / `try_close_for_expiry`.
+#[allow(clippy::cognitive_complexity)]
+async fn try_settle<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    channel_id: ChannelId,
+) {
+    let send = match contract.settleChannel(channel_id).send().await {
+        Ok(p) => p,
+        Err(err) => {
+            warn!(%err, %channel_id, "settleChannel send failed; will retry next sweep");
+            return;
+        }
+    };
+    let receipt = match send.get_receipt().await {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(%err, %channel_id, "settleChannel receipt failed; will retry next sweep");
+            return;
+        }
+    };
+    if receipt.status() {
+        info!(
+            %channel_id,
+            tx = %receipt.transaction_hash,
+            "settled channel; routed provider remainder through FeeRouter"
+        );
+        forget_pending_logged(pending_store, channel_id);
+        return;
+    }
+    // Reverted: most likely `ChannelNotClosing` because another party already
+    // finalized. Confirm before dropping the obligation.
+    warn!(
+        %channel_id,
+        tx = %receipt.transaction_hash,
+        "settleChannel reverted; checking whether it was already finalized"
+    );
+    drop_pending_if_finalized(contract, pending_store, channel_id).await;
+}
+
+/// After a reverted `settleChannel`, read the channel to decide what to do
+/// with the pending entry:
+/// - `Closed`: another party finalized it — drop the entry.
+/// - `Closing`: the window is still open. This happens when our local clock
+///   ran ahead, or — the case worth handling — a `disputeChannel` *extended*
+///   `disputeDeadline` past the value we stored at close
+///   (`PaymentChannel.sol` forced-inclusion guarantee). Re-stamp `settle_after`
+///   from the live deadline so the gate stops submitting a guaranteed-revert
+///   `settleChannel` (and burning gas) every sweep until the new window passes.
+/// - read error: keep the entry and retry next sweep.
+async fn drop_pending_if_finalized<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    channel_id: ChannelId,
+) {
+    match contract.getChannel(channel_id).call().await {
+        Ok(ch) if matches!(ch.status, PaymentChannel::Status::Closed) => {
+            info!(%channel_id, "channel already settled elsewhere; dropping pending entry");
+            forget_pending_logged(pending_store, channel_id);
+        }
+        Ok(ch) if matches!(ch.status, PaymentChannel::Status::Closing) => {
+            // Re-stamp the gate to the current on-chain deadline (overwrites by
+            // contract). A no-op when unchanged; the fix when a dispute pushed
+            // the deadline out from under our stored value.
+            restamp_pending_logged(pending_store, channel_id, ch.disputeDeadline);
+        }
+        Ok(_) => {
+            // `Open` is unreachable for a channel we closed (close → Closing →
+            // Closed); leave the entry and retry next sweep if it ever occurs.
+        }
+        Err(err) => {
+            warn!(%err, %channel_id, "post-revert getChannel failed; will retry next sweep");
+        }
+    }
+}
+
+/// Drop a pending-settle entry, logging (not propagating) a store failure —
+/// the settlement already landed on-chain, so a failed delete only risks a
+/// redundant `settleChannel` next sweep (which reverts harmlessly and re-drops
+/// via the `Closed`-status path).
+fn forget_pending_logged(pending_store: &Arc<dyn PendingSettleStore>, channel_id: ChannelId) {
+    if let Err(err) = pending_store.forget_pending(channel_id) {
+        warn!(%err, %channel_id, "failed to drop pending-settle entry after settlement");
+    }
+}
+
+/// Re-stamp a pending entry's settle deadline (logging, not propagating, a
+/// store failure). Used when a `settleChannel` reverts because a dispute
+/// extended `disputeDeadline` past the value stored at close — keeping the
+/// gate accurate so the sweep stops submitting guaranteed-revert transactions.
+fn restamp_pending_logged(
+    pending_store: &Arc<dyn PendingSettleStore>,
+    channel_id: ChannelId,
+    settle_after: u64,
+) {
+    let entry = PendingSettle {
+        channel_id,
+        settle_after,
+    };
+    if let Err(err) = pending_store.record_pending(&entry) {
+        warn!(%err, %channel_id, "failed to re-stamp pending-settle deadline; will retry next sweep");
+    } else {
+        debug!(
+            %channel_id,
+            settle_after,
+            "settleChannel reverted with the dispute window still open; re-stamped deadline"
         );
     }
 }
@@ -819,5 +1076,19 @@ mod tests {
         assert!(within_close_window(expires_at + 10, expires_at));
         // `now` near u64::MAX must not overflow the `+ CLOSE_AHEAD` add.
         assert!(within_close_window(u64::MAX, expires_at));
+    }
+
+    #[test]
+    fn ready_to_settle_boundary() {
+        let deadline = 1_000u64;
+        // Strictly before the dispute deadline: not yet settleable (the
+        // contract reverts DisputeWindowActive).
+        assert!(!ready_to_settle(deadline - 1, deadline));
+        // At and after the deadline: settleable (contract requires now >=).
+        assert!(
+            ready_to_settle(deadline, deadline),
+            "now == disputeDeadline is settleable"
+        );
+        assert!(ready_to_settle(deadline + 1, deadline));
     }
 }

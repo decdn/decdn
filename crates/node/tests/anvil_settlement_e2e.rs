@@ -78,8 +78,8 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, bind_node_id_domain,
-    binding_signing_hash, slash_judge_domain, voucher_domain,
+    BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, PendingSettleStore,
+    bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerChannelService;
 use decdn_node::channel_store::PersistentChannelStateStore;
@@ -391,8 +391,12 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         store_tmp.path(),
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )?;
-    let store: Arc<dyn ChannelStateStore> =
-        Arc::new(PersistentChannelStateStore::open(store_tmp.path())?);
+    // One concrete redb-backed store backs both the voucher-state trait (the
+    // handler + #527 replay guard) and the pending-settle trait (the on-chain
+    // settlement sweep, PR #743 review) — mirrors the runtime wiring.
+    let concrete_store = Arc::new(PersistentChannelStateStore::open(store_tmp.path())?);
+    let store: Arc<dyn ChannelStateStore> = concrete_store.clone();
+    let pending_store: Arc<dyn PendingSettleStore> = concrete_store;
 
     let node_eth = Arc::new(node_signer.clone());
     let metrics = Arc::new(Metrics::new());
@@ -419,6 +423,7 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         payment_channel,
         node_addr,
         Arc::clone(&store),
+        pending_store,
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
     )

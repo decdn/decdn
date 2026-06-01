@@ -54,7 +54,10 @@ pub use probe_sig::{
     slash_judge_domain,
 };
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, verify_rate};
-pub use store::{ChannelStateStore, MemoryChannelStateStore, StoreError};
+pub use store::{
+    ChannelStateStore, MemoryChannelStateStore, MemoryPendingSettleStore, PendingSettle,
+    PendingSettleStore, StoreError,
+};
 pub use stream_sig::{StreamSlashData, StreamSlashError};
 pub use voucher::{
     DOMAIN_NAME, DOMAIN_VERSION, SignedVoucher, Voucher, VoucherError, voucher_domain,

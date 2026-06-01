@@ -43,8 +43,8 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
-use decdn_incentive::ChannelStateStore;
 use decdn_incentive::eth_identity::{self, PasswordSource};
+use decdn_incentive::{ChannelStateStore, PendingSettleStore};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger
@@ -351,11 +351,12 @@ pub async fn run(
     // Failure here MUST abort startup: continuing with a fresh in-memory
     // map silently reopens the replay window the store exists to close.
     let channel_store_data_dir = cfg.identity.data_dir.clone();
-    // Keep the concrete store `Arc` so it can back both the seller
-    // `ChannelStateStore` (channel_state_v1 table) and the buyer
+    // Keep the concrete store `Arc` so it can back the seller
+    // `ChannelStateStore` (channel_state_v1 table), the pending-settle store
+    // (pending_settle_v1 table, PR #743 review), and the buyer
     // `BuyerChannelStore` (buyer_channel_state_v1 table, #744) — redb forbids a
-    // second `Database` handle to the same file, so one shared store owns both.
-    let channel_store_concrete: Arc<PersistentChannelStateStore> = Arc::new(
+    // second `Database` handle to the same file, so one shared store owns all.
+    let concrete_channel_store: Arc<PersistentChannelStateStore> = Arc::new(
         tokio::task::spawn_blocking(move || {
             PersistentChannelStateStore::open(&channel_store_data_dir)
         })
@@ -363,7 +364,14 @@ pub async fn run(
         .context("channel state store open task panicked")?
         .context("failed to open channel state store (issue #527 voucher replay guard)")?,
     );
-    let channel_state_store: Arc<dyn ChannelStateStore> = channel_store_concrete.clone();
+    // The one redb-backed store implements the voucher-state trait (for the
+    // handler + #527 replay guard), the pending-settle trait (for the on-chain
+    // settlement sweep, PR #743 review), and the buyer-channel trait (#744).
+    // Derive trait-object handles from the single concrete store so all tables
+    // share one open file and one fsync discipline; `concrete_channel_store`
+    // stays bound for the buyer handle built further below.
+    let channel_state_store: Arc<dyn ChannelStateStore> = concrete_channel_store.clone();
+    let pending_settle_store: Arc<dyn PendingSettleStore> = concrete_channel_store.clone();
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema even before the
     // future cdn/client/v1 handler (#317) is constructed. The handler will
@@ -599,6 +607,7 @@ pub async fn run(
         payment_channel_addr,
         eth_signer.address(),
         Arc::clone(&channel_state_store),
+        Arc::clone(&pending_settle_store),
         Arc::clone(&client_handler),
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
     )
@@ -625,7 +634,7 @@ pub async fn run(
         .wallet(EthereumWallet::from((*eth_signer).clone()))
         .connect_http(rpc_url);
     let buyer_channel_store: Arc<dyn decdn_incentive::BuyerChannelStore> = Arc::new(
-        crate::channel_store::BuyerChannelStoreHandle::new(Arc::clone(&channel_store_concrete)),
+        crate::channel_store::BuyerChannelStoreHandle::new(Arc::clone(&concrete_channel_store)),
     );
     let _buyer_channel_service = match crate::buyer_channel::BuyerChannelService::bootstrap(
         buyer_wallet_provider,

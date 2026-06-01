@@ -1010,8 +1010,9 @@ impl CacheEngine {
 
     /// Set the probe-hold budget cap from `cache.max_probe_holds` (ADR 005
     /// §Hold budget, #318). Called once by the runtime at bring-up. `0`
-    /// disables the hold path so [`Self::try_probe_hold`] always returns
-    /// `false` (the node then answers `has_blob: false` to every probe).
+    /// disables the hold path so [`Self::try_probe_hold`] returns
+    /// [`ProbeHoldOutcome::HoldsDisabled`] for any present blob (the node then
+    /// answers `has_blob: false` to every probe).
     pub fn set_max_probe_holds(&self, max: usize) {
         self.inner.max_probe_holds.store(max, Ordering::Relaxed);
     }
@@ -1022,11 +1023,14 @@ impl CacheEngine {
     ///
     /// Returns [`ProbeHoldOutcome::Held`] only when the node may safely sign
     /// `has_blob: true`: the blob is present, not operator-evicted, **and** a
-    /// hold is guaranteed for the full slashing window. Otherwise returns
-    /// [`ProbeHoldOutcome::Unavailable`] (absent/evicted) or
-    /// [`ProbeHoldOutcome::BudgetExhausted`] (present but `max == 0` or all
-    /// slots in use) so the caller signs `has_blob: false` without a second
-    /// cache lookup to classify the miss.
+    /// hold is guaranteed for the full slashing window. Otherwise returns one
+    /// of three `has_blob: false` causes so the caller need not re-inspect the
+    /// cache to classify the miss:
+    /// - [`ProbeHoldOutcome::Unavailable`] — blob absent or operator-evicted.
+    /// - [`ProbeHoldOutcome::HoldsDisabled`] — holds disabled by config
+    ///   (`max_probe_holds == 0`); an intentional operator decision.
+    /// - [`ProbeHoldOutcome::BudgetExhausted`] — present but every hold slot
+    ///   is live (`max_probe_holds > 0`); genuine budget pressure.
     ///
     /// Per-blob semantics: a hash already held has its expiry refreshed and
     /// consumes no additional slot, so many peers probing one popular blob
@@ -1041,11 +1045,28 @@ impl CacheEngine {
     /// [`Self::has`] check and granting the hold — a takedown always wins
     /// (ADR appendix-blob-cache-eviction.md §4).
     pub async fn try_probe_hold(&self, hash: Hash) -> CacheResult<ProbeHoldOutcome> {
-        // `has` returns false for operator-evicted hashes too.
+        // `has` returns false for operator-evicted hashes too. This stays
+        // *before* the `max == 0` check below so an absent/evicted blob is a
+        // true negative (`Unavailable`), not a config-disable event.
         if !self.has(hash).await? {
             return Ok(ProbeHoldOutcome::Unavailable);
         }
         let max = self.inner.max_probe_holds.load(Ordering::Relaxed);
+        // Holds disabled by config (#739): answer `HoldsDisabled` before
+        // touching the lock. This is the unconditional "never sign
+        // has_blob:true" path — it must override an existing live hold so that
+        // if the budget is ever lowered to 0 while a hold is live, the disable
+        // wins instead of the fast path below refreshing and re-signing the
+        // hold. (Today only the tests lower it post-startup;
+        // `cache.max_probe_holds` is restart-required, not hot-reloaded.) Also
+        // skips the O(N) expiry sweep entirely while holds are off. Returning
+        // before the under-lock `is_evicted` re-check is slash-safe: a blob
+        // evicted concurrently here is still answered `has_blob: false` (the
+        // misclassification is `Unavailable`→`HoldsDisabled`, a metric-only
+        // miscount between two non-slash counters — never a phantom `true`).
+        if max == 0 {
+            return Ok(ProbeHoldOutcome::HoldsDisabled);
+        }
         let now = Instant::now();
         // `Instant + Duration` panics on overflow; saturate instead to keep
         // the workspace anti-panic policy (clippy `unwrap_used`/`panic`).
@@ -1077,8 +1098,10 @@ impl CacheEngine {
             return Ok(ProbeHoldOutcome::Unavailable);
         }
         if guard.len() >= max {
-            // Covers both budget exhaustion and the `max == 0` (holds
-            // disabled) case (ADR 005 §Hold budget).
+            // `max == 0` was already handled above, so reaching the budget
+            // ceiling here is always genuine pressure: every slot is live
+            // (#739). This is the "increase max_probe_holds" signal (ADR 005
+            // §Hold budget) — never a config disable.
             return Ok(ProbeHoldOutcome::BudgetExhausted);
         }
         guard.insert(hash, expiry);
@@ -3184,9 +3207,61 @@ mod tests {
         .await?;
         let _ = engine.get(hash).await?;
         engine.set_max_probe_holds(0);
+        // `max == 0` is an operator config decision (holds turned off), not
+        // budget pressure — it must report a cause distinct from
+        // `BudgetExhausted` (#739) so the "increase max_probe_holds" alert
+        // isn't tripped by an intentional disable.
         anyhow::ensure!(
-            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::BudgetExhausted,
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::HoldsDisabled,
             "max_probe_holds=0 must disable has_blob:true entirely"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_disable_overrides_existing_probe_hold() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"held then disabled";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+        engine.set_max_probe_holds(1);
+        anyhow::ensure!(
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held,
+            "hold should be granted while the budget is positive"
+        );
+        // Lowering the budget to 0 while a hold is live must take effect
+        // immediately: a re-probe for the already-held blob must NOT refresh
+        // the hold and re-sign has_blob:true (#739). `max == 0` means "never
+        // sign has_blob:true", unconditionally.
+        engine.set_max_probe_holds(0);
+        anyhow::ensure!(
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::HoldsDisabled,
+            "a runtime disable must override an existing live hold"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_blob_is_unavailable_even_when_holds_disabled() -> anyhow::Result<()> {
+        // Precedence pin (#739): the `max == 0` early return must sit *after*
+        // the `has()` check, so an absent blob is a true negative
+        // (`Unavailable`), never a `HoldsDisabled` config-disable event. Guards
+        // against a future reorder that moves the cheap `max == 0` load above
+        // the store lookup and silently inflates `probe_holds_disabled` with
+        // probes for content the node never had.
+        let tmp = tempfile::tempdir()?;
+        let absent = Hash::new(b"never fetched");
+        let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
+        engine.set_max_probe_holds(0);
+        anyhow::ensure!(
+            engine.try_probe_hold(absent).await? == ProbeHoldOutcome::Unavailable,
+            "absent blob must win over holds-disabled"
         );
         Ok(())
     }

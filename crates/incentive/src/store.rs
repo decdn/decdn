@@ -89,6 +89,70 @@ pub trait ChannelStateStore: Send + Sync {
     fn get(&self, channel_id: ChannelId) -> Result<Option<ChannelState>, StoreError>;
 }
 
+/// A channel this node closed on-chain (graceful shutdown or pre-expiry
+/// sweep) that is awaiting a `settleChannel` call to finalize and route the
+/// provider's un-withdrawn remainder (`claimedAmount - withdrawnAmount`)
+/// through the `FeeRouter` (#327 / PR #743 review).
+///
+/// `closeChannel` only *opens* the dispute window; the provider is paid only
+/// when `settleChannel` runs after `disputeDeadline`. The client is normally
+/// incentivized to settle (to reclaim `deposit - claimedAmount`), but when the
+/// client drew the full deposit (`clientRefund == 0`) nobody is — so the node
+/// records the closed channel here and a background sweep settles it once the
+/// dispute window has elapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingSettle {
+    /// The closed channel awaiting finalization.
+    pub channel_id: ChannelId,
+    /// On-chain `disputeDeadline` (Unix seconds). `settleChannel` reverts with
+    /// `DisputeWindowActive` before this, so the sweep does not submit until
+    /// `now >= settle_after` — avoiding gas burned on a guaranteed revert.
+    pub settle_after: u64,
+}
+
+/// Durable set of channels closed by this node that await a `settleChannel`
+/// finalization (#327 / PR #743 review). Separate from [`ChannelStateStore`]
+/// because a settle needs only the channel id and a timestamp gate — not the
+/// voucher state — and the lifecycles differ: voucher state is forgotten the
+/// moment a channel closes, whereas the settle obligation outlives the close
+/// by a full dispute window (12–72h) and must survive restarts.
+///
+/// Implementations MUST commit durably (fsync, on disk-backed impls) before
+/// returning `Ok` from `record_pending` / `forget_pending`, mirroring the
+/// [`ChannelStateStore`] durability contract.
+pub trait PendingSettleStore: Send + Sync {
+    /// Persist a closed channel awaiting settlement. Overwrites any existing
+    /// entry for the same channel (a re-close re-stamps the deadline).
+    ///
+    /// Callers MUST set `entry.settle_after` to the channel's on-chain
+    /// `disputeDeadline` (read post-close); the store does not validate it. A
+    /// too-low value makes the settle sweep submit guaranteed-revert
+    /// transactions; a too-high value defers settlement indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails.
+    fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError>;
+
+    /// Load every channel awaiting settlement. Called on each sweep tick (and
+    /// once at bring-up) to find channels whose dispute window has elapsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the backing store is unreadable.
+    fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError>;
+
+    /// Drop the pending-settle entry for a finalized channel — after this
+    /// node's own `settleChannel` lands, or when a `ChannelSettled` event
+    /// shows another party finalized first. Idempotent; a no-op for an
+    /// unknown channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable delete fails.
+    fn forget_pending(&self, channel_id: ChannelId) -> Result<(), StoreError>;
+}
+
 /// Failure modes shared by every [`ChannelStateStore`] implementation.
 ///
 /// Disk-backed impls map their backend errors into [`StoreError::Backend`]
@@ -215,6 +279,56 @@ impl ChannelStateStore for MemoryChannelStateStore {
     }
 }
 
+/// In-memory [`PendingSettleStore`] for tests and the trait's reference
+/// semantics. Not durable — drops with the process. The runtime uses the
+/// redb-backed impl in `crates/node`.
+#[derive(Debug, Default)]
+pub struct MemoryPendingSettleStore {
+    inner: Mutex<HashMap<ChannelId, u64>>,
+}
+
+impl MemoryPendingSettleStore {
+    /// Construct an empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl PendingSettleStore for MemoryPendingSettleStore {
+    fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        guard.insert(entry.channel_id, entry.settle_after);
+        Ok(())
+    }
+
+    fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        Ok(guard
+            .iter()
+            .map(|(&channel_id, &settle_after)| PendingSettle {
+                channel_id,
+                settle_after,
+            })
+            .collect())
+    }
+
+    fn forget_pending(&self, channel_id: ChannelId) -> Result<(), StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        guard.remove(&channel_id);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +392,45 @@ mod tests {
         // Forgetting a never-recorded channel is a no-op.
         store.forget(b256!(
             "1111111111111111111111111111111111111111111111111111111111111111"
+        ))?;
+        Ok(())
+    }
+
+    fn pending(channel_id_byte: u8, settle_after: u64) -> PendingSettle {
+        let mut bytes = [0u8; 32];
+        bytes[31] = channel_id_byte;
+        PendingSettle {
+            channel_id: bytes.into(),
+            settle_after,
+        }
+    }
+
+    #[test]
+    fn pending_store_round_trip_and_overwrite() -> anyhow::Result<()> {
+        let store = MemoryPendingSettleStore::new();
+        store.record_pending(&pending(1, 1_000))?;
+        store.record_pending(&pending(2, 2_000))?;
+        // A re-close re-stamps the deadline for the same channel.
+        store.record_pending(&pending(1, 1_500))?;
+
+        let mut all = store.load_pending()?;
+        all.sort_by_key(|p| p.channel_id);
+        anyhow::ensure!(all.len() == 2, "overwrite must not add a row");
+        let first = all.first().ok_or_else(|| anyhow::anyhow!("missing [0]"))?;
+        anyhow::ensure!(first.settle_after == 1_500, "re-close re-stamps deadline");
+        Ok(())
+    }
+
+    #[test]
+    fn pending_store_forget_removes_entry() -> anyhow::Result<()> {
+        let store = MemoryPendingSettleStore::new();
+        let entry = pending(3, 5_000);
+        store.record_pending(&entry)?;
+        store.forget_pending(entry.channel_id)?;
+        anyhow::ensure!(store.load_pending()?.is_empty());
+        // Forgetting a never-recorded channel is a no-op.
+        store.forget_pending(b256!(
+            "2222222222222222222222222222222222222222222222222222222222222222"
         ))?;
         Ok(())
     }
