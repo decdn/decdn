@@ -68,7 +68,7 @@ Expected: build succeeds; all tests PASS. Record the reported `CapacityBond` run
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && cargo build -p decdn-incentive && cargo nextest run -p decdn-incentive 2>&1 | tail -15
+cd "$(git rev-parse --show-toplevel)" && cargo build -p decdn-incentive && cargo nextest run -p decdn-incentive 2>&1 | tail -15
 ```
 
 Expected: build + tests PASS.
@@ -78,7 +78,7 @@ Expected: build + tests PASS.
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "[Ss]tak(e|ing|ed)|StakeMath|MIN_STAKE" -- contracts/src/CapacityBond.sol contracts/src/StakeMath.sol contracts/test/CapacityBond.t.sol contracts/script/ crates/incentive/ adr/026-tokenomics.md adr/028-slashing-appeals.md adr/036-served-bytes-voting-weight.md | wc -l
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "[Ss]tak(e|ing|ed)|StakeMath|MIN_STAKE" -- contracts/src/CapacityBond.sol contracts/src/StakeMath.sol contracts/test/CapacityBond.t.sol contracts/script/ crates/incentive/ adr/026-tokenomics.md adr/028-slashing-appeals.md adr/036-served-bytes-voting-weight.md | wc -l
 ```
 
 Expected: prints a number (the occurrence count). This is the worklist size; the final task drives it to "only intentional matches".
@@ -128,7 +128,7 @@ Note the header comment at line ~31: `Renamed from StakingRegistry per ADR 026 v
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "[Ss]tak(e|ing|ed)" -- contracts/src/CapacityBond.sol
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "[Ss]tak(e|ing|ed)" -- contracts/src/CapacityBond.sol
 ```
 
 Expected: only the intentional `StakingRegistry` historical mention (header comment). Anything else is a miss — fix it.
@@ -151,7 +151,7 @@ Defer the commit to the end of Task 3 so the tree compiles. (No commit here.)
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git mv contracts/src/StakeMath.sol contracts/src/BondMath.sol
+cd "$(git rev-parse --show-toplevel)" && git mv contracts/src/StakeMath.sol contracts/src/BondMath.sol
 ```
 
 Then in `contracts/src/BondMath.sol`, replace the library declaration `library StakeMath` → `library BondMath` and any `StakeMath` mentions in its NatSpec/comments → `BondMath`. Leave `reduceAtTier(uint256 active, uint256 unbonding, uint256 tierBps)` signature and param names unchanged.
@@ -161,7 +161,7 @@ Then in `contracts/src/BondMath.sol`, replace the library declaration `library S
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "StakeMath|[Ss]tak(e|ing|ed)" -- contracts/src/BondMath.sol
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "StakeMath|[Ss]tak(e|ing|ed)" -- contracts/src/BondMath.sol
 ```
 
 Expected: no matches (the body uses `active`/`unbonding`/`tierBps`, already neutral).
@@ -179,7 +179,7 @@ Expected: compiles. (Tests not updated yet — `forge build` compiles `test/` to
 - [ ] **Step 4: Commit src-side rename**
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git add contracts/src/CapacityBond.sol contracts/src/BondMath.sol && git commit -m "refactor(contracts): rename stake→bond on CapacityBond surface; StakeMath→BondMath
+cd "$(git rev-parse --show-toplevel)" && git add contracts/src/CapacityBond.sol contracts/src/BondMath.sol && git commit -m "refactor(contracts): rename stake→bond on CapacityBond surface; StakeMath→BondMath
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
@@ -201,7 +201,7 @@ In `contracts/test/CapacityBond.t.sol`, apply the same canonical map (longest-fi
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "[Ss]tak(e|ing|ed)|StakeMath" -- contracts/test/CapacityBond.t.sol
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "[Ss]tak(e|ing|ed)|StakeMath" -- contracts/test/CapacityBond.t.sol
 ```
 
 Expected: no matches (or only deliberate ones — none expected).
@@ -219,7 +219,7 @@ Expected: compiles; all `CapacityBondTest` tests PASS with the renamed surface.
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git add contracts/test/CapacityBond.t.sol && git commit -m "test(contracts): update CapacityBond tests to bond vocabulary
+cd "$(git rev-parse --show-toplevel)" && git add contracts/test/CapacityBond.t.sol && git commit -m "test(contracts): update CapacityBond tests to bond vocabulary
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
@@ -246,7 +246,7 @@ Replace: `MIN_STAKE` env-var string → `MIN_BOND`; `DEFAULT_MIN_STAKE` → `DEF
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "[Ss]tak(e|ing|ed)|MIN_STAKE|StakeMath" -- contracts/script/
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "[Ss]tak(e|ing|ed)|MIN_STAKE|StakeMath" -- contracts/script/
 ```
 
 Expected: no matches.
@@ -264,7 +264,7 @@ Expected: compiles (scripts included).
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git add contracts/script/ && git commit -m "chore(contracts): update deploy scripts to bond vocabulary (MIN_BOND env)
+cd "$(git rev-parse --show-toplevel)" && git add contracts/script/ && git commit -m "chore(contracts): update deploy scripts to bond vocabulary (MIN_BOND env)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
@@ -325,7 +325,7 @@ No commit (gate only). If Step 1 forced a `forge fmt`, that amend is the only ch
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "Staked|Unstaked|requestUnstake|stakeOf|getStakeMultiple|setMinStake|activeStake|minStake" -- crates/incentive/
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "Staked|Unstaked|requestUnstake|stakeOf|getStakeMultiple|setMinStake|activeStake|minStake" -- crates/incentive/
 ```
 
 Expected after edits: only the renamed forms remain. For any caller still referencing old binding types/methods, update it to the new name.
@@ -335,7 +335,7 @@ Expected after edits: only the renamed forms remain. For any caller still refere
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && cargo build -p decdn-incentive && cargo clippy -p decdn-incentive --all-targets 2>&1 | tail -15 && cargo nextest run -p decdn-incentive 2>&1 | tail -15
+cd "$(git rev-parse --show-toplevel)" && cargo build -p decdn-incentive && cargo clippy -p decdn-incentive --all-targets 2>&1 | tail -15 && cargo nextest run -p decdn-incentive 2>&1 | tail -15
 ```
 
 Expected: builds, clippy clean (anti-panic lints unaffected by a rename), tests PASS.
@@ -345,7 +345,7 @@ Expected: builds, clippy clean (anti-panic lints unaffected by a rename), tests 
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && cargo build -p decdn-node 2>&1 | tail -10
+cd "$(git rev-parse --show-toplevel)" && cargo build -p decdn-node 2>&1 | tail -10
 ```
 
 Expected: builds. `crates/node/tests/dht_loopback.rs` `StakerSet`/`AllStaked` is intentionally not renamed; confirm it still compiles (it does not depend on the CapacityBond binding names).
@@ -353,7 +353,7 @@ Expected: builds. `crates/node/tests/dht_loopback.rs` `StakerSet`/`AllStaked` is
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git add crates/incentive/ && git commit -m "refactor(incentive): mirror bond vocabulary in CapacityBond sol! bindings
+cd "$(git rev-parse --show-toplevel)" && git add crates/incentive/ && git commit -m "refactor(incentive): mirror bond vocabulary in CapacityBond sol! bindings
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
@@ -383,7 +383,7 @@ Leave "appeal bond" / "challenge bond" usage in ADR 028 alone (distinct concept)
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "[Ss]tak(e|ing|ed)" -- adr/028-slashing-appeals.md adr/036-served-bytes-voting-weight.md
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "[Ss]tak(e|ing|ed)" -- adr/028-slashing-appeals.md adr/036-served-bytes-voting-weight.md
 ```
 
 Expected: no matches referring to the operator collateral pool. If any appear, update them to bond vocabulary (skip "appeal/challenge bond" contexts). If none, no edit needed.
@@ -393,7 +393,7 @@ Expected: no matches referring to the operator collateral pool. If any appear, u
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "[Ss]tak(e|ing|ed)" -- adr/026-tokenomics.md
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "[Ss]tak(e|ing|ed)" -- adr/026-tokenomics.md
 ```
 
 Expected: no remaining collateral-pool "stake" references (any survivor must be a deliberate historical mention; none expected).
@@ -403,7 +403,7 @@ Expected: no remaining collateral-pool "stake" references (any survivor must be 
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && pre-commit run --files adr/026-tokenomics.md 2>&1 | tail -20
+cd "$(git rev-parse --show-toplevel)" && pre-commit run --files adr/026-tokenomics.md 2>&1 | tail -20
 ```
 
 Expected: "adr reference hygiene" and "adr book list in sync" hooks PASS (links/anchors intact — we changed prose, not headings).
@@ -411,7 +411,7 @@ Expected: "adr reference hygiene" and "adr book list in sync" hooks PASS (links/
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git add adr/026-tokenomics.md adr/028-slashing-appeals.md adr/036-served-bytes-voting-weight.md && git commit -m "docs(adr): align ADR 026 collateral wording with bond vocabulary
+cd "$(git rev-parse --show-toplevel)" && git add adr/026-tokenomics.md adr/028-slashing-appeals.md adr/036-served-bytes-voting-weight.md && git commit -m "docs(adr): align ADR 026 collateral wording with bond vocabulary
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
@@ -427,7 +427,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "[Ss]tak(e|ing|ed)|StakeMath|MIN_STAKE" -- contracts/src/CapacityBond.sol contracts/src/BondMath.sol contracts/test/CapacityBond.t.sol contracts/script/ crates/incentive/ adr/026-tokenomics.md
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "[Ss]tak(e|ing|ed)|StakeMath|MIN_STAKE" -- contracts/src/CapacityBond.sol contracts/src/BondMath.sol contracts/test/CapacityBond.t.sol contracts/script/ crates/incentive/ adr/026-tokenomics.md
 ```
 
 Expected: the ONLY acceptable survivors are the historical `StakingRegistry` mention in `CapacityBond.sol`'s header comment. Anything else → fix and re-commit to the relevant task's file.
@@ -437,7 +437,7 @@ Expected: the ONLY acceptable survivors are the historical `StakingRegistry` men
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git grep -nE "\.stake\(|\.unstake\(|requestUnstake|getStakeMultiple|stakeOf|setMinStake|MinStakeUpdated|InsufficientStake|StakeBelowMinimum|StakeMath" -- ':!docs/superpowers/' ':!adr/_history/'
+cd "$(git rev-parse --show-toplevel)" && git grep -nE "\.stake\(|\.unstake\(|requestUnstake|getStakeMultiple|stakeOf|setMinStake|MinStakeUpdated|InsufficientStake|StakeBelowMinimum|StakeMath" -- ':!docs/superpowers/' ':!adr/_history/'
 ```
 
 Expected: no matches (the `StakerSet`/`AllStaked` DHT mock won't match these specific patterns). Any match outside the out-of-scope mock is a stale reference — update it.
@@ -447,8 +447,8 @@ Expected: no matches (the `StakerSet`/`AllStaked` DHT mock won't match these spe
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn/contracts && forge fmt --check && FOUNDRY_PROFILE=ci forge build --sizes --deny warnings 2>&1 | tail -5 && forge test 2>&1 | tail -10
-cd /home/thiras/dev/decdn/decdn && cargo build && cargo clippy --all-targets 2>&1 | tail -10 && cargo nextest run 2>&1 | tail -15
+cd "$(git rev-parse --show-toplevel)/contracts" && forge fmt --check && FOUNDRY_PROFILE=ci forge build --sizes --deny warnings 2>&1 | tail -5 && forge test 2>&1 | tail -10
+cd "$(git rev-parse --show-toplevel)" && cargo build && cargo clippy --all-targets 2>&1 | tail -10 && cargo nextest run 2>&1 | tail -15
 ```
 
 Expected: all green; `CapacityBond` size matches the Task 1 baseline.
@@ -458,7 +458,7 @@ Expected: all green; `CapacityBond` size matches the Task 1 baseline.
 Run:
 
 ```bash
-cd /home/thiras/dev/decdn/decdn && git status && git log --oneline main..HEAD
+cd "$(git rev-parse --show-toplevel)" && git status && git log --oneline main..HEAD
 ```
 
 Expected: clean working tree; commit log shows the spec + the rename commits. Proceed to finishing-a-development-branch.
