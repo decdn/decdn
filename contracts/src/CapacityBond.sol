@@ -530,7 +530,7 @@ contract CapacityBond is
     /// @param token_                    TOKEN contract (must implement `burn`).
     /// @param ed25519Verifier_          Verifier for `registerNode` ed25519 proof.
     /// @param admin                     Initial `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE`.
-    /// @param minBond_                 Initial minimum active bond.
+    /// @param minBond_                  Initial minimum active bond.
     /// @param unbondingPeriod_          Initial unbonding period.
     /// @param multiaddrUpdateCooldown_  Initial multiaddr-update cooldown.
     /// @param maxMultiaddrSize_         Initial multiaddrs byte-length cap.

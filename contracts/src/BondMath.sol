@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 /// @title BondMath
-/// @notice Pure arithmetic for tier-based capacity-bond bond reduction,
+/// @notice Pure arithmetic for tier-based reduction of an operator's capacity bond,
 ///         extracted from `CapacityBond` so the defensive over-100%-tier clip
 ///         and the active-then-unbonding ordering can be unit-tested directly
 ///         (without deploying a near-EIP-170-ceiling test harness of the full

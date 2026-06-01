@@ -393,7 +393,7 @@ contract SlashAppealTest is Test {
         vm.prank(admin);
         appeal.grantAppeal(slashId);
 
-        // Liquid refund = bond portion (2.5k) + bond (1k); credit portion (5k)
+        // Liquid refund = bond portion (2.5k) + appeal bond (1k); credit portion (5k)
         // is restored to the vesting position, not paid out.
         assertEq(token.balanceOf(operator) - opBefore, 2500e18 + APPEAL_BOND);
         assertEq(bond.pendingCredit(operator).originalGrant, 100_000e18);
