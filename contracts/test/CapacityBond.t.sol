@@ -597,6 +597,16 @@ contract CapacityBondTest is Test {
         assertLt(bond.bondRequired(10_000), bond.bondRequired(100_000));
     }
 
+    /// @dev Monotonicity across the full declarable band (α=1.2 default is
+    ///      strictly increasing), guarding powWad rounding plateaus / edge
+    ///      cases the fixed points above miss.
+    function testFuzz_bondRequired_monotonic(uint256 a, uint256 b) public view {
+        a = bound(a, 1, 1_000_000);
+        b = bound(b, 1, 1_000_000);
+        if (a > b) (a, b) = (b, a);
+        assertLe(bond.bondRequired(a), bond.bondRequired(b));
+    }
+
     function test_declareMbps_revertsWhenBondBelowCurve() public {
         uint256 required = bond.bondRequired(1000);
         // Bond one wei short of the curve.
@@ -637,6 +647,21 @@ contract CapacityBondTest is Test {
         vm.prank(operator);
         bond.requestUnbond(MIN_BOND / 2);
         assertEq(bond.activeBond(operator), MIN_BOND / 2);
+    }
+
+    function test_requestUnbond_succeedsDownToExactlyCurve() public {
+        // Over-bond above the 1 Gbps curve, declare 1000, then unbond the slack
+        // down to exactly bondRequired(1000) — the inclusive boundary succeeds.
+        uint256 required = bond.bondRequired(1000);
+        uint256 slack = 5000e18;
+        vm.prank(admin);
+        token.transfer(operator, required + slack);
+        vm.startPrank(operator);
+        bond.bond(required + slack);
+        bond.declareMbps(1000);
+        bond.requestUnbond(slack);
+        vm.stopPrank();
+        assertEq(bond.activeBond(operator), required);
     }
 
     function test_slash_doesNotEnforceCurve() public {
@@ -682,6 +707,31 @@ contract CapacityBondTest is Test {
         bond.registerNode(nodeId, hex"", "us-east", bindingSig, hex"01");
     }
 
+    function test_registerNode_succeedsAtCurve() public {
+        // The success side of the registerNode curve gate: declaredMbps > 0 and
+        // bonded ≥ bondRequired(declaredMbps) registers cleanly.
+        uint256 opPk = 0xF00D;
+        address opAddr = vm.addr(opPk);
+
+        uint256 bonded = bond.bondRequired(1000);
+        vm.prank(admin);
+        token.transfer(opAddr, bonded);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(bonded);
+        bond.declareMbps(1000);
+        vm.stopPrank();
+
+        vm.warp(1_000_000);
+        bytes32 nodeId = bytes32(uint256(0xF00DF00D));
+        bytes memory bindingSig = _signBindNode(opPk, opAddr, nodeId);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "us-east", bindingSig, hex"01");
+
+        assertEq(bond.addressToNodeId(opAddr), nodeId);
+        assertTrue(bond.isActive(opAddr));
+    }
+
     function test_setK_updatesCurveAndEmits() public {
         uint256 oldK = bond.kConstant();
         vm.expectEmit(false, false, false, true, address(bond));
@@ -716,13 +766,17 @@ contract CapacityBondTest is Test {
     function test_setAlpha_revertsWhenGbpsTierOutOfRange() public {
         // α = 1.8 with default k = 12.6 pushes the 1 Gbps tier far above the
         // 200K-TOKEN ceiling, so the coupled bound rejects it.
+        uint256 oldAlpha = bond.alphaWad();
         uint256 tierBond = BondMath.bondRequired(1000, 12.6e18, 1.8e18);
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, tierBond, 10_000e18, 200_000e18));
         bond.setAlpha(1.8e18);
+        // Store-then-validate: the reverted setter's tentative write is rolled back.
+        assertEq(bond.alphaWad(), oldAlpha);
     }
 
     function test_setK_revertsWhenGbpsTierOutOfRange() public {
+        uint256 oldK = bond.kConstant();
         // k too low ⇒ 1 Gbps tier below the 10K floor.
         uint256 lowTier = BondMath.bondRequired(1000, 1e18, 1.2e18);
         vm.prank(admin);
@@ -734,6 +788,9 @@ contract CapacityBondTest is Test {
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, highTier, 10_000e18, 200_000e18));
         bond.setK(100e18);
+
+        // Store-then-validate: neither reverted setter left a tentative write.
+        assertEq(bond.kConstant(), oldK);
     }
 
     function test_setCurve_onlyGovernance() public {

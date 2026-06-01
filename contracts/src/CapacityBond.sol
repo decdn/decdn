@@ -936,8 +936,9 @@ contract CapacityBond is
         }
         // ADR 026 § Capacity-bond curve: the bond must also cover the declared
         // capacity tier. `bondRequired(0) == 0`, so an operator that has not
-        // declared Mbps is gated only by `minBond` above (declared-floor at
-        // register is tracked separately — see issue #681).
+        // declared Mbps is gated only by `minBond` above — `registerNode` does
+        // not itself require a prior `declareMbps`. The capacity *band* floor
+        // (`minCapacityMbps`) is enforced in `declareMbps`, not here.
         uint256 required = bondRequired(declaredMbps[msg.sender]);
         if (activeBond[msg.sender] < required) {
             revert BondBelowCurve({ bond: activeBond[msg.sender], required: required });
@@ -1240,8 +1241,9 @@ contract CapacityBond is
         // The library marks the record `Reversed`, recomputes the multi-slash
         // zero-out watermark (ADR 036), and emits `SlashReversed`; the caller
         // applies the value-typed escrow + Genesis-credit effects below.
-        (address operator, uint256 refund, uint256 creditPortion) =
-            SlashEscrowLib.settleGranted(_slashRecords, _operatorSlashIds, _slashedAtEpoch, slashId, slashCounter);
+        (address operator, uint256 refund, uint256 creditPortion) = SlashEscrowLib.settleGranted(
+            _slashRecords, _operatorSlashIds, _slashedAtEpoch, slashId, slashCounter, EPOCH_LENGTH
+        );
         escrowedTotal -= refund;
 
         // Genesis-credit portion is restored to the vesting position

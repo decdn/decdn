@@ -51,11 +51,14 @@ struct SlashRecord {
 library SlashEscrowLib {
     using SafeERC20 for IERC20;
 
-    /// @dev Mirrors `CapacityBond` (ADR 026 § Slashing and burn — 50%
-    ///      challenger / 50% burn at finality) and the canonical epoch length.
+    /// @dev The finality split (ADR 026 § Slashing and burn — 50% challenger /
+    ///      50% burn). Independent of `CapacityBond`'s slash-tier BPS math, so
+    ///      they are not cross-coupled. The canonical epoch length is NOT
+    ///      duplicated here — it is threaded in from `CapacityBond` (the single
+    ///      source `_stampSlash` also uses) so the watermark recompute can never
+    ///      diverge from the stamp.
     uint256 internal constant CHALLENGER_BPS = 5000;
     uint256 internal constant BPS_DENOMINATOR = 10_000;
-    uint64 internal constant EPOCH_LENGTH = 7 days;
 
     event SlashRecorded(uint256 indexed slashId, address indexed operator, uint64 slashedAt, uint256 slashAmount);
     event SlashEscrowed(uint256 indexed slashId, address indexed operator, uint256 amount, uint64 appealWindowClose);
@@ -174,12 +177,16 @@ library SlashEscrowLib {
     /// @return creditPortion The Genesis-credit share of `refund` (caller
     ///                       restores it to the vesting position; the remainder
     ///                       is refunded as liquid TOKEN).
+    /// @param epochLength `CapacityBond.EPOCH_LENGTH` — threaded in (not
+    ///        duplicated) so the recompute stamps the same epoch encoding
+    ///        `_stampSlash` used at mint.
     function settleGranted(
         mapping(uint256 => SlashRecord) storage records,
         mapping(address => uint256[]) storage operatorSlashIds,
         mapping(address => uint64) storage slashedAtEpoch,
         uint256 slashId,
-        uint256 slashCounter
+        uint256 slashCounter,
+        uint64 epochLength
     ) public returns (address operator, uint256 refund, uint256 creditPortion) {
         if (slashId >= slashCounter) revert UnknownSlash(slashId);
         SlashRecord storage r = records[slashId];
@@ -188,7 +195,7 @@ library SlashEscrowLib {
         creditPortion = r.creditPortion;
         operator = r.operator;
         r.status = SlashStatus.Reversed;
-        _recomputeSlashedAtEpoch(operatorSlashIds, records, slashedAtEpoch, operator);
+        _recomputeSlashedAtEpoch(operatorSlashIds, records, slashedAtEpoch, operator, epochLength);
         emit SlashReversed(slashId, operator, refund);
     }
 
@@ -219,7 +226,8 @@ library SlashEscrowLib {
         mapping(address => uint256[]) storage operatorSlashIds,
         mapping(uint256 => SlashRecord) storage records,
         mapping(address => uint64) storage slashedAtEpoch,
-        address operator
+        address operator,
+        uint64 epochLength
     ) private {
         uint256[] storage ids = operatorSlashIds[operator];
         uint64 newStamp = 0; // +1-encoded; 0 = no standing slash remains
@@ -229,7 +237,7 @@ library SlashEscrowLib {
             }
             SlashRecord storage rec = records[ids[i]];
             if (rec.status != SlashStatus.Reversed) {
-                newStamp = uint64(rec.slashedAt / EPOCH_LENGTH) + 1;
+                newStamp = uint64(rec.slashedAt / epochLength) + 1;
                 break;
             }
         }
