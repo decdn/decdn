@@ -272,3 +272,94 @@ mod tests {
         assert_eq!(voucher_reject_reason(&store_err), Err(RetrySignal));
     }
 }
+
+/// Property-based tests for the wire bridge (#740). The bridge is where the
+/// `U256` money/sequence fields cross to the fixed 32-byte big-endian wire form
+/// and back — the exact spot a truncation would corrupt a payment. These sweep
+/// the full keyspace (boundaries `0`, `u64::MAX`, `U256::MAX` guaranteed) and
+/// confirm the round-trip is lossless and that malformed wire input never
+/// panics.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod prop_tests {
+    use super::*;
+    use crate::voucher::voucher_domain;
+    use alloy::primitives::address;
+    use alloy::signers::local::PrivateKeySigner;
+    use proptest::prelude::*;
+
+    const TOKEN: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+    const VERIFYING: Address = address!("0000000000000000000000000000000000001234");
+
+    /// `U256` sweep with the truncation-prone boundaries guaranteed-sampled.
+    fn any_u256() -> impl Strategy<Value = U256> {
+        prop_oneof![
+            8 => proptest::array::uniform32(any::<u8>()).prop_map(U256::from_be_bytes),
+            1 => Just(U256::ZERO),
+            1 => Just(U256::from(1u64)),
+            1 => Just(U256::from(u64::MAX)),
+            1 => Just(U256::MAX),
+        ]
+    }
+
+    fn any_signer() -> impl Strategy<Value = PrivateKeySigner> {
+        proptest::array::uniform32(any::<u8>())
+            .prop_filter_map("scalar must be a valid, non-zero secp256k1 key", |bytes| {
+                PrivateKeySigner::from_slice(&bytes).ok()
+            })
+    }
+
+    proptest! {
+        /// `signed → wire → signed` reproduces the signed voucher exactly when
+        /// the off-wire context (`channel_id`, `token`, `bytes_delivered`) is
+        /// re-supplied — proving the big-endian `U256 ↔ [u8; 32]` encoding is
+        /// lossless across the whole range. `U256::MAX` / `0` / `u64::MAX` for
+        /// `amount` and `nonce` are the cases that would expose a truncation.
+        #[test]
+        fn wire_round_trip_is_lossless(
+            channel_id in proptest::array::uniform32(any::<u8>()).prop_map(B256::from),
+            amount in any_u256(),
+            nonce in any_u256(),
+            bytes_delivered in any_u256(),
+            signer in any_signer(),
+        ) {
+            let domain = voucher_domain(421_614, VERIFYING);
+            let signed = Voucher { channel_id, amount, nonce, bytes_delivered, token: TOKEN }
+                .sign(&signer, &domain)
+                .unwrap();
+
+            let wire = signed_to_wire_voucher(&signed);
+            prop_assert_eq!(wire.amount, amount.to_be_bytes::<32>());
+            prop_assert_eq!(wire.nonce, nonce.to_be_bytes::<32>());
+
+            let rebuilt =
+                wire_voucher_to_signed(&wire, channel_id, TOKEN, bytes_delivered).unwrap();
+            prop_assert_eq!(&rebuilt, &signed, "bridge must preserve the signed voucher");
+            // And the recovered signer survives the trip.
+            prop_assert!(rebuilt.verify_signer(signer.address(), &domain).is_ok());
+        }
+
+        /// Decoding never panics on arbitrary input, and any signature whose
+        /// length is not `VOUCHER_SIG_LEN` is rejected as `BadSignature` rather
+        /// than parsed or crashed. (A 65-byte blob may decode or be rejected —
+        /// both are well-formed outcomes; only the no-panic and wrong-length
+        /// guarantees are asserted here.)
+        #[test]
+        fn malformed_wire_signature_is_rejected_not_panicked(
+            signature in prop::collection::vec(any::<u8>(), 0..200),
+            amount in proptest::array::uniform32(any::<u8>()),
+            nonce in proptest::array::uniform32(any::<u8>()),
+        ) {
+            let wire = WireVoucher { signature: signature.clone(), amount, nonce };
+            let result = wire_voucher_to_signed(&wire, B256::ZERO, TOKEN, U256::ZERO);
+            if signature.len() != decdn_protocol::VOUCHER_SIG_LEN {
+                prop_assert_eq!(result.err(), Some(WireVoucherError::BadSignature));
+            }
+        }
+    }
+}

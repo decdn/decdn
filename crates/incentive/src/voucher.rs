@@ -489,3 +489,180 @@ mod tests {
         );
     }
 }
+
+/// Property-based tests for the EIP-712 voucher core (#740). The example-based
+/// `tests` module above pins fixed vectors and single-field tamper cases with
+/// small values; these sweep the full `U256` keyspace for `amount` / `nonce` /
+/// `bytes_delivered` with the dangerous boundaries (`0`, `u64::MAX`,
+/// `U256::MAX`) guaranteed-sampled, to catch any silent truncation or
+/// accept-invalid path before mainnet. We trust `alloy` for the EIP-712
+/// primitive and assert the invariants the protocol depends on: sign→recover is
+/// total over that range, the digest is deterministic and covers every field,
+/// and the domain is binding.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod prop_tests {
+    use super::*;
+    use alloy::signers::local::PrivateKeySigner;
+    use proptest::prelude::*;
+
+    /// A `U256` strategy that sweeps the full keyspace via uniform 32-byte
+    /// fills while guaranteeing the boundary values are sampled — these are
+    /// exactly where a `u64` truncation or an off-by-one would hide. The random
+    /// arm is weighted heavily so the boundaries punctuate a broad sweep rather
+    /// than dominate it.
+    fn any_u256() -> impl Strategy<Value = U256> {
+        prop_oneof![
+            8 => proptest::array::uniform32(any::<u8>()).prop_map(U256::from_be_bytes),
+            1 => Just(U256::ZERO),
+            1 => Just(U256::from(1u64)),
+            1 => Just(U256::from(u64::MAX)),
+            1 => Just(U256::MAX),
+        ]
+    }
+
+    fn any_address() -> impl Strategy<Value = Address> {
+        proptest::array::uniform20(any::<u8>()).prop_map(Address::from)
+    }
+
+    fn any_b256() -> impl Strategy<Value = B256> {
+        proptest::array::uniform32(any::<u8>()).prop_map(B256::from)
+    }
+
+    /// A valid secp256k1 signer from a random 32-byte scalar. Zero and
+    /// out-of-range scalars are rejected by `from_slice` and skipped with
+    /// `prop_assume!`; both are vanishingly rare over a uniform draw, so this
+    /// does not starve the case budget.
+    fn any_signer() -> impl Strategy<Value = PrivateKeySigner> {
+        proptest::array::uniform32(any::<u8>())
+            .prop_filter_map("scalar must be a valid, non-zero secp256k1 key", |bytes| {
+                PrivateKeySigner::from_slice(&bytes).ok()
+            })
+    }
+
+    fn any_voucher() -> impl Strategy<Value = Voucher> {
+        (
+            any_b256(),
+            any_u256(),
+            any_u256(),
+            any_u256(),
+            any_address(),
+        )
+            .prop_map(
+                |(channel_id, amount, nonce, bytes_delivered, token)| Voucher {
+                    channel_id,
+                    amount,
+                    nonce,
+                    bytes_delivered,
+                    token,
+                },
+            )
+    }
+
+    proptest! {
+        /// Signing then recovering returns the signer's own address, and
+        /// `verify_signer` accepts it — for every voucher across the full
+        /// `U256` range, including `amount = 0`, `nonce = U256::MAX`, and
+        /// `bytes_delivered = u64::MAX`. A truncation in the digest path would
+        /// surface here as a recovered-address mismatch.
+        #[test]
+        fn sign_then_recover_is_the_signer(
+            voucher in any_voucher(),
+            signer in any_signer(),
+            chain_id in any::<u64>(),
+            verifying in any_address(),
+        ) {
+            let domain = voucher_domain(chain_id, verifying);
+            let signed = voucher.sign(&signer, &domain).unwrap();
+            prop_assert_eq!(signed.recover_signer(&domain).unwrap(), signer.address());
+            prop_assert!(signed.verify_signer(signer.address(), &domain).is_ok());
+        }
+
+        /// The signing hash is a pure function of `(voucher, domain)` — two
+        /// independent computations agree. Cheap, but it pins determinism
+        /// across the whole boundary-laden keyspace.
+        #[test]
+        fn signing_hash_is_deterministic(
+            voucher in any_voucher(),
+            chain_id in any::<u64>(),
+            verifying in any_address(),
+        ) {
+            let domain = voucher_domain(chain_id, verifying);
+            prop_assert_eq!(voucher.signing_hash(&domain), voucher.signing_hash(&domain));
+        }
+
+        /// Changing any single field to a different value changes the digest —
+        /// no field is silently dropped from the signed payload. Each mutated
+        /// value is drawn independently and `prop_assume!`d distinct so the
+        /// "different value" precondition holds.
+        #[test]
+        fn every_field_is_bound_into_the_digest(
+            voucher in any_voucher(),
+            chain_id in any::<u64>(),
+            verifying in any_address(),
+            other_channel in any_b256(),
+            other_amount in any_u256(),
+            other_nonce in any_u256(),
+            other_bytes in any_u256(),
+            other_token in any_address(),
+        ) {
+            let domain = voucher_domain(chain_id, verifying);
+            let base = voucher.signing_hash(&domain);
+
+            if other_channel != voucher.channel_id {
+                let m = Voucher { channel_id: other_channel, ..voucher.clone() };
+                prop_assert_ne!(m.signing_hash(&domain), base, "channel_id not bound");
+            }
+            if other_amount != voucher.amount {
+                let m = Voucher { amount: other_amount, ..voucher.clone() };
+                prop_assert_ne!(m.signing_hash(&domain), base, "amount not bound");
+            }
+            if other_nonce != voucher.nonce {
+                let m = Voucher { nonce: other_nonce, ..voucher.clone() };
+                prop_assert_ne!(m.signing_hash(&domain), base, "nonce not bound");
+            }
+            if other_bytes != voucher.bytes_delivered {
+                let m = Voucher { bytes_delivered: other_bytes, ..voucher.clone() };
+                prop_assert_ne!(m.signing_hash(&domain), base, "bytes_delivered not bound");
+            }
+            if other_token != voucher.token {
+                let m = Voucher { token: other_token, ..voucher.clone() };
+                prop_assert_ne!(m.signing_hash(&domain), base, "token not bound");
+            }
+        }
+
+        /// The domain is binding: a voucher signed under one `(chain_id,
+        /// verifying_contract)` does not verify under a different one. This is
+        /// the "malformed / mismatched domain separator" guard from #740 —
+        /// the domain is implicit in the EIP-712 digest, never serialized, so a
+        /// domain change must move the digest and surface as `WrongSigner`.
+        #[test]
+        fn domain_is_binding(
+            voucher in any_voucher(),
+            signer in any_signer(),
+            chain_a in any::<u64>(),
+            verifying_a in any_address(),
+            chain_b in any::<u64>(),
+            verifying_b in any_address(),
+        ) {
+            prop_assume!((chain_a, verifying_a) != (chain_b, verifying_b));
+            let domain_a = voucher_domain(chain_a, verifying_a);
+            let domain_b = voucher_domain(chain_b, verifying_b);
+
+            let signed = voucher.sign(&signer, &domain_a).unwrap();
+            // A different domain yields a different digest, so recovery lands on
+            // some other address — `WrongSigner`, not `InvalidSignature` (the
+            // signature itself is well-formed, so recovery always succeeds).
+            let err = signed.verify_signer(signer.address(), &domain_b).unwrap_err();
+            prop_assert!(
+                matches!(err, VoucherError::WrongSigner { .. }),
+                "expected WrongSigner under a mismatched domain, got {err:?}"
+            );
+        }
+    }
+}
