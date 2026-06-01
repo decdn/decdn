@@ -246,6 +246,8 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             capacity_bond_address: "0x0000000000000000000000000000000000000002".to_string(),
             rpc_watchdog_interval_sec: 30,
             redeem_threshold_micro_usdc: 1_000_000,
+            buyer_deposit_micro_usdc: 10_000_000,
+            buyer_max_approve: true,
             slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
             chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
         },

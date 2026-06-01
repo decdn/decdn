@@ -1,6 +1,7 @@
 //! Live anvil-backed e2e for the on-chain `PaymentChannel` seller settlement
-//! path (issue #745, on top of PR #743). Gated behind the `anvil-e2e` feature
-//! so the default test run stays fast and needs no `anvil`/`forge` binaries.
+//! path (issue #745, on top of PR #743) and the buyer-side open/reuse/reclaim
+//! path (#744). Gated behind the `anvil-e2e` feature so the default test run
+//! stays fast and needs no `anvil`/`forge` binaries.
 //!
 //! PR #743 verified the seller settlement path statically (build, clippy, unit
 //! tests, ABI cross-check) but never ran it against a chain. This test closes
@@ -38,6 +39,13 @@
 //!    un-redeemed); graceful-shutdown `closeChannel` fires (assert the on-chain
 //!    `Closing` status); after the dispute window `settleChannel` → assert the
 //!    watcher decodes `ChannelSettled` and `forget`s the row from the store.
+//! 6. Buyer path (#744) — the `client` account drives a [`BuyerChannelService`]
+//!    against the registered provider: `open_or_reuse_channel` opens a channel
+//!    on-chain, a delivery signs vouchers via the service-produced
+//!    [`ChannelContext`], a second `open_or_reuse_channel` reuses it (no new
+//!    `openChannel`), and `sweep_expired_once` runs `reclaimExpired` after the
+//!    chain is warped past expiry — asserting the full deposit refunds and the
+//!    record is dropped.
 //!
 //! Requires `anvil` + `forge` on `PATH` (the CI job provisions Foundry). If
 //! they are absent the test fails loudly rather than silently skipping — it is
@@ -70,9 +78,10 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    ChannelStateStore, PendingSettleStore, bind_node_id_domain, binding_signing_hash,
-    slash_judge_domain, voucher_domain,
+    BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, PendingSettleStore,
+    bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
+use decdn_node::buyer_channel::BuyerChannelService;
 use decdn_node::channel_store::PersistentChannelStateStore;
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::metrics::Metrics;
@@ -116,6 +125,10 @@ const MIB: usize = 1024 * 1024;
 //  - channel 2: 0.5 MiB delivered → claim = ceil(0.5*10) =  5 µUSDC < 10
 const REDEEM_THRESHOLD_MICRO_USDC: u64 = 10;
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC, ≥ contract minDeposit (1 USDC)
+const TOPUP_MICRO_USDC: u64 = 2_000_000; // 2 USDC added via topUp in the buyer path (#744)
+// Warp past any governable channel lifetime (max 365 days) so `reclaimExpired`
+// is permitted on-chain in the buyer-path reclaim assertion (#744).
+const CHANNEL_EXPIRY_WARP_SECS: u64 = 366 * 24 * 60 * 60;
 
 /// Kills the spawned `anvil` on drop so a panicking assertion never leaks the
 /// process.
@@ -163,66 +176,6 @@ where
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-}
-
-/// Spawn `anvil` on a fresh ephemeral port and return its guard + RPC URL once
-/// `eth_chainId` answers.
-///
-/// `free_port` binds `127.0.0.1:0`, reads the port, then releases it for anvil
-/// to claim — a window in which a concurrent process (e.g. another test binary
-/// under `nextest`) could grab the port (TOCTOU), leaving anvil unable to bind.
-/// Rather than fail the whole run on a lost race, detect anvil exiting early
-/// and retry on a new port; a genuinely down anvil still surfaces as a clear
-/// per-port timeout.
-async fn spawn_anvil(manifest: PathBuf) -> anyhow::Result<(AnvilGuard, String)> {
-    const ATTEMPTS: usize = 5;
-    for attempt in 1..=ATTEMPTS {
-        let port = free_port();
-        let rpc_url = format!("http://127.0.0.1:{port}");
-        let child = Command::new("anvil")
-            .args([
-                "--port",
-                &port.to_string(),
-                "--chain-id",
-                &CHAIN_ID.to_string(),
-                "--silent",
-            ])
-            .spawn()
-            .expect("spawn anvil (is foundry installed?)");
-        // Own the child immediately so every early return (incl. the `?` below
-        // and the timeout path) reaps anvil via `AnvilGuard::drop`.
-        let mut guard = AnvilGuard {
-            child,
-            manifest: manifest.clone(),
-        };
-
-        let url: reqwest::Url = rpc_url.parse()?;
-        let probe = ProviderBuilder::new().connect_http(url);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            if probe.get_chain_id().await.is_ok() {
-                return Ok((guard, rpc_url));
-            }
-            // anvil exited before serving — almost always a lost port race.
-            // Drop `guard` at the end of this iteration to reap it, then retry.
-            if matches!(guard.child.try_wait(), Ok(Some(_))) {
-                eprintln!(
-                    "anvil exited before RPC came up on port {port} \
-                     (attempt {attempt}/{ATTEMPTS}); retrying on a new port"
-                );
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(anyhow::anyhow!(
-                    "anvil RPC never came up on port {port} within 20s"
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-    Err(anyhow::anyhow!(
-        "anvil could not bind a free ephemeral port after {ATTEMPTS} attempts"
-    ))
 }
 
 // Bindings for the setup/write calls not exposed by the production
@@ -301,17 +254,37 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         String::from_utf8_lossy(&build.stderr)
     );
 
-    // ---- 1. Spawn anvil (retries onto a fresh port if the ephemeral port is
-    // claimed between free_port's probe and anvil's bind — TOCTOU). Returns
-    // once the RPC answers `eth_chainId`.
+    // ---- 1. Spawn anvil.
+    let port = free_port();
+    let rpc_url = format!("http://127.0.0.1:{port}");
+    let child = Command::new("anvil")
+        .args([
+            "--port",
+            &port.to_string(),
+            "--chain-id",
+            &CHAIN_ID.to_string(),
+            "--silent",
+        ])
+        .spawn()
+        .expect("spawn anvil (is foundry installed?)");
     let manifest = contracts.join(format!("deployments/{CHAIN_ID}.json"));
-    let (_anvil, rpc_url) = spawn_anvil(manifest.clone()).await?;
+    let _anvil = AnvilGuard {
+        child,
+        manifest: manifest.clone(),
+    };
 
     let url: reqwest::Url = rpc_url.parse()?;
     let admin_signer: PrivateKeySigner = ADMIN_KEY.parse()?;
     let admin = ProviderBuilder::new()
         .wallet(EthereumWallet::from(admin_signer))
         .connect_http(url.clone());
+
+    // Wait for the RPC to accept requests.
+    poll_until(Duration::from_secs(20), || async {
+        admin.get_chain_id().await.ok()
+    })
+    .await
+    .expect("anvil RPC never came up");
 
     // ---- 2. Identities. The node holds two keys: an iroh ed25519 key (its
     // NodeId + the registration ownership proof) and an eth key (staking,
@@ -418,10 +391,9 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         store_tmp.path(),
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )?;
-    // One redb-backed store satisfies both the voucher-state trait (handler +
-    // #527 replay guard) and the pending-settle trait (the settlement sweep,
-    // #743). Mirror the runtime wiring: derive both trait handles from a single
-    // open file so the two tables share one fsync discipline.
+    // One concrete redb-backed store backs both the voucher-state trait (the
+    // handler + #527 replay guard) and the pending-settle trait (the on-chain
+    // settlement sweep, PR #743 review) — mirrors the runtime wiring.
     let concrete_store = Arc::new(PersistentChannelStateStore::open(store_tmp.path())?);
     let store: Arc<dyn ChannelStateStore> = concrete_store.clone();
     let pending_store: Arc<dyn PendingSettleStore> = concrete_store;
@@ -451,7 +423,7 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         payment_channel,
         node_addr,
         Arc::clone(&store),
-        Arc::clone(&pending_store),
+        pending_store,
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
     )
@@ -463,18 +435,8 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(node_pub).with_ip_addr(server_addr);
 
-    // Let the watcher install its event filters before the first ChannelOpened
-    // is mined. `bootstrap` returns once the watcher task is spawned; that task
-    // then opens four sequential `.watch()` (eth_newFilter) streams, and
-    // `.watch()` only delivers logs from blocks *after* the filter exists — so
-    // an openChannel that mined first would be lost and the persistence poll
-    // below would time out. The ordering is bridged by this sleep *plus* the
-    // mint+approve roundtrips that follow (both mine before openChannel), giving
-    // the four installs a multi-second margin against sub-millisecond local
-    // RPCs. Eliminating the race outright needs a readiness signal or a
-    // start-block `get_logs` fallback in the production service — out of scope
-    // for this test; if the margin ever proves tight the failure is a clean,
-    // retryable poll timeout, not silent corruption.
+    // Give the watcher a moment to install its event filters before the first
+    // ChannelOpened is emitted (filters only capture logs after creation).
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Client funds + approves USDC once (covers both channels).
@@ -657,15 +619,9 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         "channel 2 should be below the redeem threshold, but was withdrawn"
     );
 
-    // Graceful shutdown force-closes *every* channel still Open with unredeemed
-    // work (closeChannel fires → dispute window opens). Channel 2 always
-    // qualifies — its sub-threshold claim was never redeemed. Channel 1 also
-    // closes here iff its single redeem landed the 1 MiB interval voucher rather
-    // than the 1.5 MiB closing one (see the redeem-timing note above): in that
-    // branch it still has 0.5 MiB unredeemed and status Open. We assert only
-    // channel 2's transition below; channel 1's terminal state is timing-
-    // dependent and not load-bearing here. Verifies the shutdown close path +
-    // that the persisted voucher signature is accepted on-chain.
+    // Graceful shutdown closes the un-redeemed channel (closeChannel fires →
+    // dispute window opens). Verifies the shutdown close path + that the
+    // persisted voucher signature is accepted on-chain.
     service
         .close_open_channels_on_shutdown(Duration::from_secs(30))
         .await;
@@ -715,6 +671,151 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     anyhow::ensure!(
         forgotten.is_some(),
         "watcher did not observe ChannelSettled / forget channel 2 (live event-decode gap)"
+    );
+
+    // ============================================================
+    // BUYER PATH (#744) — the `client` account drives a `BuyerChannelService`
+    // against the registered `node_addr` provider: open → deliver (service
+    // ChannelContext) → reuse → reclaimExpired. This exercises the buyer-side
+    // bindings (`openChannel`, `clientChannelNonce`, `reclaimExpired`) and the
+    // service end-to-end on a live deployment.
+    // ============================================================
+    let buyer_store = Arc::new(MemoryBuyerChannelStore::new());
+    let buyer_store_dyn: Arc<dyn BuyerChannelStore> = buyer_store.clone();
+    let buyer_service = BuyerChannelService::bootstrap(
+        client_provider.clone(),
+        payment_channel,
+        client_addr,
+        buyer_store_dyn,
+        Arc::clone(&client_signer),
+        voucher_domain(CHAIN_ID, payment_channel),
+        U256::from(DEPOSIT_MICRO_USDC),
+        false, // USDC already approved above; don't issue a second approval
+    )
+    .await?;
+
+    // Lazy open against the provider → a fresh on-chain channel (the client's
+    // 3rd, nonce 2) + a persisted buyer record.
+    let buyer_ctx = buyer_service
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .await?;
+    let buyer_id = buyer_ctx.channel_id;
+    let on_chain = pc_read.getChannel(buyer_id).call().await?;
+    anyhow::ensure!(
+        on_chain.client == client_addr && on_chain.provider == node_addr,
+        "buyer channel opened with wrong client/provider"
+    );
+    anyhow::ensure!(
+        buyer_store.len() == 1,
+        "buyer service should track exactly one channel after open"
+    );
+
+    // Wait for the seller watcher to persist this ChannelOpened so the handler
+    // accepts the buyer's vouchers, then deliver the 0.5 MiB suffix
+    // (below the redeem threshold, so the channel stays Open + un-withdrawn for
+    // the reclaim assertion). The voucher is signed via the service-produced
+    // ChannelContext — proving the buyer open → sign path end-to-end.
+    anyhow::ensure!(
+        poll_until(Duration::from_secs(60), || {
+            let store = Arc::clone(&store);
+            async move { store.get(buyer_id).ok().flatten() }
+        })
+        .await
+        .is_some(),
+        "watcher did not persist the buyer channel"
+    );
+    let suffix = stream_fetch(
+        &client_ep,
+        target.clone(),
+        &buyer_ctx,
+        &domains.slash,
+        node_addr,
+        *hash.as_bytes(),
+        MIB as u64,
+        0x00c0_ffe3,
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        suffix.as_ref() == &payload[MIB..],
+        "buyer channel suffix delivery mismatch"
+    );
+
+    // Reuse: a second open for the same provider returns the SAME channel (no
+    // new `openChannel`), resuming from the cumulative totals the service was
+    // told to record.
+    buyer_service.record_progress(
+        node_addr,
+        U256::from(1u64),
+        U256::from(MIB / 2),
+        U256::from(5u64),
+    )?;
+    let reuse_ctx = buyer_service
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .await?;
+    anyhow::ensure!(
+        reuse_ctx.channel_id == buyer_id,
+        "open_or_reuse must reuse the live channel, not open a new one"
+    );
+    anyhow::ensure!(
+        reuse_ctx.prior_nonce == U256::from(1u64),
+        "reused context must resume from recorded progress"
+    );
+    anyhow::ensure!(
+        buyer_store.len() == 1,
+        "reuse must not open a second channel"
+    );
+
+    // Top-up: add funds to the live channel and assert both the on-chain
+    // deposit and the persisted record reflect it.
+    buyer_service
+        .top_up(node_addr, U256::from(TOPUP_MICRO_USDC))
+        .await?;
+    let topped_deposit = U256::from(DEPOSIT_MICRO_USDC) + U256::from(TOPUP_MICRO_USDC);
+    anyhow::ensure!(
+        pc_read.getChannel(buyer_id).call().await?.deposit == topped_deposit,
+        "topUp must raise the on-chain deposit"
+    );
+    anyhow::ensure!(
+        buyer_store
+            .get_by_provider(node_addr)?
+            .ok_or_else(|| anyhow::anyhow!("buyer channel vanished after top_up"))?
+            .deposit
+            == topped_deposit,
+        "top_up must persist the new deposit in the buyer record"
+    );
+
+    // Reclaim: force the channel to look expired to the sweep and warp the
+    // chain past its on-chain expiry, then run one reclaim pass. The full
+    // deposit (no withdrawal occurred) refunds to the client and the record is
+    // dropped.
+    let mut expired = buyer_store
+        .get_by_provider(node_addr)?
+        .ok_or_else(|| anyhow::anyhow!("buyer channel vanished before reclaim"))?;
+    expired.expires_at = 1; // far in the past vs the system clock → sweep treats as expired
+    buyer_store.record(&expired)?;
+    let balance_before = usdc_client.balanceOf(client_addr).call().await?;
+    let _: serde_json::Value = node_provider
+        .raw_request("evm_increaseTime".into(), (CHANNEL_EXPIRY_WARP_SECS,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+
+    buyer_service.sweep_expired_once().await;
+
+    anyhow::ensure!(
+        buyer_store.get_by_provider(node_addr)?.is_none(),
+        "reclaimed buyer channel record must be dropped"
+    );
+    let balance_after = usdc_client.balanceOf(client_addr).call().await?;
+    anyhow::ensure!(
+        balance_after.saturating_sub(balance_before) == topped_deposit,
+        "reclaimExpired must refund the full deposit ({topped_deposit} µUSDC); \
+         got {balance_before} → {balance_after}"
+    );
+    let reclaimed = pc_read.getChannel(buyer_id).call().await?;
+    anyhow::ensure!(
+        matches!(reclaimed.status, PaymentChannel::Status::Closed),
+        "reclaimed channel must be Closed on-chain"
     );
 
     client_ep.close().await;

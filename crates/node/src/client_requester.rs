@@ -31,7 +31,7 @@ use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::signers::local::PrivateKeySigner;
 use bytes::{Bytes, BytesMut};
 use decdn_cache::Hash;
-use decdn_incentive::{StreamSlashData, Voucher, signed_to_wire_voucher};
+use decdn_incentive::{BuyerChannelState, StreamSlashData, Voucher, signed_to_wire_voucher};
 use decdn_protocol::client::{ClientMessage, StreamRequest, StreamResponse};
 use decdn_protocol::{
     ALPN_CLIENT, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, decode_message, encode_message, read_frame,
@@ -67,6 +67,32 @@ pub struct ChannelContext {
     pub prior_bytes_delivered: U256,
     /// Cumulative amount paid on this channel before this stream.
     pub prior_amount: U256,
+}
+
+impl ChannelContext {
+    /// Build a context for a buyer-held channel, resuming from its persisted
+    /// cumulative voucher state (#744). The `prior_*` fields come straight from
+    /// the stored [`BuyerChannelState`], so the next voucher continues the
+    /// channel at `last_nonce + 1` rather than restarting from zero (which the
+    /// upstream node would reject). For a freshly-opened channel the stored
+    /// `last_*` are all `ZERO`, yielding a fresh-channel context.
+    #[must_use]
+    pub const fn for_buyer_channel(
+        state: &BuyerChannelState,
+        client_signer: Arc<PrivateKeySigner>,
+        voucher_domain: Eip712Domain,
+    ) -> Self {
+        Self {
+            channel_id: state.channel_id,
+            token: state.token,
+            deposit: state.deposit,
+            client_signer,
+            voucher_domain,
+            prior_nonce: state.last_nonce,
+            prior_bytes_delivered: state.last_bytes_delivered,
+            prior_amount: state.last_amount,
+        }
+    }
 }
 
 impl std::fmt::Debug for ChannelContext {

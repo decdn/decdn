@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
 use decdn_incentive::store::{ChannelStateStore, PendingSettle, PendingSettleStore, StoreError};
-use decdn_incentive::{ChannelId, ChannelState};
+use decdn_incentive::{BuyerChannelState, BuyerChannelStore, ChannelId, ChannelState};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +68,26 @@ const SANE_TRAILER_MAX_BYTES: usize = 256;
 /// Key: raw `ChannelId` bytes (`[u8; 32]`).
 /// Value: postcard-encoded [`StoredChannelState`] (variable length).
 const CHANNEL_TABLE: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("channel_state_v1");
+
+/// redb table holding buyer-side channel bookkeeping (#744), keyed by the
+/// **upstream provider address** so the cache-miss open trigger can reuse an
+/// existing channel instead of opening (and depositing into) a new one. Lives
+/// in the same database file as [`CHANNEL_TABLE`] so both stores share one
+/// `redb::Database` handle and the file-mode hardening — redb forbids two
+/// `Database` handles to the same file, so a second store file would need the
+/// whole #527 open/cleanup path duplicated. The two tables never collide:
+/// distinct names, distinct key widths (`[u8; 20]` here vs `[u8; 32]`).
+///
+/// Key: raw provider `Address` bytes (`[u8; 20]`).
+/// Value: postcard-encoded [`StoredBuyerChannelState`] (variable length).
+const BUYER_CHANNEL_TABLE: TableDefinition<&[u8; 20], &[u8]> =
+    TableDefinition::new("buyer_channel_state_v1");
+
+/// Highest buyer-record `schema_version` this binary can decode. Independent
+/// of [`SUPPORTED_SCHEMA_VERSION`] (the seller table) — the buyer table is new
+/// in #744 with no legacy records, so it starts at 1 and carries `expires_at`
+/// inline rather than as a trailing segment.
+const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// redb table holding the pending-settle set (#327 / PR #743 review): channels
 /// this node closed on-chain that await a `settleChannel` finalization once
@@ -636,6 +656,344 @@ impl ChannelStateStore for PersistentChannelStateStore {
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Buyer-side store (#744)
+// ---------------------------------------------------------------------------
+
+/// On-disk buyer-channel record. Like [`StoredChannelState`], all numeric
+/// fields are fixed-size big-endian byte arrays so the encoded width is stable
+/// across postcard versions. Unlike the seller record there is no legacy v1
+/// schema to stay byte-compatible with, so `expires_at` is an inline field
+/// rather than a trailing segment; `schema_version` still lives in the value
+/// so a future additive field can ship without renaming the table (decode uses
+/// [`postcard::take_from_bytes`], tolerating trailing bytes).
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredBuyerChannelState {
+    schema_version: u32,
+    channel_id: [u8; 32],
+    provider: [u8; 20],
+    token: [u8; 20],
+    deposit: [u8; 32],
+    last_amount: [u8; 32],
+    last_nonce: [u8; 32],
+    last_bytes_delivered: [u8; 32],
+    expires_at: u64,
+}
+
+impl From<&BuyerChannelState> for StoredBuyerChannelState {
+    fn from(state: &BuyerChannelState) -> Self {
+        Self {
+            schema_version: BUYER_SUPPORTED_SCHEMA_VERSION,
+            channel_id: state.channel_id.into(),
+            provider: state.provider.into(),
+            token: state.token.into(),
+            deposit: state.deposit.to_be_bytes(),
+            last_amount: state.last_amount.to_be_bytes(),
+            last_nonce: state.last_nonce.to_be_bytes(),
+            last_bytes_delivered: state.last_bytes_delivered.to_be_bytes(),
+            expires_at: state.expires_at,
+        }
+    }
+}
+
+impl StoredBuyerChannelState {
+    fn into_state(self) -> Result<BuyerChannelState, StoreError> {
+        if self.schema_version > BUYER_SUPPORTED_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema {
+                found: self.schema_version,
+                supported: BUYER_SUPPORTED_SCHEMA_VERSION,
+            });
+        }
+        Ok(BuyerChannelState {
+            channel_id: B256::from(self.channel_id),
+            provider: Address::from(self.provider),
+            token: Address::from(self.token),
+            deposit: U256::from_be_bytes(self.deposit),
+            last_amount: U256::from_be_bytes(self.last_amount),
+            last_nonce: U256::from_be_bytes(self.last_nonce),
+            last_bytes_delivered: U256::from_be_bytes(self.last_bytes_delivered),
+            expires_at: self.expires_at,
+        })
+    }
+}
+
+/// Decode one buyer record into a [`BuyerChannelState`], validating that the
+/// embedded `provider` matches the table key. Mirrors [`decode_record`] for
+/// the seller table (additive-forward-compat via `take_from_bytes`; bounded
+/// trailing-bytes warning).
+fn decode_buyer_record(
+    key_bytes: [u8; 20],
+    value_bytes: &[u8],
+) -> Result<BuyerChannelState, StoreError> {
+    let provider = Address::from(key_bytes);
+    let (stored, remainder): (StoredBuyerChannelState, &[u8]) =
+        postcard::take_from_bytes(value_bytes).map_err(|err| StoreError::Corrupt {
+            channel_id: None,
+            detail: format!("buyer record postcard decode failed (provider {provider}): {err}"),
+        })?;
+    if stored.provider != key_bytes {
+        return Err(StoreError::Corrupt {
+            channel_id: None,
+            detail: format!("buyer record provider {provider} does not match table key"),
+        });
+    }
+    if remainder.len() > SANE_TRAILER_MAX_BYTES {
+        tracing::warn!(
+            %provider,
+            remainder = remainder.len(),
+            limit = SANE_TRAILER_MAX_BYTES,
+            event = "buyer_channel_store_excess_trailer",
+            "buyer channel record has unusually large trailing bytes; possible malicious padding or large-additive-field schema skew",
+        );
+    }
+    stored.into_state()
+}
+
+/// Buyer-table operations as **inherent** methods on the shared store. They
+/// are named `buyer_*` (rather than implementing [`BuyerChannelStore`] on
+/// `PersistentChannelStateStore` directly) so they don't collide with the
+/// `ChannelStateStore` trait methods of the same base name (`load_all`,
+/// `record`, `forget`) — which would make every concrete-type call site
+/// ambiguous. The [`BuyerChannelStoreHandle`] newtype below adapts these into
+/// the trait object the buyer service consumes.
+impl PersistentChannelStateStore {
+    fn buyer_load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(BUYER_CHANNEL_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let mut out = Vec::new();
+        let iter = table
+            .iter()
+            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
+        for entry in iter {
+            let (key_guard, value_guard) =
+                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
+            let key_bytes: [u8; 20] = *key_guard.value();
+            // Skip (don't fail the whole load) on a single undecodable record.
+            // Unlike the seller `load_all` — whose error aborts startup (a
+            // corrupt voucher record reopening the #527 replay window is unsafe
+            // to run past) — buyer bootstrap is *non-fatal*: a propagated error
+            // here would not just disable new buys, it would stop the reclaim
+            // sweep from ever spawning, stranding every *other* tracked
+            // channel's deposit as unreclaimable (PR #753 review, alpergundogdu).
+            // One bad row must not take the others down. Logged at `error!`, not
+            // `warn!`: the skipped row's deposit stays escrowed-but-unreclaimable
+            // until an operator repairs the record, so it warrants action (and
+            // must not be filtered out of alerting). The channel id can't be
+            // named — it lives inside the undecodable bytes — so the on-chain
+            // provider key is the only handle the operator gets.
+            match decode_buyer_record(key_bytes, value_guard.value()) {
+                Ok(state) => out.push(state),
+                Err(err) => tracing::error!(
+                    provider = %Address::from(key_bytes),
+                    %err,
+                    event = "buyer_channel_store_skip_undecodable_record",
+                    "buyer channel hydration: skipping an undecodable record; its escrowed deposit \
+                     is untracked and will not be auto-reclaimed until the record is repaired \
+                     (other channels remain healthy)",
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    fn buyer_record(&self, state: &BuyerChannelState) -> Result<(), StoreError> {
+        let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(state))
+            .map_err(|err| StoreError::Codec(format!("buyer record postcard encode: {err}")))?;
+        let key: [u8; 20] = state.provider.into();
+
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(BUYER_CHANNEL_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            table
+                .insert(&key, encoded.as_slice())
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+
+    fn buyer_forget(&self, provider: Address) -> Result<(), StoreError> {
+        let key: [u8; 20] = provider.into();
+
+        // Do not implicitly create the table on a never-written store.
+        {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+            match read_txn.open_table(BUYER_CHANNEL_TABLE) {
+                Ok(_) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+            }
+        }
+
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(BUYER_CHANNEL_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            table
+                .remove(&key)
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+
+    fn buyer_get_by_provider(
+        &self,
+        provider: Address,
+    ) -> Result<Option<BuyerChannelState>, StoreError> {
+        let key: [u8; 20] = provider.into();
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(BUYER_CHANNEL_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let Some(value_guard) = table
+            .get(&key)
+            .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(decode_buyer_record(key, value_guard.value())?))
+    }
+
+    /// Compare-and-delete inside a single write transaction: remove
+    /// `provider`'s row only if the stored `channel_id` matches. Returns
+    /// whether a row was deleted.
+    fn buyer_forget_if_channel(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+    ) -> Result<bool, StoreError> {
+        let key: [u8; 20] = provider.into();
+
+        // Do not implicitly create the table on a never-written store
+        // (`WriteTransaction::open_table` would).
+        {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+            match read_txn.open_table(BUYER_CHANNEL_TABLE) {
+                Ok(_) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+                Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+            }
+        }
+
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        let deleted = {
+            let mut table = write_txn
+                .open_table(BUYER_CHANNEL_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            // Read the current row inside the same (serialised) write txn so the
+            // match-and-remove is atomic against a concurrent replace.
+            let matches = match table
+                .get(&key)
+                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+            {
+                Some(value_guard) => {
+                    decode_buyer_record(key, value_guard.value())?.channel_id == channel_id
+                }
+                None => false,
+            };
+            if matches {
+                table
+                    .remove(&key)
+                    .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+            }
+            matches
+        };
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(deleted)
+    }
+}
+
+/// [`BuyerChannelStore`] adapter over the shared [`PersistentChannelStateStore`].
+///
+/// Holds an `Arc` to the same store the seller path uses, so both the seller
+/// `channel_state_v1` table and the buyer `buyer_channel_state_v1` table live
+/// in one redb file behind one handle. Hand this to the buyer service as
+/// `Arc<dyn BuyerChannelStore>`.
+#[derive(Debug, Clone)]
+pub struct BuyerChannelStoreHandle {
+    inner: std::sync::Arc<PersistentChannelStateStore>,
+}
+
+impl BuyerChannelStoreHandle {
+    /// Wrap a shared persistent store as a buyer-channel store.
+    #[must_use]
+    pub const fn new(inner: std::sync::Arc<PersistentChannelStateStore>) -> Self {
+        Self { inner }
+    }
+}
+
+impl BuyerChannelStore for BuyerChannelStoreHandle {
+    fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
+        self.inner.buyer_load_all()
+    }
+
+    fn record(&self, state: &BuyerChannelState) -> Result<(), StoreError> {
+        self.inner.buyer_record(state)
+    }
+
+    fn forget(&self, provider: Address) -> Result<(), StoreError> {
+        self.inner.buyer_forget(provider)
+    }
+
+    fn forget_if_channel(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+    ) -> Result<bool, StoreError> {
+        self.inner.buyer_forget_if_channel(provider, channel_id)
+    }
+
+    fn get_by_provider(&self, provider: Address) -> Result<Option<BuyerChannelState>, StoreError> {
+        self.inner.buyer_get_by_provider(provider)
     }
 }
 
@@ -1246,6 +1604,303 @@ mod tests {
             ),
             "expected Corrupt {{ channel_id: Some(key_b), detail: ...does not match... }}, got {err:?}",
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Buyer-table tests (#744)
+    // -----------------------------------------------------------------------
+
+    fn buyer_sample(byte: u8) -> BuyerChannelState {
+        let mut id = [0u8; 32];
+        id[31] = byte;
+        let mut prov = [0u8; 20];
+        prov[19] = byte;
+        BuyerChannelState {
+            channel_id: id.into(),
+            provider: Address::from(prov),
+            token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            deposit: U256::from(10_000_000u64),
+            last_amount: U256::from(byte) * U256::from(1_000u64),
+            last_nonce: U256::from(byte),
+            last_bytes_delivered: U256::from(byte) * U256::from(1_024u64),
+            expires_at: 1_900_000_000 + u64::from(byte),
+        }
+    }
+
+    #[test]
+    fn buyer_open_empty_store_returns_no_entries() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(store));
+        anyhow::ensure!(handle.load_all()?.is_empty());
+        anyhow::ensure!(handle.get_by_provider(buyer_sample(1).provider)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn buyer_record_get_and_persist_across_reopen() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let a = buyer_sample(1);
+        let b = buyer_sample(2);
+        {
+            let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+                PersistentChannelStateStore::open(dir.path())?,
+            ));
+            handle.record(&a)?;
+            handle.record(&b)?;
+            let got = handle
+                .get_by_provider(a.provider)?
+                .ok_or_else(|| anyhow::anyhow!("missing a"))?;
+            anyhow::ensure!(got == a, "get_by_provider must round-trip");
+        }
+        // Reopen: records survive.
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+            PersistentChannelStateStore::open(dir.path())?,
+        ));
+        let mut all = handle.load_all()?;
+        all.sort_by_key(|s| s.provider);
+        anyhow::ensure!(all.len() == 2);
+        anyhow::ensure!(*all.first().ok_or_else(|| anyhow::anyhow!("[0]"))? == a);
+        anyhow::ensure!(*all.get(1).ok_or_else(|| anyhow::anyhow!("[1]"))? == b);
+        Ok(())
+    }
+
+    #[test]
+    fn buyer_record_overwrites_by_provider() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+            PersistentChannelStateStore::open(dir.path())?,
+        ));
+        let mut s = buyer_sample(5);
+        handle.record(&s)?;
+        s.last_nonce = U256::from(99u64);
+        s.deposit = U256::from(20_000_000u64);
+        handle.record(&s)?;
+        anyhow::ensure!(handle.load_all()?.len() == 1, "same provider overwrites");
+        let only = handle
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        anyhow::ensure!(only.last_nonce == U256::from(99u64));
+        anyhow::ensure!(only.deposit == U256::from(20_000_000u64));
+        Ok(())
+    }
+
+    #[test]
+    fn buyer_forget_removes_entry() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+            PersistentChannelStateStore::open(dir.path())?,
+        ));
+        let s = buyer_sample(3);
+        handle.record(&s)?;
+        handle.forget(s.provider)?;
+        anyhow::ensure!(handle.load_all()?.is_empty());
+        // forget on an unknown provider is a no-op.
+        handle.forget(address!("00000000000000000000000000000000000000ff"))?;
+        Ok(())
+    }
+
+    /// The buyer and seller tables share one redb file but never interfere:
+    /// a buyer record and a seller record with overlapping low bytes coexist.
+    #[test]
+    fn buyer_and_seller_tables_are_independent() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = std::sync::Arc::new(PersistentChannelStateStore::open(dir.path())?);
+        let seller = sample(7);
+        ChannelStateStore::record(store.as_ref(), &seller)?;
+        let buyer = buyer_sample(7);
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::clone(&store));
+        handle.record(&buyer)?;
+
+        // Each table sees only its own row.
+        anyhow::ensure!(ChannelStateStore::load_all(store.as_ref())?.len() == 1);
+        anyhow::ensure!(handle.load_all()?.len() == 1);
+        let got_seller = ChannelStateStore::get(store.as_ref(), seller.channel_id)?
+            .ok_or_else(|| anyhow::anyhow!("seller row missing"))?;
+        anyhow::ensure!(got_seller == seller);
+        let got_buyer = handle
+            .get_by_provider(buyer.provider)?
+            .ok_or_else(|| anyhow::anyhow!("buyer row missing"))?;
+        anyhow::ensure!(got_buyer == buyer);
+        Ok(())
+    }
+
+    /// A buyer record stamped with a future schema version must refuse to
+    /// load — same safety posture as the seller table.
+    #[test]
+    fn buyer_future_schema_version_skipped_on_hydration() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s = buyer_sample(1);
+        let mut stored = StoredBuyerChannelState::from(&s);
+        stored.schema_version = BUYER_SUPPORTED_SCHEMA_VERSION + 1;
+        let encoded = postcard::to_allocvec(&stored)?;
+        let key: [u8; 20] = s.provider.into();
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(BUYER_CHANNEL_TABLE)?;
+            t.insert(&key, encoded.as_slice())?;
+        }
+        tx.commit()?;
+
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(store));
+        // A future-schema record (the canonical post-downgrade case) must NOT
+        // fail hydration — that would disable the whole buyer path and the
+        // reclaim sweep (PR #753 review). `load_all` skips it instead.
+        anyhow::ensure!(
+            handle.load_all()?.is_empty(),
+            "future-schema record must be skipped, not propagated, by load_all",
+        );
+        // The point lookup still surfaces the precise error (it is not on the
+        // bootstrap path, so propagating is safe and diagnostic).
+        let err = handle
+            .get_by_provider(s.provider)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("future schema must reject on get_by_provider"))?;
+        anyhow::ensure!(
+            matches!(
+                err,
+                StoreError::UnsupportedSchema { found, supported }
+                    if found == BUYER_SUPPORTED_SCHEMA_VERSION + 1
+                        && supported == BUYER_SUPPORTED_SCHEMA_VERSION,
+            ),
+            "expected UnsupportedSchema, got {err:?}",
+        );
+        Ok(())
+    }
+
+    /// Garbage value bytes under a real buyer key are skipped by `load_all`
+    /// (one bad row must not strand every other channel's deposit — PR #753
+    /// review), while a healthy record alongside it survives. The point lookup
+    /// (`get_by_provider`) still surfaces `Corrupt`.
+    #[test]
+    fn buyer_corrupt_value_bytes_skipped_keeps_healthy() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let healthy = buyer_sample(2);
+        let corrupt_key: [u8; 20] = buyer_sample(3).provider.into();
+        let healthy_encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&healthy))?;
+        let healthy_key: [u8; 20] = healthy.provider.into();
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(BUYER_CHANNEL_TABLE)?;
+            t.insert(&healthy_key, healthy_encoded.as_slice())?;
+            t.insert(&corrupt_key, &[0u8; 8][..])?; // far too short for a valid record
+        }
+        tx.commit()?;
+
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(store));
+        let all = handle.load_all()?;
+        anyhow::ensure!(
+            all.len() == 1 && all.first() == Some(&healthy),
+            "corrupt row must be skipped while the healthy row survives, got {all:?}",
+        );
+        let err = handle
+            .get_by_provider(buyer_sample(3).provider)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("garbage value must reject on get_by_provider"))?;
+        anyhow::ensure!(
+            matches!(&err, StoreError::Corrupt { detail, .. } if detail.contains("postcard decode")),
+            "expected Corrupt(postcard decode), got {err:?}",
+        );
+        Ok(())
+    }
+
+    /// A buyer record whose embedded `provider` doesn't match its table key is
+    /// skipped by `load_all`; the point lookup still surfaces `Corrupt`.
+    #[test]
+    fn buyer_provider_key_mismatch_skipped_on_hydration() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s_for_a = buyer_sample(0xAA);
+        let key_b: [u8; 20] = buyer_sample(0xBB).provider.into(); // different key
+        let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&s_for_a))?;
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(BUYER_CHANNEL_TABLE)?;
+            t.insert(&key_b, encoded.as_slice())?;
+        }
+        tx.commit()?;
+
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(store));
+        anyhow::ensure!(
+            handle.load_all()?.is_empty(),
+            "provider/key-mismatch record must be skipped by load_all",
+        );
+        let err = handle
+            .get_by_provider(buyer_sample(0xBB).provider)
+            .err()
+            .ok_or_else(|| {
+                anyhow::anyhow!("provider/key mismatch must reject on get_by_provider")
+            })?;
+        anyhow::ensure!(
+            matches!(&err, StoreError::Corrupt { detail, .. } if detail.contains("does not match table key")),
+            "expected Corrupt(does not match table key), got {err:?}",
+        );
+        Ok(())
+    }
+
+    /// Forward-compat: a future writer's additive trailing bytes after the
+    /// buyer prefix decode cleanly (`take_from_bytes`). Mirrors the seller
+    /// `extra_trailing_bytes_are_tolerated` guard.
+    #[test]
+    fn buyer_extra_trailing_bytes_are_tolerated() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s = buyer_sample(0x42);
+        let key: [u8; 20] = s.provider.into();
+        let mut encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&s))?;
+        encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(BUYER_CHANNEL_TABLE)?;
+            t.insert(&key, encoded.as_slice())?;
+        }
+        tx.commit()?;
+
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(store));
+        let all = handle.load_all()?;
+        anyhow::ensure!(all.len() == 1);
+        let only = all.first().ok_or_else(|| anyhow::anyhow!("missing"))?;
+        anyhow::ensure!(*only == s, "prefix must decode despite trailing bytes");
+        Ok(())
+    }
+
+    /// `forget_if_channel` (compare-and-delete) deletes only the matching
+    /// channel — the lost-update guard for the reclaim sweep.
+    #[test]
+    fn buyer_forget_if_channel_is_compare_and_delete() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+            PersistentChannelStateStore::open(dir.path())?,
+        ));
+        // CAS on a never-written store is a no-op (false), no table created.
+        anyhow::ensure!(
+            !handle.forget_if_channel(buyer_sample(1).provider, buyer_sample(1).channel_id)?
+        );
+
+        let s = buyer_sample(4);
+        handle.record(&s)?;
+        // Wrong channel id → not deleted, row survives.
+        anyhow::ensure!(
+            !handle.forget_if_channel(
+                s.provider,
+                b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+            )?,
+            "mismatched channel must not delete"
+        );
+        anyhow::ensure!(
+            handle.get_by_provider(s.provider)?.is_some(),
+            "row must survive"
+        );
+        // Matching channel id → deleted.
+        anyhow::ensure!(handle.forget_if_channel(s.provider, s.channel_id)?);
+        anyhow::ensure!(handle.get_by_provider(s.provider)?.is_none());
         Ok(())
     }
 }
