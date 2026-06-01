@@ -213,7 +213,7 @@ The node-offline-for-the-full-48h case is a node-operations responsibility, not 
 
 Client sends probe requests to many nodes at high frequency to map the network or exhaust node resources without ever paying.
 
-Per-NodeId rate limiting alone is bypassable: clients are not staked, NodeIds are free to rotate, and iroh connection setup is cheap. The mitigation is the layered token-bucket rate limit in [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting): per-peer (NodeId) plus per-IP plus a global node cap, applied before any signature or hold-slot allocation. The per-IP layer raises the cost of bulk probing because IP rotation requires money (proxies, IPv6 delegation, cloud bills) while NodeId rotation does not; the global cap is defence in depth.
+Per-NodeId rate limiting alone is bypassable: clients are not bonded, NodeIds are free to rotate, and iroh connection setup is cheap. The mitigation is the layered token-bucket rate limit in [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting): per-peer (NodeId) plus per-IP plus a global node cap, applied before any signature or hold-slot allocation. The per-IP layer raises the cost of bulk probing because IP rotation requires money (proxies, IPv6 delegation, cloud bills) while NodeId rotation does not; the global cap is defence in depth.
 
 **Note:** Probe responses are considered public information (see [ADR 005](005-protocol.md#adr-005-wire-protocol)). The concern here is resource exhaustion from bulk probing, not information leakage — content availability is discoverable via probing (see [ADR 005](005-protocol.md#adr-005-wire-protocol)), and pricing is revealed in probe/stream responses by design.
 
@@ -289,11 +289,11 @@ BLAKE3 verification catches data corruption regardless of peer-table composition
 
 Node sends high-volume `NodeAnnounce` messages to exhaust peer table memory or crowd out legitimate announcements.
 
-Registry check + per-sender rate limiting. Residual gap: the local registry cache may be up to 10 minutes stale, briefly allowing recently-unstaked nodes to flood; mitigated by tightening the registry cache refresh on high flood detection.
+Registry check + per-sender rate limiting. Residual gap: the local registry cache may be up to 10 minutes stale, briefly allowing recently-unbonded nodes to flood; mitigated by tightening the registry cache refresh on high flood detection.
 
 #### Sybil nodes
 
-Attacker stakes many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
+Attacker bonds many cheap nodes to dominate probe responses for popular content, controlling pricing in a region.
 
 The core weakness is governance-token-price dependency: at $0.001/TOKEN, the 1 Gbps entry-tier capacity bond (~50,000 TOKEN at default `k=12.6`, `α=1.2` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) costs $50 per sybil node. Higher tiers are super-linearly more expensive (10 Gbps ≈ 795K TOKEN; 100 Gbps ≈ 12.6M TOKEN), but a sybil fleet can be dominated by many entry-tier nodes. The unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` (see [ADR 001](001-network.md#node-selection-algorithm)) helps — a sybil fleet must be real hardware in the right geography, competitively priced, and build reputation over time — but does not eliminate the risk when the token is cheap. Options:
 
@@ -305,11 +305,11 @@ The core weakness is governance-token-price dependency: at $0.001/TOKEN, the 1 G
 
 Colluding nodes in a region hold rates artificially high.
 
-Origin-backed nodes set the effective price ceiling for any blob. Clients can always probe origin-backed nodes directly and pay their rates as a guaranteed fallback. Any node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join the cache-only role permissionlessly by staking; the origin role for content in registered namespaces requires `OriginAssignment` membership ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)), but cache-only competition is sufficient to discipline the rate cartel because cache delivery is interchangeable with origin delivery from the requester's perspective.
+Origin-backed nodes set the effective price ceiling for any blob. Clients can always probe origin-backed nodes directly and pay their rates as a guaranteed fallback. Any node outside the cartel that undercuts wins all local traffic — the incentive to defect is strong. New entrants can join the cache-only role permissionlessly by bonding; the origin role for content in registered namespaces requires `OriginAssignment` membership ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)), but cache-only competition is sufficient to discipline the rate cartel because cache delivery is interchangeable with origin delivery from the requester's perspective.
 
 #### Content withholding
 
-A node stakes, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in the peer table without actually participating.
+A node bonds, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in the peer table without actually participating.
 
 **Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. The protocol does not guarantee availability; publishers who want fault tolerance opt into it by proposing multiple operators, and the network deprioritizes flaky nodes through reputation:
 
@@ -625,7 +625,7 @@ Voucher nonces within a channel start at **1**. Nonce 0 is reserved as the senti
 
 ### Node Registry
 
-The on-chain registry of staked nodes is part of the `CapacityBond` contract, not a separate contract. Staking is a prerequisite for registration ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)), so co-locating them avoids cross-contract calls and simplifies the atomic stake-then-register flow.
+The on-chain registry of bonded nodes is part of the `CapacityBond` contract, not a separate contract. Bonding is a prerequisite for registration ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)), so co-locating them avoids cross-contract calls and simplifies the atomic bond-then-register flow.
 
 > **No on-channel fee-discount path.** Operator return is differentiated through the `CapacityBond` lock-to-capacity curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), not via a bond-multiple fee toggle on the channel contract. `getEffectiveFee`, `getBondMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `CapacityBond` carries the registration, bond-bookkeeping, and slashing responsibilities; the operator bond is `bond = k × Mbps^α` with defaults `k=12.6`, `α=1.2` (≈50K TOKEN at 1 Gbps) per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve).
 
@@ -694,7 +694,7 @@ event NodeRegistered(
 );
 event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
 event NodeDeregistered(bytes32 indexed nodeId);
-event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingStake);
+event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingBond);
 event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 ```
 
@@ -702,7 +702,7 @@ event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
 
 #### Constraints
 
-- **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This enforces a one-stake-position-per-node invariant.
+- **One-to-one mapping.** Each `nodeId` maps to exactly one `ethAddress` and vice versa. Enforced with `require(nodeByAddress[msg.sender].nodeId == bytes32(0))` and `require(nodes[nodeId].ethAddress == address(0))`, where `bytes32(0)` is the sentinel for "unregistered". This enforces a one-bond-position-per-node invariant.
 - **`registerNode` rejects `nodeId == bytes32(0)`** (reserved as the unregistered sentinel). It binds `msg.sender` to `nodeId` — the caller's Ethereum address becomes `ethAddress`. This binding is on-chain and permanent until deregistration, distinct from the ephemeral per-session `NodeId`-to-address binding in [§ Off-Chain (Ephemeral) Binding for Clients](#off-chain-ephemeral-binding-for-clients). The function performs two signature verifications: (1) the `bindingSignature` parameter is an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` (see [§ Binding Message Format](#binding-message-format)); `registerNode` verifies this against the caller's current `bindingNonce`, then atomically writes the `nodeIdToAddress`/`addressToNodeId` mappings and increments `bindingNonce[msg.sender]`. (2) The `ed25519Signature` parameter proves ownership of the NodeId's ed25519 private key — see [§ NodeId Ownership Verification](#nodeid-ownership-verification) below. The shared per-address `bindingNonce` counter with `bindNodeId` ensures replay protection across both registration and rebinding. Every registered node is immediately slashable — there is no window in which a node is active in the mesh without a verifiable binding. The separate `CapacityBond.bindNodeId()` function in [§ On-Chain Registration](#on-chain-registration) remains available for rebinding (key rotation) after initial registration.
 - **`deregisterNode` deactivates without touching the bond.** Sets `active = false`, removes the operator from the active set, and increments `registrationNonce[nodeId]` to invalidate any previously issued ed25519 registration signatures for this NodeId. It does **not** move the bond into unbonding — deactivation and bond exit are separate operations. The bond stays locked and fully slashable after deregistration (accountability is preserved), and an operator who changes their mind can re-register without re-funding. To withdraw, the operator calls `unbond()` (which starts the 14-day unbonding window per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)); the slash-then-run protection is the `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant ([ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period)), which keys off the `unbond()` call rather than off deregistration, so it holds regardless. Separating the two lets an operator pause node duties (stop serving, leave the active set) without forcing a bond-return clock, while a full exit is just `deregisterNode` followed by `unbond()`.
 - **Auto-ejection.** When slashing drops a node's bond below 50% of the minimum bond for its declared tier ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)), the contract sets `active = false` and emits `NodeAutoEjected`. The node must re-bond at the full tier minimum to rejoin.
@@ -755,14 +755,14 @@ EVM has no native ed25519 precompile, and no such precompile is deployed on the 
 
 ##### Reclaim flow
 
-If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, deactivates the current holder's node if the reclaimed NodeId was its bound id (clearing the active flag and removing it from the active set — the bond is left locked and slashable, exactly as `deregisterNode`; the holder exits the bond separately via `unbond()`), clears the NodeId↔address mappings (and zeroes the holder's now-stale `NodeInfo.nodeId` so the read views stay consistent with the cleared binding), increments `registrationNonce[nodeId]`, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have stake — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 on-chain signatures used for slash evidence ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) and EIP-712 NodeId↔Ethereum binding ([§ NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)).
+If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, deactivates the current holder's node if the reclaimed NodeId was its bound id (clearing the active flag and removing it from the active set — the bond is left locked and slashable, exactly as `deregisterNode`; the holder exits the bond separately via `unbond()`), clears the NodeId↔address mappings (and zeroes the holder's now-stale `NodeInfo.nodeId` so the read views stay consistent with the cleared binding), increments `registrationNonce[nodeId]`, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have a bond — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 on-chain signatures used for slash evidence ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) and EIP-712 NodeId↔Ethereum binding ([§ NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)).
 
 ## Admission and Priority
 
 Node admission and queueing policy — how a node orders incoming `StreamRequest`s under congestion — is implementation-defined and lives outside the protocol. The wire format carries no priority bits, the channel and voucher mechanisms encode no per-stream priority state, and different operators are expected to tune their policy differently. Two signals are available to any admission policy:
 
 - **Committed voucher rate.** The advertised `rate_per_mb` in `ProbeResponse` / `StreamResponse` is a **floor**, not equality — nodes verify `amount_delta / bytes_delta >= rate_per_mb`. Clients MAY commit at higher rates; nodes MAY use the committed rate as a per-stream priority key, with the premium paid directly via [`FeeRouter.routeSettlement`](#feerouter-integration).
-- **Registered node-stake.** `CapacityBond.bondOf(address)` is readable on-chain for any registered operator. Nodes MAY treat addresses with `bondOf >= bond_required(declared_capacity)` ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)) as eligible for a higher-priority admission lane.
+- **Registered node-bond.** `CapacityBond.bondOf(address)` is readable on-chain for any registered operator. Nodes MAY treat addresses with `bondOf >= bond_required(declared_capacity)` ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)) as eligible for a higher-priority admission lane.
 
 ## NodeId-to-Ethereum Binding
 
@@ -835,7 +835,7 @@ function isActive(address operator) external view returns (bool);
 // proving ownership, so squatting is impossible and reclaimNodeId is a
 // defense-in-depth backstop (for legacy / buggy bindings) rather than a
 // routine remedy. Calling this before registerNode is permitted but only
-// records a binding without mesh membership or stake.
+// records a binding without mesh membership or bond.
 function bindNodeId(bytes32 nodeId, bytes calldata bindingSignature, bytes calldata ed25519Signature) external {
     uint64 nonce = bindingNonce[msg.sender];
     bytes32 digest = keccak256(abi.encodePacked(
@@ -891,7 +891,7 @@ Clients without on-chain registration MAY include a signed binding in their `Str
 
 | Role | On-chain binding required? | Rationale |
 | --- | --- | --- |
-| Node (staked) | **Yes** — `registerNode` performs binding atomically via `bindingSignature` (EIP-712, proves Ethereum key consent) and `ed25519Signature` (proves NodeId ownership) | Slash evidence references on-chain NodeId→address mapping; atomic binding eliminates gap; ed25519 proof prevents NodeId squatting |
+| Node (bonded) | **Yes** — `registerNode` performs binding atomically via `bindingSignature` (EIP-712, proves Ethereum key consent) and `ed25519Signature` (proves NodeId ownership) | Slash evidence references on-chain NodeId→address mapping; atomic binding eliminates gap; ed25519 proof prevents NodeId squatting |
 | Client (opening channels) | No — channel `client` field is the Ethereum address directly | Channel operations use Ethereum addresses, not NodeIds |
 
 ### Rebinding
@@ -927,11 +927,11 @@ The router does not validate `bytesDelivered` against any oracle of physical del
 
 Slashing and payment channels are independent by design.
 
-**Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN stake in the `CapacityBond` (schedule per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5%/15%/50% escalation tiers; slashed stake is held in escrow-on-slash and distributed at finality 50% challenger / 50% burn). Channel funds are client deposits held in escrow — not stake, never touched by slashing. This follows from the functional separation in [Consequences](#consequences): payment channel contracts never hold or move TOKEN stake, cannot be called by `CapacityBond` to slash or reassign stake, and any `CapacityBond` interaction is read-only (e.g., resolving NodeId↔address bindings).
+**Slashing does not affect channel funds.** Slashing operates exclusively on TOKEN bond in the `CapacityBond` (schedule per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5%/15%/50% escalation tiers; slashed bond is held in escrow-on-slash and distributed at finality 50% challenger / 50% burn). Channel funds are client deposits held in escrow — not bond, never touched by slashing. This follows from the functional separation in [Consequences](#consequences): payment channel contracts never hold or move TOKEN bond, cannot be called by `CapacityBond` to slash or reassign bond, and any `CapacityBond` interaction is read-only (e.g., resolving NodeId↔address bindings).
 
 **Slashing can drop a node below its tier minimum bond while channels are open.** Channel deposits being independent of the bond, a node can be slashed below the tier minimum (or to zero) with open channels. The channels continue their normal lifecycle — close, dispute window, settle — regardless of bonding status; settlement is purely a function of voucher state, not registry status.
 
-**Auto-ejection does not interrupt open channels.** When a node's stake drops below 50% of the minimum and auto-ejection triggers (see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)):
+**Auto-ejection does not interrupt open channels.** When a node's bond drops below 50% of the minimum and auto-ejection triggers (see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)):
 
 - Open channels settle normally. Client funds are never trapped.
 - The ejected node cannot participate in new channels (clients verify node registration before opening channels, and nodes verify counterparty status before accepting a `StreamRequest`).
