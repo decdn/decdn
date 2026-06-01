@@ -190,10 +190,11 @@ impl ProbeHandler {
         // Probe-triggered eviction hold (ADR 005 §Probe-triggered eviction
         // hold). Only `Held` permits signing `has_blob: true` — the blob is
         // present, not operator-evicted, and a 35s hold is guaranteed. The
-        // outcome enum already classifies the miss (absent vs budget
-        // exhausted) so no second cache lookup is needed. The hold is taken
-        // *after* the rate limiter (ADR 005 §Probe rate limiting: hold
-        // admission occurs only after the limiter passes — do not reorder).
+        // outcome enum already classifies each `has_blob: false` cause
+        // (absent/evicted, holds disabled, budget exhausted) so no second
+        // cache lookup is needed. The hold is taken *after* the rate limiter
+        // (ADR 005 §Probe rate limiting: hold admission occurs only after the
+        // limiter passes — do not reorder).
         let (has_blob, total_bytes) = match self.cache.try_probe_hold(hash).await {
             Ok(ProbeHoldOutcome::Held) => {
                 let size = self
@@ -211,9 +212,12 @@ impl ProbeHandler {
                 // raise `max_probe_holds`, so this is the counter that drives
                 // that alert (#739).
                 self.metrics.probe_hold_violation();
+                // Don't log `probe_hold_slots_used()` here: it re-acquires the
+                // `probe_holds` lock and sweeps, and on this hot refusal path
+                // the value is a foregone ~`max` anyway. The gauge is published
+                // once per probe below.
                 tracing::debug!(
                     hash = %hash,
-                    slots_used = self.cache.probe_hold_slots_used(),
                     "probe hold refused: budget exhausted; signing has_blob:false"
                 );
                 (false, None)

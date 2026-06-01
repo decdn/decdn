@@ -82,17 +82,14 @@ async fn cache_with_two_blobs(
     b: &[u8],
 ) -> anyhow::Result<(CacheEngine, Hash, Hash, tempfile::TempDir)> {
     let origin_dir = tempfile::tempdir()?;
-    let mut hashes = Vec::with_capacity(2);
     for payload in [a, b] {
-        let hash = Hash::new(payload);
-        let hex = hash.to_hex();
+        let hex = Hash::new(payload).to_hex();
         let shard = hex
             .get(..2)
             .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
         let dir = origin_dir.path().join(shard);
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join(hex.as_str()), payload)?;
-        hashes.push(hash);
     }
 
     let cache_dir = tempfile::tempdir()?;

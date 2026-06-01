@@ -1022,11 +1022,14 @@ impl CacheEngine {
     ///
     /// Returns [`ProbeHoldOutcome::Held`] only when the node may safely sign
     /// `has_blob: true`: the blob is present, not operator-evicted, **and** a
-    /// hold is guaranteed for the full slashing window. Otherwise returns
-    /// [`ProbeHoldOutcome::Unavailable`] (absent/evicted) or
-    /// [`ProbeHoldOutcome::BudgetExhausted`] (present but `max == 0` or all
-    /// slots in use) so the caller signs `has_blob: false` without a second
-    /// cache lookup to classify the miss.
+    /// hold is guaranteed for the full slashing window. Otherwise returns one
+    /// of three `has_blob: false` causes so the caller need not re-inspect the
+    /// cache to classify the miss:
+    /// - [`ProbeHoldOutcome::Unavailable`] — blob absent or operator-evicted.
+    /// - [`ProbeHoldOutcome::HoldsDisabled`] — holds disabled by config
+    ///   (`max_probe_holds == 0`); an intentional operator decision.
+    /// - [`ProbeHoldOutcome::BudgetExhausted`] — present but every hold slot
+    ///   is live (`max_probe_holds > 0`); genuine budget pressure.
     ///
     /// Per-blob semantics: a hash already held has its expiry refreshed and
     /// consumes no additional slot, so many peers probing one popular blob
@@ -1046,6 +1049,15 @@ impl CacheEngine {
             return Ok(ProbeHoldOutcome::Unavailable);
         }
         let max = self.inner.max_probe_holds.load(Ordering::Relaxed);
+        // Holds disabled by config (#739): answer `HoldsDisabled` before
+        // touching the lock. This is the unconditional "never sign
+        // has_blob:true" path — it must override an existing live hold so a
+        // runtime `set_max_probe_holds(0)` takes effect immediately rather
+        // than letting the fast path below refresh and re-sign the hold. Also
+        // skips the O(N) expiry sweep entirely while holds are off.
+        if max == 0 {
+            return Ok(ProbeHoldOutcome::HoldsDisabled);
+        }
         let now = Instant::now();
         // `Instant + Duration` panics on overflow; saturate instead to keep
         // the workspace anti-panic policy (clippy `unwrap_used`/`panic`).
@@ -1077,15 +1089,11 @@ impl CacheEngine {
             return Ok(ProbeHoldOutcome::Unavailable);
         }
         if guard.len() >= max {
-            // Present-but-un-holdable splits by cause (#739): `max == 0` is an
-            // operator config decision (holds off), whereas a positive budget
-            // with every slot live is genuine pressure. Only the latter is the
-            // "increase max_probe_holds" signal (ADR 005 §Hold budget).
-            return Ok(if max == 0 {
-                ProbeHoldOutcome::HoldsDisabled
-            } else {
-                ProbeHoldOutcome::BudgetExhausted
-            });
+            // `max == 0` was already handled above, so reaching the budget
+            // ceiling here is always genuine pressure: every slot is live
+            // (#739). This is the "increase max_probe_holds" signal (ADR 005
+            // §Hold budget) — never a config disable.
+            return Ok(ProbeHoldOutcome::BudgetExhausted);
         }
         guard.insert(hash, expiry);
         Ok(ProbeHoldOutcome::Held)
@@ -3197,6 +3205,35 @@ mod tests {
         anyhow::ensure!(
             engine.try_probe_hold(hash).await? == ProbeHoldOutcome::HoldsDisabled,
             "max_probe_holds=0 must disable has_blob:true entirely"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_disable_overrides_existing_probe_hold() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"held then disabled";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+        engine.set_max_probe_holds(1);
+        anyhow::ensure!(
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Held,
+            "hold should be granted while the budget is positive"
+        );
+        // Disabling holds at runtime (config reload) must take effect
+        // immediately: a re-probe for the already-held blob must NOT refresh
+        // the hold and re-sign has_blob:true (#739). `max == 0` means "never
+        // sign has_blob:true", unconditionally.
+        engine.set_max_probe_holds(0);
+        anyhow::ensure!(
+            engine.try_probe_hold(hash).await? == ProbeHoldOutcome::HoldsDisabled,
+            "a runtime disable must override an existing live hold"
         );
         Ok(())
     }
