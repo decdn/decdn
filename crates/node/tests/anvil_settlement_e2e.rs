@@ -608,10 +608,10 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
 
     // Advance past the dispute window and settle (callable by anyone).
     let _: serde_json::Value = node_provider
-        .raw_request(
-            "evm_increaseTime".into(),
-            (U256::from(DISPUTE_WINDOW_SECS + 600),),
-        )
+        // Pass a plain `u64` (serializes to a JSON number); a `U256` would
+        // serialize to a hex-quantity string, which not every EVM client
+        // accepts for this RPC.
+        .raw_request("evm_increaseTime".into(), (DISPUTE_WINDOW_SECS + 600,))
         .await?;
     let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
     pc_settle
@@ -657,11 +657,13 @@ async fn current_epoch<P: Provider>(provider: &P) -> anyhow::Result<u64> {
 /// Deploy the mintable mock USDC from its compiled artifact bytecode.
 async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow::Result<Address> {
     let artifact = contracts.join("out/MintableUSDC.sol/MintableUSDC.json");
-    let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&artifact).expect("read MintableUSDC artifact"))?;
+    let bytes = std::fs::read(&artifact).map_err(|e| {
+        anyhow::anyhow!("read MintableUSDC artifact at {}: {e}", artifact.display())
+    })?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes)?;
     let code_hex = json["bytecode"]["object"]
         .as_str()
-        .expect("bytecode.object");
+        .ok_or_else(|| anyhow::anyhow!("MintableUSDC artifact missing bytecode.object"))?;
     let code: Bytes = code_hex.parse()?;
     let receipt = provider
         .send_transaction(alloy::rpc::types::TransactionRequest::default().with_deploy_code(code))
