@@ -122,6 +122,15 @@ pub struct DecdnMetrics {
     /// case unreachable by construction, so this counter surfaces the
     /// budget-pressure cause the operator can actually act on).
     pub probe_hold_violations: Counter,
+    /// `decdn_probe_holds_disabled_total` (#739): probes answered
+    /// `has_blob: false` for a *present* blob because the eviction-hold path
+    /// is **disabled by config** (`max_probe_holds == 0`), as opposed to
+    /// genuine slot exhaustion. Split out from `probe_hold_violations` so an
+    /// intentional operator disable does not trip that counter's "increase
+    /// `max_probe_holds`" alert — a nonsensical remedy when holds are
+    /// deliberately off. Field has no `_total` suffix because the
+    /// `OpenMetrics` encoder appends it.
+    pub probe_holds_disabled: Counter,
     /// `decdn_probe_hold_slots_used` (registry): current active
     /// probe-triggered eviction holds (distinct held blobs), ADR 005
     /// §Probe-triggered eviction hold. Sampled from the cache engine on
@@ -316,6 +325,14 @@ impl Metrics {
     /// budget).
     pub fn probe_hold_violation(&self) {
         self.decdn.probe_hold_violations.inc();
+    }
+
+    /// A probe answered `has_blob: false` for a present blob because the
+    /// eviction-hold path is disabled by config (`max_probe_holds == 0`) —
+    /// an intentional operator decision, not budget pressure (#739, ADR 005
+    /// §Hold budget).
+    pub fn probe_holds_disabled(&self) {
+        self.decdn.probe_holds_disabled.inc();
     }
 
     /// Publish the current count of active probe holds (ADR 005).

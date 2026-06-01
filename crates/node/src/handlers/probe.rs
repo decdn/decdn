@@ -205,9 +205,29 @@ impl ProbeHandler {
                 (true, size)
             }
             Ok(ProbeHoldOutcome::BudgetExhausted) => {
-                // Present but un-holdable: an availability degradation, never
-                // a safety fault (ADR 005 §Hold budget). Answer false.
+                // Present but un-holdable because every hold slot is live: an
+                // availability degradation under genuine load, never a safety
+                // fault (ADR 005 §Hold budget). The actionable remedy is to
+                // raise `max_probe_holds`, so this is the counter that drives
+                // that alert (#739).
                 self.metrics.probe_hold_violation();
+                tracing::debug!(
+                    hash = %hash,
+                    slots_used = self.cache.probe_hold_slots_used(),
+                    "probe hold refused: budget exhausted; signing has_blob:false"
+                );
+                (false, None)
+            }
+            Ok(ProbeHoldOutcome::HoldsDisabled) => {
+                // Present but un-holdable because holds are disabled by config
+                // (`max_probe_holds == 0`). Counted separately from budget
+                // pressure (#739) so an intentional disable does not trip the
+                // "increase max_probe_holds" alert.
+                self.metrics.probe_holds_disabled();
+                tracing::debug!(
+                    hash = %hash,
+                    "probe hold refused: holds disabled (max_probe_holds=0); signing has_blob:false"
+                );
                 (false, None)
             }
             // Blob genuinely absent or operator-evicted — a true negative,
