@@ -436,6 +436,44 @@ jobs:
               throw e;
             }
 
+  # Live anvil-backed on-chain settlement e2e (issue #745). Gated behind the
+  # `anvil-e2e` cargo feature so the default `test` job stays fast and needs no
+  # Foundry; this job is the only one that compiles + runs it. Needs BOTH
+  # toolchains: the Rust test spawns `anvil` and shells out to `forge`
+  # (DeployProtocol.s.sol + the mintable-USDC mock), then drives the
+  # `PaymentChannelService` settlement path against the live chain. Runs when
+  # either Rust or Solidity paths changed; accepted via ci-success allowed-skips
+  # otherwise.
+  anvil-e2e:
+    name: anvil e2e
+    runs-on: ubuntu-latest
+    needs: changes
+    if: >-
+      needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.solidity == 'true' ||
+      github.event_name != 'pull_request'
+    steps:
+      # submodules: recursive — the in-test `forge build` needs the forge-std +
+      # openzeppelin-contracts submodules under contracts/lib/.
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.95.0
+      # Installs the pinned Foundry (anvil + forge on PATH) and warms the solc
+      # cache. cache-profile: none — the test drives its own `forge build`.
+      - uses: ./.github/actions/foundry-setup
+        with:
+          cache-profile: none
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: anvil-e2e
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Run on-chain settlement e2e
+        run: cargo nextest run -p decdn-node --features anvil-e2e --test anvil_settlement_e2e
+
   # ----- Solidity contracts ----------------------------------------------
   # The contracts pipeline mirrors the Rust split (one concern per job).
   # All jobs gate on `needs.changes.outputs.solidity` and are accepted
@@ -861,7 +899,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     needs: [fmt, clippy, changes, test, deny, doc, public-api, markdownlint, adr-book-list,
-            pr-title,
+            pr-title, anvil-e2e,
             solidity-fmt, solidity-build-test, solidity-coverage,
             solidity-solhint, solidity-slither, solidity-aderyn]
     steps:
@@ -876,6 +914,6 @@ jobs:
           # here. `changes` is intentionally omitted — it always runs, so a
           # skip from it signals a misconfiguration that should fail the gate.
           allowed-skips: fmt, clippy, test, deny, doc, public-api, adr-book-list,
-                         pr-title, markdownlint,
+                         pr-title, markdownlint, anvil-e2e,
                          solidity-fmt, solidity-build-test, solidity-coverage,
                          solidity-solhint, solidity-slither, solidity-aderyn
