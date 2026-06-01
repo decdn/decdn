@@ -280,6 +280,32 @@ impl RoutingTable {
     }
 }
 
+/// Construct a `NodeId` that lands in bucket `bucket_idx` relative to
+/// `self_id`, varied within the bucket by `salt`. Shared by both test modules
+/// below.
+///
+/// Flips the single distance bit that selects `bucket_idx` and buries `salt`
+/// in the last byte to vary peers within a bucket without changing the leading
+/// prefix. Note that for the lowest eight buckets the selecting bit lives in
+/// the last byte too, so a non-zero `salt` there can perturb the bucket;
+/// callers wanting a guaranteed bucket across all salts use `bucket_idx >= 8`
+/// (the selecting bit then sits in byte 30, which `salt` never touches).
+#[cfg(test)]
+fn id_in_bucket(self_id: &NodeId, bucket_idx: usize, salt: u8) -> NodeId {
+    // bucket_idx = KEYSPACE_BITS - 1 - bit_from_msb  =>  bit_from_msb = 255 - bucket_idx
+    let bit_from_msb = KEYSPACE_BITS - 1 - bucket_idx;
+    let byte_idx = bit_from_msb / 8;
+    let bit_within = bit_from_msb % 8;
+    let mut out = *self_id.as_bytes();
+    if let Some(b) = out.get_mut(byte_idx) {
+        *b ^= 1u8 << (7 - bit_within);
+    }
+    if let Some(last) = out.last_mut() {
+        *last ^= salt;
+    }
+    NodeId::from_bytes(out)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -292,27 +318,6 @@ mod tests {
 
     fn id(byte: u8) -> NodeId {
         NodeId::from_bytes([byte; 32])
-    }
-
-    /// Construct a `NodeId` that XORs with `self_id` to a value with exactly
-    /// `prefix_bits` leading zeros. Used to drop entries into a specific
-    /// bucket deterministically.
-    fn id_in_bucket(self_id: &NodeId, bucket_idx: usize, salt: u8) -> NodeId {
-        // bucket_idx = KEYSPACE_BITS - 1 - bit_from_msb  =>  bit_from_msb = 255 - bucket_idx
-        let bit_from_msb = KEYSPACE_BITS - 1 - bucket_idx;
-        let byte_idx = bit_from_msb / 8;
-        let bit_within = bit_from_msb % 8;
-        let mut out = *self_id.as_bytes();
-        // Flip the leading bit so distance bucket index lands on `bucket_idx`.
-        if let Some(b) = out.get_mut(byte_idx) {
-            *b ^= 1u8 << (7 - bit_within);
-        }
-        // Bury `salt` in the last byte to vary peers within a bucket without
-        // changing the leading prefix.
-        if let Some(last) = out.last_mut() {
-            *last ^= salt;
-        }
-        NodeId::from_bytes(out)
     }
 
     #[test]
@@ -562,7 +567,7 @@ mod tests {
     clippy::indexing_slicing
 )]
 mod prop_tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use proptest::prelude::*;
 
@@ -571,29 +576,6 @@ mod prop_tests {
     /// Strategy yielding a uniformly-random `NodeId` over the full 256-bit space.
     fn node_id() -> impl Strategy<Value = NodeId> {
         proptest::array::uniform32(any::<u8>()).prop_map(NodeId::from_bytes)
-    }
-
-    /// Construct a `NodeId` that lands in bucket `bucket_idx` relative to
-    /// `self_id`, varied within the bucket by `salt`. Mirrors the helper in
-    /// the sibling `tests` module.
-    ///
-    /// Callers in this module restrict `bucket_idx` to `8..16` so the
-    /// bucket-defining bit lives in byte 30 while `salt` only perturbs byte 31
-    /// (the last byte) — the two never interfere, so every id provably lands in
-    /// the intended bucket and distinct salts give distinct ids (and never the
-    /// zero distance, since the byte-30 bit is always flipped).
-    fn id_in_bucket(self_id: &NodeId, bucket_idx: usize, salt: u8) -> NodeId {
-        let bit_from_msb = KEYSPACE_BITS - 1 - bucket_idx;
-        let byte_idx = bit_from_msb / 8;
-        let bit_within = bit_from_msb % 8;
-        let mut out = *self_id.as_bytes();
-        if let Some(b) = out.get_mut(byte_idx) {
-            *b ^= 1u8 << (7 - bit_within);
-        }
-        if let Some(last) = out.last_mut() {
-            *last ^= salt;
-        }
-        NodeId::from_bytes(out)
     }
 
     /// Independent leading-zero-bit count over a big-endian 256-bit value,
@@ -628,6 +610,54 @@ mod prop_tests {
             carry = sum >> 8;
         }
         (out, carry != 0)
+    }
+
+    /// Assert a `closest` / `closest_unbounded` result is correctly sized,
+    /// distance-sorted, deduplicated, a subset of `held`, and genuinely the
+    /// nearest peers (every excluded peer is no closer than the farthest
+    /// returned). Shared by both variants so a regression in either — sorting,
+    /// dedup, or selection — is caught identically rather than only via a size
+    /// check on the unbounded path.
+    fn check_closest_result(
+        res: &[NodeId],
+        held: &BTreeSet<NodeId>,
+        target: &[u8; NODE_ID_LEN],
+        expected_len: usize,
+    ) -> Result<(), TestCaseError> {
+        prop_assert_eq!(res.len(), expected_len);
+
+        let mut returned: BTreeSet<NodeId> = BTreeSet::new();
+        for p in res {
+            prop_assert!(held.contains(p), "closest returned a peer not in the table");
+            prop_assert!(returned.insert(*p), "closest returned a duplicate");
+        }
+
+        // Distance-sorted (non-decreasing) by XOR distance to `target`.
+        let dists: Vec<[u8; NODE_ID_LEN]> = res
+            .iter()
+            .map(|p| xor_distance_bytes(p.as_bytes(), target))
+            .collect();
+        for w in dists.windows(2) {
+            if let (Some(x), Some(y)) = (w.first(), w.get(1)) {
+                prop_assert!(x <= y, "closest not distance-sorted");
+            }
+        }
+
+        // Selection correctness: every peer NOT returned is at least as far as
+        // the farthest returned peer. Only constrains when some peers were
+        // excluded (the table held more than the cap).
+        if let Some(farthest) = dists.last() {
+            for p in held {
+                if !returned.contains(p) {
+                    let dp = xor_distance_bytes(p.as_bytes(), target);
+                    prop_assert!(
+                        dp >= *farthest,
+                        "an excluded peer was closer than a returned one"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     proptest! {
@@ -720,22 +750,25 @@ mod prop_tests {
                 // Own id is never stored.
                 prop_assert!(!rt.contains(&self_id));
 
-                // Recompute placement from the outside: group held peers by the
-                // bucket their distance dictates and assert correct placement,
-                // within-K fill, and no duplicates.
-                let mut per_bucket: BTreeMap<usize, usize> = BTreeMap::new();
+                // Validate each peer against the bucket it is ACTUALLY stored in
+                // (`rt.buckets[actual_idx]`), comparing to an independent
+                // leading-zero oracle rather than `bucket_index` — the table uses
+                // `bucket_index` to place peers, so checking against it would be
+                // circular and blind to a `bucket_index` bug. Within-K is read
+                // from the real bucket length, not a recomputed grouping.
                 let mut held: BTreeSet<NodeId> = BTreeSet::new();
-                for p in rt.iter_peers() {
-                    prop_assert_ne!(*p, self_id);
-                    let idx = bucket_index(&xor_distance(&self_id, p));
-                    prop_assert!(idx.is_some());
-                    if let Some(i) = idx {
-                        *per_bucket.entry(i).or_default() += 1;
+                for (actual_idx, bucket) in rt.buckets.iter().enumerate() {
+                    prop_assert!(bucket.len() <= K_BUCKET_SIZE, "bucket exceeded K");
+                    for p in bucket {
+                        prop_assert_ne!(*p, self_id);
+                        let lz = leading_zero_bits(&xor_distance(&self_id, p));
+                        prop_assert_eq!(
+                            actual_idx,
+                            KEYSPACE_BITS - 1 - lz,
+                            "peer stored in the wrong bucket"
+                        );
+                        prop_assert!(held.insert(*p), "duplicate peer across buckets");
                     }
-                    prop_assert!(held.insert(*p), "duplicate peer across buckets");
-                }
-                for count in per_bucket.values() {
-                    prop_assert!(*count <= K_BUCKET_SIZE);
                 }
                 prop_assert_eq!(rt.len(), held.len());
             }
@@ -771,41 +804,14 @@ mod prop_tests {
             let held: BTreeSet<NodeId> = rt.iter_peers().copied().collect();
             let len = rt.len();
 
+            // The wire-capped variant: bounded at min(n, K, len).
             let res = rt.closest(&target_bytes, n);
-            prop_assert_eq!(res.len(), n.min(K_BUCKET_SIZE).min(len));
+            check_closest_result(&res, &held, &target_bytes, n.min(K_BUCKET_SIZE).min(len))?;
 
-            let mut returned: BTreeSet<NodeId> = BTreeSet::new();
-            for p in &res {
-                prop_assert!(held.contains(p), "closest() returned a peer not in the table");
-                prop_assert!(returned.insert(*p), "closest() returned a duplicate");
-            }
-
-            // Distance-sorted (non-decreasing) by XOR distance to `target`.
-            let dists: Vec<[u8; NODE_ID_LEN]> = res
-                .iter()
-                .map(|p| xor_distance_bytes(p.as_bytes(), &target_bytes))
-                .collect();
-            for w in dists.windows(2) {
-                if let (Some(x), Some(y)) = (w.first(), w.get(1)) {
-                    prop_assert!(x <= y, "closest() not distance-sorted");
-                }
-            }
-
-            // Selection correctness: every peer NOT returned is at least as far
-            // as the farthest returned peer. (Only constrains when some peers
-            // were excluded — i.e. the table held more than the cap.)
-            if let Some(farthest) = dists.last() {
-                for p in &held {
-                    if !returned.contains(p) {
-                        let dp = xor_distance_bytes(p.as_bytes(), &target_bytes);
-                        prop_assert!(dp >= *farthest, "an excluded peer was closer than a returned one");
-                    }
-                }
-            }
-
-            // The unbounded variant is capped only by the request and table size.
+            // The unbounded variant: same ordering/dedup/nearest guarantees,
+            // bounded only by the request and table size.
             let res_unbounded = rt.closest_unbounded(&target_bytes, n);
-            prop_assert_eq!(res_unbounded.len(), n.min(len));
+            check_closest_result(&res_unbounded, &held, &target_bytes, n.min(len))?;
         }
     }
 }
