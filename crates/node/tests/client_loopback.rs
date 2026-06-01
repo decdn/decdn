@@ -642,6 +642,13 @@ impl ChannelStateStore for FailingRecordStore {
     ) -> Result<(), decdn_incentive::StoreError> {
         self.inner.forget(channel_id)
     }
+
+    fn get(
+        &self,
+        channel_id: decdn_incentive::ChannelId,
+    ) -> Result<Option<ChannelState>, decdn_incentive::StoreError> {
+        self.inner.get(channel_id)
+    }
 }
 
 /// A transient persist-write failure (`ChannelError::Store`) is surfaced in-band
@@ -1110,5 +1117,125 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
     client_ep.close().await;
     server_ep.close().await;
     let _ = server_task.await;
+    Ok(())
+}
+
+/// **#327 / #527 idempotency guard.** A re-observed `ChannelOpened` (which the
+/// settlement watcher *will* replay after any RPC-error resubscription) must
+/// NOT reset an already-advanced voucher watermark via `register_open_channel`
+/// — doing so would reopen the replay window. Here the channel is already
+/// known with `last_nonce = 5` (hydrated from the store at construction); a
+/// fresh `register_open_channel` for the same id (nonce 0) must be a no-op.
+#[tokio::test]
+async fn register_open_channel_is_idempotent_and_preserves_watermark() -> anyhow::Result<()> {
+    let (cache, _tmp) = empty_cache().await?;
+    let store = Arc::new(MemoryChannelStateStore::new());
+    let client = PrivateKeySigner::random().address();
+
+    // Pre-seed an advanced watermark, as if vouchers had been accepted.
+    let mut advanced = ChannelState::new(channel_id(), client, TOKEN, U256::from(10_000_000u64));
+    advanced.last_nonce = U256::from(5u64);
+    advanced.last_amount = U256::from(4_321u64);
+    advanced.last_bytes_delivered = U256::from(2_048u64);
+    advanced.last_signature = vec![0x11; 65];
+    store.record(&advanced)?;
+
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler(
+        fresh_key().public(),
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    // A replayed ChannelOpened arrives as a brand-new (nonce 0) state.
+    handler
+        .register_open_channel(ChannelState::new(
+            channel_id(),
+            client,
+            TOKEN,
+            U256::from(10_000_000u64),
+        ))
+        .await?;
+
+    let after = store
+        .get(channel_id())?
+        .ok_or_else(|| anyhow::anyhow!("channel vanished"))?;
+    anyhow::ensure!(
+        after.last_nonce == U256::from(5u64),
+        "re-observed ChannelOpened reset the watermark to {} (reopened #527 replay window)",
+        after.last_nonce
+    );
+    anyhow::ensure!(after.last_amount == U256::from(4_321u64));
+    Ok(())
+}
+
+/// `update_channel_deposit` (#327 `ChannelToppedUp` handling): raises a tracked
+/// deposit, is a no-op for a non-increasing value (deposits only grow; the
+/// event is not provider-indexed), and a no-op for an untracked channel.
+#[tokio::test]
+async fn update_channel_deposit_raises_and_is_idempotent() -> anyhow::Result<()> {
+    let (cache, _tmp) = empty_cache().await?;
+    let store = Arc::new(MemoryChannelStateStore::new());
+    let client = PrivateKeySigner::random().address();
+    store.record(&ChannelState::new(
+        channel_id(),
+        client,
+        TOKEN,
+        U256::from(10_000_000u64),
+    ))?;
+
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler(
+        fresh_key().public(),
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    // Non-increasing => no-op.
+    handler
+        .update_channel_deposit(channel_id(), U256::from(5_000_000u64))
+        .await?;
+    let deposit = |s: &Arc<MemoryChannelStateStore>| -> anyhow::Result<U256> {
+        Ok(s.get(channel_id())?
+            .ok_or_else(|| anyhow::anyhow!("missing"))?
+            .deposit)
+    };
+    anyhow::ensure!(
+        deposit(&store)? == U256::from(10_000_000u64),
+        "lower deposit ignored"
+    );
+
+    // Higher => raised and persisted.
+    handler
+        .update_channel_deposit(channel_id(), U256::from(20_000_000u64))
+        .await?;
+    anyhow::ensure!(
+        deposit(&store)? == U256::from(20_000_000u64),
+        "top-up raised deposit"
+    );
+
+    // Untracked channel => no-op, no error, no row created.
+    let other = B256::repeat_byte(0x99);
+    handler
+        .update_channel_deposit(other, U256::from(50_000_000u64))
+        .await?;
+    anyhow::ensure!(
+        store.get(other)?.is_none(),
+        "untracked top-up must not create state"
+    );
     Ok(())
 }

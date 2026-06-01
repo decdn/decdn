@@ -19,7 +19,7 @@ use crate::dht::routing::NodeId;
 /// Membership change emitted by [`StakerSet::subscribe_changes`].
 ///
 /// The chain-backed implementation emits one of these for every
-/// observed `StakingRegistry` event that flips the canonical
+/// observed `CapacityBond` event that flips the canonical
 /// `isActive` predicate (`NodeRegistered` / `NodeDeregistered` /
 /// `NodeAutoEjected` / `Reinstated` / `UnbondingRequested`), after
 /// the in-memory active set has been updated. `ConfigStakerSet` never
@@ -68,7 +68,7 @@ pub trait StakerSet: Send + Sync + std::fmt::Debug {
     }
 
     /// Subscribe to membership changes. The chain-backed impl emits on
-    /// every `StakingRegistry` event that flips a node's `isActive`
+    /// every `CapacityBond` event that flips a node's `isActive`
     /// predicate, after its own cache has been updated — so a
     /// `recv().await` followed by `is_active` returns the post-event
     /// state. `ConfigStakerSet` returns a receiver that never fires.
@@ -84,7 +84,7 @@ pub trait StakerSet: Send + Sync + std::fmt::Debug {
 /// `NodeId` set or empty.
 ///
 /// The runtime wires this with [`Self::empty`] until the chain-backed
-/// `ChainStakerSet` (reads `StakingRegistry.getActiveNodes()` once at
+/// `ChainStakerSet` (reads `CapacityBond.getActiveNodes()` once at
 /// startup and subscribes to the registry's membership events) is
 /// ready — same trait, drop-in swap at the runtime construction site.
 /// Tests construct via [`Self::new`] with a known `HashSet`.

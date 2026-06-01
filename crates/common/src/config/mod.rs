@@ -60,6 +60,11 @@ const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
 /// the watchdog probing the RPC endpoint frequently enough to risk
 /// tripping provider rate limits or exhausting paid quotas.
 const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
+
+/// Default accrued-claim redemption threshold: 1 USDC (`1_000_000` `µUSDC`).
+/// At this size the ~$0.10 `withdraw` gas is a few percent of the redeemed
+/// amount while bounding unsettled exposure to ~1 USDC per channel (#327).
+const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -137,7 +142,7 @@ pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE
 /// Returns an error if:
 /// - The config file exists but cannot be read or parsed.
 /// - A required field (`rpc_url`, `payment_channel_address`,
-///   `staking_registry_address`) is not provided by any source.
+///   `capacity_bond_address`) is not provided by any source.
 /// - The home directory cannot be determined for default paths.
 pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Result<ResolvedConfig> {
     // `load_file_config` stays fail-fast: a file we could not read, parse,
@@ -599,14 +604,14 @@ fn resolve_blockchain_into(
         bag,
     );
 
-    let staking_registry_address = resolve_contract_address(
-        "blockchain.staking_registry_address",
-        "staking_registry_address",
-        "missing required option: --staking-registry-address \
-         (or blockchain.staking_registry_address in config file)",
-        cli.staking_registry_address
+    let capacity_bond_address = resolve_contract_address(
+        "blockchain.capacity_bond_address",
+        "capacity_bond_address",
+        "missing required option: --capacity-bond-address \
+         (or blockchain.capacity_bond_address in config file)",
+        cli.capacity_bond_address
             .clone()
-            .or_else(|| file.and_then(|b| b.staking_registry_address.clone())),
+            .or_else(|| file.and_then(|b| b.capacity_bond_address.clone())),
         bag,
     );
 
@@ -672,6 +677,23 @@ fn resolve_blockchain_into(
         },
     );
 
+    let redeem_threshold_micro_usdc = file
+        .and_then(|b| b.redeem_threshold_micro_usdc)
+        .unwrap_or(DEFAULT_REDEEM_THRESHOLD_MICRO_USDC);
+    // A `0` threshold would withdraw on every accepted voucher — burning gas
+    // per MB and reverting on-chain (`NothingToWithdraw`) for any zero-delta
+    // re-hint. Reject it; operators wanting aggressive redemption set a small
+    // positive value (base units, µUSDC).
+    bag.check_with(
+        redeem_threshold_micro_usdc > 0,
+        "blockchain.redeem_threshold_micro_usdc",
+        || {
+            "blockchain.redeem_threshold_micro_usdc must be > 0 (a 0 threshold \
+             withdraws on every voucher, burning gas and reverting on zero-delta)"
+                .to_string()
+        },
+    );
+
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
     // the runtime loader: if the operator passes a stale path the failure
@@ -684,10 +706,11 @@ fn resolve_blockchain_into(
         eth_keystore,
         keystore_password_file,
         payment_channel_address,
-        staking_registry_address,
+        capacity_bond_address,
         slash_judge_address,
         chain_id,
         rpc_watchdog_interval_sec,
+        redeem_threshold_micro_usdc,
     }
 }
 
@@ -1867,8 +1890,8 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
             "blockchain.payment_channel_address",
         )?;
         expand_str(
-            &mut b.staking_registry_address,
-            "blockchain.staking_registry_address",
+            &mut b.capacity_bond_address,
+            "blockchain.capacity_bond_address",
         )?;
         expand_str(&mut b.slash_judge_address, "blockchain.slash_judge_address")?;
     }
@@ -2811,9 +2834,9 @@ mod tests {
                     ..Default::default()
                 });
             }),
-            ("blockchain.staking_registry_address", |c, v| {
+            ("blockchain.capacity_bond_address", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
-                    staking_registry_address: Some(v.to_string()),
+                    capacity_bond_address: Some(v.to_string()),
                     ..Default::default()
                 });
             }),
@@ -5331,7 +5354,7 @@ mod tests {
             ("eth_keystore", "DECDN_ETH_KEYSTORE"),
             ("keystore_password_file", "DECDN_KEYSTORE_PASSWORD_FILE"),
             ("payment_channel_address", "DECDN_PAYMENT_CHANNEL_ADDRESS"),
-            ("staking_registry_address", "DECDN_STAKING_REGISTRY_ADDRESS"),
+            ("capacity_bond_address", "DECDN_CAPACITY_BOND_ADDRESS"),
             ("slash_judge_address", "DECDN_SLASH_JUDGE_ADDRESS"),
             ("chain_id", "DECDN_CHAIN_ID"),
             ("cache_dir", "DECDN_CACHE_DIR"),
@@ -5394,7 +5417,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some("0xNOTHEX".to_string()),
+            capacity_bond_address: Some("0xNOTHEX".to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5404,8 +5427,8 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("staking_registry_address"),
-            "error should name staking_registry_address: {msg}"
+            msg.contains("capacity_bond_address"),
+            "error should name capacity_bond_address: {msg}"
         );
         assert!(
             !msg.contains("payment_channel_address"),
@@ -5421,7 +5444,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some("0xNOTHEX".to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5435,7 +5458,7 @@ mod tests {
             "error should name payment_channel_address: {msg}"
         );
         assert!(
-            !msg.contains("staking_registry_address"),
+            !msg.contains("capacity_bond_address"),
             "error must not name the valid field: {msg}"
         );
         Ok(())
@@ -5449,7 +5472,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5477,7 +5500,7 @@ mod tests {
             eth_keystore: Some(bogus),
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5504,7 +5527,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5542,7 +5565,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: None,
-            staking_registry_address: None,
+            capacity_bond_address: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         }
@@ -5686,7 +5709,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5694,8 +5717,9 @@ mod tests {
             rpc_url: Some("https://file-loses.example/rpc".to_string()),
             eth_keystore: None,
             payment_channel_address: None,
-            staking_registry_address: None,
+            capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
+            redeem_threshold_micro_usdc: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5719,8 +5743,9 @@ mod tests {
             rpc_url: Some("https://file-only.example/rpc".to_string()),
             eth_keystore: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             rpc_watchdog_interval_sec: None,
+            redeem_threshold_micro_usdc: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5743,7 +5768,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5766,7 +5791,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: None,
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5782,24 +5807,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_blockchain_errors_when_staking_registry_address_missing() -> anyhow::Result<()> {
+    fn resolve_blockchain_errors_when_capacity_bond_address_missing() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: None,
+            capacity_bond_address: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-            anyhow::bail!("expected error when staking_registry_address missing");
+            anyhow::bail!("expected error when capacity_bond_address missing");
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("staking_registry_address"),
-            "error should mention staking_registry_address: {msg}"
+            msg.contains("capacity_bond_address"),
+            "error should mention capacity_bond_address: {msg}"
         );
         Ok(())
     }
@@ -5812,7 +5837,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: None,
             chain_id: None,
         };
@@ -5835,7 +5860,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some("0x0000000000000000000000000000000000000000".to_string()),
             chain_id: None,
         };
@@ -5858,7 +5883,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: Some(0),
         };
@@ -5884,7 +5909,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5907,7 +5932,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5915,8 +5940,9 @@ mod tests {
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
-            staking_registry_address: None,
+            capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(1),
+            redeem_threshold_micro_usdc: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5933,6 +5959,39 @@ mod tests {
     }
 
     #[test]
+    fn resolve_blockchain_rejects_zero_redeem_threshold() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            capacity_bond_address: None,
+            rpc_watchdog_interval_sec: None,
+            redeem_threshold_micro_usdc: Some(0),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when redeem threshold is 0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("redeem_threshold_micro_usdc"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resolve_blockchain_accepts_zero_watchdog_interval() -> anyhow::Result<()> {
         // `0` is the documented disable sentinel and must bypass the floor.
         let dir = data_dir_with_keystore()?;
@@ -5941,7 +6000,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5949,8 +6008,9 @@ mod tests {
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
-            staking_registry_address: None,
+            capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(0),
+            redeem_threshold_micro_usdc: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5967,7 +6027,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5975,8 +6035,9 @@ mod tests {
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
-            staking_registry_address: None,
+            capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
+            redeem_threshold_micro_usdc: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6000,7 +6061,7 @@ mod tests {
             eth_keystore: None,
             keystore_password_file: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
-            staking_registry_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6210,7 +6271,7 @@ mod tests {
 [blockchain]
 rpc_url = "https://example/rpc"
 payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [gossip]
 subscribe_global = false
@@ -6220,7 +6281,7 @@ subscribe_global = false
     fn blockchain_toml_body(
         rpc_url: &str,
         payment_channel_address: &str,
-        staking_registry_address: &str,
+        capacity_bond_address: &str,
         rpc_watchdog_interval_sec: Option<u64>,
     ) -> String {
         let watchdog = rpc_watchdog_interval_sec
@@ -6231,7 +6292,7 @@ subscribe_global = false
 [blockchain]
 rpc_url = "{rpc_url}"
 payment_channel_address = "{payment_channel_address}"
-staking_registry_address = "{staking_registry_address}"
+capacity_bond_address = "{capacity_bond_address}"
 {watchdog}[gossip]
 subscribe_global = false
 "#
@@ -6306,7 +6367,7 @@ subscribe_global = false
         let mut args = run_args_with_data_dir(dir.path());
         args.blockchain.rpc_url = Some("https://override.example/rpc".to_string());
         args.blockchain.payment_channel_address = Some(GOOD_ADDR.to_string());
-        args.blockchain.staking_registry_address = Some(ALT_ADDR_3.to_string());
+        args.blockchain.capacity_bond_address = Some(ALT_ADDR_3.to_string());
 
         let resolved = resolve_config(Some(&path), &args)?;
 
@@ -6319,7 +6380,7 @@ subscribe_global = false
             resolved.blockchain.rpc_url,
         );
         assert_eq!(resolved.blockchain.payment_channel_address, GOOD_ADDR);
-        assert_eq!(resolved.blockchain.staking_registry_address, ALT_ADDR_3);
+        assert_eq!(resolved.blockchain.capacity_bond_address, ALT_ADDR_3);
         Ok(())
     }
 
@@ -6348,7 +6409,7 @@ subscribe_global = false
             resolved.blockchain.rpc_url,
         );
         assert_eq!(resolved.blockchain.payment_channel_address, ALT_ADDR_1);
-        assert_eq!(resolved.blockchain.staking_registry_address, ALT_ADDR_2);
+        assert_eq!(resolved.blockchain.capacity_bond_address, ALT_ADDR_2);
         assert_eq!(
             resolved.blockchain.rpc_watchdog_interval_sec,
             MIN_RPC_WATCHDOG_INTERVAL_SEC
@@ -6390,7 +6451,7 @@ subscribe_global = false
 [blockchain]
 rpc_url = "https://example/rpc"
 payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 "#;
         let dir = data_dir_with_keystore()?;
         let path = write_minimal_toml(&dir, body)?;
@@ -6438,7 +6499,7 @@ region = "USA"
 
 [blockchain]
 payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [cache]
@@ -6490,7 +6551,7 @@ rate_per_mb = 0
         let body = r#"
 [blockchain]
 payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [gossip]
@@ -6530,7 +6591,7 @@ subscribe_global = false
 [blockchain]
 rpc_url = "https://example/rpc"
 payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [gossip]
 subscribe_global = false
@@ -6572,7 +6633,7 @@ subscribe_global = false
 [blockchain]
 rpc_url = "https://example/rpc"
 payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [gossip]
@@ -6616,7 +6677,7 @@ region = "USA"
 [blockchain]
 rpc_url = "https://example/rpc"
 payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-staking_registry_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [[cache.origins]]

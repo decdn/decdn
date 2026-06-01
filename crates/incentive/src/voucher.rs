@@ -1,4 +1,4 @@
-//! EIP-712 payment vouchers for the `StablePaymentChannel` contract.
+//! EIP-712 payment vouchers for the `PaymentChannel` contract.
 //!
 //! Vouchers are off-chain signed messages a client (payer) issues to a node
 //! (payee) as content is delivered. Each voucher carries a cumulative `amount`
@@ -14,10 +14,10 @@
 //!
 //! ```text
 //! EIP712Domain {
-//!     name: "StablePaymentChannel",
+//!     name: "PaymentChannel",
 //!     version: "1",
 //!     chainId: <L2 chain id>,
-//!     verifyingContract: <StablePaymentChannel deployment address>,
+//!     verifyingContract: <PaymentChannel deployment address>,
 //! }
 //! ```
 //!
@@ -36,10 +36,10 @@ use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::signers::SignerSync;
 use alloy::sol_types::{SolStruct, eip712_domain};
 
-/// EIP-712 domain `name` field. Must match the `StablePaymentChannel`
+/// EIP-712 domain `name` field. Must match the `PaymentChannel`
 /// contract's domain exactly — a mismatch produces a different digest and
 /// every signature fails on-chain.
-pub const DOMAIN_NAME: &str = "StablePaymentChannel";
+pub const DOMAIN_NAME: &str = "PaymentChannel";
 
 /// EIP-712 domain `version` field.
 pub const DOMAIN_VERSION: &str = "1";
@@ -70,7 +70,7 @@ mod sol_types {
 use sol_types::Voucher as VoucherSol;
 
 /// Construct the EIP-712 domain used to sign vouchers for a given
-/// `StablePaymentChannel` deployment.
+/// `PaymentChannel` deployment.
 #[must_use]
 pub fn voucher_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
     eip712_domain! {
@@ -97,7 +97,7 @@ pub struct Voucher {
     /// Cumulative bytes delivered against this channel.
     pub bytes_delivered: U256,
     /// `ERC-20` token address (`USDC` — the only token bound by
-    /// `StablePaymentChannel`).
+    /// `PaymentChannel`).
     pub token: Address,
 }
 
@@ -469,5 +469,23 @@ mod tests {
             "recovered {recovered}, expected {address}"
         );
         Ok(())
+    }
+
+    /// Pin the EIP-712 domain `name`/`version` to the on-chain contract's
+    /// constructor args — `PaymentChannel.sol` calls `EIP712("PaymentChannel",
+    /// "1")`. A divergence here makes every `closeChannel`/`withdraw` revert
+    /// with the contract's `InvalidVoucherSignature` even though off-chain
+    /// `verify_signer` passes, so the literal is asserted directly rather than
+    /// derived from `DOMAIN_NAME` (which would let a regression slip through).
+    #[test]
+    fn domain_matches_payment_channel_contract() {
+        assert_eq!(
+            DOMAIN_NAME, "PaymentChannel",
+            "voucher domain name must match PaymentChannel.sol EIP712 ctor"
+        );
+        assert_eq!(
+            DOMAIN_VERSION, "1",
+            "voucher domain version must match PaymentChannel.sol EIP712 ctor"
+        );
     }
 }

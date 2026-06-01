@@ -36,13 +36,15 @@ use crate::handlers::dht::DhtHandler;
 use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::ProbeHandler;
 use crate::metrics;
-use alloy::primitives::Address;
+use crate::payment_settlement::PaymentChannelService;
+use alloy::network::EthereumWallet;
+use alloy::primitives::{Address, U256};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
-use decdn_incentive::ChannelStateStore;
 use decdn_incentive::eth_identity::{self, PasswordSource};
+use decdn_incentive::{ChannelStateStore, PendingSettleStore};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger
@@ -349,7 +351,7 @@ pub async fn run(
     // Failure here MUST abort startup: continuing with a fresh in-memory
     // map silently reopens the replay window the store exists to close.
     let channel_store_data_dir = cfg.identity.data_dir.clone();
-    let channel_state_store: Arc<dyn ChannelStateStore> = Arc::new(
+    let concrete_channel_store = Arc::new(
         tokio::task::spawn_blocking(move || {
             PersistentChannelStateStore::open(&channel_store_data_dir)
         })
@@ -357,6 +359,13 @@ pub async fn run(
         .context("channel state store open task panicked")?
         .context("failed to open channel state store (issue #527 voucher replay guard)")?,
     );
+    // The one redb-backed store implements both the voucher-state trait (for
+    // the handler + #527 replay guard) and the pending-settle trait (for the
+    // on-chain settlement sweep, PR #743 review). Derive two trait-object
+    // handles from the single concrete store so both tables share one open
+    // file and one fsync discipline.
+    let channel_state_store: Arc<dyn ChannelStateStore> = concrete_channel_store.clone();
+    let pending_settle_store: Arc<dyn PendingSettleStore> = concrete_channel_store;
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema even before the
     // future cdn/client/v1 handler (#317) is constructed. The handler will
@@ -505,22 +514,22 @@ pub async fn run(
                 cfg.blockchain.rpc_url
             )
         })?;
-    let staking_registry_addr: Address = cfg
-        .blockchain
-        .staking_registry_address
-        .parse()
-        .with_context(|| {
-            format!(
-                "blockchain.staking_registry_address {:?} is not a valid address",
-                cfg.blockchain.staking_registry_address
-            )
-        })?;
-    let chain_provider = ProviderBuilder::new().connect_http(rpc_url);
+    let capacity_bond_addr: Address =
+        cfg.blockchain
+            .capacity_bond_address
+            .parse()
+            .with_context(|| {
+                format!(
+                    "blockchain.capacity_bond_address {:?} is not a valid address",
+                    cfg.blockchain.capacity_bond_address
+                )
+            })?;
+    let chain_provider = ProviderBuilder::new().connect_http(rpc_url.clone());
     let staker_set: Arc<dyn StakerSet> = Arc::new(
-        ChainStakerSet::bootstrap(chain_provider, staking_registry_addr)
+        ChainStakerSet::bootstrap(chain_provider, capacity_bond_addr)
             .await
             .with_context(|| {
-                format!("ChainStakerSet bootstrap from StakingRegistry at {staking_registry_addr}")
+                format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
             })?,
     );
     let dht_handler = Arc::new(DhtHandler::new(
@@ -538,8 +547,8 @@ pub async fn run(
     let dht_routing = dht_handler.routing_table();
 
     // `cdn/client/v1` paid-delivery handler (#317). The voucher EIP-712 domain
-    // binds to the `StablePaymentChannel` deployment; the ephemeral-binding
-    // domain to the `CapacityBond` deployment (== `staking_registry_addr`,
+    // binds to the `PaymentChannel` deployment; the ephemeral-binding
+    // domain to the `CapacityBond` deployment (== `capacity_bond_addr`,
     // which holds the NodeId↔address mappings). The handler hydrates per-channel
     // voucher state from `channel_state_store` so a restart cannot replay an
     // already-accepted voucher (#527).
@@ -556,7 +565,7 @@ pub async fn run(
     let voucher_domain =
         decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr);
     let bind_domain =
-        decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, staking_registry_addr);
+        decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
     let client_handler = Arc::new(ClientHandler::new(
         secret_key.public(),
         Arc::clone(&node_metrics),
@@ -576,6 +585,29 @@ pub async fn run(
             .saturating_mul(decdn_protocol::MB_BYTES),
         MAX_CLIENT_STREAMS,
     )?);
+
+    // On-chain seller-settlement service (#327). A wallet-filled provider
+    // (the staker-set provider above is read-only) signs the `withdraw` /
+    // `closeChannel` transactions with the same eth keystore signer. The
+    // bootstrap self-checks the contract via `usdc()`; the watcher persists
+    // channels opened against this node so the handler accepts their vouchers,
+    // and forgets settled ones. The redeem hint lets the handler nudge the
+    // service when an accrued claim may have crossed the threshold.
+    let wallet_provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from((*eth_signer).clone()))
+        .connect_http(rpc_url);
+    let payment_service = PaymentChannelService::bootstrap(
+        wallet_provider,
+        payment_channel_addr,
+        eth_signer.address(),
+        Arc::clone(&channel_state_store),
+        Arc::clone(&pending_settle_store),
+        Arc::clone(&client_handler),
+        U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
+    )
+    .await
+    .context("PaymentChannel settlement service bootstrap")?;
+    client_handler.attach_redeem_hint(payment_service.redeem_hint_sender());
 
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
@@ -981,6 +1013,15 @@ pub async fn run(
     for handle in &gossip_handles {
         handle.abort();
     }
+
+    // Redeem on shutdown (#327): now that the router has drained, no further
+    // vouchers will arrive and the persisted channel state is final. Close
+    // any channel still carrying an un-redeemed claim so a later
+    // `settleChannel` can finalize it. Best-effort and bounded so a slow RPC
+    // cannot hang shutdown past the deadline.
+    payment_service
+        .close_open_channels_on_shutdown(SHUTDOWN_DEADLINE)
+        .await;
 
     // Late admin stop (issue #604 `AfterRouter` path). The polling
     // client (`decdn node drain --wait`) needed admin to stay open
@@ -1713,8 +1754,9 @@ mod tests {
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,
                 payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
-                staking_registry_address: "0x0000000000000000000000000000000000000002".into(),
+                capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
+                redeem_threshold_micro_usdc: 1_000_000,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },

@@ -9,14 +9,18 @@
 //! rejection is sent as a [`ClientMessage::StreamError`] and the stream is
 //! closed **cleanly** (no QUIC reset) so the client can read the reason.
 //!
-//! # Scope (#317 / #327 boundary)
+//! # Scope (#317 / #327)
 //!
-//! This handler validates vouchers only for channels already present in the
-//! persisted [`ChannelStateStore`]. The on-chain channel-open consumer that
-//! would populate new channels is out of scope (#327), so a voucher for an
-//! unknown `channel_id` is rejected with
-//! [`VoucherRejectReason::WrongChannel`] — the closest existing reason. The
-//! handler is therefore useful for already-persisted channels until #327 lands.
+//! This handler validates vouchers only for channels present in the persisted
+//! [`ChannelStateStore`]. Channels enter that set two ways: hydrated from the
+//! store at construction (see [`ClientHandler::new`]), and live as the
+//! on-chain `ChannelOpened` consumer in [`crate::payment_settlement`] (#327)
+//! calls [`ClientHandler::register_open_channel`]. A voucher for a
+//! still-unknown `channel_id` is rejected with
+//! [`VoucherRejectReason::WrongChannel`] — the closest existing reason. After
+//! accepting a voucher the handler emits a redeem hint (see
+//! [`ClientHandler::attach_redeem_hint`]) so the settlement service can
+//! withdraw the accrued claim once it crosses its threshold.
 //!
 //! # 0-RTT
 //!
@@ -25,8 +29,8 @@
 //! takes the full handshake.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -34,6 +38,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, Hash};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, verify_rate};
+use decdn_incentive::store::StoreError;
 use decdn_incentive::{
     ChannelId, ChannelState, ChannelStateStore, StreamSlashData, verify_binding,
     voucher_reject_reason, wire_voucher_to_signed,
@@ -50,7 +55,7 @@ use futures_util::StreamExt as _;
 use iroh::PublicKey;
 use iroh::endpoint::{Accepting, Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
@@ -91,7 +96,7 @@ pub struct ClientHandler {
     eth_signer: Arc<PrivateKeySigner>,
     /// `SlashJudge` EIP-712 domain for `StreamResponse.slash_sig`.
     slash_domain: Eip712Domain,
-    /// `StablePaymentChannel` EIP-712 domain for voucher verification.
+    /// `PaymentChannel` EIP-712 domain for voucher verification.
     voucher_domain: Eip712Domain,
     /// `CapacityBond` EIP-712 domain for ephemeral `BindNodeId` verification.
     bind_domain: Eip712Domain,
@@ -100,6 +105,11 @@ pub struct ClientHandler {
     /// guards the map; each inner mutex serializes voucher application for one
     /// channel across its concurrent streams (ADR 003 §concurrent streams).
     channels: Arc<Mutex<HashMap<ChannelId, Arc<Mutex<ChannelDeliveryState>>>>>,
+    /// Redeem-hint sender to the on-chain settlement service (#327), attached
+    /// post-construction via [`ClientHandler::attach_redeem_hint`]. `None`
+    /// until attached (e.g. in tests with no settlement service) — a hint is
+    /// best-effort, so an unattached or full channel just skips it.
+    redeem_hint: OnceLock<mpsc::Sender<ChannelId>>,
     rate_per_mb: Arc<AtomicU64>,
     delivery_floor: u64,
     delivery_ceiling: u64,
@@ -169,6 +179,7 @@ impl ClientHandler {
             bind_domain,
             channel_state_store,
             channels: Arc::new(Mutex::new(map)),
+            redeem_hint: OnceLock::new(),
             rate_per_mb,
             delivery_floor,
             delivery_ceiling,
@@ -176,6 +187,105 @@ impl ClientHandler {
             max_blob_size_bytes,
             max_concurrent_streams,
         })
+    }
+
+    /// Attach the redeem-hint sender from the on-chain settlement service
+    /// (#327). Called once during runtime wiring; a second call is ignored
+    /// (the `OnceLock` keeps the first). After this, an accepted voucher
+    /// best-effort hints the channel for redemption.
+    pub fn attach_redeem_hint(&self, tx: mpsc::Sender<ChannelId>) {
+        let _ = self.redeem_hint.set(tx);
+    }
+
+    /// Register a channel observed on-chain via `ChannelOpened` (#327) so the
+    /// voucher path accepts vouchers for it. Persists a fresh [`ChannelState`]
+    /// durably, then inserts it into the live map.
+    ///
+    /// **Idempotent:** a re-observed `ChannelOpened` (e.g. after a watcher
+    /// resubscription) for an already-tracked channel is a no-op — it MUST
+    /// NOT reset the accepted-voucher watermark and reopen the #527 replay
+    /// window. The live map (hydrated from the store at construction, updated
+    /// here) is the authority.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a [`StoreError`] if the durable persist fails; the watcher
+    /// logs and retries on the next `ChannelOpened` observation.
+    pub async fn register_open_channel(&self, state: ChannelState) -> Result<(), StoreError> {
+        if self.channels.lock().await.contains_key(&state.channel_id) {
+            return Ok(());
+        }
+        // The store write is a synchronous fsync (store trait §Durability) —
+        // run it off the runtime worker, same as the voucher-accept path.
+        let store = Arc::clone(&self.channel_state_store);
+        let to_persist = state.clone();
+        tokio::task::spawn_blocking(move || store.record(&to_persist))
+            .await
+            .map_err(|e| StoreError::Backend(format!("register_open_channel join: {e}")))??;
+
+        let bytes = state.last_bytes_delivered;
+        self.channels
+            .lock()
+            .await
+            .entry(state.channel_id)
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(ChannelDeliveryState {
+                    state,
+                    bytes_delivered_cumulative: bytes,
+                }))
+            });
+        Ok(())
+    }
+
+    /// Drop a settled channel (observed via `ChannelSettled`, #327) from the
+    /// live map and the persisted store. Idempotent — forgetting an unknown
+    /// channel is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a [`StoreError`] if the durable delete fails.
+    pub async fn forget_channel(&self, channel_id: ChannelId) -> Result<(), StoreError> {
+        self.channels.lock().await.remove(&channel_id);
+        let store = Arc::clone(&self.channel_state_store);
+        tokio::task::spawn_blocking(move || store.forget(channel_id))
+            .await
+            .map_err(|e| StoreError::Backend(format!("forget_channel join: {e}")))?
+    }
+
+    /// Raise a tracked channel's on-chain deposit after a `ChannelToppedUp`
+    /// event (#327). Without this, [`decdn_incentive::ChannelState::apply_voucher`]
+    /// keeps enforcing the original (lower) deposit and rejects the
+    /// otherwise-valid vouchers a client signs *after* topping up. No-op for
+    /// channels this node does not track; idempotent for a non-increasing
+    /// `new_deposit` (deposits only ever grow).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a [`StoreError`] if the durable persist fails.
+    pub async fn update_channel_deposit(
+        &self,
+        channel_id: ChannelId,
+        new_deposit: U256,
+    ) -> Result<(), StoreError> {
+        let entry = self.channels.lock().await.get(&channel_id).cloned();
+        let Some(entry) = entry else { return Ok(()) };
+        let mut guard = entry.lock().await;
+        if guard.state.deposit >= new_deposit {
+            return Ok(());
+        }
+        // Persist the raised deposit before advancing in-memory, mirroring the
+        // voucher-accept commit discipline (#527): record a clone durably and
+        // swap it in only on success. The per-channel guard is held across the
+        // blocking write so a concurrent voucher on this channel serializes.
+        let mut next = guard.state.clone();
+        next.deposit = new_deposit;
+        let to_persist = next.clone();
+        let store = Arc::clone(&self.channel_state_store);
+        tokio::task::spawn_blocking(move || store.record(&to_persist))
+            .await
+            .map_err(|e| StoreError::Backend(format!("update_channel_deposit join: {e}")))??;
+        guard.state = next;
+        Ok(())
     }
 
     /// Accept the connection-level rate-limit permit, then serve each inbound
@@ -511,6 +621,23 @@ impl ClientHandler {
         };
 
         let mut guard = channel.lock().await;
+
+        // Expiry gate (#327): once the channel has passed its on-chain
+        // `expiresAt`, `withdraw`/`closeChannel` revert and the client can
+        // `reclaimExpired` for a full refund — any further delivery would be
+        // unpaid. Refuse rather than accept a voucher we could never redeem.
+        // (The settlement sweep normally closes + retires channels well before
+        // this; this is the defense-in-depth for a node that was down through
+        // the close window.) Fails the stream — there is no wire reason for
+        // expiry, same as the underpayment path below.
+        if crate::payment_settlement::is_expired(
+            crate::payment_settlement::unix_now(),
+            guard.state.expires_at,
+        ) {
+            drop(guard);
+            anyhow::bail!("channel {channel_id} expired on-chain; refusing further paid delivery");
+        }
+
         let new_bytes = guard
             .bytes_delivered_cumulative
             .saturating_add(U256::from(delta_bytes));
@@ -561,6 +688,13 @@ impl ClientHandler {
                 guard.state = candidate;
                 guard.bytes_delivered_cumulative = new_bytes;
                 drop(guard);
+                // Hint the on-chain settlement service that this channel's
+                // accrued claim advanced (#327). Best-effort: an unattached or
+                // full hint channel just skips — the next voucher re-hints, and
+                // shutdown closes any residual claim.
+                if let Some(tx) = self.redeem_hint.get() {
+                    let _ = tx.try_send(channel_id);
+                }
                 self.write_message(send, &ClientMessage::VoucherAck).await?;
                 Ok(VoucherOutcome::Accepted)
             }

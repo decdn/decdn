@@ -14,5 +14,6 @@ pub mod dht;
 pub mod dispatch;
 pub mod handlers;
 pub mod metrics;
+pub mod payment_settlement;
 pub mod runtime;
 pub mod selection;

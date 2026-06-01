@@ -58,7 +58,7 @@ pub struct ChannelContext {
     pub deposit: U256,
     /// Client key that signs vouchers.
     pub client_signer: Arc<PrivateKeySigner>,
-    /// `StablePaymentChannel` EIP-712 domain.
+    /// `PaymentChannel` EIP-712 domain.
     pub voucher_domain: Eip712Domain,
     /// Nonce of the last voucher the client issued on this channel (the next
     /// voucher uses `prior_nonce + 1`). `ZERO` for a fresh channel.

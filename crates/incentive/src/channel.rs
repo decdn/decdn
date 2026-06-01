@@ -47,7 +47,7 @@ pub struct ChannelState {
     /// The Ethereum address that opened the channel and signs vouchers.
     pub client: Address,
     /// `ERC-20` token bound by this channel (`USDC` is the only token
-    /// supported by `StablePaymentChannel`).
+    /// supported by `PaymentChannel`).
     pub token: Address,
     /// On-chain deposited amount in token base units. Vouchers MUST NOT
     /// exceed this value.
@@ -61,6 +61,21 @@ pub struct ChannelState {
     pub last_nonce: U256,
     /// Cumulative bytes delivered as of the most-recently-accepted voucher.
     pub last_bytes_delivered: U256,
+    /// Raw bytes (`r‖s‖v`, 65 bytes) of the signature on the
+    /// most-recently-accepted voucher — the `signature` argument the seller
+    /// path submits to the on-chain `closeChannel` / `withdraw` (#327). Empty
+    /// until the first voucher is applied (and for channels hydrated from a
+    /// pre-signature store schema). Same encoding as the
+    /// [`crate::client_bridge`] wire form.
+    pub last_signature: Vec<u8>,
+    /// On-chain channel expiry (Unix seconds), from the `ChannelOpened` event.
+    /// `0` means "unknown / not tracked" (channels constructed by [`Self::new`]
+    /// without a chain source, and records hydrated from a pre-expiry store
+    /// schema) and is treated as never-expiring. After expiry the contract
+    /// reverts `withdraw`/`closeChannel` and the client may `reclaimExpired`,
+    /// so the seller path uses this to close (and stop serving) beforehand
+    /// (#327). Set as a field — not advanced through [`Self::apply_voucher`].
+    pub expires_at: u64,
 }
 
 impl ChannelState {
@@ -81,6 +96,8 @@ impl ChannelState {
             last_amount: U256::ZERO,
             last_nonce: U256::ZERO,
             last_bytes_delivered: U256::ZERO,
+            last_signature: Vec::new(),
+            expires_at: 0,
         }
     }
 
@@ -166,6 +183,10 @@ impl ChannelState {
         next.last_amount = signed.voucher.amount;
         next.last_nonce = signed.voucher.nonce;
         next.last_bytes_delivered = signed.voucher.bytes_delivered;
+        // Retain the signature so the seller path can submit this exact
+        // voucher to the on-chain `closeChannel` / `withdraw` (#327). Same
+        // `r‖s‖v` encoding as the wire form in `client_bridge`.
+        next.last_signature = signed.signature.as_bytes().to_vec();
         store.record(&next)?;
         *self = next;
         Ok(())
@@ -274,6 +295,9 @@ mod tests {
         }
         fn forget(&self, _channel_id: ChannelId) -> Result<(), StoreError> {
             Ok(())
+        }
+        fn get(&self, _channel_id: ChannelId) -> Result<Option<ChannelState>, StoreError> {
+            Ok(None)
         }
     }
 
