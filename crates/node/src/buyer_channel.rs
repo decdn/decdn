@@ -27,7 +27,8 @@
 //! Structurally this mirrors [`crate::payment_settlement::PaymentChannelService`]:
 //! a generic-over-`Provider` struct owning an `AbortOnDrop` background task.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -69,6 +70,27 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// RAII slot in the per-provider in-flight-open set. Dropping it removes the
+/// provider so every path out of the open routine — success, error, or early
+/// return — releases the slot and the provider is never wedged. See
+/// [`BuyerChannelService::opens_in_flight`].
+struct InFlightOpenGuard {
+    set: Arc<Mutex<HashSet<Address>>>,
+    provider: Address,
+}
+
+impl Drop for InFlightOpenGuard {
+    fn drop(&mut self) {
+        // A poisoned lock means a prior holder panicked; recover the inner set
+        // and still release the slot rather than leaving the provider stuck.
+        let mut set = self
+            .set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.remove(&self.provider);
+    }
+}
+
 /// Buyer-side `PaymentChannel` service. Generic over the alloy [`Provider`]
 /// (a wallet-filled provider is required for the `approve` / `openChannel` /
 /// `topUp` / `reclaimExpired` write paths). Cheap to construct; owns its
@@ -82,6 +104,14 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     self_address: Address,
     min_deposit: U256,
     default_deposit: U256,
+    /// Providers with an `openChannel` currently in flight. Makes the
+    /// one-channel-per-provider invariant real (PR #753 review): a concurrent
+    /// [`Self::open_or_reuse_channel`] for a provider already mid-open bails for
+    /// retry instead of escrowing a second deposit whose `record` would orphan
+    /// the first. Only the open path touches this set — pure reuse never
+    /// contends, so many concurrent pulls to an already-open provider proceed
+    /// freely.
+    opens_in_flight: Arc<Mutex<HashSet<Address>>>,
     _reclaimer: AbortOnDrop,
 }
 
@@ -154,8 +184,35 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             self_address,
             min_deposit,
             default_deposit,
+            opens_in_flight: Arc::new(Mutex::new(HashSet::new())),
             _reclaimer: AbortOnDrop(reclaimer),
         })
+    }
+
+    /// Reuse the live (non-expired) channel tracked for `provider_addr`, if any.
+    /// Returns `None` when no channel is tracked or the tracked one has expired
+    /// (the caller then opens / rotates one under the per-provider open guard).
+    fn try_reuse_live(&self, provider_addr: Address) -> Result<Option<ChannelContext>> {
+        let Some(existing) = self
+            .store
+            .get_by_provider(provider_addr)
+            .context("look up existing buyer channel")?
+        else {
+            return Ok(None);
+        };
+        if existing.is_expired_at(unix_now()) {
+            return Ok(None);
+        }
+        debug!(
+            provider = %provider_addr,
+            channel_id = %existing.channel_id,
+            "reusing existing buyer channel"
+        );
+        Ok(Some(ChannelContext::for_buyer_channel(
+            &existing,
+            Arc::clone(&self.signer),
+            self.voucher_domain.clone(),
+        )))
     }
 
     /// Return a [`ChannelContext`] for paying `provider_addr`: reuse the live
@@ -176,43 +233,66 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     ///
     /// # Concurrency
     ///
-    /// One channel is tracked per provider, so the caller MUST NOT issue
-    /// concurrent `open_or_reuse_channel` calls for the *same* `provider_addr`:
-    /// two racing opens would each escrow a deposit and the second `record`
-    /// would orphan the first. Concurrent opens for *distinct* providers are
-    /// fine.
-    // Linear guard-and-act sequence (reuse-check → reclaim-expired → open →
-    // decode → persist); the early-return guards read more clearly inline.
+    /// Opens are serialized per provider via an in-flight-open set. Concurrent
+    /// `open_or_reuse_channel` calls for the *same* `provider_addr` that both
+    /// miss the reuse fast-path race for one open slot: the winner opens, the
+    /// others bail with a retryable error (the resulting channel is reused on
+    /// retry). This enforces the one-channel-per-provider invariant — two racing
+    /// opens would otherwise each escrow a deposit and the second `record` would
+    /// orphan the first. Pure reuse of an already-open channel never contends,
+    /// and opens for *distinct* providers run in parallel.
+    // Fast-path reuse → per-provider open guard → re-check → reclaim-expired →
+    // open → decode → persist; the early-return guards read more clearly inline.
     #[allow(clippy::cognitive_complexity)]
     pub async fn open_or_reuse_channel(
         &self,
         provider_addr: Address,
         deposit_hint: U256,
     ) -> Result<ChannelContext> {
-        // Reuse a live, unexpired channel if one exists.
+        // Fast path: reuse a live channel without touching the in-flight set, so
+        // many concurrent pulls to an already-open provider never serialize.
+        if let Some(ctx) = self.try_reuse_live(provider_addr)? {
+            return Ok(ctx);
+        }
+
+        // No live channel — we are about to open (or rotate an expired one).
+        // Claim the per-provider open slot; if another open is already in flight
+        // for this provider, bail for retry rather than escrow a second deposit
+        // whose `record` would orphan the first.
+        let _open_guard = {
+            let mut in_flight = self
+                .opens_in_flight
+                .lock()
+                .map_err(|err| anyhow::anyhow!("opens_in_flight mutex poisoned: {err}"))?;
+            if !in_flight.insert(provider_addr) {
+                anyhow::bail!(
+                    "openChannel for provider {provider_addr} is already in flight; retry once it \
+                     completes (the resulting channel will be reused)"
+                );
+            }
+            InFlightOpenGuard {
+                set: Arc::clone(&self.opens_in_flight),
+                provider: provider_addr,
+            }
+        };
+
+        // Re-check under the slot: a concurrent open may have created the channel
+        // between the fast-path miss and claiming the slot (closes the TOCTOU).
+        if let Some(ctx) = self.try_reuse_live(provider_addr)? {
+            return Ok(ctx);
+        }
+
+        // Any record still present here is expired (the re-check above returned
+        // for a live one). Reclaim its deposit BEFORE rotating: the store is
+        // provider-keyed, so opening a replacement would overwrite the expired
+        // record and the reclaim sweep (which iterates `load_all`) would never
+        // see it — silently abandoning a refundable deposit (10 USDC default +
+        // any top-ups). `try_reclaim` is best-effort and CAS-forgets on success.
         if let Some(existing) = self
             .store
             .get_by_provider(provider_addr)
-            .context("look up existing buyer channel")?
+            .context("look up expired buyer channel before reopen")?
         {
-            if !existing.is_expired_at(unix_now()) {
-                debug!(
-                    provider = %provider_addr,
-                    channel_id = %existing.channel_id,
-                    "reusing existing buyer channel"
-                );
-                return Ok(ChannelContext::for_buyer_channel(
-                    &existing,
-                    Arc::clone(&self.signer),
-                    self.voucher_domain.clone(),
-                ));
-            }
-            // Expired: reclaim its deposit BEFORE rotating. The store is
-            // provider-keyed, so opening a replacement here would overwrite the
-            // expired record and the reclaim sweep (which iterates `load_all`)
-            // would never see it — silently abandoning a refundable deposit
-            // (10 USDC default + any top-ups). `try_reclaim` is best-effort and
-            // CAS-forgets the record on success.
             debug!(
                 provider = %provider_addr,
                 channel_id = %existing.channel_id,
@@ -599,5 +679,48 @@ mod tests {
         assert_eq!(ctx.prior_nonce, U256::from(3u64));
         assert_eq!(ctx.prior_bytes_delivered, U256::from(3_000u64));
         assert_eq!(ctx.prior_amount, U256::from(30u64));
+    }
+
+    /// The per-provider in-flight-open slot refuses a second concurrent claim
+    /// (the open path bails for retry) and frees on guard drop, so a later open
+    /// proceeds. This is the mechanism that makes the one-channel-per-provider
+    /// invariant real rather than a documented caller contract (#753 review).
+    #[test]
+    fn in_flight_open_guard_refuses_concurrent_then_releases() {
+        let set: Arc<Mutex<HashSet<Address>>> = Arc::new(Mutex::new(HashSet::new()));
+        let provider = sample(7).provider;
+        // Mirrors the insert-or-refuse claim in `open_or_reuse_channel`.
+        let claim = || -> Option<InFlightOpenGuard> {
+            let mut in_flight = set
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !in_flight.insert(provider) {
+                return None;
+            }
+            Some(InFlightOpenGuard {
+                set: Arc::clone(&set),
+                provider,
+            })
+        };
+
+        let guard = claim();
+        assert!(guard.is_some(), "first claim acquires the open slot");
+        assert!(
+            claim().is_none(),
+            "a concurrent claim for the same provider is refused"
+        );
+        drop(guard);
+        let reclaimed = claim();
+        assert!(
+            reclaimed.is_some(),
+            "the slot is free once the prior guard drops"
+        );
+        drop(reclaimed);
+        assert!(
+            set.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "dropping the guard releases the slot",
+        );
     }
 }

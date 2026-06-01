@@ -778,7 +778,27 @@ impl PersistentChannelStateStore {
             let (key_guard, value_guard) =
                 entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
             let key_bytes: [u8; 20] = *key_guard.value();
-            out.push(decode_buyer_record(key_bytes, value_guard.value())?);
+            // Skip-and-warn on a single undecodable record rather than failing
+            // the whole load. Unlike the seller `load_all` — whose error aborts
+            // startup (a corrupt voucher record reopening the #527 replay window
+            // is unsafe to run past) — buyer bootstrap is *non-fatal*: a
+            // propagated error here would not just disable new buys, it would
+            // stop the reclaim sweep from ever spawning, stranding every *other*
+            // tracked channel's deposit as unreclaimable (PR #753 review,
+            // alpergundogdu). One bad row must not take the others down; its own
+            // deposit stays untracked until the row is repaired, which the
+            // `warn!` surfaces.
+            match decode_buyer_record(key_bytes, value_guard.value()) {
+                Ok(state) => out.push(state),
+                Err(err) => tracing::warn!(
+                    provider = %Address::from(key_bytes),
+                    %err,
+                    event = "buyer_channel_store_skip_undecodable_record",
+                    "buyer channel hydration: skipping an undecodable record; its deposit is \
+                     untracked and unreclaimable until the record is repaired, but other channels \
+                     remain healthy",
+                ),
+            }
         }
         Ok(out)
     }
@@ -1706,7 +1726,7 @@ mod tests {
     /// A buyer record stamped with a future schema version must refuse to
     /// load — same safety posture as the seller table.
     #[test]
-    fn buyer_future_schema_version_refuses_to_load() -> anyhow::Result<()> {
+    fn buyer_future_schema_version_skipped_on_hydration() -> anyhow::Result<()> {
         let dir = data_dir()?;
         let store = PersistentChannelStateStore::open(dir.path())?;
         let s = buyer_sample(1);
@@ -1723,10 +1743,19 @@ mod tests {
         tx.commit()?;
 
         let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(store));
+        // A future-schema record (the canonical post-downgrade case) must NOT
+        // fail hydration — that would disable the whole buyer path and the
+        // reclaim sweep (PR #753 review). `load_all` skips it instead.
+        anyhow::ensure!(
+            handle.load_all()?.is_empty(),
+            "future-schema record must be skipped, not propagated, by load_all",
+        );
+        // The point lookup still surfaces the precise error (it is not on the
+        // bootstrap path, so propagating is safe and diagnostic).
         let err = handle
-            .load_all()
+            .get_by_provider(s.provider)
             .err()
-            .ok_or_else(|| anyhow::anyhow!("future schema must reject"))?;
+            .ok_or_else(|| anyhow::anyhow!("future schema must reject on get_by_provider"))?;
         anyhow::ensure!(
             matches!(
                 err,
@@ -1739,27 +1768,37 @@ mod tests {
         Ok(())
     }
 
-    /// Garbage value bytes under a real buyer key → `Corrupt`. Mirrors the
-    /// seller `corrupt_value_bytes_rejected` guard for the buyer table.
+    /// Garbage value bytes under a real buyer key are skipped by `load_all`
+    /// (one bad row must not strand every other channel's deposit — PR #753
+    /// review), while a healthy record alongside it survives. The point lookup
+    /// (`get_by_provider`) still surfaces `Corrupt`.
     #[test]
-    fn buyer_corrupt_value_bytes_rejected() -> anyhow::Result<()> {
+    fn buyer_corrupt_value_bytes_skipped_keeps_healthy() -> anyhow::Result<()> {
         let dir = data_dir()?;
         let store = PersistentChannelStateStore::open(dir.path())?;
-        let s = buyer_sample(2);
-        let key: [u8; 20] = s.provider.into();
+        let healthy = buyer_sample(2);
+        let corrupt_key: [u8; 20] = buyer_sample(3).provider.into();
+        let healthy_encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&healthy))?;
+        let healthy_key: [u8; 20] = healthy.provider.into();
         let mut tx = store.db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {
             let mut t = tx.open_table(BUYER_CHANNEL_TABLE)?;
-            t.insert(&key, &[0u8; 8][..])?; // far too short for a valid record
+            t.insert(&healthy_key, healthy_encoded.as_slice())?;
+            t.insert(&corrupt_key, &[0u8; 8][..])?; // far too short for a valid record
         }
         tx.commit()?;
 
         let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(store));
+        let all = handle.load_all()?;
+        anyhow::ensure!(
+            all.len() == 1 && all.first() == Some(&healthy),
+            "corrupt row must be skipped while the healthy row survives, got {all:?}",
+        );
         let err = handle
-            .load_all()
+            .get_by_provider(buyer_sample(3).provider)
             .err()
-            .ok_or_else(|| anyhow::anyhow!("garbage value must reject"))?;
+            .ok_or_else(|| anyhow::anyhow!("garbage value must reject on get_by_provider"))?;
         anyhow::ensure!(
             matches!(&err, StoreError::Corrupt { detail, .. } if detail.contains("postcard decode")),
             "expected Corrupt(postcard decode), got {err:?}",
@@ -1767,10 +1806,10 @@ mod tests {
         Ok(())
     }
 
-    /// A buyer record whose embedded `provider` doesn't match its table key →
-    /// `Corrupt`. Mirrors the seller `key_value_channel_id_mismatch_rejected`.
+    /// A buyer record whose embedded `provider` doesn't match its table key is
+    /// skipped by `load_all`; the point lookup still surfaces `Corrupt`.
     #[test]
-    fn buyer_provider_key_mismatch_rejected() -> anyhow::Result<()> {
+    fn buyer_provider_key_mismatch_skipped_on_hydration() -> anyhow::Result<()> {
         let dir = data_dir()?;
         let store = PersistentChannelStateStore::open(dir.path())?;
         let s_for_a = buyer_sample(0xAA);
@@ -1785,10 +1824,16 @@ mod tests {
         tx.commit()?;
 
         let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(store));
+        anyhow::ensure!(
+            handle.load_all()?.is_empty(),
+            "provider/key-mismatch record must be skipped by load_all",
+        );
         let err = handle
-            .load_all()
+            .get_by_provider(buyer_sample(0xBB).provider)
             .err()
-            .ok_or_else(|| anyhow::anyhow!("provider/key mismatch must reject"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("provider/key mismatch must reject on get_by_provider")
+            })?;
         anyhow::ensure!(
             matches!(&err, StoreError::Corrupt { detail, .. } if detail.contains("does not match table key")),
             "expected Corrupt(does not match table key), got {err:?}",
