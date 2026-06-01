@@ -70,8 +70,8 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    ChannelStateStore, bind_node_id_domain, binding_signing_hash, slash_judge_domain,
-    voucher_domain,
+    ChannelStateStore, PendingSettleStore, bind_node_id_domain, binding_signing_hash,
+    slash_judge_domain, voucher_domain,
 };
 use decdn_node::channel_store::PersistentChannelStateStore;
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
@@ -165,6 +165,66 @@ where
     }
 }
 
+/// Spawn `anvil` on a fresh ephemeral port and return its guard + RPC URL once
+/// `eth_chainId` answers.
+///
+/// `free_port` binds `127.0.0.1:0`, reads the port, then releases it for anvil
+/// to claim — a window in which a concurrent process (e.g. another test binary
+/// under `nextest`) could grab the port (TOCTOU), leaving anvil unable to bind.
+/// Rather than fail the whole run on a lost race, detect anvil exiting early
+/// and retry on a new port; a genuinely down anvil still surfaces as a clear
+/// per-port timeout.
+async fn spawn_anvil(manifest: PathBuf) -> anyhow::Result<(AnvilGuard, String)> {
+    const ATTEMPTS: usize = 5;
+    for attempt in 1..=ATTEMPTS {
+        let port = free_port();
+        let rpc_url = format!("http://127.0.0.1:{port}");
+        let child = Command::new("anvil")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                &CHAIN_ID.to_string(),
+                "--silent",
+            ])
+            .spawn()
+            .expect("spawn anvil (is foundry installed?)");
+        // Own the child immediately so every early return (incl. the `?` below
+        // and the timeout path) reaps anvil via `AnvilGuard::drop`.
+        let mut guard = AnvilGuard {
+            child,
+            manifest: manifest.clone(),
+        };
+
+        let url: reqwest::Url = rpc_url.parse()?;
+        let probe = ProviderBuilder::new().connect_http(url);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if probe.get_chain_id().await.is_ok() {
+                return Ok((guard, rpc_url));
+            }
+            // anvil exited before serving — almost always a lost port race.
+            // Drop `guard` at the end of this iteration to reap it, then retry.
+            if matches!(guard.child.try_wait(), Ok(Some(_))) {
+                eprintln!(
+                    "anvil exited before RPC came up on port {port} \
+                     (attempt {attempt}/{ATTEMPTS}); retrying on a new port"
+                );
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow::anyhow!(
+                    "anvil RPC never came up on port {port} within 20s"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    Err(anyhow::anyhow!(
+        "anvil could not bind a free ephemeral port after {ATTEMPTS} attempts"
+    ))
+}
+
 // Bindings for the setup/write calls not exposed by the production
 // `decdn_incentive` bindings. The seller-path read surface (`getChannel`,
 // `settleChannel`, the `Channel` struct, the `Status` enum) is reused from
@@ -241,37 +301,17 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         String::from_utf8_lossy(&build.stderr)
     );
 
-    // ---- 1. Spawn anvil.
-    let port = free_port();
-    let rpc_url = format!("http://127.0.0.1:{port}");
-    let child = Command::new("anvil")
-        .args([
-            "--port",
-            &port.to_string(),
-            "--chain-id",
-            &CHAIN_ID.to_string(),
-            "--silent",
-        ])
-        .spawn()
-        .expect("spawn anvil (is foundry installed?)");
+    // ---- 1. Spawn anvil (retries onto a fresh port if the ephemeral port is
+    // claimed between free_port's probe and anvil's bind — TOCTOU). Returns
+    // once the RPC answers `eth_chainId`.
     let manifest = contracts.join(format!("deployments/{CHAIN_ID}.json"));
-    let _anvil = AnvilGuard {
-        child,
-        manifest: manifest.clone(),
-    };
+    let (_anvil, rpc_url) = spawn_anvil(manifest.clone()).await?;
 
     let url: reqwest::Url = rpc_url.parse()?;
     let admin_signer: PrivateKeySigner = ADMIN_KEY.parse()?;
     let admin = ProviderBuilder::new()
         .wallet(EthereumWallet::from(admin_signer))
         .connect_http(url.clone());
-
-    // Wait for the RPC to accept requests.
-    poll_until(Duration::from_secs(20), || async {
-        admin.get_chain_id().await.ok()
-    })
-    .await
-    .expect("anvil RPC never came up");
 
     // ---- 2. Identities. The node holds two keys: an iroh ed25519 key (its
     // NodeId + the registration ownership proof) and an eth key (staking,
@@ -378,8 +418,13 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         store_tmp.path(),
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )?;
-    let store: Arc<dyn ChannelStateStore> =
-        Arc::new(PersistentChannelStateStore::open(store_tmp.path())?);
+    // One redb-backed store satisfies both the voucher-state trait (handler +
+    // #527 replay guard) and the pending-settle trait (the settlement sweep,
+    // #743). Mirror the runtime wiring: derive both trait handles from a single
+    // open file so the two tables share one fsync discipline.
+    let concrete_store = Arc::new(PersistentChannelStateStore::open(store_tmp.path())?);
+    let store: Arc<dyn ChannelStateStore> = concrete_store.clone();
+    let pending_store: Arc<dyn PendingSettleStore> = concrete_store;
 
     let node_eth = Arc::new(node_signer.clone());
     let metrics = Arc::new(Metrics::new());
@@ -406,6 +451,7 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         payment_channel,
         node_addr,
         Arc::clone(&store),
+        Arc::clone(&pending_store),
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
     )
@@ -417,8 +463,18 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(node_pub).with_ip_addr(server_addr);
 
-    // Give the watcher a moment to install its event filters before the first
-    // ChannelOpened is emitted (filters only capture logs after creation).
+    // Let the watcher install its event filters before the first ChannelOpened
+    // is mined. `bootstrap` returns once the watcher task is spawned; that task
+    // then opens four sequential `.watch()` (eth_newFilter) streams, and
+    // `.watch()` only delivers logs from blocks *after* the filter exists — so
+    // an openChannel that mined first would be lost and the persistence poll
+    // below would time out. The ordering is bridged by this sleep *plus* the
+    // mint+approve roundtrips that follow (both mine before openChannel), giving
+    // the four installs a multi-second margin against sub-millisecond local
+    // RPCs. Eliminating the race outright needs a readiness signal or a
+    // start-block `get_logs` fallback in the production service — out of scope
+    // for this test; if the margin ever proves tight the failure is a clean,
+    // retryable poll timeout, not silent corruption.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Client funds + approves USDC once (covers both channels).
@@ -601,9 +657,15 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         "channel 2 should be below the redeem threshold, but was withdrawn"
     );
 
-    // Graceful shutdown closes the un-redeemed channel (closeChannel fires →
-    // dispute window opens). Verifies the shutdown close path + that the
-    // persisted voucher signature is accepted on-chain.
+    // Graceful shutdown force-closes *every* channel still Open with unredeemed
+    // work (closeChannel fires → dispute window opens). Channel 2 always
+    // qualifies — its sub-threshold claim was never redeemed. Channel 1 also
+    // closes here iff its single redeem landed the 1 MiB interval voucher rather
+    // than the 1.5 MiB closing one (see the redeem-timing note above): in that
+    // branch it still has 0.5 MiB unredeemed and status Open. We assert only
+    // channel 2's transition below; channel 1's terminal state is timing-
+    // dependent and not load-bearing here. Verifies the shutdown close path +
+    // that the persisted voucher signature is accepted on-chain.
     service
         .close_open_channels_on_shutdown(Duration::from_secs(30))
         .await;
