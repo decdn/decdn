@@ -21,11 +21,20 @@
 //!   (#762), the first watcher cycle records the head block `S` captured at
 //!   bootstrap, installs the live filters, reads the block `F` they took over
 //!   at, and `get_logs`-backfills `ChannelOpened` over `[S, F]` — so the
-//!   backfilled `[S, F]` and the live `(F, ∞)` stream together leave no gap.
-//!   The overlap at `F` is harmless because [`ClientHandler::register_open_channel`]
-//!   is idempotent. A channel opened while this node was fully **down** (before
-//!   `S`) is still not back-filled — closing that across-restart downtime gap
-//!   needs the last-scanned block persisted across restarts (#751).
+//!   backfilled `[S, F]` and the live stream (which starts at-or-before `F`)
+//!   together leave no gap. The overlap around `F` is harmless because
+//!   [`ClientHandler::register_open_channel`] is idempotent.
+//!
+//!   Scope of the backfill: **only `ChannelOpened`**. A `ChannelToppedUp` or
+//!   `ChannelSettled` emitted inside `[S, F]` is not back-filled, so a channel
+//!   both opened and topped-up/settled within that window could carry a stale
+//!   tracked deposit or be re-registered after settlement. In practice the
+//!   window is sub-second (and a settle is additionally gated by the on-chain
+//!   dispute window, far longer than any bring-up), so this is negligible;
+//!   ordered multi-event backfill belongs with the across-restart work (#751).
+//!   A channel opened while this node was fully **down** (before `S`) is
+//!   likewise not back-filled — that across-restart downtime gap needs the
+//!   last-scanned block persisted across restarts (#751).
 //! - **Redemption (threshold + on-shutdown).** On a redeem hint emitted by
 //!   the voucher-accept path, it reads the latest persisted voucher and the
 //!   on-chain `withdrawnAmount`, and submits `withdraw` once the accrued
@@ -135,11 +144,23 @@ const fn ready_to_settle(now: u64, settle_after: u64) -> bool {
     now >= settle_after
 }
 
-/// Whether the bring-up backfill range `[from, to]` spans at least one block
-/// (#762). `from > to` means no blocks elapsed between the head captured at
-/// bootstrap and the block the live filters installed at — nothing to scan.
-const fn backfill_range_nonempty(from: u64, to: u64) -> bool {
-    from <= to
+/// Validate the bring-up backfill range `[from, to]` (#762). On a consistent
+/// chain the head is monotonic, so `to` (read on the first watcher cycle) is
+/// always `>=` `from` (the head captured at bootstrap); `from == to` is a valid
+/// single-block range that must still be scanned (a `ChannelOpened` can sit in
+/// that exact block). `from > to` is an anomaly — RPC replication lag (a
+/// load-balanced endpoint answering from a stale node) or a reorg — returned as
+/// an `Err` so the caller retries via the watcher backoff rather than skipping
+/// the backfill (which would permanently reopen the race once the lagging node
+/// catches up).
+fn check_backfill_range(from: u64, to: u64) -> Result<()> {
+    if from > to {
+        anyhow::bail!(
+            "backfill range invalid: from_block ({from}) > to_block ({to}); \
+             likely RPC replication lag or a reorg — retrying via watcher backoff"
+        );
+    }
+    Ok(())
 }
 
 /// Aborts the wrapped task on drop so a node-restart cycle never leaks a
@@ -562,7 +583,15 @@ async fn run_watcher_once<P: Provider + Clone>(
         tokio::select! {
             ev = opened.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    apply_channel_opened(handler, self_address, usdc_token, &event, false).await;
+                    // Live arm: a persist failure is logged and skipped — the
+                    // channel stays observable on-chain and a top-up/settle (or
+                    // operator action) re-drives it; unlike the backfill, this
+                    // is not the sole delivery, so we don't tear down the stream.
+                    if let Err(err) =
+                        apply_channel_opened(handler, self_address, usdc_token, &event, false).await
+                    {
+                        warn!(%err, channel_id = %event.channelId, "failed to persist opened channel");
+                    }
                 }
                 Some(Err(e)) => return Err(e).context("ChannelOpened stream"),
                 None => return Ok(()),
@@ -627,16 +656,22 @@ async fn run_watcher_once<P: Provider + Clone>(
 /// bring-up backfill (#762); `register_open_channel` is idempotent, so applying
 /// the same event from both paths (the backfill/live overlap block) is safe.
 /// `from_backfill` only varies the log line so the gap path is distinguishable.
+///
+/// Returns the persist result so the caller picks the failure policy: the live
+/// arm logs and continues, but the backfill — the *sole* delivery of a channel
+/// opened in `[S, F]` — propagates the error so the whole backfill retries with
+/// `backfill_from` still set, rather than silently dropping the very channel the
+/// backfill exists to recover.
 async fn apply_channel_opened(
     handler: &Arc<ClientHandler>,
     self_address: Address,
     usdc_token: Address,
     event: &PaymentChannel::ChannelOpened,
     from_backfill: bool,
-) {
+) -> Result<()> {
     // Only channels where this node is the provider concern us.
     if event.provider != self_address {
-        return;
+        return Ok(());
     }
     let mut state = ChannelState::new(event.channelId, event.client, usdc_token, event.deposit);
     // Track on-chain expiry so the sweep can close (and the handler can stop
@@ -644,29 +679,36 @@ async fn apply_channel_opened(
     // "never" — safe, since the only effect of a too-far expiry is we never
     // force-close.
     state.expires_at = u64::try_from(event.expiresAt).unwrap_or(u64::MAX);
+    handler
+        .register_open_channel(state)
+        .await
+        .context("persist opened channel")?;
     let via = if from_backfill {
         "backfilled channel opened during watcher bring-up"
     } else {
         "registered channel opened against this node"
     };
-    if let Err(err) = handler.register_open_channel(state).await {
-        warn!(%err, channel_id = %event.channelId, "failed to persist opened channel");
-    } else {
-        info!(
-            channel_id = %event.channelId,
-            client = %event.client,
-            deposit = %event.deposit,
-            "{via}"
-        );
-    }
+    info!(
+        channel_id = %event.channelId,
+        client = %event.client,
+        deposit = %event.deposit,
+        "{via}"
+    );
+    Ok(())
 }
 
-/// One-time bring-up backfill (#762): `get_logs` every `ChannelOpened` in
-/// `[from_block, to_block]` and register the ones this node provides, closing
-/// the gap between `bootstrap` returning and the live `.watch()` filters
-/// installing. A `from > to` range (no blocks elapsed since bootstrap) is a
-/// no-op. Returns an error only on the `get_logs` RPC itself so the caller can
-/// retry on the next resubscription; per-channel persist failures are logged.
+/// One-time bring-up backfill (#762): `get_logs` (alloy's `.query()` issues an
+/// `eth_getLogs`) every `ChannelOpened` in `[from_block, to_block]` and register
+/// the ones this node provides, closing the gap between `bootstrap` returning
+/// and the live `.watch()` filters installing.
+///
+/// Every failure mode returns an `Err` so the caller retries the whole backfill
+/// via the watcher backoff (with `backfill_from` still set): an invalid
+/// `from > to` range ([`check_backfill_range`]), the `get_logs` RPC, and — see
+/// [`apply_channel_opened`] — a per-channel persist failure (the backfill is the
+/// sole delivery of a `[S, F]` channel, so swallowing it would permanently drop
+/// the channel). Only `ChannelOpened` is backfilled; see the module header for
+/// why an in-window top-up/settle is out of scope (#751).
 async fn backfill_opened_channels<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     self_address: Address,
@@ -675,9 +717,7 @@ async fn backfill_opened_channels<P: Provider + Clone>(
     from_block: u64,
     to_block: u64,
 ) -> Result<()> {
-    if !backfill_range_nonempty(from_block, to_block) {
-        return Ok(());
-    }
+    check_backfill_range(from_block, to_block)?;
     let logs = contract
         .ChannelOpened_filter()
         .from_block(from_block)
@@ -692,7 +732,10 @@ async fn backfill_opened_channels<P: Provider + Clone>(
         "scanned ChannelOpened logs for watcher bring-up backfill"
     );
     for (event, _log) in logs {
-        apply_channel_opened(handler, self_address, usdc_token, &event, true).await;
+        let channel_id = event.channelId;
+        apply_channel_opened(handler, self_address, usdc_token, &event, true)
+            .await
+            .with_context(|| format!("backfill register channel {channel_id}"))?;
     }
     Ok(())
 }
@@ -1177,15 +1220,18 @@ mod tests {
     }
 
     #[test]
-    fn backfill_range_nonempty_boundary() {
-        // No blocks elapsed since bootstrap (`from == to + 1`): nothing to scan.
-        assert!(!backfill_range_nonempty(1_001, 1_000));
-        // Single block (`from == to`): scan it — a ChannelOpened could sit there.
-        assert!(backfill_range_nonempty(1_000, 1_000));
+    fn check_backfill_range_boundary() {
+        // Empty range (`from > to`): an RPC-lag / reorg anomaly, not "no blocks
+        // elapsed" — returned as a retryable `Err` so the caller retries rather
+        // than silently skipping (which would reopen the race).
+        assert!(check_backfill_range(1_001, 1_000).is_err());
+        // Single block (`from == to`): valid and must be scanned — a
+        // ChannelOpened can sit in the exact block bootstrap read the head at.
+        assert!(check_backfill_range(1_000, 1_000).is_ok());
         // Normal forward range.
-        assert!(backfill_range_nonempty(1_000, 1_005));
+        assert!(check_backfill_range(1_000, 1_005).is_ok());
         // Genesis / zero head is a valid single-block range.
-        assert!(backfill_range_nonempty(0, 0));
+        assert!(check_backfill_range(0, 0).is_ok());
     }
 
     #[test]
