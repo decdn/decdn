@@ -535,8 +535,8 @@ mod prop_tests {
     }
 
     /// A valid secp256k1 signer from a random 32-byte scalar. Zero and
-    /// out-of-range scalars are rejected by `from_slice` and skipped with
-    /// `prop_assume!`; both are vanishingly rare over a uniform draw, so this
+    /// out-of-range scalars fail `from_slice` and are dropped by
+    /// `prop_filter_map`; both are vanishingly rare over a uniform draw, so this
     /// does not starve the case budget.
     fn any_signer() -> impl Strategy<Value = PrivateKeySigner> {
         proptest::array::uniform32(any::<u8>())
@@ -598,8 +598,9 @@ mod prop_tests {
 
         /// Changing any single field to a different value changes the digest —
         /// no field is silently dropped from the signed payload. Each mutated
-        /// value is drawn independently and `prop_assume!`d distinct so the
-        /// "different value" precondition holds.
+        /// value is `prop_assume!`d distinct from the original up front, so
+        /// every surviving case asserts all five bindings unconditionally (no
+        /// field is skipped on a value collision).
         #[test]
         fn every_field_is_bound_into_the_digest(
             voucher in any_voucher(),
@@ -611,29 +612,29 @@ mod prop_tests {
             other_bytes in any_u256(),
             other_token in any_address(),
         ) {
+            prop_assume!(other_channel != voucher.channel_id);
+            prop_assume!(other_amount != voucher.amount);
+            prop_assume!(other_nonce != voucher.nonce);
+            prop_assume!(other_bytes != voucher.bytes_delivered);
+            prop_assume!(other_token != voucher.token);
+
             let domain = voucher_domain(chain_id, verifying);
             let base = voucher.signing_hash(&domain);
 
-            if other_channel != voucher.channel_id {
-                let m = Voucher { channel_id: other_channel, ..voucher.clone() };
-                prop_assert_ne!(m.signing_hash(&domain), base, "channel_id not bound");
-            }
-            if other_amount != voucher.amount {
-                let m = Voucher { amount: other_amount, ..voucher.clone() };
-                prop_assert_ne!(m.signing_hash(&domain), base, "amount not bound");
-            }
-            if other_nonce != voucher.nonce {
-                let m = Voucher { nonce: other_nonce, ..voucher.clone() };
-                prop_assert_ne!(m.signing_hash(&domain), base, "nonce not bound");
-            }
-            if other_bytes != voucher.bytes_delivered {
-                let m = Voucher { bytes_delivered: other_bytes, ..voucher.clone() };
-                prop_assert_ne!(m.signing_hash(&domain), base, "bytes_delivered not bound");
-            }
-            if other_token != voucher.token {
-                let m = Voucher { token: other_token, ..voucher.clone() };
-                prop_assert_ne!(m.signing_hash(&domain), base, "token not bound");
-            }
+            let with_channel = Voucher { channel_id: other_channel, ..voucher.clone() };
+            prop_assert_ne!(with_channel.signing_hash(&domain), base, "channel_id not bound");
+
+            let with_amount = Voucher { amount: other_amount, ..voucher.clone() };
+            prop_assert_ne!(with_amount.signing_hash(&domain), base, "amount not bound");
+
+            let with_nonce = Voucher { nonce: other_nonce, ..voucher.clone() };
+            prop_assert_ne!(with_nonce.signing_hash(&domain), base, "nonce not bound");
+
+            let with_bytes = Voucher { bytes_delivered: other_bytes, ..voucher.clone() };
+            prop_assert_ne!(with_bytes.signing_hash(&domain), base, "bytes_delivered not bound");
+
+            let with_token = Voucher { token: other_token, ..voucher.clone() };
+            prop_assert_ne!(with_token.signing_hash(&domain), base, "token not bound");
         }
 
         /// The domain is binding: a voucher signed under one `(chain_id,
