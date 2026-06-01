@@ -9,7 +9,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 /// @title BuybackBurner
-/// @notice Receives the 25% USDC bucket from `FeeRouter.routeSettlement`, swaps
+/// @notice Receives the 30% USDC bucket from `FeeRouter.routeSettlement`, swaps
 ///         it for TOKEN via the Balancer V3 80/20 pool (ADR 018), and burns
 ///         the proceeds (ADR 026 § FeeRouter split → § Slashing and burn).
 /// @dev    This revision ships the inflow + governance-mutable pool wiring; the
@@ -20,6 +20,19 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 ///         `_performSwap` with the live Balancer V3 ABI. Once that override
 ///         is in place, the contract performs a single swap against the
 ///         Vault then burns the received TOKEN.
+///
+///         MANDATORY `_performSwap` SUBCLASS INVARIANTS (the deployment-PR
+///         auditor MUST verify these before mainnet — the base contract cannot
+///         enforce them because the Vault ABI is unknown here):
+///           1. Derive the `minOut` floor from an on-chain TWAP/oracle and
+///              require the keeper-supplied `minOut >= twapFloor`; the base
+///              only rejects `minOut == 0` (no zero-slippage swaps) and bounds
+///              `amountIn` by the contract's USDC balance.
+///           2. Scope the Vault approval to exactly `amountIn`
+///              (`forceApprove(vault, amountIn)`) and reset it to `0` after the
+///              swap, so no standing USDC allowance survives the call.
+///           3. Optionally cap `amountIn` against a governed per-epoch
+///              liquidity budget to limit sandwich exposure on thin pools.
 // slither-disable-next-line unimplemented-functions
 abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -56,9 +69,12 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     event BuybackExecuted(uint256 usdcIn, uint256 tokenOut);
     event PoolUpdated(address indexed oldAddr, address indexed newAddr);
     event VaultUpdated(address indexed oldAddr, address indexed newAddr);
+    event UsdcRescued(address indexed to, uint256 amount);
 
     error ZeroAddress();
     error ZeroAmount();
+    error ZeroMinOut();
+    error AmountExceedsBalance(uint256 amountIn, uint256 balance);
     error PoolNotWired();
     error SwapNotImplemented();
     error SwapReportMismatch(uint256 reported, uint256 actual);
@@ -100,7 +116,16 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
         returns (uint256 tokenOut)
     {
         if (amountIn == 0) revert ZeroAmount();
+        // Reject zero-slippage swaps: a `minOut == 0` keeper call (or one
+        // front-run into a thin pool) would accept near-zero TOKEN out and
+        // burn dust. The TWAP-derived floor on top of this lives in the
+        // subclass `_performSwap` (see header invariants).
+        if (minOut == 0) revert ZeroMinOut();
         if (balancerPool == address(0) || balancerVault == address(0)) revert PoolNotWired();
+        // Bound the spend by the contract's actual USDC holdings so a keeper
+        // cannot request a swap larger than the buyback bucket.
+        uint256 usdcBalance = usdc.balanceOf(address(this));
+        if (amountIn > usdcBalance) revert AmountExceedsBalance(amountIn, usdcBalance);
 
         // Verify the subclass's reported `tokenOut` matches the actual
         // balance delta. Closes the trust boundary: a buggy override that
@@ -149,6 +174,20 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
         address old = balancerVault;
         balancerVault = newVault;
         emit VaultUpdated(old, newVault);
+    }
+
+    /// @notice Recover USDC stranded in this contract — e.g. inflow that
+    ///         accumulated while the pool was unwired, residue left by a keeper
+    ///         under-swap, or the full balance before a `setBuybackBurner`
+    ///         replacement on `FeeRouter`. Without this, replacing the burner
+    ///         would permanently strand the old contract's USDC.
+    /// @dev Governance-gated; only moves the externally-held USDC bucket, never
+    ///      TOKEN (which is always burned, never transferred out).
+    function rescueUSDC(address to, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        emit UsdcRescued(to, amount);
+        usdc.safeTransfer(to, amount);
     }
 
     function pause() external onlyRole(PAUSER_ROLE) {

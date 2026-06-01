@@ -2,12 +2,12 @@
 pragma solidity 0.8.28;
 
 /// @title IFeeRouter
-/// @notice External surface of `FeeRouter` — the four-bucket per-byte settlement
+/// @notice External surface of `FeeRouter` — the three-bucket per-byte settlement
 ///         distributor (ADR 026 § FeeRouter split) and the canonical served-bytes
 ///         accountant that `DecdnGovernor` reads for voting weight per ADR 036.
 /// @dev    Settlement: `PaymentChannel.settleChannel` forwards the operator's
 ///         full USDC balance to `routeSettlement`, which performs the
-///         60% operator / 25% buyback / 10% treasury / 5% safety split inline,
+///         60% operator / 30% buyback / 10% treasury split inline,
 ///         updates per-operator + global byte counters, and notifies
 ///         `CapacityBond.recordSettlement`.
 ///
@@ -19,7 +19,7 @@ pragma solidity 0.8.28;
 interface IFeeRouter {
     // ─── Settlement entrypoint ────────────────────────────────────────
 
-    /// @notice Distribute `amount` USDC across the four buckets and stamp the
+    /// @notice Distribute `amount` USDC across the three buckets and stamp the
     ///         served `bytesDelivered` into the current epoch. Called by
     ///         `PaymentChannel.settleChannel` under `ROUTER_CALLER_ROLE`.
     function routeSettlement(address operator, uint256 bytesDelivered, uint256 amount) external;

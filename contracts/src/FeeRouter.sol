@@ -251,6 +251,10 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     /// @inheritdoc IFeeRouter
     function bytesInWindow(address operator, uint64 endEpoch, uint64 n) external view override returns (uint256 sum) {
         if (n == 0) return 0;
+        // Clamp the window length to the governable ceiling: no legitimate caller
+        // (the Governor passes `windowEpochs() <= WINDOW_EPOCHS_CEILING`) needs a
+        // longer span, and an unclamped `n` is an unbounded on-chain loop.
+        if (n > WINDOW_EPOCHS_CEILING) n = WINDOW_EPOCHS_CEILING;
         uint64 startEpoch = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
         for (uint64 e = startEpoch; e <= endEpoch; e++) {
             sum += _bytesPerEpoch[operator][e];
@@ -260,6 +264,8 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     /// @inheritdoc IFeeRouter
     function totalBytesInWindow(uint64 endEpoch, uint64 n) external view override returns (uint256 sum) {
         if (n == 0) return 0;
+        // Clamp to the governable ceiling — see `bytesInWindow`.
+        if (n > WINDOW_EPOCHS_CEILING) n = WINDOW_EPOCHS_CEILING;
         uint64 startEpoch = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
         for (uint64 e = startEpoch; e <= endEpoch; e++) {
             sum += _totalBytesPerEpoch[e];

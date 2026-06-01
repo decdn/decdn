@@ -76,6 +76,23 @@ contract MockSettlementRouter is IFeeRouterSettlement {
     }
 }
 
+/// @notice Router that pulls one wei LESS than approved, leaving a residual
+///         allowance. Used to prove `_route` zeroes the allowance after the
+///         router call (M-3): without the reset, the residue would persist as a
+///         standing allowance over the channel's USDC.
+contract UnderPullRouter is IFeeRouterSettlement {
+    IERC20 public immutable usdc;
+
+    constructor(IERC20 usdc_) {
+        usdc = usdc_;
+    }
+
+    function routeSettlement(address, uint256, uint256 amount) external override {
+        require(amount != 0, "UnderPullRouter: zero amount");
+        usdc.transferFrom(msg.sender, address(this), amount - 1);
+    }
+}
+
 /// @notice Minimal ERC-1271 smart-account wallet: validates a signature by
 ///         recovering it to a fixed owner EOA. Exercises the SignatureChecker
 ///         ERC-1271 branch of voucher verification (ADR 024 smart-account signers).
@@ -300,6 +317,37 @@ contract PaymentChannelTest is Test {
         vm.prank(provider);
         vm.expectRevert(PaymentChannel.NotChannelParty.selector);
         channel.topUp(id, 500e6);
+    }
+
+    function test_topUp_revertsWhenPaused() public {
+        bytes32 id = _open();
+        vm.prank(pauser);
+        channel.pause();
+        vm.prank(client);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        channel.topUp(id, 500e6);
+    }
+
+    // -----------------------------------------------------------------
+    // _route allowance hygiene (M-3): no standing allowance survives a
+    // settlement, even if the router pulls less than approved.
+    // -----------------------------------------------------------------
+
+    function test_route_zeroesResidualAllowanceAfterUnderPull() public {
+        UnderPullRouter under = new UnderPullRouter(usdc);
+        vm.prank(admin);
+        channel.setFeeRouter(address(under));
+
+        bytes32 id = _open();
+        uint256 amount = 400e6;
+        uint256 bytesDelivered = 40_000_000;
+        bytes memory sig = _sign(id, amount, 1, bytesDelivered);
+        vm.prank(provider);
+        channel.withdraw(id, amount, 1, bytesDelivered, sig);
+
+        // Router pulled amount-1, leaving 1 wei of would-be residue; the reset
+        // in `_route` must bring the standing allowance back to zero.
+        assertEq(usdc.allowance(address(channel), address(under)), 0);
     }
 
     // -----------------------------------------------------------------
