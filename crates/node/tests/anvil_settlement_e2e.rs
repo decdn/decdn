@@ -218,9 +218,14 @@ fn derive_channel_id(client: Address, provider: Address, channel_nonce: u64) -> 
 async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     // Surface the redeemer/watcher background-task logs (the `warn!` carrying an
     // on-chain revert reason is the key diagnostic when a `withdraw`/`close`
-    // poll times out). `try_init` is idempotent so a shared-process re-run is
-    // harmless; `with_test_writer` routes through libtest's capture.
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    // poll times out). Those tasks run on tokio worker threads under
+    // `multi_thread`, so write to process stderr — NOT `with_test_writer`, whose
+    // libtest thread-local capture is set only on the test's main thread and
+    // would drop cross-thread output. nextest captures the process's stderr and
+    // shows it on failure. `try_init` is idempotent (harmless on a re-run).
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
 
     let contracts = contracts_dir();
 
@@ -457,11 +462,23 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
             "watcher did not decode ChannelOpened / persist channel 1 (live event-decode gap)"
         )
     })?;
-    // `expiresAt` is decoded from the event and feeds the expiry-sweep close
-    // path; a non-zero value confirms the field (not just the id) round-tripped.
+    // Confirm the event's non-indexed fields (not just the id topic)
+    // round-tripped through the watcher's decode + ChannelState construction:
+    // `expiresAt` feeds the expiry-sweep close path; `client`/`deposit` are
+    // otherwise unasserted here.
     anyhow::ensure!(
         persisted.expires_at != 0,
         "persisted channel 1 has no expiry — ChannelOpened.expiresAt was not decoded"
+    );
+    anyhow::ensure!(
+        persisted.client == client_addr,
+        "persisted channel 1 client mismatch: {} != {client_addr}",
+        persisted.client
+    );
+    anyhow::ensure!(
+        persisted.deposit == deposit,
+        "persisted channel 1 deposit mismatch: {} != {deposit}",
+        persisted.deposit
     );
 
     // Real paid-delivery roundtrip → genuine client-signed voucher.
