@@ -1,4 +1,7 @@
 {
+  "lib/crypto-lib": {
+    "rev": "d714e9824e2e2e44be3c8fd498e0de651ddc9425"
+  },
   "lib/forge-std": {
     "tag": {
       "name": "v1.16.1",
@@ -9,6 +12,12 @@
     "tag": {
       "name": "v5.1.0",
       "rev": "69c8def5f222ff96f2b5beff05dfba996368aa79"
+    }
+  },
+  "lib/solady": {
+    "tag": {
+      "name": "v0.1.26",
+      "rev": "acd959aa4bd04720d640bf4e6a5c71037510cc4b"
     }
   }
 }

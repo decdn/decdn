@@ -9,7 +9,8 @@
   "fail_on": "medium",
   "solc_remaps": [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
-    "forge-std/=lib/forge-std/src/"
+    "forge-std/=lib/forge-std/src/",
+    "solady/=lib/solady/src/"
   ],
   "detectors_to_exclude": "naming-convention,solc-version,pragma"
 }
