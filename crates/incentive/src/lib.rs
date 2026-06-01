@@ -39,7 +39,7 @@ pub use bind_sig::{
     bind_node_id_domain, binding_signing_hash, verify_binding,
 };
 pub use buyer_channel::{BuyerChannelState, BuyerChannelStore, MemoryBuyerChannelStore};
-pub use channel::{ChannelError, ChannelId, ChannelState};
+pub use channel::{ChannelError, ChannelId, ChannelState, VoucherApplied};
 pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
     wire_voucher_to_signed,
