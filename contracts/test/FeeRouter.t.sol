@@ -120,6 +120,22 @@ contract FeeRouterTest is Test {
         assertEq(router.totalBytesInWindow(4, 4), 10_000);
     }
 
+    function test_bytesInWindow_clampsOversizedWindow() public {
+        // Drive 4 epochs of settlement.
+        for (uint64 i = 1; i <= 4; i++) {
+            vm.warp(uint256(i) * EPOCH + 1);
+            vm.prank(channel);
+            router.routeSettlement(operator, i * 1000, 100e6);
+        }
+        // A massive `n` must not loop unbounded: it clamps to the 26-epoch
+        // ceiling, which (ending at epoch 4) covers all 4 populated epochs and
+        // returns the same sum as an explicit ceiling-length window.
+        uint256 clamped = router.bytesInWindow(operator, 4, type(uint64).max);
+        assertEq(clamped, 10_000);
+        assertEq(clamped, router.bytesInWindow(operator, 4, 26));
+        assertEq(router.totalBytesInWindow(4, type(uint64).max), router.totalBytesInWindow(4, 26));
+    }
+
     function test_bytesInWindow_zeroWindowReturnsZero() public view {
         assertEq(router.bytesInWindow(operator, 100, 0), 0);
         assertEq(router.totalBytesInWindow(100, 0), 0);

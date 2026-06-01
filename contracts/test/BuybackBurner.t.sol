@@ -148,6 +148,22 @@ contract BuybackBurnerTest is Test {
         bb.executeBuyback(0, 0);
     }
 
+    function test_executeBuyback_revertsZeroMinOut() public {
+        bb.setSwap({ actual_: TOKEN_OUT, reported_: TOKEN_OUT });
+        vm.prank(keeper);
+        vm.expectRevert(BuybackBurner.ZeroMinOut.selector);
+        bb.executeBuyback(USDC_AMOUNT, 0);
+    }
+
+    function test_executeBuyback_revertsWhenAmountExceedsBalance() public {
+        // `bb` holds 10_000_000e6 USDC (funded in setUp); request more.
+        uint256 balance = usdc.balanceOf(address(bb));
+        bb.setSwap({ actual_: TOKEN_OUT, reported_: TOKEN_OUT });
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurner.AmountExceedsBalance.selector, balance + 1, balance));
+        bb.executeBuyback(balance + 1, 1);
+    }
+
     function test_executeBuyback_revertsPoolNotWiredWhenPoolUnset() public {
         // Fresh deployment with vault set but pool unset.
         TestableBuybackBurner fresh =
@@ -159,7 +175,7 @@ contract BuybackBurnerTest is Test {
 
         vm.prank(keeper);
         vm.expectRevert(BuybackBurner.PoolNotWired.selector);
-        fresh.executeBuyback(USDC_AMOUNT, 0);
+        fresh.executeBuyback(USDC_AMOUNT, 1);
     }
 
     function test_executeBuyback_revertsPoolNotWiredWhenVaultUnset() public {
@@ -172,7 +188,7 @@ contract BuybackBurnerTest is Test {
 
         vm.prank(keeper);
         vm.expectRevert(BuybackBurner.PoolNotWired.selector);
-        fresh.executeBuyback(USDC_AMOUNT, 0);
+        fresh.executeBuyback(USDC_AMOUNT, 1);
     }
 
     function test_executeBuyback_revertsSwapNotImplementedWhenActualDeltaIsZero() public {
@@ -184,7 +200,7 @@ contract BuybackBurnerTest is Test {
 
         vm.prank(keeper);
         vm.expectRevert(BuybackBurner.SwapNotImplemented.selector);
-        bb.executeBuyback(USDC_AMOUNT, 0);
+        bb.executeBuyback(USDC_AMOUNT, 1);
     }
 
     function test_executeBuyback_revertsSwapReportMismatch() public {
@@ -195,7 +211,7 @@ contract BuybackBurnerTest is Test {
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(BuybackBurner.SwapReportMismatch.selector, TOKEN_OUT, TOKEN_OUT / 2));
-        bb.executeBuyback(USDC_AMOUNT, 0);
+        bb.executeBuyback(USDC_AMOUNT, 1);
     }
 
     function test_executeBuyback_revertsWhenPaused() public {
@@ -205,7 +221,7 @@ contract BuybackBurnerTest is Test {
         bb.setSwap({ actual_: TOKEN_OUT, reported_: TOKEN_OUT });
         vm.prank(keeper);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        bb.executeBuyback(USDC_AMOUNT, 0);
+        bb.executeBuyback(USDC_AMOUNT, 1);
     }
 
     function test_executeBuyback_revertsWithoutKeeperRole() public {
@@ -216,7 +232,7 @@ contract BuybackBurnerTest is Test {
                 IAccessControl.AccessControlUnauthorizedAccount.selector, address(this), bb.KEEPER_ROLE()
             )
         );
-        bb.executeBuyback(USDC_AMOUNT, 0);
+        bb.executeBuyback(USDC_AMOUNT, 1);
     }
 
     // -----------------------------------------------------------------
@@ -233,7 +249,7 @@ contract BuybackBurnerTest is Test {
         vm.expectEmit(false, false, false, true, address(bb));
         emit BuybackBurner.BuybackExecuted(USDC_AMOUNT, TOKEN_OUT);
         vm.prank(keeper);
-        uint256 tokenOut = bb.executeBuyback(USDC_AMOUNT, 0);
+        uint256 tokenOut = bb.executeBuyback(USDC_AMOUNT, 1);
 
         assertEq(tokenOut, TOKEN_OUT);
         // Supply burned, contract holds no residual TOKEN.
@@ -301,5 +317,45 @@ contract BuybackBurnerTest is Test {
             )
         );
         bb.unpause();
+    }
+
+    // -----------------------------------------------------------------
+    // rescueUSDC — recover stranded USDC
+    // -----------------------------------------------------------------
+
+    function test_rescueUSDC_transfersToRecipient() public {
+        address recipient = address(0xBEEF);
+        uint256 amount = 1234e6;
+        uint256 recipientBefore = usdc.balanceOf(recipient);
+        uint256 bbBefore = usdc.balanceOf(address(bb));
+
+        vm.expectEmit(true, false, false, true, address(bb));
+        emit BuybackBurner.UsdcRescued(recipient, amount);
+        vm.prank(admin);
+        bb.rescueUSDC(recipient, amount);
+
+        assertEq(usdc.balanceOf(recipient), recipientBefore + amount);
+        assertEq(usdc.balanceOf(address(bb)), bbBefore - amount);
+    }
+
+    function test_rescueUSDC_revertsWithoutGovernanceRole() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(this), bb.GOVERNANCE_ROLE()
+            )
+        );
+        bb.rescueUSDC(address(0xBEEF), 1e6);
+    }
+
+    function test_rescueUSDC_revertsOnZeroRecipient() public {
+        vm.prank(admin);
+        vm.expectRevert(BuybackBurner.ZeroAddress.selector);
+        bb.rescueUSDC(address(0), 1e6);
+    }
+
+    function test_rescueUSDC_revertsOnZeroAmount() public {
+        vm.prank(admin);
+        vm.expectRevert(BuybackBurner.ZeroAmount.selector);
+        bb.rescueUSDC(address(0xBEEF), 0);
     }
 }

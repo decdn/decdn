@@ -35,13 +35,22 @@ contract MockPublisherRegistry is IPublisherRegistryOwnership {
 
 contract MockBlacklistOrigin is IContentBlacklistOriginView {
     mapping(address => bool) internal _bl;
+    mapping(address => bool) internal _opBl;
 
     function setBlacklisted(address op, bool b) external {
         _bl[op] = b;
     }
 
+    function setOperatorBlacklisted(address op, bool b) external {
+        _opBl[op] = b;
+    }
+
     function isOriginBlacklisted(address op) external view override returns (bool) {
         return _bl[op];
+    }
+
+    function isOperatorBlacklisted(address op) external view override returns (bool) {
+        return _opBl[op];
     }
 }
 
@@ -198,6 +207,17 @@ contract OriginAssignmentTest is Test {
         oa.activateAssignment(NS);
     }
 
+    /// @notice M-2 — activation must also reject an operator blacklisted via the
+    ///         operator mapping (`addOperator`), not only the origin mapping.
+    function test_activate_revertsOperatorBlacklistedViaOperatorMapping() public {
+        _propose(_ops2());
+        vm.warp(block.timestamp + TIMELOCK);
+        blacklist.setOperatorBlacklisted(opB, true);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opB));
+        oa.activateAssignment(NS);
+    }
+
     function test_activate_onlyGovernance() public {
         _propose(_ops2());
         vm.warp(block.timestamp + TIMELOCK);
@@ -282,6 +302,20 @@ contract OriginAssignmentTest is Test {
 
         blacklist.setBlacklisted(opA, true);
         // Permissionless — any caller.
+        vm.prank(stranger);
+        oa.pruneBlacklistedAssignment(NS, opA);
+        assertFalse(oa.isAuthorizedOrigin(NS, opA));
+    }
+
+    /// @notice M-2 — prune must also work for an operator blacklisted via the
+    ///         operator mapping (`addOperator`), not only the origin mapping.
+    function test_prune_removesOperatorBlacklistedViaOperatorMapping() public {
+        _propose(_ops2());
+        vm.warp(block.timestamp + TIMELOCK);
+        vm.prank(admin);
+        oa.activateAssignment(NS);
+
+        blacklist.setOperatorBlacklisted(opA, true);
         vm.prank(stranger);
         oa.pruneBlacklistedAssignment(NS, opA);
         assertFalse(oa.isAuthorizedOrigin(NS, opA));

@@ -182,6 +182,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error RatificationWindowOpen(uint64 readyAt);
     error RegionalCapHit(bytes32 region, uint256 cap);
     error AppealAlreadyActive(bytes32 region, bytes32 hash);
+    error HashHasActiveAppeal(bytes32 region, bytes32 hash);
     error FrequencyCapHit(uint64 nextAvailableAt);
     error UnauthorizedStanding(StandingPath path);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
@@ -231,7 +232,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         _removeHashRegional(region, hash);
     }
 
-    function addOperator(address operator) external onlyRole(GOVERNANCE_ROLE) {
+    /// @dev `nonReentrant` for consistency with the appeal mutators: this is the
+    ///      one path that makes an external state-changing call
+    ///      (`capacityBond.ejectNode`) after a state write (M-4). `ejectNode` is
+    ///      a trusted contract, but the guard hardens against a future hook.
+    function addOperator(address operator) external nonReentrant onlyRole(GOVERNANCE_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
         if (!isOperatorBlacklisted[operator]) {
             isOperatorBlacklisted[operator] = true;
@@ -286,11 +291,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (block.timestamp > uint256(entry.addedAt) + APPEAL_FILING_WINDOW) {
             revert AppealFilingWindowClosed(region, hash);
         }
-        if (regionActiveReliefCount[region] >= BODY_CONCURRENT_APPEAL_CAP) {
-            revert RegionalCapHit(region, BODY_CONCURRENT_APPEAL_CAP);
-        }
         // Single live appeal per (region, hash) — see `hasActiveAppeal`
-        // declaration for the override bug this prevents.
+        // declaration for the override bug this prevents. The per-region
+        // concurrent cap is NOT enforced here: an Open appeal grants no interim
+        // relief, so un-acted-upon filings must not crowd out others. The cap
+        // is charged only once an appeal is fast-tracked (M-1).
         if (hasActiveAppeal[region][hash]) revert AppealAlreadyActive(region, hash);
         uint64 last = lastRatifiedSuccessAt[msg.sender];
         if (last != 0) {
@@ -323,7 +328,6 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
                 status: AppealStatus.Open
             })
         );
-        regionActiveReliefCount[region] += 1;
         hasActiveAppeal[region][hash] = true;
 
         emit BlacklistAppealOpened(appealId, hash, region, msg.sender, standingPath, evidenceBundleHash, appealBond);
@@ -332,8 +336,16 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     function fastTrackBlacklistAppeal(uint256 appealId) external nonReentrant onlyRole(EMERGENCY_MULTISIG_ROLE) {
         BlacklistAppeal storage a = _appeals[appealId];
         if (a.status != AppealStatus.Open) revert AppealNotOpen(appealId);
+        // The per-region concurrent cap counts only fast-tracked appeals — the
+        // ones actually holding interim relief (a suspended entry) — so it
+        // bounds simultaneous suspensions per region without letting un-acted
+        // Open filings consume the budget (M-1).
+        if (regionActiveReliefCount[a.region] >= BODY_CONCURRENT_APPEAL_CAP) {
+            revert RegionalCapHit(a.region, BODY_CONCURRENT_APPEAL_CAP);
+        }
         a.fastTrackedAt = uint64(block.timestamp);
         a.status = AppealStatus.FastTracked;
+        regionActiveReliefCount[a.region] += 1;
         _hashEntries[a.region][a.hash].suspended = true;
         emit BlacklistAppealFastTracked(appealId);
     }
@@ -343,11 +355,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (a.status != AppealStatus.Open && a.status != AppealStatus.FastTracked) revert AppealNotOpen(appealId);
         if (a.status == AppealStatus.FastTracked) {
             _hashEntries[a.region][a.hash].suspended = false;
+            // Only fast-tracked appeals charge the relief cap (M-1).
+            if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
         }
         uint256 bondBurned = a.bond;
         a.bond = 0;
         a.status = AppealStatus.Rejected;
-        if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
         hasActiveAppeal[a.region][a.hash] = false;
         if (bondBurned != 0) token.burn(bondBurned);
         emit BlacklistAppealRejected(appealId, bondBurned);
@@ -396,7 +409,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             uint256 bondBurned = a.bond;
             a.bond = 0;
             a.status = AppealStatus.Lapsed;
-            if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+            // Open appeals never charged the relief cap (M-1) — nothing to release.
             hasActiveAppeal[a.region][a.hash] = false;
             if (bondBurned != 0) token.burn(bondBurned);
             emit BlacklistAppealLapsed(appealId, 1);
@@ -450,6 +463,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     function _addHash(bytes32 region, bytes32 hash) internal {
         if (hash == bytes32(0)) revert ZeroHash();
+        // A re-add while an appeal is live would clear `suspended` and refresh
+        // `addedAt`, orphaning the in-flight appeal and resetting the slash-
+        // eligibility boundary (H-2). Force governance to terminate the appeal
+        // first (reject / reverse / ratify) before re-adding.
+        if (hasActiveAppeal[region][hash]) revert HashHasActiveAppeal(region, hash);
         HashEntry storage e = _hashEntries[region][hash];
         // Re-adding refreshes `addedAt` (resets the filing window).
         e.addedAt = uint64(block.timestamp);

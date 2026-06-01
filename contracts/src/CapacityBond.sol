@@ -377,13 +377,15 @@ contract CapacityBond is
     ///         `slash()`, decremented at every terminal escrow transition.
     uint256 public escrowedTotal;
 
-    /// @notice Cumulative time (seconds) this contract has spent paused, plus
-    ///         the in-progress interval if currently paused. Added to the
-    ///         filing-window deadline checks so a pause never silently consumes
-    ///         an operator's appeal window (ADR 028 §5). Conservative: a pause
-    ///         that predates a slash still extends that slash's window, which
-    ///         only ever favors the operator.
-    uint64 public pausedTotal;
+    /// @notice Combined slash-path paused-seconds accumulator (the single source
+    ///         of truth). Folds in this contract's own pauses plus, via
+    ///         `creditPauseTime`, `SlashAppeal`'s pauses, so every appeal window
+    ///         (filing here, review/ratification on `SlashAppeal`) extends by the
+    ///         same total and a pause on either contract never silently consumes
+    ///         a window (ADR 028 §5). Conservative: a pause that predates a slash
+    ///         still extends that slash's window, which only ever favors the
+    ///         operator.
+    uint64 public override pausedTotal;
 
     /// @notice `block.timestamp` at which the current pause began; 0 when not
     ///         paused.
@@ -1220,6 +1222,16 @@ contract CapacityBond is
     }
 
     /// @inheritdoc ICapacityBondSlashEscrow
+    /// @dev Not `whenNotPaused`: `SlashAppeal` may unpause (and thus credit its
+    ///      pause time) independently of this contract's pause state, and the
+    ///      effect is purely additive to `pausedTotal` (only ever extends a
+    ///      window in the operator's favor), so it is safe to accept while
+    ///      paused.
+    function creditPauseTime(uint64 delta) external override onlyRole(SLASH_APPEAL_ROLE) {
+        pausedTotal += delta;
+    }
+
+    /// @inheritdoc ICapacityBondSlashEscrow
     function settleAppealUpheld(uint256 slashId)
         external
         override
@@ -1256,6 +1268,18 @@ contract CapacityBond is
         }
         uint256 bondPortion = refund - creditPortion;
         if (bondPortion != 0) IERC20(address(token)).safeTransfer(operator, bondPortion);
+    }
+
+    /// @notice Emergency: force-resolve an `AppealOpen` slash on the upheld path
+    ///         (50% challenger / 50% burn) when the normal `SlashAppeal` flow
+    ///         cannot — e.g. `SLASH_APPEAL_ROLE` was revoked mid-migration,
+    ///         wedging the record's escrow with no caller able to drive the
+    ///         settle hooks. Governance-gated escape hatch (ADR 028); resolves a
+    ///         stuck record exactly as `finalizeUnappealedSlash` would have.
+    /// @dev Reuses `SlashEscrowLib.settleUpheld`, so it can only act on an
+    ///      `AppealOpen` record and produces an identical 50/50 distribution.
+    function forceResolveStuckAppeal(uint256 slashId) external nonReentrant onlyRole(GOVERNANCE_ROLE) {
+        escrowedTotal -= SlashEscrowLib.settleUpheld(_slashRecords, token, slashId, slashCounter);
     }
 
     // The multi-slash zero-out recompute lives in

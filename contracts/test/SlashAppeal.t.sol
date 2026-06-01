@@ -472,4 +472,82 @@ contract SlashAppealTest is Test {
         bond.finalizeUnappealedSlash(slashId);
         assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.Upheld));
     }
+
+    // -----------------------------------------------------------------
+    // H-1 — pausing SlashAppeal extends the CapacityBond filing window
+    // -----------------------------------------------------------------
+
+    function test_slashAppealPause_extendsCapacityBondFilingWindow() public {
+        // Pausing SlashAppeal blocks `openSlashAppeal`, so the filing deadline
+        // (enforced on CapacityBond) must move by the paused duration even
+        // though CapacityBond itself never paused — the combined-counter fix.
+        uint256 slashId = _bondAndSlash();
+        uint64 slashTime = uint64(block.timestamp);
+
+        vm.startPrank(admin);
+        appeal.grantRole(appeal.PAUSER_ROLE(), admin);
+        appeal.pause();
+        vm.stopPrank();
+        vm.warp(slashTime + 10 days);
+        vm.prank(admin);
+        appeal.unpause();
+
+        // SlashAppeal's pause time was credited to CapacityBond's counter.
+        assertEq(bond.pausedTotal(), 10 days);
+
+        // Just past the nominal 30-day deadline — still open (extended +10d).
+        vm.warp(slashTime + 30 days + 1);
+        uint64 closeAt = bond.getSlashRecord(slashId).appealWindowClose + bond.pausedTotal();
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.FilingWindowStillOpen.selector, closeAt));
+        bond.finalizeUnappealedSlash(slashId);
+
+        // The operator can still file inside the extended window.
+        _open(slashId);
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.AppealOpen));
+    }
+
+    // -----------------------------------------------------------------
+    // M-3 — governance escape hatch for a role-revocation-wedged escrow
+    // -----------------------------------------------------------------
+
+    function test_forceResolveStuckAppeal_resolvesAfterRoleRevoked() public {
+        uint256 slashId = _bondAndSlash();
+        _open(slashId); // AppealOpen — escrow locked
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.AppealOpen));
+
+        // Migration mistake: SLASH_APPEAL_ROLE revoked mid-appeal, so SlashAppeal
+        // can no longer drive the settle hooks and the escrow is wedged.
+        bytes32 appealRole = bond.SLASH_APPEAL_ROLE();
+        vm.prank(admin);
+        bond.revokeRole(appealRole, address(appeal));
+
+        uint256 challengerBefore = token.balanceOf(challenger);
+        uint256 escrowBefore = bond.escrowedTotal();
+
+        vm.prank(admin);
+        bond.forceResolveStuckAppeal(slashId);
+
+        // Resolved on the upheld path: 50% to challenger, 50% burned.
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.Upheld));
+        assertEq(token.balanceOf(challenger) - challengerBefore, SLASH_AMT / 2);
+        assertEq(escrowBefore - bond.escrowedTotal(), SLASH_AMT);
+    }
+
+    function test_forceResolveStuckAppeal_revertsWhenNotAppealOpen() public {
+        uint256 slashId = _bondAndSlash(); // Escrowed, no appeal opened
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.SlashAppealNotOpen.selector, slashId));
+        bond.forceResolveStuckAppeal(slashId);
+    }
+
+    function test_forceResolveStuckAppeal_revertsWithoutGovernanceRole() public {
+        uint256 slashId = _bondAndSlash();
+        _open(slashId);
+        bytes32 govRole = bond.GOVERNANCE_ROLE();
+        vm.prank(challenger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, challenger, govRole)
+        );
+        bond.forceResolveStuckAppeal(slashId);
+    }
 }

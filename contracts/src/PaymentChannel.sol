@@ -293,28 +293,49 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         ch.client = msg.sender;
         ch.provider = provider;
         ch.token = address(usdc);
-        ch.deposit = deposit;
         ch.openedAt = uint64(block.timestamp);
         ch.expiresAt = uint64(block.timestamp + maxChannelDuration);
         ch.status = Status.Open;
 
+        // Credit the balance actually received, not the requested amount, so a
+        // future fee-on-transfer USDC proxy upgrade cannot over-state this
+        // channel's share of the shared pool and brick later settlements.
+        // Balance reads are staticcalls to the trusted USDC under `nonReentrant`.
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        uint256 balanceBefore = usdc.balanceOf(address(this));
         usdc.safeTransferFrom(msg.sender, address(this), deposit);
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        uint256 received = usdc.balanceOf(address(this)) - balanceBefore;
+        if (received < minDeposit) revert DepositBelowMinimum(received, minDeposit);
+        ch.deposit = received;
 
-        emit ChannelOpened(channelId, msg.sender, provider, deposit, ch.expiresAt);
+        emit ChannelOpened(channelId, msg.sender, provider, received, ch.expiresAt);
     }
 
     /// @notice Client-only: add funds to an open channel; does not extend `expiresAt`.
-    function topUp(bytes32 channelId, uint256 additionalDeposit) external nonReentrant {
+    /// @dev `whenNotPaused`: pause refuses new inflows during an incident, while the
+    ///      existing-channel exit paths stay open (funds are never trapped).
+    function topUp(bytes32 channelId, uint256 additionalDeposit) external nonReentrant whenNotPaused {
         Channel storage ch = channels[channelId];
         _requireOpenAndUnexpired(ch);
         if (msg.sender != ch.client) revert NotChannelParty();
         if (additionalDeposit == 0) revert ZeroAmount();
 
-        ch.deposit += additionalDeposit;
-
+        // Credit the measured delta (see `openChannel`) so fee-on-transfer
+        // behavior cannot over-credit the channel's deposit. Balance reads are
+        // staticcalls to the trusted USDC under `nonReentrant`.
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        uint256 balanceBefore = usdc.balanceOf(address(this));
         usdc.safeTransferFrom(msg.sender, address(this), additionalDeposit);
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        uint256 received = usdc.balanceOf(address(this)) - balanceBefore;
+        // `received` is a derived balance delta; the `== 0` is a presence check
+        // (a top-up that delivered nothing), not a dangerous balance equality.
+        // slither-disable-next-line incorrect-equality
+        if (received == 0) revert ZeroAmount();
+        ch.deposit += received;
 
-        emit ChannelToppedUp(channelId, additionalDeposit, ch.deposit);
+        emit ChannelToppedUp(channelId, received, ch.deposit);
     }
 
     /// @notice Provider-only: redeem the accrued delta of a client-signed voucher
@@ -499,6 +520,9 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         if (newRouter.code.length == 0) revert FeeRouterHasNoCode(newRouter);
         if (newRouter == feeRouter) revert RouterUnchanged();
         address old = feeRouter;
+        // Drop any standing allowance to the outgoing router so a re-point can
+        // never leave it able to pull this contract's USDC after replacement.
+        usdc.forceApprove(old, 0);
         feeRouter = newRouter;
         emit FeeRouterUpdated(old, newRouter);
     }
@@ -624,6 +648,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     function _route(address operator, uint256 bytesDelta, uint256 amountDelta) internal {
         usdc.forceApprove(feeRouter, amountDelta);
         IFeeRouterSettlement(feeRouter).routeSettlement(operator, bytesDelta, amountDelta);
+        // Zero any residue: an honest router pulls exactly `amountDelta`, but a
+        // re-pointed or buggy one pulling less would otherwise leave a standing
+        // allowance over this contract's USDC. Reset closes that surface.
+        usdc.forceApprove(feeRouter, 0);
     }
 
     /// @dev L2-specific forced-inclusion detection seam. Returns `false` in this

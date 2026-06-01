@@ -204,7 +204,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
             // aderyn-ignore-next-line(reentrancy-state-change)
             if (!capacityBond.isActive(operators[i])) revert OperatorNotActive(operators[i]);
             // aderyn-ignore-next-line(reentrancy-state-change)
-            if (blacklist != address(0) && IContentBlacklistOriginView(blacklist).isOriginBlacklisted(operators[i])) {
+            if (blacklist != address(0) && _isBlacklisted(blacklist, operators[i])) {
                 revert OperatorBlacklisted(operators[i]);
             }
         }
@@ -248,11 +248,21 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         address blacklist = contentBlacklist;
         if (blacklist == address(0)) revert ContentBlacklistNotSet();
         // aderyn-ignore-next-line(reentrancy-state-change)
-        if (!IContentBlacklistOriginView(blacklist).isOriginBlacklisted(operator)) {
+        if (!_isBlacklisted(blacklist, operator)) {
             revert OperatorNotBlacklisted(operator);
         }
         if (!_origins[namespaceId].remove(operator)) revert NotAuthorizedOrigin(namespaceId, operator);
         emit BlacklistedAssignmentPruned(namespaceId, operator, msg.sender);
+    }
+
+    /// @dev True if `operator` is blacklisted via EITHER the origin or the
+    ///      operator mapping on `ContentBlacklist` (M-2). An operator can be
+    ///      ejected via the operator mapping (`addOperator`) without the origin
+    ///      mapping being set, and vice versa; authorization must reject — and
+    ///      pruning must succeed on — either.
+    function _isBlacklisted(address blacklist, address operator) internal view returns (bool) {
+        IContentBlacklistOriginView bl = IContentBlacklistOriginView(blacklist);
+        return bl.isOriginBlacklisted(operator) || bl.isOperatorBlacklisted(operator);
     }
 
     // -----------------------------------------------------------------
