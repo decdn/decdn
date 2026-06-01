@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 
 import { CapacityBond } from "../src/CapacityBond.sol";
+import { SlashStatus, SlashRecord } from "../src/SlashEscrowLib.sol";
 import { BondMath } from "../src/BondMath.sol";
 import { Token } from "../src/Token.sol";
 
@@ -59,6 +60,27 @@ contract CapacityBondTest is Test {
 
         vm.prank(operator);
         token.approve(address(bond), type(uint256).max);
+    }
+
+    /// @dev Bring the operator's active bond up to exactly the ADR 026
+    ///      § Capacity-bond curve requirement `bondRequired(mbps)` so
+    ///      `declareMbps(mbps)` passes the on-chain enforcement (issue #770).
+    ///      Bonds only the deficit (and tops the operator up from `admin` only
+    ///      for that deficit), so the helper is idempotent and never overshoots
+    ///      — callers asserting "exactly at curve" boundaries stay precise even
+    ///      if the operator already holds bond.
+    function _bondForMbps(uint256 mbps) internal {
+        uint256 need = bond.bondRequired(mbps);
+        uint256 active = bond.activeBond(operator);
+        if (active >= need) return;
+        uint256 deficit = need - active;
+        uint256 bal = token.balanceOf(operator);
+        if (bal < deficit) {
+            vm.prank(admin);
+            token.transfer(operator, deficit - bal);
+        }
+        vm.prank(operator);
+        bond.bond(deficit);
     }
 
     function test_firstBondedAt_setsOnFirstBond() public {
@@ -444,6 +466,7 @@ contract CapacityBondTest is Test {
     }
 
     function test_declaredMbps_storesValue() public {
+        _bondForMbps(1000);
         vm.prank(operator);
         bond.declareMbps(1000);
         assertEq(bond.declaredMbps(operator), 1000);
@@ -457,6 +480,7 @@ contract CapacityBondTest is Test {
     }
 
     function test_declareMbps_acceptsFloorAndCeiling() public {
+        _bondForMbps(200_000);
         vm.startPrank(operator);
         bond.declareMbps(10);
         assertEq(bond.declaredMbps(operator), 10);
@@ -495,6 +519,7 @@ contract CapacityBondTest is Test {
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.DeclaredCapacityOutOfBand.selector, 100, 500, 200_000));
         bond.declareMbps(100);
 
+        _bondForMbps(500);
         vm.prank(operator);
         bond.declareMbps(500);
         assertEq(bond.declaredMbps(operator), 500);
@@ -545,7 +570,275 @@ contract CapacityBondTest is Test {
         bond.setMaxCapacityMbps(50_000);
     }
 
+    // -----------------------------------------------------------------
+    // ADR 026 § Capacity-bond curve — on-chain enforcement + governance
+    // (issue #770). `bond_required(Mbps) = k × Mbps^α`, default k = 12.6
+    // TOKEN, α = 1.2; the coupling `activeBond ≥ bondRequired(declaredMbps)`
+    // is enforced at `declareMbps` / `requestUnbond` / `registerNode`.
+    // -----------------------------------------------------------------
+
+    function test_bondRequired_matchesAdrWorkedExamples() public view {
+        // ADR 026 § Capacity-bond curve worked table (α = 1.2, k = 12.6),
+        // checked within ±2% of the rounded ADR figures.
+        assertApproxEqRel(bond.bondRequired(10), 200e18, 0.02e18, "10 Mbps");
+        assertApproxEqRel(bond.bondRequired(1000), 50_000e18, 0.02e18, "1 Gbps");
+        assertApproxEqRel(bond.bondRequired(10_000), 795_000e18, 0.02e18, "10 Gbps");
+        assertApproxEqRel(bond.bondRequired(100_000), 12_600_000e18, 0.02e18, "100 Gbps");
+    }
+
+    function test_bondRequired_zeroForZeroMbps() public view {
+        assertEq(bond.bondRequired(0), 0);
+    }
+
+    function test_bondRequired_strictlyMonotonic() public view {
+        assertLt(bond.bondRequired(10), bond.bondRequired(100));
+        assertLt(bond.bondRequired(100), bond.bondRequired(1000));
+        assertLt(bond.bondRequired(1000), bond.bondRequired(10_000));
+        assertLt(bond.bondRequired(10_000), bond.bondRequired(100_000));
+    }
+
+    /// @dev Monotonicity across the full declarable band (α=1.2 default is
+    ///      strictly increasing), guarding powWad rounding plateaus / edge
+    ///      cases the fixed points above miss.
+    function testFuzz_bondRequired_monotonic(uint256 a, uint256 b) public view {
+        a = bound(a, 1, 1_000_000);
+        b = bound(b, 1, 1_000_000);
+        if (a > b) (a, b) = (b, a);
+        assertLe(bond.bondRequired(a), bond.bondRequired(b));
+    }
+
+    function test_declareMbps_revertsWhenBondBelowCurve() public {
+        uint256 required = bond.bondRequired(1000);
+        // Bond one wei short of the curve.
+        vm.prank(admin);
+        token.transfer(operator, required);
+        vm.prank(operator);
+        bond.bond(required - 1);
+
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, required - 1, required));
+        bond.declareMbps(1000);
+    }
+
+    function test_declareMbps_succeedsExactlyAtCurve() public {
+        _bondForMbps(1000);
+        vm.prank(operator);
+        bond.declareMbps(1000);
+        assertEq(bond.declaredMbps(operator), 1000);
+    }
+
+    function test_requestUnbond_revertsWhenItDropsBelowCurve() public {
+        _bondForMbps(1000);
+        vm.prank(operator);
+        bond.declareMbps(1000);
+
+        uint256 required = bond.bondRequired(1000);
+        // Operator bonded exactly `required`; unbonding any amount drops below.
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, required - 1, required));
+        bond.requestUnbond(1);
+    }
+
+    function test_requestUnbond_allowedWhenNoCapacityDeclared() public {
+        // declaredMbps defaults to 0 ⇒ bondRequired(0) == 0, so the curve does
+        // not constrain unbonding.
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        vm.prank(operator);
+        bond.requestUnbond(MIN_BOND / 2);
+        assertEq(bond.activeBond(operator), MIN_BOND / 2);
+    }
+
+    function test_requestUnbond_succeedsDownToExactlyCurve() public {
+        // Over-bond above the 1 Gbps curve, declare 1000, then unbond the slack
+        // down to exactly bondRequired(1000) — the inclusive boundary succeeds.
+        uint256 required = bond.bondRequired(1000);
+        uint256 slack = 5000e18;
+        vm.prank(admin);
+        token.transfer(operator, required + slack);
+        vm.startPrank(operator);
+        bond.bond(required + slack);
+        bond.declareMbps(1000);
+        bond.requestUnbond(slack);
+        vm.stopPrank();
+        assertEq(bond.activeBond(operator), required);
+    }
+
+    function test_slash_doesNotEnforceCurve() public {
+        // A slash may drop active bond below the curve; it must NOT revert
+        // (slash paths are intentionally exempt — ADR 026 § Slashing and burn).
+        _bondForMbps(1000);
+        vm.prank(operator);
+        bond.declareMbps(1000);
+
+        vm.prank(admin);
+        bond.slash(operator, challenger, 1);
+        // Post-slash active bond is below bondRequired(1000); no revert occurred.
+        assertLt(bond.activeBond(operator), bond.bondRequired(1000));
+    }
+
+    function test_registerNode_revertsWhenBondBelowCurve() public {
+        uint256 opPk = 0xBADC0DE;
+        address opAddr = vm.addr(opPk);
+
+        // Bond exactly bondRequired(1000) and declare the 1 Gbps tier (passes).
+        uint256 bonded = bond.bondRequired(1000);
+        vm.prank(admin);
+        token.transfer(opAddr, bonded);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(bonded);
+        bond.declareMbps(1000);
+        vm.stopPrank();
+
+        // Governance raises k so the 1 Gbps requirement now exceeds the
+        // (unchanged) bond, while the bond still clears minBond.
+        vm.prank(admin);
+        bond.setK(20e18);
+        uint256 newRequired = bond.bondRequired(1000);
+        assertGt(bonded, MIN_BOND); // still satisfies the minBond gate
+        assertLt(bonded, newRequired); // but is now below the curve
+
+        vm.warp(1_000_000);
+        bytes32 nodeId = bytes32(uint256(0xDEAD));
+        bytes memory bindingSig = _signBindNode(opPk, opAddr, nodeId);
+        vm.prank(opAddr);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, bonded, newRequired));
+        bond.registerNode(nodeId, hex"", "us-east", bindingSig, hex"01");
+    }
+
+    function test_registerNode_succeedsAtCurve() public {
+        // The success side of the registerNode curve gate: declaredMbps > 0 and
+        // bonded ≥ bondRequired(declaredMbps) registers cleanly.
+        uint256 opPk = 0xF00D;
+        address opAddr = vm.addr(opPk);
+
+        uint256 bonded = bond.bondRequired(1000);
+        vm.prank(admin);
+        token.transfer(opAddr, bonded);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(bonded);
+        bond.declareMbps(1000);
+        vm.stopPrank();
+
+        vm.warp(1_000_000);
+        bytes32 nodeId = bytes32(uint256(0xF00DF00D));
+        bytes memory bindingSig = _signBindNode(opPk, opAddr, nodeId);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "us-east", bindingSig, hex"01");
+
+        assertEq(bond.addressToNodeId(opAddr), nodeId);
+        assertTrue(bond.isActive(opAddr));
+    }
+
+    function test_setK_updatesCurveAndEmits() public {
+        uint256 oldK = bond.kConstant();
+        vm.expectEmit(false, false, false, true, address(bond));
+        emit CapacityBond.KUpdated(oldK, 20e18);
+        vm.prank(admin);
+        bond.setK(20e18);
+        assertEq(bond.kConstant(), 20e18);
+        // bondRequired now scales with the new k.
+        assertEq(bond.bondRequired(1000), BondMath.bondRequired(1000, 20e18, 1.2e18));
+    }
+
+    function test_setAlpha_updatesCurveAndEmits() public {
+        uint256 oldAlpha = bond.alphaWad();
+        vm.expectEmit(false, false, false, true, address(bond));
+        emit CapacityBond.AlphaUpdated(oldAlpha, 1e18);
+        vm.prank(admin);
+        bond.setAlpha(1e18);
+        assertEq(bond.alphaWad(), 1e18);
+        // α = 1.0 ⇒ linear: bondRequired(1000) = k × 1000 = 12_600 TOKEN.
+        assertApproxEqRel(bond.bondRequired(1000), 12_600e18, 0.001e18);
+    }
+
+    function test_setAlpha_revertsOutOfBounds() public {
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, 0.9e18, 1e18, 1.8e18));
+        bond.setAlpha(0.9e18);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, 1.9e18, 1e18, 1.8e18));
+        bond.setAlpha(1.9e18);
+        vm.stopPrank();
+    }
+
+    function test_setAlpha_revertsWhenGbpsTierOutOfRange() public {
+        // α = 1.8 with default k = 12.6 pushes the 1 Gbps tier far above the
+        // 200K-TOKEN ceiling, so the coupled bound rejects it.
+        uint256 oldAlpha = bond.alphaWad();
+        uint256 tierBond = BondMath.bondRequired(1000, 12.6e18, 1.8e18);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, tierBond, 10_000e18, 200_000e18));
+        bond.setAlpha(1.8e18);
+        // Store-then-validate: the reverted setter's tentative write is rolled back.
+        assertEq(bond.alphaWad(), oldAlpha);
+    }
+
+    function test_setK_revertsWhenGbpsTierOutOfRange() public {
+        uint256 oldK = bond.kConstant();
+        // k too low ⇒ 1 Gbps tier below the 10K floor.
+        uint256 lowTier = BondMath.bondRequired(1000, 1e18, 1.2e18);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, lowTier, 10_000e18, 200_000e18));
+        bond.setK(1e18);
+
+        // k too high ⇒ 1 Gbps tier above the 200K ceiling.
+        uint256 highTier = BondMath.bondRequired(1000, 100e18, 1.2e18);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, highTier, 10_000e18, 200_000e18));
+        bond.setK(100e18);
+
+        // Store-then-validate: neither reverted setter left a tentative write.
+        assertEq(bond.kConstant(), oldK);
+    }
+
+    function test_setCurve_onlyGovernance() public {
+        bytes32 role = bond.GOVERNANCE_ROLE();
+        vm.startPrank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, operator, role)
+        );
+        bond.setK(20e18);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, operator, role)
+        );
+        bond.setAlpha(1e18);
+        vm.stopPrank();
+    }
+
+    function test_curveDefaults() public view {
+        assertEq(bond.kConstant(), 12.6e18);
+        assertEq(bond.alphaWad(), 1.2e18);
+    }
+
+    /// @dev Locks the documented `setK`/`setAlpha` ordering hazard: each setter
+    ///      validates the 1 Gbps tier against the *live* other coefficient, so a
+    ///      valid target pair can be unreachable in the wrong order. Target
+    ///      (k=180, α=1.0) ⇒ 1 Gbps = 180_000 TOKEN (in range), but k-first
+    ///      passes through (k=180, α=1.2) ⇒ ~716K TOKEN (over the 200K ceiling).
+    function test_setKAlpha_orderingMatters() public {
+        vm.startPrank(admin);
+
+        // k-first reverts at the out-of-range intermediate (k=180, α=1.2).
+        uint256 badIntermediate = BondMath.bondRequired(1000, 180e18, 1.2e18);
+        vm.expectRevert(
+            abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, badIntermediate, 10_000e18, 200_000e18)
+        );
+        bond.setK(180e18);
+
+        // α-first reaches the same target pair: each step stays in range.
+        bond.setAlpha(1e18); // (k=12.6, α=1.0) ⇒ 12_600 TOKEN
+        bond.setK(180e18); // (k=180, α=1.0) ⇒ 180_000 TOKEN
+        vm.stopPrank();
+
+        assertEq(bond.kConstant(), 180e18);
+        assertEq(bond.alphaWad(), 1e18);
+        assertApproxEqRel(bond.bondRequired(1000), 180_000e18, 0.001e18);
+    }
+
     function test_declareMbps_emitsOldAndNewValue() public {
+        _bondForMbps(500);
         vm.startPrank(operator);
 
         // First declaration: `old` is the zero default.
@@ -912,8 +1205,8 @@ contract CapacityBondTest is Test {
         assertEq(bond.escrowedTotal(), totalSlash);
         assertEq(token.balanceOf(challenger), challengerBefore); // nothing paid yet
         assertEq(token.totalSupply(), supplyBefore); // nothing burned yet
-        CapacityBond.SlashRecord memory r = bond.getSlashRecord(slashId);
-        assertEq(uint8(r.status), uint8(CapacityBond.SlashStatus.Escrowed));
+        SlashRecord memory r = bond.getSlashRecord(slashId);
+        assertEq(uint8(r.status), uint8(SlashStatus.Escrowed));
         assertEq(r.challenger, challenger);
     }
 
@@ -940,7 +1233,7 @@ contract CapacityBondTest is Test {
         assertEq(token.balanceOf(challenger) - challengerBefore, totalSlash / 2);
         assertEq(supplyBefore - token.totalSupply(), totalSlash - totalSlash / 2);
         assertEq(bond.escrowedTotal(), 0);
-        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(CapacityBond.SlashStatus.Upheld));
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.Upheld));
     }
 
     /// An opened appeal flips the escrow to `AppealOpen`, so the permissionless

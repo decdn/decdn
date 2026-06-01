@@ -7,3 +7,6 @@
 [submodule "contracts/lib/crypto-lib"]
 	path = contracts/lib/crypto-lib
 	url = https://github.com/get-smooth/crypto-lib
+[submodule "contracts/lib/solady"]
+	path = contracts/lib/solady
+	url = https://github.com/vectorized/solady

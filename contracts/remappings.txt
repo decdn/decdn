@@ -2,3 +2,4 @@
 forge-std/=lib/forge-std/src/
 crypto-lib/=lib/crypto-lib/src/
 @solidity/=lib/crypto-lib/src/
+solady/=lib/solady/src/

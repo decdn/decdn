@@ -6,6 +6,7 @@ import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.so
 
 import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
+import { SlashStatus, SlashRecord } from "../src/SlashEscrowLib.sol";
 import { Token } from "../src/Token.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
 import { ISlashAppeal } from "../src/interfaces/ISlashAppeal.sol";
@@ -108,7 +109,7 @@ contract SlashAppealTest is Test {
         assertEq(bondBefore - token.balanceOf(operator), APPEAL_BOND);
         assertEq(token.balanceOf(address(appeal)), APPEAL_BOND);
         // CapacityBond escrow flipped to AppealOpen.
-        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(CapacityBond.SlashStatus.AppealOpen));
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.AppealOpen));
         assertEq(uint8(appeal.getAppeal(slashId).status), uint8(ISlashAppeal.AppealStatus.Open));
     }
 
@@ -168,7 +169,7 @@ contract SlashAppealTest is Test {
         assertEq(token.balanceOf(operator) - opBefore, SLASH_AMT + APPEAL_BOND);
         assertEq(bond.slashedAtEpoch(operator), 0);
         assertEq(bond.escrowedTotal(), 0);
-        assertEq(bond.getSlashRecord(slashId).status == CapacityBond.SlashStatus.Reversed, true);
+        assertEq(bond.getSlashRecord(slashId).status == SlashStatus.Reversed, true);
         // Frequency cap stamped.
         assertEq(appeal.lastAcceptedAppealAt(operator), uint64(block.timestamp));
     }
@@ -469,6 +470,6 @@ contract SlashAppealTest is Test {
         // Past the EXTENDED deadline — finalize succeeds.
         vm.warp(slashTime + 40 days + 1);
         bond.finalizeUnappealedSlash(slashId);
-        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(CapacityBond.SlashStatus.Upheld));
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.Upheld));
     }
 }
