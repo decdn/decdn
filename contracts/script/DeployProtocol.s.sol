@@ -56,7 +56,7 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///
 ///         Optional env vars (defaults from ADR 026 / ADR 028 / ADR 009 / 036):
 ///           - `TIMELOCK_DELAY`             (default 48h; floor MIN_TIMELOCK_DELAY)
-///           - `MIN_STAKE`                  (default 50_000e18)
+///           - `MIN_BOND`                   (default 50_000e18)
 ///           - `UNBONDING_PERIOD`           (default 14 days)
 ///           - `MULTIADDR_UPDATE_COOLDOWN`  (default 0)
 ///           - `MAX_MULTIADDR_SIZE`         (default 1024)
@@ -73,7 +73,7 @@ contract DeployProtocol is BaseProtocolDeploy {
     // OZ's TimelockController silently accepts). Production should use the 48h
     // default per ADR 009; the floor only blocks footgun values.
     uint256 internal constant MIN_TIMELOCK_DELAY = 1 hours;
-    uint256 internal constant DEFAULT_MIN_STAKE = 50_000e18;
+    uint256 internal constant DEFAULT_MIN_BOND = 50_000e18;
     uint256 internal constant DEFAULT_UNBONDING_PERIOD = 14 days;
     uint256 internal constant DEFAULT_MULTIADDR_UPDATE_COOLDOWN = 0;
     uint256 internal constant DEFAULT_MAX_MULTIADDR_SIZE = 1024;
@@ -161,7 +161,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         if (cfg.timelockDelay < MIN_TIMELOCK_DELAY) {
             revert TimelockDelayTooShort(cfg.timelockDelay, MIN_TIMELOCK_DELAY);
         }
-        cfg.minStake = vm.envOr("MIN_STAKE", DEFAULT_MIN_STAKE);
+        cfg.minBond = vm.envOr("MIN_BOND", DEFAULT_MIN_BOND);
         cfg.unbondingPeriod = vm.envOr("UNBONDING_PERIOD", DEFAULT_UNBONDING_PERIOD);
         cfg.multiaddrUpdateCooldown = vm.envOr("MULTIADDR_UPDATE_COOLDOWN", DEFAULT_MULTIADDR_UPDATE_COOLDOWN);
         cfg.maxMultiaddrSize = vm.envOr("MAX_MULTIADDR_SIZE", DEFAULT_MAX_MULTIADDR_SIZE);
@@ -239,7 +239,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         sharesArr[1] = cfg.feeRouterShares[1];
         sharesArr[2] = cfg.feeRouterShares[2];
         vm.serializeUint(params, "feeRouterShares", sharesArr);
-        vm.serializeUint(params, "minStake", cfg.minStake);
+        vm.serializeUint(params, "minBond", cfg.minBond);
         string memory paramsJson = vm.serializeUint(params, "timelockDelay", cfg.timelockDelay);
 
         string memory root = "manifest";

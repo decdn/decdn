@@ -135,7 +135,7 @@ abstract contract BaseProtocolDeploy is Script {
         // Governance / Timelock
         uint256 timelockDelay;
         // CapacityBond economic params (ADR 026 defaults)
-        uint256 minStake;
+        uint256 minBond;
         uint256 unbondingPeriod;
         uint256 multiaddrUpdateCooldown;
         uint256 maxMultiaddrSize;
@@ -247,7 +247,7 @@ abstract contract BaseProtocolDeploy is Script {
             token_: d.token,
             ed25519Verifier_: cfg.ed25519Verifier,
             admin: cfg.deployer,
-            minStake_: cfg.minStake,
+            minBond_: cfg.minBond,
             unbondingPeriod_: cfg.unbondingPeriod,
             multiaddrUpdateCooldown_: cfg.multiaddrUpdateCooldown,
             maxMultiaddrSize_: cfg.maxMultiaddrSize,
