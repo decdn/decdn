@@ -186,6 +186,13 @@ const REORG_MARGIN_BLOCKS: u64 = 128;
 /// of blocks behind head; a single unbounded `eth_getLogs` over that gap would
 /// exceed the range/result caps most RPC providers enforce. The backfill walks
 /// the gap in windows of this size instead.
+///
+/// This bounds the *block span* per request, not the *result count* — some
+/// providers cap `eth_getLogs` by number of matched logs (or a lower block span)
+/// rather than range, so a dense 10k-block window could still trip a result-count
+/// limit. 10k is a conservative default that clears the common range caps; tie it
+/// to the deployment provider's documented `eth_getLogs` limit (and make it
+/// configurable) if a target RPC enforces a tighter or result-count-based cap.
 const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
 
 /// Resolve the watcher backfill floor from the persisted scan checkpoint and
@@ -266,8 +273,10 @@ pub struct PaymentChannelService<P: Provider + Clone + 'static> {
     _watcher: AbortOnDrop,
     /// The redemption task handle. Unlike `_watcher`/`_sweeper` (aborted only on
     /// drop) this is held so the shutdown path can abort+await it *before*
-    /// closing channels (#751) — a live `withdraw` racing the shutdown
-    /// `closeChannel` benign-reverts and logs a misleading warn. `take()`n by
+    /// closing channels (#751) — greatly narrowing (not eliminating; a tx already
+    /// broadcast before the abort can still mine) the window where a live
+    /// `withdraw` races the shutdown `closeChannel`, benign-reverts, and logs a
+    /// misleading warn. `take()`n by
     /// [`Self::quiesce_redeemer`]; the [`Drop`] impl aborts whatever remains as
     /// the safety net the `AbortOnDrop` wrapper gave the other tasks. A
     /// `std::sync::Mutex` (not `tokio`): the guard is only ever held to `take()`
@@ -384,11 +393,16 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
     /// persisted state is final. A close starts the dispute window; a later
     /// `settleChannel` (callable by anyone) finalizes it.
     pub async fn close_open_channels_on_shutdown(&self, deadline: Duration) {
-        // Quiesce the redeemer first (#751): with the router already drained,
-        // no new hints arrive, and stopping any in-flight `withdraw` here means
-        // the `closeChannel`s below cannot race one — which would benign-revert
-        // and log a misleading warn. The deadline below covers only the closes;
-        // the abort+await is bounded (an aborted task stops at its next await).
+        // Quiesce the redeemer first (#751): with the router already drained, no
+        // new hints arrive, and aborting the redeemer here stops it from *issuing*
+        // any further `withdraw`, so the `closeChannel`s below are very unlikely to
+        // race one (which would benign-revert and log a misleading warn). This
+        // narrows the window rather than closing it: a `withdraw` already broadcast
+        // before the abort can still mine concurrently with a `closeChannel`. That
+        // residual race is benign (the revert is expected; settlement is unchanged)
+        // — the abort just keeps the common case quiet. The deadline below covers
+        // only the closes; the abort+await is bounded (an aborted task stops at its
+        // next await).
         self.quiesce_redeemer().await;
         let Ok(closed) = tokio::time::timeout(deadline, self.close_all_unredeemed()).await else {
             warn!(
@@ -402,9 +416,11 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         }
     }
 
-    /// Abort and await the redemption task so no in-flight `withdraw` survives
-    /// into the shutdown close path (#751). Idempotent: once the handle is
-    /// taken, later calls — and the [`Drop`] safety net — find `None` and no-op.
+    /// Abort and await the redemption task so it issues no *further* `withdraw`
+    /// into the shutdown close path (#751) — a `withdraw` already broadcast before
+    /// the abort can still mine, so this narrows rather than eliminates the
+    /// withdraw-vs-`closeChannel` race. Idempotent: once the handle is taken,
+    /// later calls — and the [`Drop`] safety net — find `None` and no-op.
     /// Awaiting the aborted handle resolves promptly (cancellation lands at the
     /// task's next await point), so this adds no meaningful latency to shutdown.
     async fn quiesce_redeemer(&self) {
@@ -635,10 +651,30 @@ fn normalize_voucher_signature(sig: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Why a [`run_watcher_once`] cycle returned, so [`watcher_loop`] can pick the
+/// right resubscribe cadence.
+enum CycleOutcome {
+    /// An event filter ended cleanly (filter expiry / provider rotation).
+    /// Resubscribe immediately with backoff reset.
+    StreamEnded,
+    /// A live `ChannelOpened` for this node failed to persist; the checkpoint is
+    /// held below its block and `backfill_from` re-armed. We return early (rather
+    /// than draining on) so the outer loop resubscribes and the next cycle's
+    /// backfill re-covers the channel *without* waiting for an unrelated
+    /// stream-end or restart — otherwise a healthy never-resubscribing stream
+    /// would strand that client (vouchers rejected `WrongChannel`) indefinitely
+    /// (#751 MEDIUM-1). Resubscribe is paced by backoff so a *durable* store
+    /// failure backs off exponentially instead of hot-looping the backfill.
+    RecoveryPending,
+}
+
 /// Background lifecycle watcher: follow `ChannelOpened` / `ChannelSettled` /
 /// `ChannelCloseInitiated`, restarting subscriptions with exponential backoff
 /// on stream error. Mirrors `chain_staker_set::watcher_loop`.
-#[allow(clippy::too_many_arguments)]
+// The three-way resubscribe dispatch (clean end / recovery-pending / RPC error,
+// each with its own backoff cadence) puts this a hair over the cognitive-
+// complexity bar; splitting it would scatter the backoff state machine.
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 async fn watcher_loop<P: Provider + Clone>(
     contract: PaymentChannel::PaymentChannelInstance<P>,
     self_address: Address,
@@ -667,9 +703,20 @@ async fn watcher_loop<P: Provider + Clone>(
         )
         .await
         {
-            Ok(()) => {
+            Ok(CycleOutcome::StreamEnded) => {
                 debug!("PaymentChannel watcher stream ended cleanly; resubscribing");
                 backoff = WATCHER_INITIAL_BACKOFF;
+            }
+            Ok(CycleOutcome::RecoveryPending) => {
+                // A live open failed to persist; `backfill_from` is re-armed.
+                // Resubscribe so the next cycle's backfill re-covers it, but pace
+                // it with backoff so a persistent store failure doesn't hot-loop.
+                warn!(
+                    backoff_secs = backoff.as_secs(),
+                    "watcher holding checkpoint after a failed open-persist; resubscribing to re-run the backfill"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(WATCHER_MAX_BACKOFF);
             }
             Err(err) => {
                 warn!(
@@ -703,7 +750,7 @@ async fn run_watcher_once<P: Provider + Clone>(
     checkpoint_store: &Arc<dyn WatcherCheckpointStore>,
     backfill_from: &mut Option<u64>,
     metrics: &Arc<Metrics>,
-) -> Result<()> {
+) -> Result<CycleOutcome> {
     let mut opened = contract
         .ChannelOpened_filter()
         .watch()
@@ -742,13 +789,6 @@ async fn run_watcher_once<P: Provider + Clone>(
             0
         }
     };
-    // Lowest block whose `ChannelOpened` (provided by this node) failed to
-    // persist this cycle. The checkpoint — advanced only from the `opened` arm —
-    // MUST stay strictly below it so a later same-stream open can't move it past
-    // the failed block; combined with re-arming `backfill_from` to that block, a
-    // restart (via the held checkpoint) and a resubscribe (via the backfill)
-    // both re-cover the channel rather than stranding it (#751).
-    let mut checkpoint_hold: Option<u64> = None;
 
     // Bring-up backfill (#762): with the live filters now installed (they cover
     // blocks after their install point forward), read the block they took over
@@ -795,33 +835,40 @@ async fn run_watcher_once<P: Provider + Clone>(
                             checkpoint_store,
                             log.block_number,
                             &mut checkpoint_hw,
-                            checkpoint_hold,
                         ),
                         Err(err) => {
                             metrics.watcher_persist_failure();
                             warn!(
                                 %err,
                                 channel_id = %event.channelId,
-                                "failed to persist opened channel; holding scan checkpoint below its block and re-arming the backfill so the next cycle re-covers it",
+                                "failed to persist opened channel; holding scan checkpoint below its block and resubscribing so the backfill re-covers it",
                             );
                             // `None` block (unconfirmed) → fall back to the current
                             // floor, conservatively re-scanning from there.
                             let failed = log.block_number.unwrap_or(checkpoint_hw);
-                            // Hold the checkpoint below the failed block for the rest
-                            // of this cycle (a later same-stream open mustn't move it
-                            // past `failed`)...
-                            checkpoint_hold =
-                                Some(checkpoint_hold.map_or(failed, |h| h.min(failed)));
-                            // ...and re-arm the bring-up backfill from it, so the
-                            // next resubscribe re-scans and re-registers the channel
-                            // (the held checkpoint also makes a restart re-cover it).
+                            // Re-arm the bring-up backfill from the failed block so the
+                            // resubscribe forced just below re-scans and re-registers
+                            // the channel. The persisted checkpoint already stays at
+                            // or below `failed` — only the `opened` arm advances it,
+                            // the stream is block-ordered, and we return before any
+                            // higher-block open processes — so a restart's
+                            // checkpoint-floored backfill also re-covers it.
                             *backfill_from =
                                 Some(backfill_from.map_or(failed, |b| b.min(failed)));
+                            // Don't drain on: return so `watcher_loop` resubscribes
+                            // and the next cycle's backfill recovers the channel now,
+                            // not on some unrelated future stream-end/restart (#751
+                            // MEDIUM-1). Returning here (rather than holding the
+                            // checkpoint and draining on) is also what keeps the
+                            // checkpoint safe without an in-cycle hold. Backoff-paced,
+                            // so a durable store failure backs off instead of
+                            // hot-looping.
+                            return Ok(CycleOutcome::RecoveryPending);
                         }
                     }
                 }
                 Some(Err(e)) => return Err(e).context("ChannelOpened stream"),
-                None => return Ok(()),
+                None => return Ok(CycleOutcome::StreamEnded),
             },
             ev = topped_up.next() => match ev {
                 Some(Ok((event, _log))) => {
@@ -843,7 +890,7 @@ async fn run_watcher_once<P: Provider + Clone>(
                     }
                 }
                 Some(Err(e)) => return Err(e).context("ChannelToppedUp stream"),
-                None => return Ok(()),
+                None => return Ok(CycleOutcome::StreamEnded),
             },
             ev = settled.next() => match ev {
                 Some(Ok((event, _log))) => {
@@ -863,7 +910,7 @@ async fn run_watcher_once<P: Provider + Clone>(
                     }
                 }
                 Some(Err(e)) => return Err(e).context("ChannelSettled stream"),
-                None => return Ok(()),
+                None => return Ok(CycleOutcome::StreamEnded),
             },
             ev = close_initiated.next() => match ev {
                 Some(Ok((event, _log))) => {
@@ -876,7 +923,7 @@ async fn run_watcher_once<P: Provider + Clone>(
                     );
                 }
                 Some(Err(e)) => return Err(e).context("ChannelCloseInitiated stream"),
-                None => return Ok(()),
+                None => return Ok(CycleOutcome::StreamEnded),
             },
         }
     }
@@ -1006,26 +1053,40 @@ async fn backfill_window<P: Provider + Clone>(
 /// Best-effort advance of the persisted scan checkpoint to a processed log's
 /// block (#751). Monotonic via the `high_water` guard (seeded from the stored
 /// value, so it never regresses across cycles) — a burst of events in nearby
-/// blocks costs at most one fsync per new block. `hold_below`, when set, caps
-/// advancement strictly below a block whose `ChannelOpened` failed to persist
-/// this cycle, so the resume backfill re-scans it. A failed write is logged, not
+/// blocks costs at most one fsync per new block. A failed write is logged, not
 /// fatal — per the [`WatcherCheckpointStore`] contract a lost checkpoint only
 /// widens the next rescan, never narrows it.
+///
+/// # Caller contract (load-bearing — #751 MEDIUM-2)
+///
+/// The anti-strand guarantee rests on two properties of *how* this is called,
+/// which the function cannot enforce from its arguments alone. A refactor that
+/// merges a second event source into the advance, or feeds blocks out of order,
+/// silently breaks them — so they are spelled out here rather than left implicit
+/// at the call site:
+///
+/// 1. **Sole caller is the `opened` arm, on a successful register.** Only a
+///    successful `ChannelOpened` proves opens were scanned + persisted through
+///    its block. Advancing from any other arm (or on a foreign-channel event)
+///    could persist the checkpoint past a block whose open *of ours* later fails
+///    to persist, stranding that channel (vouchers rejected `WrongChannel` until
+///    an unrelated rescan).
+/// 2. **The `opened` stream is strictly block-ordered.** On a persist failure
+///    the cycle returns immediately (see the `opened` arm), so every advance in a
+///    cycle precedes its first failure — and block-ordering then guarantees those
+///    advanced blocks are all `<=` the failed block. The persisted checkpoint
+///    therefore never exceeds the failed block, so a restart's checkpoint-floored
+///    backfill re-covers it. Feeding blocks out of order would let an advance
+///    overshoot a later-failing open by more than `REORG_MARGIN_BLOCKS` and
+///    strand it across a crash-before-resubscribe.
 fn advance_checkpoint(
     checkpoint_store: &Arc<dyn WatcherCheckpointStore>,
     block: Option<u64>,
     high_water: &mut u64,
-    hold_below: Option<u64>,
 ) {
     let Some(block) = block else {
         return;
     };
-    // Never advance to or past a block with an unpersisted `ChannelOpened`.
-    if let Some(hold) = hold_below
-        && block >= hold
-    {
-        return;
-    }
     if block <= *high_water {
         return;
     }
@@ -1114,9 +1175,18 @@ async fn redeem_one<P: Provider + Clone>(
 
 /// Self-tick sweep (#751): scan every persisted channel and redeem any that
 /// crossed the threshold, independent of hints. The cached-`withdrawn`
-/// pre-check in [`try_redeem`] short-circuits sub-threshold channels, so a warm
-/// cache makes this cheap; a cold entry costs one `getChannel`. Errors are
-/// per-channel (logged in [`redeem_one`]); a store-load failure is logged and
+/// pre-check in [`try_redeem`] short-circuits sub-threshold channels for free,
+/// but the cache starts empty and a miss estimates withdrawn-from-zero, so it
+/// can't short-circuit an above-threshold channel: the **first sweep after boot
+/// issues one `getChannel` per above-threshold channel** (O(channels) RPC
+/// fan-out), and likewise whenever fresh bytes push a previously-redeemed
+/// channel back over the threshold. Subsequent ticks are cheap — a `getChannel`
+/// warms the entry, and a successful `withdraw` seeds it to the voucher amount
+/// so the channel short-circuits until it next crosses the threshold. At the
+/// testnet node count this stays well within RPC budget at the 5-min
+/// [`REDEEM_TICK_INTERVAL`]; revisit the cadence (or seed the cache at bootstrap)
+/// if a node tracks enough channels to make the post-boot fan-out costly. Errors
+/// are per-channel (logged in [`redeem_one`]); a store-load failure is logged and
 /// skips this tick.
 async fn redeem_sweep<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
@@ -1623,29 +1693,24 @@ mod tests {
     }
 
     #[test]
-    fn advance_checkpoint_respects_hold_and_monotonicity() {
+    fn advance_checkpoint_is_monotonic() {
         let store: Arc<dyn WatcherCheckpointStore> = Arc::new(RecordingCheckpointStore::default());
         let mut hw = 0u64;
-        // No hold: advances and persists.
-        advance_checkpoint(&store, Some(100), &mut hw, None);
+        // Advances and persists.
+        advance_checkpoint(&store, Some(100), &mut hw);
         assert_eq!(hw, 100);
-        // Monotonic: a lower or equal block does not move the high-water mark.
-        advance_checkpoint(&store, Some(50), &mut hw, None);
+        // Monotonic: a lower or equal block does not move the high-water mark
+        // (the seed-from-stored-value guard that keeps the checkpoint from
+        // regressing across cycles, #751).
+        advance_checkpoint(&store, Some(50), &mut hw);
         assert_eq!(hw, 100);
-        advance_checkpoint(&store, Some(100), &mut hw, None);
+        advance_checkpoint(&store, Some(100), &mut hw);
         assert_eq!(hw, 100);
-        // Hold caps advancement strictly below the held block (the #751 invariant
-        // — the resume backfill must re-scan a block with an unpersisted open).
-        advance_checkpoint(&store, Some(200), &mut hw, Some(150));
-        assert_eq!(hw, 100, "must not advance to/past the held block");
-        // A block below the hold still advances.
-        advance_checkpoint(&store, Some(140), &mut hw, Some(150));
+        // A higher block advances again.
+        advance_checkpoint(&store, Some(140), &mut hw);
         assert_eq!(hw, 140);
-        // A block exactly at the hold is also refused.
-        advance_checkpoint(&store, Some(150), &mut hw, Some(150));
-        assert_eq!(hw, 140, "the held block itself must not be crossed");
         // A `None` block (unconfirmed log) is a no-op.
-        advance_checkpoint(&store, None, &mut hw, None);
+        advance_checkpoint(&store, None, &mut hw);
         assert_eq!(hw, 140);
     }
 

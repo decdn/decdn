@@ -703,8 +703,11 @@ impl ClientHandler {
                 // accrued claim advanced (#327). Best-effort: an unattached or
                 // full hint channel just skips — the next voucher re-hints, the
                 // redeemer self-tick sweeps, and shutdown closes any residual
-                // claim. A full channel is counted so a sustained drop rate is
-                // visible (#751).
+                // claim. Only `Full` is counted (a saturated queue is a real
+                // dropped hint; a sustained rate is the signal worth watching,
+                // #751). `Closed` — the redeemer aborted during shutdown
+                // `quiesce_redeemer` — is expected, not a fault, so it is
+                // deliberately left uncounted; don't "fix" this to count both.
                 if let Some(tx) = self.redeem_hint.get()
                     && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
                         tx.try_send(channel_id)

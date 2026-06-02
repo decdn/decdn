@@ -1158,6 +1158,13 @@ impl WatcherCheckpointStore for PersistentChannelStateStore {
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
         // Force fsync-on-commit, same durability discipline as the other tables.
+        // This fsyncs once per distinct new block with a provider-owned
+        // `ChannelOpened`, so draining a backlog after a resubscribe (and steady
+        // state on a popular provider) writes one fsync/block. Safe to debounce to
+        // a coarser cadence later — the resume backfill rounds this checkpoint down
+        // by `REORG_MARGIN_BLOCKS` and `register_open_channel` is idempotent, so a
+        // lagging floor only widens the next rescan — tracked in #784. Left
+        // immediate here: low fan-out at the testnet target.
         write_txn
             .set_durability(Durability::Immediate)
             .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
