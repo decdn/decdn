@@ -576,6 +576,17 @@ impl AdminRpcServer for AdminRpcImpl {
         // `try_from` here — it's used purely for stylistic uniformity with
         // the narrowing bucket conversions above. The `unwrap_or(u64::MAX)`
         // arms are unreachable on every supported (≤64-bit) target.
+        // Poison reporting to the operator is *partial* by design. The
+        // routing-table and record-store reads above go through
+        // `lock_or_rpc_err`, so a poisoned lock there surfaces as
+        // `DHT_POISONED_CODE`. The `staker_set` / `republish` counts below
+        // can't: their `len()` signatures own their own poison policy and
+        // return a plain `usize`. `RepublishScheduler::len` degrades a
+        // poisoned lock to `0` (so `scheduled_records` under-reports rather
+        // than failing the call); `ChainStakerSet::len` recovers the inner
+        // set and warns (true count, no error). We can't change those
+        // signatures from here, so these two fields trade poison-visibility
+        // for not aborting the whole snapshot — accepted, documented.
         Ok(StatusResponse {
             node_id: alloy::primitives::hex::encode(self.state.node_id),
             routing: RoutingHealth {
@@ -1726,6 +1737,29 @@ mod tests {
         let routing = Arc::clone(&handles.routing);
         std::thread::spawn(move || {
             let _guard = routing.lock();
+            panic!("intentional poison");
+        })
+        .join()
+        .expect_err("the spawned thread must panic to poison the lock");
+
+        let rpc = AdminRpcImpl::new(state.with_dht(handles));
+        let err = rpc.status().await.expect_err("expected DHT-poisoned error");
+        assert_eq!(err.code(), DHT_POISONED_CODE);
+    }
+
+    /// Symmetric to the routing test: the record-store read also goes
+    /// through `lock_or_rpc_err`, so a poisoned record-store mutex must
+    /// surface as [`DHT_POISONED_CODE`] too. Guards against a future edit
+    /// swapping this site for an `unwrap` while the routing site keeps the
+    /// anti-panic net.
+    #[tokio::test]
+    async fn status_poisoned_record_store_mutex_returns_poisoned_error() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let handles = seeded_dht_handles();
+        // Poison the record-store mutex by panicking while holding it.
+        let record_store = Arc::clone(&handles.record_store);
+        std::thread::spawn(move || {
+            let _guard = record_store.lock();
             panic!("intentional poison");
         })
         .join()
