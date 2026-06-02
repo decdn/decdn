@@ -217,6 +217,23 @@ Per [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) (`cd
 | `decdn_dht_findvalue_queries_total` | Counter | R | — | DHT FIND_VALUE lookups this node issued to discover providers. |
 | `decdn_dht_routing_table_size` | Gauge | R | — | Distinct entries in the local Kademlia routing table. |
 
+##### Active-Staker Set Watcher Metrics
+
+The `ChainStakerSet` watcher follows `CapacityBond` membership events to keep a cached active-staker set in sync with chain state ([ADR 022 § STORE Flow](022-content-discovery.md#adr-022--content-discovery-at-scale), [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry)). On a mid-run watcher RPC outage the cache can **drift** from chain state (there is no `getActiveNodes` resync after extended outage). That drift is revenue-impacting: the cached set decides which probes the stake-lane reservation sheds ([ADR 003 § Admission and Priority](003-payments.md#admission-and-priority), #757) and gates DHT `Store` admission. These metrics make the drift window alertable rather than log-grep-only — `decdn_rpc_healthy` tracks the reachability watchdog, **not** this watcher (#783).
+
+| Metric | Type | Tier | Labels | Description |
+|--------|------|------|--------|-------------|
+| `decdn_staker_set_watcher_restarts_total` | Counter | M | — | Times the watcher re-established its event filters after the event stream terminated with an error (#783). Each restart brackets a drift window. A clean stream end (filter expiry / provider rotation) is **not** a restart and does not advance this. Pairs with the per-restart `warn!` in `watcher_loop`. |
+| `decdn_staker_set_watcher_down_seconds` | Gauge | M | — | Seconds since the watcher last established its event-stream cycle (#783). Reads `0` while a cycle is live and climbs through the exponential backoff once the stream has errored, so an alert can fire on a *sustained* outage rather than a single transient restart. Reads `0` until the first cycle is established after bootstrap. |
+| `decdn_staker_set_active_count` | Gauge | R | — | Current cached active-staker set size (#783), sampled on bootstrap and on every membership change. Pair with `decdn_staker_set_watcher_down_seconds`: the count holding flat while down-seconds climbs means the cache is frozen, not that the network genuinely lost operators. |
+
+**Recommended alerts:**
+
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| `decdn_staker_set_watcher_down_seconds` | > 120s | > 600s sustained | Check the blockchain RPC provider; the cached active-staker set may be drifting from chain state, mis-shedding stake-lane probes and DHT `Store`s. |
+| `decdn_staker_set_watcher_restarts_total` (rate) | > 0 | > 0 sustained | Investigate flapping RPC / event subscription; correlate with `decdn_staker_set_watcher_down_seconds` depth. |
+
 ### Health Endpoint
 
 `GET /health` (same HTTP port as `/metrics`) returns a JSON object:

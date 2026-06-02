@@ -75,6 +75,15 @@ blacklist updates and stop being able to settle channels. Once
 
 - Provider status page.
 
+- `decdn_staker_set_watcher_down_seconds` climbing (with
+  `decdn_staker_set_watcher_restarts_total` advancing) is the chain-side
+  symptom specific to the active-staker set watcher (#783): a mid-run RPC
+  outage stops the watcher following `CapacityBond` membership events, so the
+  cached active-staker set drifts from chain state and mis-sheds stake-lane
+  probes / DHT `Store`s. This watcher is **not** covered by
+  `decdn_rpc_healthy`. See
+  [appendix-observability § Active-Staker Set Watcher Metrics](../adr/appendix-observability.md#active-staker-set-watcher-metrics).
+
 **Remediate:**
 
 1. Rotate `blockchain.rpc_url` to a secondary provider in the config and

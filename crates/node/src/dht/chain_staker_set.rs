@@ -29,12 +29,22 @@
 //! for an exponentially-growing backoff (1s → 60s cap), and
 //! re-establishes its event filters. Today there is no `getActiveNodes`
 //! resync after extended outage, so the cached set can drift from
-//! chain state when an event arrives while filters are down. The
-//! operator-visible signal is the `warn!` log line — pair with a
-//! tail-the-logs alert, since `decdn_rpc_healthy` tracks the
-//! reachability watchdog, not this task.
+//! chain state when an event arrives while filters are down.
 //!
-//! A `getActiveNodes` resync-on-extended-outage path is a follow-up.
+//! This drift window is dashboard-visible and alertable via three
+//! metrics (#783), distinct from `decdn_rpc_healthy` (which tracks the
+//! reachability watchdog, not this task):
+//! - `decdn_staker_set_watcher_restarts_total` — bumped on each
+//!   filter re-establishment after an error.
+//! - `decdn_staker_set_watcher_down_seconds` — seconds since the last
+//!   established event-stream cycle; climbs through the backoff so an
+//!   alert can fire on a *sustained* outage rather than a transient
+//!   restart.
+//! - `decdn_staker_set_active_count` — current cached active-set size,
+//!   to spot a frozen or collapsed cache.
+//!
+//! A `getActiveNodes` resync-on-extended-outage path is a follow-up;
+//! these metrics surface the window that path would close.
 //!
 //! # N+1 round-trips at bootstrap
 //!
@@ -58,6 +68,7 @@ use tracing::{debug, info, warn};
 
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::{StakerChange, StakerSet};
+use crate::metrics::Metrics;
 use decdn_incentive::capacity_bond::CapacityBond;
 
 /// Page size for the initial paginated `getActiveNodes` read.
@@ -96,7 +107,11 @@ impl ChainStakerSet {
     /// watcher. Returns once the cache is populated and the watcher
     /// is running — the watcher's own subscription failures do not
     /// fail bootstrap.
-    pub async fn bootstrap<P>(provider: P, registry_addr: Address) -> Result<Self>
+    pub async fn bootstrap<P>(
+        provider: P,
+        registry_addr: Address,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self>
     where
         P: Provider + Clone + 'static,
     {
@@ -109,6 +124,10 @@ impl ChainStakerSet {
             %registry_addr,
             "ChainStakerSet bootstrap from CapacityBond complete"
         );
+        // Publish the bootstrap size so the gauge is non-`(no data)` before
+        // the first membership change, and so a watcher that never observes
+        // an event still reports a meaningful active count.
+        metrics.staker_set_active_count(initial.len());
 
         let (changes_tx, _) = broadcast::channel(CHANGES_CHANNEL_CAPACITY);
         let active = Arc::new(RwLock::new(initial));
@@ -116,6 +135,7 @@ impl ChainStakerSet {
             registry,
             Arc::clone(&active),
             changes_tx.clone(),
+            metrics,
         ));
 
         Ok(Self {
@@ -231,19 +251,28 @@ async fn watcher_loop<P>(
     registry: CapacityBond::CapacityBondInstance<P>,
     active: Arc<RwLock<HashSet<NodeId>>>,
     changes_tx: broadcast::Sender<StakerChange>,
+    metrics: Arc<Metrics>,
 ) where
     P: Provider + Clone,
 {
     let mut backoff = WATCHER_INITIAL_BACKOFF;
     loop {
-        match run_watcher_once(&registry, &active, &changes_tx).await {
+        match run_watcher_once(&registry, &active, &changes_tx, &metrics).await {
             Ok(()) => {
                 // Stream ended without error (filter expired, etc.) —
-                // restart immediately and reset backoff.
+                // restart immediately and reset backoff. A clean end is
+                // not a drift-inducing restart, so it does NOT bump
+                // `staker_set_watcher_restarts_total`; the next cycle's
+                // `cycle_established` keeps `down_seconds` near zero.
                 debug!("watcher stream ended cleanly; restarting subscription");
                 backoff = WATCHER_INITIAL_BACKOFF;
             }
             Err(err) => {
+                // An error-driven restart brackets the drift window: until
+                // the next cycle re-establishes filters, events arriving
+                // on-chain are missed. Surface it as an alertable counter
+                // alongside the existing per-restart `warn!`.
+                metrics.staker_set_watcher_restarted();
                 warn!(
                     %err,
                     backoff_secs = backoff.as_secs(),
@@ -266,6 +295,7 @@ async fn run_watcher_once<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
     active: &Arc<RwLock<HashSet<NodeId>>>,
     changes_tx: &broadcast::Sender<StakerChange>,
+    metrics: &Arc<Metrics>,
 ) -> Result<()>
 where
     P: Provider + Clone,
@@ -308,39 +338,59 @@ where
         .context("watch UnbondingRequested")?
         .into_stream();
 
+    // All five filters established: this is a successful event-stream cycle.
+    // Stamp it so `decdn_staker_set_watcher_down_seconds` resets to ~0; it
+    // will climb again only if a stream errors and the loop backs off.
+    metrics.staker_set_watcher_cycle_established();
+
     loop {
         tokio::select! {
             ev = node_registered.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    apply_change(active, changes_tx, StakerChange::Active(event.nodeId.0.into()));
+                    apply_change(
+                        active, changes_tx, metrics,
+                        StakerChange::Active(event.nodeId.0.into()),
+                    );
                 }
                 Some(Err(e)) => return Err(e).context("NodeRegistered stream"),
                 None => return Ok(()),
             },
             ev = node_deregistered.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    apply_change(active, changes_tx, StakerChange::Inactive(event.nodeId.0.into()));
+                    apply_change(
+                        active, changes_tx, metrics,
+                        StakerChange::Inactive(event.nodeId.0.into()),
+                    );
                 }
                 Some(Err(e)) => return Err(e).context("NodeDeregistered stream"),
                 None => return Ok(()),
             },
             ev = node_auto_ejected.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    apply_change(active, changes_tx, StakerChange::Inactive(event.nodeId.0.into()));
+                    apply_change(
+                        active, changes_tx, metrics,
+                        StakerChange::Inactive(event.nodeId.0.into()),
+                    );
                 }
                 Some(Err(e)) => return Err(e).context("NodeAutoEjected stream"),
                 None => return Ok(()),
             },
             ev = reinstated.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    apply_operator_change(registry, active, changes_tx, event.operator, true).await;
+                    apply_operator_change(
+                        registry, active, changes_tx, metrics, event.operator, true,
+                    )
+                    .await;
                 }
                 Some(Err(e)) => return Err(e).context("Reinstated stream"),
                 None => return Ok(()),
             },
             ev = unbonding_requested.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    apply_operator_change(registry, active, changes_tx, event.operator, false).await;
+                    apply_operator_change(
+                        registry, active, changes_tx, metrics, event.operator, false,
+                    )
+                    .await;
                 }
                 Some(Err(e)) => return Err(e).context("UnbondingRequested stream"),
                 None => return Ok(()),
@@ -361,6 +411,7 @@ async fn apply_operator_change<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
     active: &Arc<RwLock<HashSet<NodeId>>>,
     changes_tx: &broadcast::Sender<StakerChange>,
+    metrics: &Arc<Metrics>,
     operator: Address,
     event_implies_active: bool,
 ) where
@@ -401,7 +452,7 @@ async fn apply_operator_change<P>(
     } else {
         StakerChange::Inactive(node_id.into())
     };
-    apply_change(active, changes_tx, change);
+    apply_change(active, changes_tx, metrics, change);
 }
 
 /// Apply a change to the active set, then broadcast it. The broadcast
@@ -412,9 +463,10 @@ async fn apply_operator_change<P>(
 fn apply_change(
     active: &Arc<RwLock<HashSet<NodeId>>>,
     changes_tx: &broadcast::Sender<StakerChange>,
+    metrics: &Arc<Metrics>,
     change: StakerChange,
 ) {
-    let mutated = {
+    let (mutated, size) = {
         let mut guard = match active.write() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -422,12 +474,19 @@ fn apply_change(
                 poisoned.into_inner()
             }
         };
-        match change {
+        let mutated = match change {
             StakerChange::Active(id) => guard.insert(id),
             StakerChange::Inactive(id) => guard.remove(&id),
-        }
+        };
+        // Sample the size while holding the lock so the gauge can never
+        // observe a torn view from a concurrent change.
+        (mutated, guard.len())
     };
     if mutated {
+        // Only republish the gauge on a real membership change; a no-op
+        // (re-insert / absent-remove) leaves the set — and the gauge —
+        // unchanged.
+        metrics.staker_set_active_count(size);
         // No live subscriber is a normal case for an empty
         // ConfigStakerSet runtime, or a chain-backed set during
         // bootstrap before any consumer has subscribed.
@@ -452,9 +511,14 @@ mod tests {
     fn fresh_state() -> (
         Arc<RwLock<HashSet<NodeId>>>,
         broadcast::Sender<StakerChange>,
+        Arc<Metrics>,
     ) {
         let (tx, _) = broadcast::channel(8);
-        (Arc::new(RwLock::new(HashSet::new())), tx)
+        (
+            Arc::new(RwLock::new(HashSet::new())),
+            tx,
+            Arc::new(Metrics::new()),
+        )
     }
 
     /// `apply_change(Active)` on an absent `NodeId` inserts and emits.
@@ -462,13 +526,13 @@ mod tests {
     /// emission).
     #[test]
     fn apply_change_active_idempotent() {
-        let (active, tx) = fresh_state();
+        let (active, tx, metrics) = fresh_state();
         let mut rx = tx.subscribe();
-        apply_change(&active, &tx, StakerChange::Active(nid(1)));
+        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
         assert!(active.read().unwrap().contains(&nid(1)));
         assert_eq!(rx.try_recv().unwrap(), StakerChange::Active(nid(1)));
 
-        apply_change(&active, &tx, StakerChange::Active(nid(1)));
+        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
         assert_eq!(active.read().unwrap().len(), 1);
         // Second application was a no-op; channel empty.
         let err = rx.try_recv().expect_err("no second emission");
@@ -479,16 +543,76 @@ mod tests {
     /// `NodeId` is a no-op (no emission).
     #[test]
     fn apply_change_inactive_idempotent() {
-        let (active, tx) = fresh_state();
+        let (active, tx, metrics) = fresh_state();
         active.write().unwrap().insert(nid(1));
         let mut rx = tx.subscribe();
-        apply_change(&active, &tx, StakerChange::Inactive(nid(1)));
+        apply_change(&active, &tx, &metrics, StakerChange::Inactive(nid(1)));
         assert!(!active.read().unwrap().contains(&nid(1)));
         assert_eq!(rx.try_recv().unwrap(), StakerChange::Inactive(nid(1)));
 
-        apply_change(&active, &tx, StakerChange::Inactive(nid(2)));
+        apply_change(&active, &tx, &metrics, StakerChange::Inactive(nid(2)));
         // nid(2) was never in the set; no emission.
         let err = rx.try_recv().expect_err("no emission for absent removal");
         assert!(matches!(err, broadcast::error::TryRecvError::Empty));
+    }
+
+    /// A real membership change republishes `decdn_staker_set_active_count`;
+    /// an idempotent no-op leaves it untouched. This is the gauge that lets
+    /// an operator spot a frozen/collapsed cache during a watcher outage
+    /// (#783).
+    #[test]
+    fn apply_change_updates_active_count_gauge_only_on_real_change() {
+        let (active, tx, metrics) = fresh_state();
+        // Two distinct inserts → gauge tracks the growing set.
+        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
+        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(2)));
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines().any(|l| l == "decdn_staker_set_active_count 2"),
+            "active-count gauge should report 2 after two distinct inserts:\n{text}"
+        );
+
+        // A no-op re-insert must not move the gauge.
+        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines().any(|l| l == "decdn_staker_set_active_count 2"),
+            "active-count gauge should stay at 2 after an idempotent re-insert:\n{text}"
+        );
+
+        // A real removal shrinks it.
+        apply_change(&active, &tx, &metrics, StakerChange::Inactive(nid(1)));
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines().any(|l| l == "decdn_staker_set_active_count 1"),
+            "active-count gauge should report 1 after a removal:\n{text}"
+        );
+    }
+
+    /// Simulate the watcher's error-restart accounting: each error-driven
+    /// restart bumps `decdn_staker_set_watcher_restarts_total`, mirroring the
+    /// `Err` arm of `watcher_loop`. Exercises the metric wiring without a live
+    /// RPC provider (the real `run_watcher_once` needs a chain endpoint).
+    #[test]
+    fn watcher_error_restart_bumps_counter() {
+        let metrics = Arc::new(Metrics::new());
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_staker_set_watcher_restarts_total 0"),
+            "restart counter should start at zero:\n{text}"
+        );
+
+        // Two simulated error-driven restarts (the `metrics.*` call in
+        // `watcher_loop`'s `Err` arm).
+        metrics.staker_set_watcher_restarted();
+        metrics.staker_set_watcher_restarted();
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_staker_set_watcher_restarts_total 2"),
+            "expected 2 restarts after two error-driven restart events:\n{text}"
+        );
     }
 }
