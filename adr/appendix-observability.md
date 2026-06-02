@@ -223,8 +223,9 @@ The `ChainStakerSet` watcher follows `CapacityBond` membership events to keep a 
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_staker_set_watcher_restarts_total` | Counter | M | — | Times the watcher re-established its event filters after the event stream terminated with an error (#783). Each restart brackets a drift window. A clean stream end (filter expiry / provider rotation) is **not** a restart and does not advance this. Pairs with the per-restart `warn!` in `watcher_loop`. |
-| `decdn_staker_set_watcher_down_seconds` | Gauge | M | — | Seconds since the watcher last established its event-stream cycle (#783). Reads `0` while a cycle is live and climbs through the exponential backoff once the stream has errored, so an alert can fire on a *sustained* outage rather than a single transient restart. Reads `0` until the first cycle is established after bootstrap. |
+| `decdn_staker_set_watcher_restarts_total` | Counter | M | — | Distinct drift windows the watcher has entered (#783, edge-triggered #788): bumped **once** on the transition from a healthy cycle into the error/backoff state, so each increment brackets exactly one drift window (it does **not** count individual backoff iterations of one continuous outage). A clean stream end (filter expiry / provider rotation) is **not** an error and does not advance this. Pairs with the per-error `warn!` in `watcher_loop`. |
+| `decdn_staker_set_watcher_resolve_failures_total` | Counter | M | — | Operator-indexed events (`Reinstated` / `UnbondingRequested`) dropped because the follow-up `nodeIdOf(operator)` RPC failed (#788). The membership change is lost, leaving the cached set out of sync for that operator until a later event corrects it — silent drift that trips no restart/down-seconds metric, hence its own counter. Pairs with the per-failure `warn!` in `apply_operator_change`. |
+| `decdn_staker_set_watcher_down_seconds` | Gauge | M | — | True downtime (#783, semantics corrected #788): seconds the watcher has been in the error/backoff state with no established filters. Reads `0` for the **entire life of any established cycle**, however long or quiet (a healthy filter stream persists indefinitely — this is *not* cycle age), and climbs only while between a failed cycle and the next re-establishment, so an alert fires on a *sustained* outage rather than a transient restart. Reads `0` until the first cycle is established after bootstrap; a poisoned internal lock reports `i64::MAX` (conservative — never masks an in-progress outage). |
 | `decdn_staker_set_active_count` | Gauge | R | — | Current cached active-staker set size (#783), sampled on bootstrap and on every membership change. Pair with `decdn_staker_set_watcher_down_seconds`: the count holding flat while down-seconds climbs means the cache is frozen, not that the network genuinely lost operators. |
 
 **Recommended alerts:**
@@ -233,6 +234,7 @@ The `ChainStakerSet` watcher follows `CapacityBond` membership events to keep a 
 |--------|---------|----------|--------|
 | `decdn_staker_set_watcher_down_seconds` | > 120s | > 600s sustained | Check the blockchain RPC provider; the cached active-staker set may be drifting from chain state, mis-shedding stake-lane probes and DHT `Store`s. |
 | `decdn_staker_set_watcher_restarts_total` (rate) | > 0 | > 0 sustained | Investigate flapping RPC / event subscription; correlate with `decdn_staker_set_watcher_down_seconds` depth. |
+| `decdn_staker_set_watcher_resolve_failures_total` (rate) | > 0 | > 0 sustained | A `nodeIdOf` RPC is failing and silently dropping membership changes — the cached active-staker set is drifting from chain state. Check the RPC provider; correlate with `decdn_staker_set_active_count`. |
 
 ### Health Endpoint
 

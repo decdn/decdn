@@ -31,15 +31,26 @@
 //! resync after extended outage, so the cached set can drift from
 //! chain state when an event arrives while filters are down.
 //!
-//! This drift window is dashboard-visible and alertable via three
-//! metrics (#783), distinct from `decdn_rpc_healthy` (which tracks the
-//! reachability watchdog, not this task):
-//! - `decdn_staker_set_watcher_restarts_total` — bumped on each
-//!   filter re-establishment after an error.
-//! - `decdn_staker_set_watcher_down_seconds` — seconds since the last
-//!   established event-stream cycle; climbs through the backoff so an
-//!   alert can fire on a *sustained* outage rather than a transient
-//!   restart.
+//! A narrower drift source: an operator-indexed event whose follow-up
+//! `nodeIdOf(operator)` RPC fails is dropped (the membership change is
+//! lost) without tripping the stream backoff. That case bumps no
+//! restart/down-seconds metric, so it is surfaced separately by
+//! `decdn_staker_set_watcher_resolve_failures_total` (#788).
+//!
+//! This drift window is dashboard-visible and alertable via four
+//! metrics (#783, #788), distinct from `decdn_rpc_healthy` (which tracks
+//! the reachability watchdog, not this task):
+//! - `decdn_staker_set_watcher_restarts_total` — distinct drift windows;
+//!   bumped once on the *edge* from a healthy cycle into the error state,
+//!   not once per backoff iteration of one continuous outage.
+//! - `decdn_staker_set_watcher_down_seconds` — true downtime: reads `0`
+//!   for the whole life of any established cycle (however long/quiet) and
+//!   climbs only while the loop is in error/backoff between a failed cycle
+//!   and the next success, so an alert fires on a *sustained* outage.
+//! - `decdn_staker_set_watcher_resolve_failures_total` — operator-indexed
+//!   events (`Reinstated` / `UnbondingRequested`) dropped because the
+//!   follow-up `nodeIdOf` RPC failed; a nonzero rate is silent-drift risk
+//!   that no stream-level restart would otherwise surface.
 //! - `decdn_staker_set_active_count` — current cached active-set size,
 //!   to spot a frozen or collapsed cache.
 //!
@@ -261,18 +272,20 @@ async fn watcher_loop<P>(
             Ok(()) => {
                 // Stream ended without error (filter expired, etc.) —
                 // restart immediately and reset backoff. A clean end is
-                // not a drift-inducing restart, so it does NOT bump
-                // `staker_set_watcher_restarts_total`; the next cycle's
-                // `cycle_established` keeps `down_seconds` near zero.
+                // not an error, so it does NOT open a drift window:
+                // `down_since` stays `None` (down_seconds reads 0) and the
+                // restart counter does not advance.
                 debug!("watcher stream ended cleanly; restarting subscription");
                 backoff = WATCHER_INITIAL_BACKOFF;
             }
             Err(err) => {
-                // An error-driven restart brackets the drift window: until
-                // the next cycle re-establishes filters, events arriving
-                // on-chain are missed. Surface it as an alertable counter
-                // alongside the existing per-restart `warn!`.
-                metrics.staker_set_watcher_restarted();
+                // An error opens the drift window: until the next cycle
+                // re-establishes filters, events arriving on-chain are missed.
+                // `backoff_started` stamps `down_since` (so `down_seconds`
+                // begins to climb) and, on the edge into the error state,
+                // counts exactly one restart per window — repeated failed
+                // re-opens during one continuous outage do NOT re-count.
+                metrics.staker_set_watcher_backoff_started();
                 warn!(
                     %err,
                     backoff_secs = backoff.as_secs(),
@@ -339,8 +352,9 @@ where
         .into_stream();
 
     // All five filters established: this is a successful event-stream cycle.
-    // Stamp it so `decdn_staker_set_watcher_down_seconds` resets to ~0; it
-    // will climb again only if a stream errors and the loop backs off.
+    // Clear `down_since` so `decdn_staker_set_watcher_down_seconds` reads 0
+    // for the entire life of this cycle (however long/quiet); it climbs again
+    // only if a stream errors and the loop enters backoff.
     metrics.staker_set_watcher_cycle_established();
 
     loop {
@@ -423,8 +437,12 @@ async fn apply_operator_change<P>(
             // Dropping the change leaves the cached set out of sync
             // with chain state until either a follow-up event for
             // the same operator arrives or the resync-on-extended-
-            // outage path is implemented. Surface loudly so a noisy
-            // operator alert can fire.
+            // outage path is implemented. Unlike a stream-level error
+            // this does not trip the watcher backoff, so without an
+            // explicit counter it would move no metric at all — bump
+            // the resolve-failure counter (alertable as drift risk)
+            // alongside the loud `warn!`.
+            metrics.staker_set_watcher_resolve_failure();
             warn!(
                 %err,
                 %operator,
@@ -589,12 +607,15 @@ mod tests {
         );
     }
 
-    /// Simulate the watcher's error-restart accounting: each error-driven
-    /// restart bumps `decdn_staker_set_watcher_restarts_total`, mirroring the
-    /// `Err` arm of `watcher_loop`. Exercises the metric wiring without a live
-    /// RPC provider (the real `run_watcher_once` needs a chain endpoint).
+    /// Simulate the watcher's drift-window accounting (#788): the restart
+    /// counter is edge-triggered, so repeated `backoff_started` calls during
+    /// one continuous outage (no intervening `cycle_established`) count as ONE
+    /// window. A fresh window requires a `cycle_established` in between.
+    /// Mirrors the `Err` arm of `watcher_loop`. Exercises the metric wiring
+    /// without a live RPC provider (the real `run_watcher_once` needs a chain
+    /// endpoint).
     #[test]
-    fn watcher_error_restart_bumps_counter() {
+    fn watcher_error_restart_counts_one_per_drift_window() {
         let metrics = Arc::new(Metrics::new());
         let text = metrics.encode().unwrap();
         assert!(
@@ -603,16 +624,51 @@ mod tests {
             "restart counter should start at zero:\n{text}"
         );
 
-        // Two simulated error-driven restarts (the `metrics.*` call in
-        // `watcher_loop`'s `Err` arm).
-        metrics.staker_set_watcher_restarted();
-        metrics.staker_set_watcher_restarted();
+        // First outage: three failed re-open attempts (three backoff
+        // iterations) but a single continuous drift window → counts once.
+        metrics.staker_set_watcher_backoff_started();
+        metrics.staker_set_watcher_backoff_started();
+        metrics.staker_set_watcher_backoff_started();
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_staker_set_watcher_restarts_total 1"),
+            "one continuous outage should count exactly one restart:\n{text}"
+        );
 
+        // Filters re-establish (window closes), then a second outage opens a
+        // new window → counts again.
+        metrics.staker_set_watcher_cycle_established();
+        metrics.staker_set_watcher_backoff_started();
         let text = metrics.encode().unwrap();
         assert!(
             text.lines()
                 .any(|l| l == "decdn_staker_set_watcher_restarts_total 2"),
-            "expected 2 restarts after two error-driven restart events:\n{text}"
+            "a second distinct outage should count a second restart:\n{text}"
+        );
+    }
+
+    /// A `nodeIdOf` resolution failure in `apply_operator_change` bumps
+    /// `decdn_staker_set_watcher_resolve_failures_total` (#788). Exercises the
+    /// metric wiring directly — the `Err` arm calls exactly this method.
+    #[test]
+    fn watcher_resolve_failure_bumps_counter() {
+        let metrics = Arc::new(Metrics::new());
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_staker_set_watcher_resolve_failures_total 0"),
+            "resolve-failure counter should start at zero:\n{text}"
+        );
+
+        metrics.staker_set_watcher_resolve_failure();
+        metrics.staker_set_watcher_resolve_failure();
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_staker_set_watcher_resolve_failures_total 2"),
+            "expected 2 resolve failures:\n{text}"
         );
     }
 }

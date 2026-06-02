@@ -281,29 +281,45 @@ pub struct DecdnMetrics {
     /// backfill re-drives it), but a non-zero rate flags a struggling channel
     /// store. Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
-    /// `decdn_staker_set_watcher_restarts_total` (#783): times the
-    /// [`crate::dht::chain_staker_set`] watcher re-established its event
-    /// filters after the event stream terminated with an error. Each restart
-    /// brackets a window in which the cached active-staker set can drift from
-    /// chain state — the module's documented mid-run degradation. Because the
-    /// stake-lane probe reservation (#757) and the DHT `Store` admission path
-    /// both read that cached set, sustained restarts are revenue-impacting,
-    /// not just a discovery-health blip. The paired `tracing::warn!` in
-    /// `watcher_loop` carries the underlying error; this counter is the
-    /// alertable rate. A clean stream end (filter expiry / provider rotation)
-    /// is NOT a restart and does not bump this. Field has no `_total` suffix
-    /// because the `OpenMetrics` encoder appends it.
+    /// `decdn_staker_set_watcher_restarts_total` (#783): distinct drift
+    /// windows the [`crate::dht::chain_staker_set`] watcher has entered —
+    /// bumped once on the *transition* from a healthy cycle into the
+    /// error/backoff state, NOT on every backoff iteration of one continuous
+    /// outage. Each increment therefore brackets exactly one window in which
+    /// the cached active-staker set can drift from chain state — the module's
+    /// documented mid-run degradation. Because the stake-lane probe
+    /// reservation (#757) and the DHT `Store` admission path both read that
+    /// cached set, sustained restarts are revenue-impacting, not just a
+    /// discovery-health blip. The paired `tracing::warn!` in `watcher_loop`
+    /// carries the underlying error; this counter is the alertable rate. A
+    /// clean stream end (filter expiry / provider rotation) is NOT an error
+    /// and does not bump this. Field has no `_total` suffix because the
+    /// `OpenMetrics` encoder appends it.
     pub staker_set_watcher_restarts: Counter,
-    /// `decdn_staker_set_watcher_down_seconds` (#783): seconds since the
-    /// staker-set watcher last established its event filters (the start of a
-    /// successful event-stream cycle). Reads `0` while a cycle is live and
-    /// climbs once the stream has errored and the loop is sleeping through its
-    /// exponential backoff — so an alert can fire on a *sustained* outage
-    /// rather than on a single transient restart. Reads `0` until the first
-    /// cycle is established after bootstrap. Recomputed at scrape time from a
-    /// monotonic timestamp, mirroring `uptime_seconds`. This is the drift-
-    /// window depth gauge that `decdn_rpc_healthy` (a different watchdog) does
-    /// not cover.
+    /// `decdn_staker_set_watcher_resolve_failures_total` (#788): times an
+    /// operator-indexed event (`Reinstated` / `UnbondingRequested`) was
+    /// dropped because the follow-up `nodeIdOf(operator)` RPC failed. A dropped
+    /// resolution leaves the cached active set out of sync with chain state for
+    /// that operator until a later event or the (future) resync path corrects
+    /// it — exactly the silent drift these #783/#788 metrics exist to surface.
+    /// Unlike a stream-level error, this does NOT trip a backoff/restart, so it
+    /// would otherwise move no metric at all. Pairs with the per-failure
+    /// `warn!` in `apply_operator_change`. Field has no `_total` suffix because
+    /// the `OpenMetrics` encoder appends it.
+    pub staker_set_watcher_resolve_failures: Counter,
+    /// `decdn_staker_set_watcher_down_seconds` (#783, semantics corrected
+    /// #788): true downtime — seconds the staker-set watcher has been in the
+    /// error/backoff state with no established event filters. Reads `0` for the
+    /// entire life of any established cycle, however long or quiet (a healthy
+    /// filter stream persists indefinitely, so this must NOT measure cycle
+    /// age), and climbs only while the loop is between a failed cycle and the
+    /// next successful re-establishment. Reads `0` until the first cycle is
+    /// established after bootstrap. Recomputed at scrape time from a monotonic
+    /// `down_since` timestamp. A poisoned lock reports `i64::MAX` (not `0`) so
+    /// it trips the alert rather than masking an in-progress outage — the
+    /// conservative direction for a downtime gauge. This is the drift-window
+    /// depth gauge that `decdn_rpc_healthy` (a different watchdog) does not
+    /// cover.
     pub staker_set_watcher_down_seconds: Gauge,
     /// `decdn_staker_set_active_count` (#783): current cached active-staker
     /// set size, sampled on every membership change the watcher applies. Pairs
@@ -337,14 +353,17 @@ pub struct Metrics {
     /// — the insert path is fed by the unauthenticated probe handler, so
     /// the cap is what stops an unbounded-distinct-peer memory leak.
     session_ticket_peers: Mutex<HashSet<[u8; 32]>>,
-    /// Monotonic instant of the staker-set watcher's last established event-
-    /// stream cycle (#783). `None` until the first cycle is established after
-    /// bootstrap. Backs the `staker_set_watcher_down_seconds` gauge, which is
-    /// recomputed from this at scrape time (a gauge updated only on events
-    /// would read stale across a sustained outage — the exact window we need
-    /// to surface). Kept behind a `Mutex<Option<Instant>>` so a poisoned lock
-    /// degrades to "report 0 down-seconds" rather than panicking.
-    staker_set_watcher_last_event: Mutex<Option<Instant>>,
+    /// Monotonic instant at which the staker-set watcher entered its current
+    /// error/backoff window (#783, downtime semantics #788). `None` whenever a
+    /// cycle is established (healthy) — including from bootstrap until the
+    /// first cycle and after every successful re-establishment. `Some(t)` only
+    /// while the loop is between a failed cycle and the next success. Backs the
+    /// `staker_set_watcher_down_seconds` gauge, recomputed from this at scrape
+    /// time so the value reads exactly `0` across an arbitrarily long healthy
+    /// cycle and climbs only through an actual outage. A poisoned lock reports
+    /// `i64::MAX` down-seconds (the conservative, alerting direction for a
+    /// downtime gauge — reporting `0` would mask an in-progress outage).
+    staker_set_watcher_down_since: Mutex<Option<Instant>>,
 }
 
 impl Default for Metrics {
@@ -374,7 +393,7 @@ impl Metrics {
             cache,
             started_at: Instant::now(),
             session_ticket_peers: Mutex::new(HashSet::new()),
-            staker_set_watcher_last_event: Mutex::new(None),
+            staker_set_watcher_down_since: Mutex::new(None),
         }
     }
 
@@ -480,23 +499,44 @@ impl Metrics {
         self.decdn.watcher_persist_failures.inc();
     }
 
-    /// The staker-set watcher re-established its event filters after the
-    /// event stream terminated with an error (#783, [`crate::dht::chain_staker_set`]).
-    /// Brackets a window in which the cached active set can drift from chain
-    /// state. Pairs with the per-restart `warn!` in `watcher_loop`.
-    pub fn staker_set_watcher_restarted(&self) {
-        self.decdn.staker_set_watcher_restarts.inc();
+    /// The staker-set watcher's event stream terminated with an error and the
+    /// loop is about to back off (#783, [`crate::dht::chain_staker_set`]).
+    /// Stamps `down_since` so `staker_set_watcher_down_seconds` begins to climb,
+    /// and — on the *transition* from a healthy cycle into the error state
+    /// (`down_since` was `None`) — bumps `staker_set_watcher_restarts_total`
+    /// exactly once per drift window, rather than once per backoff iteration of
+    /// one continuous outage. A poisoned lock is treated as "skip the update"
+    /// rather than panicking (anti-panic policy); the gauge's poison fallback
+    /// (`i64::MAX`) still keeps the alert tripped. Pairs with the per-error
+    /// `warn!` in `watcher_loop`.
+    pub fn staker_set_watcher_backoff_started(&self) {
+        if let Ok(mut down_since) = self.staker_set_watcher_down_since.lock()
+            && down_since.is_none()
+        {
+            // Edge into the error state: open a fresh drift window and count it.
+            *down_since = Some(Instant::now());
+            self.decdn.staker_set_watcher_restarts.inc();
+        }
     }
 
-    /// Mark the staker-set watcher's event-stream cycle as established (#783):
-    /// the filters were (re)opened and events can flow. Resets the
-    /// `staker_set_watcher_down_seconds` gauge to `0` at the next scrape by
-    /// recording the current monotonic instant. A poisoned lock is treated as
-    /// "skip the update" rather than panicking (anti-panic policy); the gauge
-    /// then keeps climbing, which is the safe (alerting) direction.
+    /// A `nodeIdOf(operator)` resolution for an operator-indexed event failed,
+    /// dropping the membership change (#788, [`crate::dht::chain_staker_set`]).
+    /// Bumps `staker_set_watcher_resolve_failures_total`. Pairs with the
+    /// per-failure `warn!` in `apply_operator_change`.
+    pub fn staker_set_watcher_resolve_failure(&self) {
+        self.decdn.staker_set_watcher_resolve_failures.inc();
+    }
+
+    /// Mark the staker-set watcher's event-stream cycle as established (#783,
+    /// downtime semantics #788): the filters were (re)opened and events can
+    /// flow. Clears `down_since` to `None` so `staker_set_watcher_down_seconds`
+    /// reads `0` for the entire life of this cycle, however long. A poisoned
+    /// lock is treated as "skip the update" rather than panicking (anti-panic
+    /// policy); the gauge then keeps climbing, which is the safe (alerting)
+    /// direction.
     pub fn staker_set_watcher_cycle_established(&self) {
-        if let Ok(mut last) = self.staker_set_watcher_last_event.lock() {
-            *last = Some(Instant::now());
+        if let Ok(mut down_since) = self.staker_set_watcher_down_since.lock() {
+            *down_since = None;
         }
     }
 
@@ -773,17 +813,19 @@ impl Metrics {
         let uptime = i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.decdn.uptime_seconds.set(uptime);
 
-        // Recompute the staker-set watcher down-seconds gauge from the last
-        // established-cycle instant, mirroring `uptime_seconds`. `None` (no
-        // cycle yet) and a poisoned lock both report `0` — a quiet "not yet
-        // up" rather than a spurious outage. Once a cycle is established the
-        // value climbs until the next `staker_set_watcher_cycle_established`.
-        let down_seconds = self
-            .staker_set_watcher_last_event
-            .lock()
-            .ok()
-            .and_then(|last| last.map(|t| t.elapsed().as_secs()))
-            .map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
+        // Recompute the staker-set watcher down-seconds gauge from `down_since`
+        // (true downtime), mirroring `uptime_seconds`. `None` (healthy cycle,
+        // including pre-bootstrap) reads `0` regardless of how long the cycle
+        // has been live. A poisoned lock reports `i64::MAX` — the conservative,
+        // alerting direction for a downtime gauge: reporting `0` would MASK an
+        // in-progress outage. Once an error window opens the value climbs until
+        // the next `staker_set_watcher_cycle_established` clears `down_since`.
+        let down_seconds = match self.staker_set_watcher_down_since.lock() {
+            Ok(down_since) => down_since
+                .map(|t| t.elapsed().as_secs())
+                .map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)),
+            Err(_) => i64::MAX,
+        };
         self.decdn.staker_set_watcher_down_seconds.set(down_seconds);
 
         let reg = self
@@ -969,6 +1011,8 @@ impl Drop for ConnectionGuard<'_> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// Match an exact `<name> <value>` metric line, anchored against
@@ -1101,8 +1145,18 @@ mod tests {
             "active-count gauge should start at zero:\n{text}"
         );
 
-        metrics.staker_set_watcher_restarted();
-        metrics.staker_set_watcher_restarted();
+        // The resolve-failure counter (#788) is also exposed at zero.
+        assert!(
+            has_metric_line(&text, "decdn_staker_set_watcher_resolve_failures_total", 0),
+            "resolve-failure counter should start at zero:\n{text}"
+        );
+
+        // Two distinct drift windows (each `backoff_started` is an edge into
+        // the error state; `cycle_established` between them closes the first).
+        metrics.staker_set_watcher_backoff_started();
+        metrics.staker_set_watcher_cycle_established();
+        metrics.staker_set_watcher_backoff_started();
+        metrics.staker_set_watcher_resolve_failure();
         metrics.staker_set_active_count(7);
 
         let text = metrics.encode().unwrap();
@@ -1111,22 +1165,62 @@ mod tests {
             "expected 2 restart events:\n{text}"
         );
         assert!(
+            has_metric_line(&text, "decdn_staker_set_watcher_resolve_failures_total", 1),
+            "expected 1 resolve failure:\n{text}"
+        );
+        assert!(
             has_metric_line(&text, "decdn_staker_set_active_count", 7),
             "expected active-count gauge to report 7:\n{text}"
         );
     }
 
     #[test]
-    fn staker_set_watcher_down_seconds_resets_on_cycle_established() {
-        // Establishing a cycle stamps "now" as the last successful event, so
-        // an immediate scrape reads ~0 down-seconds (the watcher is healthy).
-        // A non-monotonic stale read would surface here as a non-zero value.
-        let metrics = Metrics::new();
+    fn staker_set_watcher_down_seconds_reads_zero_across_a_long_healthy_cycle() {
+        // CRITICAL-fix regression guard (#788): `down_seconds` measures true
+        // downtime, NOT cycle age. A healthy filter stream persists
+        // indefinitely, so the gauge must read 0 for the entire life of an
+        // established cycle — even when the node has been up (and the cycle
+        // live) for a while. We simulate "a while" by backdating the metrics'
+        // `started_at` well into the past: under the OLD age-based model the
+        // gauge climbed with cycle age and would read ~3600 here; under the
+        // downtime model `down_since` is `None`, so it stays 0.
+        let mut metrics = Metrics::new();
+        metrics.started_at = Instant::now()
+            .checked_sub(Duration::from_hours(1))
+            .unwrap_or_else(Instant::now);
+        metrics.staker_set_watcher_cycle_established();
+
+        let text = metrics.encode().unwrap();
+        // Sanity: the node really is "old" (uptime reflects the backdate), so a
+        // gauge that tracked age would be non-zero.
+        assert!(
+            has_metric_line(&text, "decdn_uptime_seconds", 3600),
+            "uptime should reflect the backdated start:\n{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
+            "down-seconds must read 0 across a long healthy cycle (true downtime, not age):\n{text}"
+        );
+
+        // An error opens the drift window: down-seconds is now driven by
+        // `down_since` (not cycle age). An immediate scrape reads ~0s of
+        // *downtime*; backdating `down_since` proves it then climbs.
+        metrics.staker_set_watcher_backoff_started();
+        if let Ok(mut down_since) = metrics.staker_set_watcher_down_since.lock() {
+            *down_since = Instant::now().checked_sub(Duration::from_secs(150));
+        }
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 150),
+            "down-seconds should climb to the downtime depth once in backoff:\n{text}"
+        );
+
+        // Re-establishing the cycle clears the window back to 0.
         metrics.staker_set_watcher_cycle_established();
         let text = metrics.encode().unwrap();
         assert!(
             has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
-            "down-seconds should read 0 immediately after a cycle is established:\n{text}"
+            "down-seconds should reset to 0 once filters re-establish:\n{text}"
         );
     }
 
