@@ -1287,66 +1287,14 @@ contract CapacityBondTest is Test {
 
     // ----------------------------------------------------------------------
     // ADR 030 — region self-attestation
+    //
+    // The full keygen → signed `registerNode` (real `Ed25519Verifier`) →
+    // `updateRegion` cooldown/replay flow, plus the cross-contract eject path,
+    // lives in `CapacityBondRegionE2E.t.sol` (it needs the production verifier
+    // and the generated signing vector). `CapacityBondTest` deploys the mock
+    // verifier, so only the no-signature unit branch (`NodeNotActive`) is
+    // exercised here.
     // ----------------------------------------------------------------------
-
-    /// @notice ADR 030 § Region-stability window: the first `updateRegion`
-    ///         call has no cooldown (operators may correct their initial
-    ///         `registerNode` region); every subsequent call is gated by
-    ///         `regionStabilityWindow` and snapshots the prior value into
-    ///         `regionPrev`. Also asserts the `RegionUpdated` event payload
-    ///         on both successful calls so a future emit-arg rename or
-    ///         omission lands as a test failure. Uses a key-derived operator
-    ///         so the EIP-712 binding signature for `registerNode` is
-    ///         forge-signable.
-    function test_updateRegion_cooldownAndPrevSnapshot() public {
-        uint256 opPk = 0xC0FFEE;
-        address opAddr = vm.addr(opPk);
-
-        // Fund + approve from the admin's TOKEN balance.
-        vm.prank(admin);
-        token.transfer(opAddr, MIN_BOND);
-        vm.prank(opAddr);
-        token.approve(address(bond), type(uint256).max);
-
-        // Warp to a base far past EPOCH boundaries so any nested epoch math
-        // in this test is comfortably non-zero.
-        vm.warp(1_000_000);
-
-        // Bond to satisfy the registerNode precondition.
-        vm.prank(opAddr);
-        bond.bond(MIN_BOND);
-
-        // Register node — binding signature signed with opPk; ed25519 is
-        // mocked to accept any signature unconditionally.
-        bytes32 nodeId = bytes32(uint256(0xC0FFEEC0FFEEC0FFEE));
-        bytes memory bindingSig = _signBindNode(opPk, opAddr, nodeId);
-        bytes memory edSig = hex"01";
-        vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", bindingSig, edSig);
-
-        // First updateRegion has no cooldown (lastChanged == 0 branch).
-        vm.expectEmit(true, false, false, true, address(bond));
-        emit CapacityBond.RegionUpdated(nodeId, "us-east", "eu-west");
-        vm.prank(opAddr);
-        bond.updateRegion("eu-west");
-        assertEq(bond.regionPrev(opAddr), "us-east");
-        assertEq(bond.regionLastChanged(opAddr), uint64(block.timestamp));
-
-        // Second call inside `regionStabilityWindow` (7 days) reverts.
-        vm.warp(block.timestamp + 1 days);
-        vm.prank(opAddr);
-        vm.expectRevert();
-        bond.updateRegion("ap-south");
-
-        // After the window elapses, the call succeeds and `regionPrev`
-        // captures the now-prior region.
-        vm.warp(block.timestamp + 7 days + 1);
-        vm.expectEmit(true, false, false, true, address(bond));
-        emit CapacityBond.RegionUpdated(nodeId, "eu-west", "ap-south");
-        vm.prank(opAddr);
-        bond.updateRegion("ap-south");
-        assertEq(bond.regionPrev(opAddr), "eu-west");
-    }
 
     // ----------------------------------------------------------------------
     // Access-control guards on governance setters

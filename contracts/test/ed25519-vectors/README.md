@@ -1,7 +1,8 @@
 # ed25519-vectors
 
 Differential test-vector generator for [`Ed25519Verifier.sol`](../../src/Ed25519Verifier.sol).
-Emits paste-ready Solidity consumed by [`Ed25519Verifier.t.sol`](../Ed25519Verifier.t.sol).
+Emits paste-ready Solidity consumed by [`Ed25519Verifier.t.sol`](../Ed25519Verifier.t.sol)
+and [`CapacityBondRegionE2E.t.sol`](../CapacityBondRegionE2E.t.sol).
 
 The on-chain verifier must be **at least as strict as `ed25519-dalek::verify_strict`** —
 the check deCDN nodes run off-chain (issue #669). A verifier more permissive than
@@ -15,9 +16,12 @@ reference implementation rather than against our own re-derivation.
 cargo run            # from this directory
 ```
 
-Copy the output verbatim into `Ed25519Verifier.t.sol`, replacing everything
-between the `AUTO-GENERATED` / `END AUTO-GENERATED` markers (the `smallOrder`
-array, `OFF_CURVE_PK`, and `_validVectors()`).
+Copy the output verbatim into the consuming test, replacing everything between
+the `AUTO-GENERATED` / `END AUTO-GENERATED` markers:
+
+- `Ed25519Verifier.t.sol` — the `smallOrder` array, `OFF_CURVE_PK`, and
+  `_validVectors()` (sections 1–3).
+- `CapacityBondRegionE2E.t.sol` — the `REG_*` constants (section 4).
 
 Offline-capable: the dependency versions are exact-pinned and committed in
 `Cargo.lock`, so `cargo run` resolves against the registry cache already
@@ -30,9 +34,11 @@ populated by a normal workspace build — no network fetch required.
 | `ed25519-dalek` | `=2.2.0` | `verify_strict` — the parity bar |
 | `curve25519-dalek` | `=4.1.3` | `EIGHT_TORSION`, point decompression |
 | `hex` | `=0.4.3` | encoding only |
+| `sha3` | `=0.10.8` | keccak256 for the `registerNode` digest (section 4) |
 
 Bumping a pin is a deliberate act: re-run `cargo run`, re-paste, and confirm the
-12 tests still pass. `Cargo.lock` is committed (this is a binary, not a library)
+`Ed25519Verifier` and `CapacityBondRegionE2E` suites still pass.
+`Cargo.lock` is committed (this is a binary, not a library)
 so the transitive closure is reproducible too. This crate carries an empty
 `[workspace]` table so it stays isolated from the parent Rust workspace (which
 excludes `contracts/` anyway).
@@ -50,3 +56,11 @@ excludes `contracts/` anyway).
 3. **1 off-curve key** — canonical `y` (`< p`) whose `x²` is a non-residue, so
    dalek's `decompress()` returns `None`. Isolates the on-curve guard from the
    non-canonical-`y` guard.
+4. **1 `registerNode` ownership vector** — a real ed25519 signature over the
+   `CapacityBond.registerNode` digest
+   `keccak256(nodeId ‖ operator ‖ chainId ‖ registrationNonce)`, with the public
+   key as the NodeId. The operator is Foundry's default account #0 (so its key is
+   forge-signable for the EIP-712 binding signature) and `chainId` is pinned to
+   the Foundry default `31337`; the consuming test asserts both so any drift
+   fails loudly. Lets `CapacityBondRegionE2E.t.sol` register a node through the
+   production verifier instead of a mock.
