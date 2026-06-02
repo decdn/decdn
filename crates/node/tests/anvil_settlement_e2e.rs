@@ -398,7 +398,9 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     let concrete_store = Arc::new(PersistentChannelStateStore::open(store_tmp.path())?);
     let store: Arc<dyn ChannelStateStore> = concrete_store.clone();
     let pending_store: Arc<dyn PendingSettleStore> = concrete_store.clone();
-    let checkpoint_store: Arc<dyn WatcherCheckpointStore> = concrete_store;
+    // Keep `concrete_store` alive (don't move it) so the downtime-backfill phase
+    // at the end can re-bootstrap a second service against the same store.
+    let checkpoint_store: Arc<dyn WatcherCheckpointStore> = concrete_store.clone();
 
     let node_eth = Arc::new(node_signer.clone());
     let metrics = Arc::new(Metrics::new());
@@ -823,6 +825,77 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         matches!(reclaimed.status, PaymentChannel::Status::Closed),
         "reclaimed channel must be Closed on-chain"
     );
+
+    // ============================================================
+    // DOWNTIME BACKFILL (#751) — the headline across-restart fix. Take the
+    // settlement service DOWN (drop it → watcher/sweeper aborted), open a fresh
+    // channel against this provider while nothing is watching, then bring the
+    // node back up by re-bootstrapping a second service against the SAME store.
+    // Service 2's bootstrap reads the scan checkpoint service 1 persisted, floors
+    // the backfill below the new channel's block, and registers it — proving a
+    // channel opened during downtime is recovered, not rejected `WrongChannel`
+    // forever.
+    // ============================================================
+    drop(service); // node "goes down": watcher/sweeper/redeemer all aborted
+
+    // Re-fund + re-approve so the deposit is covered regardless of prior spend
+    // (ERC-20 `approve` overwrites the allowance), then open the channel while no
+    // service is watching. It is the client's 4th channel → nonce 3.
+    usdc_admin
+        .mint(
+            client_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(2u64),
+        )
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    usdc_client
+        .approve(
+            payment_channel,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(2u64),
+        )
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let down_id = derive_channel_id(client_addr, node_addr, 3);
+    pc_client
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    // While down, nothing registered it.
+    anyhow::ensure!(
+        store.get(down_id)?.is_none(),
+        "channel opened while the service is down must be unknown until re-bootstrap"
+    );
+
+    // Node comes back up against the same store. Bootstrap re-reads the persisted
+    // checkpoint and the bring-up backfill covers the downtime block.
+    let service2 = PaymentChannelService::bootstrap(
+        node_provider.clone(),
+        payment_channel,
+        node_addr,
+        Arc::clone(&store),
+        concrete_store.clone(),
+        concrete_store.clone(),
+        Arc::clone(&handler),
+        U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        Arc::clone(&metrics),
+    )
+    .await?;
+    let backfilled = poll_until(Duration::from_secs(60), || {
+        let store = Arc::clone(&store);
+        async move { store.get(down_id).ok().flatten() }
+    })
+    .await;
+    anyhow::ensure!(
+        backfilled.is_some(),
+        "downtime-opened channel was not registered after restart — #751 checkpoint backfill failed"
+    );
+    drop(service2);
 
     client_ep.close().await;
     server_ep.close().await;

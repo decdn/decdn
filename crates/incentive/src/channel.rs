@@ -42,6 +42,17 @@ pub type ChannelId = B256;
 /// cross-crate hydration path (`decdn-node` reading `channels.redb`) goes
 /// through [`Self::hydrate`] rather than a struct literal (#751). This makes the
 /// invariant compiler-enforced rather than doc-enforced.
+///
+/// The remaining fields stay `pub` deliberately, and the asymmetry is
+/// intentional: `channel_id`/`client`/`token` are immutable identity set once at
+/// construction; `deposit` is raised by on-chain top-ups
+/// ([`crate::ChannelState`] consumers via `ChannelOpened`/`ChannelToppedUp`) and
+/// `expires_at` by the lifecycle watcher — both mutated only by trusted node-side
+/// writers under the same clone-record-swap discipline. They are not
+/// replay-critical (they don't gate the nonce/amount monotonicity the #527
+/// guard protects), so they don't need the private treatment the `last_*` fields
+/// do. A `pub` write that *lowered* `deposit` could retroactively break the
+/// `amount <= deposit` check, but no such writer exists (top-ups only raise it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelState {
     /// Channel identifier (matches the on-chain `channelId`).
@@ -52,7 +63,7 @@ pub struct ChannelState {
     /// supported by `PaymentChannel`).
     pub token: Address,
     /// On-chain deposited amount in token base units. Vouchers MUST NOT
-    /// exceed this value.
+    /// exceed this value. Raised by top-ups; never lowered.
     pub deposit: U256,
     /// Cumulative amount of the most-recently-accepted voucher
     /// (token base units). `U256::ZERO` until the first voucher is applied.
@@ -115,6 +126,15 @@ impl ChannelState {
     /// compiler-enforced. `last_signature` is `None` for a channel with no
     /// accepted voucher yet (or a pre-signature store schema) and otherwise the
     /// exact 65-byte `r‖s‖v` signature.
+    ///
+    /// **Trust boundary.** This is the one constructor that bypasses
+    /// `apply_voucher`'s validation, and several arguments share a type
+    /// (`deposit`/`last_amount`/`last_nonce`/`last_bytes_delivered` are all
+    /// `U256`; `client`/`token` are both `Address`), so a transposition compiles.
+    /// It has a single caller — the `channels.redb` decoder — whose
+    /// record→load round-trip tests would catch a swap; do not add callers
+    /// without the same coverage (a field-named init struct would be the move if
+    /// a second one ever appears).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn hydrate(

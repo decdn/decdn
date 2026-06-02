@@ -26,14 +26,15 @@
 //!   head (closing the #762 race only); on a restart the checkpoint sits below
 //!   head, so `S` drops to it and the scanned range `[S, F]` covers both the
 //!   downtime gap (#751, blocks below head) and the bring-up window (#762,
-//!   `[head, F]`). The watcher records the last scanned block via
-//!   [`WatcherCheckpointStore`] as it runs, so the next boot resumes from there
-//!   and registers channels a client opened while this node was **down**. The backfilled `[S, F]` and the live stream
-//!   (which starts at-or-before `F`) leave no gap; the overlap around `F` and
-//!   any re-scanned blocks below the checkpoint are harmless because
-//!   [`ClientHandler::register_open_channel`] is idempotent. A long gap is
-//!   walked in bounded windows so a single `get_logs` never exceeds RPC range
-//!   caps.
+//!   `[head, F]`). As it runs, the watcher records the last block it scanned for
+//!   `ChannelOpened` via [`WatcherCheckpointStore`] (advanced only on a
+//!   successfully-registered open), so the next boot resumes from there and
+//!   registers channels a client opened while this node was **down**. The
+//!   backfilled `[S, F]` and the live stream (which starts at-or-before `F`)
+//!   leave no gap; the overlap around `F` and any re-scanned blocks below the
+//!   checkpoint are harmless because [`ClientHandler::register_open_channel`] is
+//!   idempotent. A long gap is walked in bounded windows so a single `get_logs`
+//!   never exceeds RPC range caps.
 //!
 //!   Scope of the backfill: **only `ChannelOpened`**. A `ChannelToppedUp` or
 //!   `ChannelSettled` emitted inside the backfilled range is not back-filled, so
@@ -735,12 +736,11 @@ async fn run_watcher_once<P: Provider + Clone>(
         }
     };
     // Lowest block whose `ChannelOpened` (provided by this node) failed to
-    // persist this cycle. The checkpoint MUST stay strictly below it so the next
-    // resume backfill re-scans the block and re-registers the channel — a live
-    // open is the *sole* registration delivery, so advancing past an unpersisted
-    // one would strand the channel until a (possibly never) restart (#751). The
-    // other event arms are re-derivable, so they don't set this hold — but they
-    // do respect it (a single scalar checkpoint can't skip one block).
+    // persist this cycle. The checkpoint — advanced only from the `opened` arm —
+    // MUST stay strictly below it so a later same-stream open can't move it past
+    // the failed block; combined with re-arming `backfill_from` to that block, a
+    // restart (via the held checkpoint) and a resubscribe (via the backfill)
+    // both re-cover the channel rather than stranding it (#751).
     let mut checkpoint_hold: Option<u64> = None;
 
     // Bring-up backfill (#762): with the live filters now installed (they cover
@@ -757,8 +757,10 @@ async fn run_watcher_once<P: Provider + Clone>(
         backfill_opened_channels(contract, self_address, usdc_token, handler, start, to).await?;
         *backfill_from = None;
         // The gap is now scanned through `to`; persist it so the next boot
-        // resumes from here (the #751 downtime floor). Best-effort: a failed
-        // write only widens the next rescan.
+        // resumes from here (the #751 downtime floor). `to` is the live-filter
+        // install block, i.e. at/after the seeded floor, so this never regresses
+        // the stored value. Best-effort: a failed write only widens the next
+        // rescan.
         checkpoint_hw = to;
         if let Err(err) = checkpoint_store.record_last_seen_block(to) {
             warn!(%err, block = to, "failed to persist watcher scan checkpoint after backfill");
@@ -769,13 +771,16 @@ async fn run_watcher_once<P: Provider + Clone>(
         tokio::select! {
             ev = opened.next() => match ev {
                 Some(Ok((event, log))) => {
-                    // Live arm. On success, advance the scan checkpoint past this
-                    // block. On a persist failure, hold the checkpoint strictly
-                    // below this block (#751): a live `ChannelOpened` is the sole
-                    // registration delivery, so letting the checkpoint move past
-                    // an unpersisted one would skip it on the next resume backfill
-                    // and strand the channel (vouchers rejected `WrongChannel`
-                    // forever). We log + count but don't tear down the stream.
+                    // The scan checkpoint is advanced ONLY here, on a successful
+                    // persist (#751). A `ChannelOpened` is the sole registration
+                    // delivery, and it is the only event that proves we scanned +
+                    // registered opens through its block — the other arms (and
+                    // foreign-channel events) say nothing about whether an earlier
+                    // open of *ours* was persisted, so advancing the checkpoint
+                    // from them could leap past an open that later fails and strand
+                    // the channel (vouchers rejected `WrongChannel` forever). The
+                    // `opened` stream is block-ordered, so the per-cycle hold below
+                    // suffices against a later same-stream open.
                     match apply_channel_opened(handler, self_address, usdc_token, &event, false)
                         .await
                     {
@@ -790,15 +795,21 @@ async fn run_watcher_once<P: Provider + Clone>(
                             warn!(
                                 %err,
                                 channel_id = %event.channelId,
-                                "failed to persist opened channel; holding scan checkpoint below its block so the next rescan re-covers it",
+                                "failed to persist opened channel; holding scan checkpoint below its block and re-arming the backfill so the next cycle re-covers it",
                             );
-                            // `None` block (unconfirmed) → hold at 0, freezing all
-                            // advancement this cycle: we can't bound the failed
-                            // block, so conservatively re-scan from the seed next
-                            // restart.
-                            let failed = log.block_number.unwrap_or(0);
+                            // `None` block (unconfirmed) → fall back to the current
+                            // floor, conservatively re-scanning from there.
+                            let failed = log.block_number.unwrap_or(checkpoint_hw);
+                            // Hold the checkpoint below the failed block for the rest
+                            // of this cycle (a later same-stream open mustn't move it
+                            // past `failed`)...
                             checkpoint_hold =
                                 Some(checkpoint_hold.map_or(failed, |h| h.min(failed)));
+                            // ...and re-arm the bring-up backfill from it, so the
+                            // next resubscribe re-scans and re-registers the channel
+                            // (the held checkpoint also makes a restart re-cover it).
+                            *backfill_from =
+                                Some(backfill_from.map_or(failed, |b| b.min(failed)));
                         }
                     }
                 }
@@ -806,9 +817,10 @@ async fn run_watcher_once<P: Provider + Clone>(
                 None => return Ok(()),
             },
             ev = topped_up.next() => match ev {
-                Some(Ok((event, log))) => {
+                Some(Ok((event, _log))) => {
                     // `ChannelToppedUp` is not provider-indexed; `update_channel_deposit`
-                    // is a no-op for channels this node does not track.
+                    // is a no-op for channels this node does not track. Does NOT
+                    // advance the scan checkpoint — only the `opened` arm does.
                     if let Err(err) = handler
                         .update_channel_deposit(event.channelId, event.newDeposit)
                         .await
@@ -822,17 +834,12 @@ async fn run_watcher_once<P: Provider + Clone>(
                             "channel top-up applied to tracked deposit"
                         );
                     }
-                    advance_checkpoint(checkpoint_store, log.block_number, &mut checkpoint_hw, checkpoint_hold);
                 }
                 Some(Err(e)) => return Err(e).context("ChannelToppedUp stream"),
                 None => return Ok(()),
             },
             ev = settled.next() => match ev {
-                Some(Ok((event, log))) => {
-                    // Advance the scan checkpoint regardless of provider: any
-                    // observed log means the watcher has scanned through its
-                    // block for `ChannelOpened` too.
-                    advance_checkpoint(checkpoint_store, log.block_number, &mut checkpoint_hw, checkpoint_hold);
+                Some(Ok((event, _log))) => {
                     if event.provider != self_address {
                         continue;
                     }
@@ -852,9 +859,9 @@ async fn run_watcher_once<P: Provider + Clone>(
                 None => return Ok(()),
             },
             ev = close_initiated.next() => match ev {
-                Some(Ok((event, log))) => {
-                    // Dispute monitor is deferred (#324); observe-only.
-                    advance_checkpoint(checkpoint_store, log.block_number, &mut checkpoint_hw, checkpoint_hold);
+                Some(Ok((event, _log))) => {
+                    // Dispute monitor is deferred (#324); observe-only. Does NOT
+                    // advance the scan checkpoint — only the `opened` arm does.
                     debug!(
                         channel_id = %event.channelId,
                         initiator = %event.initiator,
