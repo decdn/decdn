@@ -106,6 +106,13 @@ mod sol_types {
             /// deposit up to the on-chain floor before opening.
             function minDeposit() external view returns (uint256);
 
+            /// Per-client channel counter (public mapping getter). The *next*
+            /// nonce `openChannel` will assign to `client`; the resulting
+            /// `channelId` is `keccak256(client, provider, nonce)`. Reads let a
+            /// caller derive a channel id without parsing the `ChannelOpened`
+            /// receipt.
+            function clientChannelNonce(address client) external view returns (uint256);
+
             // -----------------------------------------------------------------
             // Write functions (provider/seller path)
             // -----------------------------------------------------------------

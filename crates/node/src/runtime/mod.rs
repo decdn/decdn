@@ -372,6 +372,8 @@ pub async fn run(
     // stays bound for the buyer handle built further below.
     let channel_state_store: Arc<dyn ChannelStateStore> = concrete_channel_store.clone();
     let pending_settle_store: Arc<dyn PendingSettleStore> = concrete_channel_store.clone();
+    let watcher_checkpoint_store: Arc<dyn decdn_incentive::WatcherCheckpointStore> =
+        concrete_channel_store.clone();
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema even before the
     // future cdn/client/v1 handler (#317) is constructed. The handler will
@@ -608,8 +610,10 @@ pub async fn run(
         eth_signer.address(),
         Arc::clone(&channel_state_store),
         Arc::clone(&pending_settle_store),
+        Arc::clone(&watcher_checkpoint_store),
         Arc::clone(&client_handler),
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
+        Arc::clone(&node_metrics),
     )
     .await
     .context("PaymentChannel settlement service bootstrap")?;

@@ -153,6 +153,40 @@ pub trait PendingSettleStore: Send + Sync {
     fn forget_pending(&self, channel_id: ChannelId) -> Result<(), StoreError>;
 }
 
+/// Durable high-water mark of the last block the settlement watcher scanned for
+/// `ChannelOpened` events (#751). Persisting it across restarts is what lets the
+/// watcher bring-up backfill cover the **downtime gap**: a channel a client
+/// opens against this node while the node is *down* lands in a block before the
+/// next boot's head, so without a persisted floor the head-anchored backfill
+/// (#762) never sees it and the channel's vouchers are rejected `WrongChannel`
+/// forever. On boot the watcher backfills from the stored block (minus a small
+/// reorg margin) up to the live-filter install block; `register_open_channel`
+/// is idempotent, so re-scanning the overlap is harmless.
+///
+/// Implementations MUST commit durably (fsync, on disk-backed impls) before
+/// returning `Ok` from `record_last_seen_block`, mirroring the
+/// [`ChannelStateStore`] durability contract — a lost checkpoint silently
+/// widens the rescan (safe, just more RPC), never narrows it.
+pub trait WatcherCheckpointStore: Send + Sync {
+    /// The last block scanned for `ChannelOpened`, or `None` on a never-written
+    /// store (first-ever boot — there is no downtime gap to cover, so the
+    /// caller backfills from the current head).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the backing store is unreadable.
+    fn load_last_seen_block(&self) -> Result<Option<u64>, StoreError>;
+
+    /// Persist the last block scanned for `ChannelOpened`. Overwrites the prior
+    /// value. Called after the bring-up backfill completes and as the live
+    /// stream advances, so the next boot resumes from here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails.
+    fn record_last_seen_block(&self, block: u64) -> Result<(), StoreError>;
+}
+
 /// Failure modes shared by every [`ChannelStateStore`] implementation.
 ///
 /// Disk-backed impls map their backend errors into [`StoreError::Backend`]
@@ -337,17 +371,17 @@ mod tests {
     fn sample(channel_id_byte: u8) -> ChannelState {
         let mut bytes = [0u8; 32];
         bytes[31] = channel_id_byte;
-        ChannelState {
-            channel_id: bytes.into(),
-            client: address!("00000000000000000000000000000000000000aa"),
-            token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
-            deposit: U256::from(10_000_000u64),
-            last_amount: U256::from(1_234u64),
-            last_nonce: U256::from(7u64),
-            last_bytes_delivered: U256::from(4_096u64),
-            last_signature: vec![0xABu8; 65],
-            expires_at: 1_900_000_000,
-        }
+        ChannelState::hydrate(
+            bytes.into(),
+            address!("00000000000000000000000000000000000000aa"),
+            address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            U256::from(10_000_000u64),
+            U256::from(1_234u64),
+            U256::from(7u64),
+            U256::from(4_096u64),
+            Some([0xABu8; 65]),
+            1_900_000_000,
+        )
     }
 
     #[test]
@@ -370,14 +404,27 @@ mod tests {
     #[test]
     fn memory_store_record_overwrites() -> anyhow::Result<()> {
         let store = MemoryChannelStateStore::new();
-        let mut s = sample(1);
+        let s = sample(1);
         store.record(&s)?;
-        s.last_nonce = U256::from(99u64);
-        store.record(&s)?;
+        // Re-record the same channel with an advanced nonce (overwrite). The
+        // `last_*` fields are private, so rebuild via `hydrate` rather than
+        // mutating in place.
+        let advanced = ChannelState::hydrate(
+            s.channel_id,
+            s.client,
+            s.token,
+            s.deposit,
+            s.last_amount(),
+            U256::from(99u64),
+            s.last_bytes_delivered(),
+            s.last_signature().copied(),
+            s.expires_at,
+        );
+        store.record(&advanced)?;
         let all = store.load_all()?;
         anyhow::ensure!(all.len() == 1);
         let only = all.first().ok_or_else(|| anyhow::anyhow!("missing [0]"))?;
-        anyhow::ensure!(only.last_nonce == U256::from(99u64));
+        anyhow::ensure!(only.last_nonce() == U256::from(99u64));
         Ok(())
     }
 

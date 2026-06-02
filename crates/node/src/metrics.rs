@@ -242,6 +242,28 @@ pub struct DecdnMetrics {
     /// `ChannelState::apply_voucher`. Operator-visible name:
     /// `decdn_voucher_nonce_gaps_total`.
     pub voucher_nonce_gaps: Counter,
+    /// Redeem hints the voucher-accept path could not enqueue because the
+    /// bounded advisory channel was full (`try_send` → `Full`), counted once
+    /// per dropped hint (#751). A hint is advisory — the next voucher re-hints
+    /// and the redeemer self-tick / shutdown close still redeem — so a few drops
+    /// are benign, but a sustained non-zero rate means the redeemer is not
+    /// keeping up with channel fan-out and threshold redemption is leaning on
+    /// the slow self-tick. Operator-visible name:
+    /// `decdn_redeem_hints_dropped_total`.
+    pub redeem_hints_dropped: Counter,
+    /// Redemption attempts (`try_redeem`) that returned an error — a failed
+    /// `getChannel`/`withdraw` RPC or receipt wait (#751). Each is otherwise
+    /// only a single `warn!`; a sustained rate means accrued earnings are not
+    /// being withdrawn and warrants investigating the RPC / wallet. Operator-
+    /// visible name: `decdn_redemption_failures_total`.
+    pub redemption_failures: Counter,
+    /// Channel-lifecycle persists the settlement watcher swallowed: a failed
+    /// `register_open_channel` / `update_channel_deposit` / `forget_channel`
+    /// from the live event stream (#751). The watcher logs and continues (the
+    /// channel stays observable on-chain and a later event or the bring-up
+    /// backfill re-drives it), but a non-zero rate flags a struggling channel
+    /// store. Operator-visible name: `decdn_watcher_persist_failures_total`.
+    pub watcher_persist_failures: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -371,6 +393,26 @@ impl Metrics {
     /// skip count rides the paired `tracing::warn!` in `apply_voucher`.
     pub fn voucher_nonce_gap(&self) {
         self.decdn.voucher_nonce_gaps.inc();
+    }
+
+    /// A redeem hint was dropped because the bounded advisory channel was full
+    /// (`try_send` → `Full`, #751). Advisory, so a few drops are benign; a
+    /// sustained rate means the redeemer is not keeping up with fan-out.
+    pub fn redeem_hint_dropped(&self) {
+        self.decdn.redeem_hints_dropped.inc();
+    }
+
+    /// A redemption attempt (`try_redeem`) failed with an RPC/receipt error
+    /// (#751). Pairs with the `warn!` in `redeemer_loop`.
+    pub fn redemption_failure(&self) {
+        self.decdn.redemption_failures.inc();
+    }
+
+    /// The settlement watcher swallowed a channel-lifecycle persist failure
+    /// (`register_open_channel` / `update_channel_deposit` / `forget_channel`,
+    /// #751). Pairs with the per-site `warn!` in `run_watcher_once`.
+    pub fn watcher_persist_failure(&self) {
+        self.decdn.watcher_persist_failures.inc();
     }
 
     pub fn connection_opened(&self) {

@@ -487,12 +487,15 @@ impl StreamError {
 /// The first eight variants mirror `decdn_incentive::ChannelError` ∪
 /// `VoucherError` one-to-one; the handler-side conversion `voucher_reject_reason`
 /// matches those exhaustively so a new `ChannelError` variant fails to compile
-/// until this enum is extended (ADR 005 §Mirror obligation). The ninth,
-/// [`Self::RetryLater`], has no validation-enum counterpart: it is the wire
+/// until this enum is extended (ADR 005 §Mirror obligation). The last two have
+/// no validation-enum counterpart and are emitted directly by the
+/// `cdn/client/v1` handler: the ninth, [`Self::RetryLater`], is the wire
 /// expression of a transient persist-write failure (`ChannelError::Store`,
 /// `decdn_incentive::RetrySignal`), the one rejection where the client should
 /// resend the **same** voucher rather than treat the failure as permanent
-/// (ADR 003 §Off-chain voucher state persistence). Variant order is frozen.
+/// (ADR 003 §Off-chain voucher state persistence); the tenth, [`Self::Expired`],
+/// is the on-chain channel-expiry serve-gate refusal (#751). Variant order is
+/// frozen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -524,6 +527,16 @@ pub enum VoucherRejectReason {
     /// never returns this; the `cdn/client/v1` handler emits it directly (ADR
     /// 003 §Off-chain voucher state persistence).
     RetryLater,
+    /// The channel has passed its on-chain `expiresAt`: `withdraw`/`closeChannel`
+    /// now revert and the client may `reclaimExpired` for a full refund, so any
+    /// further delivery would be unpaid. The node refuses to accept the voucher
+    /// (the seller settlement sweep normally closes + retires the channel well
+    /// before this; this gate is the defense-in-depth for a node that was down
+    /// through the close window). The voucher itself may be valid — the client
+    /// should stop streaming on this channel rather than resend (#751). No
+    /// validation-enum counterpart — `voucher_reject_reason` never returns this;
+    /// the `cdn/client/v1` handler emits it directly.
+    Expired,
 }
 
 #[cfg(test)]
@@ -779,6 +792,7 @@ mod tests {
             VoucherRejectReason::BytesRegression,
             VoucherRejectReason::InsufficientDeposit,
             VoucherRejectReason::RetryLater,
+            VoucherRejectReason::Expired,
         ]
         .into_iter()
         .enumerate()

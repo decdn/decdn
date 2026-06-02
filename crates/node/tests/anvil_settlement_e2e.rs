@@ -79,7 +79,8 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
     BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, PendingSettleStore,
-    bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
+    WatcherCheckpointStore, bind_node_id_domain, binding_signing_hash, slash_judge_domain,
+    voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerChannelService;
 use decdn_node::channel_store::PersistentChannelStateStore;
@@ -396,7 +397,10 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     // settlement sweep, PR #743 review) — mirrors the runtime wiring.
     let concrete_store = Arc::new(PersistentChannelStateStore::open(store_tmp.path())?);
     let store: Arc<dyn ChannelStateStore> = concrete_store.clone();
-    let pending_store: Arc<dyn PendingSettleStore> = concrete_store;
+    let pending_store: Arc<dyn PendingSettleStore> = concrete_store.clone();
+    // Keep `concrete_store` alive (don't move it) so the downtime-backfill phase
+    // at the end can re-bootstrap a second service against the same store.
+    let checkpoint_store: Arc<dyn WatcherCheckpointStore> = concrete_store.clone();
 
     let node_eth = Arc::new(node_signer.clone());
     let metrics = Arc::new(Metrics::new());
@@ -424,8 +428,10 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         node_addr,
         Arc::clone(&store),
         pending_store,
+        checkpoint_store,
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        Arc::clone(&metrics),
     )
     .await?;
     handler.attach_redeem_hint(service.redeem_hint_sender());
@@ -819,6 +825,94 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         matches!(reclaimed.status, PaymentChannel::Status::Closed),
         "reclaimed channel must be Closed on-chain"
     );
+
+    // ============================================================
+    // DOWNTIME BACKFILL (#751) — the headline across-restart fix. Take the
+    // settlement service DOWN (drop it → watcher/sweeper aborted), open a fresh
+    // channel against this provider while nothing is watching, then bring the
+    // node back up by re-bootstrapping a second service against the SAME store.
+    // Service 2's bootstrap reads the scan checkpoint service 1 persisted, floors
+    // the backfill below the new channel's block, and registers it — proving a
+    // channel opened during downtime is recovered, not rejected `WrongChannel`
+    // forever.
+    // ============================================================
+    drop(service); // node "goes down": watcher/sweeper/redeemer all aborted
+
+    // Re-fund + re-approve so the deposit is covered regardless of prior spend
+    // (ERC-20 `approve` overwrites the allowance), then open the channel while no
+    // service is watching. Derive the channel id from the live per-client nonce
+    // (read before the open) rather than hardcoding it, so the proof survives any
+    // change to the earlier channel count.
+    usdc_admin
+        .mint(
+            client_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(2u64),
+        )
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    usdc_client
+        .approve(
+            payment_channel,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(2u64),
+        )
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let down_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
+    let down_id = derive_channel_id(client_addr, node_addr, down_nonce.to::<u64>());
+    pc_client
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let down_block = node_provider.get_block_number().await?;
+    // While down, nothing registered it.
+    anyhow::ensure!(
+        store.get(down_id)?.is_none(),
+        "channel opened while the service is down must be unknown until re-bootstrap"
+    );
+
+    // Mine a block so service2's bootstrap head is STRICTLY above the downtime
+    // channel's block. This is what makes the proof specific to #751: the #762
+    // within-session backfill floors at the bootstrap head and scans
+    // `[head, F]`, which now EXCLUDES `down_block` — so only the persisted
+    // checkpoint floor (#751) can pull the backfill start low enough to re-cover
+    // it. Without this, `head == down_block` and the test would pass on the #762
+    // path alone, proving nothing.
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    anyhow::ensure!(
+        node_provider.get_block_number().await? > down_block,
+        "evm_mine must advance head above the downtime channel block"
+    );
+
+    // Node comes back up against the same store. Bootstrap re-reads the persisted
+    // checkpoint and the bring-up backfill covers the downtime block.
+    let service2 = PaymentChannelService::bootstrap(
+        node_provider.clone(),
+        payment_channel,
+        node_addr,
+        Arc::clone(&store),
+        concrete_store.clone(),
+        concrete_store.clone(),
+        Arc::clone(&handler),
+        U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        Arc::clone(&metrics),
+    )
+    .await?;
+    let backfilled = poll_until(Duration::from_secs(60), || {
+        let store = Arc::clone(&store);
+        async move { store.get(down_id).ok().flatten() }
+    })
+    .await;
+    anyhow::ensure!(
+        backfilled.is_some(),
+        "downtime-opened channel was not registered after restart — #751 checkpoint backfill failed"
+    );
+    drop(service2);
 
     client_ep.close().await;
     server_ep.close().await;

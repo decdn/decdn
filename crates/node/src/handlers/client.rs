@@ -159,7 +159,7 @@ impl ClientHandler {
     ) -> anyhow::Result<Self> {
         let mut map = HashMap::new();
         for state in channel_state_store.load_all()? {
-            let bytes = state.last_bytes_delivered;
+            let bytes = state.last_bytes_delivered();
             map.insert(
                 state.channel_id,
                 Arc::new(Mutex::new(ChannelDeliveryState {
@@ -223,7 +223,7 @@ impl ClientHandler {
             .await
             .map_err(|e| StoreError::Backend(format!("register_open_channel join: {e}")))??;
 
-        let bytes = state.last_bytes_delivered;
+        let bytes = state.last_bytes_delivered();
         self.channels
             .lock()
             .await
@@ -628,21 +628,24 @@ impl ClientHandler {
         // unpaid. Refuse rather than accept a voucher we could never redeem.
         // (The settlement sweep normally closes + retires channels well before
         // this; this is the defense-in-depth for a node that was down through
-        // the close window.) Fails the stream — there is no wire reason for
-        // expiry, same as the underpayment path below.
+        // the close window.) Surface it in-band as `VoucherRejectReason::Expired`
+        // and finish the stream cleanly (#751) so the client sees an actionable
+        // reason instead of an opaque connection drop.
         if crate::payment_settlement::is_expired(
             crate::payment_settlement::unix_now(),
             guard.state.expires_at,
         ) {
             drop(guard);
-            anyhow::bail!("channel {channel_id} expired on-chain; refusing further paid delivery");
+            self.write_reject(send, VoucherRejectReason::Expired)
+                .await?;
+            return Ok(VoucherOutcome::Rejected);
         }
 
         let new_bytes = guard
             .bytes_delivered_cumulative
             .saturating_add(U256::from(delta_bytes));
         let amount = U256::from_be_bytes(wire.amount);
-        let amount_delta = amount.saturating_sub(guard.state.last_amount);
+        let amount_delta = amount.saturating_sub(guard.state.last_amount());
 
         // Rate enforcement (ADR 003 §Voucher withholding). There is no wire
         // reason code for underpayment, so an underpaying voucher fails the
@@ -698,10 +701,18 @@ impl ClientHandler {
                 }
                 // Hint the on-chain settlement service that this channel's
                 // accrued claim advanced (#327). Best-effort: an unattached or
-                // full hint channel just skips — the next voucher re-hints, and
-                // shutdown closes any residual claim.
-                if let Some(tx) = self.redeem_hint.get() {
-                    let _ = tx.try_send(channel_id);
+                // full hint channel just skips — the next voucher re-hints, the
+                // redeemer self-tick sweeps, and shutdown closes any residual
+                // claim. Only `Full` is counted (a saturated queue is a real
+                // dropped hint; a sustained rate is the signal worth watching,
+                // #751). `Closed` — the redeemer aborted during shutdown
+                // `quiesce_redeemer` — is expected, not a fault, so it is
+                // deliberately left uncounted; don't "fix" this to count both.
+                if let Some(tx) = self.redeem_hint.get()
+                    && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                        tx.try_send(channel_id)
+                {
+                    self.metrics.redeem_hint_dropped();
                 }
                 self.write_message(send, &ClientMessage::VoucherAck).await?;
                 Ok(VoucherOutcome::Accepted)
