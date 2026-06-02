@@ -447,6 +447,10 @@ jobs:
   anvil-e2e:
     name: anvil e2e
     runs-on: ubuntu-latest
+    # Bound the job so a stalled in-test `forge script --broadcast` (issue #785)
+    # fails red quickly instead of squatting the runner until GitHub's 6-hour
+    # default — or masquerading as "cancelled" when a later push pre-empts it.
+    timeout-minutes: 15
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||

@@ -63,6 +63,7 @@
     // splitting it would fragment the shared anvil/deploy setup. Second-scale
     // timeouts read more clearly as `from_secs` than `from_mins` here.
     clippy::too_many_lines,
+    clippy::cognitive_complexity,
     clippy::duration_suboptimal_units
 )]
 
@@ -76,6 +77,7 @@ use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
+use anyhow::Context;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
     BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, PendingSettleStore,
@@ -131,6 +133,20 @@ const TOPUP_MICRO_USDC: u64 = 2_000_000; // 2 USDC added via topUp in the buyer 
 // is permitted on-chain in the buyer-path reclaim assertion (#744).
 const CHANNEL_EXPIRY_WARP_SECS: u64 = 366 * 24 * 60 * 60;
 
+// Wall-clock bounds on the `forge` subprocesses (issue #785). `forge build`
+// compiles the contract set cold; the deploy normally finishes in ~1–5s but
+// `forge script --broadcast` intermittently stalls in receipt-wait under runner
+// CPU contention, so it is bounded per attempt and a *stall* (timeout) is
+// retried. A non-zero exit is treated as deterministic and fails fast.
+const FORGE_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
+const DEPLOY_TIMEOUT: Duration = Duration::from_secs(45);
+const DEPLOY_ATTEMPTS: usize = 2;
+// Overall ceiling on the single e2e flow, sized above the sum of the internal
+// `poll_until` budgets (~560s) + build + deploy so a slow-but-legitimate run
+// still surfaces its specific poll diagnostic, while a truly *unbounded* await
+// (iroh, `get_receipt`) fails fast. Stays under the 15-minute CI job cap.
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+
 /// Kills the spawned `anvil` on drop so a panicking assertion never leaks the
 /// process.
 struct AnvilGuard {
@@ -176,6 +192,33 @@ where
             return None;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// Run a `forge` subprocess to completion under a wall-clock `timeout`, killing
+/// the child if it overruns. `forge script --broadcast` intermittently stalls in
+/// its broadcast/receipt-wait phase against anvil (issue #785); an unbounded
+/// `std::process::Command::output()` would freeze the whole test. `kill_on_drop`
+/// SIGKILLs the child (the otherwise-orphaned `forge`) when the timed-out
+/// `output()` future is dropped; the tokio runtime then reaps it so it never
+/// lingers as a zombie.
+///
+/// The three outcomes are kept distinct so callers can react correctly:
+/// - `Err(_)` — the child could not be spawned (e.g. `forge` missing). This is
+///   deterministic; callers should fail fast, not retry.
+/// - `Ok(Err(timeout))` — the run stalled and was killed (#785). Retryable.
+/// - `Ok(Ok(output))` — the process exited; the caller inspects its status.
+async fn forge_output(
+    mut cmd: tokio::process::Command,
+    timeout: Duration,
+    what: &str,
+) -> anyhow::Result<Result<std::process::Output, Duration>> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(res) => res
+            .map(Ok)
+            .with_context(|| format!("spawn `{what}` (is foundry installed?)")),
+        Err(_) => Ok(Err(timeout)),
     }
 }
 
@@ -230,6 +273,19 @@ fn derive_channel_id(client: Address, provider: Address, channel_nonce: u64) -> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
+    // Defense-in-depth: bound the whole flow so any unbounded await (iroh,
+    // `get_receipt`) fails fast with a clear message instead of squatting the
+    // runner. Cleanup is preserved on timeout — dropping `run_e2e`'s future runs
+    // `AnvilGuard::drop` (kills anvil + removes the manifest) and kills any
+    // in-flight `forge` child via `kill_on_drop`.
+    // `Box::pin` keeps the large `run_e2e` body future off the stack
+    // (clippy::large_futures fires above ~16 KB).
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_e2e()))
+        .await
+        .with_context(|| format!("anvil-e2e exceeded the overall {OVERALL_TIMEOUT:?} timeout"))?
+}
+
+async fn run_e2e() -> anyhow::Result<()> {
     // Surface the redeemer/watcher background-task logs (the `warn!` carrying an
     // on-chain revert reason is the key diagnostic when a `withdraw`/`close`
     // poll times out). Those tasks run on tokio worker threads under
@@ -244,14 +300,17 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     let contracts = contracts_dir();
 
     // ---- 0. Build contracts so artifacts + the deploy script are available.
-    let build = Command::new("forge")
-        .current_dir(&contracts)
-        .args(["build"])
-        .output()
-        .expect("run `forge build` (is foundry installed?)");
+    let mut build_cmd = tokio::process::Command::new("forge");
+    build_cmd.current_dir(&contracts).args(["build"]);
+    let build = match forge_output(build_cmd, FORGE_BUILD_TIMEOUT, "forge build").await? {
+        Ok(out) => out,
+        Err(timeout) => anyhow::bail!("`forge build` timed out after {timeout:?}"),
+    };
     assert!(
         build.status.success(),
-        "forge build failed:\n{}",
+        // forge writes compiler errors to stdout, not stderr — capture both.
+        "forge build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
 
@@ -314,7 +373,7 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
     // ---- 3. Deploy mock USDC (mintable) from its compiled bytecode, then run
     // the production deploy script with USDC_ADDRESS pointed at it.
     let usdc_addr = deploy_mock_usdc(&admin, &contracts).await?;
-    run_deploy_script(&contracts, &rpc_url, usdc_addr, node_addr)?;
+    run_deploy_script(&contracts, &rpc_url, usdc_addr, node_addr).await?;
     let (capacity_bond, payment_channel, fee_router, token, slash_judge) =
         read_manifest(&manifest)?;
 
@@ -954,39 +1013,68 @@ async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow
 /// Run `forge script DeployProtocol.s.sol` against the anvil RPC, broadcasting
 /// from the anvil dev deployer. `INITIAL_TOKEN_HOLDER` is the node so it holds
 /// the staking TOKEN directly.
-fn run_deploy_script(
+///
+/// `forge script --broadcast` can *stall* in its receipt-wait phase under runner
+/// CPU contention (issue #785), so each attempt is bounded by `DEPLOY_TIMEOUT`
+/// and a stall (timeout) is retried up to `DEPLOY_ATTEMPTS` times. Retry is safe:
+/// each run broadcasts from a fresh deployer nonce (new contract addresses) and
+/// `FORCE_OVERWRITE_MANIFEST` rewrites the manifest the test reads, so a
+/// completed retry fully supersedes a killed one. A *non-zero exit* (revert,
+/// script bug, RPC rejection) is almost always deterministic, so it fails fast
+/// with the full output rather than retrying a guaranteed-identical failure (and
+/// rather than logging a misleading "retrying" line for a hard error).
+async fn run_deploy_script(
     contracts: &Path,
     rpc_url: &str,
     usdc: Address,
     initial_token_holder: Address,
 ) -> anyhow::Result<()> {
-    let out = Command::new("forge")
-        .current_dir(contracts)
-        .args([
-            "script",
-            "script/DeployProtocol.s.sol:DeployProtocol",
-            "--rpc-url",
-            rpc_url,
-            "--broadcast",
-            "--private-key",
-            DEPLOYER_KEY,
-            "--sender",
-            DEPLOYER_ADDR,
-        ])
-        .env("USDC_ADDRESS", usdc.to_string())
-        .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
-        .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
-        .env("CHALLENGER_INCENTIVE_POOL", DEPLOYER_ADDR)
-        .env("FORCE_OVERWRITE_MANIFEST", "true")
-        .output()
-        .expect("run forge script");
-    anyhow::ensure!(
-        out.status.success(),
-        "forge script DeployProtocol failed:\n{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(())
+    for attempt in 1..=DEPLOY_ATTEMPTS {
+        let mut cmd = tokio::process::Command::new("forge");
+        cmd.current_dir(contracts)
+            .args([
+                "script",
+                "script/DeployProtocol.s.sol:DeployProtocol",
+                "--rpc-url",
+                rpc_url,
+                "--broadcast",
+                "--private-key",
+                DEPLOYER_KEY,
+                "--sender",
+                DEPLOYER_ADDR,
+            ])
+            .env("USDC_ADDRESS", usdc.to_string())
+            .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
+            .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
+            .env("CHALLENGER_INCENTIVE_POOL", DEPLOYER_ADDR)
+            .env("FORCE_OVERWRITE_MANIFEST", "true");
+        // A spawn failure (`forge` missing) is deterministic — `?` fails fast
+        // rather than masquerading as a stall and burning a retry.
+        match forge_output(cmd, DEPLOY_TIMEOUT, "forge script DeployProtocol").await? {
+            Ok(out) if out.status.success() => return Ok(()),
+            // Deterministic failure — surface the full output and stop.
+            Ok(out) => {
+                anyhow::bail!(
+                    "forge script DeployProtocol exited non-zero:\n{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            }
+            // Stall (#785) — retry while attempts remain, else surface it.
+            Err(timeout) => {
+                if attempt == DEPLOY_ATTEMPTS {
+                    anyhow::bail!(
+                        "forge script DeployProtocol stalled on all {DEPLOY_ATTEMPTS} attempts (timed out after {timeout:?})"
+                    );
+                }
+                tracing::warn!(
+                    "forge script DeployProtocol attempt {attempt}/{DEPLOY_ATTEMPTS} stalled, retrying after {timeout:?}"
+                );
+            }
+        }
+    }
+    // Reached only if DEPLOY_ATTEMPTS == 0; the loop returns on every other path.
+    anyhow::bail!("DEPLOY_ATTEMPTS must be >= 1 (was {DEPLOY_ATTEMPTS})")
 }
 
 /// Read `(CapacityBond, PaymentChannel, FeeRouter, Token, SlashJudge)` from the
