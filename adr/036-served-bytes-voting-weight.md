@@ -147,7 +147,7 @@ The per-operator cap (`voteCapBps`, default 5%) is the primary concentration def
 
 ### Negative
 
-- **Wash-trading is bounded but not zero-cost prevented.** ~40% of attacker-paid USDC is forfeit per cycle (burn + treasury + safety legs). At cap floor (1%) and default parameters, attacker cost is non-trivial but not unaffordable. See [§ Threat Model — Wash-trading](#wash-trading-as-vote-buying).
+- **Wash-trading is bounded but not zero-cost prevented.** ~40% of attacker-paid USDC is forfeit per cycle (30% burn + 10% treasury). At cap floor (1%) and default parameters, attacker cost is non-trivial but not unaffordable. See [§ Threat Model — Wash-trading](#wash-trading-as-vote-buying).
 - **Vote weight is more volatile than capacity-weighted weight.** A heavy traffic week ramps an operator's vote in days; a quiet quarter decays it out. Governance proposers cannot assume a fixed voting set; quorum computations must re-read the FeeRouter window state.
 - **No on-chain aggregate vote-weight getter.** `CapacityBond` exposes no `totalVotingWeightAt(ts)`; indexers and dashboards must compute totals from the FeeRouter-derived window (`totalBytesInWindow`) rather than a single contract read.
 - **`FeeRouter` migration becomes a governance-snapshot reset.** `epochLength` is constructor-immutable per [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns), so any future `FeeRouter` migration starts with empty `bytesPerEpoch`; vote weight resets to zero for all operators until traffic refills the window. Operational consideration, not a soundness concern — the existing `FeeRouter` migration path already requires state migration.
