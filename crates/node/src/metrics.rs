@@ -137,7 +137,7 @@ pub struct DecdnMetrics {
     /// ceiling (`max_probe_holds - cache.stake_lane_reserved_holds`),
     /// reserving the remaining slots for stake-lane (node-to-node
     /// cache-miss) probes per ADR 003 §Admission and Priority. Unlike the
-    /// two counters below, this fires *before* `try_probe_hold`, so the
+    /// two counters above, this fires *before* `try_probe_hold`, so the
     /// cache is **not consulted** — the blob may or may not be present; the
     /// reservation is a content-independent admission decision. Distinct
     /// from `probe_hold_violations` (genuine exhaustion of the *whole*

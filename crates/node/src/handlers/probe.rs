@@ -271,16 +271,23 @@ impl ProbeHandler {
         // the slots-used read races a concurrent hold, which is acceptable
         // for a priority heuristic (admission is implementation-defined per
         // ADR 003) and never a safety property.
+        // Sample `slots_used` once here and reuse it for the slots gauge
+        // below: on the shed path no hold is attempted, so the sampled value
+        // stays current and a second lock+sweep is pure waste on exactly the
+        // loaded path this gate fires under (#757 review).
+        let mut slots_used = None;
         let stake_lane_reserved = match self.stake_lane.as_ref() {
             Some(policy) => {
-                let requester = NodeId::from_bytes(*conn.remote_id().as_bytes());
-                let is_stake_lane = policy.staker_set.is_active(&requester);
-                stake_lane_reserved_out(
-                    is_stake_lane,
-                    policy.reserved_holds.get(),
-                    policy.max_holds,
-                    self.cache.probe_hold_slots_used(),
-                )
+                let used = self.cache.probe_hold_slots_used();
+                slots_used = Some(used);
+                // `is_stake_lane` is resolved lazily: `stake_lane_reserved_out`
+                // calls it only after the cheap ceiling guards pass, so the
+                // uncongested common path skips the staker-set lookup (an
+                // RwLock read + NodeId conversion) entirely (#757 review).
+                stake_lane_reserved_out(policy.reserved_holds.get(), policy.max_holds, used, || {
+                    let requester = NodeId::from_bytes(*conn.remote_id().as_bytes());
+                    policy.staker_set.is_active(&requester)
+                })
             }
             None => false,
         };
@@ -364,8 +371,15 @@ impl ProbeHandler {
                 }
             }
         };
-        self.metrics
-            .probe_hold_slots(self.cache.probe_hold_slots_used());
+        // On the shed path no hold was attempted, so the value sampled for
+        // the gate is still current — reuse it instead of re-acquiring the
+        // lock and sweeping again. Off that path a hold may have been taken,
+        // so re-sample for an accurate gauge (#757 review).
+        self.metrics.probe_hold_slots(if stake_lane_reserved {
+            slots_used.unwrap_or_else(|| self.cache.probe_hold_slots_used())
+        } else {
+            self.cache.probe_hold_slots_used()
+        });
 
         // Clamp the quoted rate to the configured delivery bounds before
         // signing (ADR 005 §Rate bounds validation): clamp-and-warn keeps
@@ -526,11 +540,16 @@ const fn frame_err_code(e: &FrameError) -> u32 {
 /// registered operators issuing node-to-node cache-miss probes (#757, ADR
 /// 003 §Admission and Priority).
 ///
-/// Returns `true` only when ALL of: the requester is **not** in the stake
-/// lane, a reservation is configured (`reserved > 0`), holds are enabled
-/// (`max_holds > 0`), and current hold usage has reached the end-client
-/// ceiling (`slots_used >= max_holds - reserved`). The last `reserved`
-/// slots are thereby kept available for the stake lane.
+/// Returns `true` only when ALL of: a reservation is configured
+/// (`reserved > 0`), holds are enabled (`max_holds > 0`), current hold usage
+/// has reached the end-client ceiling (`slots_used >= max_holds - reserved`),
+/// and the requester is **not** in the stake lane. The last `reserved` slots
+/// are thereby kept available for the stake lane.
+///
+/// `is_stake_lane` is evaluated **lazily** and only after the three cheap
+/// guards above have passed, so callers can pass a closure that performs the
+/// staker-set lookup (an `RwLock` read + `NodeId` conversion) and have it
+/// skipped entirely on the uncongested common path (#757 review).
 ///
 /// `reserved == 0` is the default and makes this an unconditional no-op so
 /// single-lane operators are unaffected. The `max_holds == 0` short-circuit
@@ -542,13 +561,16 @@ const fn frame_err_code(e: &FrameError) -> u32 {
 /// atomic `try_probe_hold`, so a concurrent hold may still cross the
 /// boundary. That is acceptable for a priority heuristic — it is never a
 /// safety property (ADR 003 frames admission as implementation-defined).
-const fn stake_lane_reserved_out(
-    stake_lane: bool,
+fn stake_lane_reserved_out(
     reserved: usize,
     max_holds: usize,
     slots_used: usize,
+    is_stake_lane: impl FnOnce() -> bool,
 ) -> bool {
-    !stake_lane && reserved > 0 && max_holds > 0 && slots_used >= max_holds.saturating_sub(reserved)
+    reserved > 0
+        && max_holds > 0
+        && slots_used >= max_holds.saturating_sub(reserved)
+        && !is_stake_lane()
 }
 
 /// Error from the probe-request read path carrying the ADR 013 app error
@@ -644,8 +666,8 @@ mod tests {
     /// operators must be entirely unaffected (#757).
     #[test]
     fn no_reservation_never_reserves_out() {
-        assert!(!stake_lane_reserved_out(false, 0, 256, 256));
-        assert!(!stake_lane_reserved_out(false, 0, 256, 0));
+        assert!(!stake_lane_reserved_out(0, 256, 256, || false));
+        assert!(!stake_lane_reserved_out(0, 256, 0, || false));
     }
 
     /// A stake-lane (registered-operator) requester is never reserved out,
@@ -653,8 +675,8 @@ mod tests {
     /// protect exactly these node-to-node cache-miss probes.
     #[test]
     fn stake_lane_requester_never_reserved_out() {
-        assert!(!stake_lane_reserved_out(true, 8, 256, 256));
-        assert!(!stake_lane_reserved_out(true, 8, 256, 255));
+        assert!(!stake_lane_reserved_out(8, 256, 256, || true));
+        assert!(!stake_lane_reserved_out(8, 256, 255, || true));
     }
 
     /// An end-client probe is admitted while hold usage is below the
@@ -663,9 +685,9 @@ mod tests {
     #[test]
     fn end_client_refused_at_reserved_ceiling() {
         // reserved=8, max=256 => end-client ceiling is 248.
-        assert!(!stake_lane_reserved_out(false, 8, 256, 247));
-        assert!(stake_lane_reserved_out(false, 8, 256, 248));
-        assert!(stake_lane_reserved_out(false, 8, 256, 256));
+        assert!(!stake_lane_reserved_out(8, 256, 247, || false));
+        assert!(stake_lane_reserved_out(8, 256, 248, || false));
+        assert!(stake_lane_reserved_out(8, 256, 256, || false));
     }
 
     /// Holds disabled (`max_holds == 0`) short-circuits to `false` so the
@@ -674,7 +696,7 @@ mod tests {
     /// every end-client, mis-attributing an intentional disable.
     #[test]
     fn holds_disabled_is_not_a_reservation_refusal() {
-        assert!(!stake_lane_reserved_out(false, 8, 0, 0));
+        assert!(!stake_lane_reserved_out(8, 0, 0, || false));
     }
 
     /// Reserving the entire budget (`reserved >= max_holds`) yields a `0`
@@ -682,7 +704,30 @@ mod tests {
     /// enabled. An aggressive but valid "stake lane only" configuration.
     #[test]
     fn reserving_full_budget_excludes_all_end_clients() {
-        assert!(stake_lane_reserved_out(false, 256, 256, 0));
-        assert!(stake_lane_reserved_out(false, 512, 256, 0));
+        assert!(stake_lane_reserved_out(256, 256, 0, || false));
+        assert!(stake_lane_reserved_out(512, 256, 0, || false));
+    }
+
+    /// The `is_stake_lane` closure is consulted only after the cheap ceiling
+    /// guards pass, so the staker-set lookup is skipped on the uncongested
+    /// common path (#757 review). Each cheap guard failing must short-circuit
+    /// before the closure runs.
+    #[test]
+    fn is_stake_lane_lookup_is_skipped_below_ceiling() {
+        let consulted = std::cell::Cell::new(false);
+        let probe = || {
+            consulted.set(true);
+            false
+        };
+        // reserved == 0 (default-off), holds disabled, and usage below the
+        // end-client ceiling each short-circuit before the lookup.
+        assert!(!stake_lane_reserved_out(0, 256, 256, probe));
+        assert!(!stake_lane_reserved_out(8, 0, 0, probe));
+        assert!(!stake_lane_reserved_out(8, 256, 247, probe));
+        assert!(!consulted.get(), "staker-set lookup ran below the ceiling");
+
+        // At the ceiling the lookup is required and must run.
+        assert!(stake_lane_reserved_out(8, 256, 248, probe));
+        assert!(consulted.get(), "staker-set lookup skipped at the ceiling");
     }
 }

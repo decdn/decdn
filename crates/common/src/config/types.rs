@@ -228,7 +228,9 @@ pub struct CacheConfig {
     /// so end-client load cannot starve them. Absent / `0` (the default)
     /// disables the reservation entirely — a single-lane node is unaffected.
     /// Values `>= max_probe_holds` reserve the whole budget for the stake
-    /// lane (every end-client probe is shed under any hold pressure).
+    /// lane: the end-client ceiling collapses to `0`, so every end-client
+    /// probe is shed whenever holds are enabled — regardless of current
+    /// usage, not only under pressure.
     pub stake_lane_reserved_holds: Option<u64>,
 }
 
