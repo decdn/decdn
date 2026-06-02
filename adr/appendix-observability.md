@@ -166,8 +166,8 @@ A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `
 
 | Metric | Type | Tier | Labels | Source | Consumer | Description |
 |--------|------|------|--------|--------|----------|-------------|
-| `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={operator_base,burn,treasury,safety}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. All four legs transfer same-tx ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). |
-| `decdn_fee_router_inflow_usdc_rate` | Gauge | R | `bucket={operator_base,burn,treasury,safety}` | Derived (rolling 7-epoch avg over `..._inflow_usdc_total`) | Governance + capacity-planning dashboards | Rolling-average per-bucket USDC inflow per epoch. |
+| `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={operator_base,burn,treasury}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. All three legs transfer same-tx ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). |
+| `decdn_fee_router_inflow_usdc_rate` | Gauge | R | `bucket={operator_base,burn,treasury}` | Derived (rolling 7-epoch avg over `..._inflow_usdc_total`) | Governance + capacity-planning dashboards | Rolling-average per-bucket USDC inflow per epoch. |
 
 ##### Served-Bytes Voting Metrics
 
