@@ -679,15 +679,6 @@ pub struct AutoSettleConfig {
     pub voucher_nonce_span_threshold: Option<u64>,
 }
 
-impl AutoSettleConfig {
-    /// Whether any auto-settlement trigger is enabled. When neither is set the
-    /// redeemer skips the extra `getChannel`-driven close path entirely, so an
-    /// opted-out node pays no per-channel cost.
-    const fn is_enabled(&self) -> bool {
-        self.value_threshold.is_some() || self.voucher_nonce_span_threshold.is_some()
-    }
-}
-
 /// Pure auto-settlement decision (#742): given a channel's un-redeemed value and
 /// un-redeemed nonce span, decide whether either configured trigger has fired.
 /// Returns `true` when the value crosses [`AutoSettleConfig::value_threshold`]
@@ -715,6 +706,44 @@ fn should_auto_settle(
         return true;
     }
     false
+}
+
+/// Pure cheap-pre-check decision: given the off-chain voucher watermark
+/// (`last_amount`, `last_nonce`) and the cached on-chain `(withdrawn, claimed
+/// nonce)` lower bounds, decide whether the `getChannel` RPC can be skipped this
+/// tick. The cached values are `<=` the true on-chain ones (only this node's
+/// `withdraw`/`closeChannel` advance them), so the derived
+/// `est_unredeemed = last_amount − cached_withdrawn` and
+/// `est_nonce_span = last_nonce − cached_nonce` are UPPER BOUNDS — when every
+/// upper bound sits strictly below its threshold the true values do too, so no
+/// trigger (redeem, auto-settle value, or auto-settle nonce span) can fire and
+/// the RPC is safe to skip. Each enabled threshold tightens the skip predicate;
+/// a cache miss (estimating from zero) yields the widest bounds, so the first
+/// hint per channel never skips. Pure so the predicate is unit-testable without
+/// a live provider.
+fn can_skip_redeem_rpc(
+    last_amount: U256,
+    last_nonce: U256,
+    cached_withdrawn: U256,
+    cached_nonce: U256,
+    redeem_threshold: U256,
+    auto_settle: &AutoSettleConfig,
+) -> bool {
+    let est_unredeemed = last_amount.saturating_sub(cached_withdrawn);
+    // The redeem `withdraw` path always applies; its value bound is mandatory.
+    let mut can_skip = est_unredeemed < redeem_threshold;
+    // The auto-settle value trigger fires on the same `withdrawnAmount`-derived
+    // delta, so the cached withdrawn lower bound proves it can't have fired.
+    if let Some(val_threshold) = auto_settle.value_threshold {
+        can_skip &= est_unredeemed < val_threshold;
+    }
+    // The auto-settle nonce-span trigger fires on `last_nonce − claimedNonce`;
+    // the cached claimed-nonce lower bound proves it can't have fired.
+    if let Some(span_threshold) = auto_settle.voucher_nonce_span_threshold {
+        let est_nonce_span = unredeemed_nonce_span(last_nonce, cached_nonce);
+        can_skip &= est_nonce_span < span_threshold;
+    }
+    can_skip
 }
 
 /// Why a [`run_watcher_once`] cycle returned, so [`watcher_loop`] can pick the
@@ -1180,14 +1209,16 @@ async fn redeemer_loop<P: Provider + Clone>(
     mut redeem_rx: mpsc::Receiver<ChannelId>,
     metrics: Arc<Metrics>,
 ) {
-    // Per-channel cache of the last-known on-chain `withdrawnAmount`.
-    // `withdrawnAmount` is only ever advanced by this node's own `withdraw`
-    // transactions, so the cache is exact once seeded and is always `<=` the
-    // true on-chain value — letting us skip the `getChannel` RPC for hints
-    // whose accrued claim is provably still below the threshold (avoids RPC
-    // spam under active per-MB voucher streaming). A cache miss estimates
-    // from zero, so the first hint per channel still does one RPC.
-    let mut withdrawn_cache: HashMap<ChannelId, U256> = HashMap::new();
+    // Per-channel cache of the last-known on-chain `(withdrawnAmount,
+    // claimedNonce)`. Both are only ever advanced by this node's own
+    // `withdraw`/`closeChannel` transactions, so the cache is exact once seeded
+    // and is always `<=` the true on-chain values — letting us skip the
+    // `getChannel` RPC for hints whose accrued claim AND nonce span are
+    // provably still below every enabled threshold (avoids RPC spam under
+    // active per-MB voucher streaming, including for nodes that opt into
+    // auto-settlement). A cache miss estimates both from zero, so the first
+    // hint per channel still does one RPC.
+    let mut withdrawn_cache: HashMap<ChannelId, (U256, U256)> = HashMap::new();
     let mut ticker = tokio::time::interval(REDEEM_TICK_INTERVAL);
     // Skip the immediate first tick: nothing has accrued right after bootstrap,
     // and the bring-up backfill + first vouchers hint anyway.
@@ -1230,7 +1261,7 @@ async fn redeem_one<P: Provider + Clone>(
     redeem_threshold: U256,
     auto_settle: AutoSettleConfig,
     channel_id: ChannelId,
-    withdrawn_cache: &mut HashMap<ChannelId, U256>,
+    withdrawn_cache: &mut HashMap<ChannelId, (U256, U256)>,
     metrics: &Arc<Metrics>,
 ) {
     if let Err(err) = try_redeem(
@@ -1276,7 +1307,7 @@ async fn redeem_sweep<P: Provider + Clone>(
     self_address: Address,
     redeem_threshold: U256,
     auto_settle: AutoSettleConfig,
-    withdrawn_cache: &mut HashMap<ChannelId, U256>,
+    withdrawn_cache: &mut HashMap<ChannelId, (U256, U256)>,
     metrics: &Arc<Metrics>,
 ) {
     let states = match store.load_all() {
@@ -1399,7 +1430,7 @@ async fn try_redeem<P: Provider + Clone>(
     redeem_threshold: U256,
     auto_settle: AutoSettleConfig,
     channel_id: ChannelId,
-    withdrawn_cache: &mut HashMap<ChannelId, U256>,
+    withdrawn_cache: &mut HashMap<ChannelId, (U256, U256)>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let Some(st) = store
@@ -1414,22 +1445,27 @@ async fn try_redeem<P: Provider + Clone>(
         return Ok(());
     }
 
-    // Cheap pre-check against the cached withdrawn amount before any RPC. The
-    // cache is `<=` the true on-chain `withdrawnAmount`, so this estimate is
-    // an upper bound on the unredeemed claim — if it's already below the
-    // threshold we can safely skip the `getChannel` call entirely. Only valid
-    // when auto-settlement is disabled: an auto-settle voucher-count trigger
-    // can fire below the redeem value threshold (many small vouchers), and that
-    // count is derived from on-chain `claimedNonce` (not cached here), so an
-    // opted-in node must read `getChannel` to evaluate it.
-    if !auto_settle.is_enabled() {
-        let cached_withdrawn = withdrawn_cache
-            .get(&channel_id)
-            .copied()
-            .unwrap_or(U256::ZERO);
-        if st.last_amount().saturating_sub(cached_withdrawn) < redeem_threshold {
-            return Ok(());
-        }
+    // Cheap pre-check against the cached on-chain `(withdrawn, claimedNonce)`
+    // before any RPC. Both are `<=` the true on-chain values, so the derived
+    // unredeemed value and nonce span are upper bounds — if every enabled
+    // trigger's bound is below its threshold we can safely skip the
+    // `getChannel` call entirely. This now holds even with auto-settlement
+    // opted in: the value trigger keys off the same cached `withdrawnAmount`,
+    // and the nonce-span trigger off the cached `claimedNonce`, so an idle
+    // channel short-circuits regardless of which triggers are configured.
+    let (cached_withdrawn, cached_nonce) = withdrawn_cache
+        .get(&channel_id)
+        .copied()
+        .unwrap_or_default();
+    if can_skip_redeem_rpc(
+        st.last_amount(),
+        st.last_nonce(),
+        cached_withdrawn,
+        cached_nonce,
+        redeem_threshold,
+        &auto_settle,
+    ) {
+        return Ok(());
     }
 
     let ch = contract
@@ -1437,7 +1473,7 @@ async fn try_redeem<P: Provider + Clone>(
         .call()
         .await
         .context("getChannel for redemption")?;
-    withdrawn_cache.insert(channel_id, ch.withdrawnAmount);
+    withdrawn_cache.insert(channel_id, (ch.withdrawnAmount, ch.claimedNonce));
     // Defensive: only redeem channels this node provides and that are open.
     if ch.provider != self_address || !matches!(ch.status, PaymentChannel::Status::Open) {
         return Ok(());
@@ -1501,8 +1537,10 @@ async fn try_redeem<P: Provider + Clone>(
         return Ok(());
     }
     // A successful withdraw advances on-chain `withdrawnAmount` to the voucher
-    // amount; reflect that in the cache so the next hints short-circuit.
-    withdrawn_cache.insert(channel_id, st.last_amount());
+    // amount and `claimedNonce` to the voucher nonce (strict watermark advance,
+    // PaymentChannel.withdraw); reflect both in the cache so the next hints
+    // short-circuit on the value AND nonce-span bounds.
+    withdrawn_cache.insert(channel_id, (st.last_amount(), st.last_nonce()));
     info!(
         %channel_id,
         tx = %receipt.transaction_hash,
@@ -2013,7 +2051,6 @@ mod tests {
         // Both triggers `None` (the default): no value or count ever settles,
         // so an opted-out node behaves exactly as before #742.
         let cfg = AutoSettleConfig::default();
-        assert!(!cfg.is_enabled());
         assert!(!should_auto_settle(&cfg, U256::from(u64::MAX), u64::MAX));
         assert!(!should_auto_settle(&cfg, U256::ZERO, 0));
     }
@@ -2024,7 +2061,6 @@ mod tests {
             value_threshold: Some(U256::from(1_000_000u64)),
             voucher_nonce_span_threshold: None,
         };
-        assert!(cfg.is_enabled());
         // Strictly below the threshold: does not fire.
         assert!(!should_auto_settle(&cfg, U256::from(999_999u64), 9_999));
         // Exactly at the threshold settles (>= comparison).
@@ -2040,7 +2076,6 @@ mod tests {
             value_threshold: None,
             voucher_nonce_span_threshold: Some(100),
         };
-        assert!(cfg.is_enabled());
         // A large value never fires when only the nonce-span trigger is set.
         assert!(!should_auto_settle(&cfg, U256::from(u64::MAX), 99));
         // Exactly at the span threshold settles (>= comparison).
@@ -2090,5 +2125,157 @@ mod tests {
             unredeemed_nonce_span(U256::from(u64::MAX) + U256::from(5u64), U256::ZERO),
             u64::MAX
         );
+    }
+
+    // ---- can_skip_redeem_rpc (cheap pre-check) --------------------------------
+
+    /// Helper: a redeem threshold of one thousand.
+    fn rt() -> U256 {
+        U256::from(1_000u64)
+    }
+
+    #[test]
+    fn skip_precheck_below_redeem_threshold_no_autosettle() {
+        // est_unredeemed = 900 - 0 = 900 < 1_000: skip.
+        let cfg = AutoSettleConfig::default();
+        assert!(can_skip_redeem_rpc(
+            U256::from(900u64),
+            U256::from(50u64),
+            U256::ZERO,
+            U256::ZERO,
+            rt(),
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn no_skip_at_or_above_redeem_threshold_no_autosettle() {
+        // est_unredeemed = 1_000 - 0 = 1_000, NOT < 1_000: must RPC.
+        let cfg = AutoSettleConfig::default();
+        assert!(!can_skip_redeem_rpc(
+            U256::from(1_000u64),
+            U256::from(50u64),
+            U256::ZERO,
+            U256::ZERO,
+            rt(),
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn skip_precheck_uses_cached_withdrawn_lower_bound() {
+        // last_amount 5_000, cached withdrawn 4_500 => est_unredeemed 500 < 1_000.
+        let cfg = AutoSettleConfig::default();
+        assert!(can_skip_redeem_rpc(
+            U256::from(5_000u64),
+            U256::from(50u64),
+            U256::from(4_500u64),
+            U256::from(40u64),
+            rt(),
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn value_only_autosettle_can_still_skip() {
+        // The regression the bots flagged: value-only auto-settle previously
+        // forced an RPC every tick. With a value threshold of 600 and
+        // est_unredeemed = 500, BOTH the redeem (1_000) and value (600) bounds
+        // are below threshold, so the channel still short-circuits.
+        let cfg = AutoSettleConfig {
+            value_threshold: Some(U256::from(600u64)),
+            voucher_nonce_span_threshold: None,
+        };
+        assert!(can_skip_redeem_rpc(
+            U256::from(5_000u64),
+            U256::from(50u64),
+            U256::from(4_500u64), // est_unredeemed = 500
+            U256::ZERO,
+            rt(),
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn value_only_autosettle_no_skip_when_value_threshold_crossable() {
+        // est_unredeemed = 700 is below the redeem threshold (1_000) but at/above
+        // the auto-settle value threshold (700): the value trigger could fire, so
+        // we must NOT skip even though the redeem path alone would.
+        let cfg = AutoSettleConfig {
+            value_threshold: Some(U256::from(700u64)),
+            voucher_nonce_span_threshold: None,
+        };
+        assert!(!can_skip_redeem_rpc(
+            U256::from(700u64),
+            U256::from(50u64),
+            U256::ZERO,
+            U256::ZERO,
+            rt(),
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn nonce_span_trigger_blocks_skip_until_cached_nonce_seeded() {
+        // span threshold 10. Cache miss => cached_nonce 0 => est span = last_nonce
+        // = 20 >= 10: cannot skip (must RPC to read claimedNonce), even though the
+        // value bound (est_unredeemed 100 < 1_000) alone would allow it.
+        let cfg = AutoSettleConfig {
+            value_threshold: None,
+            voucher_nonce_span_threshold: Some(10),
+        };
+        assert!(!can_skip_redeem_rpc(
+            U256::from(100u64),
+            U256::from(20u64),
+            U256::ZERO,
+            U256::ZERO,
+            rt(),
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn nonce_span_trigger_skips_once_cached_nonce_catches_up() {
+        // Same config, but the cache now holds claimedNonce 15 (seeded by a prior
+        // getChannel/withdraw). est span = 20 - 15 = 5 < 10 and est_unredeemed
+        // 100 < 1_000: skip.
+        let cfg = AutoSettleConfig {
+            value_threshold: None,
+            voucher_nonce_span_threshold: Some(10),
+        };
+        assert!(can_skip_redeem_rpc(
+            U256::from(100u64),
+            U256::from(20u64),
+            U256::ZERO,
+            U256::from(15u64),
+            rt(),
+            &cfg,
+        ));
+    }
+
+    #[test]
+    fn both_triggers_require_both_bounds_below() {
+        let cfg = AutoSettleConfig {
+            value_threshold: Some(U256::from(600u64)),
+            voucher_nonce_span_threshold: Some(10),
+        };
+        // Value bound below (500) but nonce span at threshold (10): no skip.
+        assert!(!can_skip_redeem_rpc(
+            U256::from(5_000u64),
+            U256::from(20u64),
+            U256::from(4_500u64), // est_unredeemed 500 < 600
+            U256::from(10u64),    // est span 10 >= 10
+            rt(),
+            &cfg,
+        ));
+        // Both below: skip.
+        assert!(can_skip_redeem_rpc(
+            U256::from(5_000u64),
+            U256::from(20u64),
+            U256::from(4_500u64), // est_unredeemed 500 < 600
+            U256::from(15u64),    // est span 5 < 10
+            rt(),
+            &cfg,
+        ));
     }
 }
