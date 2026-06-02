@@ -649,7 +649,7 @@ pub async fn run(
                 .blockchain
                 .settlement_auto_threshold_micro_usdc
                 .map(U256::from),
-            voucher_count_threshold: cfg.blockchain.settlement_auto_by_voucher_count,
+            voucher_nonce_span_threshold: cfg.blockchain.settlement_auto_by_voucher_nonce_span,
         },
         Arc::clone(&node_metrics),
     )
@@ -1871,7 +1871,7 @@ mod tests {
                 buyer_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
                 settlement_auto_threshold_micro_usdc: None,
-                settlement_auto_by_voucher_count: None,
+                settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },

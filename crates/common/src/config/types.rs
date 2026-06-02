@@ -111,14 +111,18 @@ pub struct BlockchainConfig {
     /// Absent => disabled (`None`): behavior is unchanged unless an operator
     /// opts in. A configured value of `0` is rejected at resolution.
     pub settlement_auto_threshold_micro_usdc: Option<u64>,
-    /// Optional voucher-count companion to
+    /// Optional nonce-span companion to
     /// [`Self::settlement_auto_threshold_micro_usdc`] (#742): close a channel
-    /// once it has accumulated at least this many un-redeemed vouchers (tracked
-    /// via the on-chain voucher nonce), independent of USDC value. Useful when
-    /// many small vouchers accrue without crossing the value threshold. Either
-    /// trigger firing closes the channel (logical OR). Absent => disabled
-    /// (`None`); a configured value of `0` is rejected at resolution.
-    pub settlement_auto_by_voucher_count: Option<u64>,
+    /// once its un-redeemed nonce span reaches at least this value, independent
+    /// of USDC value. The span is the off-chain latest voucher nonce minus the
+    /// on-chain `claimedNonce` — an UPPER BOUND on the un-redeemed voucher count,
+    /// NOT an exact count: voucher nonces may skip values (ADR 003 §Voucher Nonce
+    /// Convention), so a gapped stream reaches a given span with fewer vouchers
+    /// than the span implies. Useful when many small vouchers accrue without
+    /// crossing the value threshold. Either trigger firing closes the channel
+    /// (logical OR). Absent => disabled (`None`); a configured value of `0` is
+    /// rejected at resolution.
+    pub settlement_auto_by_voucher_nonce_span: Option<u64>,
 }
 
 /// Cache section of the config file.

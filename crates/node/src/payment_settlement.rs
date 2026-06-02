@@ -357,6 +357,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             contract.clone(),
             Arc::clone(&store),
             Arc::clone(&pending_store),
+            Arc::clone(&handler),
             self_address,
             redeem_threshold,
             auto_settle,
@@ -669,9 +670,13 @@ pub struct AutoSettleConfig {
     /// Outstanding (un-redeemed) value (`µUSDC`) at which to close. `None`
     /// disables the value trigger.
     pub value_threshold: Option<U256>,
-    /// Un-redeemed voucher count at which to close, tracked via the on-chain
-    /// voucher nonce. `None` disables the count trigger.
-    pub voucher_count_threshold: Option<u64>,
+    /// Un-redeemed nonce SPAN at which to close, derived as the off-chain latest
+    /// voucher nonce minus the on-chain `claimedNonce`. This is the nonce *span*,
+    /// an UPPER BOUND on the voucher count — voucher nonces may skip values (ADR
+    /// 003 §Voucher Nonce Convention; `ChannelState::apply_voucher` accepts a
+    /// `nonce > last_nonce` with a gap), so the span can exceed the number of
+    /// vouchers actually accepted. `None` disables the span trigger.
+    pub voucher_nonce_span_threshold: Option<u64>,
 }
 
 impl AutoSettleConfig {
@@ -679,30 +684,33 @@ impl AutoSettleConfig {
     /// redeemer skips the extra `getChannel`-driven close path entirely, so an
     /// opted-out node pays no per-channel cost.
     const fn is_enabled(&self) -> bool {
-        self.value_threshold.is_some() || self.voucher_count_threshold.is_some()
+        self.value_threshold.is_some() || self.voucher_nonce_span_threshold.is_some()
     }
 }
 
 /// Pure auto-settlement decision (#742): given a channel's un-redeemed value and
-/// voucher count, decide whether either configured trigger has fired. Returns
-/// `true` when the value crosses [`AutoSettleConfig::value_threshold`] **or** the
-/// count crosses [`AutoSettleConfig::voucher_count_threshold`] (logical OR — a
-/// burst of small vouchers can trip the count trigger without the value one, and
-/// a single large voucher the reverse). Both comparisons are `>=` so a channel
-/// sitting exactly at a threshold settles. A disabled (`None`) trigger never
-/// fires. Pure so the policy is unit-testable without a live provider.
+/// un-redeemed nonce span, decide whether either configured trigger has fired.
+/// Returns `true` when the value crosses [`AutoSettleConfig::value_threshold`]
+/// **or** the nonce span crosses
+/// [`AutoSettleConfig::voucher_nonce_span_threshold`] (logical OR — a burst of
+/// small vouchers can trip the span trigger without the value one, and a single
+/// large voucher the reverse). The nonce span is `last_nonce − claimedNonce`, an
+/// UPPER BOUND on the un-redeemed voucher count (nonces may skip values), not the
+/// exact count. Both comparisons are `>=` so a channel sitting exactly at a
+/// threshold settles. A disabled (`None`) trigger never fires. Pure so the policy
+/// is unit-testable without a live provider.
 fn should_auto_settle(
     cfg: &AutoSettleConfig,
     unredeemed_value: U256,
-    unredeemed_vouchers: u64,
+    unredeemed_nonce_span: u64,
 ) -> bool {
     if let Some(threshold) = cfg.value_threshold
         && unredeemed_value >= threshold
     {
         return true;
     }
-    if let Some(count) = cfg.voucher_count_threshold
-        && unredeemed_vouchers >= count
+    if let Some(span) = cfg.voucher_nonce_span_threshold
+        && unredeemed_nonce_span >= span
     {
         return true;
     }
@@ -1165,6 +1173,7 @@ async fn redeemer_loop<P: Provider + Clone>(
     contract: PaymentChannel::PaymentChannelInstance<P>,
     store: Arc<dyn ChannelStateStore>,
     pending_store: Arc<dyn PendingSettleStore>,
+    handler: Arc<ClientHandler>,
     self_address: Address,
     redeem_threshold: U256,
     auto_settle: AutoSettleConfig,
@@ -1188,8 +1197,9 @@ async fn redeemer_loop<P: Provider + Clone>(
             hint = redeem_rx.recv() => match hint {
                 Some(channel_id) => {
                     redeem_one(
-                        &contract, &store, &pending_store, self_address, redeem_threshold,
-                        auto_settle, channel_id, &mut withdrawn_cache, &metrics,
+                        &contract, &store, &pending_store, &handler, self_address,
+                        redeem_threshold, auto_settle, channel_id, &mut withdrawn_cache,
+                        &metrics,
                     )
                     .await;
                 }
@@ -1198,8 +1208,8 @@ async fn redeemer_loop<P: Provider + Clone>(
             },
             _ = ticker.tick() => {
                 redeem_sweep(
-                    &contract, &store, &pending_store, self_address, redeem_threshold,
-                    auto_settle, &mut withdrawn_cache, &metrics,
+                    &contract, &store, &pending_store, &handler, self_address,
+                    redeem_threshold, auto_settle, &mut withdrawn_cache, &metrics,
                 )
                 .await;
             }
@@ -1215,6 +1225,7 @@ async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn ChannelStateStore>,
     pending_store: &Arc<dyn PendingSettleStore>,
+    handler: &Arc<ClientHandler>,
     self_address: Address,
     redeem_threshold: U256,
     auto_settle: AutoSettleConfig,
@@ -1226,6 +1237,7 @@ async fn redeem_one<P: Provider + Clone>(
         contract,
         store,
         pending_store,
+        handler,
         self_address,
         redeem_threshold,
         auto_settle,
@@ -1260,6 +1272,7 @@ async fn redeem_sweep<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn ChannelStateStore>,
     pending_store: &Arc<dyn PendingSettleStore>,
+    handler: &Arc<ClientHandler>,
     self_address: Address,
     redeem_threshold: U256,
     auto_settle: AutoSettleConfig,
@@ -1278,6 +1291,7 @@ async fn redeem_sweep<P: Provider + Clone>(
             contract,
             store,
             pending_store,
+            handler,
             self_address,
             redeem_threshold,
             auto_settle,
@@ -1289,47 +1303,80 @@ async fn redeem_sweep<P: Provider + Clone>(
     }
 }
 
+/// The un-redeemed nonce SPAN driving the count trigger: the off-chain latest
+/// voucher nonce minus the on-chain `claimedNonce` (advanced by
+/// `withdraw`/`closeChannel`), saturating so a stale on-chain nonce never
+/// underflows and clamped to `u64::MAX` if it somehow exceeds `u64`. This is the
+/// nonce *span*, an UPPER BOUND on the un-redeemed voucher count — nonces may skip
+/// values (ADR 003 §Voucher Nonce Convention), so it is not the exact count. Pure
+/// so the derivation (incl. the saturating-to-zero stale-nonce case) is
+/// unit-testable.
+fn unredeemed_nonce_span(last_nonce: U256, claimed_nonce: U256) -> u64 {
+    last_nonce
+        .saturating_sub(claimed_nonce)
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 /// Evaluate the auto-settlement triggers (#742) for one channel and, if either
 /// fired, `closeChannel` to secure the balance on-chain. Returns `true` iff a
 /// close transaction landed — the caller then skips the `withdraw` path (the
-/// channel is now `Closing`). A disabled config, a sub-threshold balance, an
-/// absent signature, or a failed send/revert all return `false`, leaving the
-/// redeem path to run as before.
+/// channel is now `Closing`). A disabled config, a sub-threshold balance, or an
+/// absent signature return `false` without firing, leaving the redeem path to run
+/// as before; a FAILED close (send returned `None`, or the receipt
+/// reverted/errored) also returns `false` but bumps `settlement_auto_failures`
+/// first so the silent-failure of a revenue-protection feature is observable.
 ///
-/// Un-redeemed voucher count is the off-chain latest nonce minus the on-chain
-/// `claimedNonce` (advanced by `withdraw`/`closeChannel`), saturating so a stale
-/// nonce never underflows and clamped to `u64::MAX` if it somehow exceeds `u64`.
+/// On a landed close the channel is **retired** from the handler (mirroring the
+/// expiry-close path in [`try_close_for_expiry`]): the channel is now `Closing`,
+/// so `withdraw`/`closeChannel` revert against it and any further bytes served
+/// would be unredeemable. The `ChannelCloseInitiated` watcher arm is observe-only
+/// (#324 deferred), so without this forget the node would keep accepting vouchers
+/// against a channel it can no longer redeem until the eventual `ChannelSettled`.
 /// `send_close` records the durable pending-settle entry so the sweep finalizes
 /// the provider's remainder after the dispute window.
+#[allow(clippy::too_many_arguments)]
 async fn try_auto_settle_close<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     pending_store: &Arc<dyn PendingSettleStore>,
+    handler: &Arc<ClientHandler>,
     auto_settle: &AutoSettleConfig,
     st: &ChannelState,
     claimed_nonce: U256,
     unredeemed: U256,
     metrics: &Arc<Metrics>,
 ) -> bool {
-    let unredeemed_vouchers = st
-        .last_nonce()
-        .saturating_sub(claimed_nonce)
-        .try_into()
-        .unwrap_or(u64::MAX);
-    if !should_auto_settle(auto_settle, unredeemed, unredeemed_vouchers) {
+    let nonce_span = unredeemed_nonce_span(st.last_nonce(), claimed_nonce);
+    if !should_auto_settle(auto_settle, unredeemed, nonce_span) {
         return false;
     }
     let Some(fut) = send_close(contract, pending_store, st).await else {
+        // Trigger fired but the `closeChannel` submit failed — the at-risk
+        // balance is NOT secured. Surface it (the success counter alone can't
+        // distinguish "never crossed" from "crossed and every close failing").
+        metrics.settlement_auto_failure();
         return false;
     };
     if !fut.await {
+        // Trigger fired and the close was submitted, but the receipt reverted
+        // or errored — same unsecured outcome, same signal.
+        metrics.settlement_auto_failure();
         return false;
+    }
+    // The claim is now secured by the close (settles after the dispute window).
+    // Retire the channel — drop it from the handler so we stop serving a channel
+    // we can no longer redeem against (mirrors `try_close_for_expiry`). Count the
+    // success / log only after the forget so the metric reflects a fully-retired
+    // close, not just a landed tx.
+    if let Err(err) = handler.forget_channel(st.channel_id).await {
+        warn!(%err, channel_id = %st.channel_id, "auto-settle: forget after close failed");
     }
     metrics.settlement_auto_triggered();
     info!(
         channel_id = %st.channel_id,
         unredeemed = %unredeemed,
-        unredeemed_vouchers,
-        "auto-settlement trigger fired; closed channel to secure balance (#742)"
+        nonce_span,
+        "auto-settlement trigger fired; closed + retired channel to secure balance (#742)"
     );
     true
 }
@@ -1347,6 +1394,7 @@ async fn try_redeem<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn ChannelStateStore>,
     pending_store: &Arc<dyn PendingSettleStore>,
+    handler: &Arc<ClientHandler>,
     self_address: Address,
     redeem_threshold: U256,
     auto_settle: AutoSettleConfig,
@@ -1403,6 +1451,7 @@ async fn try_redeem<P: Provider + Clone>(
     if try_auto_settle_close(
         contract,
         pending_store,
+        handler,
         &auto_settle,
         &st,
         ch.claimedNonce,
@@ -1973,28 +2022,28 @@ mod tests {
     fn auto_settle_value_threshold_boundary() {
         let cfg = AutoSettleConfig {
             value_threshold: Some(U256::from(1_000_000u64)),
-            voucher_count_threshold: None,
+            voucher_nonce_span_threshold: None,
         };
         assert!(cfg.is_enabled());
         // Strictly below the threshold: does not fire.
         assert!(!should_auto_settle(&cfg, U256::from(999_999u64), 9_999));
         // Exactly at the threshold settles (>= comparison).
         assert!(should_auto_settle(&cfg, U256::from(1_000_000u64), 0));
-        // Above the threshold settles; voucher count is ignored when its
+        // Above the threshold settles; nonce span is ignored when its
         // trigger is disabled.
         assert!(should_auto_settle(&cfg, U256::from(5_000_000u64), 0));
     }
 
     #[test]
-    fn auto_settle_voucher_count_threshold_boundary() {
+    fn auto_settle_voucher_nonce_span_threshold_boundary() {
         let cfg = AutoSettleConfig {
             value_threshold: None,
-            voucher_count_threshold: Some(100),
+            voucher_nonce_span_threshold: Some(100),
         };
         assert!(cfg.is_enabled());
-        // A large value never fires when only the count trigger is set.
+        // A large value never fires when only the nonce-span trigger is set.
         assert!(!should_auto_settle(&cfg, U256::from(u64::MAX), 99));
-        // Exactly at the count threshold settles (>= comparison).
+        // Exactly at the span threshold settles (>= comparison).
         assert!(should_auto_settle(&cfg, U256::ZERO, 100));
         assert!(should_auto_settle(&cfg, U256::ZERO, 101));
     }
@@ -2004,15 +2053,42 @@ mod tests {
         // Both set: a logical OR — either crossing fires.
         let cfg = AutoSettleConfig {
             value_threshold: Some(U256::from(1_000_000u64)),
-            voucher_count_threshold: Some(100),
+            voucher_nonce_span_threshold: Some(100),
         };
         // Neither crossed.
         assert!(!should_auto_settle(&cfg, U256::from(500_000u64), 50));
         // Only the value crossed.
         assert!(should_auto_settle(&cfg, U256::from(1_000_000u64), 50));
-        // Only the count crossed.
+        // Only the nonce span crossed.
         assert!(should_auto_settle(&cfg, U256::from(500_000u64), 100));
         // Both crossed.
         assert!(should_auto_settle(&cfg, U256::from(2_000_000u64), 200));
+    }
+
+    #[test]
+    fn unredeemed_nonce_span_derivation() {
+        // The span feeding the count trigger is `last_nonce − claimedNonce`
+        // (an UPPER BOUND on the voucher count, since nonces may skip values),
+        // saturating to zero on a stale on-chain nonce and clamping to
+        // `u64::MAX` past the `u64` range.
+        // Normal case: off-chain latest ahead of on-chain claimed.
+        assert_eq!(
+            unredeemed_nonce_span(U256::from(42u64), U256::from(7u64)),
+            35
+        );
+        // Exactly caught up: span is zero (nothing un-redeemed).
+        assert_eq!(unredeemed_nonce_span(U256::from(9u64), U256::from(9u64)), 0);
+        // Stale on-chain nonce ABOVE the off-chain latest (e.g. a concurrent
+        // close advanced claimedNonce past our cached voucher): saturating
+        // subtraction yields zero, never an underflow.
+        assert_eq!(
+            unredeemed_nonce_span(U256::from(3u64), U256::from(10u64)),
+            0
+        );
+        // A span exceeding u64 clamps rather than truncating.
+        assert_eq!(
+            unredeemed_nonce_span(U256::from(u64::MAX) + U256::from(5u64), U256::ZERO),
+            u64::MAX
+        );
     }
 }

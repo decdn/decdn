@@ -727,7 +727,7 @@ fn resolve_blockchain_into(
     // Auto-settlement triggers (#742). Both default to disabled (`None`) so
     // behavior is unchanged unless an operator opts in. A configured `0` is an
     // operator mistake: a 0 µUSDC value threshold would close on the first
-    // voucher, and a 0 voucher-count threshold would close before any voucher
+    // voucher, and a 0 nonce-span threshold would close before any voucher
     // accrues — both burn gas on a guaranteed dust/no-op close. Reject either.
     let settlement_auto_threshold_micro_usdc =
         file.and_then(|b| b.settlement_auto_threshold_micro_usdc);
@@ -741,14 +741,15 @@ fn resolve_blockchain_into(
                 .to_string()
         },
     );
-    let settlement_auto_by_voucher_count = file.and_then(|b| b.settlement_auto_by_voucher_count);
+    let settlement_auto_by_voucher_nonce_span =
+        file.and_then(|b| b.settlement_auto_by_voucher_nonce_span);
     bag.check_with(
-        settlement_auto_by_voucher_count != Some(0),
-        "blockchain.settlement_auto_by_voucher_count",
+        settlement_auto_by_voucher_nonce_span != Some(0),
+        "blockchain.settlement_auto_by_voucher_nonce_span",
         || {
-            "blockchain.settlement_auto_by_voucher_count must be > 0 when set \
-             (a 0 count closes the channel before any voucher accrues); omit the key \
-             to disable the voucher-count trigger"
+            "blockchain.settlement_auto_by_voucher_nonce_span must be > 0 when set \
+             (a 0 span closes the channel before any voucher accrues); omit the key \
+             to disable the voucher-nonce-span trigger"
                 .to_string()
         },
     );
@@ -773,7 +774,7 @@ fn resolve_blockchain_into(
         buyer_deposit_micro_usdc,
         buyer_max_approve,
         settlement_auto_threshold_micro_usdc,
-        settlement_auto_by_voucher_count,
+        settlement_auto_by_voucher_nonce_span,
     }
 }
 
@@ -5857,7 +5858,7 @@ mod tests {
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_count: None,
+            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5887,7 +5888,7 @@ mod tests {
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_count: None,
+            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6088,7 +6089,7 @@ mod tests {
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_count: None,
+            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6126,7 +6127,7 @@ mod tests {
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_count: None,
+            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6163,7 +6164,7 @@ mod tests {
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: Some(0),
-            settlement_auto_by_voucher_count: None,
+            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6179,7 +6180,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_blockchain_rejects_zero_auto_settlement_voucher_count() -> anyhow::Result<()> {
+    fn resolve_blockchain_rejects_zero_auto_settlement_voucher_nonce_span() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             rpc_url: Some("https://example/rpc".to_string()),
@@ -6200,16 +6201,16 @@ mod tests {
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_count: Some(0),
+            settlement_auto_by_voucher_nonce_span: Some(0),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
-            anyhow::bail!("expected error when auto-settlement voucher count is 0");
+            anyhow::bail!("expected error when auto-settlement voucher nonce span is 0");
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("settlement_auto_by_voucher_count"),
+            msg.contains("settlement_auto_by_voucher_nonce_span"),
             "error should name the field: {msg}"
         );
         Ok(())
@@ -6231,7 +6232,7 @@ mod tests {
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
         assert_eq!(resolved.settlement_auto_threshold_micro_usdc, None);
-        assert_eq!(resolved.settlement_auto_by_voucher_count, None);
+        assert_eq!(resolved.settlement_auto_by_voucher_nonce_span, None);
         Ok(())
     }
 
@@ -6257,7 +6258,7 @@ mod tests {
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: Some(50_000_000),
-            settlement_auto_by_voucher_count: Some(1_000),
+            settlement_auto_by_voucher_nonce_span: Some(1_000),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6266,7 +6267,7 @@ mod tests {
             resolved.settlement_auto_threshold_micro_usdc,
             Some(50_000_000)
         );
-        assert_eq!(resolved.settlement_auto_by_voucher_count, Some(1_000));
+        assert_eq!(resolved.settlement_auto_by_voucher_nonce_span, Some(1_000));
         Ok(())
     }
 
@@ -6293,7 +6294,7 @@ mod tests {
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_count: None,
+            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6324,7 +6325,7 @@ mod tests {
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_count: None,
+            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
