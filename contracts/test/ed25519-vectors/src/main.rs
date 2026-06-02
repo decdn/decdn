@@ -175,6 +175,11 @@ fn emit_register_node_vector() {
     );
     println!("    uint256 internal constant REG_CHAIN_ID = {CHAIN_ID};");
     println!(
+        "    // Real ed25519 signature over the digest above; never hand-edit. Regenerate"
+    );
+    println!("    // the whole block with `cargo run` (see README) — a tweaked value fails");
+    println!("    // verify_strict, so registerNode would revert InvalidEd25519Signature.");
+    println!(
         "    bytes internal constant REG_ED25519_SIG = hex\"{}\";",
         h(&sig.to_bytes())
     );
