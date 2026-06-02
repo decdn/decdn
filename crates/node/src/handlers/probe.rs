@@ -1,5 +1,6 @@
 //! `cdn/probe/v1` handler — unauthenticated latency + rate probe.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -17,6 +18,8 @@ use iroh::PublicKey;
 use iroh::endpoint::{Accepting, Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
+use crate::dht::routing::NodeId;
+use crate::dht::staker_set::StakerSet;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 
@@ -45,6 +48,70 @@ const APP_ERR_NO_ERROR: u32 = 0x00;
 const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
 const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
 const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
+
+/// Stake-lane probe-acceptance policy (#757, ADR 003 §Admission and
+/// Priority). Reserves probe-hold headroom for stake-lane requesters —
+/// registered operators issuing node-to-node cache-miss probes — so
+/// end-client probe load cannot starve them under hold-budget pressure.
+///
+/// "Stake lane" is the `CapacityBond.isActive` predicate (registered + bond
+/// ≥ minBond + not unbonding + not ejected), resolved from the same
+/// chain-followed [`StakerSet`] the DHT handler consumes — no per-probe
+/// chain read and no new chain wiring (the issue's constraint). It is a
+/// faithful binary reading of ADR 003's `bondOf >= bond_required(...)`
+/// prioritization; finer capacity-scaled bond tiering is out of scope.
+///
+/// Construction is gated by the operator: the runtime only builds this when
+/// `cache.stake_lane_reserved_holds > 0`, so a single-lane deployment passes
+/// `None` and the handler's hot path is unchanged.
+#[derive(Clone)]
+pub struct StakeLanePolicy {
+    /// Chain-followed active-staker set, keyed by iroh `NodeId`. The probe
+    /// requester's id (`conn.remote_id()`) is looked up directly — the
+    /// `CapacityBond` holds the NodeId↔operator binding, so a `true` here
+    /// means the requester is a registered, sufficiently-bonded operator.
+    staker_set: Arc<dyn StakerSet>,
+    /// Number of hold slots reserved for the stake lane. End-client probes
+    /// are shed once `probe_hold_slots_used >= max_holds.saturating_sub(reserved_holds)`
+    /// (the `saturating_sub` makes `reserved_holds >= max_holds` clamp the
+    /// end-client ceiling to `0`, i.e. "stake lane only"). Typed
+    /// [`NonZeroUsize`] so the "reservation off" case is *unrepresentable*
+    /// here — it is encoded as `None` at the call site — rather than relying
+    /// on a documented `> 0` convention.
+    reserved_holds: NonZeroUsize,
+    /// The configured `max_probe_holds` budget — the ceiling the reservation
+    /// is subtracted from. Carried here (rather than re-read from the cache)
+    /// because `max_probe_holds` is restart-required, so the value is stable
+    /// for the handler's lifetime.
+    max_holds: usize,
+}
+
+impl std::fmt::Debug for StakeLanePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StakeLanePolicy")
+            .field("reserved_holds", &self.reserved_holds)
+            .field("max_holds", &self.max_holds)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StakeLanePolicy {
+    /// Build a policy. `reserved_holds` is [`NonZeroUsize`] so the "off" case
+    /// (a zero reservation) cannot be constructed — callers encode it as
+    /// `None`. `max_holds` is the configured `max_probe_holds`.
+    #[must_use]
+    pub fn new(
+        staker_set: Arc<dyn StakerSet>,
+        reserved_holds: NonZeroUsize,
+        max_holds: usize,
+    ) -> Self {
+        Self {
+            staker_set,
+            reserved_holds,
+            max_holds,
+        }
+    }
+}
 
 /// Serves `cdn/probe/v1`: reads a framed [`ProbeMessage::Request`], writes a
 /// framed [`ProbeMessage::Response`].
@@ -81,6 +148,11 @@ pub struct ProbeHandler {
     /// when off) — not by this handler refusing 0-RTT; see the
     /// `on_accepting` doc and ADR 015 §"Replay Safety Is Client-Side".
     enable_0rtt: bool,
+    /// Optional stake-lane probe-acceptance reservation (#757). `None` (the
+    /// single-lane default) makes the hold-admission path identical to
+    /// pre-#757 behaviour; `Some` reserves hold headroom for registered
+    /// node-to-node requesters under budget pressure.
+    stake_lane: Option<StakeLanePolicy>,
 }
 
 impl std::fmt::Debug for ProbeHandler {
@@ -111,6 +183,7 @@ impl ProbeHandler {
         delivery_floor: u64,
         delivery_ceiling: u64,
         enable_0rtt: bool,
+        stake_lane: Option<StakeLanePolicy>,
     ) -> Self {
         Self {
             node_id,
@@ -123,6 +196,7 @@ impl ProbeHandler {
             delivery_floor,
             delivery_ceiling,
             enable_0rtt,
+            stake_lane,
         }
     }
 
@@ -187,6 +261,30 @@ impl ProbeHandler {
 
         let hash = Hash::from_bytes(req.hash);
 
+        // Stake-lane probe-acceptance reservation (#757, ADR 003 §Admission
+        // and Priority). Under hold-budget pressure, reserve the last
+        // `reserved_holds` slots for stake-lane requesters (registered
+        // operators issuing node-to-node cache-miss probes) so end-client
+        // load cannot starve them. Evaluated *before* `try_probe_hold` and
+        // gated by `self.stake_lane`, so it is a strict no-op for
+        // single-lane operators (the `None` default). Soft and best-effort:
+        // the slots-used read races a concurrent hold, which is acceptable
+        // for a priority heuristic (admission is implementation-defined per
+        // ADR 003) and never a safety property.
+        let stake_lane_reserved = match self.stake_lane.as_ref() {
+            Some(policy) => {
+                let requester = NodeId::from_bytes(*conn.remote_id().as_bytes());
+                let is_stake_lane = policy.staker_set.is_active(&requester);
+                stake_lane_reserved_out(
+                    is_stake_lane,
+                    policy.reserved_holds.get(),
+                    policy.max_holds,
+                    self.cache.probe_hold_slots_used(),
+                )
+            }
+            None => false,
+        };
+
         // Probe-triggered eviction hold (ADR 005 §Probe-triggered eviction
         // hold). Only `Held` permits signing `has_blob: true` — the blob is
         // present, not operator-evicted, and a 35s hold is guaranteed. The
@@ -195,60 +293,75 @@ impl ProbeHandler {
         // cache lookup is needed. The hold is taken *after* the rate limiter
         // (ADR 005 §Probe rate limiting: hold admission occurs only after the
         // limiter passes — do not reorder).
-        let (has_blob, total_bytes) = match self.cache.try_probe_hold(hash).await {
-            Ok(ProbeHoldOutcome::Held) => {
-                let size = self
-                    .cache
-                    .inspect(hash)
-                    .await
-                    .ok()
-                    .and_then(|p| p.size_bytes);
-                (true, size)
-            }
-            Ok(ProbeHoldOutcome::BudgetExhausted) => {
-                // Present but un-holdable because every hold slot is live: an
-                // availability degradation under genuine load, never a safety
-                // fault (ADR 005 §Hold budget). The actionable remedy is to
-                // raise `max_probe_holds`, so this is the counter that drives
-                // that alert (#739).
-                self.metrics.probe_hold_violation();
-                // Don't log `probe_hold_slots_used()` here: it re-acquires the
-                // `probe_holds` lock and sweeps, and on this hot refusal path
-                // the value is a foregone ~`max` anyway. The gauge is published
-                // once per probe below.
-                tracing::debug!(
-                    hash = %hash,
-                    "probe hold refused: budget exhausted; signing has_blob:false"
-                );
-                (false, None)
-            }
-            Ok(ProbeHoldOutcome::HoldsDisabled) => {
-                // Present but un-holdable because holds are disabled by config
-                // (`max_probe_holds == 0`). Counted separately from budget
-                // pressure (#739) so an intentional disable does not trip the
-                // "increase max_probe_holds" alert.
-                self.metrics.probe_holds_disabled();
-                tracing::debug!(
-                    hash = %hash,
-                    "probe hold refused: holds disabled (max_probe_holds=0); signing has_blob:false"
-                );
-                (false, None)
-            }
-            // Blob genuinely absent or operator-evicted — a true negative,
-            // no signal needed.
-            Ok(ProbeHoldOutcome::Unavailable) => (false, None),
-            // A transient cache fault is *not* the same as "absent": the
-            // node may actually hold the blob. We still conservatively
-            // answer `has_blob: false` (never risk a phantom slash, ADR
-            // 005), but a degrading backend must be operator-visible rather
-            // than indistinguishable from a normal miss. The registry has
-            // no metric for this; a warn log is the actionable signal.
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "cache error during probe hold check; answering has_blob:false"
-                );
-                (false, None)
+        let (has_blob, total_bytes) = if stake_lane_reserved {
+            // End-client probe shed to protect stake-lane headroom. Sign
+            // `has_blob: false` (the blob may be present, but a
+            // non-guaranteed hold must never risk a phantom slash — ADR
+            // 005) and count the reservation distinctly from genuine
+            // budget exhaustion / config disable (#757).
+            self.metrics.probe_stake_lane_reserved();
+            tracing::debug!(
+                hash = %hash,
+                "probe hold refused: stake-lane reservation (end-client under \
+                 budget pressure); signing has_blob:false"
+            );
+            (false, None)
+        } else {
+            match self.cache.try_probe_hold(hash).await {
+                Ok(ProbeHoldOutcome::Held) => {
+                    let size = self
+                        .cache
+                        .inspect(hash)
+                        .await
+                        .ok()
+                        .and_then(|p| p.size_bytes);
+                    (true, size)
+                }
+                Ok(ProbeHoldOutcome::BudgetExhausted) => {
+                    // Present but un-holdable because every hold slot is live: an
+                    // availability degradation under genuine load, never a safety
+                    // fault (ADR 005 §Hold budget). The actionable remedy is to
+                    // raise `max_probe_holds`, so this is the counter that drives
+                    // that alert (#739).
+                    self.metrics.probe_hold_violation();
+                    // Don't log `probe_hold_slots_used()` here: it re-acquires the
+                    // `probe_holds` lock and sweeps, and on this hot refusal path
+                    // the value is a foregone ~`max` anyway. The gauge is published
+                    // once per probe below.
+                    tracing::debug!(
+                        hash = %hash,
+                        "probe hold refused: budget exhausted; signing has_blob:false"
+                    );
+                    (false, None)
+                }
+                Ok(ProbeHoldOutcome::HoldsDisabled) => {
+                    // Present but un-holdable because holds are disabled by config
+                    // (`max_probe_holds == 0`). Counted separately from budget
+                    // pressure (#739) so an intentional disable does not trip the
+                    // "increase max_probe_holds" alert.
+                    self.metrics.probe_holds_disabled();
+                    tracing::debug!(
+                        hash = %hash,
+                        "probe hold refused: holds disabled (max_probe_holds=0); signing has_blob:false"
+                    );
+                    (false, None)
+                }
+                // Blob genuinely absent or operator-evicted — a true negative,
+                // no signal needed.
+                Ok(ProbeHoldOutcome::Unavailable) => (false, None),
+                // A transient cache fault is *not* the same as "absent": the
+                // node may actually hold the blob. We still conservatively
+                // answer `has_blob: false` (never risk a phantom slash, ADR
+                // 005), but a degrading backend must be operator-visible rather
+                // than indistinguishable from a normal miss. The registry has
+                // no metric for this; a warn log is the actionable signal.
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cache error during probe hold check; answering has_blob:false"
+                    );
+                    (false, None)
+                }
             }
         };
         self.metrics
@@ -408,6 +521,36 @@ const fn frame_err_code(e: &FrameError) -> u32 {
     }
 }
 
+/// Decide whether an end-client (non-stake-lane) probe should be refused a
+/// probe hold to preserve reserved headroom for stake-lane requesters —
+/// registered operators issuing node-to-node cache-miss probes (#757, ADR
+/// 003 §Admission and Priority).
+///
+/// Returns `true` only when ALL of: the requester is **not** in the stake
+/// lane, a reservation is configured (`reserved > 0`), holds are enabled
+/// (`max_holds > 0`), and current hold usage has reached the end-client
+/// ceiling (`slots_used >= max_holds - reserved`). The last `reserved`
+/// slots are thereby kept available for the stake lane.
+///
+/// `reserved == 0` is the default and makes this an unconditional no-op so
+/// single-lane operators are unaffected. The `max_holds == 0` short-circuit
+/// keeps an intentional holds-disabled config (which `try_probe_hold` maps
+/// to [`ProbeHoldOutcome::HoldsDisabled`]) from being mis-attributed to a
+/// reservation refusal.
+///
+/// This is a **soft, best-effort** gate: `slots_used` is sampled before the
+/// atomic `try_probe_hold`, so a concurrent hold may still cross the
+/// boundary. That is acceptable for a priority heuristic — it is never a
+/// safety property (ADR 003 frames admission as implementation-defined).
+const fn stake_lane_reserved_out(
+    stake_lane: bool,
+    reserved: usize,
+    max_holds: usize,
+    slots_used: usize,
+) -> bool {
+    !stake_lane && reserved > 0 && max_holds > 0 && slots_used >= max_holds.saturating_sub(reserved)
+}
+
 /// Error from the probe-request read path carrying the ADR 013 app error
 /// code the handler should propagate to the peer.
 struct ProbeReadError {
@@ -487,5 +630,59 @@ async fn read_probe_request(
                 app_code: APP_ERR_UNSUPPORTED_MESSAGE,
             })
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::stake_lane_reserved_out;
+
+    /// With no reservation configured (`reserved == 0`) the gate is a
+    /// no-op: even a non-stake requester at a full hold budget is never
+    /// reserved out. This is the default-off invariant — single-lane
+    /// operators must be entirely unaffected (#757).
+    #[test]
+    fn no_reservation_never_reserves_out() {
+        assert!(!stake_lane_reserved_out(false, 0, 256, 256));
+        assert!(!stake_lane_reserved_out(false, 0, 256, 0));
+    }
+
+    /// A stake-lane (registered-operator) requester is never reserved out,
+    /// even with the budget fully consumed — the reservation exists to
+    /// protect exactly these node-to-node cache-miss probes.
+    #[test]
+    fn stake_lane_requester_never_reserved_out() {
+        assert!(!stake_lane_reserved_out(true, 8, 256, 256));
+        assert!(!stake_lane_reserved_out(true, 8, 256, 255));
+    }
+
+    /// An end-client probe is admitted while hold usage is below the
+    /// end-client ceiling (`max_holds - reserved`) and refused once usage
+    /// reaches it, reserving the last `reserved` slots for the stake lane.
+    #[test]
+    fn end_client_refused_at_reserved_ceiling() {
+        // reserved=8, max=256 => end-client ceiling is 248.
+        assert!(!stake_lane_reserved_out(false, 8, 256, 247));
+        assert!(stake_lane_reserved_out(false, 8, 256, 248));
+        assert!(stake_lane_reserved_out(false, 8, 256, 256));
+    }
+
+    /// Holds disabled (`max_holds == 0`) short-circuits to `false` so the
+    /// reservation gate never pre-empts the `HoldsDisabled` outcome — the
+    /// `saturating_sub` would otherwise yield a `0` ceiling and refuse
+    /// every end-client, mis-attributing an intentional disable.
+    #[test]
+    fn holds_disabled_is_not_a_reservation_refusal() {
+        assert!(!stake_lane_reserved_out(false, 8, 0, 0));
+    }
+
+    /// Reserving the entire budget (`reserved >= max_holds`) yields a `0`
+    /// ceiling: every end-client probe is reserved out whenever holds are
+    /// enabled. An aggressive but valid "stake lane only" configuration.
+    #[test]
+    fn reserving_full_budget_excludes_all_end_clients() {
+        assert!(stake_lane_reserved_out(false, 256, 256, 0));
+        assert!(stake_lane_reserved_out(false, 512, 256, 0));
     }
 }

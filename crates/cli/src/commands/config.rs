@@ -213,6 +213,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # max_blob_size_mb = 1024
 # gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518)
 # max_probe_holds = 256                    # probe eviction-hold budget (ADR 005 §Hold budget); 0 disables has_blob:true
+# stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
 
 [payment]
 # rate_per_mb = 10

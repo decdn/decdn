@@ -129,6 +129,12 @@ pub struct ResolvedCache {
     /// [`crate::config::DEFAULT_MAX_PROBE_HOLDS`]; `0` disables
     /// `has_blob: true`.
     pub max_probe_holds: usize,
+    /// Probe-hold slots reserved for the stake lane (registered node-to-node
+    /// requesters) under hold-budget pressure (#757, ADR 003 §Admission and
+    /// Priority). Default `0` disables the reservation (single-lane node).
+    /// The runtime only builds a `StakeLanePolicy` when this is `> 0`, so the
+    /// probe handler's hot path is unchanged for the default.
+    pub stake_lane_reserved_holds: usize,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors

@@ -131,6 +131,23 @@ pub struct DecdnMetrics {
     /// deliberately off. Field has no `_total` suffix because the
     /// `OpenMetrics` encoder appends it.
     pub probe_holds_disabled: Counter,
+    /// `decdn_probe_stake_lane_reserved_total` (#757): an end-client probe
+    /// (a requester that is *not* a registered operator) answered
+    /// `has_blob: false` because the hold budget had reached the end-client
+    /// ceiling (`max_probe_holds - cache.stake_lane_reserved_holds`),
+    /// reserving the remaining slots for stake-lane (node-to-node
+    /// cache-miss) probes per ADR 003 §Admission and Priority. Unlike the
+    /// two counters below, this fires *before* `try_probe_hold`, so the
+    /// cache is **not consulted** — the blob may or may not be present; the
+    /// reservation is a content-independent admission decision. Distinct
+    /// from `probe_hold_violations` (genuine exhaustion of the *whole*
+    /// budget, checked after a confirmed-present blob) and
+    /// `probe_holds_disabled` (`max_probe_holds == 0`): this is a deliberate
+    /// priority decision, not budget pressure or a disable, so it must not
+    /// trip either of those counters' alerts. Zero whenever the reservation
+    /// is unconfigured (`stake_lane_reserved_holds == 0`). Field has no
+    /// `_total` suffix because the `OpenMetrics` encoder appends it.
+    pub probe_stake_lane_reserved: Counter,
     /// `decdn_probe_hold_slots_used` (registry): current active
     /// probe-triggered eviction holds (distinct held blobs), ADR 005
     /// §Probe-triggered eviction hold. Sampled from the cache engine on
@@ -343,6 +360,15 @@ impl Metrics {
     /// §Hold budget).
     pub fn probe_holds_disabled(&self) {
         self.decdn.probe_holds_disabled.inc();
+    }
+
+    /// An end-client probe answered `has_blob: false` because the hold
+    /// budget reached the stake-lane-reserved end-client ceiling, before any
+    /// cache lookup (#757, ADR 003 §Admission and Priority). A deliberate,
+    /// content-independent priority decision — not budget pressure or a
+    /// config disable.
+    pub fn probe_stake_lane_reserved(&self) {
+        self.decdn.probe_stake_lane_reserved.inc();
     }
 
     /// Publish the current count of active probe holds (ADR 005).
