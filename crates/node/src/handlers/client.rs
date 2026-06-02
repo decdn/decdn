@@ -775,6 +775,16 @@ impl ClientHandler {
     /// the client. The `voucher_nonce` is rendered as a decimal `uint256` from
     /// the big-endian wire nonce; `client_node_id` is the iroh node id of the
     /// paying peer; `delta_bytes` is the bytes this voucher covers.
+    ///
+    /// The append is `write_all` + `flush` with **no fsync** (see the
+    /// [`crate::receipt_log`] durability note) under a sync `Mutex`, bounded to
+    /// roughly one call per voucher interval (~1 MiB). It is run inline rather
+    /// than offloaded to [`tokio::task::spawn_blocking`]: a fire-and-forget
+    /// offload would let the audit tail be dropped on runtime shutdown and
+    /// reorder receipts relative to voucher acceptance, while awaiting an offload
+    /// would only move (not remove) the same single write and add a task hop per
+    /// interval. At testnet scale the no-fsync write is cheap enough to keep here
+    /// (CLAUDE.md / ADR 003), so recording stays synchronous with acceptance.
     fn record_receipt(
         &self,
         hash: Hash,

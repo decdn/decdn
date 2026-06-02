@@ -131,9 +131,19 @@ pub struct VecReceiptLog {
 
 impl VecReceiptLog {
     /// Snapshot the receipts appended so far.
+    ///
+    /// Recovers the inner `Vec` even if the mutex was poisoned by a panic on
+    /// another thread (`PoisonError::into_inner`), so a failing assertion still
+    /// sees the receipts actually collected rather than a misleading empty list.
+    /// The anti-panic policy rules out `unwrap`/`expect` here, and silently
+    /// defaulting to empty (the prior `unwrap_or_default`) would mask the real
+    /// failure cause in a test double.
     #[must_use]
     pub fn snapshot(&self) -> Vec<DownloadReceipt> {
-        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 

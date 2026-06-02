@@ -172,18 +172,13 @@ impl DownloadReceipt {
     }
 }
 
-/// Lower-hex encode a 32-byte array without a `0x` prefix. Local helper so the
-/// receipt log carries no extra dependency just for hex.
+/// Lower-hex encode a 32-byte array without a `0x` prefix. Delegates to
+/// `alloy::primitives::hex::encode` (the `const-hex` re-export already pulled in
+/// via the `alloy` dependency), which emits lowercase with no `0x` prefix —
+/// byte-identical to the prior hand-rolled `{:02x}` loop, and locked against
+/// drift by the `serialized_line_is_wire_stable` test.
 fn hex_lower(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        // Writing to a `String` is infallible; the `let _ =` documents that we
-        // deliberately ignore the always-`Ok` `fmt::Result` (anti-panic policy:
-        // no `unwrap`).
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    alloy::primitives::hex::encode(bytes)
 }
 
 /// Append-only sink for [`DownloadReceipt`]s.
