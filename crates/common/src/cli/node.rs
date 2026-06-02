@@ -44,6 +44,16 @@ pub enum NodeCommand {
     /// routing-table degradation without scraping Prometheus or reading
     /// logs.
     Status(StatusArgs),
+    /// Print a live snapshot of the running node's open payment channels
+    /// via `admin_v1_channels` (issue #749): per channel the last-accepted
+    /// nonce, outstanding accrued claim (micro-USDC), escrowed deposit,
+    /// time since the last voucher, and whether the accrued claim has
+    /// reached the configured redemption threshold. Lets operators spot
+    /// channels approaching settlement, stale channels, or unusually high
+    /// outstanding balances before they become a liquidity risk — without
+    /// scraping metrics or reading logs. Same admin-URL resolution and
+    /// timeout semantics as `decdn node health`.
+    Channels(ChannelsArgs),
     /// Forcibly remove a single blob from the local cache (issue #279).
     /// Useful for DMCA takedown, corruption recovery, and storage
     /// reclamation.
@@ -150,6 +160,38 @@ pub struct StatusArgs {
 
     /// Emit the admin response body as JSON instead of the human-readable
     /// summary + bucket table.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node channels` — list open payment channels via
+/// `admin_v1_channels` (issue #749). Same admin-URL resolution and
+/// timeout semantics as `decdn node health`.
+#[derive(Args, Debug)]
+pub struct ChannelsArgs {
+    /// Base URL of the node's admin HTTP surface.
+    ///
+    /// Also read from `DECDN_ADMIN_URL` when unset; clap folds the env
+    /// var into this field. If still unset, the admin port is derived
+    /// from `observability.admin_port` in the config file (see
+    /// `--config`). Example: `http://127.0.0.1:9191`.
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. Takes precedence
+    /// over the top-level `decdn --config`; if neither is set,
+    /// resolution falls through to `~/.decdn/node.toml` and then the
+    /// built-in default port.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response body as JSON instead of the human-readable
+    /// summary + channel table.
     #[arg(long)]
     pub json: bool,
 

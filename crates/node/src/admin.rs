@@ -14,16 +14,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use alloy::primitives::U256;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
-    AdminRpcServer, AnnounceResponse, BucketStat, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE,
-    DHT_POISONED_CODE, DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview,
-    EvictRequest, EvictResponse, HealthResponse, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse,
-    RELOAD_ERROR_CODE, RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth,
-    StatusResponse, parse_hash_arg,
+    AdminRpcServer, AnnounceResponse, BucketStat, CACHE_ERROR_CODE, CHANNEL_STORE_ERROR_CODE,
+    CONFIG_PATH_UNSET_CODE, ChannelSnapshot, ChannelsResponse, DHT_POISONED_CODE,
+    DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
+    HealthResponse, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE,
+    RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth, StatusResponse,
+    parse_hash_arg,
 };
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
+use decdn_incentive::{ChannelState, ChannelStateStore, VoucherActivity};
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::{Server, ServerConfig};
 use jsonrpsee::types::ErrorObjectOwned;
@@ -108,6 +111,52 @@ pub struct AdminState {
     /// [`AdminState::with_dht`]). The `status` RPC returns
     /// [`DHT_UNAVAILABLE_CODE`] when this is `None`.
     dht: Option<DhtStatusHandles>,
+    /// Payment-channel introspection handles backing `admin_v1_channels`
+    /// (issue #749). `None` when the channel subsystem isn't wired (the
+    /// unit tests that exercise the cache/peer-table methods build
+    /// `AdminState` without it; the production runtime always attaches it
+    /// via [`AdminState::with_channels`]). The `channels` RPC returns an
+    /// empty list (not an error) when this is `None` — a node with no
+    /// payment surface legitimately has zero channels to report, and the
+    /// CLI's empty-table sentinel covers it.
+    channels: Option<ChannelStatusHandles>,
+}
+
+/// Read-only payment-channel handles the `admin_v1_channels` handler
+/// snapshots (issue #749). Each is an `Arc` clone of state the runtime
+/// already owns and shares with the `cdn/client/v1` handler and the
+/// settlement service, so attaching this to [`AdminState`] adds read
+/// access, not new ownership. Bundled into one struct so the
+/// `with_channels` builder stays a single argument.
+#[derive(Clone)]
+pub struct ChannelStatusHandles {
+    /// Persistent per-channel voucher state (same handle the client
+    /// handler commits accepted vouchers to). Read via `load_all` to
+    /// build the snapshot — the freshest committed `last_*` per channel.
+    pub channel_store: Arc<dyn ChannelStateStore>,
+    /// In-memory last-voucher clock (same handle the client handler
+    /// stamps on each accepted voucher). Read for
+    /// `seconds_since_last_voucher`; `None` per channel until this
+    /// process sees a voucher for it.
+    pub voucher_activity: Arc<VoucherActivity>,
+    /// Configured redemption threshold in micro-USDC
+    /// (`blockchain.redeem_threshold_micro_usdc`). A channel whose
+    /// accrued claim has reached this is reported `settlement_eligible`.
+    pub redeem_threshold_micro_usdc: u64,
+}
+
+// `AdminState` derives `Debug`, so the bundled handles must too. The
+// trait-object `Arc<dyn ChannelStateStore>` carries no `Debug` bound, so
+// hand-roll a terse impl that names the struct without formatting the handles.
+impl std::fmt::Debug for ChannelStatusHandles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelStatusHandles")
+            .field(
+                "redeem_threshold_micro_usdc",
+                &self.redeem_threshold_micro_usdc,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// Read-only DHT subsystem handles the `admin_v1_status` handler snapshots
@@ -274,6 +323,7 @@ impl AdminState {
             signer,
             metrics,
             dht: None,
+            channels: None,
         }
     }
 
@@ -284,6 +334,16 @@ impl AdminState {
     #[must_use]
     pub fn with_dht(mut self, dht: DhtStatusHandles) -> Self {
         self.dht = Some(dht);
+        self
+    }
+
+    /// Attach payment-channel introspection handles so `admin_v1_channels`
+    /// can report open-channel state (issue #749). The production runtime
+    /// calls this once after `new`; without it, `channels` returns an
+    /// empty list with the default-zero threshold.
+    #[must_use]
+    pub fn with_channels(mut self, channels: ChannelStatusHandles) -> Self {
+        self.channels = Some(channels);
         self
     }
 }
@@ -607,6 +667,105 @@ impl AdminRpcServer for AdminRpcImpl {
             },
         })
     }
+
+    async fn channels(&self) -> RpcResult<ChannelsResponse> {
+        // No channel subsystem wired (unit tests / a node with no payment
+        // surface): report an empty list rather than an error. Zero
+        // channels is a legitimate state, and the CLI renders the
+        // empty-table sentinel for it.
+        let Some(ch) = self.state.channels.as_ref() else {
+            return Ok(ChannelsResponse {
+                channels: Vec::new(),
+                redeem_threshold_micro_usdc: 0,
+            });
+        };
+
+        // `load_all` on the redb-backed store is blocking I/O (the store
+        // trait is sync per ADR appendix-poc-production-seams §1). Run it
+        // on the blocking pool so we don't stall a runtime worker, then
+        // build the wire DTOs off the loaded `Vec` — the cheap part. A
+        // store failure surfaces as a specific RPC error so the operator
+        // sees "channel snapshot unavailable" rather than a transport fault.
+        let store = Arc::clone(&ch.channel_store);
+        let states = tokio::task::spawn_blocking(move || store.load_all())
+            .await
+            .map_err(|join_err| {
+                tracing::error!(error = %join_err, "channel-store load task panicked");
+                ErrorObjectOwned::owned(
+                    CHANNEL_STORE_ERROR_CODE,
+                    "channel state store load task failed",
+                    None::<()>,
+                )
+            })?
+            .map_err(|store_err| {
+                tracing::error!(error = %store_err, "admin_v1_channels could not load channel store");
+                ErrorObjectOwned::owned(
+                    CHANNEL_STORE_ERROR_CODE,
+                    format!("channel state store load failed: {store_err}"),
+                    None::<()>,
+                )
+            })?;
+
+        let threshold = U256::from(ch.redeem_threshold_micro_usdc);
+        let channels = build_channel_snapshots(&states, threshold, &ch.voucher_activity);
+        Ok(ChannelsResponse {
+            channels,
+            redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
+        })
+    }
+}
+
+/// Build the wire `ChannelSnapshot` list from loaded channel states, the
+/// redemption `threshold` (in micro-USDC as a `U256`), and the in-memory
+/// voucher-activity clock. Pure (no I/O, no locks beyond the activity
+/// read) so it's unit-testable without a store or an async runtime.
+///
+/// Ordering: channels with a known last-voucher age first (most recently
+/// active ahead of those with `None`), then by descending outstanding
+/// amount — the on-call use case is "which channels are closest to a
+/// settlement / liquidity event?". `U256` amounts narrow to `u64`
+/// micro-USDC via `try_from(...).unwrap_or(u64::MAX)`; a real channel is
+/// bounded by its on-chain deposit so the saturation arm is unreachable.
+fn build_channel_snapshots(
+    states: &[ChannelState],
+    threshold: U256,
+    activity: &VoucherActivity,
+) -> Vec<ChannelSnapshot> {
+    let mut snapshots: Vec<ChannelSnapshot> = states
+        .iter()
+        .map(|state| {
+            let outstanding = state.last_amount();
+            ChannelSnapshot {
+                channel_id: state.channel_id.to_string(),
+                counterparty: state.client.to_string(),
+                last_nonce: u64::try_from(state.last_nonce()).unwrap_or(u64::MAX),
+                outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
+                deposit_micro_usdc: u64::try_from(state.deposit).unwrap_or(u64::MAX),
+                seconds_since_last_voucher: activity.seconds_since(state.channel_id),
+                // Upper-bound eligibility: the admin surface doesn't read
+                // the on-chain `withdrawnAmount`, so it compares the full
+                // accrued claim against the threshold (documented on the
+                // DTO field). `>=` matches the redeemer's `< threshold`
+                // short-circuit (`redeem_one` in payment_settlement.rs).
+                settlement_eligible: outstanding >= threshold,
+            }
+        })
+        .collect();
+    // Most recently active first: `Some(age)` sorts ahead of `None`, and
+    // within each group smaller age (more recent) first; ties broken by
+    // descending outstanding. `Reverse` on the outstanding term puts the
+    // largest claim first.
+    snapshots.sort_by(|a, b| {
+        let key = |s: &ChannelSnapshot| {
+            (
+                s.seconds_since_last_voucher.is_none(),
+                s.seconds_since_last_voucher.unwrap_or(0),
+                std::cmp::Reverse(s.outstanding_micro_usdc),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    snapshots
 }
 
 /// Bind the admin listener. Kept synchronous-at-startup so port
@@ -1768,5 +1927,188 @@ mod tests {
         let rpc = AdminRpcImpl::new(state.with_dht(handles));
         let err = rpc.status().await.expect_err("expected DHT-poisoned error");
         assert_eq!(err.code(), DHT_POISONED_CODE);
+    }
+
+    // ---- admin_v1_channels (issue #749) ----
+
+    use alloy::primitives::{Address, address};
+    use decdn_incentive::MemoryChannelStateStore;
+
+    const CHANNEL_TOKEN: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+
+    /// Build a hydrated `ChannelState` with the given identity + voucher
+    /// figures. `last_amount` doubles as the outstanding claim.
+    fn mk_channel(
+        id_byte: u8,
+        client_byte: u8,
+        deposit: u64,
+        last_amount: u64,
+        last_nonce: u64,
+    ) -> ChannelState {
+        let mut id = [0u8; 32];
+        id[31] = id_byte;
+        let mut client = [0u8; 20];
+        client[19] = client_byte;
+        ChannelState::hydrate(
+            id.into(),
+            Address::from(client),
+            CHANNEL_TOKEN,
+            U256::from(deposit),
+            U256::from(last_amount),
+            U256::from(last_nonce),
+            U256::from(last_amount), // bytes_delivered — irrelevant to the snapshot
+            None,
+            0,
+        )
+    }
+
+    /// `build_channel_snapshots` maps each `ChannelState` to its wire DTO:
+    /// hex ids, narrowed amounts, and threshold-based eligibility. A
+    /// channel at/above the threshold is eligible; one below is not.
+    #[test]
+    fn build_channel_snapshots_maps_fields_and_eligibility() {
+        let states = vec![
+            mk_channel(1, 0xAA, 10_000_000, 2_500_000, 7),
+            mk_channel(2, 0xBB, 5_000_000, 500_000, 3),
+        ];
+        let activity = VoucherActivity::new();
+        let threshold = U256::from(1_000_000u64);
+        let snaps = build_channel_snapshots(&states, threshold, &activity);
+        assert_eq!(snaps.len(), 2);
+        // No activity recorded → both have `None`; within the `None`
+        // group ordering is by descending outstanding, so the
+        // 2_500_000-claim channel comes first.
+        let first = snaps.first().expect("first snapshot");
+        assert_eq!(first.outstanding_micro_usdc, 2_500_000);
+        assert_eq!(first.deposit_micro_usdc, 10_000_000);
+        assert_eq!(first.last_nonce, 7);
+        assert!(
+            first.channel_id.starts_with("0x"),
+            "channel_id must be 0x-hex: {}",
+            first.channel_id
+        );
+        assert!(
+            first.counterparty.starts_with("0x"),
+            "counterparty must be 0x-hex: {}",
+            first.counterparty
+        );
+        assert_eq!(first.seconds_since_last_voucher, None);
+        assert!(
+            first.settlement_eligible,
+            "2.5 USDC claim >= 1 USDC threshold → eligible"
+        );
+        let second = snaps.get(1).expect("second snapshot");
+        assert_eq!(second.outstanding_micro_usdc, 500_000);
+        assert!(
+            !second.settlement_eligible,
+            "0.5 USDC claim < 1 USDC threshold → not eligible"
+        );
+    }
+
+    /// Threshold boundary: outstanding exactly equal to the threshold is
+    /// eligible (`>=`), matching the redeemer's `< threshold` short-circuit.
+    #[test]
+    fn build_channel_snapshots_threshold_is_inclusive() {
+        let states = vec![mk_channel(1, 0xAA, 10_000_000, 1_000_000, 1)];
+        let activity = VoucherActivity::new();
+        let snaps = build_channel_snapshots(&states, U256::from(1_000_000u64), &activity);
+        assert!(
+            snaps.first().expect("snapshot").settlement_eligible,
+            "outstanding == threshold must be eligible (>=)"
+        );
+    }
+
+    /// A channel with recorded voucher activity sorts ahead of one with
+    /// none, and reports `Some(age)`.
+    #[test]
+    fn build_channel_snapshots_orders_active_channels_first() {
+        let active = mk_channel(1, 0xAA, 10_000_000, 100, 1);
+        let idle = mk_channel(2, 0xBB, 10_000_000, 9_000_000, 1);
+        let activity = VoucherActivity::new();
+        activity.touch(active.channel_id);
+        // `idle` has a much larger outstanding, but no activity — the
+        // active channel must still sort first (recency beats size).
+        let snaps = build_channel_snapshots(&[idle, active], U256::from(1_000_000u64), &activity);
+        let first = snaps.first().expect("first snapshot");
+        assert!(
+            first.seconds_since_last_voucher.is_some(),
+            "active channel (with a touch) must sort first"
+        );
+        assert_eq!(first.outstanding_micro_usdc, 100);
+    }
+
+    /// `admin_v1_channels` with no channel handles wired returns an empty
+    /// list and a zero threshold (not an error) — a node with no payment
+    /// surface legitimately has nothing to report.
+    #[tokio::test]
+    async fn channels_without_handles_returns_empty() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state);
+        let resp = rpc.channels().await.expect("channels ok");
+        assert!(resp.channels.is_empty());
+        assert_eq!(resp.redeem_threshold_micro_usdc, 0);
+    }
+
+    /// End-to-end through the RPC method: a store seeded with two channels
+    /// surfaces both, with the configured threshold echoed and eligibility
+    /// computed against it.
+    #[tokio::test]
+    async fn channels_rpc_reports_seeded_store() -> anyhow::Result<()> {
+        let store = Arc::new(MemoryChannelStateStore::new());
+        store.record(&mk_channel(1, 0xAA, 10_000_000, 2_000_000, 5))?;
+        store.record(&mk_channel(2, 0xBB, 5_000_000, 100_000, 2))?;
+
+        let (state, _tmp) = state_with(vec![]).await;
+        let handles = ChannelStatusHandles {
+            channel_store: store as Arc<dyn ChannelStateStore>,
+            voucher_activity: Arc::new(VoucherActivity::new()),
+            redeem_threshold_micro_usdc: 1_000_000,
+        };
+        let rpc = AdminRpcImpl::new(state.with_channels(handles));
+        let resp = rpc.channels().await.expect("channels ok");
+        assert_eq!(resp.redeem_threshold_micro_usdc, 1_000_000);
+        assert_eq!(resp.channels.len(), 2);
+        // Both have no activity → ordered by descending outstanding.
+        let first = resp.channels.first().expect("first");
+        assert_eq!(first.outstanding_micro_usdc, 2_000_000);
+        assert!(first.settlement_eligible);
+        let second = resp.channels.get(1).expect("second");
+        assert_eq!(second.outstanding_micro_usdc, 100_000);
+        assert!(!second.settlement_eligible);
+        Ok(())
+    }
+
+    /// A store whose `load_all` errors surfaces as
+    /// [`CHANNEL_STORE_ERROR_CODE`] rather than a generic transport fault.
+    #[tokio::test]
+    async fn channels_rpc_surfaces_store_load_failure() {
+        use decdn_incentive::{ChannelId, StoreError};
+
+        #[derive(Debug)]
+        struct FailingStore;
+        impl ChannelStateStore for FailingStore {
+            fn load_all(&self) -> Result<Vec<ChannelState>, StoreError> {
+                Err(StoreError::Backend("simulated load failure".to_string()))
+            }
+            fn record(&self, _state: &ChannelState) -> Result<(), StoreError> {
+                Ok(())
+            }
+            fn forget(&self, _channel_id: ChannelId) -> Result<(), StoreError> {
+                Ok(())
+            }
+            fn get(&self, _channel_id: ChannelId) -> Result<Option<ChannelState>, StoreError> {
+                Ok(None)
+            }
+        }
+
+        let (state, _tmp) = state_with(vec![]).await;
+        let handles = ChannelStatusHandles {
+            channel_store: Arc::new(FailingStore) as Arc<dyn ChannelStateStore>,
+            voucher_activity: Arc::new(VoucherActivity::new()),
+            redeem_threshold_micro_usdc: 1_000_000,
+        };
+        let rpc = AdminRpcImpl::new(state.with_channels(handles));
+        let err = rpc.channels().await.expect_err("expected store-load error");
+        assert_eq!(err.code(), CHANNEL_STORE_ERROR_CODE);
     }
 }

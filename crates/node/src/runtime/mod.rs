@@ -650,6 +650,14 @@ pub async fn run(
     .context("PaymentChannel settlement service bootstrap")?;
     client_handler.attach_redeem_hint(payment_service.redeem_hint_sender());
 
+    // In-memory last-voucher clock shared between the client handler (writer:
+    // stamps on each accepted voucher) and `admin_v1_channels` (reader:
+    // reports "time since last voucher"), issue #749. Non-durable by design —
+    // a restart resets it and channels report "no activity yet" until their
+    // next voucher (see `decdn_incentive::VoucherActivity`).
+    let voucher_activity = Arc::new(decdn_incentive::VoucherActivity::new());
+    client_handler.attach_voucher_activity(Arc::clone(&voucher_activity));
+
     // On-chain buyer-side service (#744). When this node pulls content from an
     // upstream provider on a cache miss it pays via the same channel mechanism,
     // acting as the client: a separate wallet-filled provider signs `approve` /
@@ -980,6 +988,15 @@ pub async fn run(
             republish: Arc::clone(&republish_scheduler),
             refresh_clock: Arc::clone(&bucket_refresh_clock),
             refresh_interval: crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
+        })
+        // Payment-channel introspection for `admin_v1_channels` (issue #749).
+        // Shares the same persistent channel-state store the client handler
+        // and settlement service use, plus the in-memory voucher-activity
+        // clock — read-only here.
+        .with_channels(admin::ChannelStatusHandles {
+            channel_store: Arc::clone(&channel_state_store),
+            voucher_activity: Arc::clone(&voucher_activity),
+            redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         });
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {

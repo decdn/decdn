@@ -40,7 +40,7 @@ use decdn_cache::{CacheEngine, Hash};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
-    ChannelId, ChannelState, ChannelStateStore, StreamSlashData, verify_binding,
+    ChannelId, ChannelState, ChannelStateStore, StreamSlashData, VoucherActivity, verify_binding,
     voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
@@ -110,6 +110,13 @@ pub struct ClientHandler {
     /// until attached (e.g. in tests with no settlement service) — a hint is
     /// best-effort, so an unattached or full channel just skips it.
     redeem_hint: OnceLock<mpsc::Sender<ChannelId>>,
+    /// In-memory last-voucher clock shared with `admin_v1_channels`
+    /// (issue #749), attached post-construction via
+    /// [`ClientHandler::attach_voucher_activity`]. `None` until attached
+    /// (e.g. tests with no admin surface) — stamping is best-effort, so
+    /// an unattached handler just skips it and the channel reports "no
+    /// activity since restart" to the operator.
+    voucher_activity: OnceLock<Arc<VoucherActivity>>,
     rate_per_mb: Arc<AtomicU64>,
     delivery_floor: u64,
     delivery_ceiling: u64,
@@ -180,6 +187,7 @@ impl ClientHandler {
             channel_state_store,
             channels: Arc::new(Mutex::new(map)),
             redeem_hint: OnceLock::new(),
+            voucher_activity: OnceLock::new(),
             rate_per_mb,
             delivery_floor,
             delivery_ceiling,
@@ -195,6 +203,15 @@ impl ClientHandler {
     /// best-effort hints the channel for redemption.
     pub fn attach_redeem_hint(&self, tx: mpsc::Sender<ChannelId>) {
         let _ = self.redeem_hint.set(tx);
+    }
+
+    /// Attach the in-memory voucher-activity clock shared with
+    /// `admin_v1_channels` (issue #749). Called once during runtime
+    /// wiring; a second call is ignored (the `OnceLock` keeps the first).
+    /// After this, each accepted voucher stamps the channel's last-voucher
+    /// time so `decdn node channels` can report "time since last voucher".
+    pub fn attach_voucher_activity(&self, activity: Arc<VoucherActivity>) {
+        let _ = self.voucher_activity.set(activity);
     }
 
     /// Register a channel observed on-chain via `ChannelOpened` (#327) so the
@@ -691,6 +708,14 @@ impl ClientHandler {
                 guard.state = candidate;
                 guard.bytes_delivered_cumulative = new_bytes;
                 drop(guard);
+                // Stamp the in-memory last-voucher clock for
+                // `admin_v1_channels` (issue #749). Best-effort: an
+                // unattached clock (no admin surface) just skips. Done
+                // after the guard drop — the activity map has its own
+                // lock and doesn't need the per-channel guard.
+                if let Some(activity) = self.voucher_activity.get() {
+                    activity.touch(channel_id);
+                }
                 // Nonce-gap signal (#747): the voucher was accepted, but its
                 // nonce skipped values past the prior `last_nonce + 1`. The
                 // structured `tracing::warn!` already fired inside

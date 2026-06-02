@@ -13,8 +13,9 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use serde::Deserialize;
 
 use decdn_common::admin::{
-    AdminRpcClient, AnnounceResponse, DrainRequest, DrainResponse, EvictRequest, EvictResponse,
-    HealthResponse, PeerView, PeersResponse, ReloadResponse, StatusResponse,
+    AdminRpcClient, AnnounceResponse, ChannelSnapshot, ChannelsResponse, DrainRequest,
+    DrainResponse, EvictRequest, EvictResponse, HealthResponse, PeerView, PeersResponse,
+    ReloadResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -53,6 +54,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Peers(p) => peers(p, global_config).await,
         cli::NodeCommand::Health(h) => health(h, global_config).await,
         cli::NodeCommand::Status(s) => status(s, global_config).await,
+        cli::NodeCommand::Channels(c) => channels(c, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Announce(a) => announce(a, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
@@ -583,6 +585,126 @@ pub async fn status(args: &cli::StatusArgs, global_config: Option<&Path>) -> any
     }
 
     Ok(())
+}
+
+/// `decdn node channels`: call `admin_v1_channels` on the running node and
+/// print a snapshot of its open payment channels (issue #749).
+pub async fn channels(
+    args: &cli::ChannelsArgs,
+    global_config: Option<&Path>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let parsed: ChannelsResponse = client
+        .channels()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&parsed).context("failed to encode channels as JSON")?;
+        println!("{pretty}");
+    } else {
+        let mut stdout = io::stdout().lock();
+        write_channels_table(&mut stdout, &parsed).context("failed to write channels table")?;
+    }
+
+    Ok(())
+}
+
+/// Write the payment-channel table to `w`. Pure function (takes `&mut impl
+/// Write`) so the formatting is unit-testable without an HTTP hop,
+/// mirroring [`write_peers_table`] / [`write_status`]. A summary line
+/// carries the redemption threshold as a stable `key=value` token; the
+/// per-channel table follows. USDC amounts are rendered from micro-USDC.
+fn write_channels_table(w: &mut impl io::Write, resp: &ChannelsResponse) -> io::Result<()> {
+    writeln!(
+        w,
+        "redeem_threshold={} channels={}",
+        format_usdc(resp.redeem_threshold_micro_usdc),
+        resp.channels.len(),
+    )?;
+    if resp.channels.is_empty() {
+        return writeln!(w, "(no open channels)");
+    }
+    // Fixed-column layout: channel preview | counterparty preview | nonce |
+    // outstanding | deposit | last-voucher age | eligible.
+    writeln!(
+        w,
+        "{:<14} {:<14} {:>6} {:>12} {:>12} {:>12} ELIGIBLE",
+        "CHANNEL", "COUNTERPARTY", "NONCE", "OUTSTANDING", "DEPOSIT", "LAST_VOUCHER",
+    )?;
+    for c in &resp.channels {
+        write_channel_row(w, c)?;
+    }
+    Ok(())
+}
+
+/// Render one channel as a fixed-column row. Split out so the column
+/// formatting stays in one place and the loop body reads as a single call.
+fn write_channel_row(w: &mut impl io::Write, c: &ChannelSnapshot) -> io::Result<()> {
+    let channel = short_node_id(&c.channel_id);
+    let counterparty = short_node_id(&c.counterparty);
+    let last_voucher = match c.seconds_since_last_voucher {
+        // No voucher seen since this process started — distinct from
+        // "<1s ago" so operators know the activity clock has no record
+        // (a freshly-restarted node, or a channel that has never billed).
+        None => "never".to_string(),
+        Some(secs) => format_age_secs(secs),
+    };
+    let eligible = if c.settlement_eligible { "yes" } else { "no" };
+    writeln!(
+        w,
+        "{channel:<14} {counterparty:<14} {:>6} {:>12} {:>12} {last_voucher:>12} {eligible}",
+        c.last_nonce,
+        format_usdc(c.outstanding_micro_usdc),
+        format_usdc(c.deposit_micro_usdc),
+    )
+}
+
+/// Format a micro-USDC amount as a `"N.NNNNNN"` USDC string. USDC has 6
+/// decimals (ADR 003), so 1 USDC == `1_000_000` micro-USDC. Trailing
+/// fractional zeros are kept fixed-width (six places) so columns align and
+/// a script parsing the value sees a stable shape.
+fn format_usdc(micro: u64) -> String {
+    let whole = micro / 1_000_000;
+    let frac = micro % 1_000_000;
+    format!("{whole}.{frac:06}")
+}
+
+/// Coarse age bucket from a whole-seconds delta (the wire form
+/// `seconds_since_last_voucher` already carries). Mirrors `format_age`'s
+/// unit set (s/m/h/d) but takes seconds rather than microseconds so the
+/// channels path doesn't re-scale a value the server already rounded.
+fn format_age_secs(secs: u64) -> String {
+    const SEC_PER_MIN: u64 = 60;
+    const SEC_PER_HOUR: u64 = 60 * SEC_PER_MIN;
+    const SEC_PER_DAY: u64 = 24 * SEC_PER_HOUR;
+    if secs == 0 {
+        return "<1s ago".to_string();
+    }
+    if secs < SEC_PER_MIN {
+        return format!("{secs}s ago");
+    }
+    if secs < SEC_PER_HOUR {
+        return format!("{}m ago", secs / SEC_PER_MIN);
+    }
+    if secs < SEC_PER_DAY {
+        return format!("{}h ago", secs / SEC_PER_HOUR);
+    }
+    format!("{}d ago", secs / SEC_PER_DAY)
 }
 
 /// Map a `jsonrpsee` client error into the three operator-actionable
@@ -1363,6 +1485,105 @@ mod tests {
             Some(4242)
         );
         Ok(())
+    }
+
+    fn mk_channel(
+        channel_id: &str,
+        counterparty: &str,
+        last_nonce: u64,
+        outstanding: u64,
+        deposit: u64,
+        secs_since: Option<u64>,
+        eligible: bool,
+    ) -> ChannelSnapshot {
+        ChannelSnapshot {
+            channel_id: channel_id.to_string(),
+            counterparty: counterparty.to_string(),
+            last_nonce,
+            outstanding_micro_usdc: outstanding,
+            deposit_micro_usdc: deposit,
+            seconds_since_last_voucher: secs_since,
+            settlement_eligible: eligible,
+        }
+    }
+
+    #[test]
+    fn write_channels_table_empty_emits_sentinel() -> anyhow::Result<()> {
+        let resp = ChannelsResponse {
+            channels: Vec::new(),
+            redeem_threshold_micro_usdc: 1_000_000,
+        };
+        let mut buf = Vec::<u8>::new();
+        write_channels_table(&mut buf, &resp)?;
+        let s = String::from_utf8(buf)?;
+        // Summary line still prints the threshold, then the sentinel.
+        assert!(s.contains("redeem_threshold=1.000000"), "{s}");
+        assert!(s.contains("channels=0"), "{s}");
+        assert!(s.contains("(no open channels)"), "{s}");
+        // No table header when there are no rows.
+        assert!(!s.contains("CHANNEL"), "header must be omitted: {s}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_channels_table_renders_header_and_rows() -> anyhow::Result<()> {
+        let resp = ChannelsResponse {
+            redeem_threshold_micro_usdc: 1_000_000,
+            channels: vec![
+                mk_channel(
+                    &format!("0x{}", "a".repeat(64)),
+                    &format!("0x{}", "b".repeat(40)),
+                    7,
+                    2_500_000,
+                    10_000_000,
+                    Some(90),
+                    true,
+                ),
+                mk_channel(
+                    &format!("0x{}", "c".repeat(64)),
+                    &format!("0x{}", "d".repeat(40)),
+                    0,
+                    0,
+                    5_000_000,
+                    None,
+                    false,
+                ),
+            ],
+        };
+        let mut buf = Vec::<u8>::new();
+        write_channels_table(&mut buf, &resp)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("channels=2"), "{s}");
+        assert!(s.contains("CHANNEL"), "header missing: {s}");
+        assert!(s.contains("OUTSTANDING"), "header missing: {s}");
+        assert!(s.contains("ELIGIBLE"), "header missing: {s}");
+        // First row: USDC-formatted amounts, 90s → "1m ago", eligible "yes".
+        assert!(s.contains("2.500000"), "outstanding USDC missing: {s}");
+        assert!(s.contains("10.000000"), "deposit USDC missing: {s}");
+        assert!(s.contains("1m ago"), "last-voucher age missing: {s}");
+        // Channel id preview is the short form.
+        assert!(s.contains("0xaaaaaaaaaa"), "channel preview missing: {s}");
+        // Second row: no activity → "never", not eligible → "no".
+        assert!(s.contains("never"), "never sentinel missing: {s}");
+        Ok(())
+    }
+
+    #[test]
+    fn format_usdc_renders_six_decimals() {
+        assert_eq!(format_usdc(0), "0.000000");
+        assert_eq!(format_usdc(1_000_000), "1.000000");
+        assert_eq!(format_usdc(2_500_000), "2.500000");
+        assert_eq!(format_usdc(1), "0.000001");
+        assert_eq!(format_usdc(12_345_678), "12.345678");
+    }
+
+    #[test]
+    fn format_age_secs_units() {
+        assert_eq!(format_age_secs(0), "<1s ago");
+        assert_eq!(format_age_secs(2), "2s ago");
+        assert_eq!(format_age_secs(90), "1m ago");
+        assert_eq!(format_age_secs(2 * 3600), "2h ago");
+        assert_eq!(format_age_secs(36 * 3600), "1d ago");
     }
 
     #[test]
