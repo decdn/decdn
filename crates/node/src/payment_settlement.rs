@@ -464,7 +464,22 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
     /// propagated — it must not abort the shutdown close path.
     fn flush_checkpoint_on_shutdown(&self) {
         if let Err(err) = self.checkpoint_store.flush() {
-            warn!(%err, "failed to flush watcher scan checkpoint on shutdown");
+            // A failed flush leaves the buffered block intact, so
+            // `load_last_seen_block` surfaces the still-buffered high-water block:
+            // how far ahead of the durable floor this stop lost progress, i.e. the
+            // span the next boot's head-anchored backfill will re-scan. Logging it
+            // gives a post-mortem the rescan depth without a dedicated accessor.
+            //
+            // The in-loop persist sites bump `metrics.watcher_persist_failure()`,
+            // but no `metrics` handle is held on this shutdown path (the watcher
+            // task owns it), so we deliberately do not plumb one through solely for
+            // counter parity here — the warn is the signal for a failed flush.
+            let pending_block = self.checkpoint_store.load_last_seen_block().ok().flatten();
+            warn!(
+                %err,
+                ?pending_block,
+                "failed to flush watcher scan checkpoint on shutdown"
+            );
         }
     }
 
@@ -1157,7 +1172,7 @@ struct DebounceState {
     /// `None` if nothing has been persisted in this process yet. Also the floor
     /// against which the block-cadence threshold is measured.
     last_persisted: Option<u64>,
-    /// Wall-clock instant of the last durable write, for the time-based
+    /// Monotonic [`Instant`] of the last durable write, for the time-based
     /// threshold. Seeded at construction so the first interval is measured from
     /// service start.
     last_persist_at: Instant,
@@ -2127,6 +2142,43 @@ mod tests {
         assert_eq!(store.load_last_seen_block()?, Some(50));
         store.record_last_seen_block(200)?; // sub-threshold buffer
         assert_eq!(store.load_last_seen_block()?, Some(200));
+        Ok(())
+    }
+
+    /// A fresh wrapper over an inner store that *already* holds a persisted floor
+    /// still forces a durable write on the FIRST in-process `record`, even when
+    /// that record is well below both debounce thresholds. The decorator keys the
+    /// block-cadence threshold off its own in-process `last_persisted` (seeded
+    /// `None`), not the inner store's value it loads through — so the first write
+    /// is always durable and the floor is re-anchored to the live scan position
+    /// promptly after a restart, rather than lingering at the pre-existing
+    /// (potentially much older) on-disk floor until a threshold trips. This is
+    /// distinct from `debounce_load_returns_max_of_persisted_and_pending`, which
+    /// only checks the read-through; here we assert the *write* behavior.
+    #[test]
+    fn debounce_first_record_writes_through_over_existing_floor() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        inner.record_last_seen_block(50)?; // pre-existing persisted floor (write #1)
+        assert_eq!(inner.writes(), 1);
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            512,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        // First in-process record is only 10 blocks ahead (< 512) and at t=0
+        // (< 30s), so block- and time-cadence alone would buffer it — but the
+        // `last_persisted.is_none()` first-write rule forces it durable anyway.
+        store.record_last_seen_block(60)?;
+        assert_eq!(inner.writes(), 2, "first in-process record must fsync");
+        assert_eq!(inner.load_last_seen_block()?, Some(60));
+        // The very next sub-threshold record is now genuinely buffered (the
+        // in-process floor is established), proving the first-write was the
+        // special case and not the steady-state behavior.
+        store.record_last_seen_block(70)?;
+        assert_eq!(inner.writes(), 2, "second sub-threshold record must buffer");
+        assert_eq!(inner.load_last_seen_block()?, Some(60)); // disk floor unchanged
+        assert_eq!(store.load_last_seen_block()?, Some(70)); // buffered high-water
         Ok(())
     }
 
