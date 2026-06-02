@@ -721,7 +721,8 @@ impl ClientHandler {
                 guard.bytes_delivered_cumulative = new_bytes;
                 drop(guard);
                 // Audit receipt for this served-and-paid interval (issue #248).
-                self.record_receipt(hash, delta_bytes, client_node_id, wire.nonce);
+                self.record_receipt(hash, delta_bytes, client_node_id, wire.nonce)
+                    .await;
                 // Nonce-gap signal (#747): the voucher was accepted, but its
                 // nonce skipped values past the prior `last_nonce + 1`. The
                 // structured `tracing::warn!` already fired inside
@@ -778,14 +779,15 @@ impl ClientHandler {
     ///
     /// The append is `write_all` + `flush` with **no fsync** (see the
     /// [`crate::receipt_log`] durability note) under a sync `Mutex`, bounded to
-    /// roughly one call per voucher interval (~1 MiB). It is run inline rather
-    /// than offloaded to [`tokio::task::spawn_blocking`]: a fire-and-forget
-    /// offload would let the audit tail be dropped on runtime shutdown and
-    /// reorder receipts relative to voucher acceptance, while awaiting an offload
-    /// would only move (not remove) the same single write and add a task hop per
-    /// interval. At testnet scale the no-fsync write is cheap enough to keep here
-    /// (CLAUDE.md / ADR 003), so recording stays synchronous with acceptance.
-    fn record_receipt(
+    /// roughly one call per voucher interval (~1 MiB). The blocking write is
+    /// offloaded to [`tokio::task::spawn_blocking`] and **awaited** so it never
+    /// runs on a runtime worker thread: awaiting (not fire-and-forget) preserves
+    /// receipt ordering relative to voucher acceptance and keeps the audit tail
+    /// from being dropped on runtime shutdown. The owned [`DownloadReceipt`] and
+    /// a clone of the `Arc<dyn ReceiptLog>` are moved into the closure, so the
+    /// borrow of `self` ends before the hop. Recording therefore stays ordered
+    /// with — and completes before — the `VoucherAck` (CLAUDE.md / ADR 003).
+    async fn record_receipt(
         &self,
         hash: Hash,
         delta_bytes: u64,
@@ -800,7 +802,13 @@ impl ClientHandler {
             voucher_nonce,
             crate::payment_settlement::unix_now(),
         );
-        if let Err(e) = self.receipt_log.append(&receipt) {
+        let receipt_log = Arc::clone(&self.receipt_log);
+        let append_res = tokio::task::spawn_blocking(move || receipt_log.append(&receipt)).await;
+        let write_res = match append_res {
+            Ok(res) => res,
+            Err(join_err) => Err(std::io::Error::other(join_err)),
+        };
+        if let Err(e) = write_res {
             tracing::warn!(
                 %hash,
                 %client_node_id,

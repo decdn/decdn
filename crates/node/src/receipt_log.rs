@@ -273,7 +273,7 @@ impl ReceiptLog for JsonlReceiptLog {
         // Serialize to a single line first, so a serialization failure never
         // writes a partial record. `serde_json::to_string` cannot embed a
         // newline in these scalar fields, keeping one-receipt-per-line.
-        let mut line = serde_json::to_string(receipt)?;
+        let mut line = serde_json::to_string(receipt).map_err(std::io::Error::other)?;
         line.push('\n');
         let mut guard = self
             .file
