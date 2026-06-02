@@ -671,7 +671,7 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 | **α (capacity-curve exponent)** | **1.0** | **1.8** | **CapacityBond (default 1.2)** |
 | **k (capacity-curve constant, TOKEN)** | **bounded by 1G-tier bond ∈ [10K, 200K TOKEN]** | | **CapacityBond (default 12.6 → 50K TOKEN at 1G)** |
 | **`maxCapacityMbps`** (declared-capacity ceiling) | **50 Gbps** | **1000 Gbps** | **CapacityBond (`setMaxCapacityMbps`, default 200 Gbps)** |
-| **`minCapacityMbps`** (declared-capacity floor) | **—** | **—** | **CapacityBond (`setMinCapacityMbps`, default 10 Mbps)** |
+| **`minCapacityMbps`** (declared-capacity floor) | **10 Mbps** | **1 Gbps (1000 Mbps)** | **CapacityBond (`setMinCapacityMbps`, default 10 Mbps)** |
 | **`age_ramp_months`** | **1** | **24** | **DecdnGovernor (`setAgeRampMonths`, default 6 months) — not `CapacityBond`** |
 | **Per-operator voting cap** | **1%** | **25%** | **DecdnGovernor (default 5%)** |
 | **`windowEpochs`** (served-bytes voting window) | **4** | **26** | **FeeRouter (default 13 epochs ≈ 1 quarter) per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)** |
