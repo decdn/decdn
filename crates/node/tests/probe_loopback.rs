@@ -6,6 +6,7 @@
 //! valid EIP-712 `slash_sig` (ADR 005 / ADR 014, #318).
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -16,8 +17,10 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::ProbeSlashData;
+use decdn_node::dht::routing::NodeId;
+use decdn_node::dht::staker_set::{ConfigStakerSet, StakerSet};
 use decdn_node::dispatch::{ConnectionLimiter, RejectReason};
-use decdn_node::handlers::probe::ProbeHandler;
+use decdn_node::handlers::probe::{ProbeHandler, StakeLanePolicy};
 use decdn_node::metrics::Metrics;
 use decdn_protocol::{
     ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, MAX_RATE_PER_MB, ProbeMessage,
@@ -145,6 +148,44 @@ fn build_handler_bounds(
         // This suite is the pre-ADR-015 1-RTT loopback coverage; 0-RTT
         // acceptance has its own dedicated test (probe_0rtt.rs).
         false,
+        // No stake-lane reservation for the general-purpose builder; the
+        // dedicated reservation tests use `build_handler_with_lane` (#757).
+        None,
+    ));
+    (handler, signer, domain)
+}
+
+/// Build a `ProbeHandler` carrying a stake-lane reservation policy (#757).
+/// `stakers` seeds an in-memory [`ConfigStakerSet`]; a probe whose client
+/// `NodeId` is in that set is treated as a stake-lane (node-to-node)
+/// requester and never reserved out.
+#[allow(clippy::too_many_arguments)]
+fn build_handler_with_lane(
+    server_id: iroh::PublicKey,
+    rate: u64,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+    stakers: std::collections::HashSet<NodeId>,
+    reserved_holds: NonZeroUsize,
+    max_holds: usize,
+) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let domain = test_slash_domain();
+    let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(stakers));
+    let policy = StakeLanePolicy::new(staker_set, reserved_holds, max_holds);
+    let handler = Arc::new(ProbeHandler::new(
+        server_id,
+        Arc::new(AtomicU64::new(rate)),
+        Arc::clone(metrics),
+        limiter,
+        cache,
+        Arc::clone(&signer),
+        domain.clone(),
+        0,
+        MAX_RATE_PER_MB,
+        false,
+        Some(policy),
     ));
     (handler, signer, domain)
 }
@@ -709,6 +750,18 @@ async fn run_one_probe(
     handler: Arc<ProbeHandler>,
     req: ProbeRequest,
 ) -> anyhow::Result<ProbeResponse> {
+    run_one_probe_as(fresh_key(), server_sk, handler, req).await
+}
+
+/// Like [`run_one_probe`] but with an explicit client `SecretKey`, so a test
+/// can place the client's `NodeId` into the handler's staker set and exercise
+/// the stake-lane probe-acceptance path (#757).
+async fn run_one_probe_as(
+    client_sk: SecretKey,
+    server_sk: SecretKey,
+    handler: Arc<ProbeHandler>,
+    req: ProbeRequest,
+) -> anyhow::Result<ProbeResponse> {
     let server_id = server_sk.public();
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
@@ -728,7 +781,7 @@ async fn run_one_probe(
         Ok::<_, anyhow::Error>(())
     });
 
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
     let conn = client_ep
         .connect(target, ALPN_PROBE)
@@ -883,6 +936,129 @@ async fn probe_budget_exhausted_counts_violation_not_disabled() -> anyhow::Resul
     anyhow::ensure!(
         metric_value(&text, "decdn_probe_holds_disabled_total") == Some(0),
         "budget pressure must NOT be counted as a config disable:\n{text}"
+    );
+    Ok(())
+}
+
+/// With a stake-lane reservation configured (#757, ADR 003 §Admission and
+/// Priority), a probe from a client that is NOT a registered operator is
+/// answered `has_blob: false` once hold usage reaches the end-client ceiling.
+/// Here `max_holds=1, reserved=1` gives a ceiling of `0`, so the end-client
+/// is shed immediately even though the blob is cached and the budget is free.
+/// The event is counted as a stake-lane reservation — never as budget
+/// exhaustion (`probe_hold_violations`) or a config disable
+/// (`probe_holds_disabled`), whose alerts have different remedies.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_end_client_reserved_out_signs_has_blob_false() -> anyhow::Result<()> {
+    let payload = b"reserved-for-stake-lane content";
+    let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
+    cache.set_max_probe_holds(1);
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    // Empty staker set => the fresh client key is an unregistered end-client.
+    // reserved=1, max=1 => end-client ceiling is 0, so any end-client probe
+    // under any hold usage (including zero) is reserved out.
+    let (handler, signer, domain) = build_handler_with_lane(
+        server_id,
+        7,
+        &metrics,
+        limiter,
+        cache,
+        std::collections::HashSet::new(),
+        NonZeroUsize::MIN,
+        1,
+    );
+
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: 0x9001,
+    };
+    let resp = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        !resp.body.has_blob,
+        "an end-client under a stake-lane reservation must get has_blob=false"
+    );
+    anyhow::ensure!(
+        resp.total_bytes.is_none(),
+        "no size advertised when has_blob=false, got {:?}",
+        resp.total_bytes
+    );
+    // The signature must cover has_blob=false (never a stale true).
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_value(&text, "decdn_probe_stake_lane_reserved_total") == Some(1),
+        "reservation refusal must bump decdn_probe_stake_lane_reserved_total:\n{text}"
+    );
+    anyhow::ensure!(
+        metric_value(&text, "decdn_probe_hold_violations_total") == Some(0),
+        "a stake-lane reservation must NOT be counted as budget pressure:\n{text}"
+    );
+    anyhow::ensure!(
+        metric_value(&text, "decdn_probe_holds_disabled_total") == Some(0),
+        "a stake-lane reservation must NOT be counted as a config disable:\n{text}"
+    );
+    Ok(())
+}
+
+/// Under the very same reservation that sheds an end-client, a probe from a
+/// registered operator (its `NodeId` in the staker set) is admitted: it
+/// passes the reservation gate, takes a hold, and signs `has_blob: true`
+/// (#757). This is the headroom the reservation exists to protect for
+/// node-to-node cache-miss probes.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<()> {
+    let payload = b"served to a node-to-node requester";
+    let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
+    cache.set_max_probe_holds(1);
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let client_sk = fresh_key();
+    let client_node_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    // Same aggressive reservation (reserved=1, max=1) as the end-client test,
+    // but this requester IS a registered operator.
+    let mut stakers = std::collections::HashSet::new();
+    stakers.insert(client_node_id);
+    let (handler, signer, domain) = build_handler_with_lane(
+        server_id,
+        7,
+        &metrics,
+        limiter,
+        cache,
+        stakers,
+        NonZeroUsize::MIN,
+        1,
+    );
+
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: 0x9002,
+    };
+    let resp = run_one_probe_as(client_sk, server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        resp.body.has_blob,
+        "a stake-lane requester must keep its reserved headroom -> has_blob=true"
+    );
+    anyhow::ensure!(
+        resp.total_bytes == Some(payload.len() as u64),
+        "stake-lane requester should be served the blob size, got {:?}",
+        resp.total_bytes
+    );
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_value(&text, "decdn_probe_stake_lane_reserved_total").unwrap_or(0) == 0,
+        "a stake-lane requester must NOT trip the reservation counter:\n{text}"
     );
     Ok(())
 }

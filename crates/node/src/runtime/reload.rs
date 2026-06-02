@@ -789,6 +789,7 @@ impl RuntimeReloadState {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
+                stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
             },
             payment: ResolvedPayment {
                 rate_per_mb,
@@ -1256,6 +1257,7 @@ mod tests {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
+                stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
             },
             payment: ResolvedPayment {
                 rate_per_mb: rate,

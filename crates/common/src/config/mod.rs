@@ -138,6 +138,11 @@ pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 /// direct `CacheEngine::open` callers) cannot drift apart.
 pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
 
+/// Default probe-hold slots reserved for the stake lane (#757). `0` keeps
+/// the stake-lane reservation off by default, so a single-lane node behaves
+/// exactly as before — the reservation is strictly operator opt-in.
+pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
+
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -847,6 +852,13 @@ fn resolve_cache_into(
             usize::try_from(v).unwrap_or(usize::MAX)
         });
 
+    let stake_lane_reserved_holds = cli
+        .stake_lane_reserved_holds
+        .or_else(|| file.and_then(|c| c.stake_lane_reserved_holds))
+        .map_or(DEFAULT_STAKE_LANE_RESERVED_HOLDS, |v| {
+            usize::try_from(v).unwrap_or(usize::MAX)
+        });
+
     ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -857,6 +869,7 @@ fn resolve_cache_into(
         user_agent,
         gc_interval_sec,
         max_probe_holds,
+        stake_lane_reserved_holds,
     }
 }
 
@@ -3654,6 +3667,7 @@ mod tests {
             cache_size_mb,
             max_blob_size_mb,
             max_probe_holds: None,
+            stake_lane_reserved_holds: None,
         }
     }
 
@@ -3913,6 +3927,63 @@ mod tests {
             resolved.gc_interval_sec == 0,
             "0 must round-trip as 0 (disabled); got: {}",
             resolved.gc_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_stake_lane_reserved_holds_defaults_to_zero() -> anyhow::Result<()> {
+        // Absent everywhere => reservation off (#757). The default MUST be 0
+        // so a node that never opted in behaves exactly as pre-#757.
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.stake_lane_reserved_holds == DEFAULT_STAKE_LANE_RESERVED_HOLDS,
+            "expected default {DEFAULT_STAKE_LANE_RESERVED_HOLDS}, got: {}",
+            resolved.stake_lane_reserved_holds
+        );
+        anyhow::ensure!(
+            resolved.stake_lane_reserved_holds == 0,
+            "the #757 default must be 0 (reservation off)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_stake_lane_reserved_holds_from_file() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            stake_lane_reserved_holds: Some(8),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.stake_lane_reserved_holds == 8,
+            "expected 8 from file, got: {}",
+            resolved.stake_lane_reserved_holds
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_stake_lane_reserved_holds_cli_overrides_file() -> anyhow::Result<()> {
+        // CLI wins over file, mirroring the `max_probe_holds` precedence.
+        let cli = crate::cli::run::CacheArgs {
+            cache_dir: None,
+            cache_size_mb: None,
+            max_blob_size_mb: None,
+            max_probe_holds: None,
+            stake_lane_reserved_holds: Some(3),
+        };
+        let file = types::CacheConfig {
+            stake_lane_reserved_holds: Some(8),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.stake_lane_reserved_holds == 3,
+            "CLI flag must override the file value; expected 3, got: {}",
+            resolved.stake_lane_reserved_holds
         );
         Ok(())
     }
@@ -5388,6 +5459,10 @@ mod tests {
             ("cache_size_mb", "DECDN_CACHE_SIZE_MB"),
             ("max_blob_size_mb", "DECDN_MAX_BLOB_SIZE_MB"),
             ("max_probe_holds", "DECDN_MAX_PROBE_HOLDS"),
+            (
+                "stake_lane_reserved_holds",
+                "DECDN_STAKE_LANE_RESERVED_HOLDS",
+            ),
             ("rate_per_mb", "DECDN_RATE_PER_MB"),
             ("delivery_floor", "DECDN_DELIVERY_FLOOR"),
             ("delivery_ceiling", "DECDN_DELIVERY_CEILING"),
@@ -5604,6 +5679,7 @@ mod tests {
             cache_size_mb: None,
             max_blob_size_mb: None,
             max_probe_holds: None,
+            stake_lane_reserved_holds: None,
         }
     }
 

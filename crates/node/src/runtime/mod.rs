@@ -6,6 +6,7 @@ pub use reload::{LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +35,7 @@ use crate::dispatch::ConnectionLimiter;
 use crate::handlers::client::{ClientHandler, MAX_CLIENT_STREAMS};
 use crate::handlers::dht::DhtHandler;
 use crate::handlers::limited::LimitedHandler;
-use crate::handlers::probe::ProbeHandler;
+use crate::handlers::probe::{ProbeHandler, StakeLanePolicy as ProbeStakeLanePolicy};
 use crate::metrics;
 use crate::payment_settlement::PaymentChannelService;
 use alloy::network::EthereumWallet;
@@ -462,6 +463,64 @@ pub async fn run(
     let slash_domain =
         decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
 
+    // Chain-backed active-staker set. Bootstrap failure is fatal: an
+    // empty set silently rejects every inbound `Store`, and once the
+    // iterative `FindValue` lookup filter exists it would drop every
+    // responder. Built here (ahead of the probe handler) so the probe
+    // handler can consult it for stake-lane probe-acceptance (#757); the
+    // DHT handler below shares the same `Arc`.
+    let rpc_url: alloy::transports::http::reqwest::Url =
+        cfg.blockchain.rpc_url.parse().with_context(|| {
+            format!(
+                "blockchain.rpc_url {:?} is not a valid URL",
+                cfg.blockchain.rpc_url
+            )
+        })?;
+    let capacity_bond_addr: Address =
+        cfg.blockchain
+            .capacity_bond_address
+            .parse()
+            .with_context(|| {
+                format!(
+                    "blockchain.capacity_bond_address {:?} is not a valid address",
+                    cfg.blockchain.capacity_bond_address
+                )
+            })?;
+    let chain_provider = ProviderBuilder::new().connect_http(rpc_url.clone());
+    let staker_set: Arc<dyn StakerSet> = Arc::new(
+        ChainStakerSet::bootstrap(chain_provider, capacity_bond_addr)
+            .await
+            .with_context(|| {
+                format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
+            })?,
+    );
+
+    // Stake-lane probe-acceptance reservation (#757, ADR 003 §Admission and
+    // Priority). Strictly operator opt-in: a policy is built only for a
+    // non-zero `cache.stake_lane_reserved_holds` (the `NonZeroUsize` gate
+    // makes the "off" case unrepresentable in `StakeLanePolicy`), so the
+    // default single-lane node passes `None` and the probe handler's hot
+    // path is unchanged. A reservation paired with disabled holds
+    // (`max_probe_holds == 0`) can never fire — surface that misconfig as a
+    // warning and leave the lane off rather than wire a dead per-probe lookup.
+    let stake_lane_policy =
+        NonZeroUsize::new(cfg.cache.stake_lane_reserved_holds).and_then(|reserved| {
+            if cfg.cache.max_probe_holds == 0 {
+                tracing::warn!(
+                    reserved_holds = reserved.get(),
+                    "cache.stake_lane_reserved_holds is set but cache.max_probe_holds=0; \
+                     the stake-lane reservation has no effect (probe holds are disabled)"
+                );
+                None
+            } else {
+                Some(ProbeStakeLanePolicy::new(
+                    Arc::clone(&staker_set),
+                    reserved,
+                    cfg.cache.max_probe_holds,
+                ))
+            }
+        });
+
     let probe_handler = Arc::new(ProbeHandler::new(
         secret_key.public(),
         reload_state.rate_per_mb(),
@@ -476,6 +535,7 @@ pub async fn run(
         // `on_accepting` wiring): the SIGHUP path reports any
         // `[network]` change as "requires restart".
         cfg.network.enable_0rtt,
+        stake_lane_policy,
     ));
 
     // Wrap the foreign `iroh-gossip` handler with `LimitedHandler` so the
@@ -511,35 +571,6 @@ pub async fn run(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Chain-backed active-staker set. Bootstrap failure is fatal: an
-    // empty set silently rejects every inbound `Store`, and once the
-    // iterative `FindValue` lookup filter exists it would drop every
-    // responder.
-    let rpc_url: alloy::transports::http::reqwest::Url =
-        cfg.blockchain.rpc_url.parse().with_context(|| {
-            format!(
-                "blockchain.rpc_url {:?} is not a valid URL",
-                cfg.blockchain.rpc_url
-            )
-        })?;
-    let capacity_bond_addr: Address =
-        cfg.blockchain
-            .capacity_bond_address
-            .parse()
-            .with_context(|| {
-                format!(
-                    "blockchain.capacity_bond_address {:?} is not a valid address",
-                    cfg.blockchain.capacity_bond_address
-                )
-            })?;
-    let chain_provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-    let staker_set: Arc<dyn StakerSet> = Arc::new(
-        ChainStakerSet::bootstrap(chain_provider, capacity_bond_addr)
-            .await
-            .with_context(|| {
-                format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
-            })?,
-    );
     let dht_handler = Arc::new(DhtHandler::new(
         secret_key.public(),
         Arc::clone(&dht_rate_limiter),
@@ -1845,6 +1876,7 @@ mod tests {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
+                stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,

@@ -130,6 +130,14 @@ pub struct CacheArgs {
     /// (ADR 005 §Hold budget) [default: 256]. `0` disables `has_blob: true`.
     #[arg(long, value_name = "N", env = "DECDN_MAX_PROBE_HOLDS")]
     pub max_probe_holds: Option<u64>,
+
+    /// Probe-hold slots reserved for the stake lane — registered
+    /// node-to-node cache-miss probes (#757, ADR 003 §Admission and
+    /// Priority) [default: 0 = off]. Under hold-budget pressure end-client
+    /// probes are shed once usage reaches `max_probe_holds - N`, reserving
+    /// the last `N` slots for node-to-node probes.
+    #[arg(long, value_name = "N", env = "DECDN_STAKE_LANE_RESERVED_HOLDS")]
+    pub stake_lane_reserved_holds: Option<u64>,
 }
 
 /// Payment rate configuration.

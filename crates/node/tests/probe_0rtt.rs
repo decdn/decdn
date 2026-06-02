@@ -165,6 +165,7 @@ async fn spawn_core(
         0,
         MAX_RATE_PER_MB,
         enable_0rtt,
+        None, // no stake-lane reservation in the 0-RTT suite (#757)
     ));
     let router = Router::builder(ep.clone())
         .accept(ALPN_PROBE, handler)
