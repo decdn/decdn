@@ -20,12 +20,15 @@
 //!   bring-up race between `bootstrap` returning and those filters installing
 //!   (#762) — and the across-restart **downtime gap** (#751) — the first watcher
 //!   cycle backfills `ChannelOpened` from a floor block `S` up to the block `F`
-//!   the live filters took over at, then streams forward. `S` is the maximum of
-//!   the bootstrap head (closing the #762 race) and, when present, the persisted
-//!   scan checkpoint minus a reorg margin (closing the #751 gap): the watcher
-//!   records the last scanned block via [`WatcherCheckpointStore`] as it runs,
-//!   so the next boot resumes from there and registers channels a client opened
-//!   while this node was **down**. The backfilled `[S, F]` and the live stream
+//!   the live filters took over at, then streams forward. `S` is the *lower* of
+//!   the bootstrap head and the persisted scan checkpoint minus a reorg margin
+//!   (clamped to `<= head`): on first boot there is no checkpoint so `S` is the
+//!   head (closing the #762 race only); on a restart the checkpoint sits below
+//!   head, so `S` drops to it and the scanned range `[S, F]` covers both the
+//!   downtime gap (#751, blocks below head) and the bring-up window (#762,
+//!   `[head, F]`). The watcher records the last scanned block via
+//!   [`WatcherCheckpointStore`] as it runs, so the next boot resumes from there
+//!   and registers channels a client opened while this node was **down**. The backfilled `[S, F]` and the live stream
 //!   (which starts at-or-before `F`) leave no gap; the overlap around `F` and
 //!   any re-scanned blocks below the checkpoint are harmless because
 //!   [`ClientHandler::register_open_channel`] is idempotent. A long gap is
@@ -258,8 +261,10 @@ pub struct PaymentChannelService<P: Provider + Clone + 'static> {
     /// closing channels (#751) — a live `withdraw` racing the shutdown
     /// `closeChannel` benign-reverts and logs a misleading warn. `take()`n by
     /// [`Self::quiesce_redeemer`]; the [`Drop`] impl aborts whatever remains as
-    /// the safety net the `AbortOnDrop` wrapper gave the other tasks.
-    redeemer: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// the safety net the `AbortOnDrop` wrapper gave the other tasks. A
+    /// `std::sync::Mutex` (not `tokio`): the guard is only ever held to `take()`
+    /// the handle, never across an `.await`.
+    redeemer: std::sync::Mutex<Option<JoinHandle<()>>>,
     _sweeper: AbortOnDrop,
 }
 
@@ -352,7 +357,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             pending_store,
             redeem_tx,
             _watcher: AbortOnDrop(watcher),
-            redeemer: tokio::sync::Mutex::new(Some(redeemer)),
+            redeemer: std::sync::Mutex::new(Some(redeemer)),
             _sweeper: AbortOnDrop(sweeper),
         })
     }
@@ -395,7 +400,15 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
     /// Awaiting the aborted handle resolves promptly (cancellation lands at the
     /// task's next await point), so this adds no meaningful latency to shutdown.
     async fn quiesce_redeemer(&self) {
-        let handle = self.redeemer.lock().await.take();
+        // Sync lock: the guard is dropped at the end of this statement (before
+        // the `handle.await` below), so it is never held across an await.
+        // `into_inner` recovers a poisoned lock rather than panicking
+        // (`unwrap`/`expect` are denied workspace-wide).
+        let handle = self
+            .redeemer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(handle) = handle {
             handle.abort();
             let _ = handle.await;
@@ -582,11 +595,15 @@ impl<P: Provider + Clone + 'static> Drop for PaymentChannelService<P> {
         // Safety net mirroring the `AbortOnDrop` the watcher/sweeper get: a
         // service dropped without a graceful `close_open_channels_on_shutdown`
         // (which `take()`s the handle via `quiesce_redeemer`) must not leak the
-        // redemption task. `try_lock` never contends here — `&mut self` means we
-        // hold the only reference — and the held `JoinHandle` is aborted, not
-        // awaited (drop is sync).
-        if let Ok(mut guard) = self.redeemer.try_lock()
-            && let Some(handle) = guard.take()
+        // redemption task. The lock is uncontended (`&mut self` means we hold
+        // the only reference); `into_inner` still aborts the task even if a
+        // prior panic poisoned the lock. The handle is aborted, not awaited
+        // (drop is sync).
+        if let Some(handle) = self
+            .redeemer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
         {
             handle.abort();
         }
