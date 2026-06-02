@@ -662,7 +662,11 @@ fn write_channel_row(w: &mut impl io::Write, c: &ChannelSnapshot) -> io::Result<
         // "<1s ago" so operators know the activity clock has no record
         // (a freshly-restarted node, or a channel that has never billed).
         None => "never".to_string(),
-        Some(secs) => format_age_secs(secs),
+        // Reuse `format_age` (microsecond input) by scaling the whole-second
+        // wire value; `saturating_mul` clamps the (unrealistic) overflow on an
+        // absurd age rather than panicking. Boundary buckets are identical
+        // (covered by `format_age_units`).
+        Some(secs) => format_age(secs.saturating_mul(1_000_000)),
     };
     let eligible = if c.settlement_eligible { "yes" } else { "no" };
     writeln!(
@@ -682,29 +686,6 @@ fn format_usdc(micro: u64) -> String {
     let whole = micro / 1_000_000;
     let frac = micro % 1_000_000;
     format!("{whole}.{frac:06}")
-}
-
-/// Coarse age bucket from a whole-seconds delta (the wire form
-/// `seconds_since_last_voucher` already carries). Mirrors `format_age`'s
-/// unit set (s/m/h/d) but takes seconds rather than microseconds so the
-/// channels path doesn't re-scale a value the server already rounded.
-fn format_age_secs(secs: u64) -> String {
-    const SEC_PER_MIN: u64 = 60;
-    const SEC_PER_HOUR: u64 = 60 * SEC_PER_MIN;
-    const SEC_PER_DAY: u64 = 24 * SEC_PER_HOUR;
-    if secs == 0 {
-        return "<1s ago".to_string();
-    }
-    if secs < SEC_PER_MIN {
-        return format!("{secs}s ago");
-    }
-    if secs < SEC_PER_HOUR {
-        return format!("{}m ago", secs / SEC_PER_MIN);
-    }
-    if secs < SEC_PER_DAY {
-        return format!("{}h ago", secs / SEC_PER_HOUR);
-    }
-    format!("{}d ago", secs / SEC_PER_DAY)
 }
 
 /// Map a `jsonrpsee` client error into the three operator-actionable
@@ -1575,15 +1556,6 @@ mod tests {
         assert_eq!(format_usdc(2_500_000), "2.500000");
         assert_eq!(format_usdc(1), "0.000001");
         assert_eq!(format_usdc(12_345_678), "12.345678");
-    }
-
-    #[test]
-    fn format_age_secs_units() {
-        assert_eq!(format_age_secs(0), "<1s ago");
-        assert_eq!(format_age_secs(2), "2s ago");
-        assert_eq!(format_age_secs(90), "1m ago");
-        assert_eq!(format_age_secs(2 * 3600), "2h ago");
-        assert_eq!(format_age_secs(36 * 3600), "1d ago");
     }
 
     #[test]

@@ -690,7 +690,19 @@ impl AdminRpcServer for AdminRpcImpl {
         let states = tokio::task::spawn_blocking(move || store.load_all())
             .await
             .map_err(|join_err| {
-                tracing::error!(error = %join_err, "channel-store load task panicked");
+                // `JoinError` is returned on panic OR cancellation (e.g.
+                // runtime shutdown); name the actual cause so a cancelled
+                // task at teardown isn't misread as a panic.
+                let cause = if join_err.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "panicked"
+                };
+                tracing::error!(
+                    error = %join_err,
+                    cause,
+                    "channel-store load task did not complete"
+                );
                 ErrorObjectOwned::owned(
                     CHANNEL_STORE_ERROR_CODE,
                     "channel state store load task failed",
@@ -754,16 +766,15 @@ fn build_channel_snapshots(
     // Most recently active first: `Some(age)` sorts ahead of `None`, and
     // within each group smaller age (more recent) first; ties broken by
     // descending outstanding. `Reverse` on the outstanding term puts the
-    // largest claim first.
-    snapshots.sort_by(|a, b| {
-        let key = |s: &ChannelSnapshot| {
-            (
-                s.seconds_since_last_voucher.is_none(),
-                s.seconds_since_last_voucher.unwrap_or(0),
-                std::cmp::Reverse(s.outstanding_micro_usdc),
-            )
-        };
-        key(a).cmp(&key(b))
+    // largest claim first. The key tuple is a total order so `sort_unstable`
+    // (no allocation) is safe — equal keys mean identical sort-relevant
+    // fields, with no insertion-order tiebreak promised.
+    snapshots.sort_unstable_by_key(|s| {
+        (
+            s.seconds_since_last_voucher.is_none(),
+            s.seconds_since_last_voucher.unwrap_or(0),
+            std::cmp::Reverse(s.outstanding_micro_usdc),
+        )
     });
     snapshots
 }
