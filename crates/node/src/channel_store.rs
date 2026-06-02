@@ -28,7 +28,9 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
-use decdn_incentive::store::{ChannelStateStore, PendingSettle, PendingSettleStore, StoreError};
+use decdn_incentive::store::{
+    ChannelStateStore, PendingSettle, PendingSettleStore, StoreError, WatcherCheckpointStore,
+};
 use decdn_incentive::{BuyerChannelState, BuyerChannelStore, ChannelId, ChannelState};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -102,6 +104,18 @@ const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 const PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
     TableDefinition::new("pending_settle_v1");
 
+/// redb table holding the settlement watcher's `ChannelOpened` scan checkpoint
+/// (#751): the last block scanned, so the bring-up backfill resumes across
+/// restarts and covers channels opened while the node was down. Lives in the
+/// same database file as [`CHANNEL_TABLE`]. A single fixed string key holds the
+/// block height; a fixed-width native `u64` value needs no postcard envelope.
+const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
+    TableDefinition::new("watcher_checkpoint_v1");
+
+/// The sole key in [`WATCHER_CHECKPOINT_TABLE`] — the last block scanned for
+/// `ChannelOpened`.
+const WATCHER_CHECKPOINT_KEY: &str = "channel_opened_last_block";
+
 /// On-disk record. All numeric fields use fixed-size big-endian byte arrays
 /// instead of variable-length integers so the encoded value width is stable
 /// across postcard versions and identical to the on-chain representation,
@@ -145,18 +159,43 @@ impl From<&ChannelState> for StoredChannelState {
             client: state.client.into(),
             token: state.token.into(),
             deposit: state.deposit.to_be_bytes(),
-            last_amount: state.last_amount.to_be_bytes(),
-            last_nonce: state.last_nonce.to_be_bytes(),
-            last_bytes_delivered: state.last_bytes_delivered.to_be_bytes(),
+            last_amount: state.last_amount().to_be_bytes(),
+            last_nonce: state.last_nonce().to_be_bytes(),
+            last_bytes_delivered: state.last_bytes_delivered().to_be_bytes(),
         }
     }
 }
 
+/// The schema-v2 trailing payload (#327): the latest voucher signature then the
+/// channel expiry, appended after the [`StoredChannelState`] v1 prefix. Bundled
+/// into one type (#751) so the field order lives in the struct rather than in
+/// mirror-image `record` / `decode_record` call sites.
+///
+/// **On-disk byte-compatibility:** postcard encodes a struct as the bare
+/// concatenation of its fields in declaration order, so encoding this struct is
+/// byte-identical to the previous "append `postcard(signature)` then
+/// `postcard(expires_at)`" layout — no schema bump, and existing v2 records
+/// decode unchanged. `signature` stays a length-prefixed `Vec<u8>` on disk (the
+/// in-memory [`ChannelState`] carries the stronger `Option<[u8; 65]>`; the
+/// conversion lives at the [`StoredChannelState::into_state`] / `record`
+/// boundary). It MUST remain a **trailing** segment, never a prefix field: a v2
+/// reader decoding an existing on-disk v1 record (which has no trailer) would
+/// otherwise read past end-of-input.
+#[derive(Debug, Serialize, Deserialize)]
+struct TrailerV2 {
+    signature: Vec<u8>,
+    expires_at: u64,
+}
+
 impl StoredChannelState {
-    /// Reconstruct the in-memory [`ChannelState`]. `last_signature` and
-    /// `expires_at` are the decoded v2 trailing segments (empty / `0` for v1
-    /// records and channels with no accepted voucher yet) — see
-    /// [`StoredChannelState`]'s doc.
+    /// Reconstruct the in-memory [`ChannelState`] via its hydration constructor
+    /// (the trusted cross-crate writer, #527/#751). `last_signature` and
+    /// `expires_at` are the decoded v2 trailer (empty / `0` for v1 records and
+    /// channels with no accepted voucher yet) — see [`StoredChannelState`]'s
+    /// doc. The on-disk signature is a length-prefixed `Vec<u8>`; it is narrowed
+    /// to the in-memory `Option<[u8; 65]>` here: empty → `None`, exactly 65
+    /// bytes → `Some`, any other length → [`StoreError::Corrupt`] (a malformed
+    /// record we must not silently submit to the on-chain `closeChannel`).
     fn into_state(
         self,
         last_signature: Vec<u8>,
@@ -168,17 +207,29 @@ impl StoredChannelState {
                 supported: SUPPORTED_SCHEMA_VERSION,
             });
         }
-        Ok(ChannelState {
-            channel_id: B256::from(self.channel_id),
-            client: Address::from(self.client),
-            token: Address::from(self.token),
-            deposit: U256::from_be_bytes(self.deposit),
-            last_amount: U256::from_be_bytes(self.last_amount),
-            last_nonce: U256::from_be_bytes(self.last_nonce),
-            last_bytes_delivered: U256::from_be_bytes(self.last_bytes_delivered),
+        let channel_id = B256::from(self.channel_id);
+        let last_signature: Option<[u8; 65]> = if last_signature.is_empty() {
+            None
+        } else {
+            let len = last_signature.len();
+            Some(
+                <[u8; 65]>::try_from(last_signature).map_err(|_| StoreError::Corrupt {
+                    channel_id: Some(channel_id),
+                    detail: format!("stored voucher signature is {len} bytes, expected 0 or 65"),
+                })?,
+            )
+        };
+        Ok(ChannelState::hydrate(
+            channel_id,
+            Address::from(self.client),
+            Address::from(self.token),
+            U256::from_be_bytes(self.deposit),
+            U256::from_be_bytes(self.last_amount),
+            U256::from_be_bytes(self.last_nonce),
+            U256::from_be_bytes(self.last_bytes_delivered),
             last_signature,
             expires_at,
-        })
+        ))
     }
 }
 
@@ -484,30 +535,24 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
             detail: "channel_id in value does not match table key".into(),
         });
     }
-    // Schema v2 (#327) appends two trailing postcard segments after the v1
-    // prefix: the latest voucher signature (`Vec<u8>`) then the channel
-    // expiry (`u64`). Decode them only for a version this binary understands;
-    // a version above `SUPPORTED_SCHEMA_VERSION` is left for `into_state` to
-    // reject (its trailing layout is unknown). A v1 record has no segments
-    // and hydrates with an empty signature and `0` expiry.
-    let (last_signature, expires_at, leftover): (Vec<u8>, u64, &[u8]) = if stored.schema_version
-        >= 2
-        && stored.schema_version <= SUPPORTED_SCHEMA_VERSION
-    {
-        let (sig, after_sig) =
-            postcard::take_from_bytes::<Vec<u8>>(remainder).map_err(|err| StoreError::Corrupt {
-                channel_id: Some(channel_id),
-                detail: format!("postcard decode of voucher signature failed: {err}"),
-            })?;
-        let (exp, rest) =
-            postcard::take_from_bytes::<u64>(after_sig).map_err(|err| StoreError::Corrupt {
-                channel_id: Some(channel_id),
-                detail: format!("postcard decode of channel expiry failed: {err}"),
-            })?;
-        (sig, exp, rest)
-    } else {
-        (Vec::new(), 0, remainder)
-    };
+    // Schema v2 (#327) appends a single [`TrailerV2`] postcard segment after the
+    // v1 prefix (voucher signature then channel expiry). Decode it only for a
+    // version this binary understands; a version above `SUPPORTED_SCHEMA_VERSION`
+    // is left for `into_state` to reject (its trailing layout is unknown). A v1
+    // record has no trailer and hydrates with an empty signature and `0` expiry.
+    let (last_signature, expires_at, leftover): (Vec<u8>, u64, &[u8]) =
+        if stored.schema_version >= 2 && stored.schema_version <= SUPPORTED_SCHEMA_VERSION {
+            let (trailer, rest) =
+                postcard::take_from_bytes::<TrailerV2>(remainder).map_err(|err| {
+                    StoreError::Corrupt {
+                        channel_id: Some(channel_id),
+                        detail: format!("postcard decode of v2 trailer failed: {err}"),
+                    }
+                })?;
+            (trailer.signature, trailer.expires_at, rest)
+        } else {
+            (Vec::new(), 0, remainder)
+        };
     // Forward-compat allowance is bounded: a malicious writer could pad
     // megabytes onto every record and silently inflate every read. Log
     // (don't fail) when the trailer beyond the known fields exceeds a small
@@ -577,20 +622,19 @@ impl ChannelStateStore for PersistentChannelStateStore {
     fn record(&self, state: &ChannelState) -> Result<(), StoreError> {
         let mut encoded = postcard::to_allocvec(&StoredChannelState::from(state))
             .map_err(|err| StoreError::Codec(format!("postcard encode failed: {err}")))?;
-        // Schema v2 (#327): append two trailing postcard segments after the
-        // v1 prefix — the latest voucher signature (`Vec<u8>`, length-prefixed
-        // so an empty signature is still one `0x00` byte) then the channel
-        // expiry (`u64`). `decode_record` reads them back in this order.
-        let sig_encoded = postcard::to_allocvec(&state.last_signature).map_err(|err| {
-            StoreError::Codec(format!(
-                "postcard encode of voucher signature failed: {err}"
-            ))
-        })?;
-        encoded.extend_from_slice(&sig_encoded);
-        let expiry_encoded = postcard::to_allocvec(&state.expires_at).map_err(|err| {
-            StoreError::Codec(format!("postcard encode of channel expiry: {err}"))
-        })?;
-        encoded.extend_from_slice(&expiry_encoded);
+        // Schema v2 (#327): append a single [`TrailerV2`] segment after the v1
+        // prefix (signature then expiry). Byte-identical to the previous
+        // two-segment layout (#751) — see [`TrailerV2`]. The signature is
+        // length-prefixed, so an absent one is still a single `0x00` byte.
+        let trailer = TrailerV2 {
+            // In-memory `Option<[u8; 65]>` → on-disk length-prefixed `Vec<u8>`
+            // (`None` → empty, the v1/no-voucher-yet shape).
+            signature: state.last_signature().map_or_else(Vec::new, |s| s.to_vec()),
+            expires_at: state.expires_at,
+        };
+        let trailer_encoded = postcard::to_allocvec(&trailer)
+            .map_err(|err| StoreError::Codec(format!("postcard encode of v2 trailer: {err}")))?;
+        encoded.extend_from_slice(&trailer_encoded);
         let key: [u8; 32] = state.channel_id.into();
 
         let mut write_txn = self
@@ -1090,6 +1134,48 @@ impl PendingSettleStore for PersistentChannelStateStore {
     }
 }
 
+impl WatcherCheckpointStore for PersistentChannelStateStore {
+    fn load_last_seen_block(&self) -> Result<Option<u64>, StoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        // A never-written checkpoint table means "no prior scan" — first boot.
+        let table = match read_txn.open_table(WATCHER_CHECKPOINT_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let value = table
+            .get(WATCHER_CHECKPOINT_KEY)
+            .map_err(|err| StoreError::Backend(format!("get: {err}")))?;
+        Ok(value.map(|g| g.value()))
+    }
+
+    fn record_last_seen_block(&self, block: u64) -> Result<(), StoreError> {
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        // Force fsync-on-commit, same durability discipline as the other tables.
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(WATCHER_CHECKPOINT_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            table
+                .insert(WATCHER_CHECKPOINT_KEY, block)
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1109,17 +1195,17 @@ mod tests {
     fn sample(byte: u8) -> ChannelState {
         let mut id = [0u8; 32];
         id[31] = byte;
-        ChannelState {
-            channel_id: id.into(),
-            client: address!("00000000000000000000000000000000000000aa"),
-            token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
-            deposit: U256::from(10_000_000u64),
-            last_amount: U256::from(byte) * U256::from(1_000u64),
-            last_nonce: U256::from(byte),
-            last_bytes_delivered: U256::from(byte) * U256::from(1_024u64),
-            last_signature: vec![byte; 65],
-            expires_at: 1_900_000_000 + u64::from(byte),
-        }
+        ChannelState::hydrate(
+            id.into(),
+            address!("00000000000000000000000000000000000000aa"),
+            address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            U256::from(10_000_000u64),
+            U256::from(byte) * U256::from(1_000u64),
+            U256::from(byte),
+            U256::from(byte) * U256::from(1_024u64),
+            Some([byte; 65]),
+            1_900_000_000 + u64::from(byte),
+        )
     }
 
     #[test]
@@ -1399,7 +1485,8 @@ mod tests {
         // then append plausible *further* additive-field bytes (simulating
         // what a future schema beyond v2 would write after the known segments).
         let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
-        encoded.extend_from_slice(&postcard::to_allocvec(&s.last_signature)?);
+        let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
+        encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
         encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
 
@@ -1421,6 +1508,32 @@ mod tests {
         Ok(())
     }
 
+    /// **`TrailerV2` byte-identity (#751).** Bundling the signature + expiry into
+    /// one `TrailerV2` struct MUST encode byte-for-byte identically to the
+    /// previous "append `postcard(signature)` then `postcard(expires_at)`"
+    /// layout — otherwise existing on-disk v2 records would fail to decode. Pins
+    /// the field order so a future reorder is caught here, not on a live store.
+    #[test]
+    fn trailer_v2_encoding_matches_two_segment_layout() -> anyhow::Result<()> {
+        for sig in [Vec::new(), vec![0u8; 65], vec![0xAB; 65]] {
+            let expires_at = 1_900_000_123u64;
+            // The legacy two-segment encoding.
+            let mut legacy = postcard::to_allocvec(&sig)?;
+            legacy.extend_from_slice(&postcard::to_allocvec(&expires_at)?);
+            // The bundled-struct encoding.
+            let bundled = postcard::to_allocvec(&TrailerV2 {
+                signature: sig.clone(),
+                expires_at,
+            })?;
+            anyhow::ensure!(
+                legacy == bundled,
+                "TrailerV2 encoding diverged from the two-segment layout for sig len {}",
+                sig.len(),
+            );
+        }
+        Ok(())
+    }
+
     /// **Schema-v1 backward-compat (#327).** A record written by the
     /// pre-signature binary (`schema_version` 1, no trailing segments) MUST
     /// still load — hydrating with an empty signature and `0` expiry rather
@@ -1430,9 +1543,19 @@ mod tests {
     fn v1_record_hydrates_with_empty_signature() -> anyhow::Result<()> {
         let dir = data_dir()?;
         let store = PersistentChannelStateStore::open(dir.path())?;
-        let mut s = sample(0x55);
-        s.last_signature.clear(); // a v1 record carried no signature
-        s.expires_at = 0; // ...nor an expiry
+        // A v1 record carried no signature (None) nor an expiry (0).
+        let base = sample(0x55);
+        let s = ChannelState::hydrate(
+            base.channel_id,
+            base.client,
+            base.token,
+            base.deposit,
+            base.last_amount(),
+            base.last_nonce(),
+            base.last_bytes_delivered(),
+            None,
+            0,
+        );
 
         // Hand-write a v1-shaped record: prefix only, schema_version forced
         // to 1, NO trailing segments.
@@ -1452,11 +1575,96 @@ mod tests {
         anyhow::ensure!(all.len() == 1);
         let only = all.first().ok_or_else(|| anyhow::anyhow!("missing"))?;
         anyhow::ensure!(
-            only.last_signature.is_empty(),
+            only.last_signature().is_none(),
             "v1 record → empty signature"
         );
         anyhow::ensure!(only.expires_at == 0, "v1 record → zero expiry");
         anyhow::ensure!(*only == s, "v1 prefix fields must round-trip");
+        Ok(())
+    }
+
+    /// **Signature-length narrowing (#751).** The on-disk signature is a
+    /// length-prefixed `Vec<u8>`, but the in-memory `ChannelState` carries the
+    /// stronger `Option<[u8; 65]>`. A stored trailer whose signature is neither
+    /// empty nor exactly 65 bytes MUST be rejected as `Corrupt` rather than
+    /// silently truncated/padded into a value we'd submit to `closeChannel`.
+    #[test]
+    fn wrong_length_signature_trailer_is_corrupt() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s = sample(0x77);
+        let key: [u8; 32] = s.channel_id.into();
+
+        // Hand-write a v2 record whose trailer signature is 64 bytes (one short).
+        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
+        encoded.extend_from_slice(&postcard::to_allocvec(&TrailerV2 {
+            signature: vec![0xCD; 64],
+            expires_at: 1_900_000_000,
+        })?);
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(CHANNEL_TABLE)?;
+            t.insert(&key, encoded.as_slice())?;
+        }
+        tx.commit()?;
+
+        let err = store
+            .load_all()
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("wrong-length signature must reject"))?;
+        anyhow::ensure!(
+            matches!(
+                &err,
+                StoreError::Corrupt { channel_id: Some(id), detail }
+                    if *id == s.channel_id && detail.contains("expected 0 or 65"),
+            ),
+            "expected Corrupt(...expected 0 or 65...), got {err:?}",
+        );
+        Ok(())
+    }
+
+    /// The watcher scan checkpoint (#751) round-trips, overwrites in place, and
+    /// survives a reopen — so the next boot resumes the `ChannelOpened` backfill
+    /// from the persisted block. An empty table reads as `None` (first boot).
+    #[test]
+    fn watcher_checkpoint_round_trip_and_persist() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        {
+            let store = PersistentChannelStateStore::open(dir.path())?;
+            // Never-written table → None (first-ever boot).
+            anyhow::ensure!(store.load_last_seen_block()?.is_none());
+            store.record_last_seen_block(1_000)?;
+            anyhow::ensure!(store.load_last_seen_block()? == Some(1_000));
+            // Overwrite advances the single key (no second row).
+            store.record_last_seen_block(2_500)?;
+            anyhow::ensure!(store.load_last_seen_block()? == Some(2_500));
+        }
+        // Survives a reopen.
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        anyhow::ensure!(
+            store.load_last_seen_block()? == Some(2_500),
+            "checkpoint must survive a restart"
+        );
+        Ok(())
+    }
+
+    /// The checkpoint table shares the one redb file with the channel-state and
+    /// pending-settle tables without colliding.
+    #[test]
+    fn watcher_checkpoint_is_independent_of_other_tables() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s = sample(7);
+        store.record(&s)?;
+        store.record_pending(&PendingSettle {
+            channel_id: s.channel_id,
+            settle_after: 99,
+        })?;
+        store.record_last_seen_block(4_242)?;
+        anyhow::ensure!(store.load_all()?.len() == 1);
+        anyhow::ensure!(store.load_pending()?.len() == 1);
+        anyhow::ensure!(store.load_last_seen_block()? == Some(4_242));
         Ok(())
     }
 

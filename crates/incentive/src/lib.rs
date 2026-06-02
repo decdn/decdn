@@ -56,7 +56,7 @@ pub use probe_sig::{
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, verify_rate};
 pub use store::{
     ChannelStateStore, MemoryChannelStateStore, MemoryPendingSettleStore, PendingSettle,
-    PendingSettleStore, StoreError,
+    PendingSettleStore, StoreError, WatcherCheckpointStore,
 };
 pub use stream_sig::{StreamSlashData, StreamSlashError};
 pub use voucher::{

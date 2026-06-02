@@ -199,16 +199,16 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
     anyhow::ensure!(
-        only.last_nonce == U256::from(2u64),
+        only.last_nonce() == U256::from(2u64),
         "nonce: {}",
-        only.last_nonce
+        only.last_nonce()
     );
     anyhow::ensure!(
-        only.last_bytes_delivered == U256::from(payload.len()),
+        only.last_bytes_delivered() == U256::from(payload.len()),
         "bytes_delivered: {}",
-        only.last_bytes_delivered
+        only.last_bytes_delivered()
     );
-    anyhow::ensure!(only.last_amount > U256::ZERO, "amount must be non-zero");
+    anyhow::ensure!(only.last_amount() > U256::ZERO, "amount must be non-zero");
 
     client_ep.close().await;
     server_ep.close().await;
@@ -278,17 +278,17 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
     anyhow::ensure!(
-        s1.last_nonce == U256::from(1u64),
+        s1.last_nonce() == U256::from(1u64),
         "nonce after 1: {}",
-        s1.last_nonce
+        s1.last_nonce()
     );
-    anyhow::ensure!(s1.last_bytes_delivered == U256::from(payload.len()));
+    anyhow::ensure!(s1.last_bytes_delivered() == U256::from(payload.len()));
 
     // Stream 2: resume from the channel's advanced state.
     let ctx2 = ChannelContext {
-        prior_nonce: s1.last_nonce,
-        prior_bytes_delivered: s1.last_bytes_delivered,
-        prior_amount: s1.last_amount,
+        prior_nonce: s1.last_nonce(),
+        prior_bytes_delivered: s1.last_bytes_delivered(),
+        prior_amount: s1.last_amount(),
         ..channel_context(Arc::clone(&client_signer), deposit)
     };
     let got2 = stream_fetch(
@@ -311,14 +311,14 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
     anyhow::ensure!(
-        s2.last_nonce == U256::from(2u64),
+        s2.last_nonce() == U256::from(2u64),
         "nonce after 2: {}",
-        s2.last_nonce
+        s2.last_nonce()
     );
     anyhow::ensure!(
-        s2.last_bytes_delivered == U256::from(2 * payload.len()),
+        s2.last_bytes_delivered() == U256::from(2 * payload.len()),
         "cumulative bytes: {}",
-        s2.last_bytes_delivered
+        s2.last_bytes_delivered()
     );
 
     client_ep.close().await;
@@ -394,9 +394,9 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
     anyhow::ensure!(
-        only.last_bytes_delivered == U256::from(suffix.len()),
+        only.last_bytes_delivered() == U256::from(suffix.len()),
         "bytes_delivered should be the suffix length, got {}",
-        only.last_bytes_delivered
+        only.last_bytes_delivered()
     );
 
     client_ep.close().await;
@@ -625,6 +625,71 @@ async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
     anyhow::ensure!(
         err.to_string().contains("RetryLater"),
         "error should surface the RetryLater rejection: {err}"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// A channel past its on-chain `expiresAt` is refused in-band with
+/// `VoucherRejected { Expired }` and the stream finishes cleanly (no QUIC reset)
+/// — the client reads an actionable reason instead of an opaque drop (#751).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 4096];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    // Seed a channel whose on-chain expiry is already in the past (Unix second
+    // `1`), so the serve-gate refuses the first voucher.
+    let mut expired = ChannelState::new(channel_id(), client_signer.address(), TOKEN, deposit);
+    expired.expires_at = 1;
+    store.record(&expired)?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(client_signer, deposit);
+
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x9abd,
+        Duration::from_secs(10),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("expired channel must reject the voucher"))?;
+    anyhow::ensure!(
+        err.to_string().contains("Expired"),
+        "error should surface the Expired rejection: {err}"
     );
 
     client_ep.close().await;
@@ -955,14 +1020,14 @@ async fn client_concurrent_same_channel_accepts_one_voucher() -> anyhow::Result<
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
     anyhow::ensure!(
-        only.last_nonce == U256::from(1u64),
+        only.last_nonce() == U256::from(1u64),
         "nonce: {}",
-        only.last_nonce
+        only.last_nonce()
     );
     anyhow::ensure!(
-        only.last_bytes_delivered == U256::from(payload.len()),
+        only.last_bytes_delivered() == U256::from(payload.len()),
         "bytes_delivered: {}",
-        only.last_bytes_delivered
+        only.last_bytes_delivered()
     );
 
     client_ep.close().await;
@@ -1047,12 +1112,19 @@ async fn register_open_channel_is_idempotent_and_preserves_watermark() -> anyhow
     let store = Arc::new(MemoryChannelStateStore::new());
     let client = PrivateKeySigner::random().address();
 
-    // Pre-seed an advanced watermark, as if vouchers had been accepted.
-    let mut advanced = ChannelState::new(channel_id(), client, TOKEN, U256::from(10_000_000u64));
-    advanced.last_nonce = U256::from(5u64);
-    advanced.last_amount = U256::from(4_321u64);
-    advanced.last_bytes_delivered = U256::from(2_048u64);
-    advanced.last_signature = vec![0x11; 65];
+    // Pre-seed an advanced watermark, as if vouchers had been accepted. The
+    // `last_*` fields are private (#751), so build the watermark via `hydrate`.
+    let advanced = ChannelState::hydrate(
+        channel_id(),
+        client,
+        TOKEN,
+        U256::from(10_000_000u64),
+        U256::from(4_321u64),
+        U256::from(5u64),
+        U256::from(2_048u64),
+        Some([0x11; 65]),
+        0,
+    );
     store.record(&advanced)?;
 
     let metrics = Arc::new(Metrics::new());
@@ -1083,11 +1155,11 @@ async fn register_open_channel_is_idempotent_and_preserves_watermark() -> anyhow
         .get(channel_id())?
         .ok_or_else(|| anyhow::anyhow!("channel vanished"))?;
     anyhow::ensure!(
-        after.last_nonce == U256::from(5u64),
+        after.last_nonce() == U256::from(5u64),
         "re-observed ChannelOpened reset the watermark to {} (reopened #527 replay window)",
-        after.last_nonce
+        after.last_nonce()
     );
-    anyhow::ensure!(after.last_amount == U256::from(4_321u64));
+    anyhow::ensure!(after.last_amount() == U256::from(4_321u64));
     Ok(())
 }
 

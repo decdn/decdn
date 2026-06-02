@@ -101,7 +101,7 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
         let mut state = state0.clone();
         let v5 = signed_voucher(&signer, &domain, channel_id, 5_000, 5, 5_000_000)?;
         state.apply_voucher(&v5, &domain, &store)?;
-        anyhow::ensure!(state.last_nonce == U256::from(5u64));
+        anyhow::ensure!(state.last_nonce() == U256::from(5u64));
     }
 
     // Phase 2: simulate the restart. Reopen the store, rebuild `state` from
@@ -111,9 +111,9 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
     let store = PersistentChannelStateStore::open(dir.path())?;
     let mut state = hydrate(&store, channel_id, &signer)?;
     anyhow::ensure!(
-        state.last_nonce == U256::from(5u64),
+        state.last_nonce() == U256::from(5u64),
         "post-restart state must reflect the persisted last_nonce, got {:?}",
-        state.last_nonce,
+        state.last_nonce(),
     );
 
     let v3 = signed_voucher(&signer, &domain, channel_id, 3_000, 3, 3_000_000)?;
@@ -127,7 +127,7 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
     );
 
     // And: the in-memory state must not have advanced.
-    anyhow::ensure!(state.last_nonce == U256::from(5u64));
+    anyhow::ensure!(state.last_nonce() == U256::from(5u64));
     Ok(())
 }
 
@@ -185,8 +185,8 @@ fn forward_progress_after_restart_is_accepted() -> anyhow::Result<()> {
     let mut state = hydrate(&store, channel_id, &signer)?;
     let v6 = signed_voucher(&signer, &domain, channel_id, 6_000, 6, 6_000_000)?;
     state.apply_voucher(&v6, &domain, &store)?;
-    anyhow::ensure!(state.last_nonce == U256::from(6u64));
-    anyhow::ensure!(state.last_amount == U256::from(6_000u64));
+    anyhow::ensure!(state.last_nonce() == U256::from(6u64));
+    anyhow::ensure!(state.last_amount() == U256::from(6_000u64));
     Ok(())
 }
 
@@ -235,7 +235,7 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
                 .sign(&signer_a, &domain_a)?;
                 state.apply_voucher(&v, &domain_a, &*store_a)?;
             }
-            Ok(state.last_nonce)
+            Ok(state.last_nonce())
         })
         .await?
     });
@@ -254,7 +254,7 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
                 .sign(&signer_b, &domain_b)?;
                 state.apply_voucher(&v, &domain_b, &*store_b)?;
             }
-            Ok(state.last_nonce)
+            Ok(state.last_nonce())
         })
         .await?
     });
@@ -275,8 +275,8 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
         .iter()
         .find(|s| s.channel_id == chan_b)
         .ok_or_else(|| anyhow::anyhow!("channel B missing"))?;
-    anyhow::ensure!(a_final.last_nonce == U256::from(50u64));
-    anyhow::ensure!(b_final.last_nonce == U256::from(50u64));
+    anyhow::ensure!(a_final.last_nonce() == U256::from(50u64));
+    anyhow::ensure!(b_final.last_nonce() == U256::from(50u64));
     Ok(())
 }
 

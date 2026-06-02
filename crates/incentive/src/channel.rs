@@ -34,12 +34,14 @@ pub type ChannelId = B256;
 ///
 /// **Field invariant (#527):** the `last_*` fields MUST only be advanced
 /// through [`ChannelState::apply_voucher`] (the validated, persisted-commit
-/// path) or hydrated from a [`crate::ChannelStateStore`] (the trusted
-/// on-disk path). Direct field assignment from outside this crate bypasses
-/// the voucher-replay guard from ADR 003 §Off-chain voucher state
-/// persistence. The fields stay `pub` because the cross-crate hydration
-/// path (`decdn-node` reading `channels.redb`) legitimately needs
-/// struct-literal construction — but no other writer should exist.
+/// path) or hydrated from a [`crate::ChannelStateStore`] (the trusted on-disk
+/// path). Direct field assignment from outside this crate would bypass the
+/// voucher-replay guard from ADR 003 §Off-chain voucher state persistence, so
+/// the four replay-critical fields are **private** and reachable only through
+/// the getters ([`Self::last_amount`] et al.) and the two trusted writers; the
+/// cross-crate hydration path (`decdn-node` reading `channels.redb`) goes
+/// through [`Self::hydrate`] rather than a struct literal (#751). This makes the
+/// invariant compiler-enforced rather than doc-enforced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelState {
     /// Channel identifier (matches the on-chain `channelId`).
@@ -54,20 +56,25 @@ pub struct ChannelState {
     pub deposit: U256,
     /// Cumulative amount of the most-recently-accepted voucher
     /// (token base units). `U256::ZERO` until the first voucher is applied.
-    pub last_amount: U256,
+    /// Private (#527/#751) — read via [`Self::last_amount`].
+    last_amount: U256,
     /// Sequence number of the most-recently-accepted voucher. `U256::ZERO`
     /// before any voucher is applied — matches the on-chain
     /// `claimedNonce == 0` sentinel from ADR 003 §Voucher Nonce Convention.
-    pub last_nonce: U256,
+    /// Private (#527/#751) — read via [`Self::last_nonce`].
+    last_nonce: U256,
     /// Cumulative bytes delivered as of the most-recently-accepted voucher.
-    pub last_bytes_delivered: U256,
-    /// Raw bytes (`r‖s‖v`, 65 bytes) of the signature on the
-    /// most-recently-accepted voucher — the `signature` argument the seller
-    /// path submits to the on-chain `closeChannel` / `withdraw` (#327). Empty
-    /// until the first voucher is applied (and for channels hydrated from a
-    /// pre-signature store schema). Same encoding as the
-    /// [`crate::client_bridge`] wire form.
-    pub last_signature: Vec<u8>,
+    /// Private (#527/#751) — read via [`Self::last_bytes_delivered`].
+    last_bytes_delivered: U256,
+    /// Signature (`r‖s‖v`, exactly 65 bytes) on the most-recently-accepted
+    /// voucher — the `signature` argument the seller path submits to the
+    /// on-chain `closeChannel` / `withdraw` (#327). `None` until the first
+    /// voucher is applied (and for channels hydrated from a pre-signature store
+    /// schema); `Some` is always exactly 65 bytes, so "empty or exactly 65
+    /// bytes" is unrepresentable-when-wrong (#751). Same `r‖s‖v` encoding as the
+    /// [`crate::client_bridge`] wire form. Private — read via
+    /// [`Self::last_signature`].
+    last_signature: Option<[u8; 65]>,
     /// On-chain channel expiry (Unix seconds), from the `ChannelOpened` event.
     /// `0` means "unknown / not tracked" (channels constructed by [`Self::new`]
     /// without a chain source, and records hydrated from a pre-expiry store
@@ -96,9 +103,70 @@ impl ChannelState {
             last_amount: U256::ZERO,
             last_nonce: U256::ZERO,
             last_bytes_delivered: U256::ZERO,
-            last_signature: Vec::new(),
+            last_signature: None,
             expires_at: 0,
         }
+    }
+
+    /// Reconstruct channel state from a trusted persistent store (the only
+    /// cross-crate path allowed to set the private replay-critical `last_*`
+    /// fields, #527/#751). `decdn-node`'s `channels.redb` decoder calls this
+    /// instead of a struct literal so the [field invariant](Self) stays
+    /// compiler-enforced. `last_signature` is `None` for a channel with no
+    /// accepted voucher yet (or a pre-signature store schema) and otherwise the
+    /// exact 65-byte `r‖s‖v` signature.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn hydrate(
+        channel_id: ChannelId,
+        client: Address,
+        token: Address,
+        deposit: U256,
+        last_amount: U256,
+        last_nonce: U256,
+        last_bytes_delivered: U256,
+        last_signature: Option<[u8; 65]>,
+        expires_at: u64,
+    ) -> Self {
+        Self {
+            channel_id,
+            client,
+            token,
+            deposit,
+            last_amount,
+            last_nonce,
+            last_bytes_delivered,
+            last_signature,
+            expires_at,
+        }
+    }
+
+    /// Cumulative amount of the most-recently-accepted voucher (`U256::ZERO`
+    /// until the first voucher). See the [field invariant](Self).
+    #[must_use]
+    pub const fn last_amount(&self) -> U256 {
+        self.last_amount
+    }
+
+    /// Sequence number of the most-recently-accepted voucher (`U256::ZERO`
+    /// before any voucher). See the [field invariant](Self).
+    #[must_use]
+    pub const fn last_nonce(&self) -> U256 {
+        self.last_nonce
+    }
+
+    /// Cumulative bytes delivered as of the most-recently-accepted voucher.
+    /// See the [field invariant](Self).
+    #[must_use]
+    pub const fn last_bytes_delivered(&self) -> U256 {
+        self.last_bytes_delivered
+    }
+
+    /// The most-recently-accepted voucher's 65-byte `r‖s‖v` signature, or
+    /// `None` if no voucher has been applied. See the [field invariant](Self).
+    #[must_use]
+    pub const fn last_signature(&self) -> Option<&[u8; 65]> {
+        self.last_signature.as_ref()
     }
 
     /// Validate `signed` against this channel's invariants and, on success,
@@ -199,8 +267,9 @@ impl ChannelState {
         next.last_bytes_delivered = signed.voucher.bytes_delivered;
         // Retain the signature so the seller path can submit this exact
         // voucher to the on-chain `closeChannel` / `withdraw` (#327). Same
-        // `r‖s‖v` encoding as the wire form in `client_bridge`.
-        next.last_signature = signed.signature.as_bytes().to_vec();
+        // `r‖s‖v` encoding as the wire form in `client_bridge`;
+        // `Signature::as_bytes` is exactly 65 bytes.
+        next.last_signature = Some(signed.signature.as_bytes());
         store.record(&next)?;
 
         // Nonce-gap detection (#747). The monotonicity guard above rejected
