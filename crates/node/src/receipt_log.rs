@@ -37,6 +37,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use alloy::primitives::U256;
+use iroh_blobs::Hash;
 use serde::{Deserialize, Serialize};
 
 /// File name of the receipt log within `data_dir`.
@@ -65,42 +67,108 @@ const RECEIPT_LOG_FILE_MODE: u32 = 0o600;
 ///   show; it is reconstructed from the 32-byte big-endian wire nonce.
 ///
 /// `size` is the byte count covered by *this* voucher interval (the newly
-/// delivered, now-paid bytes), and `timestamp` is the node's wall-clock Unix
-/// time (seconds) at acceptance.
+/// delivered, now-paid bytes), and `timestamp_secs` is the node's wall-clock
+/// Unix time (seconds) at acceptance.
+///
+/// # Invariants
+///
+/// The fields are **private** and the only public constructor is [`new`], which
+/// renders the hex and decimal-`uint256` strings from typed inputs. This makes
+/// the invariants type-owned: a receipt cannot be built field-wise, and serde's
+/// derived `Deserialize` cannot synthesize one with a malformed `hash` /
+/// `client_node_id` / `voucher_nonce` from outside the crate (the fields stay
+/// private to readers). Accessor methods expose the rendered values read-only.
+///
+/// Field-wise construction from outside the crate does not compile (the fields
+/// are private), so the validating [`new`] is the only public path in:
+///
+/// ```compile_fail
+/// use decdn_node::receipt_log::DownloadReceipt;
+/// // ERROR: fields `hash`, `size`, ... are private — invariant cannot be bypassed.
+/// let _ = DownloadReceipt {
+///     hash: "not-a-hash".to_string(),
+///     size: 1,
+///     client_node_id: "nope".to_string(),
+///     voucher_nonce: "0xdeadbeef".to_string(),
+///     timestamp: 0,
+/// };
+/// ```
+///
+/// [`new`]: DownloadReceipt::new
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadReceipt {
     /// BLAKE3 content hash of the delivered blob, lower-hex (64 chars).
-    pub hash: String,
+    hash: String,
     /// Bytes covered by this voucher interval (the newly paid delivery).
-    pub size: u64,
+    size: u64,
     /// iroh `NodeId` of the paying client, lower-hex (64 chars).
-    pub client_node_id: String,
+    client_node_id: String,
     /// Accepted voucher sequence number, decimal `uint256` string.
-    pub voucher_nonce: String,
-    /// Node wall-clock Unix time (seconds) at voucher acceptance.
-    pub timestamp: u64,
+    voucher_nonce: String,
+    /// Node wall-clock Unix time (seconds) at voucher acceptance. The wire key
+    /// stays `timestamp` (preserved via `#[serde(rename)]`) so the on-disk JSONL
+    /// format is byte-identical to the original; the Rust field name carries the
+    /// unit explicitly.
+    #[serde(rename = "timestamp")]
+    timestamp_secs: u64,
 }
 
 impl DownloadReceipt {
-    /// Build a receipt from the raw delivery-path values. `hash_bytes` and
-    /// `client_node_id_bytes` are the raw 32-byte content hash and iroh node
-    /// id; `voucher_nonce` is the decimal string of the accepted voucher's
-    /// `uint256` nonce (rendered by the caller, which holds the alloy `U256`).
+    /// Build a receipt from the typed delivery-path values, rendering every
+    /// invariant inside the constructor:
+    ///
+    /// - `hash` is the [`iroh_blobs::Hash`] of the delivered blob — a distinct
+    ///   type from `client_node_id_bytes`, so the two 32-byte identifiers cannot
+    ///   be transposed at a call site. Rendered to lower-hex (no `0x`).
+    /// - `client_node_id_bytes` is the raw 32-byte iroh node id, lower-hex.
+    /// - `voucher_nonce` is the accepted voucher's `uint256` nonce; the decimal
+    ///   string is rendered here so the "decimal uint256" invariant is owned by
+    ///   the type, not the caller.
     #[must_use]
     pub fn new(
-        hash_bytes: &[u8; 32],
+        hash: &Hash,
         size: u64,
         client_node_id_bytes: &[u8; 32],
-        voucher_nonce: String,
-        timestamp: u64,
+        voucher_nonce: U256,
+        timestamp_secs: u64,
     ) -> Self {
         Self {
-            hash: hex_lower(hash_bytes),
+            hash: hex_lower(hash.as_bytes()),
             size,
             client_node_id: hex_lower(client_node_id_bytes),
-            voucher_nonce,
-            timestamp,
+            voucher_nonce: voucher_nonce.to_string(),
+            timestamp_secs,
         }
+    }
+
+    /// BLAKE3 content hash of the delivered blob, lower-hex (64 chars, no `0x`).
+    #[must_use]
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    /// Bytes covered by this voucher interval (the newly paid delivery).
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// iroh `NodeId` of the paying client, lower-hex (64 chars, no `0x`).
+    #[must_use]
+    pub fn client_node_id(&self) -> &str {
+        &self.client_node_id
+    }
+
+    /// Accepted voucher sequence number, decimal `uint256` string.
+    #[must_use]
+    pub fn voucher_nonce(&self) -> &str {
+        &self.voucher_nonce
+    }
+
+    /// Node wall-clock Unix time (seconds) at voucher acceptance.
+    #[must_use]
+    pub const fn timestamp_secs(&self) -> u64 {
+        self.timestamp_secs
     }
 }
 
@@ -255,22 +323,55 @@ mod tests {
 
     fn sample(byte: u8) -> DownloadReceipt {
         DownloadReceipt::new(
-            &[byte; 32],
+            &Hash::from_bytes([byte; 32]),
             u64::from(byte) * 1024,
             &[byte ^ 0xff; 32],
-            byte.to_string(),
+            U256::from(byte),
             1_700_000_000 + u64::from(byte),
         )
     }
 
     #[test]
     fn new_renders_hash_and_node_id_as_lower_hex() {
-        let r = DownloadReceipt::new(&[0xab; 32], 42, &[0x01; 32], "7".into(), 123);
-        assert_eq!(r.hash, "ab".repeat(32));
-        assert_eq!(r.client_node_id, "01".repeat(32));
-        assert_eq!(r.size, 42);
-        assert_eq!(r.voucher_nonce, "7");
-        assert_eq!(r.timestamp, 123);
+        let r = DownloadReceipt::new(
+            &Hash::from_bytes([0xab; 32]),
+            42,
+            &[0x01; 32],
+            U256::from(7u8),
+            123,
+        );
+        assert_eq!(r.hash(), "ab".repeat(32));
+        assert_eq!(r.client_node_id(), "01".repeat(32));
+        assert_eq!(r.size(), 42);
+        assert_eq!(r.voucher_nonce(), "7");
+        assert_eq!(r.timestamp_secs(), 123);
+    }
+
+    /// Lock the on-disk JSONL wire format: the serialized line for a known input
+    /// must be byte-identical to the original schema (lower-hex `hash` /
+    /// `client_node_id`, decimal-uint256 `voucher_nonce` string, Unix-seconds
+    /// `timestamp` key, `size` u64). This guards the private-field +
+    /// `#[serde(rename = "timestamp")]` refactor against any wire drift.
+    #[test]
+    fn serialized_line_is_wire_stable() -> anyhow::Result<()> {
+        let r = DownloadReceipt::new(
+            &Hash::from_bytes([0xab; 32]),
+            4096,
+            &[0x01; 32],
+            U256::from(42u8),
+            1_700_000_000,
+        );
+        let line = serde_json::to_string(&r)?;
+        let expected = format!(
+            "{{\"hash\":\"{}\",\"size\":4096,\"client_node_id\":\"{}\",\"voucher_nonce\":\"42\",\"timestamp\":1700000000}}",
+            "ab".repeat(32),
+            "01".repeat(32),
+        );
+        anyhow::ensure!(
+            line == expected,
+            "wire format drifted:\n got: {line}\nwant: {expected}"
+        );
+        Ok(())
     }
 
     #[test]

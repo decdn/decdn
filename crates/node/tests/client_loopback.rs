@@ -42,6 +42,7 @@ use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_fr
 use iroh::{Endpoint, EndpointAddr};
 
 mod support;
+use decdn_node::receipt_log::DownloadReceipt;
 use support::{
     FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
     build_handler_full_with_receipts, cache_with_blob, empty_cache, fresh_key, local_endpoint,
@@ -51,6 +52,16 @@ use support::{
 const CHAIN_ID: u64 = 421_614;
 const TOKEN: Address = Address::repeat_byte(0x22);
 const RATE_PER_MB: u64 = 10;
+
+/// Lower-hex encode bytes (no `0x`), matching `DownloadReceipt`'s rendering so a
+/// test can reconstruct the expected `hash` / `client_node_id` strings.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
 
 fn slash_domain() -> Eip712Domain {
     slash_judge_domain(CHAIN_ID, Address::repeat_byte(0x11))
@@ -292,16 +303,9 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
         recorded.len()
     );
 
-    let hex_lower = |bytes: &[u8]| -> String {
-        use std::fmt::Write as _;
-        bytes.iter().fold(String::new(), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
-    };
     let want_hash = hex_lower(hash.as_bytes());
     let want_node = hex_lower(client_node_id.as_bytes());
-    let total: u64 = recorded.iter().map(|r| r.size).sum();
+    let total: u64 = recorded.iter().map(DownloadReceipt::size).sum();
     anyhow::ensure!(
         total == payload.len() as u64,
         "receipt sizes sum to {total}, expected {}",
@@ -309,19 +313,22 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
     );
     for (i, r) in recorded.iter().enumerate() {
         anyhow::ensure!(
-            r.hash == want_hash,
+            r.hash() == want_hash,
             "receipt[{i}] hash {} != {want_hash}",
-            r.hash
+            r.hash()
         );
         anyhow::ensure!(
-            r.client_node_id == want_node,
+            r.client_node_id() == want_node,
             "receipt[{i}] client_node_id {} != {want_node}",
-            r.client_node_id
+            r.client_node_id()
         );
-        anyhow::ensure!(r.size > 0, "receipt[{i}] size must be > 0");
-        anyhow::ensure!(r.timestamp > 0, "receipt[{i}] timestamp must be set");
+        anyhow::ensure!(r.size() > 0, "receipt[{i}] size must be > 0");
+        anyhow::ensure!(r.timestamp_secs() > 0, "receipt[{i}] timestamp must be set");
     }
-    let nonces: Vec<&str> = recorded.iter().map(|r| r.voucher_nonce.as_str()).collect();
+    let nonces: Vec<&str> = recorded
+        .iter()
+        .map(DownloadReceipt::voucher_nonce)
+        .collect();
     anyhow::ensure!(
         nonces == vec!["1", "2"],
         "voucher nonces {nonces:?} != [1, 2]"

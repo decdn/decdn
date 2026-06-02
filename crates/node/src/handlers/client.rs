@@ -782,16 +782,19 @@ impl ClientHandler {
         client_node_id: B256,
         wire_nonce: [u8; 32],
     ) {
+        let voucher_nonce = U256::from_be_bytes(wire_nonce);
         let receipt = DownloadReceipt::new(
-            hash.as_bytes(),
+            &hash,
             delta_bytes,
             &client_node_id.0,
-            U256::from_be_bytes(wire_nonce).to_string(),
+            voucher_nonce,
             crate::payment_settlement::unix_now(),
         );
         if let Err(e) = self.receipt_log.append(&receipt) {
             tracing::warn!(
                 %hash,
+                %client_node_id,
+                %voucher_nonce,
                 error = %e,
                 event = "download_receipt_write_failed",
                 "failed to append download receipt; payment already committed (audit log only)"
