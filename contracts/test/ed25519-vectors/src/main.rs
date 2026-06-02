@@ -147,12 +147,12 @@ fn emit_register_node_vector() {
     );
 
     // Build the abi.encodePacked preimage: 32 + 20 + 32 + 8 = 92 bytes.
-    let mut preimage = Vec::with_capacity(92);
-    preimage.extend_from_slice(&node_id);
-    preimage.extend_from_slice(&REG_OPERATOR);
-    preimage.extend_from_slice(&u256_be(CHAIN_ID));
-    preimage.extend_from_slice(&NONCE.to_be_bytes());
-    let digest: [u8; 32] = Keccak256::digest(&preimage).into();
+    let mut preimage = [0u8; 92];
+    preimage[0..32].copy_from_slice(&node_id);
+    preimage[32..52].copy_from_slice(&REG_OPERATOR);
+    preimage[52..84].copy_from_slice(&u256_be(CHAIN_ID));
+    preimage[84..92].copy_from_slice(&NONCE.to_be_bytes());
+    let digest: [u8; 32] = Keccak256::digest(preimage).into();
 
     // Sign the 32-byte digest as the ed25519 message; confirm strict acceptance.
     let sig = sk.sign(&digest);

@@ -210,8 +210,13 @@ contract CapacityBondRegionE2ETest is Test {
         vm.prank(admin);
         bond.grantRole(blacklistRole, address(blacklist));
 
+        // Both eject side-effect events fire, in order: the blacklist marker
+        // then the node auto-eject carrying the remaining bond (MIN_BOND — the
+        // operator bonded the minimum and was never slashed).
         vm.expectEmit(true, false, false, false, address(bond));
         emit CapacityBond.EjectedByBlacklist(REG_OPERATOR);
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.NodeAutoEjected(REG_NODE_ID, MIN_BOND);
         vm.prank(admin);
         blacklist.addOperator(REG_OPERATOR);
 
