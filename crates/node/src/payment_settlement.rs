@@ -44,6 +44,13 @@
 //!   already-settled channel is self-correcting (the redeemer/sweeper gate on
 //!   the live on-chain status, and a stale deposit only over-restricts vouchers
 //!   conservatively). Ordered multi-event backfill remains out of scope.
+//!
+//!   If a *live* `ChannelOpened` for this node fails to persist (a transient
+//!   store error), the checkpoint is held below its block and the backfill is
+//!   re-armed, so the channel is recovered on the next resubscribe or restart —
+//!   not mid-cycle. On a healthy, never-resubscribing stream that window can be
+//!   long; the client's vouchers are rejected `WrongChannel` until then, but
+//!   nothing is stranded (the held checkpoint guarantees a restart re-covers it).
 //! - **Redemption (threshold + on-shutdown).** On a redeem hint emitted by
 //!   the voucher-accept path, it reads the latest persisted voucher and the
 //!   on-chain `withdrawnAmount`, and submits `withdraw` once the accrued

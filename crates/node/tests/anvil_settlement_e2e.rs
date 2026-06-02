@@ -840,7 +840,9 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
 
     // Re-fund + re-approve so the deposit is covered regardless of prior spend
     // (ERC-20 `approve` overwrites the allowance), then open the channel while no
-    // service is watching. It is the client's 4th channel → nonce 3.
+    // service is watching. Derive the channel id from the live per-client nonce
+    // (read before the open) rather than hardcoding it, so the proof survives any
+    // change to the earlier channel count.
     usdc_admin
         .mint(
             client_addr,
@@ -859,17 +861,32 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         .await?
         .get_receipt()
         .await?;
-    let down_id = derive_channel_id(client_addr, node_addr, 3);
+    let down_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
+    let down_id = derive_channel_id(client_addr, node_addr, down_nonce.to::<u64>());
     pc_client
         .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
         .send()
         .await?
         .get_receipt()
         .await?;
+    let down_block = node_provider.get_block_number().await?;
     // While down, nothing registered it.
     anyhow::ensure!(
         store.get(down_id)?.is_none(),
         "channel opened while the service is down must be unknown until re-bootstrap"
+    );
+
+    // Mine a block so service2's bootstrap head is STRICTLY above the downtime
+    // channel's block. This is what makes the proof specific to #751: the #762
+    // within-session backfill floors at the bootstrap head and scans
+    // `[head, F]`, which now EXCLUDES `down_block` — so only the persisted
+    // checkpoint floor (#751) can pull the backfill start low enough to re-cover
+    // it. Without this, `head == down_block` and the test would pass on the #762
+    // path alone, proving nothing.
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    anyhow::ensure!(
+        node_provider.get_block_number().await? > down_block,
+        "evm_mine must advance head above the downtime channel block"
     );
 
     // Node comes back up against the same store. Bootstrap re-reads the persisted
