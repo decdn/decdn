@@ -163,10 +163,16 @@ pub trait PendingSettleStore: Send + Sync {
 /// reorg margin) up to the live-filter install block; `register_open_channel`
 /// is idempotent, so re-scanning the overlap is harmless.
 ///
-/// Implementations MUST commit durably (fsync, on disk-backed impls) before
+/// A directly disk-backed implementation MUST commit durably (fsync) before
 /// returning `Ok` from `record_last_seen_block`, mirroring the
-/// [`ChannelStateStore`] durability contract — a lost checkpoint silently
-/// widens the rescan (safe, just more RPC), never narrows it.
+/// [`ChannelStateStore`] durability contract. A debouncing *decorator* MAY
+/// relax that per-call fsync — buffering in memory and coarsening the durable
+/// write cadence — provided it preserves the two invariants this contract
+/// rests on: the persisted block is **monotonic** (never lowered) and the
+/// latest buffered block is forced out on graceful shutdown via
+/// [`flush`](WatcherCheckpointStore::flush). Both relaxations are safe because
+/// a lost or lagging checkpoint only ever silently widens the rescan (more
+/// RPC), never narrows it.
 pub trait WatcherCheckpointStore: Send + Sync {
     /// The last block scanned for `ChannelOpened`, or `None` on a never-written
     /// store (first-ever boot — there is no downtime gap to cover, so the

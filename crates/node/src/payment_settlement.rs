@@ -1180,6 +1180,12 @@ struct DebounceState {
     /// (`record` only raises it). `None` once flushed/forwarded — i.e. equal to
     /// `last_persisted`.
     pending: Option<u64>,
+    /// Whether the first in-process `record` has run. Until it does we lazily
+    /// fold the inner store's existing checkpoint into `last_persisted` (the
+    /// constructor stays I/O-free), and we force that first record durable so a
+    /// restart re-anchors the floor to the live scan position promptly rather
+    /// than lingering at a stale on-disk value.
+    seeded: bool,
 }
 
 /// Debouncing decorator over a [`WatcherCheckpointStore`] (#784). Buffers
@@ -1268,6 +1274,7 @@ impl DebouncedCheckpointStore {
                 last_persisted: None,
                 last_persist_at: now,
                 pending: None,
+                seeded: false,
             }),
         }
     }
@@ -1307,9 +1314,22 @@ impl WatcherCheckpointStore for DebouncedCheckpointStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // On the first in-process record, fold the inner store's existing
+        // checkpoint into `last_persisted`. The constructor leaves it `None`
+        // (staying I/O-free and infallible), so without this a fresh wrapper
+        // around an *already-populated* inner store could forward a block BELOW
+        // its existing checkpoint and regress the on-disk floor. Seeding the
+        // high-water guard with that floor keeps the monotonic-floor contract
+        // for any caller, not just the watcher loop (which only feeds increasing
+        // blocks). `first_record` is captured before flipping the flag so we can
+        // still force that first advance durable (re-anchor after a restart).
+        let first_record = !state.seeded;
+        if first_record {
+            state.seeded = true;
+            state.last_persisted = self.inner.load_last_seen_block()?;
+        }
         // Buffer the latest block (monotonic: never lower an already-buffered or
-        // already-persisted floor). The watcher feeds strictly increasing blocks,
-        // but guard here too so the decorator's contract holds for any caller.
+        // already-persisted floor).
         let highest = state
             .pending
             .max(state.last_persisted)
@@ -1317,13 +1337,21 @@ impl WatcherCheckpointStore for DebouncedCheckpointStore {
             .max(block);
         state.pending = Some(highest);
 
+        // Nothing to persist if the guarded high-water is already at/below the
+        // durable floor — an out-of-order or lower-than-floor record. Skip the
+        // write entirely (no regression, no redundant fsync) regardless of the
+        // first-record rule below.
+        if state.last_persisted == Some(highest) {
+            return Ok(());
+        }
+
         let blocks_ahead = highest.saturating_sub(state.last_persisted.unwrap_or(0));
         let elapsed = (self.clock)().saturating_duration_since(state.last_persist_at);
-        // First write (nothing persisted yet) always goes through so the floor is
-        // established promptly; thereafter debounce on either threshold.
-        let due = state.last_persisted.is_none()
-            || blocks_ahead >= self.flush_blocks
-            || elapsed >= self.flush_interval;
+        // The first record that actually advances the floor always goes through,
+        // re-anchoring the durable checkpoint to the live scan position promptly
+        // after a (re)start; thereafter debounce on either threshold.
+        let due =
+            first_record || blocks_ahead >= self.flush_blocks || elapsed >= self.flush_interval;
         if due {
             self.persist_locked(&mut state, highest)
         } else {
@@ -2056,6 +2084,41 @@ mod tests {
         store.record_last_seen_block(50)?;
         store.flush()?;
         assert_eq!(inner.load_last_seen_block()?, Some(100));
+        Ok(())
+    }
+
+    /// A fresh wrapper around an *already-populated* inner store must not regress
+    /// its on-disk floor even if its very first `record` carries a lower block —
+    /// the decorator seeds `last_persisted` from the inner store before applying
+    /// the high-water guard, so the existing checkpoint is honored.
+    #[test]
+    fn debounce_seeds_floor_from_populated_inner_store() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        // Inner store already has a checkpoint at 1000 (e.g. a prior boot).
+        inner.record_last_seen_block(1000)?;
+        let writes_before = inner.writes();
+
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            10,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        // First-ever record on the fresh wrapper carries a LOWER block.
+        store.record_last_seen_block(500)?;
+        store.flush()?;
+        assert_eq!(
+            inner.load_last_seen_block()?,
+            Some(1000),
+            "a lower first record must not regress the inner store's floor"
+        );
+        assert_eq!(
+            inner.writes(),
+            writes_before,
+            "no redundant write below the existing floor"
+        );
+        // The decorator also reports the higher persisted floor, not the input.
+        assert_eq!(store.load_last_seen_block()?, Some(1000));
         Ok(())
     }
 
