@@ -26,6 +26,7 @@ use decdn_incentive::ChannelStateStore;
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
+use decdn_node::receipt_log::{DownloadReceipt, ReceiptLog};
 use decdn_protocol::MAX_RATE_PER_MB;
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
@@ -121,8 +122,48 @@ pub struct HandlerDomains {
     pub binding: Eip712Domain,
 }
 
+/// In-memory [`ReceiptLog`] fake for tests: collects appended receipts so a
+/// suite can assert what was recorded on the voucher-accept path (issue #248).
+#[derive(Debug, Default)]
+pub struct VecReceiptLog {
+    inner: std::sync::Mutex<Vec<DownloadReceipt>>,
+}
+
+impl VecReceiptLog {
+    /// Snapshot the receipts appended so far.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<DownloadReceipt> {
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+impl ReceiptLog for VecReceiptLog {
+    fn append(&self, receipt: &DownloadReceipt) -> std::io::Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| std::io::Error::other("VecReceiptLog mutex poisoned"))?
+            .push(receipt.clone());
+        Ok(())
+    }
+}
+
+/// A [`ReceiptLog`] whose `append` always errors. Proves the voucher-accept
+/// path treats a receipt-log write failure as non-fatal (issue #248): the
+/// payment already committed to the channel store, so delivery must still
+/// succeed.
+#[derive(Debug, Default)]
+pub struct FailingReceiptLog;
+
+impl ReceiptLog for FailingReceiptLog {
+    fn append(&self, _receipt: &DownloadReceipt) -> std::io::Result<()> {
+        Err(std::io::Error::other("simulated receipt-log write failure"))
+    }
+}
+
 /// Build a [`ClientHandler`] over `cache`/`store` with explicit domains and the
 /// `max_blob_size_bytes` (`0` == unlimited) / `max_concurrent_streams` knobs.
+/// Uses a throwaway in-memory receipt log; tests asserting receipt contents use
+/// [`build_handler_full_with_receipts`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_handler_full(
     server_id: iroh::PublicKey,
@@ -131,6 +172,37 @@ pub fn build_handler_full(
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
     store: Arc<dyn ChannelStateStore>,
+    rate: u64,
+    domains: &HandlerDomains,
+    max_blob_size_bytes: u64,
+    max_concurrent_streams: usize,
+) -> anyhow::Result<Arc<ClientHandler>> {
+    build_handler_full_with_receipts(
+        server_id,
+        server_eth,
+        metrics,
+        limiter,
+        cache,
+        store,
+        Arc::new(VecReceiptLog::default()),
+        rate,
+        domains,
+        max_blob_size_bytes,
+        max_concurrent_streams,
+    )
+}
+
+/// Like [`build_handler_full`] but takes an explicit [`ReceiptLog`] so a test
+/// can hold a handle ([`VecReceiptLog`]) and assert the appended receipts.
+#[allow(clippy::too_many_arguments)]
+pub fn build_handler_full_with_receipts(
+    server_id: iroh::PublicKey,
+    server_eth: &Arc<PrivateKeySigner>,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    receipt_log: Arc<dyn ReceiptLog>,
     rate: u64,
     domains: &HandlerDomains,
     max_blob_size_bytes: u64,
@@ -146,6 +218,7 @@ pub fn build_handler_full(
         domains.voucher.clone(),
         domains.binding.clone(),
         store,
+        receipt_log,
         Arc::new(AtomicU64::new(rate)),
         0,
         MAX_RATE_PER_MB,

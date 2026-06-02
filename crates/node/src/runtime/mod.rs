@@ -396,6 +396,35 @@ pub async fn run(
         "channel state store ready (issue #527 replay guard active)",
     );
 
+    // Open the append-only download-receipt audit log (issue #248). Unlike the
+    // channel store, a failure here is NON-fatal: the receipt log is an audit
+    // artifact (revenue reconciliation, dispute evidence), not the replay
+    // guard, so the node still serves paid delivery — falling back to a
+    // discard-only log — rather than refusing to start. The open does a small
+    // amount of disk I/O (create + chmod), so run it on the blocking pool.
+    let receipt_log_data_dir = cfg.identity.data_dir.clone();
+    let receipt_log: Arc<dyn crate::receipt_log::ReceiptLog> =
+        match tokio::task::spawn_blocking(move || {
+            crate::receipt_log::JsonlReceiptLog::open(&receipt_log_data_dir)
+        })
+        .await
+        .context("download-receipt log open task panicked")?
+        {
+            Ok(log) => {
+                tracing::info!(path = %log.path().display(), "download-receipt log ready");
+                Arc::new(log)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    event = "download_receipt_log_open_failed",
+                    "failed to open download-receipt log; continuing without the audit log \
+                     (paid delivery is unaffected; revenue reconciliation will be incomplete)",
+                );
+                Arc::new(crate::receipt_log::NoopReceiptLog)
+            }
+        };
+
     let cache = build_cache(&cfg, Arc::clone(&node_metrics)).await?;
     // Attach the cache to the reload state so SIGHUP handlers can swap
     // the pinned-hashes set atomically (#276). Done immediately after
@@ -615,6 +644,7 @@ pub async fn run(
         voucher_domain,
         bind_domain,
         Arc::clone(&channel_state_store),
+        Arc::clone(&receipt_log),
         reload_state.rate_per_mb(),
         cfg.payment.delivery_floor,
         cfg.payment.delivery_ceiling,
