@@ -60,6 +60,20 @@ impl VoucherActivity {
         }
     }
 
+    /// Drop the activity entry for `channel_id`, if any. Called when a
+    /// channel leaves the live set (settled/closed on-chain) so the map
+    /// can't grow without bound on a long-running, high-churn node — the
+    /// per-`ChannelId` `Instant` would otherwise linger for the whole
+    /// process lifetime. Idempotent: forgetting an unknown (or already
+    /// forgotten) channel is a no-op. A poisoned lock silently skips the
+    /// removal, consistent with [`touch`](Self::touch)/[`seconds_since`](Self::seconds_since) —
+    /// the entry then lingers, the same safe direction as a dropped stamp.
+    pub fn forget(&self, channel_id: ChannelId) {
+        if let Ok(mut map) = self.last_voucher_at.lock() {
+            map.remove(&channel_id);
+        }
+    }
+
     /// Whole seconds since the last voucher was accepted on `channel_id`,
     /// or `None` when this process has accepted none since startup (no
     /// entry — e.g. a channel hydrated from disk that hasn't been touched,
@@ -104,6 +118,34 @@ mod tests {
         );
         // An unrelated channel is unaffected.
         assert_eq!(activity.seconds_since(CH_B), None);
+    }
+
+    #[test]
+    fn forget_removes_a_stamped_channel() {
+        let activity = VoucherActivity::new();
+        activity.touch(CH_A);
+        activity.touch(CH_B);
+        assert!(activity.seconds_since(CH_A).is_some());
+        // Forgetting CH_A drops only its entry; CH_B is untouched.
+        activity.forget(CH_A);
+        assert_eq!(
+            activity.seconds_since(CH_A),
+            None,
+            "forgotten channel must report None (entry removed)"
+        );
+        assert!(
+            activity.seconds_since(CH_B).is_some(),
+            "an unrelated channel must survive forget"
+        );
+    }
+
+    #[test]
+    fn forget_unknown_channel_is_a_noop() {
+        let activity = VoucherActivity::new();
+        // Forgetting a never-stamped channel does not panic and leaves
+        // the (empty) map consistent.
+        activity.forget(CH_A);
+        assert_eq!(activity.seconds_since(CH_A), None);
     }
 
     #[test]

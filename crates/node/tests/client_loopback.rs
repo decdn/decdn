@@ -216,6 +216,97 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     Ok(())
 }
 
+/// Wiring guard for `decdn node channels` (#749 review, crit 7): a real
+/// signed-voucher accept through the live `ClientHandler` must advance the
+/// shared in-memory [`VoucherActivity`] clock the admin surface reports.
+///
+/// The `touch` call site (`handlers/client.rs`) has no other test caller — a
+/// dropped or mis-placed stamp would silently leave `seconds_since` at `None`
+/// ("never") forever. Here we attach a clock to the handler, drive one
+/// successful delivery (which accepts vouchers), and assert the channel now
+/// reports `Some(age)`. An untouched channel reports `None`, so `Some` proves
+/// the accept path stamped through the attached `Arc`.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()> {
+    use decdn_incentive::VoucherActivity;
+
+    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → crosses a voucher interval
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    // Share one `Arc<VoucherActivity>` with the handler — the same wiring
+    // `runtime::run` performs (one Arc cloned into the handler and the admin
+    // surface). Before any accept the channel is unknown to the clock.
+    let activity = Arc::new(VoucherActivity::new());
+    handler.attach_voucher_activity(Arc::clone(&activity));
+    assert_eq!(
+        activity.seconds_since(channel_id()),
+        None,
+        "no voucher accepted yet → clock must report None"
+    );
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(Arc::clone(&client_signer), deposit);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+
+    // The accept path stamped the channel through the shared Arc: the admin
+    // surface reading the SAME Arc would now report an age rather than "never".
+    assert!(
+        activity.seconds_since(channel_id()).is_some(),
+        "an accepted voucher must advance the shared VoucherActivity clock"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
 /// Reused channel: two sequential streams on one channel. The second stream
 /// must resume from the first's cumulative voucher state (nonce/bytes/amount),
 /// not restart at zero — otherwise the node rejects the second voucher as

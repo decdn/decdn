@@ -263,6 +263,14 @@ impl ClientHandler {
     /// Propagates a [`StoreError`] if the durable delete fails.
     pub async fn forget_channel(&self, channel_id: ChannelId) -> Result<(), StoreError> {
         self.channels.lock().await.remove(&channel_id);
+        // Drop the in-memory last-voucher stamp too (issue #749 review):
+        // `touch` inserts per-channel with no eviction, so without this a
+        // settled channel's `Instant` would linger for the whole process
+        // lifetime — a slow leak on a high-churn node. Best-effort, mirroring
+        // the live-map removal: an unattached clock just skips.
+        if let Some(activity) = self.voucher_activity.get() {
+            activity.forget(channel_id);
+        }
         let store = Arc::clone(&self.channel_state_store);
         tokio::task::spawn_blocking(move || store.forget(channel_id))
             .await

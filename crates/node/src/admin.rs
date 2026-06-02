@@ -2078,6 +2078,60 @@ mod tests {
         Ok(())
     }
 
+    /// Shared-`Arc` wiring guard (#749 review, crit 6): the writer (the
+    /// client handler's voucher-accept path) and the reader (this RPC) must
+    /// hold the SAME `Arc<VoucherActivity>`. If they were handed different
+    /// `Arc`s, the RPC would report `seconds_since_last_voucher: None`
+    /// ("never") forever with no failing test.
+    ///
+    /// Here the handler side is represented by a `touch` on the shared `Arc`
+    /// (the exact operation the accept path performs — `client_loopback`'s
+    /// `accepted_voucher_advances_shared_activity_clock` proves the handler
+    /// actually invokes it). We build the `channels()` reader from that SAME
+    /// `Arc` and assert it now reports `Some(age)` for the touched channel,
+    /// and that the active channel sorts ahead of the idle one (recency).
+    #[tokio::test]
+    async fn channels_rpc_reflects_touch_through_shared_activity_arc() -> anyhow::Result<()> {
+        let store = Arc::new(MemoryChannelStateStore::new());
+        // `active` has the smaller claim; `idle` the larger. Without a touch,
+        // `idle` would sort first (descending outstanding). A touch on
+        // `active` must flip that — proving the reader sees the write.
+        let active = mk_channel(1, 0xAA, 10_000_000, 100, 1);
+        let idle = mk_channel(2, 0xBB, 10_000_000, 9_000_000, 1);
+        let active_id = active.channel_id;
+        store.record(&active)?;
+        store.record(&idle)?;
+
+        // ONE Arc, shared between the (simulated) writer and the reader.
+        let activity = Arc::new(VoucherActivity::new());
+        activity.touch(active_id);
+
+        let (state, _tmp) = state_with(vec![]).await;
+        let handles = ChannelStatusHandles {
+            channel_store: store as Arc<dyn ChannelStateStore>,
+            voucher_activity: Arc::clone(&activity),
+            redeem_threshold_micro_usdc: 1_000_000,
+        };
+        let rpc = AdminRpcImpl::new(state.with_channels(handles));
+        let resp = rpc.channels().await.expect("channels ok");
+        assert_eq!(resp.channels.len(), 2);
+
+        let first = resp.channels.first().expect("first");
+        assert!(
+            first.seconds_since_last_voucher.is_some(),
+            "the touched channel must report Some(age) through the shared Arc, \
+             not None — a different Arc would read None"
+        );
+        assert_eq!(
+            first.outstanding_micro_usdc, 100,
+            "the touched (active) channel must sort first despite the smaller claim"
+        );
+        // The untouched channel still reads None through the same reader.
+        let second = resp.channels.get(1).expect("second");
+        assert_eq!(second.seconds_since_last_voucher, None);
+        Ok(())
+    }
+
     /// A store whose `load_all` errors surfaces as
     /// [`CHANNEL_STORE_ERROR_CODE`] rather than a generic transport fault.
     #[tokio::test]
