@@ -373,8 +373,18 @@ pub async fn run(
     // stays bound for the buyer handle built further below.
     let channel_state_store: Arc<dyn ChannelStateStore> = concrete_channel_store.clone();
     let pending_settle_store: Arc<dyn PendingSettleStore> = concrete_channel_store.clone();
-    let watcher_checkpoint_store: Arc<dyn decdn_incentive::WatcherCheckpointStore> =
-        concrete_channel_store.clone();
+    // Debounce the scan-checkpoint write (#784): the live watcher advances the
+    // checkpoint once per distinct block carrying a provider-owned
+    // `ChannelOpened`, and the directly-durable store fsyncs on each. The
+    // persisted value is only a *floor* for the resume backfill
+    // (`resolve_backfill_start` rewinds it by the reorg margin; registration is
+    // idempotent), so coarsening the write cadence is safe — and the settlement
+    // service forces a final flush on graceful shutdown so steady-state progress
+    // is not lost. Wrapping here (the wiring layer) keeps the domain trait and the
+    // disk store free of the debounce policy.
+    let watcher_checkpoint_store: Arc<dyn decdn_incentive::WatcherCheckpointStore> = Arc::new(
+        crate::payment_settlement::DebouncedCheckpointStore::new(concrete_channel_store.clone()),
+    );
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema even before the
     // future cdn/client/v1 handler (#317) is constructed. The handler will

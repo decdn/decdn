@@ -181,10 +181,31 @@ pub trait WatcherCheckpointStore: Send + Sync {
     /// value. Called after the bring-up backfill completes and as the live
     /// stream advances, so the next boot resumes from here.
     ///
+    /// A debouncing decorator MAY buffer the value in memory and defer the
+    /// durable write to a coarser cadence (the floor only ever lags the true
+    /// scan position, which is safe — see the type-level contract above); such
+    /// a decorator overrides [`flush`](Self::flush) to force the buffered value
+    /// out on graceful shutdown. A directly disk-backed implementation commits
+    /// durably before returning `Ok`.
+    ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the durable write fails.
     fn record_last_seen_block(&self, block: u64) -> Result<(), StoreError>;
+
+    /// Force any buffered checkpoint to durable storage. The default is a no-op:
+    /// implementations that already commit durably inside
+    /// [`record_last_seen_block`](Self::record_last_seen_block) have nothing
+    /// buffered. A debouncing decorator overrides this to fsync the latest
+    /// deferred block, and the runtime calls it on graceful shutdown so the most
+    /// recent scan progress is not lost to the next boot's rescan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails.
+    fn flush(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// Failure modes shared by every [`ChannelStateStore`] implementation.
