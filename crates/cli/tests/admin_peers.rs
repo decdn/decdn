@@ -31,11 +31,17 @@ const fn nz(v: u64) -> NonZeroU64 {
 use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
 use decdn_common::admin::{AdminRpcClient, DrainRequest};
-use decdn_common::cli::{AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs};
+use decdn_common::cli::{
+    AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs, StatusArgs,
+};
 use decdn_gossip::PeerTable;
-use decdn_node::admin::{self, AdminState, DrainTrigger};
+use decdn_node::admin::{self, AdminState, DhtStatusHandles, DrainTrigger};
+use decdn_node::dht::routing::NodeId;
+use decdn_node::dht::{
+    ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
+};
 use decdn_node::metrics::Metrics;
-use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
+use decdn_protocol::{ContentHash, NodeAnnounce, NodeAnnounceBody};
 use jsonrpsee::RpcModule;
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
@@ -80,6 +86,44 @@ fn throwaway_signer() -> Arc<alloy::signers::local::PrivateKeySigner> {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID;
     Arc::new(PrivateKeySigner::random().with_chain_id(Some(ARBITRUM_SEPOLIA_CHAIN_ID)))
+}
+
+/// Build `DhtStatusHandles` seeded with two peers in distinct buckets
+/// (0 and 255), two stakers, one provider record, one scheduled republish,
+/// and a fixed refresh clock — enough for an end-to-end `admin_v1_status`
+/// round-trip over real HTTP. Mirrors the unit-level seed in `admin.rs`.
+fn seeded_dht_handles() -> DhtStatusHandles {
+    let mut table = decdn_node::dht::RoutingTable::new(NodeId::from_bytes([0u8; 32]));
+    let mut high = [0u8; 32];
+    high[0] = 0x80; // bucket 255
+    let mut low = [0u8; 32];
+    low[31] = 0x01; // bucket 0
+    table.insert(NodeId::from_bytes(high));
+    table.insert(NodeId::from_bytes(low));
+
+    let mut stakers = std::collections::HashSet::new();
+    stakers.insert(NodeId::from_bytes([1u8; 32]));
+    stakers.insert(NodeId::from_bytes([2u8; 32]));
+    let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(stakers));
+
+    let mut store = RecordStore::new(RecordStoreConfig::default());
+    store.insert_at(
+        NodeId::from_bytes([5u8; 32]),
+        ContentHash::from_bytes([7u8; 32]),
+        1_000,
+    );
+
+    let republish = Arc::new(RepublishScheduler::new());
+    republish.schedule_steady(ContentHash::from_bytes([9u8; 32]));
+
+    DhtStatusHandles {
+        routing: Arc::new(std::sync::Mutex::new(table)),
+        staker_set,
+        record_store: Arc::new(std::sync::Mutex::new(store)),
+        republish,
+        refresh_clock: Arc::new(std::sync::atomic::AtomicU64::new(1_700_000_000_000_000)),
+        refresh_interval: std::time::Duration::from_hours(1),
+    }
 }
 
 /// Spawn an admin server with the given state, returning its URL and a
@@ -943,4 +987,94 @@ async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
         // — both mean "no longer serving".
         Ok(Err(_)) | Err(_) => Ok(()),
     }
+}
+
+/// `admin_v1_status` round-trips through real HTTP: the seeded DHT health
+/// (routing fills, staker count, record-store utilization, republish
+/// depth, last-refresh timestamp) must survive serde + the generated
+/// client bindings unchanged (issue #741).
+#[tokio::test]
+async fn status_round_trips_dht_health() -> anyhow::Result<()> {
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(
+        peer_table,
+        [0xABu8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
+        Arc::new(Metrics::new()),
+    )
+    .with_dht(seeded_dht_handles());
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    let resp = client.status().await?;
+
+    assert_eq!(resp.node_id, "ab".repeat(32));
+    assert_eq!(resp.routing.total_peers, 2);
+    assert_eq!(resp.routing.non_empty_buckets, 2);
+    let indices: Vec<u16> = resp.routing.buckets.iter().map(|b| b.index).collect();
+    assert_eq!(indices, vec![0, 255]);
+    assert_eq!(resp.routing.bucket_capacity, 20);
+    assert_eq!(resp.routing.refresh_interval_s, 3_600);
+    assert_eq!(resp.routing.last_refresh_us, Some(1_700_000_000_000_000));
+    assert_eq!(resp.known_stakers, 2);
+    assert_eq!(resp.record_store.records, 1);
+    assert_eq!(resp.record_store.capacity, 100_000);
+    assert_eq!(resp.republish.scheduled_records, 1);
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
+/// `decdn node status` against a dead port surfaces the friendly
+/// connection-refused message (not a panic), mirroring the peers path.
+#[tokio::test]
+async fn cli_status_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = StatusArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::status(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
+    Ok(())
+}
+
+/// `decdn node status --timeout-ms 0` is rejected before the client is
+/// built, same guard as the other admin subcommands.
+#[tokio::test]
+async fn cli_status_rejects_zero_timeout() -> anyhow::Result<()> {
+    let args = StatusArgs {
+        admin_url: Some("http://127.0.0.1:1".to_string()),
+        config: None,
+        json: false,
+        timeout_ms: 0,
+    };
+    let err = commands::status(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
+        .to_string();
+    assert!(
+        err.contains("--timeout-ms"),
+        "error should mention the flag, got: {err}"
+    );
+    Ok(())
 }

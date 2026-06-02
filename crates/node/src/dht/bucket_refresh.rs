@@ -23,6 +23,7 @@
 //! unreachable, timeout) is silently ignored — the next tick will try
 //! the next bucket. Failure has no operator-actionable signal.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,12 +46,22 @@ pub const BUCKET_REFRESH_TICK: Duration = Duration::from_hours(1);
 /// Long-running task: every [`BUCKET_REFRESH_TICK`] runs a
 /// `FindNode(random_id_in_bucket)` against each non-empty bucket's
 /// most-recently-seen peer in parallel. Exits on `stop_rx`.
+///
+/// `refresh_clock` is stamped with the wall-clock microseconds at which
+/// each refresh pass completes, so the `admin_v1_status` health view
+/// (issue #741) can report the network-wide "last refreshed" time. Since
+/// a pass touches *all* non-empty buckets at once, a single timestamp is
+/// the honest representation — there is no per-bucket refresh time. It
+/// starts at 0 ("never refreshed") and is updated every tick regardless
+/// of whether any bucket was populated, so it tracks "the refresh task is
+/// alive and ran at T" rather than "a bucket received fresh entries".
 pub async fn run_bucket_refresh(
     endpoint: Endpoint,
     self_id: PublicKey,
     routing: Arc<Mutex<RoutingTable>>,
     mut stop_rx: oneshot::Receiver<()>,
     interval: Duration,
+    refresh_clock: Arc<AtomicU64>,
 ) {
     let self_node_id = NodeId::from_bytes(*self_id.as_bytes());
     let mut ticker = tokio::time::interval(interval);
@@ -66,7 +77,35 @@ pub async fn run_bucket_refresh(
             }
             _ = ticker.tick() => {
                 refresh_all_non_empty_buckets(&endpoint, self_node_id, &routing).await;
+                // Stamp after the pass completes so `admin_v1_status`
+                // reports the time refresh last *finished*. `Relaxed` is
+                // sufficient: the admin reader only needs the latest value
+                // eventually, with no ordering dependency on other state.
+                refresh_clock.store(now_us(), Ordering::Relaxed);
             }
+        }
+    }
+}
+
+/// Wall-clock now in microseconds since `UNIX_EPOCH`. Falls back to 0 if
+/// the host clock is set before the epoch (panic-free per the workspace
+/// anti-panic policy), logging at `error` level on that path — same
+/// treatment as [`crate::handlers::dht`]'s `now_us`, since a 0 stamp here
+/// makes `admin_v1_status` report `last_refresh=never` even though a pass
+/// completed, so the misconfiguration must be diagnosable from the logs.
+/// (The byte-identical-but-silent copy in [`crate::dht::publish`] only
+/// feeds scheduling, where the fallback has no operator-visible effect.)
+fn now_us() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => u64::try_from(d.as_micros()).unwrap_or(u64::MAX),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "wall-clock before UNIX_EPOCH; bucket-refresh timestamp falls back to 0, so \
+                 admin_v1_status will report last_refresh=never despite refreshes running. \
+                 Set the host clock."
+            );
+            0
         }
     }
 }

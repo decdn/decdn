@@ -795,12 +795,17 @@ pub async fn run(
     // freshest peer to repopulate it. Best-effort hygiene — a failed
     // refresh is silently retried on the next tick.
     let (bucket_refresh_stop_tx, bucket_refresh_stop_rx) = oneshot::channel::<()>();
+    // Shared "last bucket-refresh completed at" clock (wall-clock µs, 0 =
+    // never). The refresh task stamps it each pass; `admin_v1_status`
+    // reads it for the routing-table health view (issue #741).
+    let bucket_refresh_clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
     tasks.spawn(crate::dht::bucket_refresh::run_bucket_refresh(
         ep.clone(),
         secret_key.public(),
         Arc::clone(&dht_routing),
         bucket_refresh_stop_rx,
         crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
+        Arc::clone(&bucket_refresh_clock),
     ));
 
     // RPC connectivity watchdog (issue #283). Updates `decdn_rpc_healthy`
@@ -930,7 +935,17 @@ pub async fn run(
             Arc::clone(&drain_trigger),
             Arc::clone(&eth_signer),
             Arc::clone(&node_metrics),
-        );
+        )
+        // DHT introspection for `admin_v1_status` (issue #741). All handles
+        // are clones of state the DHT tasks already share — read-only here.
+        .with_dht(admin::DhtStatusHandles {
+            routing: Arc::clone(&dht_routing),
+            staker_set: Arc::clone(&staker_set),
+            record_store: Arc::clone(&record_store),
+            republish: Arc::clone(&republish_scheduler),
+            refresh_clock: Arc::clone(&bucket_refresh_clock),
+            refresh_interval: crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
+        });
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");

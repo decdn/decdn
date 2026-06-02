@@ -278,6 +278,22 @@ impl RoutingTable {
     pub fn iter_peers(&self) -> impl Iterator<Item = &NodeId> + '_ {
         self.buckets.iter().flatten()
     }
+
+    /// Per-bucket fill counts for the **non-empty** buckets only, as
+    /// `(index, fill)` pairs ordered by bucket index ascending. Read-only
+    /// snapshot for the `admin_v1_status` routing-table health view (issue
+    /// #741); empty buckets (the vast majority of the 256-bucket keyspace
+    /// on a small network) are omitted so the snapshot stays compact. The
+    /// per-bucket capacity is the fixed Kademlia [`K_BUCKET_SIZE`].
+    #[must_use]
+    pub fn non_empty_bucket_fills(&self) -> Vec<(usize, usize)> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, bucket)| !bucket.is_empty())
+            .map(|(idx, bucket)| (idx, bucket.len()))
+            .collect()
+    }
 }
 
 /// Construct a `NodeId` that lands in bucket `bucket_idx` relative to
@@ -528,6 +544,29 @@ mod tests {
         assert!(collected.contains(&p1));
         assert!(collected.contains(&p2));
         assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn non_empty_bucket_fills_empty_table_is_empty() {
+        let rt = RoutingTable::new(id(0));
+        assert!(rt.non_empty_bucket_fills().is_empty());
+    }
+
+    #[test]
+    fn non_empty_bucket_fills_reports_counts_ascending_and_omits_empty() {
+        let self_id = id(0);
+        let mut rt = RoutingTable::new(self_id);
+        // Three distinct peers in bucket 10 (salts vary the last byte;
+        // bucket >= 8 keeps the selecting bit out of that byte) and one in
+        // bucket 200. All 254 other buckets stay empty and must be omitted.
+        rt.insert(id_in_bucket(&self_id, 10, 0));
+        rt.insert(id_in_bucket(&self_id, 10, 1));
+        rt.insert(id_in_bucket(&self_id, 10, 2));
+        rt.insert(id_in_bucket(&self_id, 200, 0));
+
+        let fills = rt.non_empty_bucket_fills();
+        // Only the two populated buckets, ascending by index, with real counts.
+        assert_eq!(fills, vec![(10, 3), (200, 1)]);
     }
 
     #[test]

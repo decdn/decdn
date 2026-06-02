@@ -161,6 +161,15 @@ impl RecordStore {
         self.global_lru.is_empty()
     }
 
+    /// Global record capacity — the configured
+    /// [`RecordStoreConfig::max_records_global`] ceiling. Paired with
+    /// [`Self::len`] to report store utilization in the
+    /// `admin_v1_status` health view (issue #741).
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.cfg.max_records_global
+    }
+
     /// Record count for one publisher. Returns 0 for unknown publishers.
     #[must_use]
     pub fn publisher_record_count(&self, holder: &NodeId) -> usize {

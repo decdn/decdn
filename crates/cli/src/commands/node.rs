@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use decdn_common::admin::{
     AdminRpcClient, AnnounceResponse, DrainRequest, DrainResponse, EvictRequest, EvictResponse,
-    HealthResponse, PeerView, PeersResponse, ReloadResponse,
+    HealthResponse, PeerView, PeersResponse, ReloadResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -52,6 +52,7 @@ pub async fn node_dispatch(
     match &args.cmd {
         cli::NodeCommand::Peers(p) => peers(p, global_config).await,
         cli::NodeCommand::Health(h) => health(h, global_config).await,
+        cli::NodeCommand::Status(s) => status(s, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Announce(a) => announce(a, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
@@ -549,6 +550,41 @@ pub async fn peers(args: &cli::PeersArgs, global_config: Option<&Path>) -> anyho
     Ok(())
 }
 
+/// `decdn node status`: call `admin_v1_status` on the running node and
+/// print a snapshot of its DHT participation health (issue #741).
+pub async fn status(args: &cli::StatusArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let parsed: StatusResponse = client
+        .status()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&parsed).context("failed to encode status as JSON")?;
+        println!("{pretty}");
+    } else {
+        let mut stdout = io::stdout().lock();
+        write_status(&mut stdout, &parsed, wall_clock_us())
+            .context("failed to write status report")?;
+    }
+
+    Ok(())
+}
+
 /// Map a `jsonrpsee` client error into the three operator-actionable
 /// classes the previous reqwest path exposed:
 ///
@@ -820,6 +856,90 @@ fn format_age(delta_us: u64) -> String {
     format!("{}d ago", delta_us / US_PER_DAY)
 }
 
+/// Write the DHT status report to `w`. Pure function (takes `&mut impl
+/// Write`) so the formatting is unit-testable without an HTTP hop,
+/// mirroring [`write_peers_table`]. The summary block uses stable
+/// `key=value` tokens so operator scripts can `grep` them without
+/// `--json`; the per-non-empty-bucket fill table follows.
+fn write_status(w: &mut impl io::Write, s: &StatusResponse, now_us: u64) -> io::Result<()> {
+    writeln!(w, "node_id={}", s.node_id)?;
+    writeln!(w, "known_stakers={}", s.known_stakers)?;
+    let last_refresh = match s.routing.last_refresh_us {
+        // No bucket-refresh pass has completed yet (node up < one interval).
+        None => "never".to_string(),
+        Some(us) => relative_age(now_us, us),
+    };
+    writeln!(
+        w,
+        "routing total_peers={} non_empty_buckets={} refresh_interval={} last_refresh={}",
+        s.routing.total_peers,
+        s.routing.non_empty_buckets,
+        format_interval(s.routing.refresh_interval_s),
+        last_refresh,
+    )?;
+    writeln!(
+        w,
+        "record_store records={}/{} ({})",
+        s.record_store.records,
+        s.record_store.capacity,
+        percent(s.record_store.records, s.record_store.capacity),
+    )?;
+    writeln!(
+        w,
+        "republish scheduled_records={}",
+        s.republish.scheduled_records
+    )?;
+
+    if s.routing.buckets.is_empty() {
+        return writeln!(w, "(routing table empty — no buckets populated)");
+    }
+    // Capacity is the same K for every bucket — carried once on RoutingHealth.
+    let capacity = s.routing.bucket_capacity;
+    writeln!(w)?;
+    writeln!(w, "{:<8} {:<8} FILL%", "BUCKET", "FILL")?;
+    for b in &s.routing.buckets {
+        let fill = format!("{}/{capacity}", b.fill);
+        let pct = percent(u64::from(b.fill), u64::from(capacity));
+        writeln!(w, "{:<8} {fill:<8} {pct}", b.index)?;
+    }
+    Ok(())
+}
+
+/// Integer percentage of `num/den` as an `"NN%"` string. A `den` of 0
+/// (which should never happen for a Kademlia bucket capacity or the
+/// record-store global cap) renders `"n/a"` rather than dividing by zero.
+/// `saturating_mul` guards the (unrealistic) `num * 100` overflow.
+fn percent(num: u64, den: u64) -> String {
+    if den == 0 {
+        return "n/a".to_string();
+    }
+    format!("{}%", num.saturating_mul(100) / den)
+}
+
+/// Format a whole-second interval as a coarse human string (e.g. `"1h"`,
+/// `"30m"`, `"45s"`). Uses the same unit set as `format_age` (s/m/h/d) but
+/// selects the coarsest unit that divides *exactly* — so a non-round
+/// interval like 90 minutes renders `"90m"`, not `"1h"` — keeping the
+/// reported bucket-refresh cadence precise.
+fn format_interval(secs: u64) -> String {
+    const SEC_PER_MIN: u64 = 60;
+    const SEC_PER_HOUR: u64 = 60 * SEC_PER_MIN;
+    const SEC_PER_DAY: u64 = 24 * SEC_PER_HOUR;
+    if secs == 0 {
+        return "0s".to_string();
+    }
+    if secs.is_multiple_of(SEC_PER_DAY) {
+        return format!("{}d", secs / SEC_PER_DAY);
+    }
+    if secs.is_multiple_of(SEC_PER_HOUR) {
+        return format!("{}h", secs / SEC_PER_HOUR);
+    }
+    if secs.is_multiple_of(SEC_PER_MIN) {
+        return format!("{}m", secs / SEC_PER_MIN);
+    }
+    format!("{secs}s")
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1014,6 +1134,122 @@ mod tests {
         assert!(s.contains("US"), "region missing: {s}");
         assert!(s.contains("1s ago"), "relative age missing: {s}");
         Ok(())
+    }
+
+    fn mk_status(last_refresh_us: Option<u64>) -> StatusResponse {
+        use decdn_common::admin::{BucketStat, RecordStoreHealth, RepublishHealth, RoutingHealth};
+        StatusResponse {
+            node_id: "ab".repeat(32),
+            routing: RoutingHealth {
+                total_peers: 21,
+                non_empty_buckets: 2,
+                buckets: vec![
+                    BucketStat { index: 0, fill: 1 },
+                    BucketStat {
+                        index: 255,
+                        fill: 20,
+                    },
+                ],
+                bucket_capacity: 20,
+                refresh_interval_s: 3_600,
+                last_refresh_us,
+            },
+            known_stakers: 7,
+            record_store: RecordStoreHealth {
+                records: 50_000,
+                capacity: 100_000,
+            },
+            republish: RepublishHealth {
+                scheduled_records: 5,
+            },
+        }
+    }
+
+    #[test]
+    fn write_status_renders_summary_and_bucket_table() -> anyhow::Result<()> {
+        // last_seen 1s past epoch, now 1s later → "1s ago".
+        let status = mk_status(Some(1_000_000));
+        let mut buf = Vec::<u8>::new();
+        write_status(&mut buf, &status, 2_000_000)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains(&format!("node_id={}", "ab".repeat(32))), "{s}");
+        assert!(s.contains("known_stakers=7"), "{s}");
+        assert!(s.contains("total_peers=21"), "{s}");
+        assert!(s.contains("non_empty_buckets=2"), "{s}");
+        assert!(s.contains("refresh_interval=1h"), "{s}");
+        assert!(s.contains("last_refresh=1s ago"), "{s}");
+        // Record-store utilization: 50000/100000 → 50%.
+        assert!(s.contains("record_store records=50000/100000 (50%)"), "{s}");
+        assert!(s.contains("republish scheduled_records=5"), "{s}");
+        // Bucket table: header + a full bucket at 100%.
+        assert!(s.contains("BUCKET"), "{s}");
+        assert!(s.contains("FILL%"), "{s}");
+        assert!(s.contains("20/20"), "{s}");
+        assert!(s.contains("100%"), "{s}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_status_never_refreshed_renders_never() -> anyhow::Result<()> {
+        let status = mk_status(None);
+        let mut buf = Vec::<u8>::new();
+        write_status(&mut buf, &status, 2_000_000)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("last_refresh=never"), "{s}");
+        Ok(())
+    }
+
+    /// Cold-start: a node that has joined no buckets yet renders the
+    /// empty-table sentinel and omits the bucket table header entirely —
+    /// the precise scenario `decdn node status` exists to diagnose.
+    #[test]
+    fn write_status_empty_routing_table_renders_sentinel() -> anyhow::Result<()> {
+        let mut status = mk_status(None);
+        status.routing.buckets.clear();
+        status.routing.non_empty_buckets = 0;
+        status.routing.total_peers = 0;
+        let mut buf = Vec::<u8>::new();
+        write_status(&mut buf, &status, 2_000_000)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("(routing table empty"), "{s}");
+        assert!(
+            !s.contains("BUCKET"),
+            "empty table must omit the header: {s}"
+        );
+        assert!(!s.contains("FILL%"), "{s}");
+        Ok(())
+    }
+
+    /// Clock skew between the node's stamp and the CLI's wall clock must
+    /// render "in future" via `relative_age`, not a huge wrapped age.
+    #[test]
+    fn write_status_future_last_refresh_renders_in_future() -> anyhow::Result<()> {
+        let status = mk_status(Some(5_000_000));
+        let mut buf = Vec::<u8>::new();
+        // now_us earlier than the stamp.
+        write_status(&mut buf, &status, 1_000_000)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("last_refresh=in future"), "{s}");
+        Ok(())
+    }
+
+    #[test]
+    fn percent_handles_zero_denominator() {
+        assert_eq!(percent(0, 0), "n/a");
+        assert_eq!(percent(5, 0), "n/a");
+        assert_eq!(percent(1, 20), "5%");
+        assert_eq!(percent(20, 20), "100%");
+    }
+
+    #[test]
+    fn format_interval_uses_coarsest_exact_unit() {
+        assert_eq!(format_interval(0), "0s");
+        assert_eq!(format_interval(45), "45s");
+        assert_eq!(format_interval(30 * 60), "30m");
+        assert_eq!(format_interval(3_600), "1h");
+        assert_eq!(format_interval(2 * 86_400), "2d");
+        // 90 minutes isn't a whole number of hours → falls back to minutes.
+        assert_eq!(format_interval(90 * 60), "90m");
     }
 
     #[test]
