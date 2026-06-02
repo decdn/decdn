@@ -724,6 +724,35 @@ fn resolve_blockchain_into(
     // channels without a manual approve step (ADR 003 § Deposit Economics).
     let buyer_max_approve = file.and_then(|b| b.buyer_max_approve).unwrap_or(true);
 
+    // Auto-settlement triggers (#742). Both default to disabled (`None`) so
+    // behavior is unchanged unless an operator opts in. A configured `0` is an
+    // operator mistake: a 0 µUSDC value threshold would close on the first
+    // voucher, and a 0 voucher-count threshold would close before any voucher
+    // accrues — both burn gas on a guaranteed dust/no-op close. Reject either.
+    let settlement_auto_threshold_micro_usdc =
+        file.and_then(|b| b.settlement_auto_threshold_micro_usdc);
+    bag.check_with(
+        settlement_auto_threshold_micro_usdc != Some(0),
+        "blockchain.settlement_auto_threshold_micro_usdc",
+        || {
+            "blockchain.settlement_auto_threshold_micro_usdc must be > 0 when set \
+             (a 0 threshold closes the channel on the first voucher); omit the key \
+             to disable auto-settlement"
+                .to_string()
+        },
+    );
+    let settlement_auto_by_voucher_count = file.and_then(|b| b.settlement_auto_by_voucher_count);
+    bag.check_with(
+        settlement_auto_by_voucher_count != Some(0),
+        "blockchain.settlement_auto_by_voucher_count",
+        || {
+            "blockchain.settlement_auto_by_voucher_count must be > 0 when set \
+             (a 0 count closes the channel before any voucher accrues); omit the key \
+             to disable the voucher-count trigger"
+                .to_string()
+        },
+    );
+
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
     // the runtime loader: if the operator passes a stale path the failure
@@ -743,6 +772,8 @@ fn resolve_blockchain_into(
         redeem_threshold_micro_usdc,
         buyer_deposit_micro_usdc,
         buyer_max_approve,
+        settlement_auto_threshold_micro_usdc,
+        settlement_auto_by_voucher_count,
     }
 }
 
@@ -5825,6 +5856,8 @@ mod tests {
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_count: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -5853,6 +5886,8 @@ mod tests {
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_count: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6052,6 +6087,8 @@ mod tests {
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_count: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6088,6 +6125,8 @@ mod tests {
             redeem_threshold_micro_usdc: Some(0),
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_count: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6099,6 +6138,135 @@ mod tests {
             msg.contains("redeem_threshold_micro_usdc"),
             "error should name the field: {msg}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_auto_settlement_threshold() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            capacity_bond_address: None,
+            rpc_watchdog_interval_sec: None,
+            redeem_threshold_micro_usdc: None,
+            buyer_deposit_micro_usdc: None,
+            buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: Some(0),
+            settlement_auto_by_voucher_count: None,
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when auto-settlement value threshold is 0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("settlement_auto_threshold_micro_usdc"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_auto_settlement_voucher_count() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            capacity_bond_address: None,
+            rpc_watchdog_interval_sec: None,
+            redeem_threshold_micro_usdc: None,
+            buyer_deposit_micro_usdc: None,
+            buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_count: Some(0),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when auto-settlement voucher count is 0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("settlement_auto_by_voucher_count"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_auto_settlement_disabled_by_default() -> anyhow::Result<()> {
+        // Absent keys => both auto-settlement triggers disabled (`None`), so a
+        // node that never sets them behaves exactly as before #742.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert_eq!(resolved.settlement_auto_threshold_micro_usdc, None);
+        assert_eq!(resolved.settlement_auto_by_voucher_count, None);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_accepts_positive_auto_settlement_thresholds() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            capacity_bond_address: None,
+            rpc_watchdog_interval_sec: None,
+            redeem_threshold_micro_usdc: None,
+            buyer_deposit_micro_usdc: None,
+            buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: Some(50_000_000),
+            settlement_auto_by_voucher_count: Some(1_000),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(
+            resolved.settlement_auto_threshold_micro_usdc,
+            Some(50_000_000)
+        );
+        assert_eq!(resolved.settlement_auto_by_voucher_count, Some(1_000));
         Ok(())
     }
 
@@ -6124,6 +6292,8 @@ mod tests {
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_count: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
@@ -6153,6 +6323,8 @@ mod tests {
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_count: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };

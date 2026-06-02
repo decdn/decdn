@@ -644,6 +644,13 @@ pub async fn run(
         Arc::clone(&watcher_checkpoint_store),
         Arc::clone(&client_handler),
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
+        crate::payment_settlement::AutoSettleConfig {
+            value_threshold: cfg
+                .blockchain
+                .settlement_auto_threshold_micro_usdc
+                .map(U256::from),
+            voucher_count_threshold: cfg.blockchain.settlement_auto_by_voucher_count,
+        },
         Arc::clone(&node_metrics),
     )
     .await
@@ -1863,6 +1870,8 @@ mod tests {
                 redeem_threshold_micro_usdc: 1_000_000,
                 buyer_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
+                settlement_auto_threshold_micro_usdc: None,
+                settlement_auto_by_voucher_count: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },

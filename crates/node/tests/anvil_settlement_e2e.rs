@@ -88,7 +88,7 @@ use decdn_node::buyer_channel::BuyerChannelService;
 use decdn_node::channel_store::PersistentChannelStateStore;
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::metrics::Metrics;
-use decdn_node::payment_settlement::PaymentChannelService;
+use decdn_node::payment_settlement::{AutoSettleConfig, PaymentChannelService};
 use decdn_protocol::ALPN_CLIENT;
 use iroh::EndpointAddr;
 
@@ -490,6 +490,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         checkpoint_store,
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        AutoSettleConfig::default(),
         Arc::clone(&metrics),
     )
     .await?;
@@ -959,6 +960,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         concrete_store.clone(),
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        AutoSettleConfig::default(),
         Arc::clone(&metrics),
     )
     .await?;

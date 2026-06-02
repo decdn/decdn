@@ -281,6 +281,15 @@ pub struct DecdnMetrics {
     /// backfill re-drives it), but a non-zero rate flags a struggling channel
     /// store. Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
+    /// Channels the seller path proactively `closeChannel`d because an
+    /// operator-configured auto-settlement trigger fired — the un-redeemed
+    /// value or voucher count crossed its threshold (#742). Each close starts
+    /// the dispute window so a large unsubmitted balance is secured before the
+    /// client can go dark; the settle sweep finalizes the remainder. A rising
+    /// count is normal under heavy delivery; a flat-zero count on a node that
+    /// configured a trigger means nothing has crossed it yet. Operator-visible
+    /// name: `decdn_settlement_auto_triggered_total`.
+    pub settlement_auto_triggered: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -432,6 +441,13 @@ impl Metrics {
     /// (#751). Pairs with the `warn!` in `redeemer_loop`.
     pub fn redemption_failure(&self) {
         self.decdn.redemption_failures.inc();
+    }
+
+    /// An auto-settlement trigger fired and the seller path `closeChannel`d a
+    /// channel to secure its un-redeemed balance on-chain (#742). Pairs with
+    /// the `info!` in `try_redeem`.
+    pub fn settlement_auto_triggered(&self) {
+        self.decdn.settlement_auto_triggered.inc();
     }
 
     /// The settlement watcher swallowed a channel-lifecycle persist failure
