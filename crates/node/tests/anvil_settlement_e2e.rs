@@ -202,15 +202,23 @@ where
 /// SIGKILLs the child (the otherwise-orphaned `forge`) when the timed-out
 /// `output()` future is dropped; the tokio runtime then reaps it so it never
 /// lingers as a zombie.
+///
+/// The three outcomes are kept distinct so callers can react correctly:
+/// - `Err(_)` — the child could not be spawned (e.g. `forge` missing). This is
+///   deterministic; callers should fail fast, not retry.
+/// - `Ok(Err(timeout))` — the run stalled and was killed (#785). Retryable.
+/// - `Ok(Ok(output))` — the process exited; the caller inspects its status.
 async fn forge_output(
     mut cmd: tokio::process::Command,
     timeout: Duration,
     what: &str,
-) -> anyhow::Result<std::process::Output> {
+) -> anyhow::Result<Result<std::process::Output, Duration>> {
     cmd.kill_on_drop(true);
     match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(res) => res.with_context(|| format!("spawn `{what}` (is foundry installed?)")),
-        Err(_) => anyhow::bail!("`{what}` timed out after {timeout:?}"),
+        Ok(res) => res
+            .map(Ok)
+            .with_context(|| format!("spawn `{what}` (is foundry installed?)")),
+        Err(_) => Ok(Err(timeout)),
     }
 }
 
@@ -294,7 +302,10 @@ async fn run_e2e() -> anyhow::Result<()> {
     // ---- 0. Build contracts so artifacts + the deploy script are available.
     let mut build_cmd = tokio::process::Command::new("forge");
     build_cmd.current_dir(&contracts).args(["build"]);
-    let build = forge_output(build_cmd, FORGE_BUILD_TIMEOUT, "forge build").await?;
+    let build = match forge_output(build_cmd, FORGE_BUILD_TIMEOUT, "forge build").await? {
+        Ok(out) => out,
+        Err(timeout) => anyhow::bail!("`forge build` timed out after {timeout:?}"),
+    };
     assert!(
         build.status.success(),
         // forge writes compiler errors to stdout, not stderr — capture both.
@@ -1037,7 +1048,9 @@ async fn run_deploy_script(
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
             .env("CHALLENGER_INCENTIVE_POOL", DEPLOYER_ADDR)
             .env("FORCE_OVERWRITE_MANIFEST", "true");
-        match forge_output(cmd, DEPLOY_TIMEOUT, "forge script DeployProtocol").await {
+        // A spawn failure (`forge` missing) is deterministic — `?` fails fast
+        // rather than masquerading as a stall and burning a retry.
+        match forge_output(cmd, DEPLOY_TIMEOUT, "forge script DeployProtocol").await? {
             Ok(out) if out.status.success() => return Ok(()),
             // Deterministic failure — surface the full output and stop.
             Ok(out) => {
@@ -1048,14 +1061,14 @@ async fn run_deploy_script(
                 )
             }
             // Stall (#785) — retry while attempts remain, else surface it.
-            Err(e) => {
+            Err(timeout) => {
                 if attempt == DEPLOY_ATTEMPTS {
-                    return Err(e.context(format!(
-                        "forge script DeployProtocol stalled on all {DEPLOY_ATTEMPTS} attempts"
-                    )));
+                    anyhow::bail!(
+                        "forge script DeployProtocol stalled on all {DEPLOY_ATTEMPTS} attempts (timed out after {timeout:?})"
+                    );
                 }
                 tracing::warn!(
-                    "forge script DeployProtocol attempt {attempt}/{DEPLOY_ATTEMPTS} stalled, retrying: {e}"
+                    "forge script DeployProtocol attempt {attempt}/{DEPLOY_ATTEMPTS} stalled, retrying after {timeout:?}"
                 );
             }
         }
