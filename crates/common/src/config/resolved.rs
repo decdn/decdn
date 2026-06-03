@@ -389,12 +389,12 @@ pub struct ResolvedReceipts {
 }
 
 impl Default for ResolvedReceipts {
-    /// Mirrors the `DEFAULT_RECEIPT_*` resolver constants so hand-built
-    /// `ResolvedConfig`s in tests get the production defaults.
+    /// Reuses the `DEFAULT_RECEIPT_*` resolver constants so hand-built
+    /// `ResolvedConfig`s in tests cannot drift from the production defaults.
     fn default() -> Self {
         Self {
-            max_file_bytes: 128 << 20,
-            retained_files: 4,
+            max_file_bytes: super::DEFAULT_RECEIPT_MAX_FILE_BYTES,
+            retained_files: super::DEFAULT_RECEIPT_RETAINED_FILES,
         }
     }
 }

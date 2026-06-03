@@ -310,20 +310,29 @@ impl JsonlReceiptLog {
     ///
     /// Best-effort: every step that can fail leaves `state.file` pointing at a
     /// writable canonical-path handle so the caller's next `append` still
-    /// succeeds. With `retained_files == 0` the live file is truncated in place;
-    /// otherwise the oldest backup is dropped, the chain is shifted up, the live
-    /// file becomes `.1`, and a fresh live file is opened. If opening the fresh
-    /// file fails, `.1` is renamed back so the original handle keeps writing to
-    /// the canonical path.
+    /// succeeds. Any backup numbered above `retained_files` is pruned first (so
+    /// lowering the retention count reclaims stale backups). With
+    /// `retained_files == 0` the live file is then truncated in place;
+    /// otherwise the oldest retained backup is dropped, the chain is shifted up,
+    /// the live file becomes `.1`, and a fresh live file is opened. If opening
+    /// the fresh file fails, `.1` is renamed back so the original handle keeps
+    /// writing to the canonical path.
     fn rotate(&self, state: &mut LogState) -> std::io::Result<()> {
         let retained = self.policy.retained_files;
+        // Prune any backups numbered above the retention count first. This
+        // bounds disk even after an operator *lowers* `retained_files` (or sets
+        // it to 0) between runs, when stale higher-numbered backups (e.g. `.10`)
+        // from a prior, larger setting would otherwise linger forever.
+        self.prune_backups_above(retained);
+
         if retained == 0 {
             state.file.set_len(0)?;
             state.written = 0;
             return Ok(());
         }
 
-        // Drop the oldest backup (NotFound is fine before the chain fills).
+        // Drop the oldest retained backup (NotFound is fine before the chain
+        // fills) to make room for the shift below.
         match std::fs::remove_file(self.backup_path(retained)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -352,6 +361,21 @@ impl JsonlReceiptLog {
                 // handle keeps appending to a correctly-named live log.
                 let _ = std::fs::rename(self.backup_path(1), &self.path);
                 Err(open_err)
+            }
+        }
+    }
+
+    /// Best-effort removal of every backup numbered strictly above `retained`.
+    /// Backups are written densely (`.1`..`.k`), so we delete upward from
+    /// `retained + 1` and stop at the first gap. Errors are swallowed: this is
+    /// disk-hygiene, not a correctness gate, and must never abort an append.
+    fn prune_backups_above(&self, retained: u32) {
+        let mut n = retained.saturating_add(1);
+        // Stop at the first missing index (ends the dense run) or on any error.
+        while std::fs::remove_file(self.backup_path(n)).is_ok() {
+            match n.checked_add(1) {
+                Some(next) => n = next,
+                None => break,
             }
         }
     }
@@ -403,12 +427,22 @@ impl ReceiptLog for JsonlReceiptLog {
         // Rotate before writing when this line would push the live file past the
         // cap, but only once the file already holds a record — so a single line
         // larger than the cap still writes (after one rotation) instead of
-        // looping. A rotation error is surfaced but leaves a writable handle.
+        // looping. Rotation is best-effort: if it fails, `state.file` is still a
+        // writable handle, so we log and fall through to append the receipt to
+        // the current file (temporarily exceeding the cap) rather than dropping
+        // an audit record. The next append retries the rotation.
         if self.policy.max_file_bytes > 0
             && guard.written > 0
             && guard.written.saturating_add(line_len) > self.policy.max_file_bytes
+            && let Err(e) = self.rotate(&mut guard)
         {
-            self.rotate(&mut guard)?;
+            tracing::warn!(
+                error = %e,
+                event = "download_receipt_rotation_failed",
+                path = %self.path.display(),
+                "receipt log rotation failed; appending to the current file \
+                 (it may exceed receipts.max_file_bytes until the next rotation)",
+            );
         }
         match guard
             .file
@@ -688,6 +722,36 @@ mod tests {
             read_receipts(&log.backup_path(1))? == vec![fixed(1)],
             "pre-reopen line should have rotated into .1"
         );
+        Ok(())
+    }
+
+    /// Lowering `retained_files` between runs prunes the now-stale backups on
+    /// the next rotation, so disk converges to the smaller bound (#802 review).
+    #[test]
+    fn lowering_retained_files_prunes_stale_backups() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let cap = line_len(&fixed(0))?;
+        {
+            // Build up .1..=.4 under a generous retention.
+            let log = open_log(dir.path(), cap, 4)?;
+            for tag in 0..=5 {
+                log.append(&fixed(tag))?;
+            }
+            anyhow::ensure!(log.backup_path(4).exists(), "setup: .4 should exist");
+        }
+        // Reopen with a tighter retention and rotate once.
+        let log = open_log(dir.path(), cap, 1)?;
+        log.append(&fixed(6))?;
+        anyhow::ensure!(
+            log.backup_path(1).exists(),
+            "the single retained backup should survive"
+        );
+        for stale in 2..=4 {
+            anyhow::ensure!(
+                !log.backup_path(stale).exists(),
+                "stale backup .{stale} should have been pruned"
+            );
+        }
         Ok(())
     }
 
