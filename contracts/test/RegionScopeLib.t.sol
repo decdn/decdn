@@ -75,6 +75,15 @@ contract RegionScopeLibTest is Test {
         assertEq(h.packDirty(0), bytes32(0));
     }
 
+    function test_pack_oversizedStringTruncatesNoRevert() public view {
+        // Defensive guard: a >= 32-byte string (never produced by a real caller)
+        // must not underflow the mask shift — it truncates to the first 32 bytes.
+        bytes32 full32 = bytes32("abcdefghijklmnopqrstuvwxyzABCDEF"); // exactly 32 chars
+        assertEq(h.pack("abcdefghijklmnopqrstuvwxyzABCDEFOVERFLOW"), full32);
+        // Exactly 32 bytes round-trips too (boundary of the guard).
+        assertEq(h.pack("abcdefghijklmnopqrstuvwxyzABCDEF"), full32);
+    }
+
     // --- effectiveSince -----------------------------------------------------
 
     function test_effectiveSince_lastChangedWins() public view {
@@ -154,5 +163,14 @@ contract RegionScopeLibTest is Test {
         uint64 effective = NOW - 1;
         (,, bool prevApplies) = h.scopedRegions(GLOBAL_REGION, "eu-west", "GLOBAL", NOW, effective, WINDOW);
         assertFalse(prevApplies);
+    }
+
+    function test_scopedRegions_effectiveInFutureDoesNotUnderflow() public view {
+        // Defensive guard: `nowTs < effective` (only reachable via a test-time
+        // clock rewind) must not revert. It saturates `elapsed` to 0 → in window,
+        // so prev conservatively still applies.
+        (bytes32 cur,, bool prevApplies) = h.scopedRegions(GLOBAL_REGION, "eu-west", "us-east", NOW, NOW + 100, WINDOW);
+        assertEq(cur, bytes32("eu-west"));
+        assertTrue(prevApplies);
     }
 }

@@ -34,13 +34,26 @@ library RegionScopeLib {
     /// @notice Pack a region string into a left-aligned, zero-padded `bytes32`,
     ///         matching Solidity's `bytes32("literal")` packing so the result
     ///         compares equal to `ContentBlacklist`'s `bytes32` region keys.
-    /// @dev    `CapacityBond.MAX_REGION_HINT_BYTES == 16` guarantees `len < 32`,
-    ///         so the single high-bytes mask is always correct. Memory bytes
-    ///         beyond `len` are not guaranteed zero, hence the mask.
+    /// @dev    `CapacityBond.MAX_REGION_HINT_BYTES == 16` guarantees `len < 32` for
+    ///         every real caller, so the masked path is what actually runs. Memory
+    ///         bytes beyond `len` are not guaranteed zero, hence the mask. The
+    ///         `len >= 32` branch is a defensive guard: the mask shift `sub(32, len)`
+    ///         would underflow for such an input, so longer strings are truncated to
+    ///         their first 32 bytes (already a full word) rather than mis-masked.
     function pack(string memory s) internal pure returns (bytes32 out) {
         bytes memory b = bytes(s);
         uint256 len = b.length;
         if (len == 0) return bytes32(0);
+        if (len >= 32) {
+            // The first 32 bytes are a full word — no masking needed (and the
+            // mask shift below would underflow). Defensive: not reached by real
+            // callers (regions are <= 16 bytes).
+            // slither-disable-next-line assembly
+            assembly ("memory-safe") {
+                out := mload(add(b, 32))
+            }
+            return out;
+        }
         // slither-disable-next-line assembly
         assembly ("memory-safe") {
             // Load the first word of the string data (left-aligned: first char
@@ -74,9 +87,13 @@ library RegionScopeLib {
     ///      `prev != current` dedup so `SlashJudge` and `ContentBlacklist` cannot
     ///      drift. Each caller layers its own liveness predicate (response-anchored
     ///      `_liveBefore` vs. point-in-time `_isLive`) over the returned keys.
-    ///      `effective` is always a past stamp, so `nowTs - effective` cannot
-    ///      underflow; `regionPrev == ""` packs to `bytes32(0)` (never a real key,
-    ///      since `addHashRegional` rejects it), so an empty prev never applies.
+    ///      In production `effective` is always a past stamp (timestamps increase
+    ///      monotonically per block), so `elapsed` equals `nowTs - effective`. The
+    ///      saturating guard for `nowTs < effective` — only reachable via test-time
+    ///      clock rewinds — avoids an underflow revert and conservatively treats it
+    ///      as "just changed" (prev still applies). `regionPrev == ""` packs to
+    ///      `bytes32(0)` (never a real key, since `addHashRegional` rejects it), so
+    ///      an empty prev never applies.
     function scopedRegions(
         bytes32 globalRegion,
         string memory regionHint,
@@ -88,7 +105,8 @@ library RegionScopeLib {
         currentKey = pack(regionHint);
         if (currentKey == globalRegion) currentKey = bytes32(0);
 
-        if (uint256(nowTs) - uint256(effective) < window) {
+        uint256 elapsed = nowTs > effective ? uint256(nowTs) - uint256(effective) : 0;
+        if (elapsed < window) {
             bytes32 prev = pack(regionPrev);
             if (prev != bytes32(0) && prev != globalRegion && prev != currentKey) {
                 prevKey = prev;
