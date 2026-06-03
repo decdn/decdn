@@ -37,7 +37,7 @@ use aws_smithy_types::retry::RetryConfig;
 use iroh_blobs::Hash;
 use tokio_util::io::ReaderStream;
 
-use super::{Origin, OriginFetch, OriginKind, OriginUrl};
+use super::{DecompressMode, Origin, OriginFetch, OriginKind, OriginUrl, decompress};
 use crate::error::OriginPullError;
 
 /// Validated, runtime-ready configuration for an [`S3Origin`].
@@ -188,6 +188,13 @@ pub struct S3Origin {
     /// Operator-configured key prefix (trailing slash already applied by
     /// the resolver). Same rationale as `bucket`.
     prefix: Arc<str>,
+    /// How to handle `Content-Encoding` on the S3 response. Defaults to
+    /// [`DecompressMode::Auto`] — see that type for the full semantics.
+    /// Override with [`Self::with_decompress_mode`]. Mirrors
+    /// [`super::HttpOrigin`] so both first-class origin backends decode
+    /// gzip/zstd objects to canonical bytes before the engine's BLAKE3
+    /// verify (#804).
+    decompress: DecompressMode,
 }
 
 impl S3Origin {
@@ -316,7 +323,19 @@ impl S3Origin {
             client,
             bucket: Arc::from(bucket),
             prefix: Arc::from(prefix),
+            decompress: DecompressMode::Auto,
         }
+    }
+
+    /// Set the [`DecompressMode`]. See that type for the semantics of
+    /// `Auto` vs `Strict`. Defaults to `Auto`. Mirrors
+    /// [`super::HttpOrigin::with_decompress_mode`] so the wiring layer can
+    /// honour an operator-configured `decompress` knob uniformly across
+    /// backends.
+    #[must_use]
+    pub const fn with_decompress_mode(mut self, mode: DecompressMode) -> Self {
+        self.decompress = mode;
+        self
     }
 }
 
@@ -480,23 +499,27 @@ impl Origin for S3Origin {
                 Err(e) => return classify_get_object_error(e, &log_target),
             };
 
-            // Reject Content-Encoding upfront. The BLAKE3 verify in
-            // `CacheEngine` runs over canonical bytes, so a gzipped
-            // response would later trip a hash mismatch with a
-            // confusing error. Decompression on this backend is a
-            // follow-up issue (`HttpOrigin::decompress_body` is
-            // reusable); until then, surface a clear pointer error
-            // with operator-actionable workarounds.
-            if let Some(enc) = resp.content_encoding() {
-                let trimmed = enc.trim();
-                if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("identity") {
-                    return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                        "{log_target}: the S3 backend does not yet support Content-Encoding \
-                         decompression (got {trimmed:?}); either store canonical bytes or use \
-                         the HTTP origin behind a CDN that strips encoding"
-                    )));
-                }
-            }
+            // Classify `Content-Encoding` and apply the strict/auto policy
+            // using the same helper as the HTTP backend (#804). The BLAKE3
+            // verify in `CacheEngine` runs over canonical bytes, so a
+            // compressed body must be decoded back to canonical form before
+            // it reaches the engine. `resolve_encoding` returns `Err` for
+            // unknown encodings (e.g. `br`) and for known encodings under
+            // `DecompressMode::Strict` — both are permanent and fire before
+            // any body bytes are read.
+            let supported_encoding = match resp.content_encoding() {
+                None => None,
+                Some(enc) => match decompress::resolve_encoding(enc.trim(), self.decompress) {
+                    Ok(encoding) => encoding,
+                    Err(err) => {
+                        return Err(OriginPullError::Permanent(
+                            anyhow::Error::from(err).context(format!(
+                                "{log_target}: S3 origin rejected Content-Encoding"
+                            )),
+                        ));
+                    }
+                },
+            };
 
             // Fast-path size check from the SDK-parsed Content-Length.
             // `content_length()` returns `Option<i64>` — negative is
@@ -553,8 +576,15 @@ impl Origin for S3Origin {
             // adapter; out of scope for #271).
             let async_read = resp.body.into_async_read();
             let raw_stream = ReaderStream::new(async_read);
+            // Layer the decoder (if any) onto the raw chunk stream. For an
+            // identity body this boxes the stream through unchanged; for
+            // gzip/zstd it decodes to canonical bytes. The decompressed-side
+            // `max_bytes` cap is still enforced by the engine's
+            // `count_and_cap_stream`, so a small compressed payload that
+            // decodes to a huge blob fails fast at the engine seam.
+            let stream = decompress::decode_stream(raw_stream, supported_encoding);
             Ok(OriginFetch::Found {
-                stream: Box::pin(raw_stream),
+                stream,
                 size_hint: advertised_size,
             })
         })

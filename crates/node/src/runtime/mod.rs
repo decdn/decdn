@@ -1437,7 +1437,8 @@ async fn build_cache(
                     .await
                     .with_context(|| {
                         format!("failed to construct S3 origin client for cache.origins[{idx}]")
-                    })?,
+                    })?
+                    .with_decompress_mode(s3_cfg.decompress),
             ),
         };
         origins.push(backend);
@@ -2000,6 +2001,7 @@ mod tests {
             path_style: false,
             prefix: String::new(),
             credentials: Some(ResolvedS3Credentials::DefaultChain { profile: None }),
+            decompress: decdn_cache::DecompressMode::Auto,
         };
         let (_tmp, cfg) = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
         let metrics_handle = Arc::new(metrics::Metrics::new());
@@ -2033,6 +2035,7 @@ mod tests {
                 secret_access_key: SecretString::new("secret-fake"),
                 session_token: None,
             }),
+            decompress: decdn_cache::DecompressMode::Auto,
         };
         let (_tmp, cfg) = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
         let metrics_handle = Arc::new(metrics::Metrics::new());
@@ -2071,6 +2074,7 @@ mod tests {
                 secret_access_key: SecretString::new("sk-1"),
                 session_token: Some(SecretString::new("tok-1")),
             }),
+            decompress: decdn_cache::DecompressMode::Auto,
         };
         let runtime = s3_origin_config_from_resolved(&resolved);
         assert_eq!(runtime.bucket, "b");
@@ -2117,6 +2121,7 @@ mod tests {
             credentials: Some(ResolvedS3Credentials::DefaultChain {
                 profile: Some("decdn-prod".to_string()),
             }),
+            decompress: decdn_cache::DecompressMode::Auto,
         };
         let runtime = s3_origin_config_from_resolved(&resolved);
         assert_eq!(runtime.region, "eu-west-1");

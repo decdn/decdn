@@ -195,10 +195,13 @@ since project inception and will roll into the first tagged release.
   secret_access_key = "minioadmin"
   ```
 
-  Content-Encoding is not yet decompressed by the S3 backend — non-identity
-  responses are rejected with an operator-actionable error. Decompression
-  reuse from `HttpOrigin` is a follow-up; the workaround is to store
-  canonical bytes or front the bucket with a CDN that strips encoding.
+  `Content-Encoding` on S3 responses is handled the same way as the HTTP
+  origin (#804): gzip/zstd bodies are transparently decompressed to
+  canonical bytes before the engine's BLAKE3 verify. Controlled by the
+  optional `[cache.origin] decompress` knob (`"auto"` default decompresses;
+  `"strict"` refuses any non-identity encoding), mirroring the HTTP origin.
+  Unknown encodings (e.g. `br`) are rejected with an operator-actionable
+  permanent error.
 
 #### Gossip
 

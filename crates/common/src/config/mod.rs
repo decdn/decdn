@@ -1101,6 +1101,7 @@ fn resolve_s3_origin(
         path_style,
         prefix,
         credentials,
+        decompress,
     } = cfg;
 
     validate_s3_bucket_name(&bucket).context("invalid cache.origin.bucket")?;
@@ -1189,6 +1190,7 @@ fn resolve_s3_origin(
         path_style: path_style.unwrap_or(false),
         prefix,
         credentials,
+        decompress: decompress.unwrap_or_default(),
     })
 }
 
@@ -4119,6 +4121,43 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cache_s3_decompress_strict_via_file() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(types::S3OriginConfig {
+            decompress: Some(decdn_config_types::DecompressMode::Strict),
+            ..s3_cfg("decdn-blobs")
+        });
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        match resolved.origins.into_iter().next() {
+            Some(ResolvedOrigin::S3(s3)) => {
+                anyhow::ensure!(matches!(
+                    s3.decompress,
+                    decdn_config_types::DecompressMode::Strict
+                ));
+            }
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_s3_decompress_defaults_to_auto() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = cache_with_s3(s3_cfg("decdn-blobs"));
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        match resolved.origins.into_iter().next() {
+            Some(ResolvedOrigin::S3(s3)) => {
+                anyhow::ensure!(matches!(
+                    s3.decompress,
+                    decdn_config_types::DecompressMode::Auto
+                ));
+            }
+            other => anyhow::bail!("expected S3 origin, got: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn resolve_cache_http_decompress_defaults_to_auto() -> anyhow::Result<()> {
         let cli = cache_cli(None, None);
         let file = types::CacheConfig {
@@ -4160,6 +4199,7 @@ mod tests {
             path_style: None,
             prefix: None,
             credentials: None,
+            decompress: None,
         }
     }
 
@@ -4180,6 +4220,7 @@ mod tests {
             path_style: Some(true),
             prefix: Some("blobs".to_string()),
             credentials: None,
+            decompress: None,
         });
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         match resolved.origins.into_iter().next() {
@@ -4555,6 +4596,7 @@ mod tests {
                 secret_access_key: secret::SecretString::new("test-secret-value"),
                 session_token: Some(secret::SecretString::new("STS-token")),
             }),
+            decompress: None,
         });
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         let creds = match resolved.origins.into_iter().next() {
@@ -4595,6 +4637,7 @@ mod tests {
             path_style: None,
             prefix: None,
             credentials: Some(types::S3Credentials::DefaultChain { profile: None }),
+            decompress: None,
         });
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         let creds = match resolved.origins.into_iter().next() {
@@ -4634,6 +4677,7 @@ mod tests {
             credentials: Some(types::S3Credentials::DefaultChain {
                 profile: Some(String::new()),
             }),
+            decompress: None,
         });
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         let creds = match resolved.origins.into_iter().next() {
@@ -4691,6 +4735,7 @@ mod tests {
                     path_style: None,
                     prefix: None,
                     credentials: None,
+                    decompress: None,
                 })),
                 ..Default::default()
             }),
@@ -4718,6 +4763,7 @@ mod tests {
                     path_style: None,
                     prefix: Some("blobs-${HOME}/".to_string()),
                     credentials: None,
+                    decompress: None,
                 })),
                 ..Default::default()
             }),
@@ -4756,6 +4802,7 @@ mod tests {
                         secret_access_key: secret::SecretString::new("${HOME}-secret"),
                         session_token: Some(secret::SecretString::new("${HOME}-token")),
                     }),
+                    decompress: None,
                 })),
                 ..Default::default()
             }),
@@ -4804,6 +4851,7 @@ mod tests {
                     credentials: Some(types::S3Credentials::DefaultChain {
                         profile: Some("${HOME}-prof".to_string()),
                     }),
+                    decompress: None,
                 })),
                 ..Default::default()
             }),
@@ -4849,6 +4897,7 @@ mod tests {
                         secret_access_key: secret::SecretString::new("does-not-matter"),
                         session_token: None,
                     }),
+                    decompress: None,
                 })),
                 ..Default::default()
             }),

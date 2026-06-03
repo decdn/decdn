@@ -12,6 +12,7 @@
 //! See `crates/cache/tests/pull_through.rs` for the equivalent `wiremock`
 //! suite covering [`decdn_cache::HttpOrigin`].
 
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +23,8 @@ use aws_smithy_mocks::{Rule, RuleMode, mock, mock_client};
 use aws_smithy_types::byte_stream::ByteStream;
 use aws_smithy_types::retry::RetryConfig;
 use decdn_cache::{
-    CacheEngine, CacheError, Hash, Origin, OriginFetch, OriginPullError, RetryPolicy, S3Origin,
+    CacheEngine, CacheError, DecompressMode, Hash, Origin, OriginFetch, OriginPullError,
+    RetryPolicy, S3Origin,
 };
 
 /// Bucket and prefix used across tests. Matching constants on every rule
@@ -368,15 +370,83 @@ async fn fetch_4xx_classifies_as_permanent_and_does_not_retry() -> anyhow::Resul
     Ok(())
 }
 
-/// Non-identity `Content-Encoding` is rejected with the operator-friendly
-/// pointer message. The BLAKE3 verify in the engine runs over canonical
-/// bytes; passing through a gzipped body would later trip a `HashMismatch`
-/// error with no explanation. This test pins the exact wording so a doc
-/// drift between the error and the runbook doesn't slip past review.
+/// Compress `payload` with gzip for the decode tests. Mirrors the
+/// `pull_through.rs` helper so the two backends are exercised against the
+/// same canonical/compressed pairs.
+fn gzip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    e.write_all(payload)?;
+    Ok(e.finish()?)
+}
+
+fn zstd_compress(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    Ok(zstd::stream::encode_all(payload, 1)?)
+}
+
+/// `Content-Encoding: gzip` is transparently decompressed in the default
+/// `Auto` mode (#804) — parity with the HTTP backend. The BLAKE3 verify in
+/// the engine runs over canonical bytes, so the adapter must hand back the
+/// decompressed payload, not the gzipped wire bytes.
 #[tokio::test]
-async fn fetch_with_content_encoding_gzip_is_permanent_with_pointer_message() -> anyhow::Result<()>
-{
-    let hash = Hash::new(b"gzipped");
+async fn fetch_with_content_encoding_gzip_is_decompressed() -> anyhow::Result<()> {
+    let payload: &[u8] = b"hello, gzipped s3 world! repeat repeat repeat repeat";
+    let hash = Hash::new(payload);
+    let compressed = gzip(payload)?;
+
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .content_encoding("gzip")
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found, got NotFound"))?;
+    anyhow::ensure!(
+        &bytes[..] == payload,
+        "gzip body should decode to canonical payload"
+    );
+    Ok(())
+}
+
+/// `Content-Encoding: zstd` is transparently decompressed in `Auto` mode.
+#[tokio::test]
+async fn fetch_with_content_encoding_zstd_is_decompressed() -> anyhow::Result<()> {
+    let payload: &[u8] = b"hello, zstd s3! and a longer body to compress meaningfully xxxxx";
+    let hash = Hash::new(payload);
+    let compressed = zstd_compress(payload)?;
+
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .content_encoding("zstd")
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found, got NotFound"))?;
+    anyhow::ensure!(&bytes[..] == payload, "zstd body should decode to payload");
+    Ok(())
+}
+
+/// `DecompressMode::Strict` refuses a known encoding before any body
+/// bytes are read — equivalent to the pre-#804 reject-everything posture,
+/// for operators whose origin is guaranteed to serve canonical bytes.
+#[tokio::test]
+async fn fetch_with_strict_mode_rejects_gzip_encoding() -> anyhow::Result<()> {
+    let hash = Hash::new(b"gzipped-strict");
 
     let rule = mock!(Client::get_object).then_output(|| {
         GetObjectOutput::builder()
@@ -387,23 +457,56 @@ async fn fetch_with_content_encoding_gzip_is_permanent_with_pointer_message() ->
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "").with_decompress_mode(DecompressMode::Strict);
 
     let err = origin
         .fetch(hash, 16 * 1024 * 1024)
         .await
         .err()
-        .ok_or_else(|| anyhow::anyhow!("gzipped response must be rejected"))?;
+        .ok_or_else(|| anyhow::anyhow!("strict mode must reject a compressed body"))?;
     let msg = match &err {
         OriginPullError::Permanent(e) => format!("{e:#}"),
         OriginPullError::Transient(e) => {
             anyhow::bail!("Content-Encoding rejection must be Permanent, was Transient: {e:#}");
         }
     };
-    // Operators grep for these substrings in runbooks; pin the contract.
     anyhow::ensure!(
-        msg.contains("Content-Encoding") && msg.contains("canonical bytes"),
-        "operator-facing rejection lost its actionable wording: {msg}"
+        msg.contains("Content-Encoding") && (msg.contains("unsupported") || msg.contains("gzip")),
+        "strict rejection lost its actionable wording: {msg}"
+    );
+    Ok(())
+}
+
+/// An unknown `Content-Encoding` (e.g. Brotli) is a permanent error in
+/// either mode — the adapter has no decoder for it, and passing the bytes
+/// through would later trip a confusing `HashMismatch`.
+#[tokio::test]
+async fn fetch_with_unknown_encoding_is_permanent() -> anyhow::Result<()> {
+    let hash = Hash::new(b"brotli-body");
+
+    let rule = mock!(Client::get_object).then_output(|| {
+        GetObjectOutput::builder()
+            .body(ByteStream::from_static(b"\x00\x01\x02brotli-ish"))
+            .content_encoding("br")
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    let err = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("unknown encoding must be rejected"))?;
+    let msg = match &err {
+        OriginPullError::Permanent(e) => format!("{e:#}"),
+        OriginPullError::Transient(e) => {
+            anyhow::bail!("unknown-encoding rejection must be Permanent, was Transient: {e:#}");
+        }
+    };
+    anyhow::ensure!(
+        msg.contains("Content-Encoding") && msg.contains("br"),
+        "error should name the unsupported encoding: {msg}"
     );
     Ok(())
 }
