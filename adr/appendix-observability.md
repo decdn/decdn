@@ -217,6 +217,25 @@ Per [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) (`cd
 | `decdn_dht_findvalue_queries_total` | Counter | R | — | DHT FIND_VALUE lookups this node issued to discover providers. |
 | `decdn_dht_routing_table_size` | Gauge | R | — | Distinct entries in the local Kademlia routing table. |
 
+##### Active-Staker Set Watcher Metrics
+
+The `ChainStakerSet` watcher follows `CapacityBond` membership events to keep a cached active-staker set in sync with chain state ([ADR 022 § STORE Flow](022-content-discovery.md#adr-022--content-discovery-at-scale), [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry)). On a mid-run watcher RPC outage the cache can **drift** from chain state (there is no `getActiveNodes` resync after extended outage). That drift is revenue-impacting: the cached set decides which probes the stake-lane reservation sheds ([ADR 003 § Admission and Priority](003-payments.md#admission-and-priority), #757) and gates DHT `Store` admission. These metrics make the drift window alertable rather than log-grep-only — `decdn_rpc_healthy` tracks the reachability watchdog, **not** this watcher (#783).
+
+| Metric | Type | Tier | Labels | Description |
+|--------|------|------|--------|-------------|
+| `decdn_staker_set_watcher_restarts_total` | Counter | M | — | Distinct drift windows the watcher has entered (#783, edge-triggered #788): bumped **once** on the transition from a healthy cycle into the error/backoff state, so each increment brackets exactly one drift window (it does **not** count individual backoff iterations of one continuous outage). A clean stream end (filter expiry / provider rotation) is **not** an error and does not advance this. Pairs with the per-error `warn!` in `watcher_loop`. |
+| `decdn_staker_set_watcher_resolve_failures_total` | Counter | M | — | Operator-indexed events (`Reinstated` / `UnbondingRequested`) dropped because the follow-up `nodeIdOf(operator)` RPC failed (#788). The membership change is lost, leaving the cached set out of sync for that operator until a later event corrects it — silent drift that trips no restart/down-seconds metric, hence its own counter. Pairs with the per-failure `warn!` in `apply_operator_change`. |
+| `decdn_staker_set_watcher_down_seconds` | Gauge | M | — | True downtime (#783, semantics corrected #788): seconds the watcher has been in the error/backoff state with no established filters. Reads `0` for the **entire life of any established cycle**, however long or quiet (a healthy filter stream persists indefinitely — this is *not* cycle age), and climbs only while between a failed cycle and the next re-establishment, so an alert fires on a *sustained* outage rather than a transient restart. Reads `0` until the first cycle is established after bootstrap; a poisoned internal lock reports `i64::MAX` (conservative — never masks an in-progress outage). |
+| `decdn_staker_set_active_count` | Gauge | R | — | Current cached active-staker set size (#783), sampled on bootstrap and on every membership change. Pair with `decdn_staker_set_watcher_down_seconds`: the count holding flat while down-seconds climbs means the cache is frozen, not that the network genuinely lost operators. |
+
+**Recommended alerts:**
+
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| `decdn_staker_set_watcher_down_seconds` | > 120s | > 600s sustained | Check the blockchain RPC provider; the cached active-staker set may be drifting from chain state, mis-shedding stake-lane probes and DHT `Store`s. |
+| `decdn_staker_set_watcher_restarts_total` (rate) | > 0 | > 0 sustained | Investigate flapping RPC / event subscription; correlate with `decdn_staker_set_watcher_down_seconds` depth. |
+| `decdn_staker_set_watcher_resolve_failures_total` (rate) | > 0 | > 0 sustained | A `nodeIdOf` RPC is failing and silently dropping membership changes — the cached active-staker set is drifting from chain state. Check the RPC provider; correlate with `decdn_staker_set_active_count`. |
+
 ### Health Endpoint
 
 `GET /health` (same HTTP port as `/metrics`) returns a JSON object:

@@ -163,10 +163,16 @@ pub trait PendingSettleStore: Send + Sync {
 /// reorg margin) up to the live-filter install block; `register_open_channel`
 /// is idempotent, so re-scanning the overlap is harmless.
 ///
-/// Implementations MUST commit durably (fsync, on disk-backed impls) before
+/// A directly disk-backed implementation MUST commit durably (fsync) before
 /// returning `Ok` from `record_last_seen_block`, mirroring the
-/// [`ChannelStateStore`] durability contract — a lost checkpoint silently
-/// widens the rescan (safe, just more RPC), never narrows it.
+/// [`ChannelStateStore`] durability contract. A debouncing *decorator* MAY
+/// relax that per-call fsync — buffering in memory and coarsening the durable
+/// write cadence — provided it preserves the two invariants this contract
+/// rests on: the persisted block is **monotonic** (never lowered) and the
+/// latest buffered block is forced out on graceful shutdown via
+/// [`flush`](WatcherCheckpointStore::flush). Both relaxations are safe because
+/// a lost or lagging checkpoint only ever silently widens the rescan (more
+/// RPC), never narrows it.
 pub trait WatcherCheckpointStore: Send + Sync {
     /// The last block scanned for `ChannelOpened`, or `None` on a never-written
     /// store (first-ever boot — there is no downtime gap to cover, so the
@@ -181,10 +187,31 @@ pub trait WatcherCheckpointStore: Send + Sync {
     /// value. Called after the bring-up backfill completes and as the live
     /// stream advances, so the next boot resumes from here.
     ///
+    /// A debouncing decorator MAY buffer the value in memory and defer the
+    /// durable write to a coarser cadence (the floor only ever lags the true
+    /// scan position, which is safe — see the type-level contract above); such
+    /// a decorator overrides [`flush`](Self::flush) to force the buffered value
+    /// out on graceful shutdown. A directly disk-backed implementation commits
+    /// durably before returning `Ok`.
+    ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the durable write fails.
     fn record_last_seen_block(&self, block: u64) -> Result<(), StoreError>;
+
+    /// Force any buffered checkpoint to durable storage. The default is a no-op:
+    /// implementations that already commit durably inside
+    /// [`record_last_seen_block`](Self::record_last_seen_block) have nothing
+    /// buffered. A debouncing decorator overrides this to fsync the latest
+    /// deferred block, and the runtime calls it on graceful shutdown so the most
+    /// recent scan progress is not lost to the next boot's rescan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails.
+    fn flush(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// Failure modes shared by every [`ChannelStateStore`] implementation.
