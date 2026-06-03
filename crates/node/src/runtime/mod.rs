@@ -413,10 +413,7 @@ pub async fn run(
     // discard-only log — rather than refusing to start. The open does a small
     // amount of disk I/O (create + chmod), so run it on the blocking pool.
     let receipt_log_data_dir = cfg.identity.data_dir.clone();
-    let receipt_log_policy = crate::receipt_log::RotationPolicy::new(
-        cfg.receipts.max_file_bytes,
-        cfg.receipts.retained_files,
-    );
+    let receipt_log_policy = crate::receipt_log::RotationPolicy::from(&cfg.receipts);
     let receipt_log: Arc<dyn crate::receipt_log::ReceiptLog> =
         match tokio::task::spawn_blocking(move || {
             crate::receipt_log::JsonlReceiptLog::open(&receipt_log_data_dir, receipt_log_policy)

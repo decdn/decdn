@@ -217,9 +217,19 @@ pub trait ReceiptLog: Send + Sync {
 ///
 /// `max_file_bytes` is the size at which the live file is rotated;
 /// `retained_files` is how many numbered backups (`.1`..=`.N`) to keep (`0`
-/// truncates the live file in place instead of keeping backups). The resolver
-/// (`decdn_common::config::resolve_config`) validates both into safe ranges
-/// before they reach here.
+/// truncates the live file in place instead of keeping backups). A
+/// `max_file_bytes` of `0` disables rotation entirely (the live file grows
+/// unbounded) — a degenerate value the engine accepts but production never
+/// produces.
+///
+/// The engine deliberately accepts any values (the rotation guards in
+/// [`JsonlReceiptLog::append`] cope with a sub-line cap, and tests use tiny
+/// caps to exercise rotation deterministically). Production policies are built
+/// *only* from a [`decdn_common::config::ResolvedReceipts`] via the [`From`]
+/// impl below, and that config type is range-validated by
+/// `decdn_common::config::resolve_config` — so every live policy is within the
+/// operator-facing safe bounds (`[MIN_RECEIPT_MAX_FILE_BYTES,
+/// MAX_RECEIPT_MAX_FILE_BYTES]`, `retained_files <= MAX_RECEIPT_RETAINED_FILES`).
 #[derive(Debug, Clone, Copy)]
 pub struct RotationPolicy {
     max_file_bytes: u64,
@@ -227,12 +237,29 @@ pub struct RotationPolicy {
 }
 
 impl RotationPolicy {
-    /// Build a policy from validated limits.
+    /// Build a policy from raw, *unvalidated* limits. Test-only: production
+    /// constructs policies from validated config through the [`From`] impl, so
+    /// this wider entry point (which accepts out-of-range and degenerate caps)
+    /// is not exposed outside `#[cfg(test)]`.
+    #[cfg(test)]
     #[must_use]
-    pub const fn new(max_file_bytes: u64, retained_files: u32) -> Self {
+    pub(crate) const fn new(max_file_bytes: u64, retained_files: u32) -> Self {
         Self {
             max_file_bytes,
             retained_files,
+        }
+    }
+}
+
+impl From<&decdn_common::config::ResolvedReceipts> for RotationPolicy {
+    /// The sole production constructor. `ResolvedReceipts` is range-validated by
+    /// the config resolver, so the policy is always within the operator-facing
+    /// safe bounds — the validation guarantee carries across the type boundary
+    /// instead of being re-opened by a raw constructor.
+    fn from(r: &decdn_common::config::ResolvedReceipts) -> Self {
+        Self {
+            max_file_bytes: r.max_file_bytes,
+            retained_files: r.retained_files,
         }
     }
 }
@@ -367,15 +394,35 @@ impl JsonlReceiptLog {
 
     /// Best-effort removal of every backup numbered strictly above `retained`.
     /// Backups are written densely (`.1`..`.k`), so we delete upward from
-    /// `retained + 1` and stop at the first gap. Errors are swallowed: this is
-    /// disk-hygiene, not a correctness gate, and must never abort an append.
+    /// `retained + 1` and stop at the first gap. This is disk-hygiene, not a
+    /// correctness gate, and must never abort an append — so it never returns an
+    /// error. It does, however, distinguish the two stop conditions: a missing
+    /// index ends the dense run silently, but a *real* error (permissions, busy,
+    /// I/O) is not the end of the run — higher-numbered backups may still exist
+    /// and would leak past the `(retained_files + 1) * max_file_bytes` disk
+    /// bound. Scanning past a gap could run unbounded, so we still stop, but a
+    /// real error is logged so the leak is observable rather than silent.
     fn prune_backups_above(&self, retained: u32) {
         let mut n = retained.saturating_add(1);
-        // Stop at the first missing index (ends the dense run) or on any error.
-        while std::fs::remove_file(self.backup_path(n)).is_ok() {
+        loop {
+            match std::fs::remove_file(self.backup_path(n)) {
+                Ok(()) => {}
+                // The dense `.1`..`.k` run ends at the first missing index.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        event = "download_receipt_prune_failed",
+                        path = %self.backup_path(n).display(),
+                        "could not prune stale receipt-log backup; backups above \
+                         it may exceed receipts.retained_files until removed manually",
+                    );
+                    return;
+                }
+            }
             match n.checked_add(1) {
                 Some(next) => n = next,
-                None => break,
+                None => return,
             }
         }
     }
@@ -510,7 +557,10 @@ mod tests {
     }
 
     /// A rotation policy whose cap is large enough that the existing
-    /// non-rotation tests never rotate.
+    /// non-rotation tests never rotate. Uses the engine's wider (test-only)
+    /// `new` domain — a `u64::MAX` cap is above the production ceiling, which is
+    /// exactly why `new` is gated to tests and production goes through
+    /// `From<&ResolvedReceipts>`.
     fn no_rotate() -> RotationPolicy {
         RotationPolicy::new(u64::MAX, 4)
     }
@@ -779,6 +829,72 @@ mod tests {
                 p.display()
             );
         }
+        Ok(())
+    }
+
+    /// The PR's central best-effort guarantee (#802): when `rotate()` fails, the
+    /// append must NOT be aborted — the receipt still lands in the live file and
+    /// `append` returns `Ok` — and the live handle must remain writable at the
+    /// canonical path so a *later* append rotates successfully (the same
+    /// "preserves a usable canonical-path handle" invariant the reopen rollback
+    /// in `rotate` upholds). We force a rotation failure by squatting a directory
+    /// on the `.1` backup path so the internal `remove_file`/rename errors out.
+    #[test]
+    #[cfg(unix)]
+    fn rotation_failure_still_appends_and_stays_writable() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let cap = line_len(&fixed(0))?;
+        let log = open_log(dir.path(), cap, 1)?;
+        log.append(&fixed(0))?; // fills the live file to the cap
+        // A directory at `.1` makes the rotation step that reclaims `.1` error
+        // (`remove_file` on a directory fails with a non-NotFound error).
+        std::fs::create_dir(log.backup_path(1))?;
+        // Would rotate first; rotation fails, but the append must still succeed
+        // against the (now over-cap) live file rather than drop the record.
+        log.append(&fixed(1))?;
+        anyhow::ensure!(
+            read_receipts(log.path())? == vec![fixed(0), fixed(1)],
+            "both receipts must remain in the live file when rotation fails"
+        );
+        // Clear the squatter; the next append must rotate cleanly, proving the
+        // live handle stayed at the canonical path and writable across the
+        // failure (i.e. no handle was lost mid-rotation).
+        std::fs::remove_dir(log.backup_path(1))?;
+        log.append(&fixed(2))?;
+        anyhow::ensure!(
+            read_receipts(log.path())? == vec![fixed(2)],
+            "live file should rotate cleanly once the failure is cleared"
+        );
+        anyhow::ensure!(
+            read_receipts(&log.backup_path(1))? == vec![fixed(0), fixed(1)],
+            "the pre-failure records should have rotated into .1"
+        );
+        Ok(())
+    }
+
+    /// A cap that holds several lines exercises the rotation-trigger arithmetic
+    /// (`written + line > max_file_bytes`) at a real boundary — the one-line-cap
+    /// tests above cannot distinguish `>` from `>=`. With a 3-line cap the live
+    /// file fills to exactly three records before the fourth append rotates.
+    #[test]
+    fn rotates_after_filling_a_multi_line_file() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let l = line_len(&fixed(0))?;
+        let log = open_log(dir.path(), l * 3, 2)?;
+        for tag in 0..4u8 {
+            log.append(&fixed(tag))?;
+        }
+        // Exactly three records filled the first file (now `.1`); the fourth
+        // opened a fresh live file. A `>=` boundary bug would rotate one line
+        // early, leaving two records per file.
+        anyhow::ensure!(
+            read_receipts(&log.backup_path(1))? == vec![fixed(0), fixed(1), fixed(2)],
+            "first file should hold exactly three records before rotating"
+        );
+        anyhow::ensure!(
+            read_receipts(log.path())? == vec![fixed(3)],
+            "fourth record should be alone in the fresh live file"
+        );
         Ok(())
     }
 
