@@ -828,7 +828,10 @@ contract CapacityBondTest is Test {
     /// slash-epoch watermark, and auto-eject still fire, escrow stays flat, and
     /// the unappealed-finalize terminal path no-ops without moving any TOKEN.
     function test_slash_zeroBondOperator_mintsZeroAmountRecordNoOpsAtFinality() public {
-        // Warp past epoch 0 so the slash watermark stamps a non-zero value.
+        // Warp to epoch 2 (14d / 7d EPOCH_LENGTH) so we can assert the *exact*
+        // +1-encoded watermark below. (The +1 encoding means even an epoch-0
+        // slash stamps 1, so `assertGt(.., 0)` would be near-trivially true —
+        // assert the precise value to actually pin the stamp arithmetic.)
         vm.warp(2 * 7 days);
 
         address noBond = address(0xDEAD11);
@@ -845,7 +848,7 @@ contract CapacityBondTest is Test {
         assertEq(totalSlash, 0);
         assertEq(bond.escrowedTotal(), escrowBefore);
         assertEq(bond.lifetimeOffenseCount(noBond), 1);
-        assertGt(bond.slashedAtEpoch(noBond), 0);
+        assertEq(bond.slashedAtEpoch(noBond), 3); // epoch 2, +1-encoded
         assertTrue(bond.ejected(noBond));
         SlashRecord memory r = bond.getSlashRecord(slashId);
         assertEq(r.slashAmount, 0);
@@ -870,11 +873,15 @@ contract CapacityBondTest is Test {
         vm.prank(admin);
         (uint256 slashId, uint256 totalSlash) = bond.slash(noBond, challenger, 1);
         assertEq(totalSlash, 0);
-        assertGt(bond.slashedAtEpoch(noBond), 0);
+        assertEq(bond.slashedAtEpoch(noBond), 3); // epoch 2, +1-encoded
 
         uint256 opBefore = token.balanceOf(noBond);
         vm.startPrank(admin);
         bond.markAppealOpen(slashId);
+        // The reversal still emits over the zero-amount record (refund == 0), so
+        // indexers see the state change even though no TOKEN moves.
+        vm.expectEmit(true, true, false, true, address(bond));
+        emit CapacityBond.SlashReversed(slashId, noBond, 0);
         bond.settleAppealGranted(slashId);
         vm.stopPrank();
 
