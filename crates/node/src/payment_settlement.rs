@@ -80,14 +80,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use anyhow::{Context, Result};
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    ChannelId, ChannelState, ChannelStateStore, PendingSettle, PendingSettleStore,
+    ChannelId, ChannelState, ChannelStateStore, PendingSettle, PendingSettleStore, StoreError,
     WatcherCheckpointStore,
 };
 use futures_util::StreamExt;
@@ -195,6 +195,35 @@ const REORG_MARGIN_BLOCKS: u64 = 128;
 /// configurable) if a target RPC enforces a tighter or result-count-based cap.
 const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
 
+/// Debounce thresholds for the watcher scan checkpoint (#784). The persisted
+/// checkpoint is only a *floor* for the resume backfill: `resolve_backfill_start`
+/// rounds it down by [`REORG_MARGIN_BLOCKS`] and `register_open_channel` is
+/// idempotent, so a checkpoint that lags the true scan position by a bounded
+/// amount only ever *widens* the next rescan, never narrows it. That makes the
+/// per-block fsync the live `opened` arm would otherwise pay (one fsync per
+/// distinct block carrying a provider-owned `ChannelOpened`, both while draining
+/// a resubscribe backlog and in steady state on a high-fan-out provider) safe to
+/// coarsen: [`DebouncedCheckpointStore`] forwards a durable write only once the
+/// buffered block is at least [`CHECKPOINT_FLUSH_BLOCKS`] ahead of the last
+/// persisted value *or* at least [`CHECKPOINT_FLUSH_INTERVAL`] has elapsed since
+/// the last durable write, whichever comes first, and the runtime forces a final
+/// flush on graceful shutdown.
+///
+/// The floor is allowed to lag by far more than [`REORG_MARGIN_BLOCKS`] — a
+/// crash just re-scans the lagging span via the head-anchored backfill, so the
+/// reorg margin is not an upper bound on the debounce window. `512` is chosen so
+/// a backlog drain fsyncs ~once per 512 blocks instead of per block (a ~512x
+/// reduction) while keeping the worst-case re-scanned span small relative to a
+/// long downtime gap.
+const CHECKPOINT_FLUSH_BLOCKS: u64 = 512;
+
+/// Time-based companion to [`CHECKPOINT_FLUSH_BLOCKS`]: even a slow trickle of
+/// opens (well under [`CHECKPOINT_FLUSH_BLOCKS`] apart) persists at least this
+/// often, bounding how many blocks a crash re-scans when block-cadence alone
+/// would defer the write indefinitely. 30s keeps the steady-state fsync rate
+/// negligible while making the worst-case lost progress a handful of L2 blocks.
+const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Resolve the watcher backfill floor from the persisted scan checkpoint and
 /// the bootstrap head (#751). `None` (first-ever boot) → `head`: nothing was
 /// opened against this node before it existed. `Some(b)` → `b - margin`, clamped
@@ -283,6 +312,13 @@ pub struct PaymentChannelService<P: Provider + Clone + 'static> {
     /// the handle, never across an `.await`.
     redeemer: std::sync::Mutex<Option<JoinHandle<()>>>,
     _sweeper: AbortOnDrop,
+    /// Held so graceful shutdown can force a final checkpoint flush (#784): the
+    /// watcher debounces durable checkpoint writes, so the latest scan progress
+    /// lives only in memory until either threshold trips. A clean stop flushes it
+    /// here so the next boot resumes from the true scan position rather than
+    /// re-scanning the debounce window. A directly-durable store's `flush` is a
+    /// no-op, so this is harmless when no debounce decorator is installed.
+    checkpoint_store: Arc<dyn WatcherCheckpointStore>,
 }
 
 impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
@@ -348,7 +384,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             usdc_token,
             Arc::clone(&handler),
             Arc::clone(&pending_store),
-            checkpoint_store,
+            Arc::clone(&checkpoint_store),
             start_block,
             Arc::clone(&metrics),
         ));
@@ -376,6 +412,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             _watcher: AbortOnDrop(watcher),
             redeemer: std::sync::Mutex::new(Some(redeemer)),
             _sweeper: AbortOnDrop(sweeper),
+            checkpoint_store,
         })
     }
 
@@ -393,6 +430,11 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
     /// persisted state is final. A close starts the dispute window; a later
     /// `settleChannel` (callable by anyone) finalizes it.
     pub async fn close_open_channels_on_shutdown(&self, deadline: Duration) {
+        // Force the debounced watcher checkpoint to disk first (#784) so the
+        // most-recent scan progress survives the stop and the next boot does not
+        // needlessly re-scan the debounce window. Done before the channel-close
+        // deadline so a slow `closeChannel` cannot starve it.
+        self.flush_checkpoint_on_shutdown();
         // Quiesce the redeemer first (#751): with the router already drained, no
         // new hints arrive, and aborting the redeemer here stops it from *issuing*
         // any further `withdraw`, so the `closeChannel`s below are very unlikely to
@@ -413,6 +455,31 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         };
         if closed > 0 {
             info!(closed, "closed unredeemed channels on shutdown");
+        }
+    }
+
+    /// Force the debounced watcher scan checkpoint to durable storage (#784).
+    /// Best-effort: a failed flush only widens the next boot's rescan (the
+    /// [`WatcherCheckpointStore`] floor contract), so it is logged, never
+    /// propagated — it must not abort the shutdown close path.
+    fn flush_checkpoint_on_shutdown(&self) {
+        if let Err(err) = self.checkpoint_store.flush() {
+            // A failed flush leaves the buffered block intact, so
+            // `load_last_seen_block` surfaces the still-buffered high-water block:
+            // how far ahead of the durable floor this stop lost progress, i.e. the
+            // span the next boot's head-anchored backfill will re-scan. Logging it
+            // gives a post-mortem the rescan depth without a dedicated accessor.
+            //
+            // The in-loop persist sites bump `metrics.watcher_persist_failure()`,
+            // but no `metrics` handle is held on this shutdown path (the watcher
+            // task owns it), so we deliberately do not plumb one through solely for
+            // counter parity here — the warn is the signal for a failed flush.
+            let pending_block = self.checkpoint_store.load_last_seen_block().ok().flatten();
+            warn!(
+                %err,
+                ?pending_block,
+                "failed to flush watcher scan checkpoint on shutdown"
+            );
         }
     }
 
@@ -1096,6 +1163,217 @@ fn advance_checkpoint(
     }
 }
 
+/// Mutable debounce bookkeeping for [`DebouncedCheckpointStore`], guarded by a
+/// single `std::sync::Mutex`. The lock is only ever held for the brief duration
+/// of a `record`/`flush` decision (no `.await` inside), so a sync mutex is the
+/// right primitive.
+struct DebounceState {
+    /// The block last forwarded to a *durable* write on the inner store, or
+    /// `None` if nothing has been persisted in this process yet. Also the floor
+    /// against which the block-cadence threshold is measured.
+    last_persisted: Option<u64>,
+    /// Monotonic [`Instant`] of the last durable write, for the time-based
+    /// threshold. Seeded at construction so the first interval is measured from
+    /// service start.
+    last_persist_at: Instant,
+    /// The highest block buffered but not yet durably written. Monotonic
+    /// (`record` only raises it). `None` once flushed/forwarded — i.e. equal to
+    /// `last_persisted`.
+    pending: Option<u64>,
+    /// Whether the first in-process `record` has run. Until it does we lazily
+    /// fold the inner store's existing checkpoint into `last_persisted` (the
+    /// constructor stays I/O-free), and we force that first record durable so a
+    /// restart re-anchors the floor to the live scan position promptly rather
+    /// than lingering at a stale on-disk value.
+    seeded: bool,
+}
+
+/// Debouncing decorator over a [`WatcherCheckpointStore`] (#784). Buffers
+/// `record_last_seen_block` in memory and forwards a durable write only when the
+/// buffered block is at least `flush_blocks` ahead of the last persisted value
+/// *or* at least `flush_interval` has elapsed since the last durable write —
+/// cutting the per-block fsync amplification the live `opened` arm would
+/// otherwise pay on a backlog drain or a high-fan-out provider.
+///
+/// **Durability contract preserved.** The persisted value is only ever a *floor*
+/// for the resume backfill (`resolve_backfill_start` rewinds it by
+/// `REORG_MARGIN_BLOCKS` and `register_open_channel` is idempotent), so a
+/// buffered-but-not-yet-fsynced advance that a crash loses merely widens the next
+/// rescan — never narrows it. The forwarded value stays monotonic because
+/// `record` only raises `pending`, and the watcher's own `advance_checkpoint`
+/// high-water guard never feeds a lower block. [`Self::flush`] forces the
+/// buffered value out and is wired into graceful shutdown so steady-state
+/// progress survives a clean stop.
+///
+/// `load_last_seen_block` returns the max of the inner store's value and any
+/// in-process buffered block, so a watcher resubscribe within the same process
+/// resumes from the tightest known floor rather than re-reading a stale persisted
+/// value (still safe either way; this just avoids a redundant in-process
+/// re-scan). On a fresh boot the buffer is empty, so it reads through to the
+/// inner store unchanged.
+pub struct DebouncedCheckpointStore {
+    inner: Arc<dyn WatcherCheckpointStore>,
+    flush_blocks: u64,
+    flush_interval: Duration,
+    /// Clock source, injectable so the time-based threshold is unit-testable
+    /// without sleeping. Production uses [`Instant::now`].
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    state: std::sync::Mutex<DebounceState>,
+}
+
+impl std::fmt::Debug for DebouncedCheckpointStore {
+    // Manual impl: the boxed clock closure and the `dyn` inner store are not
+    // `Debug`. Surface the static thresholds and the current buffered/persisted
+    // floors (lock recovered from poison rather than panicking).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (pending, last_persisted) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.pending, state.last_persisted)
+        };
+        f.debug_struct("DebouncedCheckpointStore")
+            .field("flush_blocks", &self.flush_blocks)
+            .field("flush_interval", &self.flush_interval)
+            .field("pending", &pending)
+            .field("last_persisted", &last_persisted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DebouncedCheckpointStore {
+    /// Wrap `inner` with the production debounce thresholds
+    /// (`CHECKPOINT_FLUSH_BLOCKS` / `CHECKPOINT_FLUSH_INTERVAL`) and the
+    /// real wall clock.
+    #[must_use]
+    pub fn new(inner: Arc<dyn WatcherCheckpointStore>) -> Self {
+        Self::with_params(
+            inner,
+            CHECKPOINT_FLUSH_BLOCKS,
+            CHECKPOINT_FLUSH_INTERVAL,
+            Box::new(Instant::now),
+        )
+    }
+
+    /// Construct with explicit thresholds and clock — the seam the unit tests
+    /// drive to exercise the block-cadence and time-cadence paths deterministically.
+    fn with_params(
+        inner: Arc<dyn WatcherCheckpointStore>,
+        flush_blocks: u64,
+        flush_interval: Duration,
+        clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
+        let now = clock();
+        Self {
+            inner,
+            flush_blocks,
+            flush_interval,
+            clock,
+            state: std::sync::Mutex::new(DebounceState {
+                last_persisted: None,
+                last_persist_at: now,
+                pending: None,
+                seeded: false,
+            }),
+        }
+    }
+
+    /// Forward `block` to the inner store and reset the debounce window. Caller
+    /// holds `state`. On a durable-write error the buffered `pending` is left
+    /// intact (and `last_persisted`/`last_persist_at` unchanged) so the next
+    /// `record` or `flush` retries — a failed write must not advance the
+    /// in-memory floor past what actually reached disk.
+    fn persist_locked(&self, state: &mut DebounceState, block: u64) -> Result<(), StoreError> {
+        self.inner.record_last_seen_block(block)?;
+        state.last_persisted = Some(block);
+        state.last_persist_at = (self.clock)();
+        state.pending = None;
+        Ok(())
+    }
+}
+
+impl WatcherCheckpointStore for DebouncedCheckpointStore {
+    fn load_last_seen_block(&self) -> Result<Option<u64>, StoreError> {
+        let persisted = self.inner.load_last_seen_block()?;
+        // Sync lock, dropped before return; never held across an await. Recover a
+        // poisoned lock rather than panicking (anti-panic policy).
+        let pending = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending;
+        Ok(match (persisted, pending) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        })
+    }
+
+    fn record_last_seen_block(&self, block: u64) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // On the first in-process record, fold the inner store's existing
+        // checkpoint into `last_persisted`. The constructor leaves it `None`
+        // (staying I/O-free and infallible), so without this a fresh wrapper
+        // around an *already-populated* inner store could forward a block BELOW
+        // its existing checkpoint and regress the on-disk floor. Seeding the
+        // high-water guard with that floor keeps the monotonic-floor contract
+        // for any caller, not just the watcher loop (which only feeds increasing
+        // blocks). `first_record` is captured before flipping the flag so we can
+        // still force that first advance durable (re-anchor after a restart).
+        let first_record = !state.seeded;
+        if first_record {
+            state.seeded = true;
+            state.last_persisted = self.inner.load_last_seen_block()?;
+        }
+        // Buffer the latest block (monotonic: never lower an already-buffered or
+        // already-persisted floor).
+        let highest = state
+            .pending
+            .max(state.last_persisted)
+            .unwrap_or(0)
+            .max(block);
+        state.pending = Some(highest);
+
+        // Nothing to persist if the guarded high-water is already at/below the
+        // durable floor — an out-of-order or lower-than-floor record. Skip the
+        // write entirely (no regression, no redundant fsync) regardless of the
+        // first-record rule below.
+        if state.last_persisted == Some(highest) {
+            return Ok(());
+        }
+
+        let blocks_ahead = highest.saturating_sub(state.last_persisted.unwrap_or(0));
+        let elapsed = (self.clock)().saturating_duration_since(state.last_persist_at);
+        // The first record that actually advances the floor always goes through,
+        // re-anchoring the durable checkpoint to the live scan position promptly
+        // after a (re)start; thereafter debounce on either threshold.
+        let due =
+            first_record || blocks_ahead >= self.flush_blocks || elapsed >= self.flush_interval;
+        if due {
+            self.persist_locked(&mut state, highest)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn flush(&self) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only a buffered block strictly above the persisted floor needs a write.
+        match state.pending {
+            Some(block) if state.last_persisted != Some(block) => {
+                self.persist_locked(&mut state, block)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Redemption task: `withdraw` a channel's accrued claim once it crosses the
 /// threshold, driven by two sources — advisory hints from the voucher-accept
 /// path and a low-frequency self-tick (#751) that scans every channel so a
@@ -1671,10 +1949,25 @@ mod tests {
     /// In-memory [`WatcherCheckpointStore`] for `advance_checkpoint` tests:
     /// records the last block written (sentinel `u64::MAX` = unset) and counts
     /// writes, all without `unwrap` (workspace anti-panic policy).
-    #[derive(Default)]
     struct RecordingCheckpointStore {
+        /// `u64::MAX` sentinel = unset (never written). `#[derive(Default)]` would
+        /// seed this to `0`, which `load_last_seen_block` would misreport as a
+        /// real block-0 checkpoint — so `Default` is hand-written to the sentinel.
         stored: std::sync::atomic::AtomicU64,
         writes: std::sync::atomic::AtomicUsize,
+        /// When set, `record_last_seen_block` returns an error without storing,
+        /// to exercise the debouncer's retry-after-failure path.
+        fail_writes: std::sync::atomic::AtomicBool,
+    }
+
+    impl Default for RecordingCheckpointStore {
+        fn default() -> Self {
+            Self {
+                stored: std::sync::atomic::AtomicU64::new(u64::MAX),
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                fail_writes: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
     }
 
     impl WatcherCheckpointStore for RecordingCheckpointStore {
@@ -1684,12 +1977,300 @@ mod tests {
         }
 
         fn record_last_seen_block(&self, block: u64) -> Result<(), decdn_incentive::StoreError> {
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(decdn_incentive::StoreError::Backend("injected".into()));
+            }
             self.stored
                 .store(block, std::sync::atomic::Ordering::SeqCst);
             self.writes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    impl RecordingCheckpointStore {
+        fn writes(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn set_fail(&self, fail: bool) {
+            self.fail_writes
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A test clock whose `now` advances only when the test pushes it, so the
+    /// time-based debounce threshold is exercised without sleeping. Cloned into
+    /// the `Box<dyn Fn>` the store holds; both views share one atomic.
+    #[derive(Clone, Default)]
+    struct ManualClock {
+        // Nanoseconds elapsed past a fixed `base` instant.
+        elapsed_nanos: Arc<std::sync::atomic::AtomicU64>,
+        base: Option<Instant>,
+    }
+
+    impl ManualClock {
+        fn new() -> Self {
+            Self {
+                elapsed_nanos: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                base: Some(Instant::now()),
+            }
+        }
+
+        fn advance(&self, by: Duration) {
+            let add = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX);
+            self.elapsed_nanos
+                .fetch_add(add, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn now_fn(&self) -> Box<dyn Fn() -> Instant + Send + Sync> {
+            let elapsed = Arc::clone(&self.elapsed_nanos);
+            let base = self.base.unwrap_or_else(Instant::now);
+            Box::new(move || {
+                let n = elapsed.load(std::sync::atomic::Ordering::SeqCst);
+                base + Duration::from_nanos(n)
+            })
+        }
+    }
+
+    /// Rapid `record` calls below both thresholds fsync only the first (which
+    /// establishes the floor) and the stored value never regresses — it tracks
+    /// the buffered high-water through `load`, while disk stays at the floor.
+    #[test]
+    fn debounce_buffers_rapid_records_below_thresholds() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            512,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        // First write establishes the floor immediately.
+        store.record_last_seen_block(100)?;
+        assert_eq!(inner.writes(), 1);
+        assert_eq!(inner.load_last_seen_block()?, Some(100));
+
+        // 50 more advances, each < 512 blocks ahead and within the interval: all
+        // buffered, no further fsync.
+        for b in 101..=150 {
+            store.record_last_seen_block(b)?;
+        }
+        assert_eq!(
+            inner.writes(),
+            1,
+            "rapid sub-threshold records must not fsync"
+        );
+        // Disk floor is still the first value...
+        assert_eq!(inner.load_last_seen_block()?, Some(100));
+        // ...but the decorator reports the tighter buffered floor.
+        assert_eq!(store.load_last_seen_block()?, Some(150));
+        Ok(())
+    }
+
+    /// A buffered advance never lowers the persisted floor even if a later
+    /// `record` carries a lower block (defensive monotonicity).
+    #[test]
+    fn debounce_is_monotonic_against_out_of_order_records() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            10,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        store.record_last_seen_block(100)?;
+        // Lower blocks are ignored by the high-water guard.
+        store.record_last_seen_block(90)?;
+        store.record_last_seen_block(50)?;
+        store.flush()?;
+        assert_eq!(inner.load_last_seen_block()?, Some(100));
+        Ok(())
+    }
+
+    /// A fresh wrapper around an *already-populated* inner store must not regress
+    /// its on-disk floor even if its very first `record` carries a lower block —
+    /// the decorator seeds `last_persisted` from the inner store before applying
+    /// the high-water guard, so the existing checkpoint is honored.
+    #[test]
+    fn debounce_seeds_floor_from_populated_inner_store() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        // Inner store already has a checkpoint at 1000 (e.g. a prior boot).
+        inner.record_last_seen_block(1000)?;
+        let writes_before = inner.writes();
+
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            10,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        // First-ever record on the fresh wrapper carries a LOWER block.
+        store.record_last_seen_block(500)?;
+        store.flush()?;
+        assert_eq!(
+            inner.load_last_seen_block()?,
+            Some(1000),
+            "a lower first record must not regress the inner store's floor"
+        );
+        assert_eq!(
+            inner.writes(),
+            writes_before,
+            "no redundant write below the existing floor"
+        );
+        // The decorator also reports the higher persisted floor, not the input.
+        assert_eq!(store.load_last_seen_block()?, Some(1000));
+        Ok(())
+    }
+
+    /// Crossing the block threshold forces a durable write of the buffered
+    /// high-water.
+    #[test]
+    fn debounce_flushes_on_block_threshold() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            512,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        store.record_last_seen_block(100)?; // floor, write #1
+        store.record_last_seen_block(500)?; // 400 < 512 ahead: buffered
+        assert_eq!(inner.writes(), 1);
+        assert_eq!(inner.load_last_seen_block()?, Some(100));
+        store.record_last_seen_block(700)?; // 600 >= 512 ahead: flush
+        assert_eq!(inner.writes(), 2);
+        assert_eq!(inner.load_last_seen_block()?, Some(700));
+        Ok(())
+    }
+
+    /// Crossing the time threshold forces a durable write even when the block
+    /// delta is tiny — driven by the manual clock, no sleeping.
+    #[test]
+    fn debounce_flushes_on_time_threshold() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        let clock = ManualClock::new();
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            512,
+            Duration::from_secs(30),
+            clock.now_fn(),
+        );
+        store.record_last_seen_block(100)?; // floor, write #1 at t=0
+        store.record_last_seen_block(101)?; // sub-threshold, buffered
+        assert_eq!(inner.writes(), 1);
+        clock.advance(Duration::from_secs(31)); // past the 30s interval
+        store.record_last_seen_block(102)?; // time threshold trips: flush
+        assert_eq!(inner.writes(), 2);
+        assert_eq!(inner.load_last_seen_block()?, Some(102));
+        Ok(())
+    }
+
+    /// `flush` (the graceful-shutdown path) persists the latest buffered value;
+    /// a redundant flush with nothing newly buffered is a no-op.
+    #[test]
+    fn debounce_flush_persists_latest_then_is_idempotent() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            512,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        store.record_last_seen_block(100)?; // floor, write #1
+        store.record_last_seen_block(300)?; // buffered
+        store.record_last_seen_block(400)?; // buffered
+        assert_eq!(inner.writes(), 1);
+        store.flush()?; // shutdown flush persists 400, write #2
+        assert_eq!(inner.writes(), 2);
+        assert_eq!(inner.load_last_seen_block()?, Some(400));
+        // Nothing new buffered → no extra write.
+        store.flush()?;
+        assert_eq!(inner.writes(), 2);
+        Ok(())
+    }
+
+    /// `load_last_seen_block` returns the tighter of the persisted floor and any
+    /// in-process buffered block; a fresh wrapper reads straight through.
+    #[test]
+    fn debounce_load_returns_max_of_persisted_and_pending() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        inner.record_last_seen_block(50)?; // pre-existing persisted floor
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            512,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        // Fresh wrapper, nothing buffered: reads through to the inner floor.
+        assert_eq!(store.load_last_seen_block()?, Some(50));
+        store.record_last_seen_block(200)?; // sub-threshold buffer
+        assert_eq!(store.load_last_seen_block()?, Some(200));
+        Ok(())
+    }
+
+    /// A fresh wrapper over an inner store that *already* holds a persisted floor
+    /// still forces a durable write on the FIRST in-process `record`, even when
+    /// that record is well below both debounce thresholds. The decorator keys the
+    /// block-cadence threshold off its own in-process `last_persisted` (seeded
+    /// `None`), not the inner store's value it loads through — so the first write
+    /// is always durable and the floor is re-anchored to the live scan position
+    /// promptly after a restart, rather than lingering at the pre-existing
+    /// (potentially much older) on-disk floor until a threshold trips. This is
+    /// distinct from `debounce_load_returns_max_of_persisted_and_pending`, which
+    /// only checks the read-through; here we assert the *write* behavior.
+    #[test]
+    fn debounce_first_record_writes_through_over_existing_floor() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        inner.record_last_seen_block(50)?; // pre-existing persisted floor (write #1)
+        assert_eq!(inner.writes(), 1);
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            512,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        // First in-process record is only 10 blocks ahead (< 512) and at t=0
+        // (< 30s), so block- and time-cadence alone would buffer it — but the
+        // `last_persisted.is_none()` first-write rule forces it durable anyway.
+        store.record_last_seen_block(60)?;
+        assert_eq!(inner.writes(), 2, "first in-process record must fsync");
+        assert_eq!(inner.load_last_seen_block()?, Some(60));
+        // The very next sub-threshold record is now genuinely buffered (the
+        // in-process floor is established), proving the first-write was the
+        // special case and not the steady-state behavior.
+        store.record_last_seen_block(70)?;
+        assert_eq!(inner.writes(), 2, "second sub-threshold record must buffer");
+        assert_eq!(inner.load_last_seen_block()?, Some(60)); // disk floor unchanged
+        assert_eq!(store.load_last_seen_block()?, Some(70)); // buffered high-water
+        Ok(())
+    }
+
+    /// A failed durable write must not advance the in-memory floor: `pending`
+    /// stays set so the next `record`/`flush` retries, and `load` keeps reporting
+    /// the buffered value (the scan genuinely reached it). Once the inner store
+    /// recovers, the buffered block is persisted.
+    #[test]
+    fn debounce_retries_after_a_failed_write() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn WatcherCheckpointStore>,
+            10,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+        // First write would establish the floor, but the inner store is failing.
+        inner.set_fail(true);
+        assert!(store.record_last_seen_block(100).is_err());
+        // Nothing reached disk, but the buffered floor is the attempted block.
+        assert_eq!(inner.load_last_seen_block()?, None);
+        assert_eq!(inner.writes(), 0);
+        assert_eq!(store.load_last_seen_block()?, Some(100));
+        // Recover and flush: the buffered block is now persisted.
+        inner.set_fail(false);
+        store.flush()?;
+        assert_eq!(inner.writes(), 1);
+        assert_eq!(inner.load_last_seen_block()?, Some(100));
+        Ok(())
     }
 
     #[test]
