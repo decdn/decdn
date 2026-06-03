@@ -71,7 +71,6 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
-            genesisCreditWindow: 30 days,
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
@@ -167,12 +166,11 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         // Only the appealed slash's escrow is released (the other two stand).
         uint256 escrowReleased = escrowBeforeGrant - d.bond.escrowedTotal();
         assertGt(escrowReleased, 0, "escrow released for granted slash");
-        // A granted appeal makes the operator whole: the escrowed bond portion is
-        // refunded liquid (no genesis credit in this flow). The appeal bond round-
-        // trips within `_appealAndGrant` (paid at openSlashAppeal, refunded at
-        // grantAppeal) — so the net delta is exactly the released escrow. If the
-        // grant failed to refund the bond, the operator would be `slashAppealBond`
-        // short and this equality would fail.
+        // A granted appeal makes the operator whole: the escrowed bond is refunded
+        // liquid. The appeal bond round-trips within `_appealAndGrant` (paid at
+        // openSlashAppeal, refunded at grantAppeal) — so the net delta is exactly the
+        // released escrow. If the grant failed to refund the bond, the operator would
+        // be `slashAppealBond` short and this equality would fail.
         assertEq(
             d.token.balanceOf(operator),
             operatorTokenBeforeGrant + escrowReleased,

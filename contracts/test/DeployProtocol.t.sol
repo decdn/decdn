@@ -61,7 +61,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
-            genesisCreditWindow: 30 days,
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
@@ -172,19 +171,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
 
     function test_crossContractWiring_slashAppealChallengerPool() public view {
         assertEq(d.slashAppeal.challengerIncentivePool(), challengerPool, "slashAppeal.challengerIncentivePool");
-    }
-
-    function test_crossContractWiring_genesisGrantorIsTimelock() public view {
-        // ADR 016 § Post-Deployment Init step 7: the Timelock (treasury custodian)
-        // holds GENESIS_GRANTOR_ROLE so genesis credits are issuable during the
-        // window without a role-grant proposal first. Granted in phase 4 — the
-        // deployer must not retain it after handoff.
-        assertTrue(
-            d.bond.hasRole(d.bond.GENESIS_GRANTOR_ROLE(), address(d.timelock)), "timelock holds GENESIS_GRANTOR_ROLE"
-        );
-        assertFalse(
-            d.bond.hasRole(d.bond.GENESIS_GRANTOR_ROLE(), cfg.deployer), "deployer retains no GENESIS_GRANTOR_ROLE"
-        );
     }
 
     // -----------------------------------------------------------------

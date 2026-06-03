@@ -91,7 +91,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(cfg.multiaddrUpdateCooldown, DEFAULT_MULTIADDR_UPDATE_COOLDOWN, "multiaddrCooldown");
         assertEq(cfg.maxMultiaddrSize, DEFAULT_MAX_MULTIADDR_SIZE, "maxMultiaddrSize");
         assertEq(cfg.regionStabilityWindow, DEFAULT_REGION_STABILITY_WINDOW, "regionStability");
-        assertEq(cfg.genesisCreditWindow, DEFAULT_GENESIS_CREDIT_WINDOW, "genesisCreditWindow");
         // Epoch length is fixed (not env-tunable); the deploy suites assert it
         // matches CapacityBond.EPOCH_LENGTH via the FeeRouter constructor check.
         assertEq(uint256(cfg.feeRouterEpochLength), uint256(FEE_ROUTER_EPOCH_LENGTH), "epochLen");

@@ -61,7 +61,6 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///           - `MULTIADDR_UPDATE_COOLDOWN`  (default 0)
 ///           - `MAX_MULTIADDR_SIZE`         (default 1024)
 ///           - `REGION_STABILITY_WINDOW`    (default 7 days)
-///           - `GENESIS_CREDIT_WINDOW`      (default 30 days)
 ///           - `FEE_ROUTER_WINDOW_EPOCHS`   (default 13; bounded [4, 26] per ADR 036)
 ///           - `SLASH_APPEAL_BOND`          (default 1000e18)
 ///           - `BLACKLIST_APPEAL_BOND`      (default 100e18)
@@ -78,7 +77,6 @@ contract DeployProtocol is BaseProtocolDeploy {
     uint256 internal constant DEFAULT_MULTIADDR_UPDATE_COOLDOWN = 0;
     uint256 internal constant DEFAULT_MAX_MULTIADDR_SIZE = 1024;
     uint256 internal constant DEFAULT_REGION_STABILITY_WINDOW = 7 days;
-    uint256 internal constant DEFAULT_GENESIS_CREDIT_WINDOW = 30 days;
     // Fixed, NOT env-tunable: must equal `CapacityBond.EPOCH_LENGTH` (also 7 days).
     // The FeeRouter constructor reverts `EpochLengthMismatch` if they ever drift,
     // so this constant + that cross-check is the single enforced source of truth.
@@ -166,7 +164,6 @@ contract DeployProtocol is BaseProtocolDeploy {
         cfg.multiaddrUpdateCooldown = vm.envOr("MULTIADDR_UPDATE_COOLDOWN", DEFAULT_MULTIADDR_UPDATE_COOLDOWN);
         cfg.maxMultiaddrSize = vm.envOr("MAX_MULTIADDR_SIZE", DEFAULT_MAX_MULTIADDR_SIZE);
         cfg.regionStabilityWindow = vm.envOr("REGION_STABILITY_WINDOW", DEFAULT_REGION_STABILITY_WINDOW);
-        cfg.genesisCreditWindow = vm.envOr("GENESIS_CREDIT_WINDOW", DEFAULT_GENESIS_CREDIT_WINDOW);
 
         // Epoch length is fixed (see FEE_ROUTER_EPOCH_LENGTH) rather than a
         // "tunable" env var that could only ever be 7 days.

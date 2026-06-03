@@ -16,8 +16,7 @@ import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 /// @notice Minimal coverage of the new ADR 036/028/030/026-v2.2 surface:
 ///         `firstBondedAt`, `slashedAtEpoch`, escrow-on-slash (slash escrows
 ///         TOKEN; `finalizeUnappealedSlash` / the `SLASH_APPEAL_ROLE` settle
-///         hooks resolve it), Genesis Bond Credit grant/vest/claim, and
-///         pending-credit slash. NodeId / region-attestation paths require a
+///         hooks resolve it). NodeId / region-attestation paths require a
 ///         signed registration helper and land with the broader integration
 ///         suite.
 /// @dev    `admin` is granted `SLASH_APPEAL_ROLE` in `setUp` so escrow-hook
@@ -48,8 +47,7 @@ contract CapacityBondTest is Test {
             unbondingPeriod_: UNBONDING,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: 7 days,
-            genesisCreditWindow_: 30 days
+            regionStabilityWindow_: 7 days
         });
 
         vm.startPrank(admin);
@@ -153,9 +151,9 @@ contract CapacityBondTest is Test {
 
     /// Slash the same operator 3× and assert the tier ladder escalates
     /// 5% → 15% → 50% (`SLASH_BPS_TIER_1/2/3`) driven by `lifetimeOffenseCount`.
-    /// No genesis credit, so `creditSlash == 0` and the reductions are pure
-    /// active-bond math. Start at 160k so even after the 50% tier the active
-    /// balance (64.6k) stays above the `minBond/2` (25k) auto-eject floor.
+    /// The reductions are pure active-bond math. Start at 160k so even after the
+    /// 50% tier the active balance (64.6k) stays above the `minBond/2` (25k)
+    /// auto-eject floor.
     function test_slash_tierEscalation_15then50pct() public {
         vm.warp(1_000_000);
         vm.prank(operator);
@@ -187,32 +185,6 @@ contract CapacityBondTest is Test {
         // Escrow grew by the slashed total; challenger paid nothing yet.
         assertEq(bond.escrowedTotal() - escrowBefore, 64_600e18);
         assertEq(token.balanceOf(challenger), challengerBefore);
-    }
-
-    /// The credit-slash helper (`_slashPendingCreditAtTier`) must escalate with
-    /// the SAME tier ladder as the bond slash. Every other credit-slash test
-    /// uses a single tier-1 slash; this drives tiers 2 and 3 against the at-risk
-    /// genesis-credit pool (`originalGrant - claimed`, claimed == 0 here).
-    function test_slash_creditSlash_escalatesAcrossTiers() public {
-        _setupGenesisGrant(100_000e18);
-
-        // Tier 1: 5% of 100k at-risk = 5k → originalGrant 95k.
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1);
-        assertEq(bond.lifetimeOffenseCount(operator), 1);
-        assertEq(bond.pendingCredit(operator).originalGrant, 95_000e18);
-
-        // Tier 2: 15% of 95k at-risk = 14.25k → originalGrant 80.75k.
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1);
-        assertEq(bond.lifetimeOffenseCount(operator), 2);
-        assertEq(bond.pendingCredit(operator).originalGrant, 80_750e18);
-
-        // Tier 3: 50% of 80.75k at-risk = 40.375k → originalGrant 40.375k.
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1);
-        assertEq(bond.lifetimeOffenseCount(operator), 3);
-        assertEq(bond.pendingCredit(operator).originalGrant, 40_375e18);
     }
 
     /// Tier-3 slash against an operator holding BOTH active and unbonding bond
@@ -328,43 +300,6 @@ contract CapacityBondTest is Test {
         assertEq(u1, 100e18);
     }
 
-    /// A successful appeal (`SlashAppeal.grantAppeal` → `settleAppealGranted`
-    /// → internal `_recomputeSlashedAtEpoch`, which clears the watermark since
-    /// this is the operator's only slash) must re-enable `claimVestedCredit`
-    /// IMMEDIATELY, inside the original slash gate window — without waiting for
-    /// the 13-epoch gate to expire naturally. This is the cross-contract
-    /// recovery semantics ADR 028/036 promise.
-    function test_appealGrant_unlocksClaimBeforeGateExpiry() public {
-        vm.warp(2 * 7 days);
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1);
-        assertGt(bond.slashedAtEpoch(operator), 0);
-
-        // Inside the gate window the claim is blocked by the slash gate
-        // specifically (not NothingVested / NotActiveForClaim).
-        vm.warp(block.timestamp + 4 weeks);
-        vm.prank(operator);
-        vm.expectRevert(abi.encodeWithSelector(CapacityBond.SlashedInWindowForClaim.selector, operator));
-        bond.claimVestedCredit();
-
-        // Successful appeal (simulating SlashAppeal via SLASH_APPEAL_ROLE)
-        // clears the stamp. The appeal is opened before the 30-day filing
-        // window closes (we are 4 weeks < 30 days past the slash).
-        vm.startPrank(admin);
-        bond.markAppealOpen(slashId);
-        bond.settleAppealGranted(slashId);
-        vm.stopPrank();
-        assertEq(bond.slashedAtEpoch(operator), 0);
-
-        // Without advancing past the gate, the claim now succeeds.
-        vm.prank(operator);
-        bond.claimVestedCredit();
-        assertGt(bond.pendingCredit(operator).claimed, 0);
-    }
-
     /// Two outstanding slashes: granting the NEWER appeal must recompute the
     /// `slashedAtEpoch` watermark down to the OLDER still-standing slash, and
     /// only granting the older one too clears it to zero (issue #709).
@@ -426,43 +361,6 @@ contract CapacityBondTest is Test {
         bond.settleAppealGranted(sMid);
         vm.stopPrank();
         assertEq(bond.slashedAtEpoch(operator), stampNewest);
-    }
-
-    /// `claimVestedCredit`'s slash gate reads the same watermark: granting the
-    /// NEWER slash's appeal must leave the claim blocked by the OLDER standing
-    /// slash, and only clear once that older slash is also reversed (issue #709).
-    function test_claimVestedCredit_multiSlash_gatedByOlderStandingSlash() public {
-        vm.warp(2 * 7 days);
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        // Slash #0 (older), then Slash #1 (newer) one epoch later.
-        vm.prank(admin);
-        (uint256 s0,) = bond.slash(operator, challenger, 1);
-        vm.warp(block.timestamp + 8 days);
-        vm.prank(admin);
-        (uint256 s1,) = bond.slash(operator, challenger, 1);
-
-        // Grant the newer appeal — the older slash still gates the claim.
-        vm.startPrank(admin);
-        bond.markAppealOpen(s1);
-        bond.settleAppealGranted(s1);
-        vm.stopPrank();
-        assertGt(bond.slashedAtEpoch(operator), 0);
-        vm.prank(operator);
-        vm.expectRevert(abi.encodeWithSelector(CapacityBond.SlashedInWindowForClaim.selector, operator));
-        bond.claimVestedCredit();
-
-        // Grant the older appeal too — watermark clears and the claim unblocks.
-        vm.startPrank(admin);
-        bond.markAppealOpen(s0);
-        bond.settleAppealGranted(s0);
-        vm.stopPrank();
-        assertEq(bond.slashedAtEpoch(operator), 0);
-        vm.prank(operator);
-        bond.claimVestedCredit();
-        assertGt(bond.pendingCredit(operator).claimed, 0);
     }
 
     function test_declaredMbps_storesValue() public {
@@ -887,293 +785,6 @@ contract CapacityBondTest is Test {
         assertLt(bond.minCapacityMbps(), bond.maxCapacityMbps());
     }
 
-    function test_genesisCredit_grantWithinWindow() public {
-        _setupGenesisGrant(50_000e18);
-        CapacityBond.PendingCredit memory pc = bond.pendingCredit(operator);
-        assertEq(pc.originalGrant, 50_000e18);
-        assertEq(pc.claimed, 0);
-    }
-
-    function test_genesisCredit_revertsAfterWindow() public {
-        bytes32 grantorRole = bond.GENESIS_GRANTOR_ROLE();
-        vm.startPrank(admin);
-        token.approve(address(bond), 100_000e18);
-        bond.grantRole(grantorRole, admin);
-        vm.warp(block.timestamp + 31 days);
-        vm.expectRevert();
-        bond.grantGenesisCredit(operator, 50_000e18);
-        vm.stopPrank();
-    }
-
-    function test_genesisCredit_vestsLinearly() public {
-        _setupGenesisGrant(100_000e18);
-        vm.warp(block.timestamp + 365 days);
-        // 365 / 730 = 0.5 → curve at half = 50k.
-        assertEq(bond.curveVested(operator), 50_000e18);
-        assertEq(bond.claimableCredit(operator), 50_000e18);
-    }
-
-    function test_genesisCredit_fullVestAfterDuration() public {
-        _setupGenesisGrant(100_000e18);
-        vm.warp(block.timestamp + 730 days);
-        assertEq(bond.curveVested(operator), 100_000e18);
-        assertEq(bond.claimableCredit(operator), 100_000e18);
-    }
-
-    function test_claimVestedCredit_movesIntoActiveBond() public {
-        _setupGenesisGrant(100_000e18);
-        // I5 gate: needs activeBond > 0.
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        vm.warp(block.timestamp + 365 days);
-        vm.prank(operator);
-        bond.claimVestedCredit();
-
-        // Bond increased by claimable (50k vested at half-curve).
-        assertEq(bond.activeBond(operator), MIN_BOND + 50_000e18);
-        assertEq(bond.pendingCredit(operator).claimed, 50_000e18);
-        assertEq(bond.pendingCredit(operator).originalGrant, 100_000e18);
-    }
-
-    function test_claimVestedCredit_revertsWhenNoActiveBond() public {
-        _setupGenesisGrant(100_000e18);
-        vm.warp(block.timestamp + 365 days);
-        // No bond → I5 gate trips.
-        vm.prank(operator);
-        vm.expectRevert();
-        bond.claimVestedCredit();
-    }
-
-    function test_claimVestedCredit_revertsWhenSlashedInWindow() public {
-        // Warp past an epoch boundary so the slash stamp is non-zero.
-        vm.warp(2 * 7 days);
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1);
-        assertGt(bond.slashedAtEpoch(operator), 0);
-
-        // Stay inside the 13-epoch slash gate window (advance only a few
-        // weeks past the slash). Claim must revert.
-        vm.warp(block.timestamp + 4 weeks);
-        vm.prank(operator);
-        vm.expectRevert();
-        bond.claimVestedCredit();
-    }
-
-    function test_claimVestedCredit_succeedsAfterSlashGateExpires() public {
-        // Stamp slashedAtEpoch on the operator, then warp past the gate.
-        vm.warp(2 * 7 days);
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1);
-
-        // Warp 14 epochs (= 98 days) past the slash so currentEpoch
-        // exceeds slashEpoch + CLAIM_SLASH_GATE_EPOCHS (13).
-        vm.warp(block.timestamp + 14 weeks);
-        vm.prank(operator);
-        bond.claimVestedCredit();
-        assertGt(bond.pendingCredit(operator).claimed, 0);
-    }
-
-    function test_claimVestedCredit_multiClaimFollowsLinearCurve() public {
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        // Total 730 days vest. Claim midway and at full vest; assert the
-        // cumulative claim equals the curve target at the second timestamp.
-        vm.warp(block.timestamp + 365 days);
-        vm.prank(operator);
-        bond.claimVestedCredit();
-
-        vm.warp(block.timestamp + 365 days);
-        vm.prank(operator);
-        bond.claimVestedCredit();
-
-        // C4 fix: cumulative claim at full vest equals the original grant
-        // (100k), regardless of the intermediate claim. Without the
-        // originalGrant decoupling, the second claim would skew.
-        assertEq(bond.pendingCredit(operator).claimed, 100_000e18);
-    }
-
-    function test_pendingCreditSlash_reducesOriginalGrant() public {
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        uint128 grantBefore = bond.pendingCredit(operator).originalGrant;
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1);
-        uint128 grantAfter = bond.pendingCredit(operator).originalGrant;
-        // Tier 1 = 5% of the at-risk pool (originalGrant − claimed = 100k − 0
-        // = 100k) = 5k. Pre-fix this was 5% of just the unvested 100k → also
-        // 5k for this no-claim case, but the regression test below covers the
-        // case where it actually differs.
-        assertEq(grantBefore - grantAfter, 5000e18);
-    }
-
-    /// @notice Closes the vested-but-unclaimed loophole — slashing must hit
-    ///         the full `originalGrant - claimed` pool, not just the unvested
-    ///         portion. An operator who claims partway and then is slashed
-    ///         MUST see their unclaimed-vested portion slashed too. Pre-fix,
-    ///         only the unvested portion was slashed; the vested-but-
-    ///         unclaimed sat in the contract escaping the slash entirely.
-    function test_slashHitsVestedButUnclaimed() public {
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND * 2);
-
-        // Half-vest: vested = 50k, unvested = 50k.
-        vm.warp(block.timestamp + 365 days);
-        // Claim the full vested (50k); claimed = 50k, activeBond += 50k.
-        vm.prank(operator);
-        bond.claimVestedCredit();
-        assertEq(bond.pendingCredit(operator).claimed, 50_000e18);
-
-        // At-risk pool = originalGrant − claimed = 100k − 50k = 50k (= the
-        // unvested portion, since the vested-claimed amount is now in
-        // activeBond and slashed there).
-        uint128 grantBefore = bond.pendingCredit(operator).originalGrant;
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1);
-        uint128 grantAfter = bond.pendingCredit(operator).originalGrant;
-        // Tier 1 = 5% of 50k = 2.5k slashed from originalGrant.
-        assertEq(grantBefore - grantAfter, 2500e18);
-    }
-
-    /// @notice Inverse of the prior test: operator never claims, half-vests,
-    ///         then is slashed. The at-risk pool is the FULL 100k (unvested
-    ///         50k + vested-unclaimed 50k). Pre-fix only the unvested 50k
-    ///         was slashed; post-fix the slash basis is the entire 100k.
-    function test_slashHitsVestedAndUnvestedTogether() public {
-        address op2 = address(0xB0B2);
-        // Provision + grant BEFORE any warp so we stay inside the
-        // GENESIS_CREDIT_WINDOW (default 30 days from construction).
-        vm.prank(admin);
-        token.transfer(op2, 200_000e18);
-        vm.prank(op2);
-        token.approve(address(bond), type(uint256).max);
-        vm.prank(op2);
-        bond.bond(MIN_BOND);
-
-        vm.startPrank(admin);
-        token.approve(address(bond), 100_000e18);
-        bond.grantRole(bond.GENESIS_GRANTOR_ROLE(), admin);
-        bond.grantGenesisCredit(op2, 100_000e18);
-        vm.stopPrank();
-
-        // Half-vest. Operator claims nothing.
-        vm.warp(block.timestamp + 365 days);
-        // originalGrant=100k, claimed=0 → at-risk = 100k.
-        uint128 op2Before = bond.pendingCredit(op2).originalGrant;
-        vm.prank(admin);
-        bond.slash(op2, challenger, 1);
-        uint128 op2After = bond.pendingCredit(op2).originalGrant;
-        // Tier 1 = 5% × 100k = 5k. Pre-fix would have been 5% × 50k unvested = 2.5k.
-        assertEq(op2Before - op2After, 5000e18);
-    }
-
-    function test_creditSlash_escrowsThenDistributes5050AtFinality() public {
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        uint256 challengerBalanceBefore = token.balanceOf(challenger);
-        uint256 supplyBefore = token.totalSupply();
-
-        vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
-
-        // C1: credit slash (5k) joins bond slash (5% × 50k = 2.5k) for a
-        // combined 7.5k — all escrowed, nothing distributed yet.
-        assertEq(totalSlash, 7500e18);
-        assertEq(bond.escrowedTotal(), 7500e18);
-        assertEq(token.balanceOf(challenger), challengerBalanceBefore);
-
-        // At finality the 7.5k escrow splits 50/50: 3.75k challenger / 3.75k burn.
-        vm.warp(block.timestamp + 30 days + 1);
-        bond.finalizeUnappealedSlash(slashId);
-        assertEq(token.balanceOf(challenger) - challengerBalanceBefore, 3750e18);
-        assertEq(supplyBefore - token.totalSupply(), 3750e18);
-    }
-
-    function test_forfeitUnvestedCredit_onUnbond() public {
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        address treasury_ = address(0xDEAD);
-        vm.prank(admin);
-        bond.setTreasury(treasury_);
-
-        vm.warp(block.timestamp + 365 days);
-        // Vested = 50k, unvested = 50k → forfeit on requestUnbond.
-        vm.prank(operator);
-        bond.requestUnbond(MIN_BOND);
-
-        assertEq(token.balanceOf(treasury_), 50_000e18);
-        assertEq(bond.pendingCredit(operator).originalGrant, 50_000e18);
-    }
-
-    /// @notice Regression for the retroactive clawback bug. After forfeit,
-    ///         `curveVested` MUST return the truncated principal directly
-    ///         and MUST NOT shrink below `claimed`. The pre-fix
-    ///         `_forfeitUnvestedCredit` set `originalGrant = vested` but
-    ///         left `grantedAt` untouched, so the curve re-stretched the
-    ///         smaller principal over the original timeline and returned
-    ///         `vested × elapsed/duration` < vested at the forfeit instant —
-    ///         clawing back claims an operator had already legitimately
-    ///         vested. The fix stamps `FULLY_VESTED_SENTINEL` so the curve
-    ///         immediately returns the truncated principal.
-    function test_forfeitUnvestedCredit_doesNotClawBackVestedUnclaimed() public {
-        _setupGenesisGrant(100_000e18);
-        // Bond well above MIN_BOND so a partial unbond leaves activeBond
-        // non-zero (I5 gate requires activeBond > 0 to claim).
-        vm.prank(operator);
-        bond.bond(MIN_BOND * 2);
-
-        // Wait halfway through the vest (vested = 50k, unvested = 50k).
-        vm.warp(block.timestamp + 365 days);
-        // Claim the full currently-claimable amount (50k at half-vest).
-        vm.prank(operator);
-        bond.claimVestedCredit();
-        assertEq(bond.pendingCredit(operator).claimed, 50_000e18);
-
-        // Partial unbond triggers forfeit while leaving activeBond > 0.
-        // Pre-fix: post-forfeit `curveVested` would return 50k × 365/730 = 25k
-        // and `claimableCredit` would saturate at 0 even though the math
-        // implies a 25k retroactive shrink below `claimed`. With the
-        // sentinel fix, `curveVested` returns the truncated 50k principal
-        // directly — `claimed` is preserved at 50k, claimable settles to 0
-        // by exhaustion (50k − 50k), not by silent clawback.
-        vm.prank(operator);
-        bond.requestUnbond(MIN_BOND);
-
-        CapacityBond.PendingCredit memory pc = bond.pendingCredit(operator);
-        assertEq(pc.originalGrant, 50_000e18);
-        assertEq(pc.claimed, 50_000e18);
-        assertEq(bond.curveVested(operator), 50_000e18);
-        assertEq(bond.claimableCredit(operator), 0);
-    }
-
-    function test_forfeitUnvestedCredit_burnsWhenNoTreasury() public {
-        _setupGenesisGrant(100_000e18);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        // treasury unset → forfeit burns.
-        uint256 supplyBefore = token.totalSupply();
-        vm.warp(block.timestamp + 365 days);
-        vm.prank(operator);
-        bond.requestUnbond(MIN_BOND);
-        assertEq(supplyBefore - token.totalSupply(), 50_000e18);
-    }
-
     function test_slashId_persistsRecord() public {
         vm.prank(operator);
         bond.bond(MIN_BOND);
@@ -1208,6 +819,69 @@ contract CapacityBondTest is Test {
         SlashRecord memory r = bond.getSlashRecord(slashId);
         assertEq(uint8(r.status), uint8(SlashStatus.Escrowed));
         assertEq(r.challenger, challenger);
+    }
+
+    /// Slashing an operator with zero active AND zero unbonding bond mints a
+    /// clean zero-amount escrow record. The (now-removed) Genesis-credit slash
+    /// leg used to make a fully-zero slash unreachable; with it gone this is a
+    /// new reachable state, so pin that it stays safe — the offense counter,
+    /// slash-epoch watermark, and auto-eject still fire, escrow stays flat, and
+    /// the unappealed-finalize terminal path no-ops without moving any TOKEN.
+    function test_slash_zeroBondOperator_mintsZeroAmountRecordNoOpsAtFinality() public {
+        // Warp past epoch 0 so the slash watermark stamps a non-zero value.
+        vm.warp(2 * 7 days);
+
+        address noBond = address(0xDEAD11);
+        assertEq(bond.activeBond(noBond), 0);
+
+        uint256 supplyBefore = token.totalSupply();
+        uint256 escrowBefore = bond.escrowedTotal();
+
+        vm.prank(admin);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(noBond, challenger, 1);
+
+        // Zero economic value, but the offense / watermark / eject side effects
+        // still fire and the escrow record is well-formed.
+        assertEq(totalSlash, 0);
+        assertEq(bond.escrowedTotal(), escrowBefore);
+        assertEq(bond.lifetimeOffenseCount(noBond), 1);
+        assertGt(bond.slashedAtEpoch(noBond), 0);
+        assertTrue(bond.ejected(noBond));
+        SlashRecord memory r = bond.getSlashRecord(slashId);
+        assertEq(r.slashAmount, 0);
+        assertEq(uint8(r.status), uint8(SlashStatus.Escrowed));
+
+        // Unappealed finalize after the filing window no-ops: no transfer, no burn.
+        vm.warp(block.timestamp + 30 days + 1);
+        uint256 challengerBefore = token.balanceOf(challenger);
+        bond.finalizeUnappealedSlash(slashId);
+        assertEq(token.balanceOf(challenger), challengerBefore);
+        assertEq(token.totalSupply(), supplyBefore);
+        assertEq(bond.escrowedTotal(), escrowBefore);
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.Upheld));
+    }
+
+    /// A granted appeal on a zero-amount slash refunds nothing (no `safeTransfer`
+    /// of a zero amount) and still clears the slash-epoch watermark.
+    function test_settleAppealGranted_zeroBondSlash_refundsNothingClearsWatermark() public {
+        vm.warp(2 * 7 days);
+        address noBond = address(0xDEAD12);
+
+        vm.prank(admin);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(noBond, challenger, 1);
+        assertEq(totalSlash, 0);
+        assertGt(bond.slashedAtEpoch(noBond), 0);
+
+        uint256 opBefore = token.balanceOf(noBond);
+        vm.startPrank(admin);
+        bond.markAppealOpen(slashId);
+        bond.settleAppealGranted(slashId);
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(noBond), opBefore); // refund == 0, nothing transferred
+        assertEq(bond.escrowedTotal(), 0);
+        assertEq(bond.slashedAtEpoch(noBond), 0); // watermark recomputed to "no standing slash"
+        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.Reversed));
     }
 
     /// No appeal filed → after the filing window anyone can finalize, paying
@@ -1276,15 +950,6 @@ contract CapacityBondTest is Test {
         return bond.getSlashRecord(slashId).appealWindowClose;
     }
 
-    function _setupGenesisGrant(uint256 amount) internal {
-        bytes32 grantorRole = bond.GENESIS_GRANTOR_ROLE();
-        vm.startPrank(admin);
-        token.approve(address(bond), amount);
-        bond.grantRole(grantorRole, admin);
-        bond.grantGenesisCredit(operator, amount);
-        vm.stopPrank();
-    }
-
     // ----------------------------------------------------------------------
     // ADR 030 — region self-attestation
     //
@@ -1318,12 +983,6 @@ contract CapacityBondTest is Test {
         bond.setUnbondingPeriod(UNBONDING);
     }
 
-    function test_setTreasury_revertsWithoutRole() public {
-        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
-        vm.prank(operator);
-        bond.setTreasury(address(0xDEAD));
-    }
-
     function test_setMultiaddrUpdateCooldown_revertsWithoutRole() public {
         _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
         vm.prank(operator);
@@ -1340,12 +999,6 @@ contract CapacityBondTest is Test {
         _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
         vm.prank(operator);
         bond.setRegionStabilityWindow(7 days);
-    }
-
-    function test_setClaimSlashGateEpochs_revertsWithoutRole() public {
-        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
-        vm.prank(operator);
-        bond.setClaimSlashGateEpochs(13);
     }
 
     function test_pause_revertsWithoutRole() public {

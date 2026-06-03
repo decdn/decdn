@@ -7,17 +7,15 @@ pragma solidity 0.8.28;
 ///         against a specific slash record per ADR 028). The escrow-mutating
 ///         appeal hooks live in `ICapacityBondSlashEscrow`.
 /// @dev    The full `CapacityBond` surface (register / unbond / slash /
-///         Genesis Bond Credit flow / region attestation) lives on the
-///         concrete contract. This interface declares only the cross-contract
-///         read entrypoints other contracts in the system need to know about.
+///         region attestation) lives on the concrete contract. This interface
+///         declares only the cross-contract read entrypoints other contracts in
+///         the system need to know about.
 interface ICapacityBond {
     /// @notice Timestamp at which the operator's `activeBond` first became
     ///         non-zero — set by the first `bond()` call that lifts the
-    ///         balance above zero, or by `claimVestedCredit()` if a Genesis
-    ///         Bond Credit claim is the first thing to activate the operator.
-    ///         Never overwritten by subsequent re-bonds. Source of the
-    ///         `age_ramp` numerator on `DecdnGovernor` per ADR 036 § Formula.
-    ///         Returns 0 if the operator has never bonded.
+    ///         balance above zero. Never overwritten by subsequent re-bonds.
+    ///         Source of the `age_ramp` numerator on `DecdnGovernor` per
+    ///         ADR 036 § Formula. Returns 0 if the operator has never bonded.
     function firstBondedAt(address operator) external view returns (uint64);
 
     /// @notice Encoded slash-epoch stamp: returns `0` when the operator is
@@ -35,12 +33,11 @@ interface ICapacityBond {
     ///         to validate appeals against a specific slash without trusting
     ///         the appellant's `operator` parameter (ADR 028 § Contract
     ///         surface — closes the unverified-operator hole).
-    /// @return operator The operator whose bond (and pending credit, if any)
-    ///                  was slashed.
+    /// @return operator The operator whose bond was slashed.
     /// @return slashedAt `block.timestamp` of the slash transaction (cast to
     ///                  `uint64`).
-    /// @return slashAmount Combined active-bond + unvested-credit amount
-    ///                    slashed at this `slashId`.
+    /// @return slashAmount Active + unbonding bond amount slashed at this
+    ///                    `slashId`.
     function slashRecords(uint256 slashId)
         external
         view
