@@ -14,6 +14,7 @@ import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
 import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.sol";
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
+import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
 import { BondMath } from "./BondMath.sol";
 import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
@@ -55,6 +56,7 @@ contract CapacityBond is
     ICapacityBondSlashEscrow,
     ICapacityBondEjector,
     ICapacityBondReporter,
+    ICapacityBondRegionView,
     AccessControl,
     ReentrancyGuard,
     Pausable,
@@ -248,15 +250,16 @@ contract CapacityBond is
     // -----------------------------------------------------------------
 
     /// @notice Previous-region snapshot taken on each `updateRegion` call.
-    ///         Pre-positioned for the ADR 030 § 52 blacklist-scope ripening
-    ///         predicate (*"a node is in scope iff the entry is global, OR
-    ///         entry.region == regionHint, OR (block.timestamp - effective <
-    ///         REGION_STABILITY_WINDOW AND entry.region == regionPrev)"*),
-    ///         which is an on-chain check that must consult this slot at
-    ///         scope-test / slash-eligibility time. No contract reads it in
-    ///         this revision — ContentBlacklist's scope test currently
-    ///         covers only GLOBAL ∪ region; the ripening leg lands with the
-    ///         ADR 030 enforcement PR.
+    ///         Consulted by the ADR 030 § Region-stability window blacklist-scope
+    ///         ripening predicate (*"a node is in scope iff the entry is global,
+    ///         OR entry.region == regionHint, OR (block.timestamp - effective <
+    ///         REGION_STABILITY_WINDOW AND entry.region == regionPrev)"*) at
+    ///         scope-test / slash-eligibility time. The predicate is enforced by
+    ///         `SlashJudge._checkBlacklistedBefore` and read by
+    ///         `ContentBlacklist.isHashBlacklistedForOperator`; both read this
+    ///         slot (with `regionLastChanged` / `firstBondedAt` /
+    ///         `regionGateActivatedAt`) via `RegionScopeLib` off the aggregate
+    ///         `regionScopeData` getter.
     mapping(address operator => string) public regionPrev;
 
     /// @notice Last `updateRegion` timestamp; 0 means region has never been
@@ -267,6 +270,16 @@ contract CapacityBond is
     /// @notice Cooldown enforced between `updateRegion` calls per ADR 030
     ///         (default 7 days; governable [3d, 30d]).
     uint256 public regionStabilityWindow;
+
+    /// @notice ADR 030 § Region-stability window gate-activation stamp — the
+    ///         floor the ripening window runs from for nodes that have never
+    ///         changed region (`effective = max(firstBondedAt, this)`). ADR 030
+    ///         specifies an "upgrade initializer" for this value, but
+    ///         `CapacityBond` is constructor-deployed and non-upgradeable, so a
+    ///         fresh deploy *is* gate activation (no pre-upgrade cohort) — it is
+    ///         set to `block.timestamp` in the constructor.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    uint64 public immutable regionGateActivatedAt;
 
     // -----------------------------------------------------------------
     // Storage — slash records (ADR 028 § Contract surface)
@@ -486,6 +499,10 @@ contract CapacityBond is
         multiaddrUpdateCooldown = multiaddrUpdateCooldown_;
         maxMultiaddrSize = maxMultiaddrSize_;
         regionStabilityWindow = regionStabilityWindow_;
+        // ADR 030 § Region-stability window: fresh deploy == gate activation
+        // (non-upgradeable, so no migration cohort to stay conservative for).
+        // forge-lint: disable-next-line(block-timestamp)
+        regionGateActivatedAt = uint64(block.timestamp);
 
         // Declared-capacity band defaults (ADR 026 § Capacity-bond curve):
         // 10 Mbps floor (bars sub-floor dust declarations), 200 Gbps ceiling.
@@ -1186,6 +1203,29 @@ contract CapacityBond is
 
     function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory) {
         return _nodes[ethAddress];
+    }
+
+    /// @inheritdoc ICapacityBondRegionView
+    function regionScopeData(address operator)
+        external
+        view
+        returns (
+            string memory regionHint,
+            string memory regionPrev_,
+            uint64 regionLastChanged_,
+            uint64 firstBondedAt_,
+            uint64 regionGateActivatedAt_,
+            uint256 regionStabilityWindow_
+        )
+    {
+        return (
+            _nodes[operator].regionHint,
+            regionPrev[operator],
+            regionLastChanged[operator],
+            _firstBondedAt[operator],
+            regionGateActivatedAt,
+            regionStabilityWindow
+        );
     }
 
     function isActiveNode(bytes32 nodeId) external view returns (bool) {

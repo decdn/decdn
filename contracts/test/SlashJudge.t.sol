@@ -9,6 +9,7 @@ import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.so
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { ISlashJudge } from "../src/interfaces/ISlashJudge.sol";
 import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol";
+import { ICapacityBondRegionView } from "../src/interfaces/ICapacityBondRegionView.sol";
 import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
 
 contract MockToken is ERC20 {
@@ -17,7 +18,7 @@ contract MockToken is ERC20 {
     }
 }
 
-contract MockSlasher is ICapacityBondSlasher {
+contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
     uint256 public unbondingPeriodValue;
     uint256 public nextId = 1;
     uint256 public returnAmount;
@@ -28,12 +29,53 @@ contract MockSlasher is ICapacityBondSlasher {
     uint8 public lastOffense;
     uint256 public slashCount;
 
+    // ADR 030 region-scope read source (production `CapacityBond` is both the
+    // slasher and the region view at one address). Defaults to empty region =>
+    // global-only behavior, so existing global blacklist tests are unaffected.
+    mapping(address => string) internal _regionHint;
+    mapping(address => string) internal _regionPrev;
+    mapping(address => uint64) internal _regionLastChanged;
+    mapping(address => uint64) internal _firstBondedAt;
+    uint64 public gateActivatedAt;
+    uint256 public window = 7 days;
+
     constructor(uint256 unbonding_) {
         unbondingPeriodValue = unbonding_;
     }
 
     function setBound(address operator, bytes32 nodeId) external {
         boundNodeId[operator] = nodeId;
+    }
+
+    function setRegion(address op, string memory current, string memory prev, uint64 lastChanged) external {
+        _regionHint[op] = current;
+        _regionPrev[op] = prev;
+        _regionLastChanged[op] = lastChanged;
+    }
+
+    function setFirstBondedAt(address op, uint64 ts) external {
+        _firstBondedAt[op] = ts;
+    }
+
+    function setGate(uint64 ts, uint256 window_) external {
+        gateActivatedAt = ts;
+        window = window_;
+    }
+
+    function regionScopeData(address operator)
+        external
+        view
+        override
+        returns (string memory, string memory, uint64, uint64, uint64, uint256)
+    {
+        return (
+            _regionHint[operator],
+            _regionPrev[operator],
+            _regionLastChanged[operator],
+            _firstBondedAt[operator],
+            gateActivatedAt,
+            window
+        );
     }
 
     function setReturnAmount(uint256 amount) external {
@@ -376,6 +418,103 @@ contract SlashJudgeTest is Test {
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashMismatch.selector, otherHash, BLOB));
         judge.submitBlacklistChallenge(node, NODE_ID, otherHash, abi.encode(s), _signStream(s), true);
+    }
+
+    // --- ADR 030 regional + ripening slash-eligibility ----------------------
+
+    function test_blacklist_slashesOnCurrentRegionEntry() public {
+        // Node's current region is "us-east"; a us-east entry is in scope.
+        slasher.setRegion(node, "us-east", "", 0);
+        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        assertEq(slasher.lastOffense(), uint8(ISlashJudge.OffenseType.Blacklist));
+    }
+
+    function test_blacklist_slashesOnPrevRegionInsideWindow() public {
+        // Node flipped us-east -> eu-west 1 day ago (inside the 7d window); the
+        // us-east entry it was exposed to must keep applying (no flip evasion).
+        slasher.setRegion(node, "eu-west", "us-east", uint64(block.timestamp - 1 days));
+        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    function test_blacklist_revertsPrevRegionAfterWindow() public {
+        // Same flip but 8 days ago — past the 7d window, so the prev (us-east)
+        // entry no longer applies and the new region (eu-west) has no entry.
+        slasher.setRegion(node, "eu-west", "us-east", uint64(block.timestamp - 8 days));
+        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+    }
+
+    function test_blacklist_revertsRegionalEntryAfterResponse() public {
+        // Current-region entry exists but post-dates the served response: the
+        // regional leg folds the before-response check into a boolean, so this
+        // surfaces the plain HashNotBlacklisted (BlacklistAfterResponse is only
+        // preserved for the global leg).
+        slasher.setRegion(node, "us-east", "", 0);
+        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp + 1000));
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+    }
+
+    function test_blacklist_unrelatedRegionEntryDoesNotSlash() public {
+        // An entry in a region the node was never in is out of scope.
+        slasher.setRegion(node, "us-east", "", 0);
+        blacklist.setEntry(bytes32("ap-south"), BLOB, uint64(block.timestamp - 1000));
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+    }
+
+    function test_blacklist_globalAfterResponse_rescuedByRegionalLeg() public {
+        // A GLOBAL entry post-dates the response, but a current-region entry
+        // pre-dates it: the regional leg rescues the slash (the non-obvious
+        // "don't early-revert BlacklistAfterResponse" branch).
+        slasher.setRegion(node, "us-east", "", 0);
+        blacklist.setEntry(GLOBAL_REGION, BLOB, uint64(block.timestamp + 1000)); // after response
+        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000)); // before response
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    function test_blacklist_globalAndRegionalBothAfterResponse_revertsBlacklistAfter() public {
+        // GLOBAL post-dates the response AND no regional leg rescues → the richer
+        // BlacklistAfterResponse error is preserved on the global leg.
+        slasher.setRegion(node, "us-east", "", 0);
+        blacklist.setEntry(GLOBAL_REGION, BLOB, uint64(block.timestamp + 1000));
+        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp + 2000)); // also after
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SlashJudge.BlacklistAfterResponse.selector, uint256(block.timestamp + 1000) * 1_000_000, streamTs
+            )
+        );
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+    }
+
+    function test_blacklist_suspendedRegionalEntryDoesNotSlash() public {
+        // A fast-track-suspended REGIONAL entry lifts slashability (mirrors the
+        // global suspended case; the regional leg re-checks `suspended`).
+        slasher.setRegion(node, "us-east", "", 0);
+        blacklist.setEntrySuspended(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000), true);
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
     }
 
     // -----------------------------------------------------------------
