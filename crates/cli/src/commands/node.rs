@@ -13,8 +13,9 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use serde::Deserialize;
 
 use decdn_common::admin::{
-    AdminRpcClient, AnnounceResponse, DrainRequest, DrainResponse, EvictRequest, EvictResponse,
-    HealthResponse, PeerView, PeersResponse, ReloadResponse, StatusResponse,
+    AdminRpcClient, AnnounceResponse, ChannelSnapshot, ChannelsResponse, DrainRequest,
+    DrainResponse, EvictRequest, EvictResponse, HealthResponse, PeerView, PeersResponse,
+    ReloadResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -53,6 +54,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Peers(p) => peers(p, global_config).await,
         cli::NodeCommand::Health(h) => health(h, global_config).await,
         cli::NodeCommand::Status(s) => status(s, global_config).await,
+        cli::NodeCommand::Channels(c) => channels(c, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Announce(a) => announce(a, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
@@ -583,6 +585,107 @@ pub async fn status(args: &cli::StatusArgs, global_config: Option<&Path>) -> any
     }
 
     Ok(())
+}
+
+/// `decdn node channels`: call `admin_v1_channels` on the running node and
+/// print a snapshot of its open payment channels (issue #749).
+pub async fn channels(
+    args: &cli::ChannelsArgs,
+    global_config: Option<&Path>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let parsed: ChannelsResponse = client
+        .channels()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&parsed).context("failed to encode channels as JSON")?;
+        println!("{pretty}");
+    } else {
+        let mut stdout = io::stdout().lock();
+        write_channels_table(&mut stdout, &parsed).context("failed to write channels table")?;
+    }
+
+    Ok(())
+}
+
+/// Write the payment-channel table to `w`. Pure function (takes `&mut impl
+/// Write`) so the formatting is unit-testable without an HTTP hop,
+/// mirroring [`write_peers_table`] / [`write_status`]. A summary line
+/// carries the redemption threshold as a stable `key=value` token; the
+/// per-channel table follows. USDC amounts are rendered from micro-USDC.
+fn write_channels_table(w: &mut impl io::Write, resp: &ChannelsResponse) -> io::Result<()> {
+    writeln!(
+        w,
+        "redeem_threshold={} channels={}",
+        format_usdc(resp.redeem_threshold_micro_usdc),
+        resp.channels.len(),
+    )?;
+    if resp.channels.is_empty() {
+        return writeln!(w, "(no open channels)");
+    }
+    // Fixed-column layout: channel preview | counterparty preview | nonce |
+    // outstanding | deposit | last-voucher age | eligible.
+    writeln!(
+        w,
+        "{:<14} {:<14} {:>6} {:>12} {:>12} {:>12} ELIGIBLE",
+        "CHANNEL", "COUNTERPARTY", "NONCE", "OUTSTANDING", "DEPOSIT", "LAST_VOUCHER",
+    )?;
+    for c in &resp.channels {
+        write_channel_row(w, c)?;
+    }
+    Ok(())
+}
+
+/// Render one channel as a fixed-column row. Split out so the column
+/// formatting stays in one place and the loop body reads as a single call.
+fn write_channel_row(w: &mut impl io::Write, c: &ChannelSnapshot) -> io::Result<()> {
+    let channel = short_node_id(&c.channel_id);
+    let counterparty = short_node_id(&c.counterparty);
+    let last_voucher = match c.seconds_since_last_voucher {
+        // No voucher seen since this process started — distinct from
+        // "<1s ago" so operators know the activity clock has no record
+        // (a freshly-restarted node, or a channel that has never billed).
+        None => "never".to_string(),
+        // Reuse `format_age` (microsecond input) by scaling the whole-second
+        // wire value; `saturating_mul` clamps the (unrealistic) overflow on an
+        // absurd age rather than panicking. Boundary buckets are identical
+        // (covered by `format_age_units`).
+        Some(secs) => format_age(secs.saturating_mul(1_000_000)),
+    };
+    let eligible = if c.settlement_eligible { "yes" } else { "no" };
+    writeln!(
+        w,
+        "{channel:<14} {counterparty:<14} {:>6} {:>12} {:>12} {last_voucher:>12} {eligible}",
+        c.last_nonce,
+        format_usdc(c.outstanding_micro_usdc),
+        format_usdc(c.deposit_micro_usdc),
+    )
+}
+
+/// Format a micro-USDC amount as a `"N.NNNNNN"` USDC string. USDC has 6
+/// decimals (ADR 003), so 1 USDC == `1_000_000` micro-USDC. Trailing
+/// fractional zeros are kept fixed-width (six places) so columns align and
+/// a script parsing the value sees a stable shape.
+fn format_usdc(micro: u64) -> String {
+    let whole = micro / 1_000_000;
+    let frac = micro % 1_000_000;
+    format!("{whole}.{frac:06}")
 }
 
 /// Map a `jsonrpsee` client error into the three operator-actionable
@@ -1362,6 +1465,191 @@ mod tests {
             port_from_config_file(Some(&path), ConfigPathSource::Default)?,
             Some(4242)
         );
+        Ok(())
+    }
+
+    fn mk_channel(
+        channel_id: &str,
+        counterparty: &str,
+        last_nonce: u64,
+        outstanding: u64,
+        deposit: u64,
+        secs_since: Option<u64>,
+        eligible: bool,
+    ) -> ChannelSnapshot {
+        ChannelSnapshot {
+            channel_id: channel_id.to_string(),
+            counterparty: counterparty.to_string(),
+            last_nonce,
+            outstanding_micro_usdc: outstanding,
+            deposit_micro_usdc: deposit,
+            seconds_since_last_voucher: secs_since,
+            settlement_eligible: eligible,
+        }
+    }
+
+    #[test]
+    fn write_channels_table_empty_emits_sentinel() -> anyhow::Result<()> {
+        let resp = ChannelsResponse {
+            channels: Vec::new(),
+            redeem_threshold_micro_usdc: 1_000_000,
+        };
+        let mut buf = Vec::<u8>::new();
+        write_channels_table(&mut buf, &resp)?;
+        let s = String::from_utf8(buf)?;
+        // Summary line still prints the threshold, then the sentinel.
+        assert!(s.contains("redeem_threshold=1.000000"), "{s}");
+        assert!(s.contains("channels=0"), "{s}");
+        assert!(s.contains("(no open channels)"), "{s}");
+        // No table header when there are no rows.
+        assert!(!s.contains("CHANNEL"), "header must be omitted: {s}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_channels_table_renders_header_and_rows() -> anyhow::Result<()> {
+        // The DTO documents `counterparty` as an EIP-55 mixed-case
+        // checksummed address (`alloy`'s `Address` Display), so the
+        // fixture must be a real checksummed string — a lowercase
+        // placeholder wouldn't exercise the mixed-case rendering the
+        // table inherits verbatim. Derive it via `alloy` so the literal
+        // is provably the canonical checksum, not a hand-typed guess.
+        let counterparty =
+            alloy::primitives::address!("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed").to_string();
+        // Sanity-guard the fixture itself: the checksum is genuinely
+        // mixed-case (some hex letters upper, some lower), so a regression
+        // that lowercased it before rendering would be caught below.
+        assert_ne!(
+            counterparty,
+            counterparty.to_lowercase(),
+            "fixture must be a mixed-case EIP-55 address: {counterparty}"
+        );
+        let resp = ChannelsResponse {
+            redeem_threshold_micro_usdc: 1_000_000,
+            channels: vec![
+                mk_channel(
+                    &format!("0x{}", "a".repeat(64)),
+                    &counterparty,
+                    7,
+                    2_500_000,
+                    10_000_000,
+                    Some(90),
+                    true,
+                ),
+                mk_channel(
+                    &format!("0x{}", "c".repeat(64)),
+                    &format!("0x{}", "d".repeat(40)),
+                    0,
+                    0,
+                    5_000_000,
+                    None,
+                    false,
+                ),
+            ],
+        };
+        let mut buf = Vec::<u8>::new();
+        write_channels_table(&mut buf, &resp)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("channels=2"), "{s}");
+        assert!(s.contains("CHANNEL"), "header missing: {s}");
+        assert!(s.contains("OUTSTANDING"), "header missing: {s}");
+        assert!(s.contains("ELIGIBLE"), "header missing: {s}");
+        // First row: USDC-formatted amounts, 90s → "1m ago", eligible "yes".
+        assert!(s.contains("2.500000"), "outstanding USDC missing: {s}");
+        assert!(s.contains("10.000000"), "deposit USDC missing: {s}");
+        assert!(s.contains("1m ago"), "last-voucher age missing: {s}");
+        // Channel id preview is the short form.
+        assert!(s.contains("0xaaaaaaaaaa"), "channel preview missing: {s}");
+        // Counterparty preview is the short form AND preserves the EIP-55
+        // mixed case verbatim — `short_node_id` truncates to 12 chars, so
+        // assert the row carries that checksummed prefix unchanged (a
+        // regression that lowercased the address would miss this).
+        let cp_preview = short_node_id(&counterparty);
+        assert!(
+            cp_preview.chars().any(|ch| ch.is_ascii_uppercase()),
+            "expected mixed-case counterparty preview: {cp_preview}"
+        );
+        assert!(
+            s.contains(&cp_preview),
+            "checksummed counterparty preview missing: {s}"
+        );
+        // Second row: no activity → "never", not eligible → "no".
+        assert!(s.contains("never"), "never sentinel missing: {s}");
+        Ok(())
+    }
+
+    #[test]
+    fn format_usdc_renders_six_decimals() {
+        assert_eq!(format_usdc(0), "0.000000");
+        assert_eq!(format_usdc(1_000_000), "1.000000");
+        assert_eq!(format_usdc(2_500_000), "2.500000");
+        assert_eq!(format_usdc(1), "0.000001");
+        assert_eq!(format_usdc(12_345_678), "12.345678");
+    }
+
+    /// `decdn node channels --json` serializes the `ChannelsResponse`
+    /// DTO with `serde_json::to_string_pretty` (the seam the `--json`
+    /// branch in [`channels`] uses). Assert the pretty encoding (a)
+    /// round-trips back to the same value and (b) carries every
+    /// load-bearing field with its wire key, so a rename or a
+    /// skipped-field regression on the DTO breaks here rather than only
+    /// at the shell. Mirrors `render_json_roundtrips_through_filter` for
+    /// the peers `--json` path. The counterparty is a real EIP-55
+    /// checksummed address so the JSON reflects production output.
+    #[test]
+    fn channels_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
+        let counterparty =
+            alloy::primitives::address!("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed").to_string();
+        let resp = ChannelsResponse {
+            redeem_threshold_micro_usdc: 1_000_000,
+            channels: vec![mk_channel(
+                &format!("0x{}", "a".repeat(64)),
+                &counterparty,
+                7,
+                2_500_000,
+                10_000_000,
+                Some(42),
+                true,
+            )],
+        };
+
+        // Exact seam the `--json` branch uses.
+        let pretty = serde_json::to_string_pretty(&resp)?;
+        // Pretty form is multi-line (indented) — guards against an
+        // accidental switch to the compact encoder.
+        assert!(
+            pretty.contains('\n'),
+            "pretty JSON must be multi-line: {pretty}"
+        );
+
+        // Round-trips back through the DTO with no lossy field — the
+        // generated client deserializes this exact shape. (The DTO doesn't
+        // derive `PartialEq`, so assert the reconstructed fields directly
+        // rather than comparing whole structs.)
+        let back: ChannelsResponse = serde_json::from_str(&pretty)?;
+        assert_eq!(back.redeem_threshold_micro_usdc, 1_000_000);
+        assert_eq!(back.channels.len(), 1);
+        let bc = back.channels.first().expect("one channel");
+        assert_eq!(bc.counterparty, counterparty);
+        assert_eq!(bc.last_nonce, 7);
+        assert_eq!(bc.outstanding_micro_usdc, 2_500_000);
+        assert_eq!(bc.deposit_micro_usdc, 10_000_000);
+        assert_eq!(bc.seconds_since_last_voucher, Some(42));
+        assert!(bc.settlement_eligible);
+
+        // Each wire key is present with the expected value, including the
+        // checksummed counterparty verbatim (mixed-case preserved).
+        let value: serde_json::Value = serde_json::from_str(&pretty)?;
+        assert_eq!(value["redeem_threshold_micro_usdc"], 1_000_000);
+        let chans = value["channels"].as_array().expect("channels array");
+        assert_eq!(chans.len(), 1);
+        let c0 = &chans[0];
+        assert_eq!(c0["counterparty"].as_str(), Some(counterparty.as_str()));
+        assert_eq!(c0["last_nonce"], 7);
+        assert_eq!(c0["outstanding_micro_usdc"], 2_500_000);
+        assert_eq!(c0["deposit_micro_usdc"], 10_000_000);
+        assert_eq!(c0["seconds_since_last_voucher"], 42);
+        assert_eq!(c0["settlement_eligible"], true);
         Ok(())
     }
 

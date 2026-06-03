@@ -33,6 +33,7 @@ pub mod rate;
 pub mod store;
 pub mod stream_sig;
 pub mod voucher;
+pub mod voucher_activity;
 
 pub use bind_sig::{
     BindError, CAPACITY_BOND_DOMAIN_NAME, CAPACITY_BOND_DOMAIN_VERSION, EPHEMERAL_BINDING_NONCE,
@@ -62,3 +63,4 @@ pub use stream_sig::{StreamSlashData, StreamSlashError};
 pub use voucher::{
     DOMAIN_NAME, DOMAIN_VERSION, SignedVoucher, Voucher, VoucherError, voucher_domain,
 };
+pub use voucher_activity::VoucherActivity;

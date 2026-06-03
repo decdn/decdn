@@ -32,10 +32,11 @@ use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
 use decdn_common::admin::{AdminRpcClient, DrainRequest};
 use decdn_common::cli::{
-    AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs, StatusArgs,
+    AnnounceArgs, ChannelsArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs, StatusArgs,
 };
 use decdn_gossip::PeerTable;
-use decdn_node::admin::{self, AdminState, DhtStatusHandles, DrainTrigger};
+use decdn_incentive::{ChannelState, ChannelStateStore, MemoryChannelStateStore, VoucherActivity};
+use decdn_node::admin::{self, AdminState, ChannelStatusHandles, DhtStatusHandles, DrainTrigger};
 use decdn_node::dht::routing::NodeId;
 use decdn_node::dht::{
     ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
@@ -291,6 +292,140 @@ async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
 
     let _ = stop_tx.send(());
     join.await?;
+    Ok(())
+}
+
+/// `admin_v1_channels` round-trips through real HTTP via jsonrpsee's
+/// generated client (issue #749): a store seeded with two channels
+/// surfaces both, ordered by descending outstanding (no activity
+/// recorded), with the configured threshold echoed and eligibility
+/// computed against it.
+#[tokio::test]
+async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
+    use alloy::primitives::{Address, U256};
+
+    let token: Address = "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse()?;
+    let mk = |id_byte: u8, amount: u64, deposit: u64, nonce: u64| -> ChannelState {
+        let mut id = [0u8; 32];
+        id[31] = id_byte;
+        let mut client = [0u8; 20];
+        client[19] = id_byte;
+        ChannelState::hydrate(
+            id.into(),
+            Address::from(client),
+            token,
+            U256::from(deposit),
+            U256::from(amount),
+            U256::from(nonce),
+            U256::from(amount),
+            None,
+            0,
+        )
+    };
+
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&mk(1, 2_000_000, 10_000_000, 5))?;
+    store.record(&mk(2, 100_000, 5_000_000, 2))?;
+
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(
+        peer_table,
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
+        Arc::new(Metrics::new()),
+    )
+    .with_channels(ChannelStatusHandles {
+        channel_store: store as Arc<dyn ChannelStateStore>,
+        voucher_activity: Arc::new(VoucherActivity::new()),
+        redeem_threshold_micro_usdc: 1_000_000,
+    });
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    let resp = client.channels().await?;
+    assert_eq!(resp.redeem_threshold_micro_usdc, 1_000_000);
+    assert_eq!(resp.channels.len(), 2);
+    // No activity → ordered by descending outstanding.
+    let first = resp
+        .channels
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing first channel"))?;
+    assert_eq!(first.outstanding_micro_usdc, 2_000_000);
+    assert_eq!(first.last_nonce, 5);
+    assert!(first.settlement_eligible, "2 USDC >= 1 USDC threshold");
+    assert!(first.channel_id.starts_with("0x"));
+    assert!(first.counterparty.starts_with("0x"));
+    assert_eq!(first.seconds_since_last_voucher, None);
+    let second = resp
+        .channels
+        .get(1)
+        .ok_or_else(|| anyhow::anyhow!("missing second channel"))?;
+    assert_eq!(second.outstanding_micro_usdc, 100_000);
+    assert!(!second.settlement_eligible, "0.1 USDC < 1 USDC threshold");
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
+/// `admin_v1_channels` on a node with no channel handles wired returns
+/// an empty list and a zero threshold over the wire — exercising the
+/// `with_channels`-absent path end-to-end.
+#[tokio::test]
+async fn channels_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(
+        peer_table,
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        None,
+        Arc::new(DrainTrigger::new()),
+        throwaway_signer(),
+        Arc::new(Metrics::new()),
+    );
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    let resp = client.channels().await?;
+    assert!(resp.channels.is_empty());
+    assert_eq!(resp.redeem_threshold_micro_usdc, 0);
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
+/// CLI `channels` against a dropped listener surfaces the
+/// connection-refused hint, same as the peers path.
+#[tokio::test]
+async fn cli_channels_surfaces_connection_refused() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    drop(listener);
+
+    let args = ChannelsArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 2_000,
+    };
+    let err = commands::channels(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
+        .to_string();
+    assert!(
+        err.contains("refused"),
+        "error should mention 'refused', got: {err}"
+    );
     Ok(())
 }
 

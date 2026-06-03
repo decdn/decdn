@@ -356,6 +356,89 @@ pub struct StatusResponse {
     pub republish: RepublishHealth,
 }
 
+/// JSON view of one open payment channel emitted by `admin_v1_channels`
+/// (issue #749). Defined separately from `decdn-incentive`'s internal
+/// `ChannelState` so the replay-critical `last_*` accessors, the `U256`
+/// money types, and any future internal fields can't leak into the wire
+/// format: every field here is a plain owned wire value. Shared between
+/// the server (serializes) and `decdn node channels` (deserializes via
+/// the generated client).
+///
+/// Money amounts are reported in **micro-USDC** (`u64`) — the same base
+/// unit `blockchain.redeem_threshold_micro_usdc` is configured in. The
+/// underlying `ChannelState` carries them as `U256`; the server narrows
+/// with `u64::try_from(...).unwrap_or(u64::MAX)`, so a value that somehow
+/// exceeded `u64::MAX` micro-USDC (~1.8e13 USDC — unreachable for a real
+/// channel bounded by the on-chain deposit) saturates rather than wraps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSnapshot {
+    /// Lowercase hex of the on-chain `channelId` (`keccak256(client,
+    /// provider, channelNonce)` per ADR 003), `0x`-prefixed — same
+    /// 32-byte encoding `alloy`'s `B256` `Display` produces.
+    pub channel_id: String,
+    /// The client (buyer) Ethereum address that opened the channel and
+    /// signs vouchers, rendered as an EIP-55 mixed-case checksummed hex
+    /// string (`0x`-prefixed) — `alloy`'s `Address` `Display`. Note this
+    /// differs from [`PeerView::node_id`], which is plain lowercase hex of
+    /// an iroh public key (a different identity type, not an EVM address).
+    pub counterparty: String,
+    /// Sequence number of the most-recently-accepted voucher
+    /// (`ChannelState::last_nonce`). `0` before any voucher has been
+    /// applied — matches the on-chain `claimedNonce == 0` sentinel.
+    pub last_nonce: u64,
+    /// Cumulative amount of the most-recently-accepted voucher, in
+    /// micro-USDC (`ChannelState::last_amount`). This is the node's
+    /// total accrued claim on the channel — the figure that crosses the
+    /// redemption threshold. `0` before any voucher.
+    pub outstanding_micro_usdc: u64,
+    /// On-chain escrowed deposit backing the channel, in micro-USDC
+    /// (`ChannelState::deposit`). Vouchers can never exceed this, so
+    /// `outstanding_micro_usdc / deposit_micro_usdc` is the channel's
+    /// drawn-down fraction — operators watch channels approaching full
+    /// draw-down as a liquidity signal.
+    pub deposit_micro_usdc: u64,
+    /// Whole seconds since this process last accepted a voucher on this
+    /// channel, or `None` when no voucher has been observed *since the
+    /// node started*. The activity clock is in-memory: a channel
+    /// hydrated from `channels.redb` at boot reports `None` until its
+    /// next voucher, because the persisted `ChannelState` carries no
+    /// last-voucher wall-clock. Operators use this to spot stale
+    /// channels (high `outstanding` but no recent vouchers).
+    /// `#[serde(default)]` keeps older servers round-tripping as `None`.
+    #[serde(default)]
+    pub seconds_since_last_voucher: Option<u64>,
+    /// `true` when the accrued claim (`outstanding_micro_usdc`) has
+    /// reached the node's configured redemption threshold
+    /// (`blockchain.redeem_threshold_micro_usdc`), i.e. the redeemer
+    /// would `withdraw` this channel on its next tick. This is an
+    /// **upper-bound** signal: the admin surface does not read the
+    /// on-chain `withdrawnAmount`, so it compares the full accrued claim
+    /// (not the un-redeemed delta) against the threshold. A channel that
+    /// already redeemed up to its current claim may still report `true`
+    /// until the next voucher advances it — surfaced so operators can
+    /// see which channels are *at or above* the redemption bar.
+    pub settlement_eligible: bool,
+}
+
+/// Response body for `admin_v1_channels` (issue #749). Shared between the
+/// server (serializes), `decdn node channels` (deserializes via the
+/// generated client), and the integration tests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelsResponse {
+    /// One entry per channel the node currently tracks. Ordering is most
+    /// recently active first (channels with a known last-voucher time
+    /// ahead of those without), then by descending outstanding amount —
+    /// the on-call use case is "which channels are closest to a
+    /// settlement / liquidity event?".
+    pub channels: Vec<ChannelSnapshot>,
+    /// The node's configured redemption threshold in micro-USDC
+    /// (`blockchain.redeem_threshold_micro_usdc`). Echoed once at the top
+    /// level — rather than repeated per channel — so the renderer can
+    /// show the bar each [`ChannelSnapshot::settlement_eligible`] is
+    /// measured against without the operator cross-referencing the config.
+    pub redeem_threshold_micro_usdc: u64,
+}
+
 /// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
 /// Matches the standard JSON-RPC 2.0 `Invalid params` code.
 pub const INVALID_PARAMS_CODE: i32 = -32_602;
@@ -402,6 +485,14 @@ pub const DHT_UNAVAILABLE_CODE: i32 = -32_005;
 /// tell "this node never had a DHT" from "this node's DHT just broke".
 /// The server also logs the poisoning at `error` level.
 pub const DHT_POISONED_CODE: i32 = -32_006;
+
+/// JSON-RPC error code: `admin_v1_channels` could not read the channel
+/// state store (issue #749) — e.g. the redb load failed or a poisoned
+/// in-memory mutex. A read-side fault distinct from the cache/DHT codes
+/// so an operator script can tell "channel snapshot is unavailable right
+/// now" from a generic transport failure. The server also logs the
+/// underlying store error.
+pub const CHANNEL_STORE_ERROR_CODE: i32 = -32_007;
 
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
@@ -494,6 +585,20 @@ pub trait AdminRpc {
     /// this node.
     #[method(name = "status")]
     async fn status(&self) -> RpcResult<StatusResponse>;
+
+    /// Return a live snapshot of every open payment channel this node
+    /// tracks (issue #749): per channel the last-accepted nonce,
+    /// outstanding accrued claim, escrowed deposit, time since the last
+    /// voucher (in-memory, `None` after a restart until the next
+    /// voucher), and whether the accrued claim has reached the
+    /// redemption threshold. Backs `decdn node channels`, giving
+    /// operators a single view to spot channels approaching settlement,
+    /// stale channels, or unusually high outstanding balances before
+    /// they become a liquidity risk — without scraping metrics or logs.
+    /// Returns [`CHANNEL_STORE_ERROR_CODE`] if the channel state store
+    /// cannot be read.
+    #[method(name = "channels")]
+    async fn channels(&self) -> RpcResult<ChannelsResponse>;
 }
 
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].
@@ -662,5 +767,76 @@ mod tests {
         assert_eq!(back.known_stakers, 7);
         assert_eq!(back.record_store.capacity, 100_000);
         assert_eq!(back.republish.scheduled_records, 5);
+    }
+
+    /// `ChannelsResponse` round-trips through serde unchanged — guards the
+    /// nested `ChannelSnapshot` shape both the server and `decdn node
+    /// channels` (de)serialize (issue #749).
+    #[test]
+    fn channels_response_round_trips() {
+        let resp = ChannelsResponse {
+            redeem_threshold_micro_usdc: 1_000_000,
+            channels: vec![
+                ChannelSnapshot {
+                    channel_id: "0xabcd".to_string(),
+                    counterparty: "0x00aa".to_string(),
+                    last_nonce: 7,
+                    outstanding_micro_usdc: 2_500_000,
+                    deposit_micro_usdc: 10_000_000,
+                    seconds_since_last_voucher: Some(42),
+                    settlement_eligible: true,
+                },
+                ChannelSnapshot {
+                    channel_id: "0xbeef".to_string(),
+                    counterparty: "0x00bb".to_string(),
+                    last_nonce: 0,
+                    outstanding_micro_usdc: 0,
+                    deposit_micro_usdc: 5_000_000,
+                    seconds_since_last_voucher: None,
+                    settlement_eligible: false,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).expect("serialize ChannelsResponse");
+        let back: ChannelsResponse =
+            serde_json::from_str(&json).expect("deserialize ChannelsResponse");
+        assert_eq!(back.redeem_threshold_micro_usdc, 1_000_000);
+        assert_eq!(back.channels.len(), 2);
+        let first = back.channels.first().expect("first channel");
+        assert_eq!(first.channel_id, "0xabcd");
+        assert_eq!(first.counterparty, "0x00aa");
+        assert_eq!(first.last_nonce, 7);
+        assert_eq!(first.outstanding_micro_usdc, 2_500_000);
+        assert_eq!(first.deposit_micro_usdc, 10_000_000);
+        assert_eq!(first.seconds_since_last_voucher, Some(42));
+        assert!(first.settlement_eligible);
+        let second = back.channels.get(1).expect("second channel");
+        assert_eq!(second.seconds_since_last_voucher, None);
+        assert!(!second.settlement_eligible);
+    }
+
+    /// Wire back-compat for `ChannelSnapshot.seconds_since_last_voucher`
+    /// (issue #749): an older server (or a channel with no in-process
+    /// voucher activity) omits the field. `#[serde(default)]` must
+    /// deserialize the omitted field to `None` so a `decdn node channels`
+    /// client renders "never" rather than failing the whole roundtrip.
+    #[test]
+    fn channel_snapshot_legacy_shape_defaults_seconds_none() {
+        let legacy = r#"{
+            "channel_id": "0xabcd",
+            "counterparty": "0x00aa",
+            "last_nonce": 3,
+            "outstanding_micro_usdc": 100,
+            "deposit_micro_usdc": 200,
+            "settlement_eligible": false
+        }"#;
+        let snap: ChannelSnapshot =
+            serde_json::from_str(legacy).expect("legacy ChannelSnapshot must deserialize");
+        assert_eq!(snap.last_nonce, 3);
+        assert_eq!(snap.outstanding_micro_usdc, 100);
+        assert!(
+            snap.seconds_since_last_voucher.is_none(),
+            "missing seconds_since_last_voucher must default to None"
+        );
     }
 }
