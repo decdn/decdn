@@ -87,7 +87,7 @@ use alloy::providers::Provider;
 use anyhow::{Context, Result};
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    ChannelId, ChannelState, ChannelStateStore, PendingSettle, PendingSettleStore,
+    ChannelId, ChannelState, ChannelStateStore, PendingSettle, PendingSettleStore, StoreError,
     WatcherCheckpointStore,
 };
 use futures_util::StreamExt;
@@ -1396,15 +1396,47 @@ async fn try_auto_settle_close<P: Provider + Clone>(
     }
     // The claim is now secured by the close (settles after the dispute window).
     // Retire the channel — drop it from the handler so we stop serving a channel
-    // we can no longer redeem against (mirrors `try_close_for_expiry`). Count the
-    // success / log only after the forget so the metric reflects a fully-retired
-    // close, not just a landed tx.
-    if let Err(err) = handler.forget_channel(st.channel_id).await {
-        warn!(%err, channel_id = %st.channel_id, "auto-settle: forget after close failed");
+    // we can no longer redeem against (mirrors `try_close_for_expiry`).
+    let forget_result = handler.forget_channel(st.channel_id).await;
+    record_auto_settle_close_outcome(
+        forget_result,
+        metrics,
+        st.channel_id,
+        unredeemed,
+        nonce_span,
+    )
+}
+
+/// Record the metric + log for a landed auto-settle close, given the result of
+/// the post-close `forget_channel`, and return the value `try_auto_settle_close`
+/// must propagate (always `true` — the close landed, so the caller MUST skip the
+/// `withdraw`, which would revert against a now-`Closing` channel).
+///
+/// The success counter / "retired" log are gated on a *successful* forget so the
+/// metric reflects a fully-retired close, not just a landed tx. A forget failure
+/// leaves an unredeemable `Closing` channel (#742's leak), so it routes to the
+/// failure counter instead — a stranded-but-closed channel stays observable
+/// rather than masquerading as a secured success.
+///
+/// Split out so the forget-success vs forget-failure branch is unit-testable
+/// without a provider (landing a real close requires the anvil e2e harness).
+fn record_auto_settle_close_outcome(
+    forget_result: Result<(), StoreError>,
+    metrics: &Arc<Metrics>,
+    channel_id: ChannelId,
+    unredeemed: U256,
+    nonce_span: u64,
+) -> bool {
+    if let Err(err) = forget_result {
+        // Close landed but the channel was NOT retired — we keep serving an
+        // unredeemable `Closing` channel. Surface it rather than claim success.
+        warn!(%err, %channel_id, "auto-settle: forget after close failed; channel closed but not retired");
+        metrics.settlement_auto_failure();
+        return true; // close landed → still skip withdraw (channel is Closing)
     }
     metrics.settlement_auto_triggered();
     info!(
-        channel_id = %st.channel_id,
+        %channel_id,
         unredeemed = %unredeemed,
         nonce_span,
         "auto-settlement trigger fired; closed + retired channel to secure balance (#742)"
@@ -1499,6 +1531,10 @@ async fn try_redeem<P: Provider + Clone>(
         return Ok(());
     }
 
+    // try_auto_settle_close returned false: either below threshold, or the close
+    // failed (failure already surfaced via settlement_auto_failure). The channel is
+    // still Open, so fall through to a best-effort withdraw — reclaim the delta this
+    // tick; the auto-settle close retries on the next sweep.
     if unredeemed < redeem_threshold {
         return Ok(());
     }
@@ -2124,6 +2160,82 @@ mod tests {
         assert_eq!(
             unredeemed_nonce_span(U256::from(u64::MAX) + U256::from(5u64), U256::ZERO),
             u64::MAX
+        );
+    }
+
+    /// Read one auto-settle counter from the `OpenMetrics` text (`<name> <n>`).
+    /// Returns 0 if the line is absent (a fresh counter exports at zero, but be
+    /// defensive). Avoids `unwrap`/indexing per the workspace anti-panic policy.
+    fn auto_settle_counter(metrics: &Arc<Metrics>, name: &str) -> u64 {
+        let Ok(text) = metrics.encode() else {
+            return 0;
+        };
+        text.lines()
+            .filter_map(|l| l.strip_prefix(name))
+            .filter_map(|rest| rest.strip_prefix(' '))
+            .find_map(|n| n.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    fn triggered(metrics: &Arc<Metrics>) -> u64 {
+        auto_settle_counter(metrics, "decdn_settlement_auto_triggered_total")
+    }
+
+    fn failures(metrics: &Arc<Metrics>) -> u64 {
+        auto_settle_counter(metrics, "decdn_settlement_auto_failures_total")
+    }
+
+    #[test]
+    fn auto_settle_close_outcome_forget_success_counts_as_secured() {
+        // Baseline: a landed close whose post-close `forget_channel` succeeds is
+        // the fully-retired path — success counter ticks, no failure, skip
+        // withdraw.
+        let metrics = Arc::new(Metrics::new());
+        let channel_id = ChannelId::from([7u8; 32]);
+        let returned =
+            record_auto_settle_close_outcome(Ok(()), &metrics, channel_id, U256::from(15u64), 3);
+        assert!(
+            returned,
+            "a landed close must skip the withdraw fallthrough"
+        );
+        assert_eq!(
+            triggered(&metrics),
+            1,
+            "secured close ticks the success counter"
+        );
+        assert_eq!(failures(&metrics), 0, "a clean retire records no failure");
+    }
+
+    #[test]
+    fn auto_settle_close_outcome_forget_failure_is_not_a_secured_success() {
+        // Fix #1 regression (Alper review, #789): the close landed but
+        // `forget_channel` errored, so the node keeps serving an unredeemable
+        // `Closing` channel. This must NOT count as a secured success — it routes
+        // to the FAILURE counter, leaves the success counter untouched, and still
+        // returns `true` so the caller skips the withdraw (the channel is
+        // `Closing`; a withdraw would revert).
+        let metrics = Arc::new(Metrics::new());
+        let channel_id = ChannelId::from([9u8; 32]);
+        let returned = record_auto_settle_close_outcome(
+            Err(StoreError::Backend("forget failed".into())),
+            &metrics,
+            channel_id,
+            U256::from(15u64),
+            3,
+        );
+        assert!(
+            returned,
+            "the close landed → must return true so the caller skips withdraw on a Closing channel"
+        );
+        assert_eq!(
+            triggered(&metrics),
+            0,
+            "a forget failure must NOT increment the secured-success counter"
+        );
+        assert_eq!(
+            failures(&metrics),
+            1,
+            "a stranded-but-closed channel must increment the failure counter so the leak is observable"
         );
     }
 
