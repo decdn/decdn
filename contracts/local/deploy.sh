@@ -22,13 +22,10 @@ if [[ -f "$here/.env" ]]; then
   set +a
 fi
 
-# Docker publishes anvil's port ONLY on WG_BIND_IP, so default the RPC target to
-# that interface (not 127.0.0.1, which won't answer when WG_BIND_IP is a
-# non-loopback VPN IP). An explicit RPC_URL in .env still wins (e.g. reaching the
-# rig from a different host).
-WG_BIND_IP="${WG_BIND_IP:-127.0.0.1}"
+# Local-only rig: Docker publishes anvil on 127.0.0.1. An explicit RPC_URL in
+# .env still wins.
 RPC_PORT="${RPC_PORT:-8545}"
-RPC_URL="${RPC_URL:-http://${WG_BIND_IP}:${RPC_PORT}}"
+RPC_URL="${RPC_URL:-http://127.0.0.1:${RPC_PORT}}"
 CHAIN_ID="${CHAIN_ID:-31337699}"
 TIMELOCK_DELAY="${TIMELOCK_DELAY:-3600}"
 # Anvil dev account #0 (mnemonic "test test ... junk"), funded at genesis.

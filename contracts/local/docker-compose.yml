@@ -22,13 +22,12 @@ services:
       --state /state/anvil-state.json
       --block-time ${BLOCK_TIME:-2}
     # SECURITY: anvil's JSON-RPC is UNAUTHENTICATED and exposes the `anvil_*`
-    # cheat methods plus well-known dev private keys. WG_BIND_IP pins the host
-    # publish to the WireGuard interface so the RPC is reachable ONLY over the
-    # VPN. It defaults to 127.0.0.1 (localhost-only) so an unconfigured `up`
-    # exposes nothing. NEVER set WG_BIND_IP=0.0.0.0 on a public VPS — Docker
-    # publishes via its own iptables chain and will punch straight through ufw.
+    # cheat methods plus well-known dev private keys, so the port is published
+    # ONLY to 127.0.0.1 — this rig is local-only. Exposing a shared test RPC to
+    # the team (and hardening it) is handled by the devops test-RPC setup, not
+    # here.
     ports:
-      - "${WG_BIND_IP:-127.0.0.1}:${RPC_PORT:-8545}:8545"
+      - "127.0.0.1:${RPC_PORT:-8545}:8545"
     volumes:
       - anvil-state:/state
     restart: unless-stopped
@@ -43,12 +42,12 @@ services:
   # OPTIONAL self-hosted iroh relay (opt-in via `--profile relay`).
   #
   # The node honors `[network] relay_url` (DECDN_RELAY_URL): set it to
-  # http://<WG_BIND_IP>:3340 to route iroh traffic through this relay instead of
+  # http://127.0.0.1:3340 to route iroh traffic through this relay instead of
   # the public n0 servers (see README § iroh relay). Not started by the default
   # `up` — run `docker compose --profile relay up -d`. You must set
   # IROH_RELAY_IMAGE in `.env` to a relay image/build first (there is no default
   # since iroh does not publish an official relay image). `--dev` disables
-  # TLS / abuse limits, appropriate behind WireGuard.
+  # TLS / abuse limits, fine for a local rig.
   # No healthcheck here (unlike anvil): the image is operator-supplied and we
   # can't assume a probe tool is present. The node's own relay reachability
   # probe (warn-and-continue) covers startup diagnosis.
@@ -56,7 +55,7 @@ services:
     image: ${IROH_RELAY_IMAGE}
     command: --dev
     ports:
-      - "${WG_BIND_IP:-127.0.0.1}:3340:3340"
+      - "127.0.0.1:3340:3340"
     restart: unless-stopped
     profiles: ["relay"]
 
