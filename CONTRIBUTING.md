@@ -220,8 +220,53 @@ The `solidity-gas-snapshot` CI job posts a sticky PR comment with the diff so re
 
 - **Slither** fails CI on medium-and-above findings (`fail_on: medium` in `slither.config.json`, also passed as `fail-on: medium` to `crytic/slither-action`); detailed output lives in the job log. SARIF upload to code-scanning is **commented out** in `ci.yml` because the repo does not have GitHub Advanced Security enabled; re-enable the step (and the matching `security-events: write` + `actions: read` permissions) when GHAS is turned on or the repo flips public. For true positives, fix the contract. For confirmed false positives, suppress *inline* (`// slither-disable-next-line <detector>` with a comment justifying the suppression) — never expand `detectors_to_exclude` in `slither.config.json`. Detectors currently excluded globally: `naming-convention` (overlaps with solhint's name-mixedcase rules), `solc-version` and `pragma` (satisfied by the explicit `solc_version` pin in `foundry.toml`).
 - **Aderyn** runs via `Cyfrin/aderyn-ci@v0.0.10` with `fail-on: high`; output lives in the job log under the action's summary.
-- **Solhint** failures point at code; fix the code rather than disabling the rule. Rule changes require a separate PR with rationale. Solhint lints `contracts/src/` only; test files (Foundry's `test_xxx_yyy` convention) are out of scope by design.
+- **Solhint** failures point at code; fix the code rather than disabling the rule. Rule changes require a separate PR with rationale. Solhint lints `contracts/src/`, `contracts/testnet/`, and `contracts/script/` (per the `lint` script in `contracts/package.json`); test files (Foundry's `test_xxx_yyy` convention) are out of scope by design.
 - **Coverage** posts a sticky PR comment with total line coverage + delta vs `main` (the `solidity-coverage` job uploads an LCOV baseline on push-to-main and downloads it on PRs). The comment script is `.github/scripts/contracts-coverage-comment.sh`; the Rust side uses the analogous `coverage-diff.py`.
+
+### Local deployment (Anvil)
+
+`script/DeployProtocol.s.sol` deploys the full contract suite, hands all governance roles to the `TimelockController`, and writes a `deployments/<chainId>.json` manifest. The script does **not** deploy USDC — it wraps an existing token — so a local deploy first stands up the `MintableUSDC` mock from `test/mocks/`.
+
+**One-command setup:** from `contracts/`, run [`./dev-deploy.sh`](contracts/dev-deploy.sh). It boots Anvil, deploys the USDC mock + full protocol + a funded TOKEN faucet, prints the deployed addresses, and stays in the foreground (Ctrl-C tears it all down). The manual steps below show what it does end to end.
+
+Run everything from `contracts/`. The addresses/keys below are Anvil's deterministic defaults (account #0 and #1); never use them anywhere but a local chain.
+
+```bash
+# 1. Start a local chain (chain id 31337). Leave running in another terminal.
+anvil
+
+# 2. Deploy the USDC mock and capture its address.
+USDC=$(forge create test/mocks/MintableUSDC.sol:MintableUSDC \
+  --rpc-url http://127.0.0.1:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --broadcast --json | jq -r .deployedTo)
+
+# 3. Deploy the protocol. The four addresses are required; for local testing any
+#    EOA works (here: account #1 for the first two, #2 for the pool). The
+#    deployer is whoever `--sender` is — it must NOT be forge's default sender,
+#    so pass it explicitly.
+USDC_ADDRESS=$USDC \
+EMERGENCY_MULTISIG=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 \
+INITIAL_TOKEN_HOLDER=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 \
+CHALLENGER_INCENTIVE_POOL=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC \
+forge script script/DeployProtocol.s.sol:DeployProtocol \
+  --rpc-url http://127.0.0.1:8545 \
+  --sender 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --broadcast
+
+# 4. Read back the deployed addresses.
+jq . deployments/31337.json
+```
+
+Notes and common snags:
+
+- **Drop `--broadcast` for a dry run** — the script simulates against the fork and prints addresses without sending transactions.
+- **Required env vars:** `USDC_ADDRESS`, `EMERGENCY_MULTISIG`, `INITIAL_TOKEN_HOLDER`, `CHALLENGER_INCENTIVE_POOL`. Every economic parameter (`MIN_BOND`, `TIMELOCK_DELAY`, `FEE_ROUTER_WINDOW_EPOCHS`, the slash/blacklist bonds, …) has a production-shaped default and is overridable via env var — see `_readConfig` in `DeployProtocol.s.sol` for the full list and defaults.
+- **`--sender` becomes the deployer.** The script reverts (`DeployerIsForgeDefaultSender`) if you let forge use its default sender, so always pass `--sender`. The deployer's roles are granted to the Timelock and then revoked as the final step; the script reverts if any privileged role is left on the deployer.
+- **Re-running on the same chain reverts** with `ManifestAlreadyExists` (the guard fires before any gas is spent). Either `rm deployments/31337.json`, restart Anvil for a clean slate, or set `FORCE_OVERWRITE_MANIFEST=true`.
+- **`BuybackBurner` is recorded as the zero address** — it ships unwired at launch (operators take 90%, treasury 10%); its 30% buyback share activates by governance once a concrete Balancer V3 subclass is deployed.
+- **Testnet TOKEN faucet (optional):** `script/TestnetFaucet.s.sol:DeployTestnetFaucet` funds and deploys a cooldown-gated dispenser. It reads `TOKEN_ADDRESS` (from the manifest), `TREASURY_ADDRESS` (must equal `--sender`), `FUNDING_AMOUNT`, and the `ADMIN_ADDRESS`/`GOVERNANCE_ADDRESS`/`PAUSER_ADDRESS` role holders; `CLAIM_AMOUNT` and `COOLDOWN_SECONDS` are optional.
 
 ## Rust Toolchain
 
