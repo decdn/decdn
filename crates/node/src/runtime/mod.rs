@@ -18,7 +18,7 @@ use decdn_cache::{
 use decdn_common::config::{ResolvedOrigin, ResolvedS3Credentials};
 use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
-use iroh::{Endpoint, SecretKey};
+use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::ALPN as GOSSIP_ALPN;
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinSet;
@@ -420,9 +420,14 @@ pub async fn run(
 
     let transport_config =
         quic_transport_config().context("failed to build QUIC transport config")?;
-    let ep = build_endpoint(&secret_key, cfg.network.bind_port, transport_config)
-        .await
-        .context("failed to build iroh endpoint")?;
+    let ep = build_endpoint(
+        &secret_key,
+        cfg.network.bind_port,
+        cfg.network.relay_url.as_deref(),
+        transport_config,
+    )
+    .await
+    .context("failed to build iroh endpoint")?;
 
     node_metrics
         .register_iroh_endpoint(&ep)
@@ -1223,10 +1228,11 @@ pub async fn run(
 async fn build_endpoint(
     secret_key: &SecretKey,
     bind_port: u16,
+    relay_url: Option<&str>,
     transport_config: QuicTransportConfig,
 ) -> anyhow::Result<Endpoint> {
     let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
-    Endpoint::builder(presets::N0)
+    let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key.clone())
         .transport_config(transport_config)
         // ADR 015 §Session Ticket Management. In iroh this knob sizes
@@ -1237,12 +1243,62 @@ async fn build_endpoint(
         // it only matters when this node resumes outbound, and
         // `network.enable_0rtt` gates whether the probe handler accepts
         // inbound resumption.
-        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE)
+        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE);
+
+    // A configured `network.relay_url` overrides the n0 default relay map with a
+    // single self-hosted relay (`RelayMode::Custom`). The `presets::N0` DNS
+    // address-lookup leg is left intact — only the relay leg is swapped — so
+    // NodeId→address discovery still works while connectivity routes through the
+    // operator's relay (useful for an isolated / self-hosted deployment). A
+    // custom relay sits on the critical path for NAT traversal, so an
+    // unreachable or mistyped URL fails bring-up here (see `probe_relay`) rather
+    // than degrading silently into unroutable connections later. Multi-relay
+    // support is tracked separately (issue #795).
+    if let Some(url) = relay_url {
+        let relay: RelayUrl = url
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid network.relay_url {url:?}: {e}"))?;
+        probe_relay(&relay).await?;
+        builder = builder.relay_mode(RelayMode::Custom(RelayMap::from(relay)));
+    }
+
+    builder
         .bind_addr(bind_addr)
         .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
         .bind()
         .await
         .map_err(|e| anyhow::anyhow!("endpoint bind {bind_addr} failed: {e}"))
+}
+
+/// Simple reachability probe for a self-hosted relay: a single TCP connect to
+/// the relay's host:port within a short timeout. A successful connect is taken
+/// as sufficient evidence the relay is up; we deliberately do not speak the
+/// relay's HTTP-upgrade handshake (that is iroh's job once the endpoint binds).
+/// The point is to turn a down or mistyped `network.relay_url` into a loud,
+/// fail-fast bring-up error instead of silent connection failures down the line.
+async fn probe_relay(relay: &RelayUrl) -> anyhow::Result<()> {
+    const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    // `RelayUrl` derefs to `url::Url`; the host/port accessors come from there.
+    let host = relay
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("relay url {relay} has no host"))?;
+    let port = relay.port_or_known_default().ok_or_else(|| {
+        anyhow::anyhow!("relay url {relay} has no port and scheme has no default")
+    })?;
+    match tokio::time::timeout(
+        RELAY_PROBE_TIMEOUT,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => Ok(()),
+        Ok(Err(e)) => Err(anyhow::anyhow!(
+            "relay {relay} unreachable: tcp connect failed: {e}"
+        )),
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "relay {relay} unreachable: tcp connect timed out after {RELAY_PROBE_TIMEOUT:?}"
+        )),
+    }
 }
 
 /// Resolve the keystore password from CLI/env/prompt, then decrypt the

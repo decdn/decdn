@@ -42,27 +42,20 @@ services:
   # --------------------------------------------------------------------------
   # OPTIONAL self-hosted iroh relay (opt-in via `--profile relay`).
   #
-  # NOT wired up by default, and NOT usable as-is: the node currently builds its
-  # iroh endpoint with `presets::N0` (public number0 relays + DNS discovery) and
-  # does NOT consume `network.relay_url` (see crates/node/src/runtime/mod.rs
-  # `build_endpoint`). Pointing nodes at a self-hosted relay therefore needs a
-  # small endpoint-builder change first — tracked as a follow-up. Until then:
-  #   - if the VPS has outbound internet, nodes reach the public n0 relays and
-  #     work with NO relay container; or
-  #   - on a flat WireGuard subnet, nodes can dial each other directly (no relay
-  #     needed) once their NodeId + direct addr are known.
-  #
-  # When the endpoint change lands, set IROH_RELAY_IMAGE and run
-  # `docker compose --profile relay up -d`, then point nodes at
-  # `http://<WG_BIND_IP>:3340` via DECDN_RELAY_URL. See README § iroh relay.
-  #
-  # relay:
-  #   image: ${IROH_RELAY_IMAGE}
-  #   command: --dev          # --dev disables TLS/abuse limits for a LAN/VPN
-  #   ports:
-  #     - "${WG_BIND_IP:-127.0.0.1}:3340:3340"
-  #   restart: unless-stopped
-  #   profiles: ["relay"]
+  # The node honors `[network] relay_url` (DECDN_RELAY_URL): set it to
+  # http://<WG_BIND_IP>:3340 to route iroh traffic through this relay instead of
+  # the public n0 servers (see README § iroh relay). Not started by the default
+  # `up` — run `docker compose --profile relay up -d`. You must set
+  # IROH_RELAY_IMAGE in `.env` to a relay image/build first (there is no default
+  # since iroh does not publish an official relay image). `--dev` disables
+  # TLS / abuse limits, appropriate behind WireGuard.
+  relay:
+    image: ${IROH_RELAY_IMAGE}
+    command: --dev
+    ports:
+      - "${WG_BIND_IP:-127.0.0.1}:3340:3340"
+    restart: unless-stopped
+    profiles: ["relay"]
 
 volumes:
   anvil-state:

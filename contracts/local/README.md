@@ -73,22 +73,22 @@ supply, held by `INITIAL_TOKEN_HOLDER` (the deployer by default); distribute it
 with `cast send`.
 
 ```bash
-RPC=http://<WG_BIND_IP>:8545
-USDC=<mock-usdc-from-deploy>                 # printed by deploy.sh
-TOKEN=<Token-from-manifest>
+RPC=http://10.0.0.1:8545      # your WG_BIND_IP:RPC_PORT from .env
+USDC=0x...                    # mock USDC, printed by deploy.sh
+TOKEN=0x...                   # Token address from the manifest
 DEPLOYER_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 
 # Mint 1,000 USDC (6 decimals) to an operator/client:
-cast send "$USDC" "mint(address,uint256)" <addr> 1000000000 \
+cast send "$USDC" "mint(address,uint256)" YOUR_ADDRESS 1000000000 \
   --rpc-url "$RPC" --private-key "$DEPLOYER_KEY"
 
 # Send 100,000 TOKEN (18 decimals) from the genesis holder to an operator
 # (needs ≥ MIN_BOND = 50,000 TOKEN to stake):
-cast send "$TOKEN" "transfer(address,uint256)" <operator> 100000000000000000000000 \
+cast send "$TOKEN" "transfer(address,uint256)" OPERATOR_ADDRESS 100000000000000000000000 \
   --rpc-url "$RPC" --private-key "$DEPLOYER_KEY"
 
 # Gas for a fresh EOA (anvil cheat method):
-cast rpc anvil_setBalance <addr> 0xde0b6b3a7640000 --rpc-url "$RPC"
+cast rpc anvil_setBalance YOUR_ADDRESS 0xde0b6b3a7640000 --rpc-url "$RPC"
 ```
 
 ## Connect a node
@@ -100,35 +100,41 @@ anvil deploy (stake → registerNode → open channel → settle) is
 `crates/node/tests/anvil_settlement_e2e.rs` — read it as the reference for the
 on-chain config a node needs.
 
-> Note: the node's `chain id` is currently bound to Arbitrum Sepolia in
-> `load_eth_signer` (see the comment in `crates/node/src/runtime/mod.rs`). Using
-> a different `CHAIN_ID` here may require threading the chain id through
-> `ResolvedBlockchain` first. Either set `CHAIN_ID` to the value the node
-> expects, or make that change before wiring real nodes.
+In the node config, set `[blockchain] chain_id` to match this rig's `CHAIN_ID`
+(it defaults to Arbitrum Sepolia otherwise — the node binds this chain id on its
+signer and `slash_sig` EIP-712 domain) and `[blockchain] rpc_url` to the wg RPC.
+To route iroh traffic through the self-hosted relay, set `[network] relay_url`
+(env `DECDN_RELAY_URL`); see § iroh relay.
 
-## iroh relay — do we need one?
+## iroh relay
 
-Short version: **probably not for a first internal test, and it isn't
-plug-and-play yet.**
+The node honors `[network] relay_url` (env `DECDN_RELAY_URL`): when set, it
+replaces the public n0 relay map with your self-hosted relay
+(`RelayMode::Custom`) while keeping n0 DNS address-lookup for NodeId→address
+discovery. On bring-up the node runs a quick TCP reachability probe against the
+relay and **fails fast** if it's down or mistyped, so a bad relay URL surfaces
+immediately instead of as silent connection failures later.
 
-The node builds its iroh endpoint with `presets::N0` (public number0 relays +
-DNS discovery) and does **not** currently consume `network.relay_url` (see
-`build_endpoint` in `crates/node/src/runtime/mod.rs`; the field is `warn_ignored`
-on reload). So:
+Do you need it?
 
-- **If the VPS has outbound internet:** nodes reach the public n0 relays and
-  work with **no relay container at all**. Simplest path to first light.
-- **On a flat WireGuard subnet:** nodes can dial each other **directly** once
-  their `NodeId` + direct address are known — relays exist for NAT hole-punching
-  and NodeId→addr discovery, neither of which a routable wg mesh needs.
-- **If you want full isolation (no public n0 dependency):** you'd run a
-  self-hosted `iroh-relay` **and** make a small endpoint-builder change to honor
-  `relay_url` (+ a discovery mechanism). That code change is out of scope for
-  this deploy tooling and tracked as a follow-up.
+- **VPS has outbound internet:** skip the relay entirely — nodes use the public
+  n0 relays. Simplest path to first light.
+- **Flat WireGuard subnet:** nodes can often dial each other directly once their
+  `NodeId` + direct address are known.
+- **Isolated / self-hosted:** run the bundled relay and point nodes at it via
+  `relay_url`.
 
-A commented `relay` service (opt-in `--profile relay`) is stubbed in
-`docker-compose.yml` so the scaffolding is ready the moment that endpoint change
-lands. Until then it's intentionally inert.
+Start the relay (opt-in profile) and wire nodes to it:
+
+```bash
+# Set IROH_RELAY_IMAGE in .env to a relay image/build first, then:
+docker compose --profile relay up -d
+# Node config: [network] relay_url = "http://10.0.0.1:3340"   (your WG_BIND_IP)
+```
+
+NodeId discovery still uses n0 DNS (pkarr), so full isolation from public n0
+infrastructure (custom discovery) and multi-relay failover are tracked as
+follow-ups — see issue #795.
 
 ## Persistence & restarts
 
@@ -153,7 +159,7 @@ cast rpc evm_mine --rpc-url "$RPC"                 # mine so the bump takes effe
 ```bash
 cd contracts/local
 docker compose down -v          # stop anvil + delete the state volume
-rm -f contracts/deployments/<chainId>.json   # if it lingers (gitignored anyway)
+rm -f ../deployments/YOUR_CHAIN_ID.json   # if it lingers (gitignored anyway)
 ```
 
 Then delete `contracts/local/`. Nothing else in the repo references it — no

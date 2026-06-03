@@ -37,7 +37,7 @@ command -v forge >/dev/null 2>&1 || {
 }
 
 echo "==> waiting for anvil at $RPC_URL"
-for i in $(seq 1 30); do
+for ((i = 1; i <= 30; i++)); do
   if cast chain-id --rpc-url "$RPC_URL" >/dev/null 2>&1; then break; fi
   if [[ "$i" -eq 30 ]]; then
     echo "error: anvil never came up at $RPC_URL (is \`docker compose up -d\` running?)" >&2
@@ -62,7 +62,7 @@ usdc_json="$(forge create test/mocks/MintableUSDC.sol:MintableUSDC \
   --rpc-url "$RPC_URL" --private-key "$DEPLOYER_KEY" --broadcast --json)"
 usdc="$(printf '%s' "$usdc_json" | { jq -r '.deployedTo' 2>/dev/null || true; })"
 if [[ -z "$usdc" || "$usdc" == "null" ]]; then
-  usdc="$(printf '%s' "$usdc_json" | sed -n 's/.*"deployedTo":"\([^"]*\)".*/\1/p')"
+  usdc="$(printf '%s' "$usdc_json" | sed -n 's/.*"deployedTo":[[:space:]]*"\([^"]*\)".*/\1/p')"
 fi
 [[ -n "$usdc" ]] || { echo "error: MintableUSDC deploy produced no address" >&2; exit 1; }
 echo "    USDC = $usdc"
