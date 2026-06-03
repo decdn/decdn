@@ -48,7 +48,7 @@ Eleven groups summing to 100%.
 | 8 | Misc. Marketing, PR, and KOLs | 5% | Internal | Marketing | 6mo lock-up, 10% at cliff, then 24mo linear (daily) |
 | 9 | Public Sale | 5% | External | Public Sale | Genesis-liquid (or 6mo lockup if regulatory posture requires) |
 | 10 | Advisors | 3% | Internal | Core Contributors | 6mo lock-up, 25% at cliff, then 24mo linear (monthly) |
-| 11 | Exchange Partnerships (co-marketing) | 3% | External | Marketing | 10% at cliff (no lock-up), then 36mo linear (daily) |
+| 11 | Exchange Partnerships | 3% | External | Marketing | 10% at cliff (no lock-up), then 36mo linear (daily); co-marketing to CEX / MM partners |
 | | **Total** | **100%** | | | |
 
 **Categorical rollup.**
@@ -77,7 +77,7 @@ Eleven groups summing to 100%.
 
 This is the *unlock* set, not the *circulating sell-side float*. Of the 20% unlocked, only ~5–10% is circulating float — POL sits as a non-circulating treasury-owned LP position (removable only by governance) and the Market Making allocation is a market-neutral two-sided position; both are "Not a seller" per [§ Sell-pressure profile](#sell-pressure-profile). Public Sale (≤5%) is the only fully-unlocked group that is a net seller.
 
-Two further groups carry a **partial** TGE unlock under the vesting schedule above: DAO Treasury releases 30% at TGE (= 4.5% of supply, 45M TOKEN) and App Incentives releases 20% at TGE (= 3.8% of supply, 38M TOKEN). These are not in the 100%-unlock set; the released portions land in Timelock-controlled wallets (operational Treasury / App-Incentives multisig) and are spent into the ecosystem, not sold — they are treasury-custodied, not sell-side float (analogous to POL). Misc. Marketing, PR, and KOLs and Exchange Partnerships (co-marketing) now follow formal lock-up/cliff/linear schedules (see the table above) rather than the prior ad-hoc / milestone treatment; both remain Treasury-administered ecosystem spend rather than profit-seeking holdings.
+Two further groups carry a **partial** TGE unlock under the vesting schedule above: DAO Treasury releases 30% at TGE (= 4.5% of supply, 45M TOKEN) and App Incentives releases 20% at TGE (= 3.8% of supply, 38M TOKEN). These are not in the 100%-unlock set; the released portions land in Timelock-controlled wallets (operational Treasury / App-Incentives multisig) and are spent into the ecosystem, not sold — they are treasury-custodied, not sell-side float (analogous to POL). Misc. Marketing, PR, and KOLs and Exchange Partnerships now follow formal lock-up/cliff/linear schedules (see the table above) rather than the prior ad-hoc / milestone treatment; both remain Treasury-administered ecosystem spend rather than profit-seeking holdings.
 
 **Genesis liquid float (TGE Day 1).**
 
