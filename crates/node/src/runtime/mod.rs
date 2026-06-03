@@ -488,11 +488,15 @@ pub async fn run(
             })?;
     let chain_provider = ProviderBuilder::new().connect_http(rpc_url.clone());
     let staker_set: Arc<dyn StakerSet> = Arc::new(
-        ChainStakerSet::bootstrap(chain_provider, capacity_bond_addr)
-            .await
-            .with_context(|| {
-                format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
-            })?,
+        ChainStakerSet::bootstrap(
+            chain_provider,
+            capacity_bond_addr,
+            Arc::clone(&node_metrics),
+        )
+        .await
+        .with_context(|| {
+            format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
+        })?,
     );
 
     // Stake-lane probe-acceptance reservation (#757, ADR 003 §Admission and
