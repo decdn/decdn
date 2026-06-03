@@ -31,6 +31,21 @@
 //! The append is also crash-atomic at the line level only in the usual POSIX
 //! sense (a torn final line is possible after a hard crash); JSONL readers MUST
 //! tolerate a truncated trailing line.
+//!
+//! # Rotation (issue #802)
+//!
+//! Left unbounded the log grows for the entire process lifetime and across
+//! restarts (`O_APPEND`), eventually exhausting `data_dir`. [`JsonlReceiptLog`]
+//! therefore takes a [`RotationPolicy`] (`max_file_bytes`, `retained_files`):
+//! once the live file would exceed `max_file_bytes` it is rotated to a numbered
+//! backup (`download_receipts.jsonl.1`, `.2`, …, oldest = highest), a fresh
+//! live file is opened, and any backup beyond `retained_files` is deleted. This
+//! bounds `data_dir` to roughly `(retained_files + 1) * max_file_bytes`.
+//! `retained_files == 0` keeps no backups — the live file is truncated in place
+//! on rotation. Rotation is **best-effort**: a rename/open failure mid-rotation
+//! never leaves the log without a writable handle and never aborts paid
+//! delivery (the caller treats an `append` error as non-fatal), it only trims
+//! or skips a backup that cycle.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -198,26 +213,64 @@ pub trait ReceiptLog: Send + Sync {
     fn append(&self, receipt: &DownloadReceipt) -> std::io::Result<()>;
 }
 
-/// JSON-Lines, append-only [`ReceiptLog`] backed by a single file under
-/// `data_dir`.
+/// Size-based rotation policy for [`JsonlReceiptLog`] (issue #802).
+///
+/// `max_file_bytes` is the size at which the live file is rotated;
+/// `retained_files` is how many numbered backups (`.1`..=`.N`) to keep (`0`
+/// truncates the live file in place instead of keeping backups). The resolver
+/// (`decdn_common::config::resolve_config`) validates both into safe ranges
+/// before they reach here.
+#[derive(Debug, Clone, Copy)]
+pub struct RotationPolicy {
+    max_file_bytes: u64,
+    retained_files: u32,
+}
+
+impl RotationPolicy {
+    /// Build a policy from validated limits.
+    #[must_use]
+    pub const fn new(max_file_bytes: u64, retained_files: u32) -> Self {
+        Self {
+            max_file_bytes,
+            retained_files,
+        }
+    }
+}
+
+/// Mutex-guarded writer state: the live append handle plus the in-memory byte
+/// count used to decide rotation without an extra `stat` per append.
+#[derive(Debug)]
+struct LogState {
+    file: File,
+    written: u64,
+}
+
+/// JSON-Lines, append-only [`ReceiptLog`] backed by a single rotating file
+/// under `data_dir`.
 ///
 /// One [`File`] handle is held open for the process lifetime behind a [`Mutex`]
 /// so concurrent delivery streams cannot interleave partial lines. The handle
 /// is opened in append mode (`O_APPEND`), so even across the (already
 /// serialized) writes each `write_all` lands at the current end of file.
+/// Rotation (issue #802) swaps that handle under the same lock; see the
+/// module-level rotation note.
 #[derive(Debug)]
 pub struct JsonlReceiptLog {
-    file: Mutex<File>,
+    state: Mutex<LogState>,
     path: PathBuf,
+    policy: RotationPolicy,
 }
 
 impl JsonlReceiptLog {
-    /// Open (or create) the receipt log under `data_dir`.
+    /// Open (or create) the receipt log under `data_dir` with rotation `policy`.
     ///
     /// The file is opened in append mode and, on Unix, created with mode
     /// `0o600`; an existing file's mode is tightened to `0o600` as
     /// defense-in-depth (idempotent — skipped when already correct, so a
-    /// read-only mount with the right mode does not brick startup).
+    /// read-only mount with the right mode does not brick startup). The
+    /// in-memory rotation counter is seeded from the existing file length so a
+    /// log that is already near the cap rotates on the next append rather than
+    /// only after a full cap's worth of fresh writes.
     ///
     /// Unlike [`crate::channel_store::PersistentChannelStateStore::open`], a
     /// failure here is **not** required to abort node bring-up: the receipt log
@@ -226,32 +279,99 @@ impl JsonlReceiptLog {
     ///
     /// # Errors
     ///
-    /// Returns a [`std::io::Error`] if the file cannot be opened/created or its
-    /// mode cannot be tightened.
-    pub fn open(data_dir: &Path) -> std::io::Result<Self> {
+    /// Returns a [`std::io::Error`] if the file cannot be opened/created, its
+    /// mode cannot be tightened, or its current length cannot be read.
+    pub fn open(data_dir: &Path, policy: RotationPolicy) -> std::io::Result<Self> {
         let path = data_dir.join(RECEIPT_LOG_FILE);
-        let mut opts = OpenOptions::new();
-        opts.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(RECEIPT_LOG_FILE_MODE);
-        }
-        let file = opts.open(&path)?;
-        #[cfg(unix)]
-        tighten_permissions(&path)?;
+        let file = open_append(&path)?;
+        let written = file.metadata()?.len();
         Ok(Self {
-            file: Mutex::new(file),
+            state: Mutex::new(LogState { file, written }),
             path,
+            policy,
         })
     }
 
-    /// Filesystem path of the underlying log file. Useful for operator log
-    /// lines and runbooks.
+    /// Filesystem path of the underlying (live) log file. Useful for operator
+    /// log lines and runbooks.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Path of the `n`-th rotated backup (`<live>.n`).
+    fn backup_path(&self, n: u32) -> PathBuf {
+        let mut raw = self.path.clone().into_os_string();
+        raw.push(format!(".{n}"));
+        PathBuf::from(raw)
+    }
+
+    /// Rotate the live file, preserving a usable append handle in `state`.
+    ///
+    /// Best-effort: every step that can fail leaves `state.file` pointing at a
+    /// writable canonical-path handle so the caller's next `append` still
+    /// succeeds. With `retained_files == 0` the live file is truncated in place;
+    /// otherwise the oldest backup is dropped, the chain is shifted up, the live
+    /// file becomes `.1`, and a fresh live file is opened. If opening the fresh
+    /// file fails, `.1` is renamed back so the original handle keeps writing to
+    /// the canonical path.
+    fn rotate(&self, state: &mut LogState) -> std::io::Result<()> {
+        let retained = self.policy.retained_files;
+        if retained == 0 {
+            state.file.set_len(0)?;
+            state.written = 0;
+            return Ok(());
+        }
+
+        // Drop the oldest backup (NotFound is fine before the chain fills).
+        match std::fs::remove_file(self.backup_path(retained)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        // Shift `.i -> .(i+1)` from the top down so no rename clobbers a file
+        // that still needs moving. A missing intermediate backup is a benign gap.
+        for i in (1..retained).rev() {
+            match std::fs::rename(self.backup_path(i), self.backup_path(i + 1)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Move the live file to `.1`. The open handle in `state.file` follows the
+        // inode, so writes through it would now land in `.1` until we swap it.
+        std::fs::rename(&self.path, self.backup_path(1))?;
+        match open_append(&self.path) {
+            Ok(fresh) => {
+                state.file = fresh;
+                state.written = 0;
+                Ok(())
+            }
+            Err(open_err) => {
+                // Restore the canonical path so the still-open `state.file`
+                // handle keeps appending to a correctly-named live log.
+                let _ = std::fs::rename(self.backup_path(1), &self.path);
+                Err(open_err)
+            }
+        }
+    }
+}
+
+/// Open (or create) an append-mode handle at `path`, applying the `0o600` mode
+/// on Unix and tightening an existing file's mode. Shared by `open` and the
+/// post-rotation reopen so both honour the same permissions invariant.
+fn open_append(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(RECEIPT_LOG_FILE_MODE);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    tighten_permissions(path)?;
+    Ok(file)
 }
 
 /// Tighten the on-disk file mode to `0o600`. Idempotent: skips the syscall when
@@ -275,14 +395,43 @@ impl ReceiptLog for JsonlReceiptLog {
         // newline in these scalar fields, keeping one-receipt-per-line.
         let mut line = serde_json::to_string(receipt).map_err(std::io::Error::other)?;
         line.push('\n');
+        let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
         let mut guard = self
-            .file
+            .state
             .lock()
             .map_err(|_| std::io::Error::other("receipt log mutex poisoned"))?;
-        guard.write_all(line.as_bytes())?;
-        // Flush to the OS so the line survives a clean process exit; no fsync —
-        // see the module-level durability note.
-        guard.flush()
+        // Rotate before writing when this line would push the live file past the
+        // cap, but only once the file already holds a record — so a single line
+        // larger than the cap still writes (after one rotation) instead of
+        // looping. A rotation error is surfaced but leaves a writable handle.
+        if self.policy.max_file_bytes > 0
+            && guard.written > 0
+            && guard.written.saturating_add(line_len) > self.policy.max_file_bytes
+        {
+            self.rotate(&mut guard)?;
+        }
+        match guard
+            .file
+            .write_all(line.as_bytes())
+            // Flush to the OS so the line survives a clean process exit; no
+            // fsync — see the module-level durability note.
+            .and_then(|()| guard.file.flush())
+        {
+            Ok(()) => {
+                guard.written = guard.written.saturating_add(line_len);
+                Ok(())
+            }
+            Err(e) => {
+                // A partial write can land bytes before erroring, so the
+                // in-memory counter may now disagree with the file. Resync from
+                // metadata (best-effort) so a later rotation isn't decided on a
+                // stale count.
+                if let Ok(meta) = guard.file.metadata() {
+                    guard.written = meta.len();
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -324,6 +473,33 @@ mod tests {
             U256::from(byte),
             1_700_000_000 + u64::from(byte),
         )
+    }
+
+    /// A rotation policy whose cap is large enough that the existing
+    /// non-rotation tests never rotate.
+    fn no_rotate() -> RotationPolicy {
+        RotationPolicy::new(u64::MAX, 4)
+    }
+
+    /// A receipt whose serialized line is a fixed width regardless of `tag`
+    /// (constant `size`/`nonce`/`timestamp`; only the fixed-width hex `hash` /
+    /// `client_node_id` vary). Rotation tests rely on every line being the same
+    /// length so the byte cap is deterministic.
+    fn fixed(tag: u8) -> DownloadReceipt {
+        DownloadReceipt::new(
+            &Hash::from_bytes([tag; 32]),
+            4096,
+            &[tag ^ 0xff; 32],
+            U256::from(42u8),
+            1_700_000_000,
+        )
+    }
+
+    /// Byte length of a serialized receipt line (including the trailing `\n`).
+    fn line_len(r: &DownloadReceipt) -> anyhow::Result<u64> {
+        let mut s = serde_json::to_string(r)?;
+        s.push('\n');
+        Ok(u64::try_from(s.len())?)
     }
 
     #[test]
@@ -372,7 +548,7 @@ mod tests {
     #[test]
     fn append_then_read_back_round_trips() -> anyhow::Result<()> {
         let dir = data_dir()?;
-        let log = JsonlReceiptLog::open(dir.path())?;
+        let log = JsonlReceiptLog::open(dir.path(), no_rotate())?;
         let a = sample(1);
         let b = sample(2);
         log.append(&a)?;
@@ -395,13 +571,13 @@ mod tests {
         let a = sample(3);
         let b = sample(4);
         {
-            let log = JsonlReceiptLog::open(dir.path())?;
+            let log = JsonlReceiptLog::open(dir.path(), no_rotate())?;
             log.append(&a)?;
         } // drop closes the handle
         {
             // Reopen the SAME data_dir: the prior line must persist and the new
             // line must append after it (not truncate).
-            let log = JsonlReceiptLog::open(dir.path())?;
+            let log = JsonlReceiptLog::open(dir.path(), no_rotate())?;
             log.append(&b)?;
         }
         let parsed = read_receipts(&dir.path().join(RECEIPT_LOG_FILE))?;
@@ -417,11 +593,137 @@ mod tests {
     fn open_tightens_file_mode_to_0600() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = data_dir()?;
-        let log = JsonlReceiptLog::open(dir.path())?;
+        let log = JsonlReceiptLog::open(dir.path(), no_rotate())?;
         log.append(&sample(5))?;
         let mode = std::fs::metadata(log.path())?.permissions().mode() & 0o777;
         anyhow::ensure!(mode == 0o600, "expected 0o600, got {mode:o}");
         Ok(())
+    }
+
+    /// Each line that would exceed the cap rotates the live file first, so the
+    /// live file holds exactly one record, the newest `retained_files` backups
+    /// are kept (`.1` newest), and the oldest is dropped.
+    #[test]
+    fn rotates_and_retains_bounded_backups() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let cap = line_len(&fixed(0))?; // one line per file
+        let log = open_log(dir.path(), cap, 3)?;
+        // r0..r4: r0 lands in the live file, each later append rotates first.
+        for tag in 0..5u8 {
+            log.append(&fixed(tag))?;
+        }
+        // Live file holds only the newest record.
+        anyhow::ensure!(
+            read_receipts(log.path())? == vec![fixed(4)],
+            "live file not rotated"
+        );
+        // Newest three backups kept: .1=r3, .2=r2, .3=r1; oldest (r0) dropped.
+        anyhow::ensure!(read_receipts(&log.backup_path(1))? == vec![fixed(3)]);
+        anyhow::ensure!(read_receipts(&log.backup_path(2))? == vec![fixed(2)]);
+        anyhow::ensure!(read_receipts(&log.backup_path(3))? == vec![fixed(1)]);
+        anyhow::ensure!(
+            !log.backup_path(4).exists(),
+            "retention cap exceeded: a 4th backup exists"
+        );
+        Ok(())
+    }
+
+    /// A single line larger than the cap still writes (after one rotation)
+    /// instead of looping or being dropped.
+    #[test]
+    fn oversized_line_writes_after_single_rotation() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        // Cap below any real line length.
+        let log = open_log(dir.path(), 1, 2)?;
+        log.append(&fixed(1))?;
+        log.append(&fixed(2))?;
+        anyhow::ensure!(
+            read_receipts(log.path())? == vec![fixed(2)],
+            "second line missing"
+        );
+        anyhow::ensure!(
+            read_receipts(&log.backup_path(1))? == vec![fixed(1)],
+            "first line lost"
+        );
+        Ok(())
+    }
+
+    /// `retained_files == 0` truncates the live file in place — no backups.
+    #[test]
+    fn zero_retained_truncates_in_place() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let cap = line_len(&fixed(0))?;
+        let log = open_log(dir.path(), cap, 0)?;
+        log.append(&fixed(1))?;
+        log.append(&fixed(2))?;
+        anyhow::ensure!(
+            read_receipts(log.path())? == vec![fixed(2)],
+            "live file not truncated"
+        );
+        anyhow::ensure!(
+            !log.backup_path(1).exists(),
+            "retained_files == 0 must not leave a backup"
+        );
+        Ok(())
+    }
+
+    /// Reopen seeds the rotation counter from the existing file length, so a log
+    /// already at the cap rotates on the next append (the pre-reopen line ends
+    /// up in `.1`).
+    #[test]
+    fn reopen_seeds_written_from_file_length() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let cap = line_len(&fixed(0))?;
+        {
+            let log = open_log(dir.path(), cap, 2)?;
+            log.append(&fixed(1))?;
+        } // drop closes the handle; file holds one cap-filling line
+        let log = open_log(dir.path(), cap, 2)?;
+        log.append(&fixed(2))?;
+        anyhow::ensure!(
+            read_receipts(log.path())? == vec![fixed(2)],
+            "reopen did not rotate"
+        );
+        anyhow::ensure!(
+            read_receipts(&log.backup_path(1))? == vec![fixed(1)],
+            "pre-reopen line should have rotated into .1"
+        );
+        Ok(())
+    }
+
+    /// The freshly-opened live file and the rotated backups all keep mode
+    /// `0o600` after rotation.
+    #[test]
+    #[cfg(unix)]
+    fn rotation_preserves_file_mode_0600() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = data_dir()?;
+        let cap = line_len(&fixed(0))?;
+        let log = open_log(dir.path(), cap, 2)?;
+        for tag in 0..3u8 {
+            log.append(&fixed(tag))?;
+        }
+        for p in [
+            log.path().to_path_buf(),
+            log.backup_path(1),
+            log.backup_path(2),
+        ] {
+            let mode = std::fs::metadata(&p)?.permissions().mode() & 0o777;
+            anyhow::ensure!(
+                mode == 0o600,
+                "expected 0o600 for {}, got {mode:o}",
+                p.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn open_log(
+        dir: &Path,
+        max_file_bytes: u64,
+        retained_files: u32,
+    ) -> std::io::Result<JsonlReceiptLog> {
+        JsonlReceiptLog::open(dir, RotationPolicy::new(max_file_bytes, retained_files))
     }
 
     fn read_receipts(path: &Path) -> anyhow::Result<Vec<DownloadReceipt>> {

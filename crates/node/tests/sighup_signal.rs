@@ -109,6 +109,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             max_tracked_sources: 4096,
         },
         dht: decdn_common::config::ResolvedDht::default(),
+        receipts: decdn_common::config::ResolvedReceipts::default(),
     }
 }
 

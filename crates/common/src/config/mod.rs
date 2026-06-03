@@ -21,7 +21,7 @@ pub use errors::ConfigErrorBag;
 pub use resolved::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedGossip,
     ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment,
-    ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -143,6 +143,22 @@ pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE
 /// exactly as before — the reservation is strictly operator opt-in.
 pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
 
+/// Default size at which the download-receipt log rotates (#802): 128 MiB.
+/// With the default `retained_files` this bounds the audit log to ~640 MiB
+/// of `data_dir` while still keeping a multi-hundred-MiB delivery history.
+pub const DEFAULT_RECEIPT_MAX_FILE_BYTES: u64 = 128 << 20;
+/// Floor for `receipts.max_file_bytes` (#802): 1 MiB. Below this, rotation
+/// would churn near-constantly at the ~1-line-per-MiB-delivered write rate.
+pub const MIN_RECEIPT_MAX_FILE_BYTES: u64 = 1 << 20;
+/// Ceiling for `receipts.max_file_bytes` (#802): 1 GiB. A single live file
+/// larger than this defeats the point of bounding `data_dir` growth.
+pub const MAX_RECEIPT_MAX_FILE_BYTES: u64 = 1 << 30;
+/// Default number of rotated receipt-log backups retained (#802).
+pub const DEFAULT_RECEIPT_RETAINED_FILES: u32 = 4;
+/// Ceiling for `receipts.retained_files` (#802). Generous; the total disk
+/// bound is `(retained_files + 1) * max_file_bytes`.
+pub const MAX_RECEIPT_RETAINED_FILES: u32 = 100;
+
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -195,6 +211,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let gossip = resolve_gossip_into(file.gossip.as_ref(), &mut bag);
     let security = resolve_security_into(file.security.as_ref(), &mut bag);
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
+    let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
 
     ensure_region_when_publishing_global_into(&identity, &gossip, &mut bag);
     validate_port_layout_into(&network, &observability, &mut bag);
@@ -211,6 +228,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         gossip,
         security,
         dht,
+        receipts,
     })
 }
 
@@ -1638,6 +1656,60 @@ fn resolve_gossip_into(
     }
 }
 
+/// Resolve download-receipt audit-log retention fields (#802).
+///
+/// `max_file_bytes` is clamped to `[MIN_RECEIPT_MAX_FILE_BYTES,
+/// MAX_RECEIPT_MAX_FILE_BYTES]` (rejected, not silently clamped) so a typo
+/// can neither rotate on every line nor defeat rotation. `retained_files`
+/// accepts `0` (truncate-in-place, no backups) up to
+/// `MAX_RECEIPT_RETAINED_FILES`.
+#[cfg(test)]
+fn resolve_receipts(file: Option<&types::ReceiptsConfig>) -> anyhow::Result<ResolvedReceipts> {
+    one_section(|bag| resolve_receipts_into(file, bag))
+}
+
+/// Bag-threading worker for the `[receipts]` section. Shares a bag with the
+/// other sections during startup ([`resolve_config`]); see
+/// [`resolve_payment_into`] for the rationale. The `#[cfg(test)]`
+/// `resolve_receipts` shim wraps this for direct unit tests.
+fn resolve_receipts_into(
+    file: Option<&types::ReceiptsConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedReceipts {
+    let max_file_bytes = file
+        .and_then(|r| r.max_file_bytes)
+        .unwrap_or(DEFAULT_RECEIPT_MAX_FILE_BYTES);
+    bag.check_with(
+        (MIN_RECEIPT_MAX_FILE_BYTES..=MAX_RECEIPT_MAX_FILE_BYTES).contains(&max_file_bytes),
+        "receipts.max_file_bytes",
+        || {
+            format!(
+                "receipts.max_file_bytes ({max_file_bytes}) must be within \
+                 [{MIN_RECEIPT_MAX_FILE_BYTES}, {MAX_RECEIPT_MAX_FILE_BYTES}] bytes"
+            )
+        },
+    );
+
+    let retained_files = file
+        .and_then(|r| r.retained_files)
+        .unwrap_or(DEFAULT_RECEIPT_RETAINED_FILES);
+    bag.check_with(
+        retained_files <= MAX_RECEIPT_RETAINED_FILES,
+        "receipts.retained_files",
+        || {
+            format!(
+                "receipts.retained_files ({retained_files}) must be <= \
+                 {MAX_RECEIPT_RETAINED_FILES}"
+            )
+        },
+    );
+
+    ResolvedReceipts {
+        max_file_bytes,
+        retained_files,
+    }
+}
+
 /// Resolve security / rate-limiting fields.
 ///
 /// Each numeric field accepts `0` as the "disable this layer" sentinel:
@@ -2384,6 +2456,85 @@ mod tests {
         assert!(g.allowlist.is_empty());
         assert_eq!(g.max_peer_table_entries, DEFAULT_MAX_PEER_TABLE_ENTRIES);
         Ok(())
+    }
+
+    #[test]
+    fn resolve_receipts_applies_defaults_when_absent() -> anyhow::Result<()> {
+        let r = resolve_receipts(None)?;
+        assert_eq!(r.max_file_bytes, DEFAULT_RECEIPT_MAX_FILE_BYTES);
+        assert_eq!(r.retained_files, DEFAULT_RECEIPT_RETAINED_FILES);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_receipts_applies_explicit_values() -> anyhow::Result<()> {
+        let cfg = types::ReceiptsConfig {
+            max_file_bytes: Some(8 << 20),
+            retained_files: Some(0),
+        };
+        let r = resolve_receipts(Some(&cfg))?;
+        assert_eq!(r.max_file_bytes, 8 << 20);
+        assert_eq!(r.retained_files, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_receipts_accepts_boundary_values() -> anyhow::Result<()> {
+        for bytes in [MIN_RECEIPT_MAX_FILE_BYTES, MAX_RECEIPT_MAX_FILE_BYTES] {
+            let cfg = types::ReceiptsConfig {
+                max_file_bytes: Some(bytes),
+                retained_files: Some(MAX_RECEIPT_RETAINED_FILES),
+            };
+            let r = resolve_receipts(Some(&cfg))?;
+            assert_eq!(r.max_file_bytes, bytes);
+            assert_eq!(r.retained_files, MAX_RECEIPT_RETAINED_FILES);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_receipts_rejects_max_file_bytes_below_floor() {
+        let cfg = types::ReceiptsConfig {
+            max_file_bytes: Some(MIN_RECEIPT_MAX_FILE_BYTES - 1),
+            retained_files: None,
+        };
+        let err = resolve_receipts(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("receipts.max_file_bytes"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_receipts_rejects_max_file_bytes_above_ceiling() {
+        let cfg = types::ReceiptsConfig {
+            max_file_bytes: Some(MAX_RECEIPT_MAX_FILE_BYTES + 1),
+            retained_files: None,
+        };
+        let err = resolve_receipts(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("receipts.max_file_bytes"),
+            "error missing field context: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_receipts_rejects_retained_files_above_cap() {
+        let cfg = types::ReceiptsConfig {
+            max_file_bytes: None,
+            retained_files: Some(MAX_RECEIPT_RETAINED_FILES + 1),
+        };
+        let err = resolve_receipts(Some(&cfg))
+            .expect_err("expected error")
+            .to_string();
+        assert!(
+            err.contains("receipts.retained_files"),
+            "error missing field context: {err}"
+        );
     }
 
     #[test]
