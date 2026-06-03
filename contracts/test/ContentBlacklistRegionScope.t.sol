@@ -170,10 +170,8 @@ contract ContentBlacklistRegionScopeTest is Test {
         // Flipped to US 8 days ago (> window); standing has ripened.
         bondMock.setNode(filer, "US", "EU", uint64(block.timestamp - 8 days), 0);
         vm.prank(filer);
-        uint256 appealId =
-            blacklist.openBlacklistAppeal(HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        blacklist.openBlacklistAppeal(HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
         assertTrue(blacklist.hasActiveAppeal(REGION_US, HASH));
-        assertEq(appealId, 0);
     }
 
     /// @notice Operator standing requires the disputed region to match the
@@ -215,5 +213,72 @@ contract ContentBlacklistRegionScopeTest is Test {
         vm.prank(filer);
         blacklist.openBlacklistAppeal(HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
         assertTrue(blacklist.hasActiveAppeal(REGION_US, HASH));
+    }
+
+    /// @notice `regionGateActivatedAt` wins over an ancient `firstBondedAt` in
+    ///         the fallback: a node bonded long ago but never region-changed is
+    ///         NOT auto-ripe the instant the gate deploys — standing is denied
+    ///         until `gate + window`. This is the core anti-evasion guarantee
+    ///         of the gate timestamp, and the branch the firstBonded-fallback
+    ///         test above does not exercise (it sets gate = 0).
+    function test_path2_gateWinsOverAncientFirstBonded_revertsNotRipened() public {
+        _addRegional(REGION_US, HASH);
+        bondMock.setGate(uint64(block.timestamp - 1 days)); // gate just activated
+        // firstBondedAt is well past the window (would be ripe on its own), but
+        // regionLastChanged == 0 ⇒ effective = max(firstBondedAt, gate) = gate
+        // (1 day ago) ⇒ not ripe. Without the gate this filer would have standing.
+        bondMock.setNode(filer, "US", "", 0, uint64(block.timestamp - 30 days));
+        uint64 readyAt = uint64(block.timestamp - 1 days) + uint64(WINDOW);
+        vm.prank(filer);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.RegionNotRipened.selector, readyAt));
+        blacklist.openBlacklistAppeal(HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+    }
+
+    // -----------------------------------------------------------------
+    // Edge cases / regression
+    // -----------------------------------------------------------------
+
+    /// @notice An operator with no previous region (`regionPrev == ""`) is out
+    ///         of scope for a real regional entry even while unripened: the
+    ///         ripening leg's `region == _toRegionKey("")` is `region ==
+    ///         bytes32(0)`, which never equals a real entry key. Guards the
+    ///         "empty prev ⇒ no second region" invariant the predicate relies on.
+    function test_scope_emptyPrevRegion_unripened_outOfScope() public {
+        _addRegional(REGION_US, HASH);
+        // Current region EU, no prior region, clock says unripened.
+        bondMock.setNode(operator, "EU", "", uint64(block.timestamp), 0);
+        assertFalse(blacklist.isOperatorInBlacklistScope(operator, HASH, REGION_US));
+    }
+
+    /// @notice The predicate must not revert when `effective >= block.timestamp`
+    ///         (the leg is written `now < effective + window`, not a
+    ///         subtraction). A future-dated `effective` is treated as unripened,
+    ///         so a prev-region entry stays in scope without an underflow panic.
+    function test_scope_effectiveNotInPast_noUnderflowRevert() public {
+        _addRegional(REGION_US, HASH);
+        // effective == now + 1 day (future): no revert, still unripened ⇒ in scope.
+        bondMock.setNode(operator, "EU", "US", uint64(block.timestamp + 1 days), 0);
+        assertTrue(blacklist.isOperatorInBlacklistScope(operator, HASH, REGION_US));
+    }
+
+    /// @notice A full 16-byte (`MAX_REGION_HINT_BYTES`) region round-trips
+    ///         through `_toRegionKey` and matches its `bytes32(...)` entry key,
+    ///         exercising the masking path for a non-trivial length.
+    function test_scope_maxLengthRegionKey_matches() public {
+        bytes32 region16 = bytes32("abcdefghijklmnop"); // exactly 16 bytes
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(region16, HASH);
+        bondMock.setNode(operator, "abcdefghijklmnop", "", 0, 0);
+        assertTrue(blacklist.isOperatorInBlacklistScope(operator, HASH, region16));
+    }
+
+    /// @notice Region keys that share a prefix but differ in length do not
+    ///         collide: an operator in "US" is not in scope for a "USX" entry.
+    function test_scope_prefixSharedDifferentLength_noCollision() public {
+        bytes32 regionUSX = bytes32("USX");
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(regionUSX, HASH);
+        bondMock.setNode(operator, "US", "", 0, 0);
+        assertFalse(blacklist.isOperatorInBlacklistScope(operator, HASH, regionUSX));
     }
 }

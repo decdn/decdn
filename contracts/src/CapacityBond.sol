@@ -166,7 +166,7 @@ contract CapacityBond is
 
     uint256 internal constant MAX_REGION_HINT_BYTES = 16;
 
-    /// @notice Bounds on `regionStabilityWindow` per ADR 030 § Cooldown.
+    /// @notice Bounds on `regionStabilityWindow` per ADR 030 § Region-stability window.
     uint256 internal constant REGION_STABILITY_WINDOW_FLOOR = 3 days;
     uint256 internal constant REGION_STABILITY_WINDOW_CEILING = 30 days;
 
@@ -303,7 +303,7 @@ contract CapacityBond is
     // -----------------------------------------------------------------
 
     /// @notice Previous-region snapshot taken on each `updateRegion` call.
-    ///         Pre-positioned for the ADR 030 § 52 blacklist-scope ripening
+    ///         Pre-positioned for the ADR 030 § Region-stability window blacklist-scope ripening
     ///         predicate (*"a node is in scope iff the entry is global, OR
     ///         entry.region == regionHint, OR (block.timestamp - effective <
     ///         REGION_STABILITY_WINDOW AND entry.region == regionPrev)"*),
@@ -753,7 +753,7 @@ contract CapacityBond is
     /// @dev    The new region is stored in the operator's `NodeInfo.regionHint`
     ///         so all downstream readers (`getActiveNodes`, off-chain DHT)
     ///         see the same source of truth. `regionPrev` retains the prior
-    ///         value for the ADR 030 § 52 blacklist-scope ripening predicate
+    ///         value for the ADR 030 § Region-stability window blacklist-scope ripening predicate
     ///         ("the previous region's entries keep applying until the change
     ///         ripens"); that predicate is enforced by
     ///         `ContentBlacklist.isOperatorInBlacklistScope` and the path-2

@@ -291,6 +291,7 @@ contract CapacityBondRegionE2ETest is Test {
 
         vm.prank(REG_OPERATOR);
         bond.updateRegion("eu-west");
+        uint64 changedAt = bond.regionLastChanged(REG_OPERATOR);
 
         bytes32 hash = bytes32(uint256(0xBEEF));
         vm.prank(regionalBody);
@@ -300,6 +301,12 @@ contract CapacityBondRegionE2ETest is Test {
         assertTrue(bl.isOperatorInBlacklistScope(REG_OPERATOR, hash, REGION_US_EAST));
         // ...but never slashable for a region it neither serves nor served.
         assertFalse(bl.isOperatorInBlacklistScope(REG_OPERATOR, hash, bytes32("ap-south")));
+
+        // The time-bound is real: once the flip ripens, the just-left region's
+        // slash exposure lapses (a flip can't shed exposure early, but it does
+        // expire on schedule).
+        vm.warp(uint256(changedAt) + REGION_WINDOW + 1);
+        assertFalse(bl.isOperatorInBlacklistScope(REG_OPERATOR, hash, REGION_US_EAST));
     }
 
     /// @notice ADR 011 § Standing path-2 over a real registration: a freshly

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-/// @notice Node-registry record (ADR 019 § Node Onboarding; NodeId binding per
+/// @notice Node-registry record (ADR 019; NodeId binding per
 ///         ADR 003). Declared at file level — like `SlashRecord` in
 ///         `SlashEscrowLib` — so both `CapacityBond` and its read-surface
 ///         interface reference one definition rather than duplicating it.
@@ -21,7 +21,7 @@ struct NodeInfo {
 /// @title ICapacityBondRegionView
 /// @notice ADR 030 region-eligibility read surface consumed by
 ///         `ContentBlacklist` for the blacklist-scope ripening predicate
-///         (ADR 030 § Eligibility) and the ADR 011 § Standing path-2 check.
+///         (ADR 030 § Region-stability window) and the ADR 011 § Standing path-2 check.
 ///         Declared as a standalone interface — like `ICapacityBondEjector` —
 ///         so the consumer types its handle narrowly and slither's
 ///         `missing-inheritance` detector can verify `CapacityBond` provides

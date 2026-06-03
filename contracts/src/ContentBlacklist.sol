@@ -18,9 +18,11 @@ import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.so
 ///         appeal flows through the same {open → fast-track → ratify/reverse}
 ///         lifecycle as `SlashAppeal` slashing appeals.
 /// @dev    Simplifications vs. ADR 031 carried for this revision:
-///           - Synthetic-standing clawback (`StandingPath.TokenHolder`
-///             balance check) is deferred. Standing path is recorded but
-///             not enforced beyond an enum-range check at filing time.
+///           - Standing: path 2 (`Operator`) is enforced — region match +
+///             ADR 030 ripening (`_requireOperatorStanding`). Path 1
+///             (`Publisher`, PublisherRegistry check) and path 3
+///             (`TokenHolder`, synthetic-standing clawback / balance check)
+///             are deferred: recorded and enum-range-validated only.
 ///           - Per-region concurrent-appeal cap (`BODY_CONCURRENT_APPEAL_CAP`)
 ///             is enforced as a single hard ceiling per region, not by
 ///             requesting body identity.
@@ -197,7 +199,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         filer's region change has not yet ripened — the disputed entry's
     ///         region matches the filer's node, but less than
     ///         `regionStabilityWindow` has elapsed since `effective` (ADR 030
-    ///         § Eligibility, ADR 011 § Standing). `readyAt` is the earliest
+    ///         § Region-stability window, ADR 011 § Standing). `readyAt` is the earliest
     ///         timestamp the filer regains permissionless standing; inside the
     ///         window the case is admissible only at multisig discretion.
     error RegionNotRipened(uint64 readyAt);
@@ -284,7 +286,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         return _isLive(region, hash);
     }
 
-    /// @notice ADR 030 § Eligibility blacklist-scope ripening predicate: is
+    /// @notice ADR 030 § Region-stability window blacklist-scope ripening predicate: is
     ///         `operator` in compliance / slash scope for the live entry at
     ///         `(region, hash)`? True iff the entry is live AND (the entry is
     ///         global, OR `region` equals the operator's current `regionHint`,
@@ -301,8 +303,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (!_isLive(region, hash)) return false;
         if (region == GLOBAL_REGION) return true;
         if (region == _toRegionKey(regionView.getNodeByAddress(operator).regionHint)) return true;
+        // Ripening leg, written as `now < effective + window` (not
+        // `now - effective < window`) so the slash-gating view can never
+        // underflow-revert — same shape as `_requireOperatorStanding`.
         // forge-lint: disable-next-line(block-timestamp)
-        return block.timestamp - _effectiveOf(operator) < regionView.regionStabilityWindow()
+        return block.timestamp < uint256(_effectiveOf(operator)) + regionView.regionStabilityWindow()
             && region == _toRegionKey(regionView.regionPrev(operator));
     }
 
@@ -345,7 +350,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
         // StandingPath is recorded; the contract verifies the declared path.
         // Path 2 (Operator) is enforced per ADR 011 § Standing + ADR 030
-        // § Eligibility below. Paths 1 (Publisher) and 3 (TokenHolder) remain
+        // § Region-stability window below. Paths 1 (Publisher) and 3 (TokenHolder) remain
         // recorded-but-not-enforced (enum-range only) per the header note —
         // the synthetic-standing clawback and PublisherRegistry checks are
         // deferred. The field is persisted so the future on-chain checks can
@@ -535,7 +540,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///      must match the filer's on-chain `regionHint` AND the region must
     ///      have ripened — `block.timestamp - effective >= regionStabilityWindow`.
     ///      Closes the reactive-flip-to-gain-standing surface (ADR 030
-    ///      § Eligibility). Global entries have no operator standing (any
+    ///      § Region-stability window). Global entries have no operator standing (any
     ///      operator would qualify); they use paths 1/3. Inside-window filings
     ///      are admissible only at multisig discretion — off-chain, not here.
     function _requireOperatorStanding(bytes32 region) internal view {
@@ -571,7 +576,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         uint256 len = b.length;
         if (len == 0) return bytes32(0);
         // solhint-disable-next-line no-inline-assembly
-        assembly {
+        assembly ("memory-safe") {
             key := mload(add(b, 32))
         }
         // `mload` reads a full word; the bytes past `len` are not guaranteed
