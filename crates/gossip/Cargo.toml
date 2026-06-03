@@ -12,6 +12,7 @@ iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
+tokio-util = { workspace = true }
 postcard = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

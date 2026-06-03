@@ -22,6 +22,7 @@ use iroh::{Endpoint, SecretKey};
 use iroh_gossip::ALPN as GOSSIP_ALPN;
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable, build_gossip};
 
@@ -972,16 +973,13 @@ pub async fn run(
     };
     let gossip_metrics: Arc<dyn GossipMetrics> =
         Arc::new(NodeGossipMetrics::new(Arc::clone(&node_metrics)));
-    // Keep the gossip JoinHandles outside the JoinSet: dropping a
-    // JoinHandle *detaches* the task in tokio (it keeps running), so if we
-    // only held wrappers inside `tasks` an `abort_all()` would cancel the
-    // wrapper but leak the inner gossip loop. Storing the handles lets us
-    // call `.abort()` on each explicitly during shutdown.
-    //
-    // TODO: GossipService should own its own shutdown (e.g. accept a
-    // CancellationToken or expose `shutdown().await`) so the runtime
-    // doesn't have to reach in with `.abort()`. Tracked for follow-up;
-    // the current parent-driven abort is the minimal wiring.
+    // GossipService owns its own shutdown via this token (#805): cancelling
+    // it makes the publisher / subscriber / TTL-sweeper loops return at a
+    // clean await boundary, so the runtime no longer reaches in with
+    // `.abort()`. The handles still live outside the `JoinSet` because we
+    // cancel the token *after* `router.shutdown()` (an `abort_all()` would
+    // cancel eagerly), then await them in the drain phase below.
+    let gossip_shutdown = CancellationToken::new();
     let decdn_gossip::GossipHandles {
         tasks: gossip_handles,
         announce_trigger,
@@ -992,6 +990,7 @@ pub async fn run(
         gossip_runtime_cfg,
         Arc::clone(&peer_table),
         gossip_metrics,
+        gossip_shutdown.clone(),
     )
     .await
     .context("gossip service failed to start")?;
@@ -1175,16 +1174,14 @@ pub async fn run(
     };
 
     // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
-    // then closes the endpoint. After this returns we can safely abort
-    // gossip's infinite loops (publisher / subscriber / TTL sweeper) so
-    // the drain phase actually finishes rather than hitting the 15s
-    // timeout every time.
+    // then closes the endpoint. After this returns we cancel gossip's
+    // shutdown token so its infinite loops (publisher / subscriber / TTL
+    // sweeper) exit cooperatively at their next await boundary, letting the
+    // drain phase finish rather than hitting the 15s timeout every time.
     if let Err(err) = router.shutdown().await {
         tracing::warn!(%err, "router shutdown reported an error");
     }
-    for handle in &gossip_handles {
-        handle.abort();
-    }
+    gossip_shutdown.cancel();
 
     // Redeem on shutdown (#327): now that the router has drained, no further
     // vouchers will arrive and the persisted channel state is final. Close
@@ -1236,16 +1233,14 @@ pub async fn run(
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "shutdown");
         }
-        // Await aborted gossip tasks so the runtime doesn't return while
-        // they're still unwinding. `abort()` then `await` resolves with
-        // `JoinError::is_cancelled()`, which is the expected path and not
-        // logged; panics in the gossip loops still surface as warnings.
+        // Await the gossip tasks so the runtime doesn't return while they're
+        // still draining. Cancelling the token (above) makes each loop return
+        // `Ok(())` cleanly; `log_join_result` reports a genuine panic at `warn`
+        // and a cancellation at `debug`, matching how every other drained task
+        // is logged. A loop that somehow never reached an await boundary would
+        // instead be bounded by the outer `SHUTDOWN_DEADLINE` timeout below.
         for handle in gossip_handles {
-            if let Err(err) = handle.await
-                && !err.is_cancelled()
-            {
-                tracing::warn!(%err, "gossip task panicked during shutdown");
-            }
+            log_join_result(handle.await, "gossip-shutdown");
         }
         // Await the RPC watchdog. We signalled it via oneshot above, so
         // a healthy run resolves cleanly here. A panic surfaces as a

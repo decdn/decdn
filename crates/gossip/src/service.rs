@@ -18,6 +18,7 @@ use iroh_gossip::proto::TopicId;
 use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::{AnnounceReject, GossipMetrics, InsertOutcome, PeerTable, validate_envelope};
 
@@ -156,8 +157,10 @@ pub fn build_gossip(endpoint: Endpoint) -> Gossip {
 /// [`GossipRuntimeConfig::region`].
 #[derive(Debug)]
 pub struct GossipHandles {
-    /// Background tasks owned by the gossip service. Caller is responsible
-    /// for awaiting / aborting these during shutdown.
+    /// Background tasks owned by the gossip service. They exit cooperatively
+    /// when the [`CancellationToken`] passed to [`GossipService::spawn`] is
+    /// cancelled; the caller cancels that token and then **awaits** these to
+    /// confirm a clean drain (rather than reaching in with `.abort()`).
     pub tasks: Vec<JoinHandle<()>>,
     /// One-shot announce trigger for the publisher. `None` iff the
     /// publisher task wasn't spawned (region-less subscribe-only mode).
@@ -187,6 +190,7 @@ impl GossipService {
         cfg: GossipRuntimeConfig,
         peer_table: Arc<RwLock<PeerTable>>,
         metrics: Arc<dyn GossipMetrics>,
+        shutdown: CancellationToken,
     ) -> Result<GossipHandles, GossipSpawnError> {
         let topics = build_topic_list(&cfg);
         if topics.is_empty() {
@@ -260,6 +264,7 @@ impl GossipService {
                 Arc::clone(&allowlist),
                 Arc::clone(&peer_table),
                 Arc::clone(&metrics),
+                shutdown.clone(),
             ));
         }
 
@@ -275,6 +280,7 @@ impl GossipService {
                 senders,
                 Arc::clone(&metrics),
                 Arc::clone(&notify),
+                shutdown.clone(),
             ));
             Some(Arc::new(AnnounceTrigger { notify }))
         } else {
@@ -287,6 +293,7 @@ impl GossipService {
         handles.push(ttl_sweeper_task(
             Arc::clone(&peer_table),
             Arc::clone(&metrics),
+            shutdown.clone(),
         ));
 
         Ok(GossipHandles {
@@ -363,6 +370,7 @@ fn subscriber_task(
     allowlist: Arc<HashSet<[u8; 32]>>,
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
+    shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     // Destructure once so the rest of the body reads as if the fields had
     // always been positional args. `sender_slot` is the publisher's view
@@ -379,8 +387,20 @@ fn subscriber_task(
         let mut backoff = RECONNECT_INITIAL_BACKOFF;
 
         loop {
-            // Consume events until the stream terminates.
-            while let Some(event) = receiver.next().await {
+            // Consume events until the stream terminates or shutdown is
+            // requested. `biased` checks cancellation first so a pending
+            // shutdown wins over a ready event and the task exits at a clean
+            // boundary instead of being aborted mid-await.
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {
+                        tracing::debug!(topic = %topic_name, "gossip subscriber stopping on shutdown");
+                        return;
+                    }
+                    ev = receiver.next() => ev,
+                };
+                let Some(event) = event else { break };
                 // Reset backoff on any successful receive — the connection is healthy.
                 backoff = RECONNECT_INITIAL_BACKOFF;
 
@@ -431,7 +451,20 @@ fn subscriber_task(
             tracing::warn!(topic = %topic_name, "gossip subscription stream ended; reconnecting");
 
             loop {
-                tokio::time::sleep(backoff).await;
+                // Cancellable backoff: without this arm a shutdown during the
+                // reconnect wait would stall up to RECONNECT_MAX_BACKOFF (1 min)
+                // before the task could exit. `biased` favours cancellation.
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {
+                        tracing::debug!(
+                            topic = %topic_name,
+                            "gossip subscriber stopping on shutdown during reconnect backoff"
+                        );
+                        return;
+                    }
+                    () = tokio::time::sleep(backoff) => {}
+                }
                 backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
 
                 match gossip.subscribe(topic_id, Vec::new()).await {
@@ -480,6 +513,7 @@ fn publisher_task(
     senders: Vec<(String, Arc<ArcSwap<GossipSender>>)>,
     metrics: Arc<dyn GossipMetrics>,
     announce_now: Arc<Notify>,
+    shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let node_id = *secret_key.public().as_bytes();
@@ -500,6 +534,11 @@ fn publisher_task(
             // which respawns the publisher and obviates the trigger
             // anyway.
             tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    tracing::debug!("gossip publisher stopping on shutdown");
+                    return;
+                }
                 _ = ticker.tick() => {}
                 () = announce_now.notified() => {}
             }
@@ -557,12 +596,20 @@ fn publisher_task(
 fn ttl_sweeper_task(
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
+    shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(30));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    tracing::debug!("gossip TTL sweeper stopping on shutdown");
+                    return;
+                }
+                _ = ticker.tick() => {}
+            }
             let mut table = peer_table.write().await;
             let evicted = table.evict_expired(now_us());
             if evicted > 0 {
@@ -858,5 +905,88 @@ mod tests {
             assert!(crate::GOSSIP_MAX_FRAME >= MIN_MAX_MESSAGE_SIZE);
             assert!(crate::GOSSIP_MAX_FRAME < 16 * 1024 * 1024);
         }
+    }
+
+    /// Spawn the gossip service for `cfg`, let the tasks reach their await
+    /// points, cancel the token, and assert every handle joins cleanly
+    /// within 2s. Returns the number of tasks spawned. Shared by the two
+    /// cooperative-shutdown (#805) cases below. Before the fix the loops
+    /// never returned, so the join would hang until the 2s timeout.
+    async fn assert_all_tasks_drain_on_cancel(cfg: GossipRuntimeConfig) -> usize {
+        use iroh::endpoint::presets;
+
+        let ep = Endpoint::builder(presets::Minimal)
+            .bind()
+            .await
+            .expect("bind minimal endpoint");
+        let gossip = build_gossip(ep.clone());
+        let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
+        let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
+        let shutdown = CancellationToken::new();
+
+        let handles = GossipService::spawn(
+            ep,
+            SecretKey::generate(),
+            gossip,
+            cfg,
+            peer_table,
+            metrics,
+            shutdown.clone(),
+        )
+        .await
+        .expect("gossip service should start")
+        .tasks;
+        let spawned = handles.len();
+
+        // Let the tasks reach their await points, then request shutdown.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+
+        for handle in handles {
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("gossip task must exit promptly after cancel, not hang")
+                .expect("gossip task must exit cleanly, not panic");
+        }
+        spawned
+    }
+
+    /// #805 — cooperative shutdown, full topology (global + region):
+    /// cancelling the [`CancellationToken`] must make every spawned task
+    /// (one subscriber per topic, the publisher, and the TTL sweeper)
+    /// return at its next await boundary, so the runtime can join the
+    /// handles on drain instead of reaching in with `.abort()`.
+    ///
+    /// Coverage note: with a peer-less Minimal endpoint the subscription
+    /// stream never terminates, so each subscriber is cancelled at its
+    /// steady-state `receiver.next()` await. The reconnect-backoff cancel
+    /// arm uses the identical `biased; cancelled => return` shape but is
+    /// not driven directly here — forcing a mid-reconnect cancel needs the
+    /// two-`Gossip` harness deferred alongside the other integration tests
+    /// (see `build_gossip_wires_gossip_max_frame`).
+    #[tokio::test]
+    async fn cancelling_token_stops_all_gossip_tasks() {
+        let spawned = assert_all_tasks_drain_on_cancel(cfg(true, Some("US"))).await;
+        assert!(
+            spawned >= 3,
+            "expected a subscriber per topic + publisher + TTL sweeper, got {spawned}"
+        );
+    }
+
+    /// #805 — cooperative shutdown of the subscribe-only topology
+    /// (`region: None` ⇒ the publisher is not spawned). This is the
+    /// default node configuration and the one the `sighup_signal`
+    /// integration tests do *not* exercise (they configure no topics, so
+    /// `spawn` short-circuits to zero handles). The task set differs from
+    /// the full case — no publisher — so this guards that cancellation
+    /// still drains every handle. Exactly two tasks: the global subscriber
+    /// and the TTL sweeper.
+    #[tokio::test]
+    async fn cancelling_token_stops_subscribe_only_gossip() {
+        let spawned = assert_all_tasks_drain_on_cancel(cfg(true, None)).await;
+        assert_eq!(
+            spawned, 2,
+            "subscribe-only mode must spawn the global subscriber + TTL sweeper only (no publisher)"
+        );
     }
 }

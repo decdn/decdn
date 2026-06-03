@@ -39,6 +39,7 @@ iroh-blobs = { workspace = true }
 iroh-gossip = { workspace = true }
 iroh-metrics = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -2673,6 +2673,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
 ]
 
@@ -2738,6 +2739,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-opentelemetry",
