@@ -1235,7 +1235,11 @@ pub async fn run(
     // cleanly; these are fired only if `drain` overruns `SHUTDOWN_DEADLINE`,
     // because dropping the timed-out `drain` future would otherwise merely
     // *detach* a wedged task (a dropped `JoinHandle` keeps running), not stop
-    // it. `tasks.abort_all()` covers the `JoinSet`; these cover the rest.
+    // it. `tasks.abort_all()` covers the `JoinSet` (reaped + logged per task
+    // below); these cover the rest as fire-and-forget aborts — we do NOT await
+    // them past the deadline, since `abort()` only lands at a poll point and a
+    // truly non-yielding loop would re-hang the shutdown the timeout escaped.
+    // The aggregate count is logged so a post-mortem knows they were hit.
     let gossip_aborts: Vec<_> = gossip_handles
         .iter()
         .map(tokio::task::JoinHandle::abort_handle)
@@ -1273,11 +1277,15 @@ pub async fn run(
     } else {
         tracing::warn!(
             deadline = ?SHUTDOWN_DEADLINE,
+            out_of_joinset_aborts = gossip_aborts.len() + usize::from(watchdog_abort.is_some()),
             "graceful shutdown timed out; aborting remaining tasks",
         );
         tasks.abort_all();
-        // The gossip loops and RPC watchdog live outside `tasks`; dropping
-        // the timed-out `drain` only detached them, so abort explicitly.
+        // The gossip loops and RPC watchdog live outside `tasks`; dropping the
+        // timed-out `drain` only detached them, so abort explicitly. Unlike the
+        // `JoinSet`, these are not reaped/awaited afterwards (see the rationale
+        // where the abort handles are collected) — the count above is their
+        // only per-shutdown record.
         for abort in &gossip_aborts {
             abort.abort();
         }
