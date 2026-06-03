@@ -1229,6 +1229,21 @@ pub async fn run(
         tracing::error!(%err, "cache shutdown failed; store state may be inconsistent");
     }
 
+    // Last-resort abort handles for the tasks that live *outside* the
+    // `JoinSet` — the gossip loops and the RPC watchdog. On the normal path
+    // the cooperative cancel (above) and the watchdog oneshot drain them
+    // cleanly; these are fired only if `drain` overruns `SHUTDOWN_DEADLINE`,
+    // because dropping the timed-out `drain` future would otherwise merely
+    // *detach* a wedged task (a dropped `JoinHandle` keeps running), not stop
+    // it. `tasks.abort_all()` covers the `JoinSet`; these cover the rest.
+    let gossip_aborts: Vec<_> = gossip_handles
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
+    let watchdog_abort = rpc_watchdog_handle
+        .as_ref()
+        .map(tokio::task::JoinHandle::abort_handle);
+
     let drain = async {
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "shutdown");
@@ -1237,8 +1252,9 @@ pub async fn run(
         // still draining. Cancelling the token (above) makes each loop return
         // `Ok(())` cleanly; `log_join_result` reports a genuine panic at `warn`
         // and a cancellation at `debug`, matching how every other drained task
-        // is logged. A loop that somehow never reached an await boundary would
-        // instead be bounded by the outer `SHUTDOWN_DEADLINE` timeout below.
+        // is logged. A loop that never reached an await boundary would keep
+        // `drain` from completing, in which case the `SHUTDOWN_DEADLINE` timeout
+        // below fires and the `else` branch force-aborts via `gossip_aborts`.
         for handle in gossip_handles {
             log_join_result(handle.await, "gossip-shutdown");
         }
@@ -1260,6 +1276,14 @@ pub async fn run(
             "graceful shutdown timed out; aborting remaining tasks",
         );
         tasks.abort_all();
+        // The gossip loops and RPC watchdog live outside `tasks`; dropping
+        // the timed-out `drain` only detached them, so abort explicitly.
+        for abort in &gossip_aborts {
+            abort.abort();
+        }
+        if let Some(abort) = &watchdog_abort {
+            abort.abort();
+        }
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "abort");
         }
