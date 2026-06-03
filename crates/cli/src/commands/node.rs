@@ -1508,12 +1508,28 @@ mod tests {
 
     #[test]
     fn write_channels_table_renders_header_and_rows() -> anyhow::Result<()> {
+        // The DTO documents `counterparty` as an EIP-55 mixed-case
+        // checksummed address (`alloy`'s `Address` Display), so the
+        // fixture must be a real checksummed string — a lowercase
+        // placeholder wouldn't exercise the mixed-case rendering the
+        // table inherits verbatim. Derive it via `alloy` so the literal
+        // is provably the canonical checksum, not a hand-typed guess.
+        let counterparty =
+            alloy::primitives::address!("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed").to_string();
+        // Sanity-guard the fixture itself: the checksum is genuinely
+        // mixed-case (some hex letters upper, some lower), so a regression
+        // that lowercased it before rendering would be caught below.
+        assert_ne!(
+            counterparty,
+            counterparty.to_lowercase(),
+            "fixture must be a mixed-case EIP-55 address: {counterparty}"
+        );
         let resp = ChannelsResponse {
             redeem_threshold_micro_usdc: 1_000_000,
             channels: vec![
                 mk_channel(
                     &format!("0x{}", "a".repeat(64)),
-                    &format!("0x{}", "b".repeat(40)),
+                    &counterparty,
                     7,
                     2_500_000,
                     10_000_000,
@@ -1544,6 +1560,19 @@ mod tests {
         assert!(s.contains("1m ago"), "last-voucher age missing: {s}");
         // Channel id preview is the short form.
         assert!(s.contains("0xaaaaaaaaaa"), "channel preview missing: {s}");
+        // Counterparty preview is the short form AND preserves the EIP-55
+        // mixed case verbatim — `short_node_id` truncates to 12 chars, so
+        // assert the row carries that checksummed prefix unchanged (a
+        // regression that lowercased the address would miss this).
+        let cp_preview = short_node_id(&counterparty);
+        assert!(
+            cp_preview.chars().any(|ch| ch.is_ascii_uppercase()),
+            "expected mixed-case counterparty preview: {cp_preview}"
+        );
+        assert!(
+            s.contains(&cp_preview),
+            "checksummed counterparty preview missing: {s}"
+        );
         // Second row: no activity → "never", not eligible → "no".
         assert!(s.contains("never"), "never sentinel missing: {s}");
         Ok(())
@@ -1556,6 +1585,72 @@ mod tests {
         assert_eq!(format_usdc(2_500_000), "2.500000");
         assert_eq!(format_usdc(1), "0.000001");
         assert_eq!(format_usdc(12_345_678), "12.345678");
+    }
+
+    /// `decdn node channels --json` serializes the `ChannelsResponse`
+    /// DTO with `serde_json::to_string_pretty` (the seam the `--json`
+    /// branch in [`channels`] uses). Assert the pretty encoding (a)
+    /// round-trips back to the same value and (b) carries every
+    /// load-bearing field with its wire key, so a rename or a
+    /// skipped-field regression on the DTO breaks here rather than only
+    /// at the shell. Mirrors `render_json_roundtrips_through_filter` for
+    /// the peers `--json` path. The counterparty is a real EIP-55
+    /// checksummed address so the JSON reflects production output.
+    #[test]
+    fn channels_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
+        let counterparty =
+            alloy::primitives::address!("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed").to_string();
+        let resp = ChannelsResponse {
+            redeem_threshold_micro_usdc: 1_000_000,
+            channels: vec![mk_channel(
+                &format!("0x{}", "a".repeat(64)),
+                &counterparty,
+                7,
+                2_500_000,
+                10_000_000,
+                Some(42),
+                true,
+            )],
+        };
+
+        // Exact seam the `--json` branch uses.
+        let pretty = serde_json::to_string_pretty(&resp)?;
+        // Pretty form is multi-line (indented) — guards against an
+        // accidental switch to the compact encoder.
+        assert!(
+            pretty.contains('\n'),
+            "pretty JSON must be multi-line: {pretty}"
+        );
+
+        // Round-trips back through the DTO with no lossy field — the
+        // generated client deserializes this exact shape. (The DTO doesn't
+        // derive `PartialEq`, so assert the reconstructed fields directly
+        // rather than comparing whole structs.)
+        let back: ChannelsResponse = serde_json::from_str(&pretty)?;
+        assert_eq!(back.redeem_threshold_micro_usdc, 1_000_000);
+        assert_eq!(back.channels.len(), 1);
+        let bc = back.channels.first().expect("one channel");
+        assert_eq!(bc.counterparty, counterparty);
+        assert_eq!(bc.last_nonce, 7);
+        assert_eq!(bc.outstanding_micro_usdc, 2_500_000);
+        assert_eq!(bc.deposit_micro_usdc, 10_000_000);
+        assert_eq!(bc.seconds_since_last_voucher, Some(42));
+        assert!(bc.settlement_eligible);
+
+        // Each wire key is present with the expected value, including the
+        // checksummed counterparty verbatim (mixed-case preserved).
+        let value: serde_json::Value = serde_json::from_str(&pretty)?;
+        assert_eq!(value["redeem_threshold_micro_usdc"], 1_000_000);
+        let chans = value["channels"].as_array().expect("channels array");
+        assert_eq!(chans.len(), 1);
+        let c0 = &chans[0];
+        assert_eq!(c0["counterparty"].as_str(), Some(counterparty.as_str()));
+        assert_eq!(c0["last_nonce"], 7);
+        assert_eq!(c0["outstanding_micro_usdc"], 2_500_000);
+        assert_eq!(c0["deposit_micro_usdc"], 10_000_000);
+        assert_eq!(c0["seconds_since_last_voucher"], 42);
+        assert_eq!(c0["settlement_eligible"], true);
+        Ok(())
     }
 
     #[test]
