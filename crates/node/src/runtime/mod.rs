@@ -373,8 +373,18 @@ pub async fn run(
     // stays bound for the buyer handle built further below.
     let channel_state_store: Arc<dyn ChannelStateStore> = concrete_channel_store.clone();
     let pending_settle_store: Arc<dyn PendingSettleStore> = concrete_channel_store.clone();
-    let watcher_checkpoint_store: Arc<dyn decdn_incentive::WatcherCheckpointStore> =
-        concrete_channel_store.clone();
+    // Debounce the scan-checkpoint write (#784): the live watcher advances the
+    // checkpoint once per distinct block carrying a provider-owned
+    // `ChannelOpened`, and the directly-durable store fsyncs on each. The
+    // persisted value is only a *floor* for the resume backfill
+    // (`resolve_backfill_start` rewinds it by the reorg margin; registration is
+    // idempotent), so coarsening the write cadence is safe — and the settlement
+    // service forces a final flush on graceful shutdown so steady-state progress
+    // is not lost. Wrapping here (the wiring layer) keeps the domain trait and the
+    // disk store free of the debounce policy.
+    let watcher_checkpoint_store: Arc<dyn decdn_incentive::WatcherCheckpointStore> = Arc::new(
+        crate::payment_settlement::DebouncedCheckpointStore::new(concrete_channel_store.clone()),
+    );
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema even before the
     // future cdn/client/v1 handler (#317) is constructed. The handler will
@@ -395,6 +405,35 @@ pub async fn run(
         channels = persisted_count,
         "channel state store ready (issue #527 replay guard active)",
     );
+
+    // Open the append-only download-receipt audit log (issue #248). Unlike the
+    // channel store, a failure here is NON-fatal: the receipt log is an audit
+    // artifact (revenue reconciliation, dispute evidence), not the replay
+    // guard, so the node still serves paid delivery — falling back to a
+    // discard-only log — rather than refusing to start. The open does a small
+    // amount of disk I/O (create + chmod), so run it on the blocking pool.
+    let receipt_log_data_dir = cfg.identity.data_dir.clone();
+    let receipt_log: Arc<dyn crate::receipt_log::ReceiptLog> =
+        match tokio::task::spawn_blocking(move || {
+            crate::receipt_log::JsonlReceiptLog::open(&receipt_log_data_dir)
+        })
+        .await
+        .context("download-receipt log open task panicked")?
+        {
+            Ok(log) => {
+                tracing::info!(path = %log.path().display(), "download-receipt log ready");
+                Arc::new(log)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    event = "download_receipt_log_open_failed",
+                    "failed to open download-receipt log; continuing without the audit log \
+                     (paid delivery is unaffected; revenue reconciliation will be incomplete)",
+                );
+                Arc::new(crate::receipt_log::NoopReceiptLog)
+            }
+        };
 
     let cache = build_cache(&cfg, Arc::clone(&node_metrics)).await?;
     // Attach the cache to the reload state so SIGHUP handlers can swap
@@ -488,11 +527,15 @@ pub async fn run(
             })?;
     let chain_provider = ProviderBuilder::new().connect_http(rpc_url.clone());
     let staker_set: Arc<dyn StakerSet> = Arc::new(
-        ChainStakerSet::bootstrap(chain_provider, capacity_bond_addr)
-            .await
-            .with_context(|| {
-                format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
-            })?,
+        ChainStakerSet::bootstrap(
+            chain_provider,
+            capacity_bond_addr,
+            Arc::clone(&node_metrics),
+        )
+        .await
+        .with_context(|| {
+            format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
+        })?,
     );
 
     // Stake-lane probe-acceptance reservation (#757, ADR 003 §Admission and
@@ -615,6 +658,7 @@ pub async fn run(
         voucher_domain,
         bind_domain,
         Arc::clone(&channel_state_store),
+        Arc::clone(&receipt_log),
         reload_state.rate_per_mb(),
         cfg.payment.delivery_floor,
         cfg.payment.delivery_ceiling,

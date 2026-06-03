@@ -59,6 +59,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
+use crate::receipt_log::{DownloadReceipt, ReceiptLog};
 
 /// Default per-connection concurrent-stream cap for `cdn/client/v1` (ADR 005
 /// §Concurrent stream limits). The QUIC transport config also caps bidi
@@ -101,6 +102,10 @@ pub struct ClientHandler {
     /// `CapacityBond` EIP-712 domain for ephemeral `BindNodeId` verification.
     bind_domain: Eip712Domain,
     channel_state_store: Arc<dyn ChannelStateStore>,
+    /// Append-only audit log of served-and-paid blobs (issue #248). Written at
+    /// each voucher acceptance; a write failure is non-fatal (the payment
+    /// already committed to the fsynced channel store).
+    receipt_log: Arc<dyn ReceiptLog>,
     /// Per-channel state, hydrated from the store at construction. Outer mutex
     /// guards the map; each inner mutex serializes voucher application for one
     /// channel across its concurrent streams (ADR 003 §concurrent streams).
@@ -150,6 +155,7 @@ impl ClientHandler {
         voucher_domain: Eip712Domain,
         bind_domain: Eip712Domain,
         channel_state_store: Arc<dyn ChannelStateStore>,
+        receipt_log: Arc<dyn ReceiptLog>,
         rate_per_mb: Arc<AtomicU64>,
         delivery_floor: u64,
         delivery_ceiling: u64,
@@ -178,6 +184,7 @@ impl ClientHandler {
             voucher_domain,
             bind_domain,
             channel_state_store,
+            receipt_log,
             channels: Arc::new(Mutex::new(map)),
             redeem_hint: OnceLock::new(),
             rate_per_mb,
@@ -524,6 +531,7 @@ impl ClientHandler {
             req.byte_offset,
             channel_id,
             channel.as_ref(),
+            client_node_id,
             rate_per_mb,
             interval_mb,
         )
@@ -543,6 +551,7 @@ impl ClientHandler {
         byte_offset: u64,
         channel_id: ChannelId,
         channel: Option<&Arc<Mutex<ChannelDeliveryState>>>,
+        client_node_id: B256,
         rate_per_mb: u64,
         interval_mb: u64,
     ) -> anyhow::Result<()> {
@@ -570,7 +579,16 @@ impl ClientHandler {
             unvouchered = unvouchered.saturating_add(chunk.len() as u64);
             if unvouchered >= interval_bytes {
                 match self
-                    .collect_voucher(send, recv, channel_id, channel, rate_per_mb, unvouchered)
+                    .collect_voucher(
+                        send,
+                        recv,
+                        hash,
+                        channel_id,
+                        channel,
+                        client_node_id,
+                        rate_per_mb,
+                        unvouchered,
+                    )
                     .await?
                 {
                     VoucherOutcome::Accepted => unvouchered = 0,
@@ -581,8 +599,17 @@ impl ClientHandler {
         // Closing voucher for the final partial batch.
         if unvouchered > 0
             && matches!(
-                self.collect_voucher(send, recv, channel_id, channel, rate_per_mb, unvouchered)
-                    .await?,
+                self.collect_voucher(
+                    send,
+                    recv,
+                    hash,
+                    channel_id,
+                    channel,
+                    client_node_id,
+                    rate_per_mb,
+                    unvouchered,
+                )
+                .await?,
                 VoucherOutcome::Rejected
             )
         {
@@ -606,8 +633,10 @@ impl ClientHandler {
         &self,
         send: &mut SendStream,
         recv: &mut RecvStream,
+        hash: Hash,
         channel_id: ChannelId,
         channel: Option<&Arc<Mutex<ChannelDeliveryState>>>,
+        client_node_id: B256,
         rate_per_mb: u64,
         delta_bytes: u64,
     ) -> anyhow::Result<VoucherOutcome> {
@@ -691,6 +720,9 @@ impl ClientHandler {
                 guard.state = candidate;
                 guard.bytes_delivered_cumulative = new_bytes;
                 drop(guard);
+                // Audit receipt for this served-and-paid interval (issue #248).
+                self.record_receipt(hash, delta_bytes, client_node_id, wire.nonce)
+                    .await;
                 // Nonce-gap signal (#747): the voucher was accepted, but its
                 // nonce skipped values past the prior `last_nonce + 1`. The
                 // structured `tracing::warn!` already fired inside
@@ -734,6 +766,57 @@ impl ClientHandler {
                     Ok(VoucherOutcome::Rejected)
                 }
             }
+        }
+    }
+
+    /// Append one durable audit receipt for a served-and-paid voucher interval
+    /// (issue #248). Called only after `apply_voucher` committed the payment to
+    /// the fsynced channel store, so a receipt-log write failure is non-fatal —
+    /// logged and swallowed rather than failing the stream or double-charging
+    /// the client. The `voucher_nonce` is rendered as a decimal `uint256` from
+    /// the big-endian wire nonce; `client_node_id` is the iroh node id of the
+    /// paying peer; `delta_bytes` is the bytes this voucher covers.
+    ///
+    /// The append is `write_all` + `flush` with **no fsync** (see the
+    /// [`crate::receipt_log`] durability note) under a sync `Mutex`, bounded to
+    /// roughly one call per voucher interval (~1 MiB). The blocking write is
+    /// offloaded to [`tokio::task::spawn_blocking`] and **awaited** so it never
+    /// runs on a runtime worker thread: awaiting (not fire-and-forget) preserves
+    /// receipt ordering relative to voucher acceptance and keeps the audit tail
+    /// from being dropped on runtime shutdown. The owned [`DownloadReceipt`] and
+    /// a clone of the `Arc<dyn ReceiptLog>` are moved into the closure, so the
+    /// borrow of `self` ends before the hop. Recording therefore stays ordered
+    /// with — and completes before — the `VoucherAck` (CLAUDE.md / ADR 003).
+    async fn record_receipt(
+        &self,
+        hash: Hash,
+        delta_bytes: u64,
+        client_node_id: B256,
+        wire_nonce: [u8; 32],
+    ) {
+        let voucher_nonce = U256::from_be_bytes(wire_nonce);
+        let receipt = DownloadReceipt::new(
+            &hash,
+            delta_bytes,
+            &client_node_id.0,
+            voucher_nonce,
+            crate::payment_settlement::unix_now(),
+        );
+        let receipt_log = Arc::clone(&self.receipt_log);
+        let append_res = tokio::task::spawn_blocking(move || receipt_log.append(&receipt)).await;
+        let write_res = match append_res {
+            Ok(res) => res,
+            Err(join_err) => Err(std::io::Error::other(join_err)),
+        };
+        if let Err(e) = write_res {
+            tracing::warn!(
+                %hash,
+                %client_node_id,
+                %voucher_nonce,
+                error = %e,
+                event = "download_receipt_write_failed",
+                "failed to append download receipt; payment already committed (audit log only)"
+            );
         }
     }
 

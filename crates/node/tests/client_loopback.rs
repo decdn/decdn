@@ -42,14 +42,26 @@ use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_fr
 use iroh::{Endpoint, EndpointAddr};
 
 mod support;
+use decdn_node::receipt_log::DownloadReceipt;
 use support::{
-    HandlerDomains, build_handler_full, cache_with_blob, empty_cache, fresh_key, local_endpoint,
+    FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
+    build_handler_full_with_receipts, cache_with_blob, empty_cache, fresh_key, local_endpoint,
     permissive_limiter, spawn_server,
 };
 
 const CHAIN_ID: u64 = 421_614;
 const TOKEN: Address = Address::repeat_byte(0x22);
 const RATE_PER_MB: u64 = 10;
+
+/// Lower-hex encode bytes (no `0x`), matching `DownloadReceipt`'s rendering so a
+/// test can reconstruct the expected `hash` / `client_node_id` strings.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
 
 fn slash_domain() -> Eip712Domain {
     slash_judge_domain(CHAIN_ID, Address::repeat_byte(0x11))
@@ -209,6 +221,199 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
         only.last_bytes_delivered()
     );
     anyhow::ensure!(only.last_amount() > U256::ZERO, "amount must be non-zero");
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// Issue #248: every accepted voucher appends one download receipt with the
+/// served blob's hash, the per-interval byte count, the paying client's iroh
+/// node id, and the voucher nonce. A 1.5 MiB blob crosses one interval boundary
+/// plus a closing voucher, so exactly two receipts are recorded (nonces 1, 2),
+/// their `size`s sum to the payload length, and every receipt names the same
+/// hash and client node id.
+#[tokio::test(flavor = "multi_thread")]
+async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 1_572_864]; // 1.5 MiB — two vouchers at 1 MiB interval.
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let receipts = Arc::new(VecReceiptLog::default());
+    let handler = build_handler_full_with_receipts(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        Arc::clone(&receipts) as Arc<dyn decdn_node::receipt_log::ReceiptLog>,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = client_sk.public();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(Arc::clone(&client_signer), deposit);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+
+    let recorded = receipts.snapshot();
+    anyhow::ensure!(
+        recorded.len() == 2,
+        "expected 2 receipts (interval + closing voucher), got {}: {recorded:?}",
+        recorded.len()
+    );
+
+    let want_hash = hex_lower(hash.as_bytes());
+    let want_node = hex_lower(client_node_id.as_bytes());
+    let total: u64 = recorded.iter().map(DownloadReceipt::size).sum();
+    anyhow::ensure!(
+        total == payload.len() as u64,
+        "receipt sizes sum to {total}, expected {}",
+        payload.len()
+    );
+    for (i, r) in recorded.iter().enumerate() {
+        anyhow::ensure!(
+            r.hash() == want_hash,
+            "receipt[{i}] hash {} != {want_hash}",
+            r.hash()
+        );
+        anyhow::ensure!(
+            r.client_node_id() == want_node,
+            "receipt[{i}] client_node_id {} != {want_node}",
+            r.client_node_id()
+        );
+        anyhow::ensure!(r.size() > 0, "receipt[{i}] size must be > 0");
+        anyhow::ensure!(r.timestamp_secs() > 0, "receipt[{i}] timestamp must be set");
+    }
+    let nonces: Vec<&str> = recorded
+        .iter()
+        .map(DownloadReceipt::voucher_nonce)
+        .collect();
+    anyhow::ensure!(
+        nonces == vec!["1", "2"],
+        "voucher nonces {nonces:?} != [1, 2]"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// Issue #248: a download-receipt write failure is non-fatal. The payment
+/// already committed to the channel store, so even with a receipt log that
+/// errors on every append, the full blob is delivered and hash-verifies and the
+/// channel state still advances. A receipt-log failure must never fail delivery
+/// or block payment.
+#[tokio::test(flavor = "multi_thread")]
+async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()> {
+    let payload = vec![0x7Eu8; 1_572_864]; // 1.5 MiB — exercises two voucher appends.
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler_full_with_receipts(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        Arc::new(FailingReceiptLog) as Arc<dyn decdn_node::receipt_log::ReceiptLog>,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(Arc::clone(&client_signer), deposit);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivery must succeed despite receipt-log failure"
+    );
+
+    // Payment still committed: the channel advanced to the full byte count.
+    let persisted = store.load_all()?;
+    let only = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
+    anyhow::ensure!(
+        only.last_bytes_delivered() == U256::from(payload.len()),
+        "channel state must still advance: bytes_delivered={}",
+        only.last_bytes_delivered()
+    );
 
     client_ep.close().await;
     server_ep.close().await;
