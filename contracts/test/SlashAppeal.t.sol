@@ -47,8 +47,7 @@ contract SlashAppealTest is Test {
             unbondingPeriod_: 7 days,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: 7 days,
-            genesisCreditWindow_: 30 days
+            regionStabilityWindow_: 7 days
         });
 
         appeal = new SlashAppeal({
@@ -361,44 +360,6 @@ contract SlashAppealTest is Test {
         vm.prank(admin);
         appeal.grantAppeal(s2);
         assertEq(bond.slashedAtEpoch(operator), stamp1);
-    }
-
-    // -----------------------------------------------------------------
-    // ADR 028 §7 — granted appeal restores credit vesting, not liquid TOKEN
-    // -----------------------------------------------------------------
-
-    function test_grant_restoresCreditVestingNotLiquid() public {
-        // Genesis-credit window closes 30 days after deploy; setUp warped to
-        // 100 days, so step back inside the window before granting.
-        vm.warp(10 days);
-        uint256 grantAmount = 100_000e18;
-        vm.startPrank(admin);
-        token.approve(address(bond), grantAmount);
-        bond.grantRole(bond.GENESIS_GRANTOR_ROLE(), admin);
-        bond.grantGenesisCredit(operator, grantAmount);
-        vm.stopPrank();
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        // Tier-1: 5% of 50k bond (2.5k) + 5% of 100k credit (5k) = 7.5k.
-        vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
-        assertEq(totalSlash, 7500e18);
-        assertEq(bond.pendingCredit(operator).originalGrant, 95_000e18);
-
-        _open(slashId);
-        vm.prank(multisig);
-        appeal.fastTrackAppeal(slashId);
-
-        uint256 opBefore = token.balanceOf(operator);
-        vm.prank(admin);
-        appeal.grantAppeal(slashId);
-
-        // Liquid refund = bond portion (2.5k) + appeal bond (1k); credit portion (5k)
-        // is restored to the vesting position, not paid out.
-        assertEq(token.balanceOf(operator) - opBefore, 2500e18 + APPEAL_BOND);
-        assertEq(bond.pendingCredit(operator).originalGrant, 100_000e18);
-        assertEq(bond.escrowedTotal(), 0);
     }
 
     // -----------------------------------------------------------------

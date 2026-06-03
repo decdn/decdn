@@ -76,8 +76,7 @@ contract CapacityBondRegionE2ETest is Test {
             unbondingPeriod_: UNBONDING,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: REGION_WINDOW,
-            genesisCreditWindow_: 30 days
+            regionStabilityWindow_: REGION_WINDOW
         });
 
         vm.prank(admin);

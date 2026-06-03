@@ -119,7 +119,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
-            genesisCreditWindow: 30 days,
             feeRouterEpochLength: EPOCH,
             feeRouterWindowEpochs: WINDOW_EPOCHS,
             // Steady-state shares (60/30/10 from ADR 026 § FeeRouter split) so
@@ -469,16 +468,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         );
     }
 
-    function test_lifecycle_CapacityBond_setTreasury_happy() public {
-        // CapacityBond.setTreasury allows address(0); pick a non-zero value.
-        address newTreasury = address(0xD9);
-        _runLifecycle(address(bond), abi.encodeCall(CapacityBond.setTreasury, (newTreasury)));
-        assertEq(bond.treasury(), newTreasury);
-    }
-
-    // No `_outOfBounds` test for `setTreasury` — the contract intentionally
-    // accepts `address(0)` as a "burn unvested credit on forfeit" sentinel.
-
     function test_lifecycle_CapacityBond_setMultiaddrUpdateCooldown_happy() public {
         _runLifecycle(address(bond), abi.encodeCall(CapacityBond.setMultiaddrUpdateCooldown, (1 hours)));
         assertEq(bond.multiaddrUpdateCooldown(), 1 hours);
@@ -517,19 +506,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             abi.encodeWithSelector(
                 CapacityBond.ParamOutOfBounds.selector, uint256(31 days), uint256(3 days), uint256(30 days)
             )
-        );
-    }
-
-    function test_lifecycle_CapacityBond_setClaimSlashGateEpochs_happy() public {
-        _runLifecycle(address(bond), abi.encodeCall(CapacityBond.setClaimSlashGateEpochs, (uint64(20))));
-        assertEq(bond.claimSlashGateEpochs(), 20);
-    }
-
-    function test_lifecycle_CapacityBond_setClaimSlashGateEpochs_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(bond),
-            abi.encodeCall(CapacityBond.setClaimSlashGateEpochs, (uint64(27))),
-            abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, uint256(27), uint256(4), uint256(26))
         );
     }
 

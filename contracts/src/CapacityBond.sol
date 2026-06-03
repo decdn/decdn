@@ -25,9 +25,7 @@ import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
 ///         distributed 50% challenger / 50% burn or refunded to the operator
 ///         on a successful appeal), is the canonical settlement reporter sink
 ///         for `FeeRouter`, is the registry for iroh-NodeId ↔ Ethereum-address
-///         bindings, holds the 50M TOKEN Genesis Bond Credit allocation in
-///         per-operator `PendingCredit` positions (ADR 026 § Genesis Bond
-///         Credits), and is the source of `firstBondedAt` / `slashedAtEpoch`
+///         bindings, and is the source of `firstBondedAt` / `slashedAtEpoch`
 ///         for `DecdnGovernor`'s served-bytes voting weight per ADR 036.
 /// @dev    Renamed from `StakingRegistry` per ADR 026 v2.2 vocabulary. The
 ///         bond / unbond / node-registry primitives are unchanged from the
@@ -52,12 +50,6 @@ import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
 ///                                    `declareMbps` / `requestUnbond` /
 ///                                    `registerNode`, with `k`/`α`
 ///                                    governance-tunable via `setK` / `setAlpha`
-///           - `pendingCredit[op]`  — Genesis Bond Credit accounting
-///                                    (ADR 026 § Genesis Bond Credits)
-///         Slash math also applies to the unvested portion of
-///         `pendingCredit[op]`: that portion is added to `slashAmount` and
-///         escrowed under the same terms as voluntary bond (ADR 026
-///         § Genesis Bond Credits — "same terms as voluntary bond").
 contract CapacityBond is
     ICapacityBond,
     ICapacityBondSlashEscrow,
@@ -79,11 +71,6 @@ contract CapacityBond is
     bytes32 public constant BLACKLIST_ROLE = keccak256("BLACKLIST_ROLE");
     bytes32 public constant SETTLEMENT_REPORTER_ROLE = keccak256("SETTLEMENT_REPORTER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
-
-    /// @notice Authority to grant a one-shot `PendingCredit` at TGE. Granted to
-    ///         the Treasury within `GENESIS_CREDIT_WINDOW` (ADR 016 § Post-
-    ///         Deployment Initialization, step 7).
-    bytes32 public constant GENESIS_GRANTOR_ROLE = keccak256("GENESIS_GRANTOR_ROLE");
 
     /// @notice Authority to drive the escrow-on-slash appeal hooks
     ///         (`markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted`).
@@ -168,14 +155,6 @@ contract CapacityBond is
     uint256 internal constant REGION_STABILITY_WINDOW_FLOOR = 3 days;
     uint256 internal constant REGION_STABILITY_WINDOW_CEILING = 30 days;
 
-    /// @notice Bounds on the Genesis Bond Credit grant window (ADR 026
-    ///         § Genesis Bond Credits — TGE one-shot, default 30 days).
-    uint256 internal constant GENESIS_CREDIT_WINDOW_FLOOR = 7 days;
-    uint256 internal constant GENESIS_CREDIT_WINDOW_CEILING = 90 days;
-
-    /// @notice Linear vest duration for Genesis Bond Credits (24 months).
-    uint256 internal constant GENESIS_VEST_DURATION = 730 days;
-
     /// @notice Canonical epoch length shared with `FeeRouter` (ADR 026 §
     ///         FeeRouter split, ADR 036 § Formula). Stored as a constant
     ///         on this contract so `slashedAtEpoch` derives the same epoch
@@ -194,13 +173,6 @@ contract CapacityBond is
         return EPOCH_LENGTH;
     }
 
-    /// @notice Bounds for `claimSlashGateEpochs` — match `FeeRouter`'s
-    ///         `[WINDOW_EPOCHS_FLOOR, WINDOW_EPOCHS_CEILING]` so governance
-    ///         can keep the two in lock-step in a single multi-call without
-    ///         this contract taking a cross-contract dependency on FeeRouter.
-    uint64 internal constant CLAIM_SLASH_GATE_FLOOR = 4;
-    uint64 internal constant CLAIM_SLASH_GATE_CEILING = 26;
-
     // -----------------------------------------------------------------
     // EIP-712 typehashes
     // -----------------------------------------------------------------
@@ -215,12 +187,6 @@ contract CapacityBond is
     ERC20Burnable public immutable token;
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IEd25519Verifier public immutable ed25519Verifier;
-
-    /// @notice End of the Genesis Bond Credit grant window
-    ///         (constructor-set as `block.timestamp + genesisCreditWindow`).
-    /// @dev    After this timestamp `grantGenesisCredit` permanently reverts.
-    // forge-lint: disable-next-line(screaming-snake-case-immutable)
-    uint64 public immutable genesisCreditWindowEnd;
 
     // -----------------------------------------------------------------
     // Storage — bonding
@@ -277,12 +243,6 @@ contract CapacityBond is
     uint256 public kConstant;
     uint256 public alphaWad;
 
-    /// @notice Treasury destination for unvested Genesis Bond Credit forfeited
-    ///         by an operator who initiates `requestUnbond` before 24mo of
-    ///         vesting (ADR 026 § Genesis Bond Credits — exit clause). If zero
-    ///         at unbond time, forfeited credit is burned as a safe fallback.
-    address public treasury;
-
     // -----------------------------------------------------------------
     // Storage — region attestation (ADR 030)
     // -----------------------------------------------------------------
@@ -307,36 +267,6 @@ contract CapacityBond is
     /// @notice Cooldown enforced between `updateRegion` calls per ADR 030
     ///         (default 7 days; governable [3d, 30d]).
     uint256 public regionStabilityWindow;
-
-    /// @notice Number of epochs after a slash during which
-    ///         `claimVestedCredit` is blocked. Default 13 (≈ one quarter),
-    ///         matching the `FeeRouter.windowEpochs` default. Governance
-    ///         SHOULD keep this in lock-step with `FeeRouter.windowEpochs`
-    ///         in the same multi-call so the claim gate doesn't drift from
-    ///         the slash zero-out window used by `DecdnGovernor`. Bounded
-    ///         [4, 26] to match FeeRouter.
-    uint64 public claimSlashGateEpochs;
-
-    // -----------------------------------------------------------------
-    // Storage — Genesis Bond Credits (ADR 026 § Genesis Bond Credits)
-    // -----------------------------------------------------------------
-
-    /// @notice Per-operator pending credit. `originalGrant` is set once at TGE
-    ///         by Treasury via `grantGenesisCredit` and decreases ONLY when the
-    ///         unvested portion is slashed or forfeited on unbond. `claimed`
-    ///         is the monotone cumulative amount the operator has pulled into
-    ///         `activeBond` via `claimVestedCredit`. The linear vest curve
-    ///         is computed on demand from `originalGrant × elapsed / 24mo`,
-    ///         not stored — decoupling principal from the running balance
-    ///         eliminates the mid-vest claim-acceleration bug that arises
-    ///         when the curve is recomputed against a reduced principal.
-    struct PendingCredit {
-        uint128 originalGrant;
-        uint128 claimed;
-        uint64 grantedAt;
-    }
-
-    mapping(address operator => PendingCredit) internal _pendingCredit;
 
     // -----------------------------------------------------------------
     // Storage — slash records (ADR 028 § Contract surface)
@@ -372,8 +302,8 @@ contract CapacityBond is
 
     /// @notice Sum of all TOKEN currently held in slash escrow (status
     ///         `Escrowed` or `AppealOpen`). Invariant anchor: the contract's
-    ///         TOKEN balance must cover `escrowedTotal` plus active bond,
-    ///         unbonding bond, and unclaimed Genesis credit. Incremented in
+    ///         TOKEN balance must cover `escrowedTotal` plus active bond and
+    ///         unbonding bond. Incremented in
     ///         `slash()`, decremented at every terminal escrow transition.
     uint256 public escrowedTotal;
 
@@ -446,7 +376,6 @@ contract CapacityBond is
     event MultiaddrUpdateCooldownUpdated(uint256 oldValue, uint256 newValue);
     event MaxMultiaddrSizeUpdated(uint256 oldValue, uint256 newValue);
     event RegionStabilityWindowUpdated(uint256 oldValue, uint256 newValue);
-    event ClaimSlashGateEpochsUpdated(uint64 oldValue, uint64 newValue);
     event MinCapacityMbpsUpdated(uint256 oldValue, uint256 newValue);
     event MaxCapacityMbpsUpdated(uint256 oldValue, uint256 newValue);
 
@@ -471,12 +400,6 @@ contract CapacityBond is
     // unslashed sentinel (the watermark recomputed to "no standing slash").
     event SlashedAtEpochStamped(address indexed operator, uint64 epoch);
 
-    // ADR 026 — Genesis Bond Credits.
-    event GenesisCreditGranted(address indexed operator, uint256 amount);
-    event GenesisCreditClaimed(address indexed operator, uint256 amount);
-    event GenesisCreditSlashed(address indexed operator, uint256 amount);
-    event GenesisCreditForfeited(address indexed operator, uint256 amount, address indexed recipient);
-
     // ADR 026 — declared capacity.
     event MbpsDeclared(address indexed operator, uint256 oldMbps, uint256 newMbps);
 
@@ -486,9 +409,6 @@ contract CapacityBond is
     event SlashAppealOpened(uint256 indexed slashId, address indexed operator);
     event SlashUpheld(uint256 indexed slashId, bool viaAppeal, uint256 challengerShare, uint256 burnShare);
     event SlashReversed(uint256 indexed slashId, address indexed operator, uint256 refund);
-
-    // Treasury wiring (C3).
-    event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
 
     // -----------------------------------------------------------------
     // Errors
@@ -520,13 +440,6 @@ contract CapacityBond is
     // ADR 030
     error RegionCooldownActive(uint64 readyAt);
 
-    // ADR 026 — Genesis Bond Credits
-    error GenesisCreditWindowClosed(uint64 windowEnd);
-    error GenesisCreditAlreadyGranted(address operator);
-    error NothingVested();
-    error NotActiveForClaim(address operator);
-    error SlashedInWindowForClaim(address operator);
-
     // ADR 028 — slash record lookup + escrow lifecycle
     error UnknownSlash(uint256 slashId);
     error SlashNotEscrowed(uint256 slashId);
@@ -547,8 +460,6 @@ contract CapacityBond is
     /// @param maxMultiaddrSize_         Initial multiaddrs byte-length cap.
     /// @param regionStabilityWindow_    Initial region-update cooldown (default
     ///                                  7 days; bounded `[3d, 30d]`).
-    /// @param genesisCreditWindow_      Duration of the TGE grant window
-    ///                                  (default 30 days; bounded `[7d, 90d]`).
     constructor(
         ERC20Burnable token_,
         IEd25519Verifier ed25519Verifier_,
@@ -557,8 +468,7 @@ contract CapacityBond is
         uint256 unbondingPeriod_,
         uint256 multiaddrUpdateCooldown_,
         uint256 maxMultiaddrSize_,
-        uint256 regionStabilityWindow_,
-        uint256 genesisCreditWindow_
+        uint256 regionStabilityWindow_
     ) EIP712("CapacityBond", "1") {
         if (address(token_) == address(0) || address(ed25519Verifier_) == address(0) || admin == address(0)) {
             revert ZeroAddress();
@@ -568,12 +478,6 @@ contract CapacityBond is
         _enforceMultiaddrCooldownBounds(multiaddrUpdateCooldown_);
         _enforceMaxMultiaddrSizeBounds(maxMultiaddrSize_);
         _enforceRegionStabilityWindowBounds(regionStabilityWindow_);
-        if (genesisCreditWindow_ < GENESIS_CREDIT_WINDOW_FLOOR || genesisCreditWindow_ > GENESIS_CREDIT_WINDOW_CEILING)
-        {
-            revert ParamOutOfBounds({
-                value: genesisCreditWindow_, floor: GENESIS_CREDIT_WINDOW_FLOOR, ceiling: GENESIS_CREDIT_WINDOW_CEILING
-            });
-        }
 
         token = token_;
         ed25519Verifier = ed25519Verifier_;
@@ -582,11 +486,6 @@ contract CapacityBond is
         multiaddrUpdateCooldown = multiaddrUpdateCooldown_;
         maxMultiaddrSize = maxMultiaddrSize_;
         regionStabilityWindow = regionStabilityWindow_;
-        genesisCreditWindowEnd = uint64(block.timestamp + genesisCreditWindow_);
-        // Default the claim slash gate to 13 epochs (matches FeeRouter's
-        // initial `windowEpochs` default). Governance can retune via
-        // `setClaimSlashGateEpochs` in lock-step with FeeRouter changes.
-        claimSlashGateEpochs = 13;
 
         // Declared-capacity band defaults (ADR 026 § Capacity-bond curve):
         // 10 Mbps floor (bars sub-floor dust declarations), 200 Gbps ceiling.
@@ -636,11 +535,6 @@ contract CapacityBond is
         }
         if (unbondingOf[msg.sender].amount != 0) revert UnbondingInProgress();
 
-        // CEI: finalize bond state BEFORE the external token operations in
-        // `_forfeitUnvestedCredit` (token.burn / safeTransfer). The token is
-        // the protocol's own ERC20Burnable so reentrancy isn't real, but
-        // ordering this way satisfies slither's reentrancy-no-eth detector
-        // and keeps the contract robust against a future TOKEN swap.
         activeBond[msg.sender] -= amount;
 
         // ADR 026 § Capacity-bond curve: the remaining active bond must still
@@ -655,44 +549,7 @@ contract CapacityBond is
         uint256 unlockAt = block.timestamp + unbondingPeriod;
         unbondingOf[msg.sender] = UnbondingRequest({ amount: amount, unlockAt: unlockAt });
 
-        // ADR 026 § Genesis Bond Credits — exit clause: initiating unbonding
-        // forfeits any unvested credit to Treasury (burn if no Treasury wired).
-        _forfeitUnvestedCredit(msg.sender);
-
         emit UnbondingRequested(msg.sender, amount, unlockAt, activeBond[msg.sender]);
-    }
-
-    /// @dev Transfers the unvested portion of `operator`'s Genesis Bond Credit
-    ///      to `treasury` (or burns if treasury is zero). Reduces `originalGrant`
-    ///      to the already-vested amount AND stamps `grantedAt` with the
-    ///      `FULLY_VESTED_SENTINEL` so the truncated grant is immediately
-    ///      fully vested for future `claimVestedCredit` calls. Without the
-    ///      sentinel, the curve would re-stretch the new (smaller) principal
-    ///      over the original timeline and silently claw back already-vested-
-    ///      but-unclaimed credit on subsequent claims (operator had vested
-    ///      500, claimed 400, would have been owed 100 more, but the
-    ///      un-stamped curve at the forfeit instant returned 250 →
-    ///      `claimable = 0`).
-    function _forfeitUnvestedCredit(address operator) internal {
-        PendingCredit storage pc = _pendingCredit[operator];
-        if (pc.originalGrant == 0) return;
-        uint256 vested = _curveVested(operator);
-        uint256 unvested = uint256(pc.originalGrant) - vested;
-        // `unvested` is a derived amount, not a token-balance read; zero is
-        // the well-defined "fully vested" sentinel.
-        // slither-disable-next-line incorrect-equality
-        if (unvested == 0) return;
-        pc.originalGrant = uint128(vested);
-        pc.grantedAt = FULLY_VESTED_SENTINEL;
-
-        address sink = treasury;
-        if (sink == address(0)) {
-            token.burn(unvested);
-            emit GenesisCreditForfeited(operator, unvested, address(0));
-        } else {
-            IERC20(address(token)).safeTransfer(sink, unvested);
-            emit GenesisCreditForfeited(operator, unvested, sink);
-        }
     }
 
     function unbond() external nonReentrant whenNotPaused {
@@ -770,130 +627,6 @@ contract CapacityBond is
         regionLastChanged[msg.sender] = uint64(block.timestamp);
 
         emit RegionUpdated(info.nodeId, oldRegion, newRegion);
-    }
-
-    // -----------------------------------------------------------------
-    // Genesis Bond Credits (ADR 026 § Genesis Bond Credits)
-    // -----------------------------------------------------------------
-
-    function pendingCredit(address operator) external view returns (PendingCredit memory) {
-        return _pendingCredit[operator];
-    }
-
-    /// @notice Linear vest curve value at `block.timestamp` for `operator` —
-    ///         `originalGrant × min(elapsed, DURATION) / DURATION`. Decoupled
-    ///         from `claimed` so partial claims do not skew the curve.
-    function curveVested(address operator) external view returns (uint256) {
-        return _curveVested(operator);
-    }
-
-    /// @notice Amount currently available to `claimVestedCredit`. Bounded
-    ///         below by 0 so a post-slash decrease in `originalGrant` cannot
-    ///         produce a negative claimable.
-    function claimableCredit(address operator) public view returns (uint256) {
-        uint256 vested = _curveVested(operator);
-        uint256 claimed = _pendingCredit[operator].claimed;
-        if (vested <= claimed) return 0;
-        return vested - claimed;
-    }
-
-    /// @notice One-shot TGE grant. Treasury must `approve(this, amount)` first;
-    ///         TOKEN is pulled into the contract and held against the operator's
-    ///         vesting schedule.
-    function grantGenesisCredit(address operator, uint256 amount)
-        external
-        nonReentrant
-        whenNotPaused
-        onlyRole(GENESIS_GRANTOR_ROLE)
-    {
-        if (operator == address(0)) revert ZeroAddress();
-        if (amount == 0) revert ZeroAmount();
-        // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp > genesisCreditWindowEnd) revert GenesisCreditWindowClosed(genesisCreditWindowEnd);
-        if (_pendingCredit[operator].originalGrant != 0) revert GenesisCreditAlreadyGranted(operator);
-        if (amount > type(uint128).max) {
-            revert ParamOutOfBounds({ value: amount, floor: 1, ceiling: type(uint128).max });
-        }
-
-        IERC20(address(token)).safeTransferFrom(msg.sender, address(this), amount);
-        _pendingCredit[operator] =
-            PendingCredit({ originalGrant: uint128(amount), claimed: 0, grantedAt: uint64(block.timestamp) });
-
-        emit GenesisCreditGranted(operator, amount);
-    }
-
-    /// @notice Move the currently-claimable portion (curve - alreadyClaimed)
-    ///         from `pendingCredit` into the caller's `activeBond`. Gated on
-    ///         `activeBond > 0 && !ejected` plus an unexpired slash-zero-out
-    ///         window: while `currentEpoch < slashedAtEpoch +
-    ///         claimSlashGateEpochs`, the claim reverts. Once the window
-    ///         elapses (or `slashedAtEpoch` is cleared by a successful
-    ///         appeal reversal) the claim is unblocked. Matches the
-    ///         "operating, non-slashed-in-window" predicate per ADR 026
-    ///         § Genesis Bond Credits. (Strict `isActive` additionally
-    ///         requires NodeId registration; the looser gate here mirrors
-    ///         the economic intent without requiring node-registry tests
-    ///         to mint EIP-712 signatures.)
-    function claimVestedCredit() external nonReentrant whenNotPaused {
-        if (activeBond[msg.sender] == 0 || ejected[msg.sender]) revert NotActiveForClaim(msg.sender);
-        // Only block while the operator is still inside their slash zero-out
-        // window — past that, the claim is unblocked (closes the lock-out-
-        // forever bug from the prior `!= 0` check). The window length is
-        // governance-tunable via `setClaimSlashGateEpochs` so it can be
-        // kept in lock-step with `FeeRouter.windowEpochs`.
-        uint64 slashStamp = _slashedAtEpoch[msg.sender];
-        if (slashStamp != 0) {
-            // Decode the +1-offset stamp before doing epoch arithmetic.
-            uint64 slashEpoch = slashStamp - 1;
-            uint64 currentEpoch = uint64(block.timestamp / EPOCH_LENGTH);
-            if (currentEpoch < slashEpoch + claimSlashGateEpochs) {
-                revert SlashedInWindowForClaim(msg.sender);
-            }
-        }
-
-        uint256 claimable = claimableCredit(msg.sender);
-        // Derived from the curve, not a balance read; zero is the
-        // well-defined "nothing to claim yet" sentinel.
-        // slither-disable-next-line incorrect-equality
-        if (claimable == 0) revert NothingVested();
-
-        PendingCredit storage pc = _pendingCredit[msg.sender];
-        pc.claimed = uint128(uint256(pc.claimed) + claimable);
-
-        uint256 oldBalance = activeBond[msg.sender];
-        uint256 newBalance = oldBalance + claimable;
-        activeBond[msg.sender] = newBalance;
-        if (oldBalance == 0 && _firstBondedAt[msg.sender] == 0) {
-            _firstBondedAt[msg.sender] = uint64(block.timestamp);
-        }
-
-        emit GenesisCreditClaimed(msg.sender, claimable);
-        emit Bonded(msg.sender, claimable, newBalance);
-    }
-
-    /// @notice Sentinel `grantedAt` value used by `_forfeitUnvestedCredit`
-    ///         to mark a credit position as "principal truncated to the
-    ///         already-vested amount, immediately fully vested for the
-    ///         purposes of future curve reads." `_curveVested` short-circuits
-    ///         on this sentinel before touching `block.timestamp` so the
-    ///         choice of sentinel value (max-uint64) is timestamp-safe even
-    ///         on test chains where `block.timestamp` is small.
-    uint64 internal constant FULLY_VESTED_SENTINEL = type(uint64).max;
-
-    /// @dev Curve helper that reads storage directly so callers don't
-    ///      pass storage→memory copies into a memory-param helper
-    ///      (aderyn H-2). Result is `originalGrant × min(elapsed, DUR) / DUR`,
-    ///      OR `originalGrant` directly if `grantedAt == FULLY_VESTED_SENTINEL`
-    ///      (post-forfeit "principal-only-remaining" state).
-    function _curveVested(address operator) internal view returns (uint256) {
-        PendingCredit storage pc = _pendingCredit[operator];
-        uint128 grant = pc.originalGrant;
-        if (grant == 0) return 0;
-        if (pc.grantedAt == FULLY_VESTED_SENTINEL) return grant;
-        // forge-lint: disable-next-line(block-timestamp)
-        uint256 elapsed = block.timestamp - pc.grantedAt;
-        if (elapsed >= GENESIS_VEST_DURATION) return grant;
-        return (uint256(grant) * elapsed) / GENESIS_VEST_DURATION;
     }
 
     // -----------------------------------------------------------------
@@ -1083,22 +816,13 @@ contract CapacityBond is
         lifetimeOffenseCount[operator] = newCount;
         uint256 tierBps = newCount == 1 ? SLASH_BPS_TIER_1 : newCount == 2 ? SLASH_BPS_TIER_2 : SLASH_BPS_TIER_3;
 
-        // ADR 026 § Genesis Bond Credits — the full at-risk pending credit
-        // pool (`originalGrant - claimed`, covering BOTH unvested and
-        // vested-but-unclaimed) is added to the bond-slash amount and
-        // escrowed under the SAME terms as voluntary bond (C1 fix + the
-        // vested-unclaimed loophole closure).
-        uint256 creditSlash = _slashPendingCreditAtTier(operator, tierBps);
-        uint256 bondSlash = _reduceBondAtTier(operator, tierBps);
-        totalSlash = bondSlash + creditSlash;
+        totalSlash = _reduceBondAtTier(operator, tierBps);
         // Escrow-on-slash (ADR 028): nothing is transferred or burned here.
         // The slashed TOKEN stays in this contract under `_slashRecords` until
         // `finalizeUnappealedSlash` (no appeal) or a `SLASH_APPEAL_ROLE` settle
         // hook resolves it. The challenger is recorded for the 50% leg paid at
-        // finality; `creditSlash` is recorded so a granted appeal can restore
-        // the Genesis-credit vesting position rather than refunding it liquid.
-        slashId = _mintSlashRecord(operator, challenger, totalSlash, creditSlash);
-        if (creditSlash != 0) emit GenesisCreditSlashed(operator, creditSlash);
+        // finality.
+        slashId = _mintSlashRecord(operator, challenger, totalSlash);
         _stampSlash(operator, challenger, offenseType, totalSlash, newCount);
     }
 
@@ -1117,45 +841,13 @@ contract CapacityBond is
         unbondingOf[operator].amount = newUnbonding;
     }
 
-    /// @dev Reduce the operator's at-risk `PendingCredit` by `tierBps`. The
-    ///      "at-risk" portion is the full unclaimed grant pool
-    ///      (`originalGrant - claimed`) — i.e., both the unvested portion
-    ///      AND the vested-but-unclaimed portion. Slashing both closes the
-    ///      loophole where an operator could shield earned credit from
-    ///      slashing simply by delaying `claimVestedCredit` calls. Already-
-    ///      claimed credit lives in `activeBond` and is slashed by
-    ///      `_reduceBondAtTier`, so the two functions partition the at-risk
-    ///      pool with no double-counting. `originalGrant` is reduced by the
-    ///      slashed amount so the operator's future curve naturally shrinks.
-    function _slashPendingCreditAtTier(address operator, uint256 tierBps) internal returns (uint256 slashed) {
-        PendingCredit storage pc = _pendingCredit[operator];
-        if (pc.originalGrant == 0) return 0;
-        uint256 originalGrant = uint256(pc.originalGrant);
-        uint256 claimed = uint256(pc.claimed);
-        if (claimed >= originalGrant) return 0;
-        uint256 atRisk = originalGrant - claimed;
-        // slither-disable-next-line divide-before-multiply
-        slashed = (atRisk * tierBps) / BPS_DENOMINATOR;
-        // Defensive clip, symmetric with `_reduceBondAtTier`'s C2 cap: the
-        // slashed amount can never exceed the at-risk pool. A no-op for the
-        // immutable tier ladder (≤ 50%), but if a future tier constant is ever
-        // set above 100% this keeps `escrowedTotal` from booking more credit
-        // than was actually removed (which would later underflow a
-        // distribute/burn). INVARIANT: the bond leg and credit leg together
-        // never exceed the operator's at-risk balances.
-        if (slashed > atRisk) slashed = atRisk;
-        // slither-disable-next-line incorrect-equality
-        if (slashed == 0) return 0;
-        pc.originalGrant = uint128(originalGrant - slashed);
-    }
-
     /// @dev Allocate the next `slashId`, book the slashed TOKEN into the
     ///      value-typed `escrowedTotal`, and persist the record + operator-list
     ///      append + events via [`SlashEscrowLib.mint`](SlashEscrowLib.sol).
     ///      The record lets `SlashAppeal.openSlashAppeal` validate appeals
     ///      without trusting the appellant's `operator` claim (I2 fix), and pins
     ///      the challenger + filing-window deadline for finality.
-    function _mintSlashRecord(address operator, address challenger, uint256 totalSlashAmount, uint256 creditPortion)
+    function _mintSlashRecord(address operator, address challenger, uint256 totalSlashAmount)
         internal
         returns (uint256 slashId)
     {
@@ -1171,7 +863,6 @@ contract CapacityBond is
             operator,
             challenger,
             totalSlashAmount,
-            creditPortion,
             uint64(APPEAL_FILING_WINDOW)
         );
     }
@@ -1252,22 +943,15 @@ contract CapacityBond is
     {
         // The library marks the record `Reversed`, recomputes the multi-slash
         // zero-out watermark (ADR 036), and emits `SlashReversed`; the caller
-        // applies the value-typed escrow + Genesis-credit effects below.
-        (address operator, uint256 refund, uint256 creditPortion) = SlashEscrowLib.settleGranted(
+        // applies the value-typed escrow refund below.
+        (address operator, uint256 refund) = SlashEscrowLib.settleGranted(
             _slashRecords, _operatorSlashIds, _slashedAtEpoch, slashId, slashCounter, EPOCH_LENGTH
         );
         escrowedTotal -= refund;
 
-        // Genesis-credit portion is restored to the vesting position
-        // (`grantedAt` is untouched, so the vest curve resumes) rather than
-        // refunded as liquid TOKEN — a wrongly-slashed operator is made exactly
-        // whole, not handed accelerated credit (ADR 028 §7). The TOKEN backing
-        // it never left the contract. Only the bond portion is refunded liquid.
-        if (creditPortion != 0) {
-            _pendingCredit[operator].originalGrant += uint128(creditPortion);
-        }
-        uint256 bondPortion = refund - creditPortion;
-        if (bondPortion != 0) IERC20(address(token)).safeTransfer(operator, bondPortion);
+        // A wrongly-slashed operator is made whole: the full escrowed bond is
+        // refunded liquid. The TOKEN backing it never left the contract.
+        if (refund != 0) IERC20(address(token)).safeTransfer(operator, refund);
     }
 
     /// @notice Emergency: force-resolve an `AppealOpen` slash on the upheld path
@@ -1389,17 +1073,6 @@ contract CapacityBond is
         emit UnbondingPeriodUpdated(oldPeriod, newPeriod);
     }
 
-    /// @notice Treasury sink for forfeited unvested Genesis Bond Credit on
-    ///         operator-initiated unbond (ADR 026 § Genesis Bond Credits —
-    ///         exit clause). May be `address(0)`; in that case forfeit is
-    ///         burned as a safe fallback.
-    // slither-disable-next-line missing-zero-check
-    function setTreasury(address newTreasury) external onlyRole(GOVERNANCE_ROLE) {
-        address oldTreasury = treasury;
-        treasury = newTreasury;
-        emit TreasuryUpdated(oldTreasury, newTreasury);
-    }
-
     function setMultiaddrUpdateCooldown(uint256 newCooldown) external onlyRole(GOVERNANCE_ROLE) {
         _enforceMultiaddrCooldownBounds(newCooldown);
         uint256 oldCooldown = multiaddrUpdateCooldown;
@@ -1419,23 +1092,6 @@ contract CapacityBond is
         uint256 oldWindow = regionStabilityWindow;
         regionStabilityWindow = newWindow;
         emit RegionStabilityWindowUpdated(oldWindow, newWindow);
-    }
-
-    /// @notice Set the claim slash gate window. Governance SHOULD update
-    ///         this in the same multi-call as any `FeeRouter.windowEpochs`
-    ///         change so the claim gate stays aligned with the slash
-    ///         zero-out window read by `DecdnGovernor._slashedInWindow`.
-    function setClaimSlashGateEpochs(uint64 newValue) external onlyRole(GOVERNANCE_ROLE) {
-        if (newValue < CLAIM_SLASH_GATE_FLOOR || newValue > CLAIM_SLASH_GATE_CEILING) {
-            revert ParamOutOfBounds({
-                value: uint256(newValue),
-                floor: uint256(CLAIM_SLASH_GATE_FLOOR),
-                ceiling: uint256(CLAIM_SLASH_GATE_CEILING)
-            });
-        }
-        uint64 old = claimSlashGateEpochs;
-        claimSlashGateEpochs = newValue;
-        emit ClaimSlashGateEpochsUpdated(old, newValue);
     }
 
     // -----------------------------------------------------------------

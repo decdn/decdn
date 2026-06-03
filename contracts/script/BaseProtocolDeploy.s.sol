@@ -61,7 +61,7 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///           4. `_wireCrossContractRoles` — peer role grants (settlement reporter,
 ///                                          slash-appeal driver, blacklist ejector,
 ///                                          emergency multisig, PAUSER_ROLE on every
-///                                          Pausable target, genesis grantor,
+///                                          Pausable target,
 ///                                          router-caller → PaymentChannel,
 ///                                          SLASH_ROLE → SlashJudge) plus the
 ///                                          deployer-only `setChallengerIncentivePool`
@@ -85,7 +85,7 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///           7. `_assertPeerRolesWired`   — reverts if any phase-4 peer-role grant
 ///                                          or address binding (slash trigger,
 ///                                          router-caller, pausers, emergency
-///                                          multisig, genesis grantor, blacklist
+///                                          multisig, blacklist
 ///                                          binding, challenger pool) did not land.
 ///                                          `grantRole` to a wrong address does not
 ///                                          revert, so without this a half-wired
@@ -140,7 +140,6 @@ abstract contract BaseProtocolDeploy is Script {
         uint256 multiaddrUpdateCooldown;
         uint256 maxMultiaddrSize;
         uint256 regionStabilityWindow;
-        uint256 genesisCreditWindow;
         // FeeRouter params (ADR 016 / ADR 026). `buybackBurner` may be
         // `address(0)` iff `feeRouterShares[1] == 0` (launch-mode dormancy
         // per ADR 016 § Tunable Economics). The cross-validation is enforced
@@ -251,8 +250,7 @@ abstract contract BaseProtocolDeploy is Script {
             unbondingPeriod_: cfg.unbondingPeriod,
             multiaddrUpdateCooldown_: cfg.multiaddrUpdateCooldown,
             maxMultiaddrSize_: cfg.maxMultiaddrSize,
-            regionStabilityWindow_: cfg.regionStabilityWindow,
-            genesisCreditWindow_: cfg.genesisCreditWindow
+            regionStabilityWindow_: cfg.regionStabilityWindow
         });
 
         d.slashAppeal = new SlashAppeal({
@@ -372,14 +370,6 @@ abstract contract BaseProtocolDeploy is Script {
         d.paymentChannel.grantRole(d.paymentChannel.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.slashJudge.grantRole(d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
 
-        // GENESIS_GRANTOR_ROLE → the Timelock (treasury custodian), which issues
-        // Genesis Bond Credits during GENESIS_CREDIT_WINDOW (ADR 016 § Post-
-        // Deployment Init step 7). CapacityBond's window clock starts at
-        // construction, so granting here — before the handoff — avoids burning
-        // ~10 days of a 30-day window on a governance proposal just to enable the
-        // grantor. Governance may revoke the role after the window for hygiene.
-        d.bond.grantRole(d.bond.GENESIS_GRANTOR_ROLE(), address(d.timelock));
-
         // PaymentChannel.settleChannel / withdraw call FeeRouter.routeSettlement
         // (ADR 016 § Post-Deployment Init step 4) — without this the settlement
         // path reverts.
@@ -465,7 +455,6 @@ abstract contract BaseProtocolDeploy is Script {
         _requireRole(d.bond, d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal));
         _requireRole(d.bond, d.bond.BLACKLIST_ROLE(), address(d.blacklist));
         _requireRole(d.bond, d.bond.SLASH_ROLE(), address(d.slashJudge));
-        _requireRole(d.bond, d.bond.GENESIS_GRANTOR_ROLE(), address(d.timelock));
         // FeeRouter settlement-routing grant.
         _requireRole(d.router, d.router.ROUTER_CALLER_ROLE(), address(d.paymentChannel));
         // EMERGENCY_MULTISIG_ROLE on both appeal surfaces.

@@ -27,8 +27,7 @@ struct SlashRecord {
     SlashStatus status; // slot 0: +1 = 29 bytes
     address challenger; // slot 1: 20 bytes — paid the 50% leg at finality
     uint64 appealWindowClose; // slot 1: +8 = 28 bytes
-    uint256 slashAmount; // slot 2: escrowed TOKEN amount (bond + credit)
-    uint256 creditPortion; // slot 3: the Genesis-credit share of slashAmount
+    uint256 slashAmount; // slot 2: escrowed TOKEN amount (active + unbonding bond)
 }
 
 /// @title SlashEscrowLib
@@ -45,9 +44,9 @@ struct SlashRecord {
 ///         mapping arguments resolve to `CapacityBond`'s slots and the emitted
 ///         events carry `CapacityBond`'s address. `CapacityBond` retains the
 ///         thin external entrypoints (role gating, reentrancy guard, pause) and
-///         applies the returned `escrowedTotal` / Genesis-credit effects, so
-///         the value-typed `escrowedTotal` state variable (not passable by
-///         storage reference) stays owned by the contract.
+///         applies the returned `escrowedTotal` effects, so the value-typed
+///         `escrowedTotal` state variable (not passable by storage reference)
+///         stays owned by the contract.
 library SlashEscrowLib {
     using SafeERC20 for IERC20;
 
@@ -88,7 +87,6 @@ library SlashEscrowLib {
         address operator,
         address challenger,
         uint256 totalSlashAmount,
-        uint256 creditPortion,
         uint64 appealFilingWindow
     ) public {
         uint64 nowTs = uint64(block.timestamp);
@@ -99,8 +97,7 @@ library SlashEscrowLib {
             status: SlashStatus.Escrowed,
             challenger: challenger,
             appealWindowClose: windowClose,
-            slashAmount: totalSlashAmount,
-            creditPortion: creditPortion
+            slashAmount: totalSlashAmount
         });
         operatorSlashIds[operator].push(slashId);
         emit SlashRecorded(slashId, operator, nowTs, totalSlashAmount);
@@ -168,15 +165,11 @@ library SlashEscrowLib {
     /// @notice Settle a granted appeal: mark the record `Reversed`, re-derive
     ///         the operator's `slashedAtEpoch` watermark over the remaining
     ///         still-standing slashes (ADR 036 § Slashing zero-out — multi-
-    ///         slash), and return the amounts for the caller to refund. The
-    ///         Genesis-credit restore and the liquid-bond transfer stay in
-    ///         `CapacityBond` (they touch `_pendingCredit` / `token`).
+    ///         slash), and return the amount for the caller to refund. The
+    ///         liquid-bond transfer stays in `CapacityBond` (it touches `token`).
     /// @return operator      The operator whose slash was reversed.
     /// @return refund        Total escrowed amount to release (caller subtracts
-    ///                       from `escrowedTotal`).
-    /// @return creditPortion The Genesis-credit share of `refund` (caller
-    ///                       restores it to the vesting position; the remainder
-    ///                       is refunded as liquid TOKEN).
+    ///                       from `escrowedTotal` and refunds liquid).
     /// @param epochLength `CapacityBond.EPOCH_LENGTH` — threaded in (not
     ///        duplicated) so the recompute stamps the same epoch encoding
     ///        `_stampSlash` used at mint.
@@ -187,12 +180,11 @@ library SlashEscrowLib {
         uint256 slashId,
         uint256 slashCounter,
         uint64 epochLength
-    ) public returns (address operator, uint256 refund, uint256 creditPortion) {
+    ) public returns (address operator, uint256 refund) {
         if (slashId >= slashCounter) revert UnknownSlash(slashId);
         SlashRecord storage r = records[slashId];
         if (r.status != SlashStatus.AppealOpen) revert SlashAppealNotOpen(slashId);
         refund = r.slashAmount;
-        creditPortion = r.creditPortion;
         operator = r.operator;
         r.status = SlashStatus.Reversed;
         _recomputeSlashedAtEpoch(operatorSlashIds, records, slashedAtEpoch, operator, epochLength);

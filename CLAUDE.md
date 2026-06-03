@@ -14,6 +14,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
 - **Do not reuse numbers:** 004, 010, 027, 029, 032, 033, 034, 035 (retired or reclassified — see history below).
 - **Canonical ADRs (recent):** 028, 030, 031, 036, 037.
 - **History:**
+  - 026 (tokenomics) — **Genesis Bond Credit removal:** the on-chain Genesis Bond Credit mechanism (the `CapacityBond` grant/vest/claim/forfeit surface, `GENESIS_GRANTOR_ROLE`, `PendingCredit`, the credit leg of slashing/escrow, and `claimSlashGateEpochs`) is gone. Its 5pp earmark folds back into the operational DAO Treasury (group 2, now a flat 15% — 30% at TGE, then 48-month linear); any retroactive testnet-operator recognition is a discretionary off-chain Treasury TGE-unlock with no contract surface. Slashing and granted-appeal refunds are now bond-only. Touched ADRs 026, 016, 028, 036, 008, architecture, glossary, and observability/key-rotation appendices.
   - 036 (`036-served-bytes-voting-weight.md`): supersedes voting-weight clauses of ADR 009 §Production and ADR 026 §Governance; promotes `FeeRouter.bytesPerEpoch` from analytics-only to governance-canonical, adds `windowEpochs` governable parameter, adds `slashedAtEpoch` zero-out on `CapacityBond`.
   - 035 (`035-delegator-pool.md`): retired under the work-token rewrite; archived in `adr/_history/035-delegator-pool.md`.
   - 034 (`034-gauge-boost-voting-escrow.md`): retired under the work-token rewrite; archived in `adr/_history/034-gauge-boost-voting-escrow.md`.
@@ -25,7 +26,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
   - 027 (Distinct-Client Diversity Gating / Delivery Receipts): collapsed into ADR 026 §3 per-operator gauge-share cap (itself now retired).
   - 010 (Multi-Token Payment Support): dropped for a single immutable USDC token set at deployment; rationale archived in `adr/_history/alternatives-pre-launch.md`.
   - 006/020/021/023/025: demoted to appendices in a pre-launch cleanup (`appendix-encrypted-content-publishing.md`, `appendix-observability.md`, `appendix-l2-deployment.md`, `appendix-poc-production-seams.md`, `appendix-local-admin-http.md`).
-  - 004 (tokenomics): superseded by ADR 026, which was rewritten to the work-token model and again to the no-emission variant (Genesis Bond Credits + App Incentives in place of OperatorEmissions).
+  - 004 (tokenomics): superseded by ADR 026, which was rewritten to the work-token model and again to the no-emission variant (App Incentives in place of OperatorEmissions; the interim Genesis Bond Credits mechanism was later removed — see the ADR 026 note above).
 
 ## Common Commands
 
