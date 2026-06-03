@@ -281,6 +281,26 @@ pub struct DecdnMetrics {
     /// backfill re-drives it), but a non-zero rate flags a struggling channel
     /// store. Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
+    /// Channels the seller path proactively `closeChannel`d because an
+    /// operator-configured auto-settlement trigger fired — the un-redeemed
+    /// value or voucher count crossed its threshold (#742). Each close starts
+    /// the dispute window so a large unsubmitted balance is secured before the
+    /// client can go dark; the settle sweep finalizes the remainder. A rising
+    /// count is normal under heavy delivery; a flat-zero count on a node that
+    /// configured a trigger means nothing has crossed it yet. Operator-visible
+    /// name: `decdn_settlement_auto_triggered_total`.
+    pub settlement_auto_triggered: Counter,
+    /// Auto-settlement close attempts that FAILED after a trigger fired (#742):
+    /// the `closeChannel` submit returned no pending tx, or the awaited receipt
+    /// reverted / errored. Distinct from `settlement_auto_triggered` (which
+    /// counts only secured closes) so an operator can compute a fire-vs-secured
+    /// ratio — a sustained non-zero rate means a configured trigger keeps firing
+    /// but the close never lands (RPC / wallet / on-chain revert), so the
+    /// at-risk balance is NOT being secured and the revenue-protection feature
+    /// is silently defeated. The fall-through leaves the redeem path to run, so
+    /// `redemption_failures` does NOT move on these — this is the only signal.
+    /// Operator-visible name: `decdn_settlement_auto_failures_total`.
+    pub settlement_auto_failures: Counter,
     /// `decdn_staker_set_watcher_restarts_total` (#783): distinct drift
     /// windows the [`crate::dht::chain_staker_set`] watcher has entered —
     /// bumped once on the *transition* from a healthy cycle into the
@@ -490,6 +510,21 @@ impl Metrics {
     /// (#751). Pairs with the `warn!` in `redeemer_loop`.
     pub fn redemption_failure(&self) {
         self.decdn.redemption_failures.inc();
+    }
+
+    /// An auto-settlement trigger fired and the seller path `closeChannel`d a
+    /// channel to secure its un-redeemed balance on-chain (#742). Pairs with
+    /// the `info!` in `try_redeem`.
+    pub fn settlement_auto_triggered(&self) {
+        self.decdn.settlement_auto_triggered.inc();
+    }
+
+    /// An auto-settlement trigger fired but the `closeChannel` did NOT secure
+    /// the balance — the submit failed or the receipt reverted/errored (#742).
+    /// Pairs with the `warn!` in `try_auto_settle_close`. Kept distinct from
+    /// `settlement_auto_triggered` so a fire-vs-secured ratio is computable.
+    pub fn settlement_auto_failure(&self) {
+        self.decdn.settlement_auto_failures.inc();
     }
 
     /// The settlement watcher swallowed a channel-lifecycle persist failure
@@ -1116,6 +1151,42 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_voucher_nonce_gaps_total", 2),
             "expected 2 gap events (one bump each, not gap-size weighted):\n{text}"
+        );
+    }
+
+    #[test]
+    fn settlement_auto_counters_start_at_zero_and_increment() {
+        // #742. Both auto-settlement counters must be exposed at zero on a
+        // fresh registry (dashboards built before any close don't render
+        // `(no data)`) and increment independently — the success counter
+        // (`settlement_auto_triggered`) and the failure counter
+        // (`settlement_auto_failures`) are deliberately distinct so an operator
+        // can compute a fire-vs-secured ratio. The OpenMetrics encoder appends
+        // `_total`, so the exported names are the suffixed forms asserted here.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_settlement_auto_triggered_total",
+            "decdn_settlement_auto_failures_total",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "settlement-auto counter {name} should start at zero:\n{text}"
+            );
+        }
+
+        metrics.settlement_auto_triggered();
+        metrics.settlement_auto_failure();
+        metrics.settlement_auto_failure();
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_settlement_auto_triggered_total", 1),
+            "expected 1 secured close:\n{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_settlement_auto_failures_total", 2),
+            "expected 2 failed closes:\n{text}"
         );
     }
 

@@ -88,7 +88,7 @@ use decdn_node::buyer_channel::BuyerChannelService;
 use decdn_node::channel_store::PersistentChannelStateStore;
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::metrics::Metrics;
-use decdn_node::payment_settlement::PaymentChannelService;
+use decdn_node::payment_settlement::{AutoSettleConfig, PaymentChannelService};
 use decdn_protocol::ALPN_CLIENT;
 use iroh::EndpointAddr;
 
@@ -490,6 +490,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         checkpoint_store,
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        AutoSettleConfig::default(),
         Arc::clone(&metrics),
     )
     .await?;
@@ -886,6 +887,198 @@ async fn run_e2e() -> anyhow::Result<()> {
     );
 
     // ============================================================
+    // CHANNEL 3 — AUTO-SETTLEMENT (#742). Bring up a dedicated settlement
+    // service opted in to auto-settle via a small `value_threshold`, sharing the
+    // same store as the live handler so its watcher persists the channel and its
+    // redeemer can read the handler-persisted voucher. The original `service`'s
+    // redeemer was permanently quiesced by channel 2's
+    // `close_open_channels_on_shutdown`, and the handler's `redeem_hint` sender
+    // is a `OnceLock` already bound to that dead service — so we drive this
+    // service's redeemer directly via its OWN `redeem_hint_sender()` after the
+    // delivery persists the voucher. Deliver enough to cross BOTH the redeem
+    // threshold (10 µUSDC) AND the auto-settle value threshold (5 µUSDC), and
+    // assert auto-settle SUPERSEDES `withdraw`: the channel goes `Closing` (not
+    // withdrawn), a `PendingSettle` entry is recorded for the settle sweep, and
+    // the channel is forgotten from the store (fix #1 — no unredeemable-bytes
+    // leak: we stop serving a `Closing` channel).
+    // ============================================================
+    let auto_settle_store: Arc<dyn PendingSettleStore> = concrete_store.clone();
+    let service_auto = PaymentChannelService::bootstrap(
+        node_provider.clone(),
+        payment_channel,
+        node_addr,
+        Arc::clone(&store),
+        concrete_store.clone(),
+        concrete_store.clone(),
+        Arc::clone(&handler),
+        U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        AutoSettleConfig {
+            // 5 µUSDC — below the 10 µUSDC redeem threshold and below channel
+            // 3's 15 µUSDC claim, so the trigger fires AND the redeem threshold
+            // is also crossed (proving auto-settle wins).
+            value_threshold: Some(U256::from(5u64)),
+            voucher_nonce_span_threshold: None,
+        },
+        Arc::clone(&metrics),
+    )
+    .await?;
+    let auto_hint = service_auto.redeem_hint_sender();
+
+    // Re-fund + re-approve, then open channel 3.
+    usdc_admin
+        .mint(client_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    usdc_client
+        .approve(payment_channel, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let auto_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
+    let id3 = derive_channel_id(client_addr, node_addr, auto_nonce.to::<u64>());
+    pc_client
+        .openChannel(node_addr, deposit)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    anyhow::ensure!(
+        poll_until(Duration::from_secs(60), || {
+            let store = Arc::clone(&store);
+            async move { store.get(id3).ok().flatten() }
+        })
+        .await
+        .is_some(),
+        "watcher did not persist channel 3 (auto-settle)"
+    );
+
+    // Deliver the full 1.5 MiB blob → 15 µUSDC claim, above both thresholds.
+    let ctx3 = ChannelContext {
+        channel_id: id3,
+        token: usdc_addr,
+        deposit,
+        client_signer: Arc::clone(&client_signer),
+        voucher_domain: voucher_domain(CHAIN_ID, payment_channel),
+        prior_nonce: U256::ZERO,
+        prior_bytes_delivered: U256::ZERO,
+        prior_amount: U256::ZERO,
+    };
+    let got3 = stream_fetch(
+        &client_ep,
+        target.clone(),
+        &ctx3,
+        &domains.slash,
+        node_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffe4,
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        got3.as_ref() == payload.as_slice(),
+        "channel 3 delivery mismatch"
+    );
+
+    // Wait for the handler's serve path to persist channel 3's voucher into the
+    // shared store, then hint the auto-settle service's redeemer (the handler's
+    // OnceLock hint is bound to the now-dead original service, so we drive this
+    // redeemer directly via its own sender). The redeemer reads the persisted
+    // voucher from the same store.
+    anyhow::ensure!(
+        poll_until(Duration::from_secs(30), || {
+            let store = Arc::clone(&store);
+            async move {
+                store
+                    .get(id3)
+                    .ok()
+                    .flatten()
+                    .filter(|st| !st.last_nonce().is_zero())
+            }
+        })
+        .await
+        .is_some(),
+        "channel 3 voucher was never persisted by the handler serve path"
+    );
+    auto_hint.send(id3).await?;
+
+    // The auto-settle trigger fires before `withdraw`: the channel goes
+    // `Closing` and `withdrawnAmount` stays zero (auto-settle SUPERSEDES the
+    // withdraw — fix #4b).
+    let closing3 = poll_until(Duration::from_secs(60), || {
+        let pc = pc_read.clone();
+        async move {
+            pc.getChannel(id3)
+                .call()
+                .await
+                .ok()
+                .filter(|ch| matches!(ch.status, PaymentChannel::Status::Closing))
+        }
+    })
+    .await
+    .ok_or_else(|| anyhow::anyhow!("auto-settlement did not move channel 3 to Closing (#742)"))?;
+    anyhow::ensure!(
+        closing3.withdrawnAmount == U256::ZERO,
+        "auto-settle must close (not withdraw) — withdrawnAmount should be 0, got {}",
+        closing3.withdrawnAmount
+    );
+
+    // A `PendingSettle` entry was recorded so the settle sweep finalizes the
+    // remainder after the dispute window (mirrors the shutdown-close path).
+    let pending3 = poll_until(Duration::from_secs(30), || {
+        let pending = Arc::clone(&auto_settle_store);
+        async move {
+            pending
+                .load_pending()
+                .ok()
+                .filter(|entries| entries.iter().any(|e| e.channel_id == id3))
+        }
+    })
+    .await;
+    anyhow::ensure!(
+        pending3.is_some(),
+        "auto-settle close did not record a PendingSettle entry for channel 3"
+    );
+
+    // Fix #1: after the landed close the channel is RETIRED — forgotten from the
+    // store so the node stops serving a channel it can no longer redeem against.
+    let forgotten3 = poll_until(Duration::from_secs(30), || {
+        let store = Arc::clone(&store);
+        async move {
+            match store.get(id3) {
+                Ok(None) => Some(()),
+                _ => None,
+            }
+        }
+    })
+    .await;
+    anyhow::ensure!(
+        forgotten3.is_some(),
+        "auto-settle close did not forget channel 3 — unredeemable-bytes leak (fix #1)"
+    );
+
+    // The success counter incremented and no failure was recorded (the close
+    // landed cleanly).
+    let metrics_text = metrics.encode()?;
+    anyhow::ensure!(
+        metrics_text
+            .lines()
+            .any(|l| l == "decdn_settlement_auto_triggered_total 1"),
+        "expected one secured auto-settle close in metrics:\n{metrics_text}"
+    );
+    anyhow::ensure!(
+        metrics_text
+            .lines()
+            .any(|l| l == "decdn_settlement_auto_failures_total 0"),
+        "expected zero auto-settle failures in metrics:\n{metrics_text}"
+    );
+
+    drop(service_auto);
+
+    // ============================================================
     // DOWNTIME BACKFILL (#751) — the headline across-restart fix. Take the
     // settlement service DOWN (drop it → watcher/sweeper aborted), open a fresh
     // channel against this provider while nothing is watching, then bring the
@@ -959,6 +1152,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         concrete_store.clone(),
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        AutoSettleConfig::default(),
         Arc::clone(&metrics),
     )
     .await?;

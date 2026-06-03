@@ -70,6 +70,19 @@ pub struct ResolvedBlockchain {
     /// Economics). Defaults to `true`; set `false` to manage the allowance
     /// out-of-band (e.g. a tighter per-channel approval policy).
     pub buyer_max_approve: bool,
+    /// Outstanding-USDC threshold (base units, `µUSDC`) at which the seller
+    /// settlement path proactively `closeChannel`s a channel to secure a large
+    /// un-redeemed balance on-chain before the client can go dark (#742). `None`
+    /// disables auto-settlement (the default — behavior unchanged). When `Some`,
+    /// the resolver guarantees it is `> 0`.
+    pub settlement_auto_threshold_micro_usdc: Option<u64>,
+    /// Nonce-span companion threshold (#742): close once a channel's un-redeemed
+    /// nonce span (`last_nonce − claimedNonce`) reaches this value, independent of
+    /// USDC value. The span is an UPPER BOUND on the un-redeemed voucher count
+    /// (nonces may skip values per ADR 003 §Voucher Nonce Convention), not an
+    /// exact count. `None` disables the span trigger; when `Some`, the resolver
+    /// guarantees `> 0`.
+    pub settlement_auto_by_voucher_nonce_span: Option<u64>,
 }
 
 /// Resolved cache fields.

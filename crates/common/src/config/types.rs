@@ -100,6 +100,29 @@ pub struct BlockchainConfig {
     /// contract at startup so the buyer path can `openChannel` (#744). Absent
     /// => `true`. Set `false` to manage the allowance out-of-band.
     pub buyer_max_approve: Option<bool>,
+    /// Outstanding (un-redeemed) USDC (base units, `µUSDC`) at which the node
+    /// proactively `closeChannel`s a channel to start its dispute window, so a
+    /// large unsubmitted voucher balance is secured on-chain before the client
+    /// can go dark (#742, ADR 003 § payment-channel lifecycle). A close starts
+    /// the dispute window; the existing settle sweep finalizes the remainder
+    /// after it elapses. Distinct from (and should be set above)
+    /// [`Self::redeem_threshold_micro_usdc`] — `withdraw` reclaims earnings on a
+    /// still-open channel, whereas this caps total at-risk exposure by closing.
+    /// Absent => disabled (`None`): behavior is unchanged unless an operator
+    /// opts in. A configured value of `0` is rejected at resolution.
+    pub settlement_auto_threshold_micro_usdc: Option<u64>,
+    /// Optional nonce-span companion to
+    /// [`Self::settlement_auto_threshold_micro_usdc`] (#742): close a channel
+    /// once its un-redeemed nonce span reaches at least this value, independent
+    /// of USDC value. The span is the off-chain latest voucher nonce minus the
+    /// on-chain `claimedNonce` — an UPPER BOUND on the un-redeemed voucher count,
+    /// NOT an exact count: voucher nonces may skip values (ADR 003 §Voucher Nonce
+    /// Convention), so a gapped stream reaches a given span with fewer vouchers
+    /// than the span implies. Useful when many small vouchers accrue without
+    /// crossing the value threshold. Either trigger firing closes the channel
+    /// (logical OR). Absent => disabled (`None`); a configured value of `0` is
+    /// rejected at resolution.
+    pub settlement_auto_by_voucher_nonce_span: Option<u64>,
 }
 
 /// Cache section of the config file.
