@@ -21,6 +21,12 @@ use crate::error::{OriginError, SupportedEncoding};
 /// `identity`), `Some(Ok(_))` for known decoders, and `Some(Err(_))`
 /// for unknown encodings. Centralises the case-folding so callers can't
 /// disagree on whether `GZIP` is gzip.
+///
+/// A stacked/multi-value token (e.g. `gzip, gzip` or `gzip, br`) matches
+/// none of the single-encoding arms and is deliberately rejected as
+/// unsupported: the BLAKE3 address is over the single canonical form, so
+/// refusing a doubly-encoded body is the safe choice (no unverified
+/// pass-through) rather than attempting to unwrap layers.
 fn classify_encoding(trimmed: &str) -> Option<Result<SupportedEncoding, OriginError>> {
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
         return None;

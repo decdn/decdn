@@ -315,16 +315,13 @@ impl Origin for HttpOrigin {
             //      encoded bytes for compressed responses — compression
             //      ratios < 1 mean this is also a sound bound on the
             //      decoded size).
-            //   3. for compressed responses, layer
-            //      `async_compression::tokio::bufread` decoder via a
-            //      `StreamReader` -> decoder -> `ReaderStream`
-            //      sandwich. The decompressed-side cap is enforced
-            //      again by the engine's `count_and_cap_stream`
-            //      (the running total there ensures we abort the
-            //      import the moment decompressed bytes exceed
-            //      `max_bytes`, so a 1 KB compressed payload that
-            //      decompresses to 100 GB fails fast at the engine
-            //      seam without ever pinning that memory).
+            //   3. for compressed responses, layer the decoder via
+            //      `decompress::decode_stream` — see that module for the
+            //      decoder sandwich and how the decompressed-side cap is
+            //      enforced by the engine's `count_and_cap_stream` (a 1 KB
+            //      compressed payload that decompresses to 100 GB fails
+            //      fast at the engine seam without ever pinning that
+            //      memory).
             let idle_timeout = self.chunk_idle_timeout;
             let raw_stream = response_chunk_stream(resp, idle_timeout, max_bytes, url_log);
 
@@ -337,16 +334,29 @@ impl Origin for HttpOrigin {
             // retryable; the body is corrupt).
             let decoded_stream = decompress::decode_stream(raw_stream, supported_encoding);
 
+            // For a decoded (compressed) response the advertised
+            // `Content-Length` is the *encoded* length, which understates
+            // the canonical length. Reporting it as `size_hint` would let
+            // the engine route a body whose encoded length fits under
+            // `buffered_max_bytes` into the buffer/drain path, where the
+            // drain cap (`buffered_max_bytes`) is applied to the *decoded*
+            // stream and falsely rejects an in-bounds blob as
+            // `BlobTooLarge` (#804). Hand `None` for compressed bodies so
+            // they always take the streaming path, where
+            // `count_and_cap_stream` checks the running decoded total
+            // against the correct `max_blob_bytes`. The pre-stream
+            // `advertised_len > max_bytes` short-circuit above still runs
+            // first (compressed-len > max_bytes already implies
+            // decoded-len > max_bytes under sane ratios). For identity
+            // responses the hint is the canonical length.
+            let size_hint = if supported_encoding.is_some() {
+                None
+            } else {
+                advertised_len
+            };
             Ok(OriginFetch::Found {
                 stream: decoded_stream,
-                // For compressed responses the size_hint is the
-                // *encoded* length (Content-Length over the wire) —
-                // useful for the engine's pre-stream short-circuit
-                // because compressed-len > max_bytes already implies
-                // decoded-len > max_bytes (assuming sane compression
-                // ratios). For identity responses it's the canonical
-                // length.
-                size_hint: advertised_len,
+                size_hint,
             })
         })
     }

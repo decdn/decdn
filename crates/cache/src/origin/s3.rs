@@ -583,10 +583,26 @@ impl Origin for S3Origin {
             // `count_and_cap_stream`, so a small compressed payload that
             // decodes to a huge blob fails fast at the engine seam.
             let stream = decompress::decode_stream(raw_stream, supported_encoding);
-            Ok(OriginFetch::Found {
-                stream,
-                size_hint: advertised_size,
-            })
+            // For a decoded (compressed) body the advertised `Content-Length`
+            // is the *encoded* size, which understates the canonical length.
+            // Reporting it as `size_hint` would let the engine route a body
+            // whose encoded length fits under `buffered_max_bytes` into the
+            // buffer/drain path, where the drain cap (`buffered_max_bytes`)
+            // is applied to the *decoded* stream and falsely rejects an
+            // in-bounds blob as `BlobTooLarge` (#804). Hand `None` so the
+            // body always takes the streaming path, where
+            // `count_and_cap_stream` checks the running decoded total
+            // against the correct `max_blob_bytes`. The pre-stream
+            // `advertised_size > max_bytes` short-circuit above still runs
+            // first, so a compressed body advertising > `max_bytes` is
+            // rejected early (compression ratios < 1 make that a sound
+            // bound). Identity bodies keep the canonical-length hint.
+            let size_hint = if supported_encoding.is_some() {
+                None
+            } else {
+                advertised_size
+            };
+            Ok(OriginFetch::Found { stream, size_hint })
         })
     }
 }
