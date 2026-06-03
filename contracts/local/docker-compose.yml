@@ -49,6 +49,9 @@ services:
   # IROH_RELAY_IMAGE in `.env` to a relay image/build first (there is no default
   # since iroh does not publish an official relay image). `--dev` disables
   # TLS / abuse limits, appropriate behind WireGuard.
+  # No healthcheck here (unlike anvil): the image is operator-supplied and we
+  # can't assume a probe tool is present. The node's own relay reachability
+  # probe (warn-and-continue) covers startup diagnosis.
   relay:
     image: ${IROH_RELAY_IMAGE}
     command: --dev

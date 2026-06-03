@@ -111,9 +111,11 @@ To route iroh traffic through the self-hosted relay, set `[network] relay_url`
 The node honors `[network] relay_url` (env `DECDN_RELAY_URL`): when set, it
 replaces the public n0 relay map with your self-hosted relay
 (`RelayMode::Custom`) while keeping n0 DNS address-lookup for NodeId→address
-discovery. On bring-up the node runs a quick TCP reachability probe against the
-relay and **fails fast** if it's down or mistyped, so a bad relay URL surfaces
-immediately instead of as silent connection failures later.
+discovery. On bring-up the node runs a quick TCP reachability probe (a few
+retries with backoff) and logs a **warning** if the relay is unreachable, but
+**starts anyway** — iroh keeps retrying the relay in the background, so a
+slow-starting or transiently-down relay won't block node startup. The probe is a
+diagnostic to catch a down/mistyped URL early, not a hard gate.
 
 Do you need it?
 

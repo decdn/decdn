@@ -1249,16 +1249,17 @@ async fn build_endpoint(
     // single self-hosted relay (`RelayMode::Custom`). The `presets::N0` DNS
     // address-lookup leg is left intact — only the relay leg is swapped — so
     // NodeId→address discovery still works while connectivity routes through the
-    // operator's relay (useful for an isolated / self-hosted deployment). A
-    // custom relay sits on the critical path for NAT traversal, so an
-    // unreachable or mistyped URL fails bring-up here (see `probe_relay`) rather
-    // than degrading silently into unroutable connections later. Multi-relay
-    // support is tracked separately (issue #795).
+    // operator's relay (useful for an isolated / self-hosted deployment).
+    // Multi-relay support is tracked separately (issue #795).
     if let Some(url) = relay_url {
         let relay: RelayUrl = url
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid network.relay_url {url:?}: {e}"))?;
-        probe_relay(&relay).await?;
+        // Startup diagnostic only: `probe_relay` warns on an unreachable relay
+        // but never blocks bring-up — iroh keeps retrying the relay in the
+        // background, so a transiently-down (or slow-starting) relay must not
+        // prevent the node from starting.
+        let _ = probe_relay(&relay).await;
         builder = builder.relay_mode(RelayMode::Custom(RelayMap::from(relay)));
     }
 
@@ -1270,38 +1271,65 @@ async fn build_endpoint(
         .map_err(|e| anyhow::anyhow!("endpoint bind {bind_addr} failed: {e}"))
 }
 
-/// Simple reachability probe for a self-hosted relay: a single TCP connect to
-/// the relay's host:port within a short timeout. A successful connect is taken
-/// as sufficient evidence the relay is up; we deliberately do not speak the
-/// relay's HTTP-upgrade handshake (that is iroh's job once the endpoint binds).
-/// The point is to turn a down or mistyped `network.relay_url` into a loud,
-/// fail-fast bring-up error instead of silent connection failures down the line.
-async fn probe_relay(relay: &RelayUrl) -> anyhow::Result<()> {
-    const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-    // `RelayUrl` derefs to `url::Url`; the host/port accessors come from there.
-    let host = unbracket_host(
-        relay
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("network.relay_url has no host"))?,
+/// Reachability probe for a self-hosted relay: a few short TCP connects with a
+/// small backoff. Returns `true` as soon as any attempt connects, otherwise logs
+/// a warning and returns `false`. This is a *startup diagnostic*, not a gate —
+/// the caller continues regardless, since iroh keeps retrying the relay in the
+/// background and a transiently-down (or slow-starting) relay must not block node
+/// bring-up. We deliberately do not speak the relay's HTTP-upgrade handshake
+/// (that is iroh's job once the endpoint binds), and report only host:port —
+/// never the full URL — so any userinfo can't leak into logs.
+async fn probe_relay(relay: &RelayUrl) -> bool {
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+    const BACKOFF: Duration = Duration::from_secs(1);
+    const ATTEMPTS: u32 = 3;
+
+    let Some((host, port)) = relay_host_port(relay) else {
+        return false;
+    };
+
+    for attempt in 1..=ATTEMPTS {
+        match relay_connect_once(host, port, ATTEMPT_TIMEOUT).await {
+            Ok(()) => return true,
+            Err(reason) => {
+                tracing::debug!("relay {host}:{port} probe attempt {attempt}/{ATTEMPTS}: {reason}");
+            }
+        }
+        if attempt < ATTEMPTS {
+            tokio::time::sleep(BACKOFF).await;
+        }
+    }
+    tracing::warn!(
+        "relay {host}:{port} unreachable after {ATTEMPTS} attempts; starting anyway (iroh keeps retrying the relay in the background)"
     );
-    let port = relay.port_or_known_default().ok_or_else(|| {
-        anyhow::anyhow!("network.relay_url has no port and scheme has no default")
-    })?;
-    // Failure messages report only host:port, never the full URL, so any
-    // userinfo in the configured relay URL can't leak into logs.
-    match tokio::time::timeout(
-        RELAY_PROBE_TIMEOUT,
-        tokio::net::TcpStream::connect((host, port)),
-    )
-    .await
-    {
+    false
+}
+
+/// Resolve the dial target from a relay URL: `(host, port)`, with IPv6 brackets
+/// stripped (`RelayUrl` derefs to `url::Url` for the accessors). Returns `None`
+/// — after a warning — for the near-unreachable cases of a host-less URL or a
+/// scheme with no default port.
+fn relay_host_port(relay: &RelayUrl) -> Option<(&str, u16)> {
+    let Some(host) = relay.host_str() else {
+        tracing::warn!("network.relay_url has no host; skipping relay reachability probe");
+        return None;
+    };
+    let Some(port) = relay.port_or_known_default() else {
+        tracing::warn!(
+            "network.relay_url has no port and scheme has no default; skipping relay reachability probe"
+        );
+        return None;
+    };
+    Some((unbracket_host(host), port))
+}
+
+/// One bounded TCP connect attempt to `host:port`. `Ok(())` on connect, `Err`
+/// carrying a short human reason (refused / timed out) for the caller to log.
+async fn relay_connect_once(host: &str, port: u16, timeout: Duration) -> Result<(), String> {
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port))).await {
         Ok(Ok(_stream)) => Ok(()),
-        Ok(Err(e)) => Err(anyhow::anyhow!(
-            "relay {host}:{port} unreachable: tcp connect failed: {e}"
-        )),
-        Err(_elapsed) => Err(anyhow::anyhow!(
-            "relay {host}:{port} unreachable: tcp connect timed out after {RELAY_PROBE_TIMEOUT:?}"
-        )),
+        Ok(Err(e)) => Err(format!("tcp connect failed: {e}")),
+        Err(_elapsed) => Err(format!("timed out after {timeout:?}")),
     }
 }
 
@@ -1842,21 +1870,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_relay_ok_when_listener_is_up() {
+    async fn probe_relay_true_when_listener_is_up() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let url: RelayUrl = format!("http://127.0.0.1:{port}").parse().unwrap();
-        assert!(probe_relay(&url).await.is_ok());
+        assert!(probe_relay(&url).await);
     }
 
     #[tokio::test]
-    async fn probe_relay_errors_when_nothing_listening() {
-        // Claim a free port, then drop the listener so the port is closed.
+    async fn probe_relay_false_when_nothing_listening() {
+        // Claim a free port, then drop the listener so the port is closed. The
+        // probe exhausts its retries and returns false (the caller continues).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let url: RelayUrl = format!("http://127.0.0.1:{port}").parse().unwrap();
-        assert!(probe_relay(&url).await.is_err());
+        assert!(!probe_relay(&url).await);
     }
 
     #[tokio::test]
@@ -1868,7 +1897,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         // `host_str()` yields "[::1]"; the probe must strip the brackets to connect.
         let url: RelayUrl = format!("http://[::1]:{port}").parse().unwrap();
-        assert!(probe_relay(&url).await.is_ok());
+        assert!(probe_relay(&url).await);
     }
 
     /// `admin_stop_order` defaults to `Early` (the original
