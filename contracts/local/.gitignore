@@ -1,0 +1,7 @@
+# Runtime artifacts from the local anvil rig. `.env` is also covered by the
+# repo-root rule; listed here for clarity. The deploy manifest itself lands in
+# contracts/deployments/<chainId>.json and is gitignored via the 3133769x range
+# in contracts/.gitignore.
+.env
+state/
+*.local

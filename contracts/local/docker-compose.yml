@@ -1,0 +1,68 @@
+# contracts/local/docker-compose.yml
+#
+# Throwaway internal-testnet anvil for the deCDN contract surface. This is a
+# DISPOSABLE dev rig — never a stand-in for the Arbitrum Sepolia / mainnet
+# deploy path. To scrap the whole thing: `docker compose down -v` then delete
+# `contracts/local/`. See ./README.md for the full runbook.
+#
+# Foundry's image ENTRYPOINT is `/bin/sh -c`, so `command` is ONE folded string.
+name: decdn-local
+
+services:
+  anvil:
+    image: ${FOUNDRY_IMAGE:-ghcr.io/foundry-rs/foundry:latest}
+    # `--state` persists the chain across restarts (named volume below).
+    # `--block-time` advances chain time without txs so epoch / dispute-window /
+    # unbonding logic progresses like a real chain (set BLOCK_TIME=0 to omit).
+    command: >
+      anvil
+      --host 0.0.0.0
+      --port 8545
+      --chain-id ${CHAIN_ID:-31337699}
+      --state /state/anvil-state.json
+      --block-time ${BLOCK_TIME:-2}
+    # SECURITY: anvil's JSON-RPC is UNAUTHENTICATED and exposes the `anvil_*`
+    # cheat methods plus well-known dev private keys. WG_BIND_IP pins the host
+    # publish to the WireGuard interface so the RPC is reachable ONLY over the
+    # VPN. It defaults to 127.0.0.1 (localhost-only) so an unconfigured `up`
+    # exposes nothing. NEVER set WG_BIND_IP=0.0.0.0 on a public VPS — Docker
+    # publishes via its own iptables chain and will punch straight through ufw.
+    ports:
+      - "${WG_BIND_IP:-127.0.0.1}:${RPC_PORT:-8545}:8545"
+    volumes:
+      - anvil-state:/state
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://127.0.0.1:8545 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  # OPTIONAL self-hosted iroh relay (opt-in via `--profile relay`).
+  #
+  # NOT wired up by default, and NOT usable as-is: the node currently builds its
+  # iroh endpoint with `presets::N0` (public number0 relays + DNS discovery) and
+  # does NOT consume `network.relay_url` (see crates/node/src/runtime/mod.rs
+  # `build_endpoint`). Pointing nodes at a self-hosted relay therefore needs a
+  # small endpoint-builder change first — tracked as a follow-up. Until then:
+  #   - if the VPS has outbound internet, nodes reach the public n0 relays and
+  #     work with NO relay container; or
+  #   - on a flat WireGuard subnet, nodes can dial each other directly (no relay
+  #     needed) once their NodeId + direct addr are known.
+  #
+  # When the endpoint change lands, set IROH_RELAY_IMAGE and run
+  # `docker compose --profile relay up -d`, then point nodes at
+  # `http://<WG_BIND_IP>:3340` via DECDN_RELAY_URL. See README § iroh relay.
+  #
+  # relay:
+  #   image: ${IROH_RELAY_IMAGE}
+  #   command: --dev          # --dev disables TLS/abuse limits for a LAN/VPN
+  #   ports:
+  #     - "${WG_BIND_IP:-127.0.0.1}:3340:3340"
+  #   restart: unless-stopped
+  #   profiles: ["relay"]
+
+volumes:
+  anvil-state:
