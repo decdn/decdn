@@ -1279,12 +1279,16 @@ async fn build_endpoint(
 async fn probe_relay(relay: &RelayUrl) -> anyhow::Result<()> {
     const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
     // `RelayUrl` derefs to `url::Url`; the host/port accessors come from there.
-    let host = relay
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("relay url {relay} has no host"))?;
+    let host = unbracket_host(
+        relay
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("network.relay_url has no host"))?,
+    );
     let port = relay.port_or_known_default().ok_or_else(|| {
-        anyhow::anyhow!("relay url {relay} has no port and scheme has no default")
+        anyhow::anyhow!("network.relay_url has no port and scheme has no default")
     })?;
+    // Failure messages report only host:port, never the full URL, so any
+    // userinfo in the configured relay URL can't leak into logs.
     match tokio::time::timeout(
         RELAY_PROBE_TIMEOUT,
         tokio::net::TcpStream::connect((host, port)),
@@ -1293,12 +1297,22 @@ async fn probe_relay(relay: &RelayUrl) -> anyhow::Result<()> {
     {
         Ok(Ok(_stream)) => Ok(()),
         Ok(Err(e)) => Err(anyhow::anyhow!(
-            "relay {relay} unreachable: tcp connect failed: {e}"
+            "relay {host}:{port} unreachable: tcp connect failed: {e}"
         )),
         Err(_elapsed) => Err(anyhow::anyhow!(
-            "relay {relay} unreachable: tcp connect timed out after {RELAY_PROBE_TIMEOUT:?}"
+            "relay {host}:{port} unreachable: tcp connect timed out after {RELAY_PROBE_TIMEOUT:?}"
         )),
     }
+}
+
+/// Strip the surrounding brackets `url::Url::host_str` adds to IPv6 literals
+/// (`[::1]` → `::1`). `TcpStream::connect`'s `ToSocketAddrs` impl rejects the
+/// bracketed form, so the host must be un-bracketed before dialing. Hosts
+/// without a matching bracket pair (domains, IPv4) pass through unchanged.
+fn unbracket_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 /// Resolve the keystore password from CLI/env/prompt, then decrypt the
@@ -1816,6 +1830,46 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn unbracket_host_strips_ipv6_brackets_only() {
+        assert_eq!(unbracket_host("[::1]"), "::1");
+        assert_eq!(unbracket_host("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(unbracket_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(unbracket_host("relay.example"), "relay.example");
+        // Unbalanced brackets pass through untouched (the dialer rejects them).
+        assert_eq!(unbracket_host("[::1"), "[::1");
+    }
+
+    #[tokio::test]
+    async fn probe_relay_ok_when_listener_is_up() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url: RelayUrl = format!("http://127.0.0.1:{port}").parse().unwrap();
+        assert!(probe_relay(&url).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn probe_relay_errors_when_nothing_listening() {
+        // Claim a free port, then drop the listener so the port is closed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url: RelayUrl = format!("http://127.0.0.1:{port}").parse().unwrap();
+        assert!(probe_relay(&url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn probe_relay_unbrackets_ipv6_host() {
+        // Best-effort: skip where the sandbox has no IPv6 loopback.
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        // `host_str()` yields "[::1]"; the probe must strip the brackets to connect.
+        let url: RelayUrl = format!("http://[::1]:{port}").parse().unwrap();
+        assert!(probe_relay(&url).await.is_ok());
+    }
 
     /// `admin_stop_order` defaults to `Early` (the original
     /// `appendix-local-admin-http` ordering) — the admin server stops
