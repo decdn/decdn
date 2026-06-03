@@ -8,6 +8,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
+import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
 
 /// @title ContentBlacklist
 /// @notice Global + regional hash blacklist, operator-level blacklist, and
@@ -78,6 +79,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ICapacityBondEjector public immutable capacityBond;
+
+    /// @notice Same deployed `CapacityBond`, typed for the ADR 030 region read
+    ///         surface (current/previous region + `effective` inputs). Used by
+    ///         the blacklist-scope ripening predicate and the path-2 standing
+    ///         check; `capacityBond` keeps the narrow eject-only type.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    ICapacityBondRegionView public immutable regionView;
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ERC20Burnable public immutable token;
@@ -185,6 +193,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error HashHasActiveAppeal(bytes32 region, bytes32 hash);
     error FrequencyCapHit(uint64 nextAvailableAt);
     error UnauthorizedStanding(StandingPath path);
+    /// @notice Raised by `openBlacklistAppeal` when an `Operator` (path-2)
+    ///         filer's region change has not yet ripened — the disputed entry's
+    ///         region matches the filer's node, but less than
+    ///         `regionStabilityWindow` has elapsed since `effective` (ADR 030
+    ///         § Eligibility, ADR 011 § Standing). `readyAt` is the earliest
+    ///         timestamp the filer regains permissionless standing; inside the
+    ///         window the case is admissible only at multisig discretion.
+    error RegionNotRipened(uint64 readyAt);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
 
     // -----------------------------------------------------------------
@@ -197,6 +213,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         }
         _enforceAppealBondBounds(appealBond_);
         capacityBond = capacityBond_;
+        regionView = ICapacityBondRegionView(address(capacityBond_));
         token = token_;
         appealBond = appealBond_;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -267,6 +284,28 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         return _isLive(region, hash);
     }
 
+    /// @notice ADR 030 § Eligibility blacklist-scope ripening predicate: is
+    ///         `operator` in compliance / slash scope for the live entry at
+    ///         `(region, hash)`? True iff the entry is live AND (the entry is
+    ///         global, OR `region` equals the operator's current `regionHint`,
+    ///         OR the region change has not yet ripened — `block.timestamp -
+    ///         effective < regionStabilityWindow` — and `region` equals the
+    ///         operator's `regionPrev`). The ripening leg keeps the previous
+    ///         region's entries (and slash exposure under them) applying until
+    ///         a region flip has been stable for the window, foreclosing
+    ///         reactive region-flip evasion (ADR 011 § Regional Scope, § Slashing).
+    /// @dev    The authoritative scope test off-chain judges / keepers consult
+    ///         for slash eligibility — region inputs are read from the on-chain
+    ///         self-attestation in `CapacityBond`, not supplied by the caller.
+    function isOperatorInBlacklistScope(address operator, bytes32 hash, bytes32 region) external view returns (bool) {
+        if (!_isLive(region, hash)) return false;
+        if (region == GLOBAL_REGION) return true;
+        if (region == _toRegionKey(regionView.getNodeByAddress(operator).regionHint)) return true;
+        // forge-lint: disable-next-line(block-timestamp)
+        return block.timestamp - _effectiveOf(operator) < regionView.regionStabilityWindow()
+            && region == _toRegionKey(regionView.regionPrev(operator));
+    }
+
     function getHashEntry(bytes32 region, bytes32 hash) external view returns (HashEntry memory) {
         return _hashEntries[region][hash];
     }
@@ -304,13 +343,15 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             if (block.timestamp < nextAvailable) revert FrequencyCapHit(nextAvailable);
         }
 
-        // StandingPath is recorded but only enum-range validated; the
-        // synthetic-standing clawback (admissibility condition (c) per
-        // ADR 031 § 216 — `status == Open && standingPath == TokenHolder &&
-        // ...`) is deferred per the contract header note. The field is
-        // persisted so the future on-chain clawback check can read it from
-        // the appeal record without re-deriving it from event history.
+        // StandingPath is recorded; the contract verifies the declared path.
+        // Path 2 (Operator) is enforced per ADR 011 § Standing + ADR 030
+        // § Eligibility below. Paths 1 (Publisher) and 3 (TokenHolder) remain
+        // recorded-but-not-enforced (enum-range only) per the header note —
+        // the synthetic-standing clawback and PublisherRegistry checks are
+        // deferred. The field is persisted so the future on-chain checks can
+        // read it from the appeal record without re-deriving it from events.
         if (uint8(standingPath) > uint8(StandingPath.TokenHolder)) revert UnauthorizedStanding(standingPath);
+        if (standingPath == StandingPath.Operator) _requireOperatorStanding(region);
 
         IERC20(address(token)).safeTransferFrom(msg.sender, address(this), appealBond);
 
@@ -488,6 +529,50 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     function _isLive(bytes32 region, bytes32 hash) internal view returns (bool) {
         HashEntry storage e = _hashEntries[region][hash];
         return e.addedAt != 0 && !e.suspended;
+    }
+
+    /// @dev ADR 011 § Standing path-2 (Operator): the disputed entry's region
+    ///      must match the filer's on-chain `regionHint` AND the region must
+    ///      have ripened — `block.timestamp - effective >= regionStabilityWindow`.
+    ///      Closes the reactive-flip-to-gain-standing surface (ADR 030
+    ///      § Eligibility). Global entries have no operator standing (any
+    ///      operator would qualify); they use paths 1/3. Inside-window filings
+    ///      are admissible only at multisig discretion — off-chain, not here.
+    function _requireOperatorStanding(bytes32 region) internal view {
+        if (region == GLOBAL_REGION) revert UnauthorizedStanding(StandingPath.Operator);
+        if (region != _toRegionKey(regionView.getNodeByAddress(msg.sender).regionHint)) {
+            revert UnauthorizedStanding(StandingPath.Operator);
+        }
+        uint64 readyAt = _effectiveOf(msg.sender) + uint64(regionView.regionStabilityWindow());
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp < readyAt) revert RegionNotRipened(readyAt);
+    }
+
+    /// @dev ADR 030 § Region-stability window `effective` timestamp:
+    ///      `regionLastChanged != 0 ? regionLastChanged
+    ///      : max(firstBondedAt, regionGateActivatedAt)`. Computed here (not in
+    ///      `CapacityBond`) to keep zero bytecode on the size-constrained bond
+    ///      contract (issue #770).
+    function _effectiveOf(address operator) internal view returns (uint64) {
+        uint64 changed = regionView.regionLastChanged(operator);
+        if (changed != 0) return changed;
+        uint64 bonded = regionView.firstBondedAt(operator);
+        uint64 gate = regionView.regionGateActivatedAt();
+        return bonded > gate ? bonded : gate;
+    }
+
+    /// @dev Left-aligned `bytes32` cast of a region string, matching the
+    ///      `bytes32("US")` convention used for entry keys. Region strings are
+    ///      bounded to `MAX_REGION_HINT_BYTES` (16) in `CapacityBond`, so the
+    ///      first word is the full value; the empty string ("" — no previous
+    ///      region) maps to `bytes32(0)`, which never equals a real entry key.
+    function _toRegionKey(string memory s) internal pure returns (bytes32 key) {
+        bytes memory b = bytes(s);
+        if (b.length == 0) return bytes32(0);
+        // solhint-disable-next-line no-inline-assembly
+        assembly {
+            key := mload(add(b, 32))
+        }
     }
 
     function _enforceAppealBondBounds(uint256 value) internal pure {

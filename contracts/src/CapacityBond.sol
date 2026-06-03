@@ -13,6 +13,7 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
 import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.sol";
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
+import { ICapacityBondRegionView, NodeInfo } from "./interfaces/ICapacityBondRegionView.sol";
 import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
 import { BondMath } from "./BondMath.sol";
@@ -62,6 +63,7 @@ contract CapacityBond is
     ICapacityBond,
     ICapacityBondSlashEscrow,
     ICapacityBondEjector,
+    ICapacityBondRegionView,
     ICapacityBondReporter,
     AccessControl,
     ReentrancyGuard,
@@ -222,6 +224,17 @@ contract CapacityBond is
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     uint64 public immutable genesisCreditWindowEnd;
 
+    /// @notice One-time contract-global ADR 030 § Region-stability window
+    ///         gate-activation timestamp. This contract is constructor-deployed
+    ///         (no proxy), so the deploy *is* the introduction of the region
+    ///         gate; set to `block.timestamp` here. It is the lower bound of the
+    ///         `effective` fallback (`max(firstBondedAt, regionGateActivatedAt)`)
+    ///         for operators that have never called `updateRegion`, ensuring a
+    ///         freshly-deployed gate starts its clock at deploy rather than
+    ///         inheriting an ancient `firstBondedAt`. Read via `regionEligibility`.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    uint64 public immutable override regionGateActivatedAt;
+
     // -----------------------------------------------------------------
     // Storage — bonding
     // -----------------------------------------------------------------
@@ -297,16 +310,16 @@ contract CapacityBond is
     ///         this revision — ContentBlacklist's scope test currently
     ///         covers only GLOBAL ∪ region; the ripening leg lands with the
     ///         ADR 030 enforcement PR.
-    mapping(address operator => string) public regionPrev;
+    mapping(address operator => string) public override regionPrev;
 
     /// @notice Last `updateRegion` timestamp; 0 means region has never been
     ///         changed (initial value from `registerNode` is final until the
     ///         first explicit update).
-    mapping(address operator => uint64) public regionLastChanged;
+    mapping(address operator => uint64) public override regionLastChanged;
 
     /// @notice Cooldown enforced between `updateRegion` calls per ADR 030
     ///         (default 7 days; governable [3d, 30d]).
-    uint256 public regionStabilityWindow;
+    uint256 public override regionStabilityWindow;
 
     /// @notice Number of epochs after a slash during which
     ///         `claimVestedCredit` is blocked. Default 13 (≈ one quarter),
@@ -396,19 +409,10 @@ contract CapacityBond is
     // NodeId binding per ADR 003 — payments authorization)
     // -----------------------------------------------------------------
 
-    struct NodeInfo {
-        bytes32 nodeId;
-        // `ethAddress` (20B) + `active` (1B) + `lastMultiaddrUpdate` (8B) =
-        // 29 bytes — pack into one storage slot. Don't separate or widen
-        // any of these three without re-checking the packing or every
-        // `_writeNodeInfo` pays an extra SSTORE.
-        address ethAddress;
-        bool active;
-        uint64 lastMultiaddrUpdate;
-        bytes multiaddrs;
-        string regionHint;
-    }
-
+    // `NodeInfo` is a file-level struct in `ICapacityBondRegionView.sol`
+    // (imported above) so the read-surface interface and this contract share
+    // one definition. The storage-packing constraint on
+    // `ethAddress`/`active`/`lastMultiaddrUpdate` is documented there.
     mapping(address operator => NodeInfo) internal _nodes;
     mapping(bytes32 nodeId => address operator) public nodeIdToAddress;
     mapping(address operator => bytes32 nodeId) public addressToNodeId;
@@ -583,6 +587,7 @@ contract CapacityBond is
         maxMultiaddrSize = maxMultiaddrSize_;
         regionStabilityWindow = regionStabilityWindow_;
         genesisCreditWindowEnd = uint64(block.timestamp + genesisCreditWindow_);
+        regionGateActivatedAt = uint64(block.timestamp);
         // Default the claim slash gate to 13 epochs (matches FeeRouter's
         // initial `windowEpochs` default). Governance can retune via
         // `setClaimSlashGateEpochs` in lock-step with FeeRouter changes.
@@ -1485,7 +1490,12 @@ contract CapacityBond is
     }
 
     /// @inheritdoc ICapacityBond
-    function firstBondedAt(address operator) external view override returns (uint64) {
+    function firstBondedAt(address operator)
+        external
+        view
+        override(ICapacityBond, ICapacityBondRegionView)
+        returns (uint64)
+    {
         return _firstBondedAt[operator];
     }
 
@@ -1528,7 +1538,7 @@ contract CapacityBond is
         return _nodes[ethAddress];
     }
 
-    function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory) {
+    function getNodeByAddress(address ethAddress) external view override returns (NodeInfo memory) {
         return _nodes[ethAddress];
     }
 

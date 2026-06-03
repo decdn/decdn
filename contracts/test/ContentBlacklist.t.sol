@@ -8,18 +8,7 @@ import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.so
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 import { Token } from "../src/Token.sol";
-
-contract MockEjector is ICapacityBondEjector {
-    address[] public ejected;
-
-    function ejectNode(address operator) external override {
-        ejected.push(operator);
-    }
-
-    function ejectedCount() external view returns (uint256) {
-        return ejected.length;
-    }
-}
+import { MockRegionBond } from "./mocks/MockRegionBond.sol";
 
 /// @title ContentBlacklist smoke tests
 /// @notice Critical-path coverage for hash/operator blacklist, cross-contract
@@ -27,7 +16,7 @@ contract MockEjector is ICapacityBondEjector {
 ///         + reverse paths, and the SF-M1 `MissingRegion` revert.
 contract ContentBlacklistTest is Test {
     Token internal token;
-    MockEjector internal bondMock;
+    MockRegionBond internal bondMock;
     ContentBlacklist internal blacklist;
 
     address internal admin = address(0xA11CE);
@@ -42,8 +31,17 @@ contract ContentBlacklistTest is Test {
 
     function setUp() public {
         token = new Token(admin);
-        bondMock = new MockEjector();
+        bondMock = new MockRegionBond();
         blacklist = new ContentBlacklist(ICapacityBondEjector(address(bondMock)), token, admin, APPEAL_BOND);
+
+        // Grant the filer ripe path-2 (Operator) standing in REGION_US so the
+        // appeal-lifecycle tests below exercise the {open → fast-track →
+        // ratify/reverse/lapse} state machine, not the standing gate. These
+        // tests don't probe ripening: window = 0 makes standing ripe at any
+        // timestamp. The ADR 030 ripening boundary itself is covered in
+        // ContentBlacklistRegionScope.t.sol and CapacityBondRegionE2E.t.sol.
+        bondMock.setWindow(0);
+        bondMock.setNode(filer, "US", "", 0, 0);
 
         // Fund filer for appeal bonds.
         vm.prank(admin);

@@ -27,11 +27,19 @@ contract CapacityBondRegionE2ETest is Test {
     CapacityBond internal bond;
 
     address internal admin = address(0xA11CE);
+    address internal regionalBody = address(0xDE);
+    address internal multisig = address(0xC0DE);
 
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING = 7 days;
     uint256 internal constant REGION_WINDOW = 7 days;
     uint256 internal constant APPEAL_BOND = 100e18;
+
+    // Region keys must equal `_toRegionKey(regionHint)` — the left-aligned
+    // `bytes32(bytes(s))` cast `ContentBlacklist` applies — so the entry key
+    // and the node's attested string match. The node registers as "us-east".
+    bytes32 internal constant REGION_US_EAST = bytes32("us-east");
+    bytes32 internal constant REGION_EU_WEST = bytes32("eu-west");
 
     // ===================================================================
     // AUTO-GENERATED — do not edit by hand.
@@ -195,14 +203,14 @@ contract CapacityBondRegionE2ETest is Test {
     /// @notice The cross-contract eject path: `ContentBlacklist.addOperator`
     ///         (GOVERNANCE_ROLE) calls `CapacityBond.ejectNode` (BLACKLIST_ROLE),
     ///         deactivating the node and bumping `registrationNonce`.
-    /// @dev    Issue #689 scope item #3 asks to cover the eject "triggered when
-    ///         `regionLastChanged` falls outside the attestation window." That
-    ///         region-ripening trigger has no production implementation in this
-    ///         revision — `CapacityBond.sol` (region-attestation storage doc)
-    ///         defers the predicate that reads `regionPrev` / `regionLastChanged`
-    ///         to the ADR 030 enforcement PR, and no contract reads those slots
-    ///         today. So this covers the only cross-contract eject path that
-    ///         exists: the blacklist-driven one. See the note on issue #689.
+    /// @dev    The region-ripening eligibility predicate that #689 scope item #3
+    ///         anticipated now exists (ADR 030 enforcement, this PR): it is
+    ///         `ContentBlacklist.isOperatorInBlacklistScope`, reading
+    ///         `regionPrev` / `regionLastChanged` via `CapacityBond`'s region
+    ///         view. The ripened/unripened slash-eligibility behavior is covered
+    ///         in `test_blacklistScope_ripenedVsUnripenedRegionChange` and
+    ///         `test_crossContractSlashEligibility_unripenedRegionChange` below;
+    ///         this test covers the operator-blacklist-driven eject path.
     function test_crossContractEject_viaContentBlacklist() public {
         _bondAndRegister();
 
@@ -236,8 +244,109 @@ contract CapacityBondRegionE2ETest is Test {
     }
 
     // ----------------------------------------------------------------------
+    // ADR 030 enforcement — blacklist-scope ripening predicate (end-to-end)
+    // ----------------------------------------------------------------------
+
+    /// @notice ADR 030 § Eligibility over a real registration: a region change
+    ///         adds the new region's entries immediately but keeps the previous
+    ///         region's entries in scope until the change ripens. The node flips
+    ///         us-east → eu-west; a us-east entry stays in scope while
+    ///         `block.timestamp - effective < window` and drops out once the
+    ///         window elapses, while the eu-west entry is in scope throughout.
+    function test_blacklistScope_ripenedVsUnripenedRegionChange() public {
+        _bondAndRegister();
+        ContentBlacklist bl = _deployBlacklistWithBody();
+
+        // Flip region (first update is cooldown-exempt); effective == now.
+        vm.prank(REG_OPERATOR);
+        bond.updateRegion("eu-west");
+        uint64 changedAt = bond.regionLastChanged(REG_OPERATOR);
+
+        bytes32 oldHash = bytes32(uint256(1));
+        bytes32 newHash = bytes32(uint256(2));
+        vm.prank(regionalBody);
+        bl.addHashRegional(REGION_US_EAST, oldHash);
+        vm.prank(regionalBody);
+        bl.addHashRegional(REGION_EU_WEST, newHash);
+
+        // Unripened: previous region's entry still applies; new region applies now.
+        assertTrue(bl.isOperatorInBlacklistScope(REG_OPERATOR, oldHash, REGION_US_EAST));
+        assertTrue(bl.isOperatorInBlacklistScope(REG_OPERATOR, newHash, REGION_EU_WEST));
+
+        // Ripened: previous region drops out; current region remains.
+        vm.warp(uint256(changedAt) + REGION_WINDOW + 1);
+        assertFalse(bl.isOperatorInBlacklistScope(REG_OPERATOR, oldHash, REGION_US_EAST));
+        assertTrue(bl.isOperatorInBlacklistScope(REG_OPERATOR, newHash, REGION_EU_WEST));
+    }
+
+    /// @notice Issue #689 scope item #3: a region flip cannot shed slash
+    ///         exposure for an entry in the region the node just left until the
+    ///         change ripens. The predicate is the slash-eligibility signal an
+    ///         off-chain judge consults — the on-chain `SlashJudge` challenge
+    ///         path is GLOBAL-only (`SlashJudge._checkBlacklistedBefore`), so
+    ///         there is no state-changing slash call to make here.
+    function test_crossContractSlashEligibility_unripenedRegionChange() public {
+        _bondAndRegister();
+        ContentBlacklist bl = _deployBlacklistWithBody();
+
+        vm.prank(REG_OPERATOR);
+        bond.updateRegion("eu-west");
+
+        bytes32 hash = bytes32(uint256(0xBEEF));
+        vm.prank(regionalBody);
+        bl.addHashRegional(REGION_US_EAST, hash);
+
+        // Still slashable under the just-left region (unripened)...
+        assertTrue(bl.isOperatorInBlacklistScope(REG_OPERATOR, hash, REGION_US_EAST));
+        // ...but never slashable for a region it neither serves nor served.
+        assertFalse(bl.isOperatorInBlacklistScope(REG_OPERATOR, hash, bytes32("ap-south")));
+    }
+
+    /// @notice ADR 011 § Standing path-2 over a real registration: a freshly
+    ///         bonded operator's `effective` (no `updateRegion` ⇒
+    ///         `max(firstBondedAt, regionGateActivatedAt)`) sits inside the
+    ///         window, so permissionless standing is denied until it ripens.
+    function test_path2Standing_ripensWithRegion() public {
+        _bondAndRegister();
+        ContentBlacklist bl = _deployBlacklistWithBody();
+        vm.prank(REG_OPERATOR);
+        token.approve(address(bl), type(uint256).max);
+
+        bytes32 hash = bytes32(uint256(0xCAFE));
+        vm.prank(regionalBody);
+        bl.addHashRegional(REGION_US_EAST, hash);
+
+        uint64 firstBonded = bond.firstBondedAt(REG_OPERATOR);
+        uint64 gate = bond.regionGateActivatedAt();
+        uint64 effective = firstBonded > gate ? firstBonded : gate;
+        uint64 readyAt = effective + uint64(REGION_WINDOW);
+
+        // Inside the window: standing not yet ripe.
+        vm.prank(REG_OPERATOR);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.RegionNotRipened.selector, readyAt));
+        bl.openBlacklistAppeal(hash, REGION_US_EAST, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+
+        // After the window: standing ripens and the appeal opens.
+        vm.warp(uint256(readyAt) + 1);
+        vm.prank(REG_OPERATOR);
+        bl.openBlacklistAppeal(hash, REGION_US_EAST, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        assertTrue(bl.hasActiveAppeal(REGION_US_EAST, hash));
+    }
+
+    // ----------------------------------------------------------------------
     // Helpers
     // ----------------------------------------------------------------------
+
+    /// @dev Deploy a `ContentBlacklist` wired to the live `bond` and grant the
+    ///      regional-body role used to seed regional entries.
+    function _deployBlacklistWithBody() internal returns (ContentBlacklist bl) {
+        bl = new ContentBlacklist(bond, token, admin, APPEAL_BOND);
+        // Cache the role getter before pranking — a nested external call inside
+        // the pranked statement would otherwise consume the prank.
+        bytes32 bodyRole = bl.REGIONAL_BODY_ROLE();
+        vm.prank(admin);
+        bl.grantRole(bodyRole, regionalBody);
+    }
 
     /// @dev Bond the minimum and register `REG_NODE_ID` with a fresh EIP-712
     ///      binding signature and the generated ed25519 ownership signature.
