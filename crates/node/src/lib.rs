@@ -16,5 +16,6 @@ pub mod dispatch;
 pub mod handlers;
 pub mod metrics;
 pub mod payment_settlement;
+pub mod receipt_log;
 pub mod runtime;
 pub mod selection;
