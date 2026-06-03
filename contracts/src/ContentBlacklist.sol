@@ -19,9 +19,12 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         appeal flows through the same {open → fast-track → ratify/reverse}
 ///         lifecycle as `SlashAppeal` slashing appeals.
 /// @dev    Simplifications vs. ADR 031 carried for this revision:
-///           - Synthetic-standing clawback (`StandingPath.TokenHolder`
-///             balance check) is deferred. Standing path is recorded but
-///             not enforced beyond an enum-range check at filing time.
+///           - Standing enforcement is partial: `StandingPath.Operator`
+///             filings require a current-region match (ADR 011 § Standing
+///             path 2, via ADR 030), but the `StandingPath.TokenHolder`
+///             synthetic-standing clawback (balance check at T and T+24h)
+///             is deferred — `Publisher`/`TokenHolder` are enum-range
+///             validated only at filing time.
 ///           - Per-region concurrent-appeal cap (`BODY_CONCURRENT_APPEAL_CAP`)
 ///             is enforced as a single hard ceiling per region, not by
 ///             requesting body identity.
@@ -347,10 +350,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             if (block.timestamp < nextAvailable) revert FrequencyCapHit(nextAvailable);
         }
 
-        // StandingPath is recorded but only enum-range validated; the
-        // synthetic-standing clawback (admissibility condition (c) per
-        // ADR 031 § 216 — `status == Open && standingPath == TokenHolder &&
-        // ...`) is deferred per the contract header note. The field is
+        // Enum-range check first. Operator standing additionally gets the
+        // current-region match below (ADR 011 § Standing path 2); the
+        // TokenHolder synthetic-standing clawback (admissibility condition (c)
+        // per ADR 031 § 216 — `status == Open && standingPath == TokenHolder &&
+        // ...`) is still deferred per the contract header note. The field is
         // persisted so the future on-chain clawback check can read it from
         // the appeal record without re-deriving it from event history.
         if (uint8(standingPath) > uint8(StandingPath.TokenHolder)) revert UnauthorizedStanding(standingPath);
