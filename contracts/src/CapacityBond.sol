@@ -231,7 +231,9 @@ contract CapacityBond is
     ///         `effective` fallback (`max(firstBondedAt, regionGateActivatedAt)`)
     ///         for operators that have never called `updateRegion`, ensuring a
     ///         freshly-deployed gate starts its clock at deploy rather than
-    ///         inheriting an ancient `firstBondedAt`. Read via `regionEligibility`.
+    ///         inheriting an ancient `firstBondedAt`. Consumed by
+    ///         `ContentBlacklist` (via `ICapacityBondRegionView`) when computing
+    ///         the `effective` timestamp for the ADR 030 ripening predicate.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     uint64 public immutable override regionGateActivatedAt;
 
@@ -305,11 +307,11 @@ contract CapacityBond is
     ///         predicate (*"a node is in scope iff the entry is global, OR
     ///         entry.region == regionHint, OR (block.timestamp - effective <
     ///         REGION_STABILITY_WINDOW AND entry.region == regionPrev)"*),
-    ///         which is an on-chain check that must consult this slot at
-    ///         scope-test / slash-eligibility time. No contract reads it in
-    ///         this revision — ContentBlacklist's scope test currently
-    ///         covers only GLOBAL ∪ region; the ripening leg lands with the
-    ///         ADR 030 enforcement PR.
+    ///         which is an on-chain check that consults this slot at
+    ///         scope-test / slash-eligibility time. Read by
+    ///         `ContentBlacklist.isOperatorInBlacklistScope` (via
+    ///         `ICapacityBondRegionView`) for the ripening leg of the scope /
+    ///         slash-eligibility test (ADR 030 enforcement).
     mapping(address operator => string) public override regionPrev;
 
     /// @notice Last `updateRegion` timestamp; 0 means region has never been
@@ -753,8 +755,9 @@ contract CapacityBond is
     ///         see the same source of truth. `regionPrev` retains the prior
     ///         value for the ADR 030 § 52 blacklist-scope ripening predicate
     ///         ("the previous region's entries keep applying until the change
-    ///         ripens"); the on-chain enforcement of that predicate lands with
-    ///         the ADR 030 implementation PR and is not active in this revision.
+    ///         ripens"); that predicate is enforced by
+    ///         `ContentBlacklist.isOperatorInBlacklistScope` and the path-2
+    ///         standing check, reading `regionPrev` via `ICapacityBondRegionView`.
     function updateRegion(string calldata newRegion) external whenNotPaused {
         if (bytes(newRegion).length > MAX_REGION_HINT_BYTES) {
             revert RegionHintTooLong({ size: bytes(newRegion).length, ceiling: MAX_REGION_HINT_BYTES });

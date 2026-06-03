@@ -563,16 +563,22 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     /// @dev Left-aligned `bytes32` cast of a region string, matching the
     ///      `bytes32("US")` convention used for entry keys. Region strings are
-    ///      bounded to `MAX_REGION_HINT_BYTES` (16) in `CapacityBond`, so the
-    ///      first word is the full value; the empty string ("" — no previous
-    ///      region) maps to `bytes32(0)`, which never equals a real entry key.
+    ///      bounded to `MAX_REGION_HINT_BYTES` (16) in `CapacityBond`. The empty
+    ///      string ("" — no previous region) maps to `bytes32(0)`, which never
+    ///      equals a real entry key.
     function _toRegionKey(string memory s) internal pure returns (bytes32 key) {
         bytes memory b = bytes(s);
-        if (b.length == 0) return bytes32(0);
+        uint256 len = b.length;
+        if (len == 0) return bytes32(0);
         // solhint-disable-next-line no-inline-assembly
         assembly {
             key := mload(add(b, 32))
         }
+        // `mload` reads a full word; the bytes past `len` are not guaranteed
+        // zero in every memory path. Mask them off so the key is the
+        // left-aligned region value only, matching the `bytes32("US")` entry
+        // keys regardless of upstream memory state.
+        if (len < 32) key = bytes32(uint256(key) & (type(uint256).max << (8 * (32 - len))));
     }
 
     function _enforceAppealBondBounds(uint256 value) internal pure {
