@@ -229,7 +229,7 @@ The `solidity-gas-snapshot` CI job posts a sticky PR comment with the diff so re
 
 **One-command setup:** from `contracts/`, run [`./dev-deploy.sh`](contracts/dev-deploy.sh). It boots Anvil, deploys the USDC mock + full protocol + a funded TOKEN faucet, prints the deployed addresses, and stays in the foreground (Ctrl-C tears it all down). The manual steps below show what it does end to end.
 
-Run everything from `contracts/`. The addresses/keys below are Anvil's deterministic defaults (account #0 and #1); never use them anywhere but a local chain.
+Run everything from `contracts/`. The addresses/keys below are Anvil's deterministic defaults (accounts #0–#2); never use them anywhere but a local chain.
 
 ```bash
 # 1. Start a local chain (chain id 31337). Leave running in another terminal.
@@ -242,12 +242,13 @@ USDC=$(forge create test/mocks/MintableUSDC.sol:MintableUSDC \
   --broadcast --json | jq -r .deployedTo)
 
 # 3. Deploy the protocol. The four addresses are required; for local testing any
-#    EOA works (here: account #1 for the first two, #2 for the pool). The
-#    deployer is whoever `--sender` is — it must NOT be forge's default sender,
-#    so pass it explicitly.
+#    EOA works. EMERGENCY_MULTISIG is account #1 and CHALLENGER_INCENTIVE_POOL is
+#    account #2; INITIAL_TOKEN_HOLDER is the deployer (account #0, the `--sender`)
+#    so it holds the genesis TOKEN and can later fund the faucet. The deployer
+#    must NOT be forge's default sender, so always pass `--sender` explicitly.
 USDC_ADDRESS=$USDC \
 EMERGENCY_MULTISIG=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 \
-INITIAL_TOKEN_HOLDER=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 \
+INITIAL_TOKEN_HOLDER=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
 CHALLENGER_INCENTIVE_POOL=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC \
 forge script script/DeployProtocol.s.sol:DeployProtocol \
   --rpc-url http://127.0.0.1:8545 \

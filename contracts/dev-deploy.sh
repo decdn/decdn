@@ -55,22 +55,27 @@ if cast block-number --rpc-url "$RPC_URL" >/dev/null 2>&1; then
   die "something is already listening on ${RPC_URL}; stop it or run with RPC_PORT=<other port>"
 fi
 
-log "starting anvil on ${RPC_URL} (log: /tmp/decdn-anvil.log)"
-anvil --port "$RPC_PORT" >/tmp/decdn-anvil.log 2>&1 &
+ANVIL_LOG=$(mktemp)
+log "starting anvil on ${RPC_URL} (log: ${ANVIL_LOG})"
+# Pin --chain-id so the manifest path (deployments/<block.chainid>.json) is
+# guaranteed to match the CHAIN_ID we read back, regardless of anvil's default.
+anvil --port "$RPC_PORT" --chain-id "$CHAIN_ID" >"$ANVIL_LOG" 2>&1 &
 ANVIL_PID=$!
-trap 'kill "$ANVIL_PID" 2>/dev/null || true' EXIT INT TERM
+# Bash runs the EXIT trap on SIGINT/SIGTERM death too, so EXIT alone covers
+# Ctrl-C and preserves the 130 exit status.
+trap 'kill "$ANVIL_PID" 2>/dev/null || true; rm -f "$ANVIL_LOG"' EXIT
 
 # Wait for the RPC to accept requests (bounded ~15s). Bail early if anvil
 # already exited — e.g. the port is in use — so we surface that immediately
 # instead of spinning the full timeout against a dead endpoint.
 for _ in $(seq 1 30); do
   kill -0 "$ANVIL_PID" 2>/dev/null \
-    || die "anvil exited during startup (port ${RPC_PORT} in use?):"$'\n'"$(tail -n 20 /tmp/decdn-anvil.log)"
+    || die "anvil exited during startup (port ${RPC_PORT} in use?):"$'\n'"$(tail -n 20 "$ANVIL_LOG")"
   if cast block-number --rpc-url "$RPC_URL" >/dev/null 2>&1; then break; fi
   sleep 0.5
 done
 cast block-number --rpc-url "$RPC_URL" >/dev/null 2>&1 \
-  || die "anvil did not become ready on ${RPC_URL}:"$'\n'"$(tail -n 20 /tmp/decdn-anvil.log)"
+  || die "anvil did not become ready on ${RPC_URL}:"$'\n'"$(tail -n 20 "$ANVIL_LOG")"
 
 # --- Deploy mock USDC --------------------------------------------------------
 log "deploying MintableUSDC mock"
