@@ -22,8 +22,8 @@ use decdn_common::admin::{
     CONFIG_PATH_UNSET_CODE, ChannelSnapshot, ChannelsResponse, DHT_POISONED_CODE,
     DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
     HealthResponse, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE,
-    RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth, StatusResponse,
-    parse_hash_arg,
+    RecordStoreHealth, RegionStatsResponse, ReloadResponse, RepublishHealth, RoutingHealth,
+    StatusResponse, parse_hash_arg,
 };
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use decdn_incentive::{ChannelState, ChannelStateStore, VoucherActivity};
@@ -723,6 +723,17 @@ impl AdminRpcServer for AdminRpcImpl {
         Ok(ChannelsResponse {
             channels,
             redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
+        })
+    }
+
+    /// Return cumulative per-region bandwidth counters (issue #750).
+    ///
+    /// Stub: the `RegionAccountant` wiring is added in a later task. Until
+    /// then, return an empty list — callers treat an empty list as "no
+    /// accounting wired", not an error.
+    async fn region_stats(&self) -> RpcResult<RegionStatsResponse> {
+        Ok(RegionStatsResponse {
+            regions: Vec::new(),
         })
     }
 }
