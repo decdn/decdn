@@ -110,6 +110,18 @@ since project inception and will roll into the first tagged release.
   operator scripts that match a `\.\d{3}` regex must update to
   `\.\d+`.
 
+### Changed
+
+#### Gossip
+
+- Gossip publisher / subscriber / TTL-sweeper tasks now shut down
+  cooperatively via a `CancellationToken` owned by `GossipService`,
+  instead of the runtime reaching in with `JoinHandle::abort()` (#805).
+  Each loop returns at a clean await boundary on cancellation — including
+  interrupting the subscriber's reconnect backoff — so the drain phase
+  finishes promptly without abrupt mid-await cancellation. Lifecycle
+  ownership only; no steady-state behavior change.
+
 ### Added
 
 #### Node runtime & wire protocol
