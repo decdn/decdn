@@ -15,6 +15,7 @@ import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
+import { ISlashJudgeEvidenceView } from "./interfaces/ISlashJudgeEvidenceView.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
 import { BondMath } from "./BondMath.sol";
 import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
@@ -230,6 +231,17 @@ contract CapacityBond is
     uint256 public minBond;
     uint256 public unbondingPeriod;
 
+    /// @notice SlashJudge view used to enforce the paired
+    ///         `maxEvidenceAgeUs < unbondingPeriod * 1e6` invariant on
+    ///         `setUnbondingPeriod` (ADR 014 § Interaction with unbonding period).
+    ///         Wired post-deploy via `setSlashJudge` because SlashJudge is deployed
+    ///         after CapacityBond (deploy-order circular dependency). While unset
+    ///         (`address(0)`), `setUnbondingPeriod` applies only the live
+    ///         `[UNBONDING_PERIOD_FLOOR, UNBONDING_PERIOD_CEILING]` bound — the
+    ///         testnet `[3d,30d]` window, which intentionally deviates from ADR
+    ///         014/009's `[7d,60d]` spec (see the bounds' declaration note).
+    ISlashJudgeEvidenceView public slashJudge;
+
     /// @notice Governable declared-capacity band (Mbps) enforced on
     ///         `declareMbps`. Defaults: 10 Mbps floor, 200 Gbps (200_000 Mbps)
     ///         ceiling (ADR 026 § Capacity-bond curve).
@@ -386,6 +398,7 @@ contract CapacityBond is
     event KUpdated(uint256 oldValue, uint256 newValue);
     event AlphaUpdated(uint256 oldValue, uint256 newValue);
     event UnbondingPeriodUpdated(uint256 oldValue, uint256 newValue);
+    event SlashJudgeUpdated(address indexed oldJudge, address indexed newJudge);
     event MultiaddrUpdateCooldownUpdated(uint256 oldValue, uint256 newValue);
     event MaxMultiaddrSizeUpdated(uint256 oldValue, uint256 newValue);
     event RegionStabilityWindowUpdated(uint256 oldValue, uint256 newValue);
@@ -449,6 +462,12 @@ contract CapacityBond is
     error OperatorEjected();
     error NodeIdNotBound(bytes32 nodeId);
     error RegionHintTooLong(uint256 size, uint256 ceiling);
+
+    /// @dev `setUnbondingPeriod` would drop `unbondingPeriod * 1e6` to or below the
+    ///      live evidence-age ceiling, violating ADR 014's slash-before-withdraw
+    ///      invariant.
+    ///      Paired with `SlashJudge.EvidenceAgeExceedsUnbonding` (the other half).
+    error UnbondingBelowEvidenceAge(uint256 unbondingUs, uint256 maxEvidenceAgeUs);
 
     // ADR 030
     error RegionCooldownActive(uint64 readyAt);
@@ -1090,8 +1109,48 @@ contract CapacityBond is
         emit MaxCapacityMbpsUpdated(oldMax, newMax);
     }
 
+    /// @notice Wire the SlashJudge whose `maxEvidenceAgeUs` bounds how low
+    ///         `unbondingPeriod` may be set (ADR 014 § Interaction with unbonding
+    ///         period). Set post-deploy (SlashJudge is deployed after this
+    ///         contract). Re-settable by governance so a redeployed SlashJudge can
+    ///         be repointed; the zero address is rejected so the invariant cannot
+    ///         be silently disabled once wired.
+    function setSlashJudge(ISlashJudgeEvidenceView newSlashJudge) external onlyRole(GOVERNANCE_ROLE) {
+        if (address(newSlashJudge) == address(0)) revert ZeroAddress();
+        // Reject a judge that would violate the paired invariant against the CURRENT
+        // unbonding period (ADR 014): maxEvidenceAgeUs MUST stay strictly below
+        // unbondingPeriod * 1e6, so the invariant holds the instant the judge is
+        // wired, not only after the next setUnbondingPeriod. `unbondingPeriod` is
+        // bounded [3d,30d] so the multiply cannot overflow.
+        uint256 unbondingUs = unbondingPeriod * 1_000_000;
+        // `maxEvidenceAgeUs()` is a view on the about-to-be-wired `slashJudge`; this
+        // setter is GOVERNANCE_ROLE-gated, so no reentrancy vector (aderyn FP).
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        uint256 maxAgeUs = newSlashJudge.maxEvidenceAgeUs();
+        if (unbondingUs <= maxAgeUs) revert UnbondingBelowEvidenceAge(unbondingUs, maxAgeUs);
+        address old = address(slashJudge);
+        slashJudge = newSlashJudge;
+        emit SlashJudgeUpdated(old, address(newSlashJudge));
+    }
+
     function setUnbondingPeriod(uint256 newPeriod) external onlyRole(GOVERNANCE_ROLE) {
         _enforceUnbondingPeriodBounds(newPeriod);
+        // Paired cross-parameter invariant (ADR 014 § Interaction with unbonding
+        // period): the unbonding period (in microseconds) MUST stay strictly above
+        // the evidence-age ceiling, else a node could offend, unbond, and withdraw
+        // before evidence can be submitted. Mirrors SlashJudge._enforceUnbondingInvariant.
+        // Skipped until `slashJudge` is wired (deploy window); `newPeriod` is bounded
+        // [3d,30d] so `newPeriod * 1_000_000` cannot overflow.
+        ISlashJudgeEvidenceView judge = slashJudge;
+        if (address(judge) != address(0)) {
+            uint256 newPeriodUs = newPeriod * 1_000_000;
+            // `maxEvidenceAgeUs()` is a view on the governance-set `slashJudge`; this
+            // setter is GOVERNANCE_ROLE-gated, so the following state write is not a
+            // reentrancy vector (aderyn reentrancy-state-change FP).
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            uint256 maxAgeUs = judge.maxEvidenceAgeUs();
+            if (newPeriodUs <= maxAgeUs) revert UnbondingBelowEvidenceAge(newPeriodUs, maxAgeUs);
+        }
         uint256 oldPeriod = unbondingPeriod;
         unbondingPeriod = newPeriod;
         emit UnbondingPeriodUpdated(oldPeriod, newPeriod);

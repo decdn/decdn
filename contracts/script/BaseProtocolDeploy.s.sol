@@ -17,6 +17,7 @@ import { PaymentChannel } from "../src/PaymentChannel.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
+import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
@@ -377,6 +378,13 @@ abstract contract BaseProtocolDeploy is Script {
         // SlashJudge is the sole holder of SLASH_ROLE on CapacityBond (step 3) —
         // the only on-chain slash trigger.
         d.bond.grantRole(d.bond.SLASH_ROLE(), address(d.slashJudge));
+        // Wire the SlashJudge into CapacityBond so `setUnbondingPeriod` enforces the
+        // paired `maxEvidenceAgeUs < unbondingPeriod * 1e6` invariant (ADR 014 § Interaction
+        // with unbonding period). Must run before `_handOffGovernance` revokes
+        // GOVERNANCE_ROLE from the deployer. SlashJudge's constructor already enforced
+        // the other half against the bond's current unbondingPeriod, and
+        // `setSlashJudge` re-checks it at wire time, so this cannot revert here.
+        d.bond.setSlashJudge(ISlashJudgeEvidenceView(address(d.slashJudge)));
         // Wire the OriginAssignment → ContentBlacklist read direction (step 2);
         // deployer still holds GOVERNANCE_ROLE on OriginAssignment here.
         d.originAssignment.setContentBlacklist(address(d.blacklist));
@@ -468,6 +476,12 @@ abstract contract BaseProtocolDeploy is Script {
         _requireRole(d.slashJudge, d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
 
         // Address bindings from deployer-only setters.
+        // CapacityBond.slashJudge wires the ADR-014 paired-invariant view used by
+        // `setUnbondingPeriod`; an unwired binding leaves the invariant unenforced.
+        address boundSlashJudge = address(d.bond.slashJudge());
+        if (boundSlashJudge != address(d.slashJudge)) {
+            revert BindingNotWired(address(d.bond), address(d.slashJudge), boundSlashJudge);
+        }
         address boundBlacklist = d.originAssignment.contentBlacklist();
         if (boundBlacklist != address(d.blacklist)) {
             revert BindingNotWired(address(d.originAssignment), address(d.blacklist), boundBlacklist);

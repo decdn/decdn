@@ -14,8 +14,10 @@ import { FeeRouter } from "../src/FeeRouter.sol";
 import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
+import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
+import { MockSlashJudgeEvidence } from "./mocks/MockSlashJudgeEvidence.sol";
 
 contract DeployUSDC is ERC20 {
     constructor() ERC20("USDC", "USDC") { }
@@ -167,6 +169,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         );
         assertTrue(d.bond.hasRole(d.bond.SLASH_ROLE(), address(d.slashJudge)), "slashJudge holds SLASH_ROLE on bond");
         assertEq(d.originAssignment.contentBlacklist(), address(d.blacklist), "originAssignment blacklist binding");
+        assertEq(address(d.bond.slashJudge()), address(d.slashJudge), "bond slashJudge binding");
     }
 
     function test_crossContractWiring_slashAppealChallengerPool() public view {
@@ -241,6 +244,35 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
 
     function externalAssertNoBackDoors(DeployConfig calldata cfg2, Deployment calldata d2) external view {
         _assertNoBackDoors(cfg2, d2);
+    }
+
+    // Negative test: `_assertPeerRolesWired` must REVERT when the CapacityBond
+    // slashJudge binding does not match `d.slashJudge`. Proves the post-deploy
+    // BindingNotWired guard for the ADR-014 paired-invariant view is real, not a
+    // no-op. Routed through an external wrapper because `vm.expectRevert` only
+    // catches reverts at external-call boundaries.
+
+    function test_assertPeerRolesWired_revertsWhenSlashJudgeMisbound() public {
+        DeployConfig memory cfg2 = _testConfig();
+        Deployment memory d2 = _deployTargets(cfg2, _deployTimelock(cfg2));
+        _deployGovernor(cfg2, d2);
+        _wireCrossContractRoles(cfg2, d2);
+        // Re-point slashJudge to a different (valid) judge so the binding no longer
+        // matches d2.slashJudge. Deployer still holds GOVERNANCE_ROLE (handoff skipped),
+        // and a 1-day judge satisfies the wire-time invariant (14d*1e6 > 1d*1e6).
+        MockSlashJudgeEvidence wrong = new MockSlashJudgeEvidence(uint256(1 days) * 1_000_000);
+        vm.prank(cfg2.deployer);
+        d2.bond.setSlashJudge(ISlashJudgeEvidenceView(address(wrong)));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.BindingNotWired.selector, address(d2.bond), address(d2.slashJudge), address(wrong)
+            )
+        );
+        this.externalAssertPeerRolesWired(cfg2, d2);
+    }
+
+    function externalAssertPeerRolesWired(DeployConfig calldata cfg2, Deployment calldata d2) external view {
+        _assertPeerRolesWired(cfg2, d2);
     }
 
     // Negative test for the OTHER half of the symmetric guard: a handoff that
