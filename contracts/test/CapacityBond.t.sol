@@ -11,6 +11,8 @@ import { Token } from "../src/Token.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
+import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
+import { MockSlashJudgeEvidence } from "./mocks/MockSlashJudgeEvidence.sol";
 
 /// @title CapacityBond smoke tests
 /// @notice Minimal coverage of the new ADR 036/028/030/026-v2.2 surface:
@@ -34,6 +36,10 @@ contract CapacityBondTest is Test {
 
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING = 7 days;
+    // 10 days in microseconds — a valid evidence-age ceiling (within [1d,30d])
+    // that is also >= the [7d,60d] unbonding floor, so the mirror check and the
+    // individual bound can be exercised independently.
+    uint256 internal constant MOCK_EVIDENCE_AGE_US = 10 days * 1_000_000;
 
     function setUp() public {
         token = new Token(admin);
@@ -1168,5 +1174,31 @@ contract CapacityBondTest is Test {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(opPk, digest);
         return abi.encodePacked(r, s, v);
+    }
+
+    // -----------------------------------------------------------------
+    // setSlashJudge (ADR 014 § Interaction with unbonding period)
+    // -----------------------------------------------------------------
+
+    function test_setSlashJudge_revertsWithoutRole() public {
+        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US);
+        vm.prank(operator); // not GOVERNANCE_ROLE
+        vm.expectRevert();
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
+    }
+
+    function test_setSlashJudge_revertsOnZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(CapacityBond.ZeroAddress.selector);
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(0)));
+    }
+
+    function test_setSlashJudge_setsAndEmits() public {
+        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US);
+        vm.prank(admin);
+        vm.expectEmit(true, true, false, false, address(bond));
+        emit CapacityBond.SlashJudgeUpdated(address(0), address(judge));
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
+        assertEq(address(bond.slashJudge()), address(judge));
     }
 }

@@ -15,6 +15,7 @@ import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
+import { ISlashJudgeEvidenceView } from "./interfaces/ISlashJudgeEvidenceView.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
 import { BondMath } from "./BondMath.sol";
 import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
@@ -230,6 +231,14 @@ contract CapacityBond is
     uint256 public minBond;
     uint256 public unbondingPeriod;
 
+    /// @notice SlashJudge view used to enforce the paired
+    ///         `maxEvidenceAgeUs < unbondingPeriod * 1e6` invariant on
+    ///         `setUnbondingPeriod` (ADR 014 § Interaction with unbonding period).
+    ///         Wired post-deploy via `setSlashJudge` because SlashJudge is deployed
+    ///         after CapacityBond (deploy-order circular dependency). While unset
+    ///         (`address(0)`), `setUnbondingPeriod` applies only the [7d,60d] bound.
+    ISlashJudgeEvidenceView public slashJudge;
+
     /// @notice Governable declared-capacity band (Mbps) enforced on
     ///         `declareMbps`. Defaults: 10 Mbps floor, 200 Gbps (200_000 Mbps)
     ///         ceiling (ADR 026 § Capacity-bond curve).
@@ -386,6 +395,7 @@ contract CapacityBond is
     event KUpdated(uint256 oldValue, uint256 newValue);
     event AlphaUpdated(uint256 oldValue, uint256 newValue);
     event UnbondingPeriodUpdated(uint256 oldValue, uint256 newValue);
+    event SlashJudgeUpdated(address indexed oldJudge, address indexed newJudge);
     event MultiaddrUpdateCooldownUpdated(uint256 oldValue, uint256 newValue);
     event MaxMultiaddrSizeUpdated(uint256 oldValue, uint256 newValue);
     event RegionStabilityWindowUpdated(uint256 oldValue, uint256 newValue);
@@ -449,6 +459,11 @@ contract CapacityBond is
     error OperatorEjected();
     error NodeIdNotBound(bytes32 nodeId);
     error RegionHintTooLong(uint256 size, uint256 ceiling);
+
+    /// @dev `setUnbondingPeriod` would drop `unbondingPeriod * 1e6` to or below the
+    ///      live evidence-age ceiling, violating ADR 014's slash-before-withdraw
+    ///      invariant.
+    error UnbondingBelowEvidenceAge(uint256 unbondingUs, uint256 maxEvidenceAgeUs);
 
     // ADR 030
     error RegionCooldownActive(uint64 readyAt);
@@ -1088,6 +1103,19 @@ contract CapacityBond is
         uint256 oldMax = maxCapacityMbps;
         maxCapacityMbps = newMax;
         emit MaxCapacityMbpsUpdated(oldMax, newMax);
+    }
+
+    /// @notice Wire the SlashJudge whose `maxEvidenceAgeUs` bounds how low
+    ///         `unbondingPeriod` may be set (ADR 014 § Interaction with unbonding
+    ///         period). Set post-deploy (SlashJudge is deployed after this
+    ///         contract). Re-settable by governance so a redeployed SlashJudge can
+    ///         be repointed; the zero address is rejected so the invariant cannot
+    ///         be silently disabled once wired.
+    function setSlashJudge(ISlashJudgeEvidenceView newSlashJudge) external onlyRole(GOVERNANCE_ROLE) {
+        if (address(newSlashJudge) == address(0)) revert ZeroAddress();
+        address old = address(slashJudge);
+        slashJudge = newSlashJudge;
+        emit SlashJudgeUpdated(old, address(newSlashJudge));
     }
 
     function setUnbondingPeriod(uint256 newPeriod) external onlyRole(GOVERNANCE_ROLE) {
