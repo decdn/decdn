@@ -8,6 +8,8 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
+import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
+import { RegionScopeLib } from "./RegionScopeLib.sol";
 
 /// @title ContentBlacklist
 /// @notice Global + regional hash blacklist, operator-level blacklist, and
@@ -17,9 +19,12 @@ import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 ///         appeal flows through the same {open → fast-track → ratify/reverse}
 ///         lifecycle as `SlashAppeal` slashing appeals.
 /// @dev    Simplifications vs. ADR 031 carried for this revision:
-///           - Synthetic-standing clawback (`StandingPath.TokenHolder`
-///             balance check) is deferred. Standing path is recorded but
-///             not enforced beyond an enum-range check at filing time.
+///           - Standing enforcement is partial: `StandingPath.Operator`
+///             filings require a current-region match (ADR 011 § Standing
+///             path 2, via ADR 030), but the `StandingPath.TokenHolder`
+///             synthetic-standing clawback (balance check at T and T+24h)
+///             is deferred — `Publisher`/`TokenHolder` are enum-range
+///             validated only at filing time.
 ///           - Per-region concurrent-appeal cap (`BODY_CONCURRENT_APPEAL_CAP`)
 ///             is enforced as a single hard ceiling per region, not by
 ///             requesting body identity.
@@ -78,6 +83,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ICapacityBondEjector public immutable capacityBond;
+
+    /// @dev Same deployed `CapacityBond` as `capacityBond`, typed for the ADR 030
+    ///      region-scope read surface (current/prev region + ripening inputs).
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    ICapacityBondRegionView public immutable capacityBondRegion;
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ERC20Burnable public immutable token;
@@ -185,6 +195,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error HashHasActiveAppeal(bytes32 region, bytes32 hash);
     error FrequencyCapHit(uint64 nextAvailableAt);
     error UnauthorizedStanding(StandingPath path);
+    error OperatorRegionMismatch(bytes32 appealRegion, bytes32 filerRegion);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
 
     // -----------------------------------------------------------------
@@ -197,6 +208,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         }
         _enforceAppealBondBounds(appealBond_);
         capacityBond = capacityBond_;
+        capacityBondRegion = ICapacityBondRegionView(address(capacityBond_));
         token = token_;
         appealBond = appealBond_;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -267,6 +279,37 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         return _isLive(region, hash);
     }
 
+    /// @notice True iff `hash` is a live blacklist entry IN SCOPE for `operator`
+    ///         under the ADR 030 § Region-stability window ripening predicate:
+    ///         global ∪ current-region ∪ (within ripening window) prev-region.
+    ///         Read-only companion to the `SlashJudge` slash-eligibility gate
+    ///         (which additionally anchors each leg to the served-response time);
+    ///         this answers "in scope right now".
+    /// @dev    Reads the operator's region inputs from `CapacityBond` via
+    ///         `regionScopeData` and evaluates the predicate with `RegionScopeLib`.
+    // slither-disable-next-line unused-return
+    function isHashBlacklistedForOperator(bytes32 hash, address operator) external view returns (bool) {
+        if (_isLive(GLOBAL_REGION, hash)) return true;
+        (
+            string memory regionHint,
+            string memory regionPrev,
+            uint64 regionLastChanged,
+            uint64 firstBondedAt,
+            uint64 gateActivatedAt,
+            uint256 window
+        ) = capacityBondRegion.regionScopeData(operator);
+
+        uint64 effective = RegionScopeLib.effectiveSince(regionLastChanged, firstBondedAt, gateActivatedAt);
+        // forge-lint: disable-next-line(block-timestamp)
+        (bytes32 cur, bytes32 prev, bool prevApplies) = RegionScopeLib.scopedRegions(
+            GLOBAL_REGION, regionHint, regionPrev, uint64(block.timestamp), effective, window
+        );
+
+        if (cur != bytes32(0) && _isLive(cur, hash)) return true;
+        if (prevApplies && _isLive(prev, hash)) return true;
+        return false;
+    }
+
     function getHashEntry(bytes32 region, bytes32 hash) external view returns (HashEntry memory) {
         return _hashEntries[region][hash];
     }
@@ -275,6 +318,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // Appeals (ADR 031)
     // -----------------------------------------------------------------
 
+    // slither attributes the `regionScopeData` tuple-destructuring unused-return
+    // (path-2 standing check) to the enclosing function, so the directive sits here.
+    // slither-disable-next-line unused-return
     function openBlacklistAppeal(bytes32 hash, bytes32 region, bytes32 evidenceBundleHash, StandingPath standingPath)
         external
         nonReentrant
@@ -304,13 +350,30 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             if (block.timestamp < nextAvailable) revert FrequencyCapHit(nextAvailable);
         }
 
-        // StandingPath is recorded but only enum-range validated; the
-        // synthetic-standing clawback (admissibility condition (c) per
-        // ADR 031 § 216 — `status == Open && standingPath == TokenHolder &&
-        // ...`) is deferred per the contract header note. The field is
+        // Enum-range check first. Operator standing additionally gets the
+        // current-region match below (ADR 011 § Standing path 2); the
+        // TokenHolder synthetic-standing clawback (admissibility condition (c)
+        // per ADR 031 § 216 — `status == Open && standingPath == TokenHolder &&
+        // ...`) is still deferred per the contract header note. The field is
         // persisted so the future on-chain clawback check can read it from
         // the appeal record without re-deriving it from event history.
         if (uint8(standingPath) > uint8(StandingPath.TokenHolder)) revert UnauthorizedStanding(standingPath);
+
+        // ADR 011 § Standing path 2 (Operator): an operator only has standing on
+        // a regional entry whose region matches their current attested region.
+        // The ADR 030 ripening window is a SOFT norm here — in-window filings are
+        // "not auto-rejected … multisig discretion" — so we enforce only the hard
+        // current-region match, never a window revert. Global entries are appealable
+        // by an in-scope operator regardless of region.
+        if (standingPath == StandingPath.Operator && region != GLOBAL_REGION) {
+            // `regionScopeData` is a view on the trusted immutable `capacityBond`
+            // and this function is `nonReentrant`, so the later appeal-state writes
+            // are not a reentrancy vector (aderyn reentrancy-state-change FP).
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            (string memory filerRegion,,,,,) = capacityBondRegion.regionScopeData(msg.sender);
+            bytes32 filerKey = RegionScopeLib.pack(filerRegion);
+            if (filerKey != region) revert OperatorRegionMismatch(region, filerKey);
+        }
 
         IERC20(address(token)).safeTransferFrom(msg.sender, address(this), appealBond);
 

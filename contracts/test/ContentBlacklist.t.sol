@@ -7,10 +7,21 @@ import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.so
 
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
+import { ICapacityBondRegionView } from "../src/interfaces/ICapacityBondRegionView.sol";
 import { Token } from "../src/Token.sol";
 
-contract MockEjector is ICapacityBondEjector {
+/// @dev Doubles as the `ejectNode` sink and the ADR 030 region-scope read source
+///      (`ICapacityBondRegionView`) — production `CapacityBond` is both at one
+///      address, so the consumer reads region data off the same reference.
+contract MockEjector is ICapacityBondEjector, ICapacityBondRegionView {
     address[] public ejected;
+
+    mapping(address => string) internal _regionHint;
+    mapping(address => string) internal _regionPrev;
+    mapping(address => uint64) internal _regionLastChanged;
+    mapping(address => uint64) internal _firstBondedAt;
+    uint64 public gateActivatedAt;
+    uint256 public window = 7 days;
 
     function ejectNode(address operator) external override {
         ejected.push(operator);
@@ -18,6 +29,37 @@ contract MockEjector is ICapacityBondEjector {
 
     function ejectedCount() external view returns (uint256) {
         return ejected.length;
+    }
+
+    function setRegion(address op, string memory current, string memory prev, uint64 lastChanged) external {
+        _regionHint[op] = current;
+        _regionPrev[op] = prev;
+        _regionLastChanged[op] = lastChanged;
+    }
+
+    function setFirstBondedAt(address op, uint64 ts) external {
+        _firstBondedAt[op] = ts;
+    }
+
+    function setGate(uint64 ts, uint256 window_) external {
+        gateActivatedAt = ts;
+        window = window_;
+    }
+
+    function regionScopeData(address operator)
+        external
+        view
+        override
+        returns (string memory, string memory, uint64, uint64, uint64, uint256)
+    {
+        return (
+            _regionHint[operator],
+            _regionPrev[operator],
+            _regionLastChanged[operator],
+            _firstBondedAt[operator],
+            gateActivatedAt,
+            window
+        );
     }
 }
 
@@ -50,6 +92,12 @@ contract ContentBlacklistTest is Test {
         token.transfer(filer, APPEAL_BOND * 10);
         vm.prank(filer);
         token.approve(address(blacklist), type(uint256).max);
+
+        // The appeal-machinery tests below file under `StandingPath.Operator` on
+        // `REGION_US` entries, so the ADR 011 path-2 region match requires the
+        // filer's current attested region to be "US". (Region-match revert / soft
+        // norm behavior is covered explicitly in the path-2 tests.)
+        bondMock.setRegion(filer, "US", "", 0);
 
         // Grant multisig + regional body roles.
         bytes32 multisigRole = blacklist.EMERGENCY_MULTISIG_ROLE();
@@ -325,5 +373,126 @@ contract ContentBlacklistTest is Test {
         vm.warp(block.timestamp + 15 days);
         blacklist.cleanupExpiredBlacklistAppeal(appealId);
         assertFalse(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+    }
+
+    // -----------------------------------------------------------------
+    // ADR 011 § Standing path-2 (Operator) region match (ADR 030)
+    // -----------------------------------------------------------------
+
+    bytes32 internal constant REGION_EU = bytes32("EU");
+
+    function test_openBlacklistAppeal_operatorRegionMismatch_reverts() public {
+        // filer's attested region is "US" (set in setUp); appealing an "EU"
+        // regional entry under Operator standing must hard-revert.
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_EU, SAMPLE_HASH);
+        vm.prank(filer);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.OperatorRegionMismatch.selector, REGION_EU, REGION_US));
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+    }
+
+    function test_openBlacklistAppeal_inWindowFiling_notAutoRejected() public {
+        vm.warp(30 days); // headroom so the `- 1 days` stamp below doesn't underflow
+        // filer flipped US -> EU one day ago (region change has NOT ripened).
+        // A path-2 filing on the NEW current region (EU) must NOT be auto-rejected
+        // — the ripening window is a soft norm left to multisig (ADR 011).
+        bondMock.setRegion(filer, "EU", "US", uint64(block.timestamp - 1 days));
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_EU, SAMPLE_HASH);
+        vm.prank(filer);
+        uint256 appealId =
+            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        assertTrue(blacklist.hasActiveAppeal(REGION_EU, SAMPLE_HASH));
+        assertEq(appealId, 0);
+    }
+
+    function test_openBlacklistAppeal_globalEntry_skipsRegionCheck() public {
+        // Operator standing on a GLOBAL entry: region match is not applied
+        // (an in-scope operator can appeal a global entry regardless of region).
+        bondMock.setRegion(filer, "ZZ", "", 0); // deliberately non-matching
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH);
+        bytes32 globalRegion = bytes32("GLOBAL");
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, globalRegion, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        assertTrue(blacklist.hasActiveAppeal(globalRegion, SAMPLE_HASH));
+    }
+
+    function test_openBlacklistAppeal_nonOperatorStanding_skipsRegionCheck() public {
+        // Publisher standing is not region-gated even on a mismatched region.
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_EU, SAMPLE_HASH); // filer region is "US"
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Publisher);
+        assertTrue(blacklist.hasActiveAppeal(REGION_EU, SAMPLE_HASH));
+    }
+
+    // -----------------------------------------------------------------
+    // isHashBlacklistedForOperator read view (ADR 030 ripening predicate)
+    // -----------------------------------------------------------------
+
+    function test_isHashBlacklistedForOperator_global() public {
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH);
+        // Global applies to any operator regardless of region.
+        assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+    }
+
+    function test_isHashBlacklistedForOperator_currentRegion() public {
+        bondMock.setRegion(operator, "US", "", 0);
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+        // An operator in a different region is out of scope.
+        bondMock.setRegion(operator, "EU", "", 0);
+        assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+    }
+
+    function test_isHashBlacklistedForOperator_suspendedRegional_false() public {
+        bondMock.setRegion(operator, "US", "", 0);
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+        // Fast-tracking an appeal suspends the entry → lifts it from scope.
+        vm.prank(filer); // filer region "US" (setUp) satisfies path-2 standing
+        uint256 appealId =
+            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+        assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+    }
+
+    function test_isHashBlacklistedForOperator_prevRegionWindow() public {
+        vm.warp(30 days); // headroom for the `- N days` stamps below
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        // Flipped US -> EU one day ago: prev (US) entry still in scope.
+        bondMock.setRegion(operator, "EU", "US", uint64(block.timestamp - 1 days));
+        assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+        // Flip 8 days ago: ripened, prev no longer in scope.
+        bondMock.setRegion(operator, "EU", "US", uint64(block.timestamp - 8 days));
+        assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+    }
+
+    function test_isHashBlacklistedForOperator_neverChangedFallback_ripensFromMaxBondGate() public {
+        vm.warp(30 days); // headroom for the `- N days` stamps below
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        // `regionLastChanged == 0` (never changed on-chain) routes the window
+        // through the `max(firstBondedAt, gate)` fallback — the path the
+        // lastChanged tests above never reach via the real `regionScopeData` read.
+        // The gate (1d ago) is the more-recent stamp; a stale `firstBondedAt` (10d
+        // ago) would have closed the 7d window. Prev (US) entry still applies →
+        // true, proving the fallback selected the gate (the `max`).
+        bondMock.setRegion(operator, "EU", "US", 0);
+        bondMock.setFirstBondedAt(operator, uint64(block.timestamp - 10 days));
+        bondMock.setGate(uint64(block.timestamp - 1 days), 7 days);
+        assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+        // Now `firstBondedAt` (8d ago) is the `max` and the gate is older still
+        // (9d); 8d ≥ the 7d window → prev US ripened out, current EU has no entry
+        // → false. Proves the window closes the fallback and selects `firstBondedAt`.
+        bondMock.setFirstBondedAt(operator, uint64(block.timestamp - 8 days));
+        bondMock.setGate(uint64(block.timestamp - 9 days), 7 days);
+        assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
     }
 }

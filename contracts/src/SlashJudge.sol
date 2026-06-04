@@ -11,7 +11,9 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { ISlashJudge } from "./interfaces/ISlashJudge.sol";
 import { ICapacityBondSlasher } from "./interfaces/ICapacityBondSlasher.sol";
+import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
 import { IContentBlacklistHashView } from "./interfaces/IContentBlacklistHashView.sol";
+import { RegionScopeLib } from "./RegionScopeLib.sol";
 
 /// @title SlashJudge
 /// @notice On-chain adjudicator for the three signature-dependent slashable
@@ -66,8 +68,9 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     uint256 internal constant CHALLENGE_BOND_FLOOR = 1e18;
     uint256 internal constant CHALLENGE_BOND_CEILING = 1000e18;
 
-    /// @dev Global blacklist scope key (ADR 014 § Blacklist violation — regional
-    ///      scope is deferred for the PoC, so all blacklist violations are global).
+    /// @dev Global blacklist scope key (ADR 014 § Blacklist violation). Regional
+    ///      and ripening-prev-region scope is now enforced too (ADR 030
+    ///      § Region-stability window) — see `_checkBlacklistedBefore`.
     bytes32 internal constant GLOBAL_REGION = bytes32("GLOBAL");
 
     // -----------------------------------------------------------------
@@ -76,6 +79,12 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ICapacityBondSlasher public immutable capacityBond;
+
+    /// @dev Same deployed `CapacityBond` as `capacityBond`, typed for the ADR 030
+    ///      region-scope read surface. A second narrow immutable (rather than
+    ///      widening `ICapacityBondSlasher`, which the SlashJudge mock shares).
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    ICapacityBondRegionView public immutable capacityBondRegion;
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IERC20 public immutable token;
@@ -168,6 +177,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         _enforceEvidenceAgeBounds(maxEvidenceAgeUs_);
 
         capacityBond = capacityBond_;
+        capacityBondRegion = ICapacityBondRegionView(address(capacityBond_));
         token = token_;
         contentBlacklist = contentBlacklist_;
         challengeBond = challengeBond_;
@@ -260,7 +270,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         if (responseHash != blobHash) revert HashMismatch(blobHash, responseHash);
         if (!servedClaim) revert NotBlacklistViolation();
         _checkStaleness(responseTsUs);
-        _checkBlacklistedBefore(blobHash, responseTsUs);
+        _checkBlacklistedBefore(challengedNode, blobHash, responseTsUs);
 
         bytes32 evidenceHash = keccak256(abi.encode(uint8(OffenseType.Blacklist), structHash, isStreamResponse));
         _resolve(challengedNode, OffenseType.Blacklist, evidenceHash);
@@ -369,16 +379,65 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         if (bound != nodeId) revert NodeIdMismatch(nodeId, bound);
     }
 
-    /// @dev Confirm the hash was an enforceable blacklist entry strictly before the
-    ///      served response. A suspended entry (fast-tracked appeal) lifts the
-    ///      serving restriction, so it is not slashable — matching
-    ///      `ContentBlacklist._isLive` (`addedAt != 0 && !suspended`).
-    function _checkBlacklistedBefore(bytes32 blobHash, uint64 responseTsUs) internal view {
-        (uint64 addedAt, bool suspended) = contentBlacklist.getHashEntry(GLOBAL_REGION, blobHash);
-        if (addedAt == 0 || suspended) revert HashNotBlacklisted(blobHash);
-        // Effective-since (seconds → μs) must precede the served response.
-        uint256 addedAtUs = uint256(addedAt) * 1_000_000;
-        if (addedAtUs >= uint256(responseTsUs)) revert BlacklistAfterResponse(addedAtUs, responseTsUs);
+    /// @dev Confirm `blobHash` was an enforceable blacklist entry IN SCOPE for
+    ///      `operator` (ADR 030 § Region-stability window: global ∪ current-region
+    ///      ∪ ripening-prev-region) strictly before the served response. A
+    ///      suspended entry (fast-tracked appeal) lifts the serving restriction,
+    ///      so it is not slashable — matching `ContentBlacklist._isLive`
+    ///      (`addedAt != 0 && !suspended`). The GLOBAL leg preserves the original
+    ///      two-error semantics (the richer `BlacklistAfterResponse` when a global
+    ///      entry exists but post-dates the response and no regional leg rescues
+    ///      it); the regional legs fold their before-response check into a boolean.
+    function _checkBlacklistedBefore(address operator, bytes32 blobHash, uint64 responseTsUs) internal view {
+        (uint64 gAddedAt, bool gSuspended) = contentBlacklist.getHashEntry(GLOBAL_REGION, blobHash);
+        if (gAddedAt != 0 && !gSuspended) {
+            // Effective-since (seconds → μs) must precede the served response.
+            uint256 gAddedAtUs = uint256(gAddedAt) * 1_000_000;
+            if (gAddedAtUs < uint256(responseTsUs)) return; // slashable under global scope
+            // Global entry exists but post-dates the response: only blockable if
+            // no regional leg independently makes the node slashable.
+            if (!_regionalLiveBefore(operator, blobHash, responseTsUs)) {
+                revert BlacklistAfterResponse(gAddedAtUs, responseTsUs);
+            }
+            return;
+        }
+        // No enforceable global entry — fall back to the ADR 030 regional legs.
+        if (!_regionalLiveBefore(operator, blobHash, responseTsUs)) revert HashNotBlacklisted(blobHash);
+    }
+
+    /// @dev ADR 030 regional scope: true iff `blobHash` is live-before-response in
+    ///      the operator's current region, OR (still inside the ripening window)
+    ///      its previous region. Region keys are read from `CapacityBond` and
+    ///      packed to `bytes32` to match `ContentBlacklist`'s region keying.
+    function _regionalLiveBefore(address operator, bytes32 blobHash, uint64 responseTsUs) private view returns (bool) {
+        (
+            string memory regionHint,
+            string memory regionPrev,
+            uint64 regionLastChanged,
+            uint64 firstBondedAt,
+            uint64 gateActivatedAt,
+            uint256 window
+        ) = capacityBondRegion.regionScopeData(operator);
+
+        uint64 effective = RegionScopeLib.effectiveSince(regionLastChanged, firstBondedAt, gateActivatedAt);
+        // forge-lint: disable-next-line(block-timestamp)
+        (bytes32 cur, bytes32 prev, bool prevApplies) = RegionScopeLib.scopedRegions(
+            GLOBAL_REGION, regionHint, regionPrev, uint64(block.timestamp), effective, window
+        );
+
+        if (cur != bytes32(0) && _liveBefore(cur, blobHash, responseTsUs)) return true;
+        if (prevApplies && _liveBefore(prev, blobHash, responseTsUs)) return true;
+        return false;
+    }
+
+    /// @dev True iff `(region, blobHash)` is a live entry (`addedAt != 0 &&
+    ///      !suspended`) whose effective-since (seconds → μs) strictly precedes
+    ///      the served response.
+    function _liveBefore(bytes32 region, bytes32 blobHash, uint64 responseTsUs) private view returns (bool) {
+        (uint64 addedAt, bool suspended) = contentBlacklist.getHashEntry(region, blobHash);
+        // Positive form (matches `ContentBlacklist._isLive`): an entry is live iff
+        // present (`addedAt != 0`) and not fast-track-suspended.
+        return addedAt != 0 && !suspended && uint256(addedAt) * 1_000_000 < uint256(responseTsUs);
     }
 
     /// @dev Skew-safe evidence-age check (ADR 014 § Evidence staleness).
