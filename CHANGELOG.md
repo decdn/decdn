@@ -207,10 +207,28 @@ since project inception and will roll into the first tagged release.
   secret_access_key = "minioadmin"
   ```
 
-  Content-Encoding is not yet decompressed by the S3 backend — non-identity
-  responses are rejected with an operator-actionable error. Decompression
-  reuse from `HttpOrigin` is a follow-up; the workaround is to store
-  canonical bytes or front the bucket with a CDN that strips encoding.
+  `Content-Encoding` on S3 responses is handled the same way as the HTTP
+  origin (#804): gzip/zstd bodies are transparently decompressed to
+  canonical bytes before the engine's BLAKE3 verify. Controlled by the
+  optional `[cache.origin] decompress` knob (`"auto"` default decompresses;
+  `"strict"` refuses any non-identity encoding), mirroring the HTTP origin.
+  Unknown encodings (e.g. `br`) are rejected with an operator-actionable
+  permanent error.
+
+  **Config-breaking (default shift):** the S3 backend previously rejected
+  *all* `Content-Encoding`; it now defaults to `decompress = "auto"`.
+  Operators who relied on that blanket rejection as a guard against
+  mis-stored objects should set `decompress = "strict"` to keep refusing
+  encoded bodies. The shift is safe by construction — BLAKE3 verify runs
+  over canonical bytes, so a mis-decode fails closed as a hash mismatch
+  rather than caching corrupt data.
+
+  This release also fixes a latent #804 bug on the **HTTP** origin (a second
+  backend, not part of the pure S3 extraction): a compressed body whose
+  *encoded* `Content-Length` fit under `cache.buffered_max_bytes` but decoded
+  above it was falsely rejected as `BlobTooLarge`. Compressed responses now
+  report no `size_hint`, so they always take the streaming path capped at the
+  blob-size limit — parity with the S3 fix, pinned by an HTTP regression test.
 
 #### Gossip
 

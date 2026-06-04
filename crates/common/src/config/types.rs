@@ -374,6 +374,14 @@ pub struct S3OriginConfig {
     /// chain (env vars, `~/.aws/credentials`, IAM role / instance
     /// profile).
     pub credentials: Option<S3Credentials>,
+    /// How to handle `Content-Encoding` on the S3 response (#804).
+    /// `"auto"` (default) decompresses gzip/zstd transparently;
+    /// `"strict"` refuses any non-identity encoding. The BLAKE3
+    /// content-address is computed over the canonical (decompressed)
+    /// form, so `"strict"` is only safe for origins guaranteed to serve
+    /// already-canonical bytes. Mirrors the HTTP origin's `decompress`
+    /// knob.
+    pub decompress: Option<decdn_config_types::DecompressMode>,
 }
 
 /// S3 credential source (#437). Tagged on the inner `source` field.

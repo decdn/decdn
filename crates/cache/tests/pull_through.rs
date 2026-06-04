@@ -959,6 +959,51 @@ async fn http_origin_decompresses_zstd_response() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// HTTP twin of `cache_engine_s3_compressed_above_buffer_threshold_succeeds`
+/// (#804). A gzip body whose *encoded* `Content-Length` fits under
+/// `buffered_max_bytes` but whose *decoded* length exceeds it — while still
+/// under `max_blob_bytes` — must succeed. Before the fix the HTTP adapter
+/// reported the encoded length as `size_hint`, routing the body into the
+/// buffer/drain path whose cap (`buffered_max_bytes`) is applied to the
+/// *decoded* stream — falsely rejecting an in-bounds blob as `BlobTooLarge`.
+/// The fix hands `None` for compressed bodies so they take the streaming path
+/// capped at `max_blob_bytes`. The advertised `Content-Length` (set by
+/// wiremock from the body) is load-bearing: without it `size_hint` is already
+/// `None` and the bug would not reproduce.
+#[tokio::test]
+async fn http_origin_compressed_above_buffer_threshold_succeeds() -> anyhow::Result<()> {
+    // Decodes to 8 MiB: above the 4 MiB default `buffered_max_bytes`,
+    // below the 16 MiB `max_blob_size` from `build_engine`.
+    let payload = vec![0u8; 8 * 1024 * 1024];
+    let hash = Hash::new(&payload);
+    let compressed = gzip(&payload)?;
+    anyhow::ensure!(
+        compressed.len() < 4 * 1024 * 1024,
+        "test setup: encoded length must be under buffered_max_bytes (4 MiB) \
+         to route into the drain path pre-fix, was {} bytes",
+        compressed.len()
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "gzip")
+                .set_body_bytes(compressed),
+        )
+        .mount(&server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        got.len() == payload.len() && got[..] == payload[..],
+        "in-bounds compressed blob must decode and cache, got {} bytes",
+        got.len()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn http_origin_passes_through_identity_encoding() -> anyhow::Result<()> {
     let payload: &[u8] = b"plain identity payload";

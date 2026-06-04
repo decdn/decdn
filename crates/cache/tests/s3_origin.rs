@@ -12,6 +12,7 @@
 //! See `crates/cache/tests/pull_through.rs` for the equivalent `wiremock`
 //! suite covering [`decdn_cache::HttpOrigin`].
 
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +23,8 @@ use aws_smithy_mocks::{Rule, RuleMode, mock, mock_client};
 use aws_smithy_types::byte_stream::ByteStream;
 use aws_smithy_types::retry::RetryConfig;
 use decdn_cache::{
-    CacheEngine, CacheError, Hash, Origin, OriginFetch, OriginPullError, RetryPolicy, S3Origin,
+    CacheEngine, CacheError, DecompressMode, Hash, Origin, OriginError, OriginFetch,
+    OriginPullError, RetryPolicy, S3Origin, SupportedEncoding,
 };
 
 /// Bucket and prefix used across tests. Matching constants on every rule
@@ -368,15 +370,83 @@ async fn fetch_4xx_classifies_as_permanent_and_does_not_retry() -> anyhow::Resul
     Ok(())
 }
 
-/// Non-identity `Content-Encoding` is rejected with the operator-friendly
-/// pointer message. The BLAKE3 verify in the engine runs over canonical
-/// bytes; passing through a gzipped body would later trip a `HashMismatch`
-/// error with no explanation. This test pins the exact wording so a doc
-/// drift between the error and the runbook doesn't slip past review.
+/// Compress `payload` with gzip for the decode tests. Mirrors the
+/// `pull_through.rs` helper so the two backends are exercised against the
+/// same canonical/compressed pairs.
+fn gzip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    e.write_all(payload)?;
+    Ok(e.finish()?)
+}
+
+fn zstd_compress(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    Ok(zstd::stream::encode_all(payload, 1)?)
+}
+
+/// `Content-Encoding: gzip` is transparently decompressed in the default
+/// `Auto` mode (#804) — parity with the HTTP backend. The BLAKE3 verify in
+/// the engine runs over canonical bytes, so the adapter must hand back the
+/// decompressed payload, not the gzipped wire bytes.
 #[tokio::test]
-async fn fetch_with_content_encoding_gzip_is_permanent_with_pointer_message() -> anyhow::Result<()>
-{
-    let hash = Hash::new(b"gzipped");
+async fn fetch_with_content_encoding_gzip_is_decompressed() -> anyhow::Result<()> {
+    let payload: &[u8] = b"hello, gzipped s3 world! repeat repeat repeat repeat";
+    let hash = Hash::new(payload);
+    let compressed = gzip(payload)?;
+
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .content_encoding("gzip")
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found, got NotFound"))?;
+    anyhow::ensure!(
+        &bytes[..] == payload,
+        "gzip body should decode to canonical payload"
+    );
+    Ok(())
+}
+
+/// `Content-Encoding: zstd` is transparently decompressed in `Auto` mode.
+#[tokio::test]
+async fn fetch_with_content_encoding_zstd_is_decompressed() -> anyhow::Result<()> {
+    let payload: &[u8] = b"hello, zstd s3! and a longer body to compress meaningfully xxxxx";
+    let hash = Hash::new(payload);
+    let compressed = zstd_compress(payload)?;
+
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .content_encoding("zstd")
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    let bytes = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected Found, got NotFound"))?;
+    anyhow::ensure!(&bytes[..] == payload, "zstd body should decode to payload");
+    Ok(())
+}
+
+/// `DecompressMode::Strict` refuses a known encoding before any body
+/// bytes are read — equivalent to the pre-#804 reject-everything posture,
+/// for operators whose origin is guaranteed to serve canonical bytes.
+#[tokio::test]
+async fn fetch_with_strict_mode_rejects_gzip_encoding() -> anyhow::Result<()> {
+    let hash = Hash::new(b"gzipped-strict");
 
     let rule = mock!(Client::get_object).then_output(|| {
         GetObjectOutput::builder()
@@ -387,13 +457,13 @@ async fn fetch_with_content_encoding_gzip_is_permanent_with_pointer_message() ->
             .build()
     });
     let client = mock_s3_client(&[&rule]);
-    let origin = s3_origin(client, "");
+    let origin = s3_origin(client, "").with_decompress_mode(DecompressMode::Strict);
 
     let err = origin
         .fetch(hash, 16 * 1024 * 1024)
         .await
         .err()
-        .ok_or_else(|| anyhow::anyhow!("gzipped response must be rejected"))?;
+        .ok_or_else(|| anyhow::anyhow!("strict mode must reject a compressed body"))?;
     let msg = match &err {
         OriginPullError::Permanent(e) => format!("{e:#}"),
         OriginPullError::Transient(e) => {
@@ -403,7 +473,41 @@ async fn fetch_with_content_encoding_gzip_is_permanent_with_pointer_message() ->
     // Operators grep for these substrings in runbooks; pin the contract.
     anyhow::ensure!(
         msg.contains("Content-Encoding") && msg.contains("canonical bytes"),
-        "operator-facing rejection lost its actionable wording: {msg}"
+        "strict rejection lost its actionable runbook hint: {msg}"
+    );
+    Ok(())
+}
+
+/// An unknown `Content-Encoding` (e.g. Brotli) is a permanent error in
+/// either mode — the adapter has no decoder for it, and passing the bytes
+/// through would later trip a confusing `HashMismatch`.
+#[tokio::test]
+async fn fetch_with_unknown_encoding_is_permanent() -> anyhow::Result<()> {
+    let hash = Hash::new(b"brotli-body");
+
+    let rule = mock!(Client::get_object).then_output(|| {
+        GetObjectOutput::builder()
+            .body(ByteStream::from_static(b"\x00\x01\x02brotli-ish"))
+            .content_encoding("br")
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    let err = origin
+        .fetch(hash, 16 * 1024 * 1024)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("unknown encoding must be rejected"))?;
+    let msg = match &err {
+        OriginPullError::Permanent(e) => format!("{e:#}"),
+        OriginPullError::Transient(e) => {
+            anyhow::bail!("unknown-encoding rejection must be Permanent, was Transient: {e:#}");
+        }
+    };
+    anyhow::ensure!(
+        msg.contains("Content-Encoding") && msg.contains("br"),
+        "error should name the unsupported encoding: {msg}"
     );
     Ok(())
 }
@@ -620,6 +724,220 @@ async fn cache_engine_rejects_s3_body_larger_than_max_blob_bytes() -> anyhow::Re
     anyhow::ensure!(
         matches!(err, CacheError::BlobTooLarge { .. }),
         "expected BlobTooLarge from engine cap, got: {err:?}"
+    );
+    Ok(())
+}
+
+/// Truncated gzip body fed through the S3 backend: the decoder emits an
+/// `io::Error` wrapping a typed `OriginError::DecompressionFailed`, which
+/// `classify_io_error` recognises as Permanent. The retry budget must not
+/// be burned even with retries available, and the typed variant must
+/// survive the S3-specific `ByteStream::into_async_read -> ReaderStream ->
+/// decode_stream` seam — the highest-risk path, since no other test
+/// exercises a decoder failure through the SDK body adapter. Mirrors
+/// `pull_through::decompression_failure_is_permanent_under_threshold`.
+#[tokio::test]
+async fn cache_engine_s3_truncated_gzip_is_permanent_decompression_failed() -> anyhow::Result<()> {
+    let payload: &[u8] = b"truncate me, please, but only the gzip wrapper xxxxxxxxxxxx";
+    let hash = Hash::new(payload);
+    let mut compressed = gzip(payload)?;
+    // Lop off the gzip trailer (CRC + ISIZE) so the decoder errors after
+    // the magic/header check passes rather than rejecting up front.
+    let drop = compressed.len().saturating_sub(20);
+    compressed.truncate(drop);
+
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .content_encoding("gzip")
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+
+    let tmp = tempfile::tempdir()?;
+    // Fast policy with retries available: the assertion is that the
+    // decoder error is Permanent, so the budget must go unspent.
+    let policy = RetryPolicy {
+        max_retries: 3,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 4,
+        jitter_ratio: 0.0,
+        buffered_max_bytes: 4 << 20,
+    };
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        vec![origin as Arc<dyn Origin>],
+        16,
+        decdn_cache::PinnedHashes::empty(),
+        policy,
+        None,
+        Duration::ZERO,
+    )
+    .await?;
+
+    let err = engine
+        .get(hash)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("truncated gzip must be rejected"))?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "expected OriginError from truncated gzip, got: {err:?}"
+    );
+    anyhow::ensure!(
+        matches!(
+            err.origin_error_kind(),
+            Some(OriginError::DecompressionFailed {
+                encoding: SupportedEncoding::Gzip,
+                ..
+            })
+        ),
+        "expected typed DecompressionFailed(Gzip) on the error chain, got: {err:?}"
+    );
+    anyhow::ensure!(
+        rule.num_calls() == 1,
+        "decoder failure is Permanent; retry must not re-dispatch, got {}",
+        rule.num_calls()
+    );
+    Ok(())
+}
+
+/// Decompression bomb through the S3 backend: a small gzip payload that
+/// decodes to far more than `max_blob_bytes`. The decoded-side cap lives
+/// in the engine's `count_and_cap_stream`, so the bomb must surface as
+/// `BlobTooLarge` rather than pinning the decoded bytes in memory. The
+/// only existing S3 `BlobTooLarge` test uses an *uncompressed* body, so
+/// this is the first to prove the cap runs over the decoded stream and
+/// that the small compressed `Content-Length` doesn't bypass it. Mirrors
+/// `pull_through::http_origin_rejects_decompression_bomb`.
+#[tokio::test]
+async fn cache_engine_s3_rejects_decompression_bomb() -> anyhow::Result<()> {
+    // 4 MiB of zeros gzips to a few KiB; cap at 1 MiB. Neither the
+    // Content-Length fast-path (KiB encoded) nor any adapter cap catches
+    // this — only the running total over decoded bytes does.
+    let payload = vec![0u8; 4 * 1024 * 1024];
+    let hash = Hash::new(&payload);
+    let compressed = gzip(&payload)?;
+    anyhow::ensure!(
+        compressed.len() < 1024 * 1024,
+        "test setup: compressed body must be smaller than the cap to \
+         exercise the running-total check, was {} bytes",
+        compressed.len()
+    );
+    let content_length = i64::try_from(compressed.len())?;
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .content_encoding("gzip")
+            .content_length(content_length)
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(
+        tmp.path(),
+        vec![origin as Arc<dyn Origin>],
+        1, // max_blob_size_mb = 1 MiB
+    )
+    .await?;
+
+    let err =
+        engine.get(hash).await.err().ok_or_else(|| {
+            anyhow::anyhow!("decompression bomb must be rejected at the decoded cap")
+        })?;
+    anyhow::ensure!(
+        matches!(err, CacheError::BlobTooLarge { .. }),
+        "expected BlobTooLarge from bomb cap, got: {err:?}"
+    );
+    Ok(())
+}
+
+/// BLAKE3 verify must run over the *decompressed* form: the engine is
+/// asked for the hash of the *compressed* wire bytes against a gzip body,
+/// and the decoded body's different hash must surface as `HashMismatch`
+/// (proving the verify saw canonical, not compressed, bytes on the S3
+/// path). Mirrors `pull_through::http_origin_blake3_verify_runs_over_decompressed_bytes`.
+#[tokio::test]
+async fn cache_engine_s3_blake3_verify_runs_over_decompressed_bytes() -> anyhow::Result<()> {
+    let payload: &[u8] = b"verify-after-decompress on the s3 path, not before";
+    let canonical = Hash::new(payload);
+    let compressed = gzip(payload)?;
+    // Hash of the *compressed* bytes — what a regression that hashed the
+    // raw wire bytes would match.
+    let raw_hash = Hash::new(&compressed);
+    anyhow::ensure!(canonical != raw_hash, "test premise: hashes differ");
+
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .content_encoding("gzip")
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+
+    // Asking for the raw-bytes hash: the decoded body has a different
+    // BLAKE3 → the engine surfaces HashMismatch.
+    let err =
+        engine.get(raw_hash).await.err().ok_or_else(|| {
+            anyhow::anyhow!("compressed-hash request must mismatch the decoded body")
+        })?;
+    anyhow::ensure!(
+        matches!(err, CacheError::HashMismatch { .. }),
+        "expected HashMismatch (verify ran over decompressed form), got: {err:?}"
+    );
+    Ok(())
+}
+
+/// Regression for #804: a compressed body whose *encoded* length fits
+/// under `buffered_max_bytes` but whose *decoded* length exceeds it, while
+/// still under `max_blob_bytes`, must succeed. Before the fix the adapter
+/// reported the encoded `Content-Length` as `size_hint`, routing the body
+/// into the buffer/drain path whose cap (`buffered_max_bytes`) is applied
+/// to the *decoded* stream — falsely rejecting an in-bounds blob as
+/// `BlobTooLarge`. The fix hands `None` for compressed bodies so they take
+/// the streaming path capped at `max_blob_bytes`. The explicit
+/// `content_length` is load-bearing: without it `size_hint` would already
+/// be `None` and the bug would not reproduce.
+#[tokio::test]
+async fn cache_engine_s3_compressed_above_buffer_threshold_succeeds() -> anyhow::Result<()> {
+    // Decodes to 8 MiB: above the 4 MiB default `buffered_max_bytes`,
+    // below the 16 MiB `max_blob_size`.
+    let payload = vec![0u8; 8 * 1024 * 1024];
+    let hash = Hash::new(&payload);
+    let compressed = gzip(&payload)?;
+    anyhow::ensure!(
+        compressed.len() < 4 * 1024 * 1024,
+        "test setup: encoded length must be under buffered_max_bytes (4 MiB) \
+         to route into the drain path pre-fix, was {} bytes",
+        compressed.len()
+    );
+    let content_length = i64::try_from(compressed.len())?;
+    let rule = mock!(Client::get_object).then_output(move || {
+        GetObjectOutput::builder()
+            .body(ByteStream::from(compressed.clone()))
+            .content_encoding("gzip")
+            .content_length(content_length)
+            .build()
+    });
+    let client = mock_s3_client(&[&rule]);
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin(client, ""));
+
+    let tmp = tempfile::tempdir()?;
+    // Default policy → buffered_max_bytes = 4 MiB; max_blob_size = 16 MiB.
+    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        got.len() == payload.len() && got[..] == payload[..],
+        "in-bounds compressed blob must decode and cache, got {} bytes",
+        got.len()
     );
     Ok(())
 }

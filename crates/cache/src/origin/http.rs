@@ -10,17 +10,16 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::Stream;
 use iroh_blobs::Hash;
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_ENCODING;
-use tokio_util::io::{ReaderStream, StreamReader};
 
 use super::{
-    DEFAULT_USER_AGENT, DecompressMode, Origin, OriginByteStream, OriginFetch, OriginKind,
-    OriginUrl, parse_origin_url, redact_for_log,
+    DEFAULT_USER_AGENT, DecompressMode, Origin, OriginFetch, OriginKind, OriginUrl, decompress,
+    parse_origin_url, redact_for_log,
 };
-use crate::error::{OriginError, OriginPullError, SupportedEncoding};
+use crate::error::{OriginError, OriginPullError};
 
 /// How long to wait for the TCP/TLS handshake to complete. Per-request total
 /// duration is intentionally *not* bounded because `max_blob_size_mb` can be
@@ -140,26 +139,6 @@ impl HttpOrigin {
         self.decompress = mode;
         self
     }
-}
-
-/// Classify a (trimmed) `Content-Encoding` token: identity / supported /
-/// unsupported. Returns `None` for the identity case (empty or
-/// `identity`), `Some(Ok(_))` for known decoders, and `Some(Err(_))`
-/// for unknown encodings. Centralises the case-folding so callers can't
-/// disagree on whether `GZIP` is gzip.
-fn classify_encoding(trimmed: &str) -> Option<Result<SupportedEncoding, OriginError>> {
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
-        return None;
-    }
-    if trimmed.eq_ignore_ascii_case("gzip") || trimmed.eq_ignore_ascii_case("x-gzip") {
-        return Some(Ok(SupportedEncoding::Gzip));
-    }
-    if trimmed.eq_ignore_ascii_case("zstd") {
-        return Some(Ok(SupportedEncoding::Zstd));
-    }
-    Some(Err(OriginError::UnsupportedEncoding {
-        encoding: trimmed.into(),
-    }))
 }
 
 /// Classify a `reqwest::Error` raised by `.send()` or `.chunk()`. The
@@ -300,27 +279,15 @@ impl Origin for HttpOrigin {
                 },
             };
             let trimmed = encoding.trim();
-            let supported_encoding = match classify_encoding(trimmed) {
-                None => None,
-                Some(Ok(supported)) => Some(supported),
-                Some(Err(unsupported_err)) => {
-                    // Unsupported encoding (e.g. `br`): typed permanent
-                    // error, before any body bytes are read.
-                    return Err(OriginPullError::Permanent(unsupported_err.into()));
-                }
+            // Classify the encoding and apply the strict/auto policy in one
+            // place shared with the S3 backend. `Err` covers both unknown
+            // encodings (e.g. `br`) and known encodings rejected under
+            // `Strict` — both are permanent and fire before any body bytes
+            // are read.
+            let supported_encoding = match decompress::resolve_encoding(trimmed, self.decompress) {
+                Ok(encoding) => encoding,
+                Err(err) => return Err(OriginPullError::Permanent(err.into())),
             };
-            let is_compressed = supported_encoding.is_some();
-
-            // Strict mode rejects any non-identity encoding even when
-            // we know the decoder. Equivalent to today's behaviour.
-            if matches!(self.decompress, DecompressMode::Strict) && is_compressed {
-                return Err(OriginPullError::Permanent(
-                    OriginError::UnsupportedEncoding {
-                        encoding: trimmed.into(),
-                    }
-                    .into(),
-                ));
-            }
 
             // Fast-path rejection using the advertised length before
             // we read anything. For identity bodies, encoded length is
@@ -348,76 +315,51 @@ impl Origin for HttpOrigin {
             //      encoded bytes for compressed responses — compression
             //      ratios < 1 mean this is also a sound bound on the
             //      decoded size).
-            //   3. for compressed responses, layer
-            //      `async_compression::tokio::bufread` decoder via a
-            //      `StreamReader` -> decoder -> `ReaderStream`
-            //      sandwich. The decompressed-side cap is enforced
-            //      again by the engine's `count_and_cap_stream`
-            //      (the running total there ensures we abort the
-            //      import the moment decompressed bytes exceed
-            //      `max_bytes`, so a 1 KB compressed payload that
-            //      decompresses to 100 GB fails fast at the engine
-            //      seam without ever pinning that memory).
+            //   3. for compressed responses, layer the decoder via
+            //      `decompress::decode_stream` — see that module for the
+            //      decoder sandwich and how the decompressed-side cap is
+            //      enforced by the engine's `count_and_cap_stream` (a 1 KB
+            //      compressed payload that decompresses to 100 GB fails
+            //      fast at the engine seam without ever pinning that
+            //      memory).
             let idle_timeout = self.chunk_idle_timeout;
             let raw_stream = response_chunk_stream(resp, idle_timeout, max_bytes, url_log);
 
-            // `StreamReader` implements `AsyncBufRead` directly, so no
-            // `tokio::io::BufReader` wrapper is needed for the
-            // `bufread::*Decoder` family.
-            //
+            // Layer the decoder (if any) onto the encoded chunk stream.
             // Decoder errors (truncated body, bad magic, mid-stream
-            // checksum mismatch) emerge from `ReaderStream` as
-            // `io::Error`. We wrap them with a typed
-            // `OriginError::DecompressionFailed` so
-            // `CacheError::origin_error_kind` can recover the typed
-            // variant later — `crate::retry::classify_io_error`
-            // downcasts the `io::Error` inner and routes the typed
-            // variant into `OriginPullError::Permanent` (decoder
-            // failures aren't retryable; the body is corrupt).
-            let decoded_stream: OriginByteStream = match supported_encoding {
-                None => Box::pin(raw_stream),
-                Some(SupportedEncoding::Gzip) => {
-                    let reader = StreamReader::new(raw_stream);
-                    let decoder = async_compression::tokio::bufread::GzipDecoder::new(reader);
-                    Box::pin(ReaderStream::new(decoder).map(|res| {
-                        res.map_err(|e| typed_decoder_error(SupportedEncoding::Gzip, e))
-                    }))
-                }
-                Some(SupportedEncoding::Zstd) => {
-                    let reader = StreamReader::new(raw_stream);
-                    let decoder = async_compression::tokio::bufread::ZstdDecoder::new(reader);
-                    Box::pin(ReaderStream::new(decoder).map(|res| {
-                        res.map_err(|e| typed_decoder_error(SupportedEncoding::Zstd, e))
-                    }))
-                }
-            };
+            // checksum mismatch) are wrapped as a typed
+            // `OriginError::DecompressionFailed` inside the shared helper so
+            // `crate::retry::classify_io_error` routes them into
+            // `OriginPullError::Permanent` (decoder failures aren't
+            // retryable; the body is corrupt).
+            let decoded_stream = decompress::decode_stream(raw_stream, supported_encoding);
 
+            // For a decoded (compressed) response the advertised
+            // `Content-Length` is the *encoded* length, which understates
+            // the canonical length. Reporting it as `size_hint` would let
+            // the engine route a body whose encoded length fits under
+            // `buffered_max_bytes` into the buffer/drain path, where the
+            // drain cap (`buffered_max_bytes`) is applied to the *decoded*
+            // stream and falsely rejects an in-bounds blob as
+            // `BlobTooLarge` (#804). Hand `None` for compressed bodies so
+            // they always take the streaming path, where
+            // `count_and_cap_stream` checks the running decoded total
+            // against the correct `max_blob_bytes`. The pre-stream
+            // `advertised_len > max_bytes` short-circuit above still runs
+            // first (compressed-len > max_bytes already implies
+            // decoded-len > max_bytes under sane ratios). For identity
+            // responses the hint is the canonical length.
+            let size_hint = if supported_encoding.is_some() {
+                None
+            } else {
+                advertised_len
+            };
             Ok(OriginFetch::Found {
                 stream: decoded_stream,
-                // For compressed responses the size_hint is the
-                // *encoded* length (Content-Length over the wire) —
-                // useful for the engine's pre-stream short-circuit
-                // because compressed-len > max_bytes already implies
-                // decoded-len > max_bytes (assuming sane compression
-                // ratios). For identity responses it's the canonical
-                // length.
-                size_hint: advertised_len,
+                size_hint,
             })
         })
     }
-}
-
-/// Wrap a decoder `io::Error` into an `io::Error` whose source is a
-/// typed [`OriginError::DecompressionFailed`]. The engine's
-/// `count_and_cap_stream` side-channel preserves the `io::Error`
-/// verbatim; `crate::retry::classify_io_error` then downcasts the
-/// inner to recover the typed variant and surfaces it as
-/// `OriginPullError::Permanent` (`CacheError::origin_error_kind`
-/// finds it on the chain walk).
-fn typed_decoder_error(encoding: SupportedEncoding, source: std::io::Error) -> std::io::Error {
-    let kind = source.kind();
-    let typed = OriginError::DecompressionFailed { encoding, source };
-    std::io::Error::new(kind, typed)
 }
 
 /// Build the per-chunk stream over `resp.chunk()`. Wraps each chunk

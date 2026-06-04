@@ -231,6 +231,9 @@ pub struct ResolvedS3Config {
     pub prefix: String,
     /// Resolved credential source.
     pub credentials: Option<ResolvedS3Credentials>,
+    /// How to handle `Content-Encoding` on the S3 origin response
+    /// (#804). Defaults to [`decdn_config_types::DecompressMode::Auto`].
+    pub decompress: decdn_config_types::DecompressMode,
 }
 
 /// Validated runtime form of S3 credentials (#437). See

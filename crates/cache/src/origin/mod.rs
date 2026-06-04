@@ -4,6 +4,7 @@
 //! [`HttpOrigin`] (generic HTTP/S), [`FilesystemOrigin`] (local disk), and
 //! [`S3Origin`] (S3-compatible object stores: AWS S3, R2, B2, `MinIO`).
 
+pub(crate) mod decompress;
 pub mod fs;
 pub mod http;
 pub mod s3;
