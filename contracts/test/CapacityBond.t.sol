@@ -1201,4 +1201,68 @@ contract CapacityBondTest is Test {
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
         assertEq(address(bond.slashJudge()), address(judge));
     }
+
+    // -----------------------------------------------------------------
+    // setUnbondingPeriod x maxEvidenceAgeUs mirror invariant (ADR 014)
+    // -----------------------------------------------------------------
+
+    function test_setUnbondingPeriod_revertsWhenEqualToEvidenceAge() public {
+        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US); // 10 days us
+        vm.startPrank(admin);
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
+        // 10 days * 1e6 == MOCK_EVIDENCE_AGE_US -> must revert (strict `<` invariant).
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CapacityBond.UnbondingBelowEvidenceAge.selector, uint256(10 days) * 1_000_000, MOCK_EVIDENCE_AGE_US
+            )
+        );
+        bond.setUnbondingPeriod(10 days);
+        vm.stopPrank();
+    }
+
+    function test_setUnbondingPeriod_revertsWhenBelowEvidenceAge() public {
+        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US); // 10 days us
+        vm.startPrank(admin);
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
+        // 9 days is within [3d,30d] but 9d*1e6 < 10d*1e6 -> mirror check reverts.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CapacityBond.UnbondingBelowEvidenceAge.selector, uint256(9 days) * 1_000_000, MOCK_EVIDENCE_AGE_US
+            )
+        );
+        bond.setUnbondingPeriod(9 days);
+        vm.stopPrank();
+    }
+
+    function test_setUnbondingPeriod_succeedsAboveEvidenceAge() public {
+        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US); // 10 days us
+        vm.startPrank(admin);
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
+        // 11 days: within [3d,30d] AND 11d*1e6 > 10d*1e6 -> passes both checks.
+        bond.setUnbondingPeriod(11 days);
+        vm.stopPrank();
+        assertEq(bond.unbondingPeriod(), 11 days);
+    }
+
+    function test_setUnbondingPeriod_boundStillEnforcedWithJudge() public {
+        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US);
+        vm.startPrank(admin);
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
+        // 61 days exceeds UNBONDING_PERIOD_CEILING (30 days) -> the bound check reverts FIRST.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CapacityBond.ParamOutOfBounds.selector, uint256(61 days), uint256(3 days), uint256(30 days)
+            )
+        );
+        bond.setUnbondingPeriod(61 days);
+        vm.stopPrank();
+    }
+
+    function test_setUnbondingPeriod_unwiredAppliesOnlyBound() public {
+        // No setSlashJudge call: slashJudge == address(0).
+        assertEq(address(bond.slashJudge()), address(0));
+        vm.prank(admin);
+        bond.setUnbondingPeriod(8 days); // within [3d,30d], no judge -> succeeds
+        assertEq(bond.unbondingPeriod(), 8 days);
+    }
 }

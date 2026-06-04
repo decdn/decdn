@@ -1120,6 +1120,22 @@ contract CapacityBond is
 
     function setUnbondingPeriod(uint256 newPeriod) external onlyRole(GOVERNANCE_ROLE) {
         _enforceUnbondingPeriodBounds(newPeriod);
+        // Paired cross-parameter invariant (ADR 014 § Interaction with unbonding
+        // period): the unbonding period (in microseconds) MUST stay strictly above
+        // the evidence-age ceiling, else a node could offend, unbond, and withdraw
+        // before evidence can be submitted. Mirrors SlashJudge._enforceUnbondingInvariant.
+        // Skipped until `slashJudge` is wired (deploy window); `newPeriod` is bounded
+        // [3d,30d] so `newPeriod * 1_000_000` cannot overflow.
+        ISlashJudgeEvidenceView judge = slashJudge;
+        if (address(judge) != address(0)) {
+            uint256 newPeriodUs = newPeriod * 1_000_000;
+            // `maxEvidenceAgeUs()` is a view on the governance-set `slashJudge`; this
+            // setter is GOVERNANCE_ROLE-gated, so the following state write is not a
+            // reentrancy vector (aderyn reentrancy-state-change FP).
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            uint256 maxAgeUs = judge.maxEvidenceAgeUs();
+            if (newPeriodUs <= maxAgeUs) revert UnbondingBelowEvidenceAge(newPeriodUs, maxAgeUs);
+        }
         uint256 oldPeriod = unbondingPeriod;
         unbondingPeriod = newPeriod;
         emit UnbondingPeriodUpdated(oldPeriod, newPeriod);
