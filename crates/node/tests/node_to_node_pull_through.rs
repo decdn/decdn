@@ -277,7 +277,10 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     client_ep.close().await;
     ep_b.close().await;
     ep_a.close().await;
-    let _ = task_b.await;
-    let _ = task_a.await;
+    // Propagate JoinResult so a panic in either accept loop fails the test
+    // rather than being silently swallowed. After `close()` the loops exit
+    // cleanly, so this only surfaces genuine background-task panics.
+    task_b.await?;
+    task_a.await?;
     Ok(())
 }
