@@ -268,6 +268,15 @@ pub struct DecdnMetrics {
     /// the slow self-tick. Operator-visible name:
     /// `decdn_redeem_hints_dropped_total`.
     pub redeem_hints_dropped: Counter,
+    /// Download-receipt audit writes dropped because the bounded writer queue
+    /// was full (`try_send` → `Full`, #803), counted once per dropped receipt.
+    /// The receipt log is audit-only and the payment already committed to the
+    /// fsynced channel store, so a drop never affects settlement — but a
+    /// sustained non-zero rate means the receipt writer cannot keep up with disk
+    /// I/O (a slow or full `data_dir`, the end-state of #802) and audit/dispute
+    /// records are being lost. Operator-visible name:
+    /// `decdn_receipt_writes_dropped_total`.
+    pub receipt_writes_dropped: Counter,
     /// Redemption attempts (`try_redeem`) that returned an error — a failed
     /// `getChannel`/`withdraw` RPC or receipt wait (#751). Each is otherwise
     /// only a single `warn!`; a sustained rate means accrued earnings are not
@@ -504,6 +513,14 @@ impl Metrics {
     /// sustained rate means the redeemer is not keeping up with fan-out.
     pub fn redeem_hint_dropped(&self) {
         self.decdn.redeem_hints_dropped.inc();
+    }
+
+    /// A download-receipt audit write was dropped because the bounded writer
+    /// queue was full (`try_send` → `Full`, #803). Audit-only, so a drop never
+    /// affects settlement; a sustained rate means the writer is not keeping up
+    /// with disk I/O and audit records are being lost.
+    pub fn receipt_write_dropped(&self) {
+        self.decdn.receipt_writes_dropped.inc();
     }
 
     /// A redemption attempt (`try_redeem`) failed with an RPC/receipt error
@@ -1151,6 +1168,29 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_voucher_nonce_gaps_total", 2),
             "expected 2 gap events (one bump each, not gap-size weighted):\n{text}"
+        );
+    }
+
+    #[test]
+    fn receipt_writes_dropped_metric_starts_at_zero_and_increments() {
+        // #803. The struct field is `receipt_writes_dropped`; the OpenMetrics
+        // encoder appends `_total`, so the exported name is
+        // `decdn_receipt_writes_dropped_total` — the operator-visible name an
+        // alert on lost audit records references. Must be exposed at zero on a
+        // fresh registry and bump once per dropped receipt.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_receipt_writes_dropped_total", 0),
+            "receipt-write-dropped counter should be exposed at zero on a fresh registry:\n{text}"
+        );
+
+        metrics.receipt_write_dropped();
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_receipt_writes_dropped_total", 1),
+            "expected one dropped-receipt event:\n{text}"
         );
     }
 

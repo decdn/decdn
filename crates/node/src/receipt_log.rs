@@ -1,20 +1,26 @@
 //! Append-only download-receipt log for the node runtime (issue #248).
 //!
-//! A node records one structured [`DownloadReceipt`] per served-and-paid blob
+//! A node enqueues one structured [`DownloadReceipt`] per served-and-paid blob
 //! at the voucher-acceptance point (see
-//! [`crate::handlers::client::ClientHandler`]). The log gives the operator a
-//! durable, off-chain record of which blobs were delivered and paid for —
-//! enabling revenue audit, cross-restart double-spend triage, and dispute
-//! evidence without relying solely on on-chain state.
+//! [`crate::handlers::client::ClientHandler`]); the durable write happens off
+//! the delivery path in a background writer (see the Seam note below, #803). The
+//! log gives the operator a durable, off-chain record of which blobs were
+//! delivered and paid for — enabling revenue audit, cross-restart double-spend
+//! triage, and dispute evidence without relying solely on on-chain state.
 //!
 //! # Seam
 //!
-//! [`ReceiptLog`] is a small trait (mirroring the trait+impl pattern of
-//! [`decdn_incentive::store::ChannelStateStore`] / [`crate::channel_store`]) so
-//! the voucher-accept path can be unit-tested against an in-memory fake without
-//! touching disk. The runtime wires the disk-backed
-//! [`JsonlReceiptLog`], which appends one JSON object per line to
-//! `<data_dir>/download_receipts.jsonl` (JSON Lines).
+//! There are two layers. [`ReceiptLog`] is the *disk* boundary — a small trait
+//! (mirroring the trait+impl pattern of
+//! [`decdn_incentive::store::ChannelStateStore`] / [`crate::channel_store`])
+//! whose runtime impl is the disk-backed [`JsonlReceiptLog`], appending one JSON
+//! object per line to `<data_dir>/download_receipts.jsonl` (JSON Lines).
+//! [`ReceiptSink`] is the *hot-path* boundary: the paid-delivery path does not
+//! call [`ReceiptLog::append`] directly — it enqueues through the non-blocking
+//! [`ReceiptSink::record`], and a single background [`spawn_receipt_writer`]
+//! task owns the `JsonlReceiptLog` and performs the actual `append` off the
+//! delivery path (#803), so a slow or full disk can never back-pressure
+//! delivery. Both seams take an in-memory fake in unit/loopback tests.
 //!
 //! # Durability
 //!
@@ -44,17 +50,23 @@
 //! `retained_files == 0` keeps no backups — the live file is truncated in place
 //! on rotation. Rotation is **best-effort**: a rename/open failure mid-rotation
 //! never leaves the log without a writable handle and never aborts paid
-//! delivery (the caller treats an `append` error as non-fatal), it only trims
-//! or skips a backup that cycle.
+//! delivery (the background writer treats an `append` error as non-fatal, and
+//! delivery is decoupled from it by the bounded queue, #803), it only trims or
+//! skips a backup that cycle.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use alloy::primitives::U256;
 use iroh_blobs::Hash;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::metrics::Metrics;
 
 /// File name of the receipt log within `data_dir`.
 const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
@@ -530,6 +542,216 @@ impl ReceiptLog for NoopReceiptLog {
     }
 }
 
+/// Non-blocking enqueue boundary for [`DownloadReceipt`]s on the paid-delivery
+/// hot path (#803).
+///
+/// The voucher-accept path records a receipt through this seam *before* sending
+/// `VoucherAck`, so the implementation MUST NOT block on disk I/O: a backed-up
+/// sink drops the receipt (best-effort, audit-only) rather than stall the
+/// payment, which already committed to the fsynced channel store. The runtime
+/// uses [`ChannelReceiptSink`] (hands off to the background
+/// [`spawn_receipt_writer`] task); tests use a synchronous fake behind
+/// [`DirectReceiptSink`].
+pub trait ReceiptSink: Send + Sync {
+    /// Best-effort, non-blocking record of one receipt. Never blocks the caller
+    /// on disk and never fails delivery — a sink that cannot accept the receipt
+    /// drops it.
+    fn record(&self, receipt: DownloadReceipt);
+}
+
+/// Capacity of the receipt-writer queue. Receipts are roughly one per voucher
+/// interval (~1 MiB served), so this absorbs a large burst of voucher
+/// acceptances while a disk stall (a slow or full `data_dir`, the realistic
+/// end-state of #802) is worked off, without ever back-pressuring paid
+/// delivery. On overflow the *audit* receipt is dropped (counted via
+/// [`Metrics::receipt_write_dropped`]) rather than the *payment* stalling — the
+/// payment already committed to the fsynced channel store. Rotation (#802)
+/// bounds the log on disk; this bounds it in memory.
+pub const RECEIPT_LOG_CAPACITY: usize = 1024;
+
+/// Production [`ReceiptSink`]: enqueues to the background writer over a bounded
+/// channel. Mirrors the redeem-hint sink (#751): a `Full` channel drops the
+/// receipt and counts it (`decdn_receipt_writes_dropped_total`); a `Closed`
+/// channel — the writer stopped during shutdown — is silently ignored (the tail
+/// drain has already run, or is bounded by the shutdown deadline).
+#[derive(Clone)]
+pub struct ChannelReceiptSink {
+    tx: mpsc::Sender<DownloadReceipt>,
+    metrics: Arc<Metrics>,
+}
+
+impl std::fmt::Debug for ChannelReceiptSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelReceiptSink")
+            .field("capacity", &self.tx.max_capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReceiptSink for ChannelReceiptSink {
+    fn record(&self, receipt: DownloadReceipt) {
+        match self.tx.try_send(receipt) {
+            // Enqueued — the background writer will append it.
+            Ok(()) => {}
+            // Queue saturated: drop the audit receipt and count it.
+            Err(mpsc::error::TrySendError::Full(_)) => self.metrics.receipt_write_dropped(),
+            // Writer gone. Expected only during shutdown (after the router drains
+            // and the writer's token is cancelled), so it is left uncounted to
+            // avoid false alerting — mirroring the redeem-hint `Closed` rationale
+            // (#751). A `debug!` still leaves a trace, so a writer that died
+            // unexpectedly (e.g. panicked) — which would otherwise drop every
+            // subsequent receipt with no signal — is at least observable.
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(
+                    event = "download_receipt_sink_closed",
+                    "receipt dropped: writer gone (expected only during shutdown)"
+                );
+            }
+        }
+    }
+}
+
+/// Synchronous [`ReceiptSink`] that appends inline to a [`ReceiptLog`],
+/// swallowing the write error. Test/loopback support only: lets the unit and
+/// `client_loopback` tests keep a deterministic in-memory [`ReceiptLog`] fake
+/// behind the sink seam the handler now depends on, without standing up the
+/// background writer or polling for an async drain. Production never uses it —
+/// the runtime always routes through [`spawn_receipt_writer`] so disk I/O cannot
+/// block paid delivery.
+///
+/// It deliberately *violates* the [`ReceiptSink`] non-blocking contract (it
+/// appends inline on the caller's thread), so it must never be wired onto the
+/// paid-delivery path. The type and constructor stay `pub` only because the
+/// cross-crate integration tests in `tests/` cannot see `#[cfg(test)]` items;
+/// the field is private and the type is `#[doc(hidden)]` so it does not read as
+/// a production knob.
+#[doc(hidden)]
+pub struct DirectReceiptSink(Arc<dyn ReceiptLog>);
+
+impl DirectReceiptSink {
+    /// Wrap a synchronous [`ReceiptLog`] as an inline-appending sink. Test and
+    /// loopback use only — see the type docs; never wire this onto the
+    /// paid-delivery path.
+    #[must_use]
+    pub fn new(log: Arc<dyn ReceiptLog>) -> Self {
+        Self(log)
+    }
+}
+
+impl std::fmt::Debug for DirectReceiptSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectReceiptSink").finish_non_exhaustive()
+    }
+}
+
+impl ReceiptSink for DirectReceiptSink {
+    fn record(&self, receipt: DownloadReceipt) {
+        // Audit-only and non-fatal, matching the background writer's handling.
+        let _ = self.0.append(&receipt);
+    }
+}
+
+/// Spawn the single background task that owns the on-disk [`ReceiptLog`] and
+/// drains the receipt queue, returning the [`ReceiptSink`] the delivery path
+/// enqueues through plus the task `JoinHandle` for graceful shutdown.
+///
+/// Decouples the audit write from the paid-delivery hot path (#803): the
+/// voucher-accept path now only does a non-blocking [`ReceiptSink::record`] (a
+/// bounded `try_send`) before `VoucherAck`, while this task performs the actual
+/// `append` on the blocking pool. A slow or full disk can therefore only fill
+/// the queue (and drop audit records, counted) — it can never delay `VoucherAck`
+/// or serialize delivery on the receipt-log mutex. The writer is the *only*
+/// caller of [`ReceiptLog::append`], so the log's internal mutex sees no
+/// cross-stream contention.
+///
+/// On `shutdown` cancellation (fired after the router has drained, so no further
+/// receipts are produced) the task flushes whatever is already enqueued and
+/// exits; await the returned handle within the shutdown deadline to preserve the
+/// audit tail.
+pub fn spawn_receipt_writer(
+    log: Arc<dyn ReceiptLog>,
+    metrics: Arc<Metrics>,
+    shutdown: CancellationToken,
+) -> (Arc<dyn ReceiptSink>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel(RECEIPT_LOG_CAPACITY);
+    let handle = tokio::spawn(receipt_writer_loop(rx, log, shutdown));
+    (Arc::new(ChannelReceiptSink { tx, metrics }), handle)
+}
+
+/// Drain loop for the background receipt writer (see [`spawn_receipt_writer`]).
+/// Appends each receipt FIFO until the queue closes or `shutdown` fires, then
+/// flushes the already-enqueued tail before returning.
+async fn receipt_writer_loop(
+    mut rx: mpsc::Receiver<DownloadReceipt>,
+    log: Arc<dyn ReceiptLog>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            maybe = rx.recv() => match maybe {
+                Some(receipt) => append_one(&log, receipt).await,
+                // All sinks dropped — nothing more can be enqueued.
+                None => break,
+            },
+            () = shutdown.cancelled() => break,
+        }
+    }
+    // Tail-drain: flush every receipt already enqueued before exiting so the
+    // audit tail is not lost on shutdown — the guarantee the previously-awaited
+    // inline write upheld (CLAUDE.md / ADR 003). `try_recv` yields `Empty` once
+    // the buffer is drained (and `Disconnected` if the senders are gone); either
+    // ends the drain.
+    while let Ok(receipt) = rx.try_recv() {
+        append_one(&log, receipt).await;
+    }
+    tracing::debug!("download-receipt writer drained and stopped");
+}
+
+/// Append one receipt on the blocking pool, logging a non-fatal failure.
+///
+/// Offloaded to [`tokio::task::spawn_blocking`] so the synchronous
+/// `write_all`/`flush` (and any disk stall under a full or slow `data_dir`)
+/// runs on the blocking pool, never on a runtime worker. The single writer
+/// awaits each append before the next, preserving receipt order. An append
+/// error is non-fatal — the payment already committed to the fsynced channel
+/// store — so it is logged at `warn` and the loop continues.
+async fn append_one(log: &Arc<dyn ReceiptLog>, receipt: DownloadReceipt) {
+    let log = Arc::clone(log);
+    let join = tokio::task::spawn_blocking(move || {
+        let res = log.append(&receipt);
+        (res, receipt)
+    })
+    .await;
+    // A `JoinError` means the blocking append panicked (`spawn_blocking` tasks
+    // are not cancellable, so a panic is the only way here). The receipt was
+    // moved into the panicked closure, so its fields are gone — but the loss
+    // still gets a structured line, distinct from the normal write-failure path
+    // below, rather than relying on the default panic hook's unstructured stderr.
+    let (res, receipt) = match join {
+        Ok(pair) => pair,
+        Err(join_err) => {
+            tracing::warn!(
+                error = %join_err,
+                event = "download_receipt_writer_join_error",
+                "download-receipt append task panicked; one audit receipt lost \
+                 (payment already committed, audit log only)"
+            );
+            return;
+        }
+    };
+    if let Err(e) = res {
+        tracing::warn!(
+            hash = receipt.hash(),
+            client_node_id = receipt.client_node_id(),
+            voucher_nonce = receipt.voucher_nonce(),
+            error = %e,
+            event = "download_receipt_write_failed",
+            "failed to append download receipt; payment already committed (audit log only)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +776,144 @@ mod tests {
             U256::from(byte),
             1_700_000_000 + u64::from(byte),
         )
+    }
+
+    /// In-memory [`ReceiptLog`] for the writer tests: records every appended
+    /// receipt and (optionally) returns an error for any whose `size` is in
+    /// `fail_sizes`, without recording it — so a test can prove the writer loop
+    /// continues past a non-fatal append error.
+    #[derive(Default)]
+    struct RecordingLog {
+        seen: Mutex<Vec<DownloadReceipt>>,
+        fail_sizes: std::collections::HashSet<u64>,
+    }
+
+    impl RecordingLog {
+        fn snapshot(&self) -> Vec<DownloadReceipt> {
+            self.seen.lock().map(|g| g.clone()).unwrap_or_default()
+        }
+    }
+
+    impl ReceiptLog for RecordingLog {
+        fn append(&self, receipt: &DownloadReceipt) -> std::io::Result<()> {
+            if self.fail_sizes.contains(&receipt.size()) {
+                return Err(std::io::Error::other("simulated receipt write failure"));
+            }
+            self.seen
+                .lock()
+                .map_err(|_| std::io::Error::other("RecordingLog mutex poisoned"))?
+                .push(receipt.clone());
+            Ok(())
+        }
+    }
+
+    /// The writer drains every queued receipt FIFO and stops cleanly once the
+    /// shutdown token is cancelled — the audit-tail-preservation guarantee (#803)
+    /// the previously-awaited inline write upheld.
+    #[tokio::test]
+    async fn writer_drains_all_queued_receipts_then_stops_on_cancel() -> anyhow::Result<()> {
+        let log = Arc::new(RecordingLog::default());
+        let metrics = Arc::new(Metrics::new());
+        let token = CancellationToken::new();
+        let (sink, handle) = spawn_receipt_writer(
+            Arc::clone(&log) as Arc<dyn ReceiptLog>,
+            metrics,
+            token.clone(),
+        );
+        for tag in 0..8u8 {
+            sink.record(sample(tag));
+        }
+        token.cancel();
+        handle.await?;
+        let seen = log.snapshot();
+        anyhow::ensure!(
+            seen.len() == 8,
+            "expected 8 drained receipts, got {}",
+            seen.len()
+        );
+        for (i, tag) in (0..8u8).enumerate() {
+            anyhow::ensure!(
+                seen.get(i) == Some(&sample(tag)),
+                "receipt {i} out of FIFO order"
+            );
+        }
+        Ok(())
+    }
+
+    /// A non-fatal append error does not stop the writer: receipts after the
+    /// failing one are still recorded.
+    #[tokio::test]
+    async fn writer_continues_past_a_failing_append() -> anyhow::Result<()> {
+        let log = Arc::new(RecordingLog {
+            // sample(2).size() == 2 * 1024; that append errors and is skipped.
+            fail_sizes: std::collections::HashSet::from([2 * 1024]),
+            ..RecordingLog::default()
+        });
+        let metrics = Arc::new(Metrics::new());
+        let token = CancellationToken::new();
+        let (sink, handle) = spawn_receipt_writer(
+            Arc::clone(&log) as Arc<dyn ReceiptLog>,
+            metrics,
+            token.clone(),
+        );
+        for tag in 0..5u8 {
+            sink.record(sample(tag));
+        }
+        token.cancel();
+        handle.await?;
+        let seen = log.snapshot();
+        let sizes: Vec<u64> = seen.iter().map(DownloadReceipt::size).collect();
+        anyhow::ensure!(
+            sizes == vec![0, 1024, 3 * 1024, 4 * 1024],
+            "the failing append should be skipped but the rest recorded: {sizes:?}"
+        );
+        Ok(())
+    }
+
+    /// The production sink drops on a full queue and counts the drop, never
+    /// blocking the caller (the paid-delivery hot path, #803).
+    #[test]
+    fn channel_sink_drops_and_counts_on_full_queue() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // Capacity-1 channel with a parked (never-polled) receiver kept alive so
+        // the second `record` sees `Full`, not `Closed`.
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = ChannelReceiptSink {
+            tx,
+            metrics: Arc::clone(&metrics),
+        };
+        sink.record(sample(1)); // fills the single slot
+        sink.record(sample(2)); // full → dropped + counted
+        let text = metrics.encode()?;
+        anyhow::ensure!(
+            text.lines()
+                .any(|l| l == "decdn_receipt_writes_dropped_total 1"),
+            "expected exactly one dropped receipt counted:\n{text}"
+        );
+        Ok(())
+    }
+
+    /// A `Closed` channel (writer gone) drops the receipt but is NOT counted —
+    /// it is expected during shutdown and must not produce false alerting noise,
+    /// mirroring the redeem-hint `Closed` rationale (#751).
+    #[test]
+    fn channel_sink_closed_drops_without_counting() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        // Drop the receiver so the channel is closed.
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+        let sink = ChannelReceiptSink {
+            tx,
+            metrics: Arc::clone(&metrics),
+        };
+        sink.record(sample(1)); // closed → dropped, uncounted
+        let text = metrics.encode()?;
+        anyhow::ensure!(
+            text.lines()
+                .any(|l| l == "decdn_receipt_writes_dropped_total 0"),
+            "a `Closed` drop must not increment the drop counter:\n{text}"
+        );
+        Ok(())
     }
 
     /// A rotation policy whose cap is large enough that the existing
