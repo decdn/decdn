@@ -224,7 +224,7 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -315,7 +315,7 @@ async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()>
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -427,7 +427,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -508,7 +508,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -619,7 +619,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -697,7 +697,7 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -764,7 +764,7 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -824,7 +824,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -925,7 +925,7 @@ async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -990,7 +990,7 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -1119,7 +1119,7 @@ async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -1157,7 +1157,7 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -1202,7 +1202,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -1258,7 +1258,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -1328,7 +1328,7 @@ async fn client_concurrent_same_channel_accepts_one_voucher() -> anyhow::Result<
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
@@ -1392,7 +1392,7 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
 
     client_ep.close().await;
     server_ep.close().await;
-    let _ = server_task.await;
+    server_task.await?;
     Ok(())
 }
 
