@@ -379,7 +379,7 @@ abstract contract BaseProtocolDeploy is Script {
         // the only on-chain slash trigger.
         d.bond.grantRole(d.bond.SLASH_ROLE(), address(d.slashJudge));
         // Wire the SlashJudge into CapacityBond so `setUnbondingPeriod` enforces the
-        // paired `maxEvidenceAgeUs < unbondingPeriod` invariant (ADR 014 § Interaction
+        // paired `maxEvidenceAgeUs < unbondingPeriod * 1e6` invariant (ADR 014 § Interaction
         // with unbonding period). Must run before `_handOffGovernance` revokes
         // GOVERNANCE_ROLE from the deployer. SlashJudge's constructor already enforced
         // the other half against the bond's current unbondingPeriod, and

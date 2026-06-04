@@ -1182,8 +1182,8 @@ contract CapacityBondTest is Test {
 
     function test_setSlashJudge_revertsWithoutRole() public {
         MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US);
+        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
         vm.prank(operator); // not GOVERNANCE_ROLE
-        vm.expectRevert();
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
     }
 

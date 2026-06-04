@@ -88,7 +88,7 @@ contract CapacityBondSlashJudgeInvariantTest is Test {
         bond.setUnbondingPeriod(20 days);
     }
 
-    /// @notice One microsecond-day above the ceiling: `21d*1e6 > 20d*1e6`, so the
+    /// @notice One day above the evidence-age ceiling: `21d*1e6 > 20d*1e6`, so the
     ///         strict invariant holds and the update succeeds.
     function test_realSlashJudge_unbondingAboveEvidenceAge_succeeds() public {
         vm.prank(admin);
