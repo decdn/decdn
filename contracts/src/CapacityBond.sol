@@ -1113,6 +1113,17 @@ contract CapacityBond is
     ///         be silently disabled once wired.
     function setSlashJudge(ISlashJudgeEvidenceView newSlashJudge) external onlyRole(GOVERNANCE_ROLE) {
         if (address(newSlashJudge) == address(0)) revert ZeroAddress();
+        // Reject a judge that would violate the paired invariant against the CURRENT
+        // unbonding period (ADR 014): maxEvidenceAgeUs MUST stay strictly below
+        // unbondingPeriod * 1e6, so the invariant holds the instant the judge is
+        // wired, not only after the next setUnbondingPeriod. `unbondingPeriod` is
+        // bounded [3d,30d] so the multiply cannot overflow.
+        uint256 unbondingUs = unbondingPeriod * 1_000_000;
+        // `maxEvidenceAgeUs()` is a view on the about-to-be-wired `slashJudge`; this
+        // setter is GOVERNANCE_ROLE-gated, so no reentrancy vector (aderyn FP).
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        uint256 maxAgeUs = newSlashJudge.maxEvidenceAgeUs();
+        if (unbondingUs <= maxAgeUs) revert UnbondingBelowEvidenceAge(unbondingUs, maxAgeUs);
         address old = address(slashJudge);
         slashJudge = newSlashJudge;
         emit SlashJudgeUpdated(old, address(newSlashJudge));
