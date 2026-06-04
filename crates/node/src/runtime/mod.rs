@@ -1115,7 +1115,8 @@ pub async fn run(
             channel_store: Arc::clone(&channel_state_store),
             voucher_activity: Arc::clone(&voucher_activity),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
-        });
+        })
+        .with_region_accountant(Arc::clone(&region_accountant));
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");
