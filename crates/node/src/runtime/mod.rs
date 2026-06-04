@@ -164,6 +164,42 @@ async fn run_dispatch_gc(
     }
 }
 
+/// Periodic per-region bandwidth accounting log (#750). Mirrors
+/// [`run_dispatch_gc`]'s shutdown shape: stops on its own oneshot at a clean
+/// await boundary so a regression that ignores `stop_rx` is directly testable.
+/// The first tick is burned so the first line lands one interval after startup
+/// (there is nothing to report at t=0). Emits one structured line per region;
+/// totals are cumulative since process start.
+async fn run_region_accounting_log(
+    accountant: Arc<crate::region_accounting::RegionAccountant>,
+    mut stop_rx: oneshot::Receiver<()>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                tracing::debug!("region accounting log shutdown signal received");
+                return;
+            }
+            _ = ticker.tick() => {
+                for r in accountant.snapshot() {
+                    tracing::info!(
+                        event = "region_bandwidth",
+                        region = %r.region,
+                        bytes_in = r.bytes_in,
+                        bytes_out = r.bytes_out,
+                        "per-region bandwidth (cumulative since start)"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Periodic DHT record-store GC task (ADR 022 §Content Records and TTL).
 ///
 /// `RecordStore::providers_at` lazily scrubs expired records for the
@@ -650,6 +686,29 @@ pub async fn run(
         decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr);
     let bind_domain =
         decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
+
+    // Shared gossip peer table (ADR 001). Built here — ahead of the client
+    // handler and admin wiring — so the per-region bandwidth accountant (#750)
+    // can resolve regions through it and be attached to the handler below.
+    // `PeerTable::new` depends only on resolved `cfg.gossip.*`, so this is
+    // safe to construct this early.
+    let peer_table = Arc::new(RwLock::new(PeerTable::new(
+        cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
+        // Saturate at `usize::MAX` on 32-bit targets where the configured
+        // `u64` cap might not fit; mirrors the saturating cast pattern
+        // already used on `i64::try_from(table.len())` in the sweeper
+        // path. The config resolver rejects `0`, so the runtime never
+        // hits the unbounded escape hatch.
+        usize::try_from(cfg.gossip.max_peer_table_entries).unwrap_or(usize::MAX),
+    )));
+
+    // Per-region bandwidth accountant (#750). Resolves regions from the shared
+    // peer table; shared (via Arc) with the client handler (records served
+    // bytes) and, in a later task, the admin surface (reads the snapshot).
+    let region_accountant = Arc::new(crate::region_accounting::RegionAccountant::new(Arc::new(
+        crate::region_accounting::PeerTableResolver::new(Arc::clone(&peer_table)),
+    )));
+
     let client_handler = Arc::new(ClientHandler::new(
         secret_key.public(),
         Arc::clone(&node_metrics),
@@ -710,6 +769,7 @@ pub async fn run(
     // next voucher (see `decdn_incentive::VoucherActivity`).
     let voucher_activity = Arc::new(decdn_incentive::VoucherActivity::new());
     client_handler.attach_voucher_activity(Arc::clone(&voucher_activity));
+    client_handler.attach_region_accountant(Arc::clone(&region_accountant));
 
     // On-chain buyer-side service (#744). When this node pulls content from an
     // upstream provider on a cache miss it pays via the same channel mechanism,
@@ -817,6 +877,23 @@ pub async fn run(
         dispatch_gc_stop_rx,
         DISPATCH_GC_INTERVAL,
     ));
+
+    // Periodic per-region bandwidth log (#750). `interval == 0` disables it,
+    // mirroring the RPC watchdog's opt-out. Same oneshot-stop shape as the GCs.
+    let region_log_stop_tx = if cfg.observability.region_accounting_interval_sec > 0 {
+        let (tx, rx) = oneshot::channel::<()>();
+        tasks.spawn(run_region_accounting_log(
+            Arc::clone(&region_accountant),
+            rx,
+            Duration::from_secs(cfg.observability.region_accounting_interval_sec),
+        ));
+        Some(tx)
+    } else {
+        tracing::info!(
+            "region accounting log disabled (observability.region_accounting_interval_sec = 0)"
+        );
+        None
+    };
 
     // Periodic DHT record-store GC (ADR 022 §Content Records and TTL).
     // Without this, expired records accumulate against per-publisher
@@ -938,16 +1015,6 @@ pub async fn run(
         tracing::info!("RPC watchdog disabled (blockchain.rpc_watchdog_interval_sec = 0)");
         None
     };
-
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(
-        cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
-        // Saturate at `usize::MAX` on 32-bit targets where the configured
-        // `u64` cap might not fit; mirrors the saturating cast pattern
-        // already used on `i64::try_from(table.len())` in the sweeper
-        // path. The config resolver rejects `0`, so the runtime never
-        // hits the unbounded escape hatch.
-        usize::try_from(cfg.gossip.max_peer_table_entries).unwrap_or(usize::MAX),
-    )));
 
     // Admin HTTP surface (ADR 025). Bind here — *before* the gossip service
     // spawns — so startup fails fast on a port collision rather than after
@@ -1132,6 +1199,9 @@ pub async fn run(
     // through `JoinSet::join_next` during the drain phase below — no
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
+    if let Some(tx) = region_log_stop_tx {
+        let _ = tx.send(());
+    }
     let _ = record_store_gc_stop_tx.send(());
     let _ = dht_rate_limit_gc_stop_tx.send(());
     let _ = republish_stop_tx.send(());
@@ -1990,6 +2060,8 @@ mod tests {
                 metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 admin_port: Some(9191),
                 otlp_endpoint: None,
+                region_accounting_interval_sec:
+                    decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
             },
             gossip: ResolvedGossip {
                 announce_interval_sec: 60,
@@ -2223,6 +2295,35 @@ mod tests {
         result
             .expect("timeout already asserted")
             .expect("task should not panic");
+    }
+
+    #[tokio::test]
+    async fn region_accounting_log_stops_promptly_on_signal() {
+        use std::sync::Arc;
+
+        use crate::region_accounting::{RegionAccountant, RegionResolver};
+
+        struct NoRegions;
+        #[async_trait::async_trait]
+        impl RegionResolver for NoRegions {
+            async fn region_of(&self, _node_id: &[u8; 32]) -> Option<String> {
+                None
+            }
+        }
+
+        let accountant = Arc::new(RegionAccountant::new(Arc::new(NoRegions)));
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        // A long interval so the test can only finish via the stop signal.
+        let handle = tokio::spawn(run_region_accounting_log(
+            accountant,
+            stop_rx,
+            Duration::from_hours(1),
+        ));
+        stop_tx.send(()).expect("receiver still alive");
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("log task did not stop within 5s")
+            .expect("log task panicked");
     }
 
     /// `run_record_store_gc` exits promptly when the stop oneshot

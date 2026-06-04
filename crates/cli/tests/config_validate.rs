@@ -278,6 +278,8 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             admin_port: Some(9191),
             otlp_endpoint: None,
+            region_accounting_interval_sec:
+                decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
         },
         gossip: ResolvedGossip {
             announce_interval_sec: 60,
