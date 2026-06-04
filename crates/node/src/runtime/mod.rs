@@ -1199,6 +1199,7 @@ pub async fn run(
     // through `JoinSet::join_next` during the drain phase below — no
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
+    // region bandwidth accounting log (#750)
     if let Some(tx) = region_log_stop_tx {
         let _ = tx.send(());
     }

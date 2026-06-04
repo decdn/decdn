@@ -146,6 +146,10 @@ pub fn write_validate_summary<W: std::io::Write>(
         Some(p) => writeln!(w, "  admin_port:               {p}")?,
         None => writeln!(w, "  admin_port:               disabled")?,
     }
+    match resolved.observability.region_accounting_interval_sec {
+        0 => writeln!(w, "  region_accounting_interval_sec: disabled")?,
+        n => writeln!(w, "  region_accounting_interval_sec: {n}")?,
+    }
     // otlp_endpoint URLs commonly carry bearer tokens or API keys in the
     // path or query, so redact like rpc_url.
     if let Some(otlp) = &resolved.observability.otlp_endpoint {
@@ -225,5 +229,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # log_format = "pretty"
 # metrics_port = 9090
 # admin_port = 9191                        # loopback-only; 0 disables (ADR 025)
+# region_accounting_interval_sec = 3600    # 0 disables the per-region bandwidth log (#750)
 # otlp_endpoint = "http://localhost:4317"  # requires --features otlp
 "#;
