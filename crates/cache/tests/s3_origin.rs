@@ -470,9 +470,10 @@ async fn fetch_with_strict_mode_rejects_gzip_encoding() -> anyhow::Result<()> {
             anyhow::bail!("Content-Encoding rejection must be Permanent, was Transient: {e:#}");
         }
     };
+    // Operators grep for these substrings in runbooks; pin the contract.
     anyhow::ensure!(
-        msg.contains("Content-Encoding") && (msg.contains("unsupported") || msg.contains("gzip")),
-        "strict rejection lost its actionable wording: {msg}"
+        msg.contains("Content-Encoding") && msg.contains("canonical bytes"),
+        "strict rejection lost its actionable runbook hint: {msg}"
     );
     Ok(())
 }

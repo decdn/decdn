@@ -203,6 +203,21 @@ since project inception and will roll into the first tagged release.
   Unknown encodings (e.g. `br`) are rejected with an operator-actionable
   permanent error.
 
+  **Config-breaking (default shift):** the S3 backend previously rejected
+  *all* `Content-Encoding`; it now defaults to `decompress = "auto"`.
+  Operators who relied on that blanket rejection as a guard against
+  mis-stored objects should set `decompress = "strict"` to keep refusing
+  encoded bodies. The shift is safe by construction — BLAKE3 verify runs
+  over canonical bytes, so a mis-decode fails closed as a hash mismatch
+  rather than caching corrupt data.
+
+  This release also fixes a latent #804 bug on the **HTTP** origin (a second
+  backend, not part of the pure S3 extraction): a compressed body whose
+  *encoded* `Content-Length` fit under `cache.buffered_max_bytes` but decoded
+  above it was falsely rejected as `BlobTooLarge`. Compressed responses now
+  report no `size_hint`, so they always take the streaming path capped at the
+  blob-size limit — parity with the S3 fix, pinned by an HTTP regression test.
+
 #### Gossip
 
 - `NodeAnnounce` publish/subscribe over `iroh-gossip` with an in-memory

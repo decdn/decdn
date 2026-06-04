@@ -512,9 +512,16 @@ impl Origin for S3Origin {
                 Some(enc) => match decompress::resolve_encoding(enc.trim(), self.decompress) {
                     Ok(encoding) => encoding,
                     Err(err) => {
+                        // Keep the operator runbook hint on the rejection: the
+                        // remediation is to store canonical bytes at the origin,
+                        // or (for gzip/zstd under `Strict`) flip to `auto`. The
+                        // `decode gzip/zstd` scoping keeps the hint honest for
+                        // unknown encodings like `br`, which `auto` cannot help.
                         return Err(OriginPullError::Permanent(
                             anyhow::Error::from(err).context(format!(
-                                "{log_target}: S3 origin rejected Content-Encoding"
+                                "{log_target}: S3 origin rejected Content-Encoding — store \
+                                 canonical bytes at the origin, or set `decompress = \"auto\"` \
+                                 to decode gzip/zstd"
                             )),
                         ));
                     }
