@@ -622,8 +622,15 @@ contract CapacityBond is
     ///         see the same source of truth. `regionPrev` retains the prior
     ///         value for the ADR 030 § 52 blacklist-scope ripening predicate
     ///         ("the previous region's entries keep applying until the change
-    ///         ripens"); the on-chain enforcement of that predicate lands with
-    ///         the ADR 030 implementation PR and is not active in this revision.
+    ///         ripens"), now enforced on-chain by `SlashJudge` and
+    ///         `ContentBlacklist` via the `regionScopeData` view (#800).
+    /// @dev    Only the length ceiling is enforced here; `"GLOBAL"` and `""` are
+    ///         accepted as region strings. `RegionScopeLib` is the canonical guard
+    ///         that excludes them from the scope predicate (a GLOBAL/empty current
+    ///         or prev region is never a regional-leg match), and `addHashRegional`
+    ///         independently rejects them as entry keys — so neither can collide
+    ///         with the global blacklist. Rejecting them here too would only add
+    ///         bytecode to this near-EIP-170-ceiling contract for no new guarantee.
     function updateRegion(string calldata newRegion) external whenNotPaused {
         if (bytes(newRegion).length > MAX_REGION_HINT_BYTES) {
             revert RegionHintTooLong({ size: bytes(newRegion).length, ceiling: MAX_REGION_HINT_BYTES });

@@ -473,4 +473,26 @@ contract ContentBlacklistTest is Test {
         bondMock.setRegion(operator, "EU", "US", uint64(block.timestamp - 8 days));
         assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
     }
+
+    function test_isHashBlacklistedForOperator_neverChangedFallback_ripensFromMaxBondGate() public {
+        vm.warp(30 days); // headroom for the `- N days` stamps below
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        // `regionLastChanged == 0` (never changed on-chain) routes the window
+        // through the `max(firstBondedAt, gate)` fallback — the path the
+        // lastChanged tests above never reach via the real `regionScopeData` read.
+        // The gate (1d ago) is the more-recent stamp; a stale `firstBondedAt` (10d
+        // ago) would have closed the 7d window. Prev (US) entry still applies →
+        // true, proving the fallback selected the gate (the `max`).
+        bondMock.setRegion(operator, "EU", "US", 0);
+        bondMock.setFirstBondedAt(operator, uint64(block.timestamp - 10 days));
+        bondMock.setGate(uint64(block.timestamp - 1 days), 7 days);
+        assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+        // Now `firstBondedAt` (8d ago) is the `max` and the gate is older still
+        // (9d); 8d ≥ the 7d window → prev US ripened out, current EU has no entry
+        // → false. Proves the window closes the fallback and selects `firstBondedAt`.
+        bondMock.setFirstBondedAt(operator, uint64(block.timestamp - 8 days));
+        bondMock.setGate(uint64(block.timestamp - 9 days), 7 days);
+        assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
+    }
 }

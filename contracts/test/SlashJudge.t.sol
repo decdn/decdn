@@ -517,6 +517,41 @@ contract SlashJudgeTest is Test {
         judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
     }
 
+    function test_blacklist_neverChangedFallback_ripensFromMaxBondGate() public {
+        // `regionLastChanged == 0` (never-changed path) routes `effectiveSince`
+        // through the `max(firstBondedAt, regionGateActivatedAt)` fallback, which
+        // the other integration tests never exercise through the real
+        // `regionScopeData` read. Here the more-recent stamp is the gate (1d ago);
+        // the stale `firstBondedAt` (10d ago) would have closed the 7d window. The
+        // prev-region (us-east) entry therefore still applies → slash, proving the
+        // fallback selected the gate (the `max`), not `firstBondedAt`.
+        slasher.setRegion(node, "eu-west", "us-east", 0);
+        slasher.setFirstBondedAt(node, uint64(block.timestamp - 10 days));
+        slasher.setGate(uint64(block.timestamp - 1 days), 7 days);
+        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    function test_blacklist_neverChangedFallback_revertsAfterMaxBondGateWindow() public {
+        // Same never-changed fallback, but now the `max` operand is `firstBondedAt`
+        // (8d ago) and the gate is older still (9d ago). 8d ≥ the 7d window, so the
+        // prev-region (us-east) entry has ripened out of scope and the current
+        // region (eu-west) has no entry → revert. Proves the window closes the
+        // fallback from `max(firstBondedAt, gate)` and that `firstBondedAt` is the
+        // selected operand.
+        slasher.setRegion(node, "eu-west", "us-east", 0);
+        slasher.setFirstBondedAt(node, uint64(block.timestamp - 8 days));
+        slasher.setGate(uint64(block.timestamp - 9 days), 7 days);
+        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+    }
+
     // -----------------------------------------------------------------
     // Governance
     // -----------------------------------------------------------------
