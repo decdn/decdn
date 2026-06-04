@@ -406,6 +406,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             Arc::clone(&pending_store),
             handler,
             self_address,
+            Arc::clone(&metrics),
         ));
 
         Ok(Self {
@@ -1877,6 +1878,7 @@ async fn sweeper_loop<P: Provider + Clone>(
     pending_store: Arc<dyn PendingSettleStore>,
     handler: Arc<ClientHandler>,
     self_address: Address,
+    metrics: Arc<Metrics>,
 ) {
     let mut ticker = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
     // Skip the immediate first tick — the expiry pass has nothing to do right
@@ -1890,7 +1892,7 @@ async fn sweeper_loop<P: Provider + Clone>(
         sweep_once(&contract, &store, &pending_store, &handler, self_address).await;
         // Read `now` here rather than before `sweep_once` (which does network
         // I/O) so the settle gate uses a fresh timestamp.
-        settle_pass(&contract, &pending_store, unix_now()).await;
+        settle_pass(&contract, &pending_store, unix_now(), &metrics).await;
     }
 }
 
@@ -1986,6 +1988,7 @@ async fn settle_pass<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     pending_store: &Arc<dyn PendingSettleStore>,
     now: u64,
+    metrics: &Arc<Metrics>,
 ) {
     let entries = match pending_store.load_pending() {
         Ok(e) => e,
@@ -2000,7 +2003,7 @@ async fn settle_pass<P: Provider + Clone>(
         if !ready_to_settle(now, entry.settle_after) {
             continue;
         }
-        try_settle(contract, pending_store, entry.channel_id).await;
+        try_settle(contract, pending_store, entry.channel_id, metrics).await;
     }
 }
 
@@ -2017,28 +2020,40 @@ async fn try_settle<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     pending_store: &Arc<dyn PendingSettleStore>,
     channel_id: ChannelId,
+    metrics: &Arc<Metrics>,
 ) {
     let send = match contract.settleChannel(channel_id).send().await {
         Ok(p) => p,
         Err(err) => {
-            warn!(%err, %channel_id, "settleChannel send failed; will retry next sweep");
+            metrics.settlement_finalize_transient_send();
+            warn!(
+                %err, %channel_id, outcome = "transient_send",
+                "settleChannel send failed; will retry next sweep"
+            );
             return;
         }
     };
     let receipt = match send.get_receipt().await {
         Ok(r) => r,
         Err(err) => {
-            warn!(%err, %channel_id, "settleChannel receipt failed; will retry next sweep");
+            metrics.settlement_finalize_transient_receipt();
+            warn!(
+                %err, %channel_id, outcome = "transient_receipt",
+                "settleChannel receipt failed; will retry next sweep"
+            );
             return;
         }
     };
-    if receipt.status() {
+    let landed = receipt.status();
+    record_settle_receipt_outcome(metrics, landed);
+    if landed {
         info!(
             %channel_id,
             tx = %receipt.transaction_hash,
+            outcome = "ok",
             "settled channel; routed provider remainder through FeeRouter"
         );
-        forget_pending_logged(pending_store, channel_id);
+        forget_pending_logged(pending_store, channel_id, metrics);
         return;
     }
     // Reverted: most likely `ChannelNotClosing` because another party already
@@ -2046,9 +2061,23 @@ async fn try_settle<P: Provider + Clone>(
     warn!(
         %channel_id,
         tx = %receipt.transaction_hash,
+        outcome = "reverted",
         "settleChannel reverted; checking whether it was already finalized"
     );
-    drop_pending_if_finalized(contract, pending_store, channel_id).await;
+    drop_pending_if_finalized(contract, pending_store, channel_id, metrics).await;
+}
+
+/// Count the terminal outcome of a `settleChannel` receipt: a landed receipt
+/// (`status() == true`) ticks `settlement_finalize_ok`, a reverted one (`false`)
+/// ticks the raw `settlement_finalize_reverted`. Split out from `try_settle` so
+/// this high-consequence ok-vs-reverted mapping is unit-testable without a live
+/// provider (mirrors `record_auto_settle_close_outcome`).
+fn record_settle_receipt_outcome(metrics: &Arc<Metrics>, landed: bool) {
+    if landed {
+        metrics.settlement_finalize_ok();
+    } else {
+        metrics.settlement_finalize_reverted();
+    }
 }
 
 /// After a reverted `settleChannel`, read the channel to decide what to do
@@ -2065,25 +2094,62 @@ async fn drop_pending_if_finalized<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     pending_store: &Arc<dyn PendingSettleStore>,
     channel_id: ChannelId,
+    metrics: &Arc<Metrics>,
 ) {
     match contract.getChannel(channel_id).call().await {
-        Ok(ch) if matches!(ch.status, PaymentChannel::Status::Closed) => {
-            info!(%channel_id, "channel already settled elsewhere; dropping pending entry");
-            forget_pending_logged(pending_store, channel_id);
-        }
-        Ok(ch) if matches!(ch.status, PaymentChannel::Status::Closing) => {
-            // Re-stamp the gate to the current on-chain deadline (overwrites by
-            // contract). A no-op when unchanged; the fix when a dispute pushed
-            // the deadline out from under our stored value.
-            restamp_pending_logged(pending_store, channel_id, ch.disputeDeadline);
-        }
-        Ok(_) => {
-            // `Open` is unreachable for a channel we closed (close → Closing →
-            // Closed); leave the entry and retry next sweep if it ever occurs.
+        Ok(ch) => {
+            record_revert_resolution(metrics, Some(&ch.status));
+            match ch.status {
+                PaymentChannel::Status::Closed => {
+                    info!(%channel_id, "channel already settled elsewhere; dropping pending entry");
+                    forget_pending_logged(pending_store, channel_id, metrics);
+                }
+                PaymentChannel::Status::Closing => {
+                    // Re-stamp the gate to the current on-chain deadline
+                    // (overwrites by contract). A no-op when unchanged; the fix
+                    // when a dispute pushed the deadline out from under our
+                    // stored value.
+                    restamp_pending_logged(pending_store, channel_id, ch.disputeDeadline, metrics);
+                }
+                _ => {
+                    // `Open` is unreachable for a channel we closed (close →
+                    // Closing → Closed); seeing it means a contract /
+                    // `channel_id` / reorg anomaly. `record_revert_resolution`
+                    // already counted it as `confirm_failed` (an unresolved
+                    // revert; `Status` has no `Debug` impl to log here). Emit a
+                    // tripwire and keep the entry for the next sweep rather than
+                    // dropping an obligation we can't explain.
+                    warn!(
+                        %channel_id,
+                        "post-revert getChannel returned an unexpected non-terminal status \
+                         (expected Closed or Closing); keeping entry"
+                    );
+                }
+            }
         }
         Err(err) => {
+            record_revert_resolution(metrics, None);
             warn!(%err, %channel_id, "post-revert getChannel failed; will retry next sweep");
         }
+    }
+}
+
+/// Count how a reverted `settleChannel` resolved once the channel was re-read.
+/// `Some(Closed)` → a co-settler finalized first (`..._confirmed_closed`,
+/// benign; the pending entry is then dropped by the caller); `Some(Closing)` →
+/// a dispute extended the window, so the caller re-stamps and retries
+/// (`..._restamped`, benign); everything else — `None` (the confirming
+/// `getChannel` read itself failed) and `Some(Open)` (unreachable for a closed
+/// channel, so an anomaly) — is an unresolved revert counted as
+/// `..._confirm_failed`, the genuinely-degraded signal. Folding the two
+/// unresolved cases together keeps the exact invariant
+/// `reverted == confirmed_closed + restamped + confirm_failed`. Split out so
+/// the status→counter mapping is unit-testable without a provider.
+fn record_revert_resolution(metrics: &Arc<Metrics>, status: Option<&PaymentChannel::Status>) {
+    match status {
+        Some(PaymentChannel::Status::Closed) => metrics.settlement_finalize_confirmed_closed(),
+        Some(PaymentChannel::Status::Closing) => metrics.settlement_finalize_restamped(),
+        _ => metrics.settlement_finalize_confirm_failed(),
     }
 }
 
@@ -2091,8 +2157,13 @@ async fn drop_pending_if_finalized<P: Provider + Clone>(
 /// the settlement already landed on-chain, so a failed delete only risks a
 /// redundant `settleChannel` next sweep (which reverts harmlessly and re-drops
 /// via the `Closed`-status path).
-fn forget_pending_logged(pending_store: &Arc<dyn PendingSettleStore>, channel_id: ChannelId) {
+fn forget_pending_logged(
+    pending_store: &Arc<dyn PendingSettleStore>,
+    channel_id: ChannelId,
+    metrics: &Arc<Metrics>,
+) {
     if let Err(err) = pending_store.forget_pending(channel_id) {
+        metrics.settlement_pending_persist_failure();
         warn!(%err, %channel_id, "failed to drop pending-settle entry after settlement");
     }
 }
@@ -2105,12 +2176,14 @@ fn restamp_pending_logged(
     pending_store: &Arc<dyn PendingSettleStore>,
     channel_id: ChannelId,
     settle_after: u64,
+    metrics: &Arc<Metrics>,
 ) {
     let entry = PendingSettle {
         channel_id,
         settle_after,
     };
     if let Err(err) = pending_store.record_pending(&entry) {
+        metrics.settlement_pending_persist_failure();
         warn!(%err, %channel_id, "failed to re-stamp pending-settle deadline; will retry next sweep");
     } else {
         debug!(
@@ -2817,6 +2890,211 @@ mod tests {
             failures(&metrics),
             1,
             "a stranded-but-closed channel must increment the failure counter so the leak is observable"
+        );
+    }
+
+    // ---- settleChannel finalization-sweep counters (#810) ---------------------
+
+    /// Read one finalization-sweep counter from the `OpenMetrics` text. Thin
+    /// alias over [`auto_settle_counter`] (same `<name> <n>` parse) for tests
+    /// that read the `settlement_finalize_*` family.
+    fn finalize_counter(metrics: &Arc<Metrics>, name: &str) -> u64 {
+        auto_settle_counter(metrics, name)
+    }
+
+    /// A `PendingSettleStore` whose writes always fail — drives the persist-
+    /// failure counter in `forget_pending_logged` / `restamp_pending_logged`.
+    struct FailingPendingStore;
+
+    impl PendingSettleStore for FailingPendingStore {
+        fn record_pending(&self, _entry: &PendingSettle) -> Result<(), StoreError> {
+            Err(StoreError::Backend("forced write failure".into()))
+        }
+        fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn forget_pending(&self, _channel_id: ChannelId) -> Result<(), StoreError> {
+            Err(StoreError::Backend("forced delete failure".into()))
+        }
+    }
+
+    #[test]
+    fn settle_receipt_outcome_maps_landed_to_ok_and_revert_to_reverted() {
+        // The highest-consequence mapping in the feature: a landed receipt is
+        // the "settlement is landing" signal; a revert is the (raw) "did not
+        // land" signal. A swap here would invert an operator's dashboard, so
+        // assert each direction independently against a fresh registry.
+        let landed = Arc::new(Metrics::new());
+        record_settle_receipt_outcome(&landed, true);
+        assert_eq!(
+            finalize_counter(&landed, "decdn_settlement_finalize_ok_total"),
+            1
+        );
+        assert_eq!(
+            finalize_counter(&landed, "decdn_settlement_finalize_reverted_total"),
+            0
+        );
+
+        let reverted = Arc::new(Metrics::new());
+        record_settle_receipt_outcome(&reverted, false);
+        assert_eq!(
+            finalize_counter(&reverted, "decdn_settlement_finalize_ok_total"),
+            0
+        );
+        assert_eq!(
+            finalize_counter(&reverted, "decdn_settlement_finalize_reverted_total"),
+            1
+        );
+    }
+
+    #[test]
+    fn revert_resolution_maps_each_status_to_its_counter() {
+        // `Closed` = benign co-settler race; `Closing` = benign dispute
+        // re-stamp; the two UNRESOLVED cases — `None` (read error) and
+        // `Some(Open)` (unreachable-for-a-closed-channel anomaly) — both fold
+        // into `confirm_failed` so the exact invariant
+        // `reverted == confirmed_closed + restamped + confirm_failed` holds and
+        // an anomaly is degraded-but-observable, never silently dropped.
+        let closed = Arc::new(Metrics::new());
+        record_revert_resolution(&closed, Some(&PaymentChannel::Status::Closed));
+        assert_eq!(
+            finalize_counter(&closed, "decdn_settlement_finalize_confirmed_closed_total"),
+            1
+        );
+        assert_eq!(
+            finalize_counter(&closed, "decdn_settlement_finalize_restamped_total"),
+            0
+        );
+        assert_eq!(
+            finalize_counter(&closed, "decdn_settlement_finalize_confirm_failed_total"),
+            0
+        );
+
+        let closing = Arc::new(Metrics::new());
+        record_revert_resolution(&closing, Some(&PaymentChannel::Status::Closing));
+        assert_eq!(
+            finalize_counter(&closing, "decdn_settlement_finalize_restamped_total"),
+            1
+        );
+        assert_eq!(
+            finalize_counter(&closing, "decdn_settlement_finalize_confirmed_closed_total"),
+            0
+        );
+
+        // Read error → confirm_failed.
+        let failed = Arc::new(Metrics::new());
+        record_revert_resolution(&failed, None);
+        assert_eq!(
+            finalize_counter(&failed, "decdn_settlement_finalize_confirm_failed_total"),
+            1
+        );
+
+        // Anomalous `Open` → also confirm_failed (degraded, not silent), and
+        // never the benign buckets.
+        let open = Arc::new(Metrics::new());
+        record_revert_resolution(&open, Some(&PaymentChannel::Status::Open));
+        assert_eq!(
+            finalize_counter(&open, "decdn_settlement_finalize_confirm_failed_total"),
+            1,
+            "an unexpected Open must be counted as a degraded/unresolved revert"
+        );
+        for name in [
+            "decdn_settlement_finalize_confirmed_closed_total",
+            "decdn_settlement_finalize_restamped_total",
+        ] {
+            assert_eq!(
+                finalize_counter(&open, name),
+                0,
+                "{name} must stay zero for the anomalous Open case"
+            );
+        }
+    }
+
+    #[test]
+    fn reverted_partitions_exactly_into_resolution_counters() {
+        // The additive invariant that justifies folding the two unresolved
+        // cases (read error + anomalous Open) into `confirm_failed`:
+        //   reverted == confirmed_closed + restamped + confirm_failed
+        // The per-status tests above prove the mapping in isolation; this drives
+        // both helpers in the SAME order `try_settle` → `drop_pending_if_finalized`
+        // uses (bump `reverted`, then resolve once) across a mixed batch on ONE
+        // registry and asserts the sum closes, so a future edit that skips or
+        // double-bumps a resolution would break this even though the isolated
+        // mapping tests still pass.
+        let metrics = Arc::new(Metrics::new());
+        let resolutions = [
+            Some(PaymentChannel::Status::Closed),
+            Some(PaymentChannel::Status::Closed),
+            Some(PaymentChannel::Status::Closing),
+            None,                               // read error → confirm_failed
+            Some(PaymentChannel::Status::Open), // anomaly → confirm_failed
+        ];
+        for status in &resolutions {
+            record_settle_receipt_outcome(&metrics, false);
+            record_revert_resolution(&metrics, status.as_ref());
+        }
+
+        let reverted = finalize_counter(&metrics, "decdn_settlement_finalize_reverted_total");
+        let confirmed_closed =
+            finalize_counter(&metrics, "decdn_settlement_finalize_confirmed_closed_total");
+        let restamped = finalize_counter(&metrics, "decdn_settlement_finalize_restamped_total");
+        let confirm_failed =
+            finalize_counter(&metrics, "decdn_settlement_finalize_confirm_failed_total");
+
+        assert_eq!(reverted, 5, "five reverts were recorded");
+        assert_eq!(
+            reverted,
+            confirmed_closed + restamped + confirm_failed,
+            "every revert must resolve into exactly one resolution counter \
+             (reverted={reverted}, confirmed_closed={confirmed_closed}, \
+             restamped={restamped}, confirm_failed={confirm_failed})"
+        );
+        assert_eq!(confirmed_closed, 2, "two Closed re-reads");
+        assert_eq!(restamped, 1, "one Closing re-read");
+        assert_eq!(
+            confirm_failed, 2,
+            "read error + anomalous Open both fold here"
+        );
+    }
+
+    #[test]
+    fn pending_persist_failure_is_counted_for_forget_and_restamp() {
+        // Both the forget (post-settle / already-Closed) and the re-stamp
+        // (dispute-extended) store writes feed the SAME persist counter, the
+        // way `watcher_persist_failure` lumps the watcher's persist sites.
+        let store: Arc<dyn PendingSettleStore> = Arc::new(FailingPendingStore);
+        let channel_id = ChannelId::from([3u8; 32]);
+        let metrics = Arc::new(Metrics::new());
+
+        forget_pending_logged(&store, channel_id, &metrics);
+        assert_eq!(
+            finalize_counter(&metrics, "decdn_settlement_pending_persist_failures_total"),
+            1,
+            "a failed forget must be counted, not just logged"
+        );
+
+        restamp_pending_logged(&store, channel_id, 123, &metrics);
+        assert_eq!(
+            finalize_counter(&metrics, "decdn_settlement_pending_persist_failures_total"),
+            2,
+            "a failed re-stamp feeds the same persist counter"
+        );
+    }
+
+    #[test]
+    fn pending_persist_success_does_not_count() {
+        use decdn_incentive::MemoryPendingSettleStore;
+
+        let store: Arc<dyn PendingSettleStore> = Arc::new(MemoryPendingSettleStore::new());
+        let channel_id = ChannelId::from([4u8; 32]);
+        let metrics = Arc::new(Metrics::new());
+
+        // Both writes succeed against the in-memory store → no persist failure.
+        restamp_pending_logged(&store, channel_id, 99, &metrics);
+        forget_pending_logged(&store, channel_id, &metrics);
+        assert_eq!(
+            finalize_counter(&metrics, "decdn_settlement_pending_persist_failures_total"),
+            0
         );
     }
 
