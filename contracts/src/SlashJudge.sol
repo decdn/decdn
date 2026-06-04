@@ -28,9 +28,10 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         round-trips the challenge bond.
 /// @dev    `MAX_EVIDENCE_AGE_US < CapacityBond.unbondingPeriod` is enforced on
 ///         this side (constructor + `setMaxEvidenceAge`). The mirror check on
-///         `CapacityBond.setUnbondingPeriod` is NOT present on the deployed
-///         `CapacityBond` (it predates `SlashJudge`); closing that half needs a
-///         `CapacityBond` change and is tracked outside this PR.
+///         `CapacityBond.setUnbondingPeriod` is enforced via CapacityBond's
+///         `slashJudge` reference (wired post-deploy through
+///         `CapacityBond.setSlashJudge`), so the paired invariant is now closed
+///         on both contracts (#778).
 contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EIP712 {
     using SafeERC20 for IERC20;
 
