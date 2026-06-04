@@ -37,7 +37,7 @@ contract CapacityBondTest is Test {
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING = 7 days;
     // 10 days in microseconds — a valid evidence-age ceiling (within [1d,30d])
-    // that is also >= the [7d,60d] unbonding floor, so the mirror check and the
+    // that is also >= the [3d,30d] unbonding floor, so the mirror check and the
     // individual bound can be exercised independently.
     uint256 internal constant MOCK_EVIDENCE_AGE_US = 10 days * 1_000_000;
 
