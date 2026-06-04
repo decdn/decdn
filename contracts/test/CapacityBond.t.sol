@@ -1227,6 +1227,21 @@ contract CapacityBondTest is Test {
         assertEq(address(bond.slashJudge()), address(okJudge));
     }
 
+    function test_setSlashJudge_rewireEmitsPreviousJudgeAsOld() public {
+        // Re-wiring a second judge must emit the FIRST judge as `old` (not address(0)).
+        // Both maxEvidenceAgeUs values (4d, 5d *1e6) are strictly below the bond's
+        // unbondingPeriod*1e6 (7 days*1e6), so both wires satisfy the invariant.
+        MockSlashJudgeEvidence first = new MockSlashJudgeEvidence(uint256(4 days) * 1_000_000);
+        MockSlashJudgeEvidence second = new MockSlashJudgeEvidence(uint256(5 days) * 1_000_000);
+        vm.startPrank(admin);
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(first)));
+        vm.expectEmit(true, true, false, false, address(bond));
+        emit CapacityBond.SlashJudgeUpdated(address(first), address(second));
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(second)));
+        vm.stopPrank();
+        assertEq(address(bond.slashJudge()), address(second));
+    }
+
     // -----------------------------------------------------------------
     // setUnbondingPeriod x maxEvidenceAgeUs mirror invariant (ADR 014)
     // -----------------------------------------------------------------
@@ -1298,5 +1313,18 @@ contract CapacityBondTest is Test {
         vm.prank(admin);
         bond.setUnbondingPeriod(8 days); // within [3d,30d], no judge -> succeeds
         assertEq(bond.unbondingPeriod(), 8 days);
+    }
+
+    function test_setUnbondingPeriod_floorWithLowEvidenceAgeSucceeds() public {
+        // Tightest valid corner: unbonding at the floor (UNBONDING_PERIOD_FLOOR == 3 days)
+        // with a 1-day evidence-age judge. The fixture bond starts at UNBONDING (7 days),
+        // so wiring a 1-day judge passes (7d*1e6 > 1d*1e6); lowering to 3 days then passes
+        // both the [3d,30d] bound (3 days is the floor) and the mirror (3d*1e6 > 1d*1e6).
+        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(1 days) * 1_000_000);
+        vm.startPrank(admin);
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
+        bond.setUnbondingPeriod(3 days); // floor; 3d*1e6 > 1d*1e6 and within [3d,30d]
+        vm.stopPrank();
+        assertEq(bond.unbondingPeriod(), 3 days);
     }
 }
