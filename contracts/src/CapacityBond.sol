@@ -463,6 +463,7 @@ contract CapacityBond is
     /// @dev `setUnbondingPeriod` would drop `unbondingPeriod * 1e6` to or below the
     ///      live evidence-age ceiling, violating ADR 014's slash-before-withdraw
     ///      invariant.
+    ///      Paired with `SlashJudge.EvidenceAgeExceedsUnbonding` (the other half).
     error UnbondingBelowEvidenceAge(uint256 unbondingUs, uint256 maxEvidenceAgeUs);
 
     // ADR 030

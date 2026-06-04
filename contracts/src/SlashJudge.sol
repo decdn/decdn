@@ -26,7 +26,7 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         window. The challenger is recorded by `slash` for the 50% finality
 ///         reward (escrow-on-slash, ADR 026 / ADR 028); `SlashJudge` itself only
 ///         round-trips the challenge bond.
-/// @dev    `MAX_EVIDENCE_AGE_US < CapacityBond.unbondingPeriod` is enforced on
+/// @dev    `MAX_EVIDENCE_AGE_US < CapacityBond.unbondingPeriod * 1e6` is enforced on
 ///         this side (constructor + `setMaxEvidenceAge`). The mirror check on
 ///         `CapacityBond.setUnbondingPeriod` is enforced via CapacityBond's
 ///         `slashJudge` reference (wired post-deploy through
