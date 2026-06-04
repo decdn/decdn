@@ -236,7 +236,10 @@ contract CapacityBond is
     ///         `setUnbondingPeriod` (ADR 014 § Interaction with unbonding period).
     ///         Wired post-deploy via `setSlashJudge` because SlashJudge is deployed
     ///         after CapacityBond (deploy-order circular dependency). While unset
-    ///         (`address(0)`), `setUnbondingPeriod` applies only the [3d,30d] bound.
+    ///         (`address(0)`), `setUnbondingPeriod` applies only the live
+    ///         `[UNBONDING_PERIOD_FLOOR, UNBONDING_PERIOD_CEILING]` bound — the
+    ///         testnet `[3d,30d]` window, which intentionally deviates from ADR
+    ///         014/009's `[7d,60d]` spec (see the bounds' declaration note).
     ISlashJudgeEvidenceView public slashJudge;
 
     /// @notice Governable declared-capacity band (Mbps) enforced on

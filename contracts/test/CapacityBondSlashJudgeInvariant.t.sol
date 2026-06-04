@@ -20,7 +20,9 @@ import { MockBlacklistView } from "./SlashJudge.t.sol";
 ///         `CapacityBond` and the REAL `SlashJudge` pointed at it, wires them,
 ///         and asserts the boundary from the CapacityBond side so both real
 ///         contracts are proven to agree on the strict-inequality boundary.
-/// @dev    Values are chosen against the real bounds: CapacityBond
+/// @dev    Values are chosen against the live testnet bounds (which deviate
+///         from ADR 014/009's `[7d,60d]` spec — see CapacityBond's
+///         `UNBONDING_PERIOD_FLOOR`/`_CEILING` note): CapacityBond
 ///         `unbondingPeriod ∈ [3 days, 30 days]`; SlashJudge
 ///         `maxEvidenceAgeUs ∈ [1 day, 30 days]` (microseconds).
 contract CapacityBondSlashJudgeInvariantTest is Test {

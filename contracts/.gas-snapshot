@@ -98,6 +98,7 @@ CapacityBondTest:test_setUnbondingPeriod_floorWithLowEvidenceAgeSucceeds() (gas:
 CapacityBondTest:test_setUnbondingPeriod_revertsWhenBelowEvidenceAge() (gas: 127571)
 CapacityBondTest:test_setUnbondingPeriod_revertsWhenEqualToEvidenceAge() (gas: 127558)
 CapacityBondTest:test_setUnbondingPeriod_revertsWithoutRole() (gas: 14890)
+CapacityBondTest:test_setUnbondingPeriod_sameValueRejectedAfterWiring() (gas: 131695)
 CapacityBondTest:test_setUnbondingPeriod_succeedsAboveEvidenceAge() (gas: 129157)
 CapacityBondTest:test_setUnbondingPeriod_unwiredAppliesOnlyBound() (gas: 23578)
 CapacityBondTest:test_settleAppealGranted_clearsAndRefunds() (gas: 298292)

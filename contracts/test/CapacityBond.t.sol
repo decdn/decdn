@@ -1327,4 +1327,29 @@ contract CapacityBondTest is Test {
         vm.stopPrank();
         assertEq(bond.unbondingPeriod(), 3 days);
     }
+
+    // Drives the full regime change in one test: a value accepted while the
+    // judge is unset becomes rejected once a judge is wired, with no other
+    // change. Proves wiring is what tightens the constraint (not the bound).
+    function test_setUnbondingPeriod_sameValueRejectedAfterWiring() public {
+        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(6 days) * 1_000_000);
+        vm.startPrank(admin);
+        // Unwired: 5 days is within [3d,30d] and there is no judge -> accepted.
+        bond.setUnbondingPeriod(5 days);
+        assertEq(bond.unbondingPeriod(), 5 days);
+        // Raise to 20 days so the 6-day judge satisfies the wire-time invariant
+        // (20d*1e6 > 6d*1e6) and can be wired.
+        bond.setUnbondingPeriod(20 days);
+        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
+        // The same 5-day value is now rejected: 5d*1e6 < 6d*1e6 violates the mirror.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CapacityBond.UnbondingBelowEvidenceAge.selector,
+                uint256(5 days) * 1_000_000,
+                uint256(6 days) * 1_000_000
+            )
+        );
+        bond.setUnbondingPeriod(5 days);
+        vm.stopPrank();
+    }
 }
