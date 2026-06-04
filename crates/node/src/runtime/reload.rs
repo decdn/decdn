@@ -552,6 +552,7 @@ struct FileSectionSnapshot {
     gossip: Option<serde_json::Value>,
     observability: Option<serde_json::Value>,
     dht: Option<serde_json::Value>,
+    receipts: Option<serde_json::Value>,
 }
 
 impl FileSectionSnapshot {
@@ -569,6 +570,7 @@ impl FileSectionSnapshot {
             gossip: snap_section("gossip", file.gossip.as_ref()),
             observability: snap_section("observability", file.observability.as_ref()),
             dht: snap_section("dht", file.dht.as_ref()),
+            receipts: snap_section("receipts", file.receipts.as_ref()),
         }
     }
 }
@@ -821,6 +823,7 @@ impl RuntimeReloadState {
                 max_tracked_sources: 4096,
             },
             dht: decdn_common::config::ResolvedDht::default(),
+            receipts: decdn_common::config::ResolvedReceipts::default(),
         };
         Self::new(
             decdn_common::cli::run::PaymentArgs {
@@ -1194,6 +1197,15 @@ fn log_ignored_other_sections(file: &decdn_common::config::FileConfig, prev: &Fi
         // inner state.
         warn_ignored("dht.* (rate-limit, trusted_ips)");
     }
+    if changed("receipts", file.receipts.as_ref(), prev.receipts.as_ref())
+        && file.receipts.is_some()
+    {
+        // `receipts.*` (rotation cap, retained backups) is read once when
+        // `JsonlReceiptLog` is opened at bring-up; changing it requires a
+        // restart, so surface the same "ignored (requires restart)" notice
+        // as the other startup-only sections.
+        warn_ignored("receipts.* (max_file_bytes, retained_files)");
+    }
     // `security.*` is fully reloadable — see `RuntimeReloadState::reload`'s
     // commit step. Invalid values reject the entire reload via
     // `resolve_security` upstream rather than landing here.
@@ -1290,6 +1302,7 @@ mod tests {
                 per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
+            receipts: decdn_common::config::ResolvedReceipts::default(),
             dht: decdn_common::config::ResolvedDht::default(),
         }
     }

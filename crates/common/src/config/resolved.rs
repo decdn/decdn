@@ -376,6 +376,32 @@ pub struct ResolvedSecurity {
     pub max_tracked_sources: usize,
 }
 
+/// Resolved download-receipt audit-log retention fields (#802).
+///
+/// `max_file_bytes` is always within `[MIN_RECEIPT_MAX_FILE_BYTES,
+/// MAX_RECEIPT_MAX_FILE_BYTES]` and `retained_files` within
+/// `[0, MAX_RECEIPT_RETAINED_FILES]` (the resolver rejects out-of-range
+/// values), so the runtime can bound disk to roughly `(retained_files + 1) *
+/// max_file_bytes`.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedReceipts {
+    /// Rotate the live receipt log once it reaches this many bytes.
+    pub max_file_bytes: u64,
+    /// Number of rotated backup files retained (`.1`..=`.N`). `0` keeps none.
+    pub retained_files: u32,
+}
+
+impl Default for ResolvedReceipts {
+    /// Reuses the `DEFAULT_RECEIPT_*` resolver constants so hand-built
+    /// `ResolvedConfig`s in tests cannot drift from the production defaults.
+    fn default() -> Self {
+        Self {
+            max_file_bytes: super::DEFAULT_RECEIPT_MAX_FILE_BYTES,
+            retained_files: super::DEFAULT_RECEIPT_RETAINED_FILES,
+        }
+    }
+}
+
 /// Fully resolved node configuration.
 ///
 /// Every field has a value determined by the three-layer merge:
@@ -395,4 +421,5 @@ pub struct ResolvedConfig {
     pub gossip: ResolvedGossip,
     pub security: ResolvedSecurity,
     pub dht: ResolvedDht,
+    pub receipts: ResolvedReceipts,
 }

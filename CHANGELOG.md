@@ -126,6 +126,14 @@ since project inception and will roll into the first tagged release.
 
 #### Node runtime & wire protocol
 
+- Download-receipt audit log (`download_receipts.jsonl`) is now bounded by
+  size-based rotation (#802). New optional `[receipts]` config section:
+  `receipts.max_file_bytes` (default 128 MiB; rotate the live file at this
+  size) and `receipts.retained_files` (default 4; numbered backups
+  `download_receipts.jsonl.1`..`.N` to keep, `0` truncates in place). Bounds
+  `data_dir` growth to roughly `(retained_files + 1) * max_file_bytes`.
+  Config-additive — absent section preserves prior behaviour with the
+  defaults; rotation is best-effort and never aborts paid delivery.
 - iroh QUIC endpoint bring-up with protocol router (#213).
 - `cdn/probe/v1` ALPN with ADR-013 varint framing and `ProbeMessage`
   request/response (#225).
