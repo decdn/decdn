@@ -15,7 +15,7 @@ use serde::Deserialize;
 use decdn_common::admin::{
     AdminRpcClient, AnnounceResponse, ChannelSnapshot, ChannelsResponse, DrainRequest,
     DrainResponse, EvictRequest, EvictResponse, HealthResponse, PeerView, PeersResponse,
-    ReloadResponse, StatusResponse,
+    RegionStatsResponse, ReloadResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -55,6 +55,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Health(h) => health(h, global_config).await,
         cli::NodeCommand::Status(s) => status(s, global_config).await,
         cli::NodeCommand::Channels(c) => channels(c, global_config).await,
+        cli::NodeCommand::RegionStats(r) => region_stats(r, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Announce(a) => announce(a, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
@@ -676,6 +677,60 @@ fn write_channel_row(w: &mut impl io::Write, c: &ChannelSnapshot) -> io::Result<
         format_usdc(c.outstanding_micro_usdc),
         format_usdc(c.deposit_micro_usdc),
     )
+}
+
+/// `decdn node region-stats`: call `admin_v1_regionStats` on the running node
+/// and print cumulative per-region bandwidth (issue #750).
+pub async fn region_stats(
+    args: &cli::RegionStatsArgs,
+    global_config: Option<&Path>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let parsed: RegionStatsResponse = client
+        .region_stats()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty = serde_json::to_string_pretty(&parsed)
+            .context("failed to encode region stats as JSON")?;
+        println!("{pretty}");
+    } else {
+        let mut stdout = io::stdout().lock();
+        write_region_stats_table(&mut stdout, &parsed)
+            .context("failed to write region stats table")?;
+    }
+
+    Ok(())
+}
+
+/// Write the per-region bandwidth table to `w`. Pure function (takes
+/// `&mut impl Write`) so the formatting is unit-testable without an HTTP hop,
+/// mirroring [`write_channels_table`]. Byte counts are raw decimal so a
+/// scraping script sees a stable shape.
+fn write_region_stats_table(w: &mut impl io::Write, resp: &RegionStatsResponse) -> io::Result<()> {
+    writeln!(w, "regions={}", resp.regions.len())?;
+    if resp.regions.is_empty() {
+        return writeln!(w, "(no region data)");
+    }
+    writeln!(w, "{:<8} {:>16} {:>16}", "REGION", "BYTES_IN", "BYTES_OUT")?;
+    for r in &resp.regions {
+        writeln!(w, "{:<8} {:>16} {:>16}", r.region, r.bytes_in, r.bytes_out)?;
+    }
+    Ok(())
 }
 
 /// Format a micro-USDC amount as a `"N.NNNNNN"` USDC string. USDC has 6
@@ -1486,6 +1541,40 @@ mod tests {
             seconds_since_last_voucher: secs_since,
             settlement_eligible: eligible,
         }
+    }
+
+    #[test]
+    fn region_stats_table_renders_rows_and_empty_sentinel() {
+        use decdn_common::admin::{RegionBytes, RegionStatsResponse};
+
+        let mut buf = Vec::new();
+        write_region_stats_table(
+            &mut buf,
+            &RegionStatsResponse {
+                regions: vec![
+                    RegionBytes {
+                        region: "DE".to_string(),
+                        bytes_in: 0,
+                        bytes_out: 1_048_576,
+                    },
+                    RegionBytes {
+                        region: "UNKNOWN".to_string(),
+                        bytes_in: 2_097_152,
+                        bytes_out: 0,
+                    },
+                ],
+            },
+        )
+        .expect("write table");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("DE"), "table must list DE: {out}");
+        assert!(out.contains("UNKNOWN"), "table must list UNKNOWN: {out}");
+
+        let mut empty = Vec::new();
+        write_region_stats_table(&mut empty, &RegionStatsResponse { regions: vec![] })
+            .expect("write empty");
+        let out = String::from_utf8(empty).expect("utf8");
+        assert!(out.contains("(no region data)"), "empty sentinel: {out}");
     }
 
     #[test]
