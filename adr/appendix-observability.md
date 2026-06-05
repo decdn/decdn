@@ -89,14 +89,16 @@ Early warning for the three slashable offenses in [ADR 026 § Slashing and burn]
 
 Operator-policy prefetch from popularity signals per [ADR 022 § Prefetch Decision](022-content-discovery.md#prefetch-decision). All metrics are exposed regardless of whether `prefetch.enabled` is true — a node with prefetch disabled reports zero counters and `decdn_prefetch_enabled` as `0`, giving operators a uniform schema to scrape against and the DAO an off-chain signal for outlier behavior.
 
+The metrics backend (`iroh_metrics`) carries no label dimension, so the per-`gate_result` breakdown of acquisitions is realized as three sibling counters (the same pattern as `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total`), and `demand_quality_ratio` is an integer gauge scaled ×1000 (`…_milli`).
+
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
 | `decdn_prefetch_enabled` | Gauge | M | — | `1` if `prefetch.enabled` is true, `0` otherwise. Provides a stable schema across enabled/disabled nodes. |
-| `decdn_prefetch_acquisitions_total` | Counter | M | `gate_result={authorized,unauthorized,bypassed}` | Prefetch acquisitions attempted (triggered by the FIND_VALUE demand signal), broken down by `prefetch.require_authorized_origin` gate outcome. `authorized` and `bypassed` (gate disabled) proceed to pull; `unauthorized` is a rejected attempt. |
-| `decdn_prefetch_spend_usdc_total` | Counter | M | — | Cumulative USDC paid out for prefetch acquisitions. Pairs with `decdn_prefetch_acquisitions_total{gate_result≠unauthorized}` to derive average spend per acquisition. |
+| `decdn_prefetch_acquisitions_{authorized,unauthorized,bypassed}_total` | Counter | M | — | Prefetch decisions triggered by the FIND_VALUE demand signal, as three sibling counters keyed on the `prefetch.require_authorized_origin` gate outcome. `authorized` and `bypassed` (gate disabled) would proceed to pull; `unauthorized` is a rejected attempt. |
+| `decdn_prefetch_spend_usdc_total` | Counter | M | — | Cumulative USDC paid out for prefetch acquisitions. Pairs with the `decdn_prefetch_acquisitions_{authorized,bypassed}_total` counters to derive average spend per acquisition. |
 | `decdn_prefetch_budget_exhaustion_events_total` | Counter | M | — | Times `prefetch.budget_usdc_per_hour` was hit, preventing further acquisitions until the rolling window advanced. Non-zero values indicate the operator should raise the budget or investigate elevated demand-signal volume. |
-| `decdn_prefetch_origin_gate_rejections_total` | Counter | R | — | Acquisitions skipped because no candidate in the DHT FIND_VALUE result set was authorized as origin under the relevant `OriginAssignment` lookup. Identical-by-construction to `decdn_prefetch_acquisitions_total{gate_result=unauthorized}`; surfaced as a standalone counter for alerting convenience. |
-| `decdn_prefetch_demand_quality_ratio` | Gauge | R | — | Current rolling-window `served_bytes / acquired_bytes` for prefetched content. Below `prefetch.demand_quality_min_ratio` triggers the auto-throttle described in [ADR 022 § Prefetch Decision](022-content-discovery.md#prefetch-decision). |
+| `decdn_prefetch_origin_gate_rejections_total` | Counter | R | — | Acquisitions skipped because no candidate in the DHT FIND_VALUE result set was authorized as origin under the relevant `OriginAssignment` lookup. Identical-by-construction to `decdn_prefetch_acquisitions_unauthorized_total`; surfaced as a standalone counter for alerting convenience. |
+| `decdn_prefetch_demand_quality_ratio_milli` | Gauge | R | — | Current rolling-window `served_bytes / acquired_bytes` for prefetched content, scaled ×1000 (the gauge backend is integer-valued). Below `prefetch.demand_quality_min_ratio` triggers the auto-throttle described in [ADR 022 § Prefetch Decision](022-content-discovery.md#prefetch-decision). |
 | `decdn_prefetch_throttle_active` | Gauge | R | — | `1` while the demand-quality auto-throttle is suppressing prefetch; `0` otherwise. |
 
 #### Probe Metrics (`cdn/probe/v1`)
