@@ -627,9 +627,17 @@ impl DhtHandler {
     ) {
         use crate::prefetch::PrefetchOutcome;
         use crate::prefetch::decision::PrefetchDecision;
-        let outcome = engine.on_find_value(hash_bytes, now_secs);
-        self.metrics.record_prefetch_decision(outcome);
-        if let PrefetchOutcome::Decided(PrefetchDecision::Acquire) = outcome {
+        // The common path (disabled, or below the demand threshold) does no
+        // metrics or lock work — `observe` is the only per-request cost, and a
+        // decision only runs on the rare threshold-cross. The quality gauges are
+        // seeded at startup (runtime bring-up) and refreshed only here, when the
+        // ledgers can have changed, so they never read a misleading default.
+        let PrefetchOutcome::Decided(decision) = engine.on_find_value(hash_bytes, now_secs) else {
+            return;
+        };
+        self.metrics
+            .record_prefetch_decision(PrefetchOutcome::Decided(decision));
+        if let PrefetchDecision::Acquire = decision {
             self.metrics
                 .record_prefetch_acquire(engine.policy_requires_origin());
             tracing::debug!(

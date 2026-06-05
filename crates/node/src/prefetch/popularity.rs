@@ -45,7 +45,12 @@ impl PopularityTracker {
     }
 
     /// Record a `FIND_VALUE` arrival for `hash` at `now` (seconds). Returns
-    /// `true` iff the in-window count reached the trigger threshold.
+    /// `true` only on the observation that makes the in-window count first
+    /// *reach* the threshold — an **edge** trigger, not a level one. Once the
+    /// window is at or above the threshold, subsequent in-window queries return
+    /// `false`; the trigger re-arms only after entries age out and the count
+    /// crosses the threshold again. This keeps "demand crossed the threshold"
+    /// a single event per burst rather than firing on every query above it.
     pub fn observe(&mut self, hash: &HashKey, now: u64) -> bool {
         if !self.windows.contains_key(hash) && self.windows.len() >= self.max_hashes {
             self.evict_least_recent();
@@ -53,7 +58,10 @@ impl PopularityTracker {
         let window = self.windows.entry(*hash).or_default();
         Self::prune(window, self.window_secs, now);
         window.push_back(now);
-        u32::try_from(window.len()).unwrap_or(u32::MAX) >= self.threshold
+        // Exactly-equal, not `>=`: one timestamp is pushed per call, so the
+        // count rises by at most one — `== threshold` is the upward crossing.
+        // A count already past the threshold returns `false`.
+        u32::try_from(window.len()).unwrap_or(u32::MAX) == self.threshold
     }
 
     /// Current in-window query count for `hash` at `now` (seconds), pruning
@@ -118,6 +126,28 @@ mod tests {
         assert!(!t.observe(&h(1), 0));
         assert!(!t.observe(&h(1), 10));
         assert!(t.observe(&h(1), 20)); // third within window
+    }
+
+    #[test]
+    fn fires_once_per_threshold_cross() {
+        // Edge trigger: only the observation that reaches the threshold fires;
+        // further in-window queries above it do not re-fire.
+        let mut t = PopularityTracker::new(300, 2, MAX_TRACKED_HASHES);
+        assert!(!t.observe(&h(1), 0)); // len 1
+        assert!(t.observe(&h(1), 1)); // len 2 == threshold -> fire
+        assert!(!t.observe(&h(1), 2)); // len 3 -> no re-fire
+        assert!(!t.observe(&h(1), 3)); // len 4 -> no re-fire
+    }
+
+    #[test]
+    fn refires_after_window_drains_and_recrosses() {
+        let mut t = PopularityTracker::new(100, 2, MAX_TRACKED_HASHES);
+        assert!(!t.observe(&h(1), 0)); // len 1
+        assert!(t.observe(&h(1), 1)); // len 2 -> fire
+        // Both early entries age out (>= 100s old); this one rebuilds to len 1.
+        assert!(!t.observe(&h(1), 200));
+        // Re-crosses the threshold -> fires again.
+        assert!(t.observe(&h(1), 201));
     }
 
     #[test]

@@ -82,26 +82,35 @@ impl PrefetchPolicy {
             return PrefetchDecision::Skip(SkipReason::Disabled);
         }
 
-        // Gate 2: demand-quality throttle (also prunes ledgers for gate 4).
-        let Ok(mut led) = self.ledgers.lock() else {
-            tracing::error!("prefetch decide: ledger mutex poisoned; skipping");
-            return PrefetchDecision::Skip(SkipReason::Throttled);
+        // Gates 2 & 4 both read ledger state. Compute them under one short-lived
+        // lock and release it BEFORE the gate-3 `OriginDirectory` trait call:
+        // that call is arbitrary third-party code (a future chain-backed
+        // directory may take its own locks or do RPC), so holding `ledgers`
+        // across it would be a lock-ordering hazard.
+        let (throttled, spent) = {
+            let Ok(mut led) = self.ledgers.lock() else {
+                tracing::error!("prefetch decide: ledger mutex poisoned; skipping");
+                return PrefetchDecision::Skip(SkipReason::Throttled);
+            };
+            Self::prune(&mut led.spend, BUDGET_WINDOW_SECS, now);
+            Self::prune(&mut led.acquired, self.cfg.demand_quality_window_secs, now);
+            Self::prune(&mut led.served, self.cfg.demand_quality_window_secs, now);
+            led.throttled = Self::compute_throttle(&led, self.cfg.demand_quality_min_ratio);
+            let spent: u64 = led.spend.iter().map(|(_, v)| *v).sum();
+            (led.throttled, spent)
         };
-        Self::prune(&mut led.spend, BUDGET_WINDOW_SECS, now);
-        Self::prune(&mut led.acquired, self.cfg.demand_quality_window_secs, now);
-        Self::prune(&mut led.served, self.cfg.demand_quality_window_secs, now);
-        led.throttled = Self::compute_throttle(&led, self.cfg.demand_quality_min_ratio);
-        if led.throttled {
+
+        // Gate 2: demand-quality throttle.
+        if throttled {
             return PrefetchDecision::Skip(SkipReason::Throttled);
         }
 
-        // Gate 3: authorized origin.
+        // Gate 3: authorized origin (ledger lock released above).
         if self.cfg.require_authorized_origin && dir.lookup_origins(hash).is_empty() {
             return PrefetchDecision::Skip(SkipReason::Unauthorized);
         }
 
         // Gate 4: rolling-1h budget.
-        let spent: u64 = led.spend.iter().map(|(_, v)| *v).sum();
         if spent >= self.cfg.budget_usdc_per_hour {
             return PrefetchDecision::Skip(SkipReason::BudgetExhausted);
         }

@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-05
 **Issue:** [#650](https://github.com/decdn/decdn/issues/650) — DHT: prefetch and popularity signals (ACs 7–8 of #320, ADR 022 §Popularity Signals)
-**Status:** Approved design; implementation pending.
+**Status:** Implemented (core slice) in PR #819; the deferred live-acquisition work (AC 7) is tracked in #820.
 
 ## Context and source of truth
 

@@ -631,6 +631,13 @@ pub async fn run(
         prefetch_origin_directory,
     ));
     node_metrics.set_prefetch_enabled(prefetch_engine.enabled());
+    // Seed the demand-quality gauges once so they read a sane baseline
+    // (ratio = 1.0, throttle = false) rather than a misleading `0` on nodes that
+    // never hit a threshold-cross; the handler refreshes them only on a decision.
+    node_metrics.set_prefetch_quality(
+        prefetch_engine.policy().demand_quality_ratio(0),
+        prefetch_engine.policy().throttle_active(0),
+    );
     let dht_handler = Arc::new(
         DhtHandler::new(
             secret_key.public(),
