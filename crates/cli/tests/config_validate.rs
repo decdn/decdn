@@ -235,7 +235,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         },
         network: ResolvedNetwork {
             bind_port: 4433,
-            relay_url: None,
+            relay_urls: Vec::new(),
             enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
@@ -354,7 +354,7 @@ fn summary_omits_optional_fields_when_unset() -> anyhow::Result<()> {
 fn summary_prints_optional_fields_when_set() -> anyhow::Result<()> {
     let cfg = sample_resolved(|c| {
         c.identity.region = Some("US".into());
-        c.network.relay_url = Some("https://relay.iroh.network".into());
+        c.network.relay_urls = vec!["https://relay.iroh.network".into()];
         c.observability.otlp_endpoint = Some("https://otel.example".into());
     });
     let out = render(None, &cfg)?;
@@ -364,6 +364,26 @@ fn summary_prints_optional_fields_when_set() -> anyhow::Result<()> {
         "{out}"
     );
     anyhow::ensure!(out.contains("otlp_endpoint:"), "{out}");
+    Ok(())
+}
+
+#[test]
+fn summary_prints_one_line_per_relay() -> anyhow::Result<()> {
+    let cfg = sample_resolved(|c| {
+        c.network.relay_urls = vec![
+            "https://relay-a.example".into(),
+            "https://relay-b.example".into(),
+        ];
+    });
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        out.contains("relay_url:                https://relay-a.example"),
+        "{out}"
+    );
+    anyhow::ensure!(
+        out.contains("relay_url:                https://relay-b.example"),
+        "{out}"
+    );
     Ok(())
 }
 

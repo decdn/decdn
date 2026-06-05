@@ -453,10 +453,23 @@ fn resolve_network(
         .or_else(|| file.and_then(|n| n.bind_port))
         .unwrap_or(DEFAULT_BIND_PORT);
 
-    let relay_url = cli
-        .relay_url
-        .clone()
-        .or_else(|| file.and_then(|n| n.relay_url.clone()));
+    // Relay precedence (highest first): CLI `--relay-url` (singular) >
+    // file `network.relay_urls` (list) > file `network.relay_url` (the
+    // deprecated singular alias). An empty result means "use the n0 default
+    // relays" — the node only swaps in a custom relay map when this is
+    // non-empty. The CLI/env surface stays singular; the multi-relay surface
+    // is the TOML `relay_urls` array (issue #795).
+    let relay_urls = if let Some(url) = cli.relay_url.clone() {
+        vec![url]
+    } else {
+        match file.and_then(|n| n.relay_urls.clone()) {
+            Some(list) if !list.is_empty() => list,
+            _ => file
+                .and_then(|n| n.relay_url.clone())
+                .map(|url| vec![url])
+                .unwrap_or_default(),
+        }
+    };
 
     // No CLI flag: 0-RTT is an operational kill switch, not a per-invocation
     // tuning knob. File `network.enable_0rtt` > built-in default (`true`).
@@ -466,7 +479,7 @@ fn resolve_network(
 
     ResolvedNetwork {
         bind_port,
-        relay_url,
+        relay_urls,
         enable_0rtt,
     }
 }
@@ -2027,6 +2040,11 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     }
     if let Some(n) = cfg.network.as_mut() {
         expand_str(&mut n.relay_url, "network.relay_url")?;
+        if let Some(urls) = n.relay_urls.as_mut() {
+            for url in urls.iter_mut() {
+                *url = expand_value(url, "network.relay_urls")?;
+            }
+        }
     }
     if let Some(b) = cfg.blockchain.as_mut() {
         expand_str(&mut b.rpc_url, "blockchain.rpc_url")?;
@@ -2827,6 +2845,37 @@ mod tests {
     }
 
     #[test]
+    fn expand_env_substitutes_each_relay_url() -> anyhow::Result<()> {
+        // Regression for the per-element loop in `expand_env`: every entry of
+        // network.relay_urls must get the same `${VAR}` treatment as the
+        // singular relay_url alias, not just the first.
+        let home = home_str()?;
+        let mut cfg = FileConfig {
+            network: Some(types::NetworkConfig {
+                bind_port: None,
+                relay_urls: Some(vec![
+                    "${HOME}/relay-a".to_string(),
+                    "${HOME}/relay-b".to_string(),
+                ]),
+                relay_url: None,
+                enable_0rtt: None,
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let urls = cfg
+            .network
+            .as_ref()
+            .and_then(|n| n.relay_urls.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("relay_urls missing"))?;
+        anyhow::ensure!(
+            urls == &[format!("{home}/relay-a"), format!("{home}/relay-b")],
+            "got: {urls:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn expand_env_substitutes_path_field() -> anyhow::Result<()> {
         let home = home_str()?;
         let mut cfg = FileConfig {
@@ -3037,7 +3086,16 @@ mod tests {
             ("network.relay_url", |c, v| {
                 c.network = Some(types::NetworkConfig {
                     bind_port: None,
+                    relay_urls: None,
                     relay_url: Some(v.to_string()),
+                    enable_0rtt: None,
+                });
+            }),
+            ("network.relay_urls", |c, v| {
+                c.network = Some(types::NetworkConfig {
+                    bind_port: None,
+                    relay_urls: Some(vec![v.to_string()]),
+                    relay_url: None,
                     enable_0rtt: None,
                 });
             }),
@@ -5378,7 +5436,7 @@ mod tests {
     fn net(port: u16) -> ResolvedNetwork {
         ResolvedNetwork {
             bind_port: port,
-            relay_url: None,
+            relay_urls: Vec::new(),
             enable_0rtt: true,
         }
     }
@@ -5984,6 +6042,7 @@ mod tests {
         cli.bind_port = Some(5555);
         let file = types::NetworkConfig {
             bind_port: Some(6666),
+            relay_urls: None,
             relay_url: None,
             enable_0rtt: None,
         };
@@ -5996,12 +6055,89 @@ mod tests {
         let cli = empty_network_args();
         let file = types::NetworkConfig {
             bind_port: Some(6666),
+            relay_urls: None,
+            // Deprecated singular alias folds into the resolved list.
             relay_url: Some("https://relay.example".to_string()),
             enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.bind_port, 6666);
-        assert_eq!(resolved.relay_url.as_deref(), Some("https://relay.example"));
+        assert_eq!(
+            resolved.relay_urls,
+            vec!["https://relay.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_network_uses_relay_urls_list() {
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(vec![
+                "https://relay-a.example".to_string(),
+                "https://relay-b.example".to_string(),
+            ]),
+            relay_url: None,
+            enable_0rtt: None,
+        };
+        let resolved = resolve_network(&cli, Some(&file));
+        assert_eq!(
+            resolved.relay_urls,
+            vec![
+                "https://relay-a.example".to_string(),
+                "https://relay-b.example".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_network_relay_urls_wins_over_singular_alias() {
+        // When both the list and the deprecated alias are set, the list wins.
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(vec!["https://list.example".to_string()]),
+            relay_url: Some("https://alias.example".to_string()),
+            enable_0rtt: None,
+        };
+        let resolved = resolve_network(&cli, Some(&file));
+        assert_eq!(
+            resolved.relay_urls,
+            vec!["https://list.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_network_cli_relay_url_overrides_file_list() {
+        // The singular `--relay-url` CLI flag takes precedence over the file
+        // list, preserving the existing single-relay override semantics.
+        let mut cli = empty_network_args();
+        cli.relay_url = Some("https://cli.example".to_string());
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(vec!["https://list.example".to_string()]),
+            relay_url: Some("https://alias.example".to_string()),
+            enable_0rtt: None,
+        };
+        let resolved = resolve_network(&cli, Some(&file));
+        assert_eq!(resolved.relay_urls, vec!["https://cli.example".to_string()]);
+    }
+
+    #[test]
+    fn resolve_network_empty_relay_urls_falls_back_to_alias() {
+        // An empty list is treated as "unset" so the alias still applies.
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(Vec::new()),
+            relay_url: Some("https://alias.example".to_string()),
+            enable_0rtt: None,
+        };
+        let resolved = resolve_network(&cli, Some(&file));
+        assert_eq!(
+            resolved.relay_urls,
+            vec!["https://alias.example".to_string()]
+        );
     }
 
     #[test]
@@ -6011,6 +6147,7 @@ mod tests {
         // Absent in file => built-in default (0-RTT on).
         let none = types::NetworkConfig {
             bind_port: None,
+            relay_urls: None,
             relay_url: None,
             enable_0rtt: None,
         };
@@ -6020,6 +6157,7 @@ mod tests {
         // Explicit `false` in file is the operational kill switch.
         let off = types::NetworkConfig {
             bind_port: None,
+            relay_urls: None,
             relay_url: None,
             enable_0rtt: Some(false),
         };
@@ -6031,7 +6169,7 @@ mod tests {
         let cli = empty_network_args();
         let resolved = resolve_network(&cli, None);
         assert_eq!(resolved.bind_port, DEFAULT_BIND_PORT);
-        assert!(resolved.relay_url.is_none());
+        assert!(resolved.relay_urls.is_empty());
     }
 
     // ---- resolve_blockchain: CLI > file, missing-required errors ---------

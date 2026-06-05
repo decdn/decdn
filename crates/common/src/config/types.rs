@@ -51,7 +51,11 @@ pub struct IdentityConfig {
 pub struct NetworkConfig {
     /// QUIC bind port.
     pub bind_port: Option<u16>,
-    /// iroh relay URL.
+    /// iroh relay URLs for NAT traversal. Multiple entries give relay
+    /// redundancy/failover; bring-up requires at least one reachable.
+    pub relay_urls: Option<Vec<String>>,
+    /// Deprecated single-relay alias for [`Self::relay_urls`]. When set and
+    /// `relay_urls` is absent, it is folded into the list as a single entry.
     pub relay_url: Option<String>,
     /// Master switch for QUIC 0-RTT on `cdn/probe/v1` (ADR 015). Absent =>
     /// default (`true`). When `false`, probe clients fall back to plain
