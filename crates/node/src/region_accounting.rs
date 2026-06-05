@@ -134,7 +134,7 @@ impl RegionAccountant {
                 bytes_out: t.bytes_out,
             })
             .collect();
-        out.sort_by(|a, b| a.region.cmp(&b.region));
+        out.sort_unstable_by(|a, b| a.region.cmp(&b.region));
         out
     }
 
