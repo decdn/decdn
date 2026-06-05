@@ -704,7 +704,8 @@ pub async fn run(
 
     // Per-region bandwidth accountant (#750). Resolves regions from the shared
     // peer table; shared (via Arc) with the client handler (records served
-    // bytes) and, in a later task, the admin surface (reads the snapshot).
+    // bytes) and the admin surface (admin_v1_regionStats reads the snapshot,
+    // wired below).
     let region_accountant = Arc::new(crate::region_accounting::RegionAccountant::new(Arc::new(
         crate::region_accounting::PeerTableResolver::new(Arc::clone(&peer_table)),
     )));

@@ -1,10 +1,10 @@
 //! Per-region bandwidth accounting (#750).
 //!
 //! Aggregates bytes served (and, via a documented seam, pulled) keyed by the
-//! counterparty peer's self-attested `NodeAnnounce.region` (ADR 030). Region
-//! is resolved through [`RegionResolver`] — the production impl reads the
-//! gossip peer table; tests inject a stub. Totals are cumulative since process
-//! start (Prometheus-counter semantics) and live only in memory.
+//! counterparty peer's self-attested `NodeAnnounceBody.region` (ADR 030).
+//! Region is resolved through [`RegionResolver`] — the production impl reads
+//! the gossip peer table; tests inject a stub. Totals are cumulative since
+//! process start (Prometheus-counter semantics) and live only in memory.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,9 +14,11 @@ use decdn_common::admin::RegionBytes;
 use decdn_gossip::PeerTable;
 use tokio::sync::RwLock;
 
-/// Region bucket for traffic whose counterparty has no known region — a
+/// Region-bucket key for traffic whose counterparty has no known region — a
 /// non-peer end-client, or a peer not currently in the gossip peer table.
-pub const UNKNOWN_REGION: &str = "UNKNOWN";
+/// Re-exported from [`decdn_common::admin`] so this crate and the wire DTOs
+/// share a single sentinel.
+pub use decdn_common::admin::UNKNOWN_REGION;
 
 /// Resolve an iroh node id (32 raw bytes) to its self-attested region.
 ///
@@ -62,6 +64,13 @@ struct RegionTotals {
     bytes_out: u64,
 }
 
+/// Which counter a recording advances.
+#[derive(Clone, Copy)]
+enum Direction {
+    In,
+    Out,
+}
+
 /// In-memory per-region byte accumulator.
 pub struct RegionAccountant {
     resolver: Arc<dyn RegionResolver>,
@@ -89,7 +98,7 @@ impl RegionAccountant {
     /// [`UNKNOWN_REGION`]).
     pub async fn record_served(&self, peer: &[u8; 32], bytes: u64) {
         let region = self.region_for(peer).await;
-        self.add(region, 0, bytes);
+        self.bump(region, Direction::Out, bytes);
     }
 
     /// Record `bytes` pulled IN from `peer`, bucketed by `peer`'s region.
@@ -101,15 +110,21 @@ impl RegionAccountant {
     /// then `bytes_in` reads `0` in production.
     pub async fn record_pulled(&self, peer: &[u8; 32], bytes: u64) {
         let region = self.region_for(peer).await;
-        self.add(region, bytes, 0);
+        self.bump(region, Direction::In, bytes);
     }
 
     /// Region-sorted snapshot of all buckets.
     #[must_use]
     pub fn snapshot(&self) -> Vec<RegionBytes> {
-        let Ok(totals) = self.totals.lock() else {
-            tracing::warn!("region accountant totals lock poisoned; reporting empty snapshot");
-            return Vec::new();
+        // Poison is recovered (counters are monotonic) — see `bump`.
+        let totals = match self.totals.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    "region accountant totals lock poisoned (holder panicked); recovering"
+                );
+                poisoned.into_inner()
+            }
         };
         let mut out: Vec<RegionBytes> = totals
             .iter()
@@ -130,14 +145,27 @@ impl RegionAccountant {
             .unwrap_or_else(|| UNKNOWN_REGION.to_string())
     }
 
-    fn add(&self, region: String, bytes_in: u64, bytes_out: u64) {
-        let Ok(mut totals) = self.totals.lock() else {
-            tracing::warn!(%region, "region accountant totals lock poisoned; dropping update");
-            return;
+    fn bump(&self, region: String, dir: Direction, bytes: u64) {
+        let mut totals = match self.totals.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // A poisoned std::sync::Mutex means a holder panicked. The counters are
+                // monotonic, so recover the guard and continue rather than dropping the
+                // update — a poisoned lock persists for the process lifetime, so dropping
+                // would permanently flatline accounting. error! matches the crate's
+                // poisoned-lock convention (see handlers/dht.rs).
+                tracing::error!(
+                    %region,
+                    "region accountant totals lock poisoned (holder panicked); recovering"
+                );
+                poisoned.into_inner()
+            }
         };
         let entry = totals.entry(region).or_default();
-        entry.bytes_in = entry.bytes_in.saturating_add(bytes_in);
-        entry.bytes_out = entry.bytes_out.saturating_add(bytes_out);
+        match dir {
+            Direction::In => entry.bytes_in = entry.bytes_in.saturating_add(bytes),
+            Direction::Out => entry.bytes_out = entry.bytes_out.saturating_add(bytes),
+        }
     }
 }
 
@@ -232,5 +260,55 @@ mod tests {
         acc.record_served(&peer, 1).await; // would overflow → must saturate
 
         assert_eq!(acc.snapshot().first().unwrap().bytes_out, u64::MAX);
+    }
+
+    /// 100 concurrent `record_served` calls against one shared accountant must
+    /// all land — guards the accumulator under contention (no lost updates).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_record_served_sums_without_loss() {
+        let peer = [3u8; 32];
+        let mut map = HashMap::new();
+        map.insert(peer, "DE".to_string());
+        let acc = Arc::new(accountant_with(map));
+
+        let mut handles = Vec::new();
+        for _ in 0..100 {
+            let acc = Arc::clone(&acc);
+            handles.push(tokio::spawn(async move {
+                acc.record_served(&peer, 1000).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let de = acc.snapshot().into_iter().next().unwrap();
+        assert_eq!(de.region, "DE");
+        assert_eq!(de.bytes_out, 100_000);
+    }
+
+    /// The production [`PeerTableResolver`] resolves a node id to the region
+    /// carried on its `NodeAnnounce`, and reports `None` for an unknown id.
+    #[tokio::test]
+    async fn peer_table_resolver_reads_announce_region() {
+        use decdn_gossip::PeerTable;
+        use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
+
+        let node_id = [4u8; 32];
+        let announce = NodeAnnounce {
+            body: NodeAnnounceBody {
+                node_id,
+                region: "FR".to_string(),
+                timestamp_us: 1,
+            },
+            signature: vec![0u8; 64],
+        };
+
+        let mut table = PeerTable::new(0, 0);
+        table.insert_or_refresh(announce, 100).unwrap();
+
+        let resolver = PeerTableResolver::new(Arc::new(RwLock::new(table)));
+        assert_eq!(resolver.region_of(&node_id).await, Some("FR".to_string()));
+        assert_eq!(resolver.region_of(&[0u8; 32]).await, None);
     }
 }

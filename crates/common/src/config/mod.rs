@@ -5438,6 +5438,31 @@ mod tests {
         Ok(())
     }
 
+    /// A file-provided `region_accounting_interval_sec` must resolve to that
+    /// exact value — guards against a regression to `unwrap_or_default()` or a
+    /// hard-coded default. `0` (a valid, explicit "off"-ish setting) and `60`
+    /// must both pass through unchanged rather than snapping to the default.
+    #[test]
+    fn resolve_observability_honors_explicit_region_accounting_interval() -> anyhow::Result<()> {
+        for want in [0_u64, 60] {
+            let file = types::ObservabilityConfig {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+                region_accounting_interval_sec: Some(want),
+            };
+            let obs = resolve_observability(&obs_cli(None, None), Some(&file))?;
+            assert_eq!(
+                obs.region_accounting_interval_sec, want,
+                "explicit interval {want} must resolve unchanged"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn validate_port_layout_rejects_bind_equal_metrics() {
         let err = validate_port_layout(&net(9090), &obs(9090))

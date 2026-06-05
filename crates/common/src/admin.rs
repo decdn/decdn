@@ -439,17 +439,20 @@ pub struct ChannelsResponse {
     pub redeem_threshold_micro_usdc: u64,
 }
 
+/// Region-bucket key for traffic whose counterparty has no known region (#750).
+pub const UNKNOWN_REGION: &str = "UNKNOWN";
+
 /// One region's cumulative byte counters (issue #750). `region` is an
-/// ISO 3166-1 alpha-2 code (the peer's self-attested `NodeAnnounce.region`,
-/// ADR 030) or the literal `"UNKNOWN"` bucket for traffic whose counterparty
+/// ISO 3166-1 alpha-2 code (the peer's self-attested `NodeAnnounceBody.region`,
+/// ADR 030) or the [`UNKNOWN_REGION`] bucket for traffic whose counterparty
 /// has no known region (a non-peer end-client, or a peer not in the table).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionBytes {
-    /// ISO 3166-1 alpha-2 region code, or `"UNKNOWN"`.
+    /// ISO 3166-1 alpha-2 region code, or [`UNKNOWN_REGION`].
     pub region: String,
     /// Cumulative bytes this node has *pulled from* counterparties in this
     /// region since process start. Reads `0` until node-to-node pull-through
-    /// is orchestrated (no production caller of `record_pulled` yet, #750).
+    /// is orchestrated (#750).
     /// `#[serde(default)]` keeps older servers that omit the field round-tripping.
     #[serde(default)]
     pub bytes_in: u64,
@@ -630,7 +633,7 @@ pub trait AdminRpc {
 
     /// Return cumulative per-region bandwidth (issue #750): bytes served to
     /// and pulled from each region, keyed by the counterparty peer's
-    /// self-attested `NodeAnnounce.region` (ADR 030), with a `"UNKNOWN"`
+    /// self-attested `NodeAnnounceBody.region` (ADR 030), with a `"UNKNOWN"`
     /// bucket for unattributable traffic. Totals are cumulative since process
     /// start. Backs `decdn node region-stats`. Returns an empty list (not an
     /// error) on a node with no accounting wired.
