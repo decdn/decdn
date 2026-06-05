@@ -1567,8 +1567,16 @@ mod tests {
         )
         .expect("write table");
         let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("regions=2"), "summary count line: {out}");
+        assert!(
+            out.contains("REGION") && out.contains("BYTES_IN") && out.contains("BYTES_OUT"),
+            "column headers: {out}"
+        );
         assert!(out.contains("DE"), "table must list DE: {out}");
         assert!(out.contains("UNKNOWN"), "table must list UNKNOWN: {out}");
+        // Raw decimal byte values are rendered verbatim (stable for scrapers).
+        assert!(out.contains("1048576"), "DE bytes_out value: {out}");
+        assert!(out.contains("2097152"), "UNKNOWN bytes_in value: {out}");
 
         let mut empty = Vec::new();
         write_region_stats_table(&mut empty, &RegionStatsResponse { regions: vec![] })
