@@ -1381,14 +1381,44 @@ async fn build_endpoint(
 }
 
 /// Parse the configured relay URL strings into `RelayUrl`s, surfacing the
-/// offending entry on a parse failure.
+/// offending entry on a parse failure. The entry is `redact_userinfo`'d first:
+/// a malformed URL can still carry `user:pass@` credentials, and this node
+/// never lets relay userinfo reach the logs (same invariant the probe upholds).
 fn parse_relay_urls(urls: &[String]) -> anyhow::Result<Vec<RelayUrl>> {
     urls.iter()
         .map(|u| {
-            u.parse::<RelayUrl>()
-                .map_err(|e| anyhow::anyhow!("invalid network.relay_urls entry {u:?}: {e}"))
+            u.parse::<RelayUrl>().map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid network.relay_urls entry {:?}: {e}",
+                    redact_userinfo(u)
+                )
+            })
         })
         .collect()
+}
+
+/// Replace any `user:pass@` userinfo in a URL-ish string with `***@` so a
+/// parse-failure log can name the offending entry without leaking credentials.
+/// Targets only the authority's userinfo (between `://` and the first `@`
+/// before the next `/`, `?`, or `#`); strings without that shape pass through
+/// unchanged, so non-credential values still appear verbatim in errors.
+fn redact_userinfo(raw: &str) -> std::borrow::Cow<'_, str> {
+    let Some(scheme_end) = raw.find("://") else {
+        return std::borrow::Cow::Borrowed(raw);
+    };
+    let authority_start = scheme_end + 3;
+    let authority = raw.get(authority_start..).unwrap_or("");
+    // Userinfo, if present, ends at the first `@` that precedes any path/query/
+    // fragment delimiter.
+    let host_delim = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    match authority.get(..host_delim).and_then(|a| a.find('@')) {
+        Some(at) => {
+            let rest = authority.get(at + 1..).unwrap_or("");
+            let prefix = raw.get(..authority_start).unwrap_or("");
+            std::borrow::Cow::Owned(format!("{prefix}***@{rest}"))
+        }
+        None => std::borrow::Cow::Borrowed(raw),
+    }
 }
 
 /// Outcome tally from probing a relay set. `reachable` + `unprobeable` +
@@ -1401,15 +1431,34 @@ struct RelayProbeTally {
     unprobeable: usize,
 }
 
-/// Probe each relay in turn and tally the outcomes. Per-relay failures are
+/// Probe the relays concurrently and tally the outcomes. Per-relay failures are
 /// logged (not fatal); the caller decides the bring-up gate.
+///
+/// Concurrency matters here: a serial loop would add ~8s per unreachable relay
+/// (3 attempts × 2s timeout plus backoff) to bring-up, so a handful of down
+/// relays could stall startup for tens of seconds. Spawning the probes bounds
+/// the wait to roughly a single relay's probe time. The tally is
+/// order-independent, so join order doesn't matter.
 async fn probe_relays(relays: &[RelayUrl]) -> RelayProbeTally {
-    let mut tally = RelayProbeTally::default();
+    let mut set = JoinSet::new();
     for relay in relays {
-        match probe_relay(relay).await {
-            Some(true) => tally.reachable = tally.reachable.saturating_add(1),
-            Some(false) => {} // probed and unreachable — feeds the gate implicitly
-            None => tally.unprobeable = tally.unprobeable.saturating_add(1),
+        let relay = relay.clone();
+        set.spawn(async move { probe_relay(&relay).await });
+    }
+
+    let mut tally = RelayProbeTally::default();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Some(true)) => tally.reachable = tally.reachable.saturating_add(1),
+            Ok(Some(false)) => {} // probed and unreachable — feeds the gate implicitly
+            Ok(None) => tally.unprobeable = tally.unprobeable.saturating_add(1),
+            // A probe task never panics; if one somehow failed to join, don't
+            // let that internal error hard-fail bring-up — treat it as
+            // "couldn't probe" so it's excluded from the reachability gate.
+            Err(e) => {
+                tracing::warn!("relay probe task failed to join: {e}");
+                tally.unprobeable = tally.unprobeable.saturating_add(1);
+            }
         }
     }
     tally
@@ -2597,6 +2646,41 @@ mod tests {
         assert!(
             err.to_string().contains("not a url"),
             "error should name the offending entry: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_relay_urls_error_redacts_userinfo() {
+        // A malformed URL that still carries credentials must not leak them.
+        let err = parse_relay_urls(&["https://user:s3cret@host:notaport".to_string()])
+            .expect_err("malformed URL is rejected");
+        let msg = err.to_string();
+        assert!(!msg.contains("s3cret"), "credentials leaked: {msg}");
+        assert!(!msg.contains("user:"), "userinfo leaked: {msg}");
+        assert!(msg.contains("***@host"), "host should still appear: {msg}");
+    }
+
+    #[test]
+    fn redact_userinfo_only_touches_authority_userinfo() {
+        use std::borrow::Cow;
+        // Credentialed authority is redacted; the rest is preserved.
+        assert_eq!(
+            redact_userinfo("https://user:pass@host:7842/path"),
+            "https://***@host:7842/path"
+        );
+        // No userinfo / no scheme separator => unchanged (borrowed, not copied).
+        assert!(matches!(
+            redact_userinfo("https://relay.example:7842"),
+            Cow::Borrowed("https://relay.example:7842")
+        ));
+        assert!(matches!(
+            redact_userinfo("not a url"),
+            Cow::Borrowed("not a url")
+        ));
+        // An `@` in the path (after the host) is not userinfo — leave it.
+        assert_eq!(
+            redact_userinfo("https://host/path@x"),
+            "https://host/path@x"
         );
     }
 

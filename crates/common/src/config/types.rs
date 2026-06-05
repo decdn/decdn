@@ -52,7 +52,9 @@ pub struct NetworkConfig {
     /// QUIC bind port.
     pub bind_port: Option<u16>,
     /// iroh relay URLs for NAT traversal. Multiple entries give relay
-    /// redundancy/failover; bring-up requires at least one reachable.
+    /// redundancy/failover; bring-up fails only if every relay that can be
+    /// TCP-probed is unreachable (entries with no derivable host/port are
+    /// skipped and don't block startup).
     pub relay_urls: Option<Vec<String>>,
     /// Deprecated single-relay alias for [`Self::relay_urls`]. When set and
     /// `relay_urls` is absent, it is folded into the list as a single entry.
