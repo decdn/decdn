@@ -35,6 +35,9 @@ pub struct FileConfig {
     /// Download-receipt audit-log retention settings (#802). Absent =>
     /// defaults (128 MiB per file, 4 retained backups).
     pub receipts: Option<ReceiptsConfig>,
+    /// Speculative-prefetch operator policy (ADR 022 §Prefetch Decision).
+    /// Absent => prefetch disabled with the ADR's recommended defaults.
+    pub prefetch: Option<PrefetchConfig>,
 }
 
 /// Identity section of the config file.
@@ -669,4 +672,34 @@ pub struct ReceiptsConfig {
     /// default 4. `0` keeps no backups (the live file is truncated in place on
     /// rotation). Capped at 100.
     pub retained_files: Option<u32>,
+}
+
+/// `[prefetch]` — speculative-prefetch operator policy (ADR 022 §Prefetch
+/// Decision "Recommended configuration"). Every field is optional; absent
+/// keys take the ADR's recommended defaults. The whole feature is gated off
+/// by `enabled = false` by default — operators must affirmatively opt in.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefetchConfig {
+    /// Master switch. Absent => `false` (opt-in).
+    pub enabled: Option<bool>,
+    /// Require an authorized origin in the `FIND_VALUE` candidate set before
+    /// prefetching. Absent => `true`. Closes the demand-supply Sybil attack.
+    pub require_authorized_origin: Option<bool>,
+    /// Hard cap on aggregate prefetch spend over a rolling 1-hour window, in
+    /// micro-USDC. Absent => `0` (no budget => never prefetches; a finite cap
+    /// is the load-bearing recommendation).
+    pub budget_usdc_per_hour: Option<u64>,
+    /// `FIND_VALUE` queries for a hash within `threshold_window_secs` that trip
+    /// the prefetch trigger. Absent => `5`. Must be `> 0`.
+    pub find_value_threshold: Option<u32>,
+    /// Rolling-window length (seconds) for the `FIND_VALUE` trigger. Absent =>
+    /// `300`. Must be `> 0`.
+    pub threshold_window_secs: Option<u64>,
+    /// Auto-throttle floor on `served_bytes / acquired_bytes` over the
+    /// demand-quality window. Absent => `0.1`. Must be finite in `[0.0, 1.0]`.
+    pub demand_quality_min_ratio: Option<f64>,
+    /// Rolling-window length (seconds) for the demand-quality predicate.
+    /// Absent => `3600`. Must be `> 0`.
+    pub demand_quality_window_secs: Option<u64>,
 }

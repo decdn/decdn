@@ -294,6 +294,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         },
         dht: decdn_common::config::ResolvedDht::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
+        prefetch: decdn_common::config::ResolvedPrefetch::default(),
     };
     overrides(&mut cfg);
     cfg
