@@ -1399,22 +1399,24 @@ fn parse_relay_urls(urls: &[String]) -> anyhow::Result<Vec<RelayUrl>> {
 
 /// Replace any `user:pass@` userinfo in a URL-ish string with `***@` so a
 /// parse-failure log can name the offending entry without leaking credentials.
-/// Targets only the authority's userinfo (between `://` and the first `@`
-/// before the next `/`, `?`, or `#`); strings without that shape pass through
-/// unchanged, so non-credential values still appear verbatim in errors.
+///
+/// The input here is an *already-malformed* entry, so we can't lean on a URL
+/// parser. The authority begins after the first `://` (a scheme separator) or
+/// at the start of the string when there is none — a typo'd entry may drop the
+/// scheme yet still carry credentials. Within the authority (up to the host's
+/// first `/`, `?`, or `#`), userinfo runs to the *last* `@`, so a password
+/// containing a literal `@` is fully redacted, while an `@` in the path/query/
+/// fragment is left intact. Strings with no authority `@` pass through
+/// unchanged (borrowed, no copy), so non-credential values still appear
+/// verbatim in errors.
 fn redact_userinfo(raw: &str) -> std::borrow::Cow<'_, str> {
-    let Some(scheme_end) = raw.find("://") else {
-        return std::borrow::Cow::Borrowed(raw);
-    };
-    let authority_start = scheme_end + 3;
-    let authority = raw.get(authority_start..).unwrap_or("");
-    // Userinfo, if present, ends at the first `@` that precedes any path/query/
-    // fragment delimiter.
-    let host_delim = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-    match authority.get(..host_delim).and_then(|a| a.find('@')) {
+    let authority_start = raw.find("://").map_or(0, |i| i + 3);
+    let after = raw.get(authority_start..).unwrap_or("");
+    let host_delim = after.find(['/', '?', '#']).unwrap_or(after.len());
+    match after.get(..host_delim).and_then(|a| a.rfind('@')) {
         Some(at) => {
-            let rest = authority.get(at + 1..).unwrap_or("");
             let prefix = raw.get(..authority_start).unwrap_or("");
+            let rest = after.get(at + 1..).unwrap_or("");
             std::borrow::Cow::Owned(format!("{prefix}***@{rest}"))
         }
         None => std::borrow::Cow::Borrowed(raw),
@@ -1427,7 +1429,8 @@ fn redact_userinfo(raw: &str) -> std::borrow::Cow<'_, str> {
 struct RelayProbeTally {
     /// Relays a TCP connect reached.
     reachable: usize,
-    /// Relays with no derivable host/port to probe (excluded from the gate).
+    /// Relays excluded from the gate: no derivable host/port to probe, or
+    /// (defensively) a probe task that failed to join.
     unprobeable: usize,
 }
 
@@ -2651,24 +2654,54 @@ mod tests {
 
     #[test]
     fn parse_relay_urls_error_redacts_userinfo() {
-        // A malformed URL that still carries credentials must not leak them.
-        let err = parse_relay_urls(&["https://user:s3cret@host:notaport".to_string()])
-            .expect_err("malformed URL is rejected");
-        let msg = err.to_string();
-        assert!(!msg.contains("s3cret"), "credentials leaked: {msg}");
-        assert!(!msg.contains("user:"), "userinfo leaked: {msg}");
-        assert!(msg.contains("***@host"), "host should still appear: {msg}");
+        // Malformed URLs that still carry credentials must not leak them — both
+        // the well-formed-authority shape and a password containing a literal
+        // `@` (which a naive first-`@` split would leak).
+        for entry in [
+            "https://user:s3cret@host:notaport",
+            "https://user:p@s3cret@host:notaport",
+        ] {
+            let err =
+                parse_relay_urls(&[entry.to_string()]).expect_err("malformed URL is rejected");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("s3cret"),
+                "credentials leaked for {entry:?}: {msg}"
+            );
+            assert!(
+                !msg.contains("user:"),
+                "userinfo leaked for {entry:?}: {msg}"
+            );
+            assert!(
+                msg.contains("***@host"),
+                "host should still appear for {entry:?}: {msg}"
+            );
+        }
     }
 
     #[test]
-    fn redact_userinfo_only_touches_authority_userinfo() {
+    fn redact_userinfo_redacts_all_credential_shapes() {
         use std::borrow::Cow;
-        // Credentialed authority is redacted; the rest is preserved.
+        // Credentialed authority is redacted; host + path/query are preserved.
         assert_eq!(
             redact_userinfo("https://user:pass@host:7842/path"),
             "https://***@host:7842/path"
         );
-        // No userinfo / no scheme separator => unchanged (borrowed, not copied).
+        // Password containing a literal `@` must be fully redacted (last-`@`).
+        assert_eq!(
+            redact_userinfo("https://user:p@ss@host:notaport"),
+            "https://***@host:notaport"
+        );
+        // Credentials with no scheme separator still get redacted.
+        assert_eq!(redact_userinfo("relay user:s3cret@host"), "***@host");
+        assert_eq!(redact_userinfo("user@pass:s3cret@host"), "***@host");
+        // Empty userinfo and IPv6 host after userinfo.
+        assert_eq!(redact_userinfo("https://@host"), "https://***@host");
+        assert_eq!(
+            redact_userinfo("https://user@[::1]:443"),
+            "https://***@[::1]:443"
+        );
+        // No userinfo => unchanged (borrowed, not copied).
         assert!(matches!(
             redact_userinfo("https://relay.example:7842"),
             Cow::Borrowed("https://relay.example:7842")
