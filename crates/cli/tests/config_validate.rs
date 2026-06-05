@@ -307,6 +307,23 @@ fn render(source: Option<&Path>, cfg: &ResolvedConfig) -> anyhow::Result<String>
 }
 
 #[test]
+fn summary_includes_prefetch_enabled() -> anyhow::Result<()> {
+    let cfg = sample_resolved(|c| {
+        c.prefetch.enabled = true;
+    });
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        out.contains("prefetch_enabled:"),
+        "summary should report prefetch_enabled: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("prefetch_enabled:         true"),
+        "prefetch_enabled should reflect the resolved value: {out}"
+    );
+    Ok(())
+}
+
+#[test]
 fn summary_redacts_rpc_url_value() -> anyhow::Result<()> {
     let cfg = sample_resolved(|_| {});
     let out = render(None, &cfg)?;

@@ -155,6 +155,11 @@ pub fn write_validate_summary<W: std::io::Write>(
             otlp.len()
         )?;
     }
+    writeln!(
+        w,
+        "  prefetch_enabled:         {}",
+        resolved.prefetch.enabled
+    )?;
     Ok(())
 }
 
@@ -226,4 +231,14 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # metrics_port = 9090
 # admin_port = 9191                        # loopback-only; 0 disables (ADR 025)
 # otlp_endpoint = "http://localhost:4317"  # requires --features otlp
+
+[prefetch]
+# ADR 022 speculative-prefetch operator policy. Disabled by default.
+# enabled = false
+# require_authorized_origin = true          # require an authorized origin in the FIND_VALUE candidate set
+# budget_usdc_per_hour = 0                  # micro-USDC rolling-1h spend cap; 0 = never prefetch
+# find_value_threshold = 5                  # FIND_VALUE queries within the window that trip the trigger
+# threshold_window_secs = 300               # rolling-window length for the trigger
+# demand_quality_min_ratio = 0.1            # served/acquired auto-throttle floor
+# demand_quality_window_secs = 3600         # rolling-window length for the demand-quality predicate
 "#;
