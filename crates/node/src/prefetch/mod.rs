@@ -4,4 +4,5 @@
 //! decision engine. This crate slice decides and meters but does not yet fire
 //! the real acquisition (see #650 follow-up).
 
+pub mod decision;
 pub mod popularity;
