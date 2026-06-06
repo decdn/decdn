@@ -437,6 +437,19 @@ pub async fn run(
             }
         };
 
+    // Decouple the audit write from the paid-delivery hot path (#803): a single
+    // background task owns the receipt log and drains a bounded queue, so the
+    // voucher-accept path only does a non-blocking enqueue before `VoucherAck`
+    // and a slow/full disk can never back-pressure delivery. The token is
+    // cancelled after the router drains on shutdown (below) so the writer
+    // flushes its tail before exiting.
+    let receipt_writer_shutdown = CancellationToken::new();
+    let (receipt_sink, receipt_writer) = crate::receipt_log::spawn_receipt_writer(
+        receipt_log,
+        Arc::clone(&node_metrics),
+        receipt_writer_shutdown.clone(),
+    );
+
     let cache = build_cache(&cfg, Arc::clone(&node_metrics)).await?;
     // Attach the cache to the reload state so SIGHUP handlers can swap
     // the pinned-hashes set atomically (#276). Done immediately after
@@ -660,7 +673,7 @@ pub async fn run(
         voucher_domain,
         bind_domain,
         Arc::clone(&channel_state_store),
-        Arc::clone(&receipt_log),
+        Arc::clone(&receipt_sink),
         reload_state.rate_per_mb(),
         cfg.payment.delivery_floor,
         cfg.payment.delivery_ceiling,
@@ -1183,6 +1196,11 @@ pub async fn run(
         tracing::warn!(%err, "router shutdown reported an error");
     }
     gossip_shutdown.cancel();
+    // The router has drained, so no further vouchers — and therefore no further
+    // receipts — will be produced. Signal the receipt writer to flush whatever
+    // is already enqueued and exit; it is awaited in the drain phase below so
+    // the audit tail survives shutdown (#803).
+    receipt_writer_shutdown.cancel();
 
     // Redeem on shutdown (#327): now that the router has drained, no further
     // vouchers will arrive and the persisted channel state is final. Close
@@ -1248,6 +1266,9 @@ pub async fn run(
     let watchdog_abort = rpc_watchdog_handle
         .as_ref()
         .map(tokio::task::JoinHandle::abort_handle);
+    // The receipt writer also lives outside `tasks`; same fire-and-forget abort
+    // backstop if the drain overruns the deadline (#803).
+    let receipt_writer_abort = receipt_writer.abort_handle();
 
     let drain = async {
         while let Some(result) = tasks.join_next().await {
@@ -1263,6 +1284,11 @@ pub async fn run(
         for handle in gossip_handles {
             log_join_result(handle.await, "gossip-shutdown");
         }
+        // Await the receipt writer so the runtime doesn't return while it's
+        // still flushing its tail. The cancel (above) makes it drain the queue
+        // and return cleanly; a panic surfaces at `warn` and a cancellation at
+        // `debug`, matching the gossip handling.
+        log_join_result(receipt_writer.await, "receipt-writer-shutdown");
         // Await the RPC watchdog. We signalled it via oneshot above, so
         // a healthy run resolves cleanly here. A panic surfaces as a
         // warning; cancellation is silent (matches gossip handling).
@@ -1278,7 +1304,8 @@ pub async fn run(
     } else {
         tracing::warn!(
             deadline = ?SHUTDOWN_DEADLINE,
-            out_of_joinset_aborts = gossip_aborts.len() + usize::from(watchdog_abort.is_some()),
+            out_of_joinset_aborts =
+                gossip_aborts.len() + usize::from(watchdog_abort.is_some()) + 1,
             "graceful shutdown timed out; aborting remaining tasks",
         );
         tasks.abort_all();
@@ -1293,6 +1320,16 @@ pub async fn run(
         if let Some(abort) = &watchdog_abort {
             abort.abort();
         }
+        // Aborting the writer mid-tail-drain discards any still-enqueued audit
+        // receipts. This only happens once shutdown has already blown its
+        // deadline (an abnormal, already-warned event), but name it specifically
+        // so a post-mortem can correlate a gap in `download_receipts.jsonl` with
+        // the overrun — the drop counter does not cover this path (#803).
+        tracing::warn!(
+            event = "receipt_writer_aborted",
+            "receipt writer aborted at shutdown deadline; enqueued audit receipts may be lost"
+        );
+        receipt_writer_abort.abort();
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "abort");
         }
