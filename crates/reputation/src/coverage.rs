@@ -82,10 +82,15 @@ impl RegionalCoverage {
                 score: COVERAGE_NEUTRAL_F32,
                 last_interaction_at: now_secs,
             });
+        // Clamp the effective "now" so an out-of-order or backward-clock report
+        // never rewinds `last_interaction_at` into the past — which would make a
+        // later read apply extra decay. `decay_to` already saturates elapsed at
+        // 0; this keeps the *stored* timestamp monotonic too.
+        let effective_now = now_secs.max(bucket.last_interaction_at);
         let decayed = decay_to(
             f64::from(bucket.score),
             bucket.last_interaction_at,
-            now_secs,
+            effective_now,
             COVERAGE_NEUTRAL,
             self.config.decay_rate_per_week,
         );
@@ -101,7 +106,7 @@ impl RegionalCoverage {
         {
             bucket.score = updated as f32;
         }
-        bucket.last_interaction_at = now_secs;
+        bucket.last_interaction_at = effective_now;
     }
 
     /// `operator`'s lazily-decayed coverage for `region`, or `None` if there is
@@ -225,6 +230,30 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("no signal"))?;
         // From 0.5 toward 1.0 with clamp +0.05 → 0.55.
         ensure!((c - 0.55).abs() < 1e-4, "got {c}");
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_order_report_does_not_rewind_decay_clock() -> anyhow::Result<()> {
+        let rc = RegionalCoverage::new(NetworkReputationConfig::default()).expect("valid cfg");
+        let week = crate::settlement::SECONDS_PER_WEEK_U64;
+        let o = op();
+        // Establish a signal at t = 10 weeks.
+        rc.record(o, DE, 1.0, 3.0, 10 * week);
+        let baseline = rc
+            .coverage(o, DE, 10 * week)
+            .ok_or_else(|| anyhow::anyhow!("no signal"))?;
+        // A delayed (out-of-order) positive report timestamped at t=0 must not
+        // rewind `last_interaction_at` to 0; otherwise coverage(10wk) would
+        // over-decay back toward neutral.
+        rc.record(o, DE, 1.0, 3.0, 0);
+        let after = rc
+            .coverage(o, DE, 10 * week)
+            .ok_or_else(|| anyhow::anyhow!("no signal"))?;
+        ensure!(
+            after >= baseline - 1e-6,
+            "out-of-order report over-decayed coverage: {after} < {baseline}"
+        );
         Ok(())
     }
 

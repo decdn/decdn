@@ -251,10 +251,15 @@ impl NetworkReputation {
                 self.config.decay_rate_per_week,
             );
         }
+        // Clamp the effective "now" so an out-of-order or backward-clock report
+        // never rewinds `last_update_secs` into the past — which would make a
+        // later `score(.., now)` apply extra decay. `decay_to` already saturates
+        // elapsed at 0; this keeps the *stored* timestamp monotonic too.
+        let effective_now = report.now_secs.max(entry.last_update_secs);
         let decayed = decay_to(
             entry.score,
             entry.last_update_secs,
-            report.now_secs,
+            effective_now,
             self.config.initial_score,
             self.config.decay_rate_per_week,
         );
@@ -266,7 +271,7 @@ impl NetworkReputation {
         );
         let updated = (decayed + delta).clamp(0.0, 1.0);
         entry.score = updated;
-        entry.last_update_secs = report.now_secs;
+        entry.last_update_secs = effective_now;
         // The set only gates the distinct-reporter threshold (`score` /
         // `is_scored` test `len() >= min_distinct_reporters`), so once the
         // threshold is reached there is nothing more to learn from new
@@ -546,6 +551,28 @@ mod tests {
             );
         }
         ensure!(nr.score(prov, 0) < 0.5, "got {}", nr.score(prov, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_order_report_does_not_rewind_decay_clock() -> anyhow::Result<()> {
+        let nr = NetworkReputation::new(NetworkReputationConfig::default())?;
+        let week = crate::settlement::SECONDS_PER_WEEK_U64;
+        let prov = peer();
+        // Establish a scored, above-neutral provider at t = 10 weeks.
+        for r in [peer(), peer(), peer()] {
+            nr.record(&full_report(prov, r, 10 * week), 3.0);
+        }
+        let baseline = nr.score(prov, 10 * week);
+        ensure!(baseline > 0.5, "precondition: scored above neutral");
+        // A delayed (out-of-order) positive report timestamped at t=0 must not
+        // rewind `last_update_secs` to 0; otherwise score(10wk) would over-decay.
+        nr.record(&full_report(prov, peer(), 0), 3.0);
+        let after = nr.score(prov, 10 * week);
+        ensure!(
+            after >= baseline - 1e-9,
+            "out-of-order report over-decayed the score: {after} < {baseline}"
+        );
         Ok(())
     }
 

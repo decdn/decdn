@@ -803,8 +803,9 @@ impl AdminRpcServer for AdminRpcImpl {
                 score,
             })
             .collect();
-        // Region-sorted for stable output (mirrors `region_stats`).
-        regions.sort_by(|a, b| a.region.cmp(&b.region));
+        // Region-sorted for stable output (mirrors `region_stats`). Keys are
+        // unique (one bucket per region), so unstable sort is sufficient.
+        regions.sort_unstable_by(|a, b| a.region.cmp(&b.region));
         Ok(ReputationResponse {
             network_score: rep.network.score(pk, now),
             scored: rep.network.is_scored(pk),
