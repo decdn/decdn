@@ -45,6 +45,25 @@
 //! `getLogs`-resync-after-extended-outage path is a follow-up, mirroring the
 //! same posture as `ChainStakerSet`; the watcher health metrics surface the
 //! drift window.
+//!
+//! # Failure model
+//!
+//! Bootstrap RPC failure → propagated (the runtime treats it as fatal; the
+//! prefetch authorized-origin gate cannot be trusted without a complete
+//! snapshot). Mirrors `ChainStakerSet::bootstrap`.
+//!
+//! Watcher stream failure (mid-run) → `warn!` + exponential backoff (1s → 60s),
+//! re-establishing filters. This opens a drift window surfaced by
+//! `decdn_origin_directory_watcher_restarts_total` (edge-triggered, one per
+//! window) and `..._down_seconds` (true downtime).
+//!
+//! A narrower silent-drift source: a per-event `getOrigins` (a newly-claimed
+//! namespace) or `nodeIdOf` (an operator binding) RPC failure is dropped — the
+//! mutation is lost — without tripping the stream backoff. It is surfaced
+//! separately by `decdn_origin_directory_watcher_resolve_failures_total` (and a
+//! `warn!`). The cache fail-closes for the affected hash/operator (resolves to
+//! empty) until a later event re-surfaces it. `decdn_origin_directory_operator_count`
+//! tracks the live authorised-origin surface to spot a frozen or collapsed cache.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -543,7 +562,10 @@ where
 
 /// A new `(hash, namespace)` claim. Record the mapping and, for a
 /// not-yet-known namespace, snapshot its current operator set so the hash
-/// resolves immediately.
+/// resolves immediately. If that `getOrigins` fails the namespace is left
+/// unpopulated (the hash resolves to empty, fail-closed) and self-heals on the
+/// next `AssignmentActivated`/`ContentClaimed` for that namespace — there is no
+/// dedicated retry, consistent with the `getLogs`-resync follow-up posture.
 async fn on_content_claimed<P>(
     contracts: &Contracts<P>,
     cache: &Arc<RwLock<DirectoryCache>>,
@@ -934,6 +956,80 @@ mod tests {
         assert!(c.default_open.contains(&addr(0xE)));
         c.default_open.remove(&addr(0xD));
         assert!(!c.default_open.contains(&addr(0xD)));
+    }
+
+    // ---- Metric-wiring tests: the drift-surfacing guarantee this type exists
+    //      to provide. Exercise the metric methods directly (the real watcher
+    //      needs a chain endpoint), mirroring `chain_staker_set.rs`. ----
+
+    #[test]
+    fn watcher_restart_counts_one_per_drift_window() {
+        let metrics = Arc::new(Metrics::new());
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_origin_directory_watcher_restarts_total 0"),
+            "restart counter should start at zero:\n{text}"
+        );
+
+        // One continuous outage = three failed re-opens (backoff iterations)
+        // with no intervening cycle → counts exactly once (edge-triggered).
+        metrics.origin_directory_watcher_backoff_started();
+        metrics.origin_directory_watcher_backoff_started();
+        metrics.origin_directory_watcher_backoff_started();
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_origin_directory_watcher_restarts_total 1"),
+            "one continuous outage should count exactly one restart:\n{text}"
+        );
+
+        // Filters re-establish (window closes), then a second outage → counts again.
+        metrics.origin_directory_watcher_cycle_established();
+        metrics.origin_directory_watcher_backoff_started();
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_origin_directory_watcher_restarts_total 2"),
+            "a second distinct outage should count a second restart:\n{text}"
+        );
+    }
+
+    #[test]
+    fn watcher_resolve_failure_bumps_counter() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.origin_directory_watcher_resolve_failure();
+        metrics.origin_directory_watcher_resolve_failure();
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_origin_directory_watcher_resolve_failures_total 2"),
+            "expected 2 resolve failures:\n{text}"
+        );
+    }
+
+    #[test]
+    fn operator_count_gauge_reflects_authorized_count_and_drops() {
+        let metrics = Arc::new(Metrics::new());
+        let mut c = cache_with(&[], &[(7, &[addr(0xA), addr(0xB)])], &[addr(0xA)], &[]);
+        // {A, B} (A shared with default-open) → 2.
+        metrics.origin_directory_operator_count(authorized_operator_count(&c));
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_origin_directory_operator_count 2"),
+            "gauge should reflect authorised count 2:\n{text}"
+        );
+        // Revoke B from ns 7 and re-publish: the gauge must DROP (the bug the
+        // fix addressed — the old gauge used the monotonic binding cache).
+        c.origins_of_ns.get_mut(&ns(7)).unwrap().remove(&addr(0xB));
+        metrics.origin_directory_operator_count(authorized_operator_count(&c));
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_origin_directory_operator_count 1"),
+            "gauge should drop to 1 after a revoke:\n{text}"
+        );
     }
 
     #[test]

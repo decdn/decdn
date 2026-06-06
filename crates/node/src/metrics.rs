@@ -891,8 +891,11 @@ impl Metrics {
         }
     }
 
-    /// Publish the current count of cached `operator → NodeId` bindings (#651) —
-    /// the distinct authorised origins the directory can resolve.
+    /// Publish the count of distinct operator addresses currently authorised as
+    /// origins — the union of every namespace's operator set and the
+    /// default-open allow-list (#651). Falls on revoke/prune/remove/replace,
+    /// unlike the monotonic `operator → NodeId` binding cache. The caller
+    /// recomputes this (`authorized_operator_count`) after each set mutation.
     pub fn origin_directory_operator_count(&self, count: usize) {
         self.decdn
             .origin_directory_operator_count

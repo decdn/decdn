@@ -750,7 +750,8 @@ fn resolve_blockchain_into(
     // `OriginAssignment` + `PublisherRegistry`. Both-or-neither — the directory
     // resolution chain needs both reads, so a lone address is an operator
     // mistake worth catching at load rather than silently degrading. When both
-    // are unset the runtime falls back to the file-config origin directory.
+    // are unset the runtime uses an empty (deny-all) origin directory: the
+    // prefetch authorized-origin gate finds no on-chain origins.
     let origin_assignment_raw = cli
         .origin_assignment_address
         .clone()
@@ -6195,7 +6196,7 @@ mod tests {
     #[test]
     fn resolve_blockchain_origin_directory_unset_resolves_to_none() -> anyhow::Result<()> {
         // The chain-backed origin directory is opt-in: with neither address set
-        // both resolve to `None` (the runtime then uses the file-config
+        // both resolve to `None` (the runtime then uses an empty deny-all origin
         // directory) and resolution succeeds.
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -6259,6 +6260,35 @@ mod tests {
         assert!(
             msg.contains("publisher_registry_address"),
             "error should name the missing publisher_registry_address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_origin_directory_lone_publisher_names_missing_origin()
+    -> anyhow::Result<()> {
+        // Symmetric to the above: only the publisher address is set, so the
+        // error must name the missing ORIGIN address (guards the field-naming
+        // branch in both directions).
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: Some(GOOD_ADDR.to_string()),
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let dir = data_dir_with_keystore()?;
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected resolve_blockchain to fail on a lone publisher address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("origin_assignment_address"),
+            "error should name the missing origin_assignment_address: {msg}"
         );
         Ok(())
     }
