@@ -209,7 +209,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     // never escapes `resolve_config`: `bag.into_result()?` below fails before
     // the materialized `ResolvedConfig` is returned to the caller.
     let data_dir_valid = !bag.has_field(IDENTITY_DATA_DIR);
-    let network = resolve_network(&cli.network, file.network.as_ref());
+    let network = resolve_network_into(&cli.network, file.network.as_ref(), &mut bag);
     let blockchain = resolve_blockchain_into(
         &cli.blockchain,
         file.blockchain.as_ref(),
@@ -463,10 +463,22 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
     Ok(upper)
 }
 
-/// Resolve network fields.
-fn resolve_network(
+/// Resolve network fields, recording any malformed `relay_urls` entry into
+/// `bag` (#818).
+///
+/// Each resolved relay URL is parse-checked with [`url::Url`] so
+/// `decdn config validate` fails fast and names a bad entry, instead of the
+/// failure only surfacing later at node bring-up (`parse_relay_urls` in the
+/// `node` runtime). The check is deliberately a *subset* of bring-up's
+/// `iroh::RelayUrl` parse: `RelayUrl` wraps a `url::Url`, so anything
+/// `url::Url::parse` rejects `RelayUrl` rejects too — the validate-time gate is
+/// never stricter than bring-up (no false positives, e.g. a `relay://` scheme
+/// passes both), and bring-up's `RelayUrl` parse stays the authoritative gate
+/// for relay-specific shape. No `iroh` dependency is pulled into `common`.
+fn resolve_network_into(
     cli: &crate::cli::run::NetworkArgs,
     file: Option<&types::NetworkConfig>,
+    bag: &mut ConfigErrorBag,
 ) -> ResolvedNetwork {
     let bind_port = cli
         .bind_port
@@ -491,6 +503,18 @@ fn resolve_network(
         }
     };
 
+    // Validate each resolved entry. The label is indexed (`network.relay_urls[i]`)
+    // matching the `cache.origins[i]` convention; the offending entry is echoed
+    // verbatim, as the `config validate` summary already prints relay URLs.
+    for (i, entry) in relay_urls.iter().enumerate() {
+        if let Err(e) = url::Url::parse(entry) {
+            bag.push(
+                format!("network.relay_urls[{i}]"),
+                format!("invalid relay URL {entry:?}: {e}"),
+            );
+        }
+    }
+
     // No CLI flag: 0-RTT is an operational kill switch, not a per-invocation
     // tuning knob. File `network.enable_0rtt` > built-in default (`true`).
     let enable_0rtt = file
@@ -502,6 +526,19 @@ fn resolve_network(
         relay_urls,
         enable_0rtt,
     }
+}
+
+/// Infallible field-resolution shim for the unit tests that assert on resolved
+/// values without exercising the relay-URL validation (those tests supply
+/// well-formed URLs, so the discarded bag is always empty). The validation path
+/// is covered by the dedicated `resolve_network_*` tests that inspect the bag.
+#[cfg(test)]
+fn resolve_network(
+    cli: &crate::cli::run::NetworkArgs,
+    file: Option<&types::NetworkConfig>,
+) -> ResolvedNetwork {
+    let mut bag = ConfigErrorBag::new();
+    resolve_network_into(cli, file, &mut bag)
 }
 
 /// Validate a user-supplied EVM contract address string.
@@ -6350,6 +6387,75 @@ mod tests {
         assert!(resolved.relay_urls.is_empty());
     }
 
+    // ---- resolve_network: validate-time relay URL parse check (#818) ------
+
+    #[test]
+    fn resolve_network_accepts_well_formed_relay_urls() {
+        // The happy path records no problems. Includes a non-`http(s)` scheme
+        // (`relay://`) that iroh's `RelayUrl` accepts at bring-up, so the
+        // validate-time check must accept it too — it is a parse-only subset
+        // of `RelayUrl`, never stricter (see the worker doc).
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(vec![
+                "https://relay-a.example".to_string(),
+                "relay://no-port-host".to_string(),
+            ]),
+            relay_url: None,
+            enable_0rtt: None,
+        };
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
+        assert_eq!(resolved.relay_urls.len(), 2);
+        assert!(
+            bag.into_result().is_ok(),
+            "well-formed relay URLs must not record a problem"
+        );
+    }
+
+    #[test]
+    fn resolve_network_records_problem_for_malformed_relay_url() {
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(vec!["not a url".to_string()]),
+            relay_url: None,
+            enable_0rtt: None,
+        };
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        // Names the indexed field and echoes the offending entry so the
+        // operator can find it.
+        assert!(msg.contains("network.relay_urls[0]"), "{msg}");
+        assert!(msg.contains("not a url"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_network_reports_each_malformed_relay_entry_by_index() {
+        // A clean entry between two malformed ones: only the bad indices are
+        // reported, each under its own label, in order.
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(vec![
+                "::: bad".to_string(),
+                "https://good.example".to_string(),
+                "also bad".to_string(),
+            ]),
+            relay_url: None,
+            enable_0rtt: None,
+        };
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(msg.contains("configuration has 2 problem(s):"), "{msg}");
+        assert!(msg.contains("network.relay_urls[0]"), "{msg}");
+        assert!(msg.contains("network.relay_urls[2]"), "{msg}");
+        assert!(!msg.contains("network.relay_urls[1]"), "{msg}");
+    }
+
     // ---- resolve_blockchain: CLI > file, missing-required errors ---------
 
     #[test]
@@ -7341,6 +7447,43 @@ rate_per_mb = 0
         assert!(
             !msg.contains("must be set when gossip.subscribe_global"),
             "region cascade should be suppressed: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_errors_on_malformed_relay_url() -> anyhow::Result<()> {
+        // Drive the #818 relay-URL parse check through resolve_config
+        // end-to-end: a malformed `network.relay_urls` entry now fails
+        // `decdn config validate` (which calls resolve_config) up front,
+        // instead of only at node bring-up.
+        let body = r#"
+[network]
+relay_urls = ["https://ok.example", "not a url"]
+
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[gossip]
+subscribe_global = false
+"#;
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to reject a malformed relay URL");
+        };
+        let msg = format!("{err:#}");
+        // Only the bad entry (index 1) is named, not the well-formed one.
+        assert!(
+            msg.contains("network.relay_urls[1]") && msg.contains("not a url"),
+            "error should name the malformed relay entry: {msg}"
+        );
+        assert!(
+            !msg.contains("network.relay_urls[0]"),
+            "the well-formed relay entry must not be reported: {msg}"
         );
         Ok(())
     }

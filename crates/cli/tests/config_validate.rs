@@ -79,6 +79,28 @@ fn validate_passes_for_complete_config() -> anyhow::Result<()> {
 }
 
 #[test]
+fn validate_fails_for_malformed_relay_url() -> anyhow::Result<()> {
+    // #818: a malformed `network.relay_urls` entry must fail `config validate`
+    // up front and name the offending entry, rather than only surfacing later
+    // at node bring-up. Otherwise this is the complete, valid config.
+    let body = format!(
+        "{VALID_CONFIG}\n[network]\nrelay_urls = [\"https://ok.example\", \"not a url\"]\n"
+    );
+    let dir = TempDir::new()?;
+    let path = write_config(&dir, &body)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+    let err = commands::config_validate(Some(&path), &args(dir.path())?)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("network.relay_urls[1]") && msg.contains("not a url"),
+        "error should name the malformed relay entry: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
 fn validate_fails_when_required_field_missing() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let path = write_config(&dir, MISSING_RPC)?;
