@@ -55,7 +55,7 @@ use decdn_reputation::{
 };
 
 use crate::buyer_channel::ChannelOpener;
-use crate::client_requester::stream_fetch;
+use crate::client_requester::{HashMismatch, stream_fetch};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
@@ -233,12 +233,21 @@ async fn probe_and_rank(
     hash_bytes: [u8; 32],
 ) -> Vec<Candidate> {
     let now_secs = crate::payment_settlement::unix_now();
-    let mut candidates = Vec::new();
-    for peer in providers.into_iter().take(deps.config.probe_fanout) {
-        if let Some(candidate) = probe_candidate(deps, peer, hash_bytes, now_secs).await {
-            candidates.push(candidate);
-        }
-    }
+    // Probe candidates CONCURRENTLY so the probe phase is bounded by a single
+    // `PROBE_TIMEOUT` rather than `fanout × PROBE_TIMEOUT`: a few slow or
+    // unreachable peers must not burn the whole pull budget before a healthy
+    // provider is even tried. `probe_candidate`'s side effects (reputation
+    // record, negative-cache insert) are all behind locks, so concurrent runs
+    // are safe; ranking afterwards makes result order irrelevant.
+    let probes = providers
+        .into_iter()
+        .take(deps.config.probe_fanout)
+        .map(|peer| probe_candidate(deps, peer, hash_bytes, now_secs));
+    let candidates: Vec<Candidate> = futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
     rank_candidates(candidates)
         .into_iter()
         .map(|r| r.candidate)
@@ -395,12 +404,11 @@ async fn pull_from_candidate(
             Some(bytes)
         }
         Err(err) => {
-            // `stream_fetch` surfaces its whole-blob integrity failure with this
-            // message; treat that as corruption (the peer was reachable and paid,
-            // but served wrong bytes), everything else as an unreachable/transport
-            // failure. Classification by message is brittle — a typed
-            // `stream_fetch` error is a follow-up.
-            let outcome = if err.to_string().contains("do not match requested hash") {
+            // A whole-blob hash mismatch (the typed `HashMismatch` sentinel,
+            // matched by `downcast_ref` — not a brittle message string) means the
+            // peer was reachable and paid but served wrong bytes → Corruption;
+            // everything else is an unreachable/transport failure.
+            let outcome = if err.downcast_ref::<HashMismatch>().is_some() {
                 Outcome::Corruption
             } else {
                 Outcome::Unreachable

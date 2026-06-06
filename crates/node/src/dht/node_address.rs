@@ -281,7 +281,7 @@ fn set_binding(
     node_id: NodeId,
     address: Address,
 ) {
-    let size = {
+    let (is_new, size) = {
         let mut guard = match bindings.write() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -289,10 +289,15 @@ fn set_binding(
                 poisoned.into_inner()
             }
         };
-        guard.insert(node_id, address);
-        guard.len()
+        // `insert` returns the prior value: `None` means a new key (cardinality
+        // grew); `Some` means an overwrite (same key, possibly rotated address)
+        // that leaves the size — and thus the gauge — unchanged.
+        let is_new = guard.insert(node_id, address).is_none();
+        (is_new, guard.len())
     };
-    metrics.node_address_directory_size(size);
+    if is_new {
+        metrics.node_address_directory_size(size);
+    }
 }
 
 /// Remove `node_id`'s binding, republishing the size gauge only on a real

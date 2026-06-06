@@ -1217,6 +1217,76 @@ impl CacheEngine {
         Ok(bytes)
     }
 
+    /// Ensure `hash` is present locally, pulling it through the origin chain on
+    /// a miss — like [`Self::get`] but WITHOUT returning the bytes or bumping
+    /// the `bytes_returned` / `hits` counters (which measure bytes served to a
+    /// `get` caller). Use this to fill the cache as a *side effect* — e.g. the
+    /// node-to-node cache-miss pull-through hook (#831) — so an internal fill is
+    /// not miscounted as client-facing egress and the whole blob is not
+    /// re-assembled into a buffer the caller would just drop. A hit is a no-op.
+    /// The origin-egress metric (`pull_through_bytes`) is still bumped by the
+    /// pull, which is correct — those bytes really did leave an origin.
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`Self::get`] (`NoOrigin` / `NotFound` / `HashMismatch` /
+    /// `BlobTooLarge` / `OriginError` / `Store`).
+    pub async fn populate(&self, hash: Hash) -> CacheResult<()> {
+        if self.has(hash).await? {
+            self.touch(hash);
+            return Ok(());
+        }
+        // Logical-eviction guard (#279): never re-pull a deliberately evicted
+        // hash (mirrors `get`).
+        if self.is_evicted(hash) {
+            if let Some(m) = &self.inner.metrics {
+                m.misses.inc();
+            }
+            return Err(CacheError::NotFound { hash });
+        }
+        // Coalesce concurrent fills for the same hash (#305), mirroring `get`'s
+        // loop but bumping no `get`-caller metrics: `populate` fills as a side
+        // effect, so it counts neither a hit nor returned bytes.
+        loop {
+            let state = self.inner.inflight.lock().ok().map(|mut guard| {
+                if let Some(n) = guard.get(&hash) {
+                    Err(Arc::clone(n))
+                } else {
+                    let n = Arc::new(Notify::new());
+                    guard.insert(hash, Arc::clone(&n));
+                    Ok(n)
+                }
+            });
+            match state {
+                // Another task owns the pull — wait, then re-check presence.
+                Some(Err(notify)) => {
+                    notify.notified().await;
+                    if self.has(hash).await? {
+                        break;
+                    }
+                }
+                // We own the pull — the guard wakes waiters + clears the entry
+                // even on cancellation.
+                Some(Ok(notify)) => {
+                    let _guard = InflightGuard {
+                        hash,
+                        inflight: &self.inner.inflight,
+                        notify: &notify,
+                    };
+                    self.pull_through(hash).await?;
+                    break;
+                }
+                // Mutex poisoned — fall through to a direct pull.
+                None => {
+                    self.pull_through(hash).await?;
+                    break;
+                }
+            }
+        }
+        self.touch(hash);
+        Ok(())
+    }
+
     /// Flush ephemeral state to disk. The iroh-blobs store does its own
     /// cleanup on drop, but only an explicit
     /// [`iroh_blobs::store::fs::FsStore`] shutdown guarantees that in-flight
@@ -3026,6 +3096,48 @@ mod tests {
             cm.pull_through_bytes.get() == bytes.len() as u64,
             "pull_through_bytes should equal payload length on a Found origin"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn populate_fills_without_bumping_bytes_returned() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"populate must not count as bytes returned";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![Arc::new(origin) as Arc<dyn Origin>],
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            Some(Arc::clone(&cm)),
+            Duration::ZERO,
+        )
+        .await?;
+
+        engine.populate(hash).await?;
+        anyhow::ensure!(engine.has(hash).await?, "populate must fill the store");
+        // Origin egress IS counted (the bytes really left an origin)...
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == payload.len() as u64,
+            "populate must still bump origin-egress pull_through_bytes"
+        );
+        // ...but it is NOT a `get` caller, so no served-bytes / hit accounting.
+        anyhow::ensure!(
+            cm.bytes_returned.get() == 0,
+            "populate must NOT bump bytes_returned (#831: internal fill, not client egress)"
+        );
+        anyhow::ensure!(cm.hits.get() == 0, "populate must not count a hit");
+
+        // A populate on an already-present hash is a no-op (no second pull).
+        engine.populate(hash).await?;
+        anyhow::ensure!(
+            cm.pull_through_bytes.get() == payload.len() as u64,
+            "a populate for an already-present blob must not re-pull"
+        );
+        anyhow::ensure!(cm.bytes_returned.get() == 0, "still no bytes_returned");
         Ok(())
     }
 

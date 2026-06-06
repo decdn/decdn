@@ -134,12 +134,13 @@ pub struct ClientHandler {
     /// Node-to-node cache-miss pull-through deadline (#831), attached
     /// post-construction via [`ClientHandler::attach_pull_through`]. Unset
     /// (the default — feature off, and in tests) keeps the pre-#831 behaviour:
-    /// a cache miss returns `NotFound`. When set, a miss *from a client whose
-    /// payment channel this node already holds* triggers a `cache.get` (the
-    /// engine's `NodeOrigin` discovers, pays, pulls, and populates), bounded by
-    /// this deadline so a slow upstream can't pin the delivery path. The
-    /// channel-presence gate is the anti-proxy-abuse defense — an unpaid client
-    /// cannot make this node front upstream egress.
+    /// a cache miss returns `NotFound`. When set, a miss *from a request that
+    /// proves ownership of the named channel* (see [`Self::pull_authorized`])
+    /// triggers `cache.populate` (the engine's `NodeOrigin` discovers, pays,
+    /// pulls, and fills the store), bounded by this deadline so a slow upstream
+    /// can't pin the delivery path. Proven channel ownership — not mere channel
+    /// existence, which is public — is the anti-proxy-abuse gate: a client
+    /// without an owned channel cannot make this node front upstream egress.
     pull_through: OnceLock<Duration>,
     rate_per_mb: Arc<AtomicU64>,
     delivery_floor: u64,
@@ -286,13 +287,16 @@ impl ClientHandler {
 
     /// Attempt to fill a cache miss by pulling from an upstream node (#831). The
     /// cache engine's `NodeOrigin` (last in the origin chain) does the discovery
-    /// → probe → ranked paid pull → populate; here we just trigger it via `get`
-    /// and discard the buffered bytes (delivery streams from the store), bounded
-    /// by `timeout` so a slow upstream can't pin the delivery path. Returns
-    /// whether the blob is now present locally.
+    /// → probe → ranked paid pull → populate; here we trigger it via
+    /// `cache.populate` (which fills the store WITHOUT returning the blob or
+    /// bumping `bytes_returned` — this is an internal fill, not client egress),
+    /// bounded by `timeout` so a slow upstream can't pin the delivery path. The
+    /// subsequent normal delivery streams the populated bytes from the store and
+    /// accounts the served-bytes metrics there. Returns whether the blob is now
+    /// present locally.
     async fn try_pull_through(&self, hash: Hash, timeout: Duration) -> bool {
-        match tokio::time::timeout(timeout, self.cache.get(hash)).await {
-            Ok(Ok(_bytes)) => true,
+        match tokio::time::timeout(timeout, self.cache.populate(hash)).await {
+            Ok(Ok(())) => true,
             // A clean miss — no origin/provider had it — is the normal
             // unfillable case (`NotFound`/`NoOrigin`); log at debug and move on.
             Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
