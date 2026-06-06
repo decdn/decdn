@@ -152,6 +152,15 @@ pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE
 /// exactly as before — the reservation is strictly operator opt-in.
 pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
 
+/// Default providers probed before ranking on a node-to-node cache-miss pull
+/// (#831). Five is enough to find a healthy upstream in a tens-of-nodes
+/// network without spending the miss-latency budget on a wide probe fan-out.
+pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
+/// Default wall-clock bound (seconds) on a single upstream pull during a
+/// node-to-node cache-miss fill (#831). Matches the integration-test budget;
+/// a slow upstream is abandoned for the next ranked candidate at this deadline.
+pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
+
 /// Default size at which the download-receipt log rotates (#802): 128 MiB.
 /// With the default `retained_files` this bounds the audit log to ~640 MiB
 /// of `data_dir` while still keeping a multi-hundred-MiB delivery history.
@@ -1017,6 +1026,16 @@ fn resolve_cache_into(
             usize::try_from(v).unwrap_or(usize::MAX)
         });
 
+    let node_to_node_pull_through_enabled = file
+        .and_then(|c| c.node_to_node_pull_through_enabled)
+        .unwrap_or(false);
+    let node_pull_probe_fanout = file
+        .and_then(|c| c.node_pull_probe_fanout)
+        .unwrap_or(DEFAULT_NODE_PULL_PROBE_FANOUT);
+    let node_pull_timeout_sec = file
+        .and_then(|c| c.node_pull_timeout_sec)
+        .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
+
     ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -1028,6 +1047,9 @@ fn resolve_cache_into(
         gc_interval_sec,
         max_probe_holds,
         stake_lane_reserved_holds,
+        node_to_node_pull_through_enabled,
+        node_pull_probe_fanout,
+        node_pull_timeout_sec,
     }
 }
 

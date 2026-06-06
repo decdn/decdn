@@ -133,6 +133,15 @@ pub fn write_validate_summary<W: std::io::Write>(
         0 => writeln!(w, "  gc_interval_sec:          disabled")?,
         n => writeln!(w, "  gc_interval_sec:          {n}")?,
     }
+    if resolved.cache.node_to_node_pull_through_enabled {
+        writeln!(
+            w,
+            "  node_to_node_pull:        enabled (probe_fanout={}, pull_timeout_sec={})",
+            resolved.cache.node_pull_probe_fanout, resolved.cache.node_pull_timeout_sec
+        )?;
+    } else {
+        writeln!(w, "  node_to_node_pull:        disabled")?;
+    }
     writeln!(
         w,
         "  rate_per_mb:              {}",
@@ -233,6 +242,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518)
 # max_probe_holds = 256                    # probe eviction-hold budget (ADR 005 §Hold budget); 0 disables has_blob:true
 # stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
+# node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
+# node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
+# node_pull_timeout_sec = 20               # per-upstream pull timeout on a node-to-node miss (#831)
 
 [payment]
 # rate_per_mb = 10

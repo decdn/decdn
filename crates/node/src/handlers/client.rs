@@ -36,7 +36,7 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{CacheEngine, Hash};
+use decdn_cache::{CacheEngine, CacheError, Hash};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
@@ -131,6 +131,16 @@ pub struct ClientHandler {
     /// (tests / no admin surface) — recording is best-effort, so an unattached
     /// handler simply skips it.
     region_accountant: OnceLock<Arc<RegionAccountant>>,
+    /// Node-to-node cache-miss pull-through deadline (#831), attached
+    /// post-construction via [`ClientHandler::attach_pull_through`]. Unset
+    /// (the default — feature off, and in tests) keeps the pre-#831 behaviour:
+    /// a cache miss returns `NotFound`. When set, a miss *from a client whose
+    /// payment channel this node already holds* triggers a `cache.get` (the
+    /// engine's `NodeOrigin` discovers, pays, pulls, and populates), bounded by
+    /// this deadline so a slow upstream can't pin the delivery path. The
+    /// channel-presence gate is the anti-proxy-abuse defense — an unpaid client
+    /// cannot make this node front upstream egress.
+    pull_through: OnceLock<Duration>,
     rate_per_mb: Arc<AtomicU64>,
     delivery_floor: u64,
     delivery_ceiling: u64,
@@ -205,6 +215,7 @@ impl ClientHandler {
             redeem_hint: OnceLock::new(),
             voucher_activity: OnceLock::new(),
             region_accountant: OnceLock::new(),
+            pull_through: OnceLock::new(),
             rate_per_mb,
             delivery_floor,
             delivery_ceiling,
@@ -237,6 +248,74 @@ impl ClientHandler {
     /// bytes against the paying peer's region.
     pub fn attach_region_accountant(&self, accountant: Arc<RegionAccountant>) {
         let _ = self.region_accountant.set(accountant);
+    }
+
+    /// Attach the node-to-node cache-miss pull-through deadline (#831). Called
+    /// once during runtime wiring when `cache.node_to_node_pull_through_enabled`
+    /// (and the engine's `NodeOrigin` is provisioned); a second call is ignored.
+    /// After this, a cache miss for a request on a channel this node already
+    /// holds attempts a paid upstream pull (bounded by `timeout`) before falling
+    /// back to `NotFound`.
+    pub fn attach_pull_through(&self, timeout: Duration) {
+        let _ = self.pull_through.set(timeout);
+    }
+
+    /// Whether `req` is authorized to trigger a paid pull-through (#831): it must
+    /// carry a verified client binding (`verified_client`) whose recovered
+    /// address is the named channel's authorized client. Channel *existence* is
+    /// public (on-chain `ChannelOpened`), so it cannot authorize spend — only
+    /// proven ownership can. An unbound request, or a binding that does not match
+    /// the channel owner, is unauthorized and must not make this node front
+    /// upstream USDC. Mirrors the post-delivery ownership check, applied *before*
+    /// any spend.
+    async fn pull_authorized(&self, req: &StreamRequest, verified_client: Option<Address>) -> bool {
+        let Some(client) = verified_client else {
+            return false;
+        };
+        let chan = self
+            .channels
+            .lock()
+            .await
+            .get(&ChannelId::from(req.channel_id))
+            .cloned();
+        match chan {
+            Some(chan) => chan.lock().await.state.client == client,
+            None => false,
+        }
+    }
+
+    /// Attempt to fill a cache miss by pulling from an upstream node (#831). The
+    /// cache engine's `NodeOrigin` (last in the origin chain) does the discovery
+    /// → probe → ranked paid pull → populate; here we just trigger it via `get`
+    /// and discard the buffered bytes (delivery streams from the store), bounded
+    /// by `timeout` so a slow upstream can't pin the delivery path. Returns
+    /// whether the blob is now present locally.
+    async fn try_pull_through(&self, hash: Hash, timeout: Duration) -> bool {
+        match tokio::time::timeout(timeout, self.cache.get(hash)).await {
+            Ok(Ok(_bytes)) => true,
+            // A clean miss — no origin/provider had it — is the normal
+            // unfillable case (`NotFound`/`NoOrigin`); log at debug and move on.
+            Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
+                tracing::debug!(%hash, error = %e, "node-to-node pull-through found no source");
+                false
+            }
+            // Any other engine error is a real store/pull fault, NOT a clean
+            // miss. Surface it (matching the `has`-lookup `warn!` on this path)
+            // and meter it so the fault isn't silent — the client still gets a
+            // `NotFound`, but the operator can see it happened.
+            Ok(Err(e)) => {
+                self.metrics.node_pull_through_error();
+                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a cache-engine error");
+                false
+            }
+            Err(_) => {
+                // A deadline hit is distinct from a genuine miss: meter it so a
+                // slow/wedged upstream is distinguishable from "not on network".
+                self.metrics.node_pull_through_timeout();
+                tracing::debug!(%hash, ?timeout, "node-to-node pull-through timed out");
+                false
+            }
+        }
     }
 
     /// Register a channel observed on-chain via `ChannelOpened` (#327) so the
@@ -476,12 +555,39 @@ impl ClientHandler {
         match self.cache.has(hash).await {
             Ok(true) => {}
             Ok(false) => {
-                let err = if self.cache.is_evicted(hash) {
-                    StreamError::EvictedSinceProbe
-                } else {
-                    StreamError::NotFound
+                // Eviction is sticky and authoritative — never pull-fill a
+                // hash an operator deliberately evicted (#279).
+                if self.cache.is_evicted(hash) {
+                    return self
+                        .respond_error(&mut send, &req, StreamError::EvictedSinceProbe)
+                        .await;
+                }
+                // Node-to-node cache-miss pull-through (#831). Fronting upstream
+                // USDC egress is privileged: gate it on the request PROVING
+                // ownership of the named channel — a verified client binding
+                // (`verified_client`) whose address is the channel's authorized
+                // client. Channel *existence* cannot gate spend (channel ids are
+                // public on-chain via `ChannelOpened`, so any leech could name
+                // one); only proven ownership can. An unbound request, or one
+                // for a channel it does not own, gets a plain `NotFound` and
+                // cannot make this node spend — closing the proxy-abuse /
+                // griefing vector where an unpaid client drains the buyer
+                // deposit. (Multi-hop node→node pulls therefore require the
+                // downstream requester to send a binding; `stream_fetch` does
+                // not yet, so chained pull-through is a follow-up.) On a
+                // successful fill, fall through to the normal size-gate +
+                // delivery path; otherwise it stays a `NotFound`.
+                let filled = match self.pull_through.get().copied() {
+                    Some(timeout) if self.pull_authorized(&req, verified_client).await => {
+                        self.try_pull_through(hash, timeout).await
+                    }
+                    _ => false,
                 };
-                return self.respond_error(&mut send, &req, err).await;
+                if !filled {
+                    return self
+                        .respond_error(&mut send, &req, StreamError::NotFound)
+                        .await;
+                }
             }
             Err(e) => {
                 tracing::warn!(%hash, error = %e, "cache `has` lookup failed on delivery path");

@@ -1738,3 +1738,153 @@ async fn update_channel_deposit_raises_and_is_idempotent() -> anyhow::Result<()>
     );
     Ok(())
 }
+
+// ===========================================================================
+// Node-to-node cache-miss pull-through authorization gate (#831)
+//
+// The miss-hook that triggers a *paid* upstream pull must fire only for a
+// request that PROVES ownership of the named channel — channel ids are public
+// on-chain, so existence cannot authorize spend. A `CountingOrigin` (returns
+// NotFound but counts every fetch) stands in for the paid `NodeOrigin`, so a
+// test can distinguish "the gate blocked the pull" (0 fetches) from "the pull
+// was attempted" (>=1 fetch) even though both cases return NotFound to the
+// client.
+// ===========================================================================
+
+/// An origin that counts how many times it was asked and always reports the blob
+/// absent. As the last origin in the chain it models the paid network pull
+/// without spending: a nonzero count means the miss-hook reached the (paid)
+/// pull, which the authorization gate must prevent for unauthorized requests.
+#[derive(Debug)]
+struct CountingOrigin {
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl decdn_cache::Origin for CountingOrigin {
+    fn fetch(
+        &self,
+        _hash: decdn_cache::Hash,
+        _max_bytes: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<decdn_cache::origin::OriginFetch, decdn_cache::OriginPullError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(decdn_cache::origin::OriginFetch::NotFound) })
+    }
+
+    fn kind(&self) -> decdn_cache::OriginKind {
+        decdn_cache::OriginKind::Peer
+    }
+}
+
+/// The pull-through gate authorizes ONLY a request proving ownership of the
+/// named channel: an unbound request and a validly-bound-but-wrong-owner request
+/// must NOT reach the paid pull (the counting origin stays at 0), while the
+/// channel owner's bound request does. All three return `NotFound` to the
+/// client (the stand-in origin has nothing); the security property is whether
+/// the paid pull was attempted at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()> {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cache_tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(
+        cache_tmp.path(),
+        vec![Arc::new(CountingOrigin {
+            hits: Arc::clone(&hits),
+        }) as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+
+    // Channel owned by `owner`; this is the only identity authorized to pull.
+    let (store, owner, _deposit) = seeded_store()?;
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_full(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+    )?;
+    // Arm pull-through, as the runtime does when the feature is enabled.
+    handler.attach_pull_through(std::time::Duration::from_secs(10));
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // A hash the node does not have → a miss that would trigger the pull.
+    let miss_hash = [0xEEu8; 32];
+    let req = StreamRequest {
+        hash: miss_hash,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        timestamp_us: 0x0091_1001,
+    };
+
+    // 1) Unbound request: no binding → not authorized → pull NOT attempted.
+    let (c1, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let _ = raw_request(&c1, target.clone(), &req, None).await?;
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "an unbound request must NOT trigger a paid pull"
+    );
+    c1.close().await;
+
+    // 2) Bound to the WRONG owner: valid signature, but not the channel's client
+    //    → not authorized → pull NOT attempted.
+    let intruder_sk = fresh_key();
+    let intruder_node_id = B256::from(*intruder_sk.public().as_bytes());
+    let (c2, _) = local_endpoint(intruder_sk, vec![]).await?;
+    let intruder = PrivateKeySigner::random();
+    let ext_intruder = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: intruder.address().into(),
+            binding_signature: sign_binding_for(&intruder, intruder_node_id)?,
+        }),
+        ..Default::default()
+    };
+    let _ = raw_request(&c2, target.clone(), &req, Some(&ext_intruder)).await?;
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "a binding for a non-owner address must NOT trigger a paid pull"
+    );
+    c2.close().await;
+
+    // 3) Bound to the channel OWNER: authorized → the pull IS attempted (the
+    //    counting origin is reached exactly once).
+    let owner_sk = fresh_key();
+    let owner_node_id = B256::from(*owner_sk.public().as_bytes());
+    let (c3, _) = local_endpoint(owner_sk, vec![]).await?;
+    let ext_owner = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: owner.address().into(),
+            binding_signature: sign_binding_for(&owner, owner_node_id)?,
+        }),
+        ..Default::default()
+    };
+    let _ = raw_request(&c3, target.clone(), &req, Some(&ext_owner)).await?;
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "the channel owner's bound request MUST trigger the pull exactly once, got {}",
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    c3.close().await;
+
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}

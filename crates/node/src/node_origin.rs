@@ -1,0 +1,543 @@
+//! `NodeOrigin` — the node-to-node cache-miss pull-through origin (#831, ADR
+//! 001/022).
+//!
+//! `CacheEngine` ingests blobs only through the [`Origin`] trait, so the
+//! production shape of "on a miss, discover a provider, open a paid channel,
+//! pull, and populate the cache" is an [`Origin`] implementation injected into
+//! the engine's origin chain (appended last, so configured HTTP/FS/S3 origins
+//! are tried first and the paid network pull is the final fallback). On
+//! [`Origin::fetch`] this:
+//!
+//! 1. discovers providers for the hash (DHT [`crate::dht::find_providers`],
+//!    with the origin-directory fallback),
+//! 2. probes each candidate for rate + RTT and ranks them by the combined
+//!    local+network reputation score ([`crate::selection::rank_candidates`]),
+//! 3. opens (or reuses) a buyer payment channel to the best candidate and pulls
+//!    via [`crate::client_requester::stream_fetch`], falling back through up to
+//!    [`crate::selection::MAX_PROVIDER_ATTEMPTS`] providers,
+//! 4. records the per-provider [`Outcome`] into the local reputation score and
+//!    the observation buffer, so the gossip publisher emits reports about the
+//!    upstreams this node pulled from (ADR 008 §Local Score / §Gossip Protocol).
+//!
+//! The cache engine verifies the returned bytes against the content hash and
+//! ingests them, and `stream_fetch` does its own whole-blob BLAKE3 check, so a
+//! dishonest provider is detected (and scored [`Outcome::Corruption`]) rather
+//! than surfaced to the caller.
+//!
+//! # Deferred initialisation
+//!
+//! The engine is constructed early in runtime bring-up — before the endpoint,
+//! DHT, buyer-channel service, and reputation handles `NodeOrigin` depends on
+//! exist — and takes its origin chain only at construction (there is no
+//! `add_origin`). So `NodeOrigin` is built empty, placed in the chain, and its
+//! dependencies are injected later via a write-once [`OnceLock`] (see
+//! [`NodeOrigin::provision`]). Until that set lands — the feature is off, or the
+//! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
+//! miss that leaves the handler behaving exactly as it did before pull-through.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::U256;
+use bytes::Bytes;
+use decdn_cache::origin::{Origin, OriginFetch};
+use decdn_cache::{Hash, OriginKind, OriginPullError};
+use decdn_protocol::ReportMetrics;
+use iroh::{Endpoint, EndpointAddr, PublicKey};
+use tracing::{debug, warn};
+
+use decdn_reputation::{
+    LocalReputation, NetworkReputation, NetworkReputationConfig, ObservationBuffer, Outcome,
+    combined_score,
+};
+
+use crate::buyer_channel::ChannelOpener;
+use crate::client_requester::stream_fetch;
+use crate::dht::negative_cache::Hash as DhtHash;
+use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
+use crate::dht::{
+    LookupConfig, NegativeProbeCache, NodeAddressResolver, OriginDirectory, StakerSet,
+};
+use crate::metrics::Metrics;
+use crate::probe_client::probe_once;
+use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, rank_candidates};
+
+/// Per-candidate probe timeout. Short relative to the pull timeout — a probe is
+/// a single unpaid round trip, so a slow candidate is dropped quickly rather
+/// than burning the caller's miss-latency budget on it.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tuning knobs for the node-to-node pull, resolved from `[cache]` config.
+#[derive(Debug, Clone)]
+pub struct NodeOriginConfig {
+    /// How many discovered providers to probe before ranking.
+    pub probe_fanout: usize,
+    /// Wall-clock bound on a single upstream pull (`stream_fetch`).
+    pub pull_timeout: Duration,
+    /// ADR 015 master switch (`network.enable_0rtt`) for the probe handshake.
+    pub enable_0rtt: bool,
+    /// Desired deposit for a freshly-opened buyer channel
+    /// (`blockchain.buyer_deposit_micro_usdc`); ignored when a channel is reused.
+    pub deposit_hint: U256,
+    /// DHT lookup tuning.
+    pub lookup: LookupConfig,
+}
+
+/// Dependencies the orchestration needs, injected once after runtime bring-up
+/// completes (see the module docs). Built and handed to [`NodeOrigin::provision`]
+/// by the runtime.
+pub struct NodeOriginDeps {
+    /// The node's shared iroh endpoint (dials probes + pulls).
+    pub endpoint: Endpoint,
+    /// DHT routing table handle for `find_providers`.
+    pub routing_table: Arc<Mutex<RoutingTable>>,
+    /// Active-staker set (lookup integrity filter).
+    pub staker_set: Arc<dyn StakerSet>,
+    /// On-chain origin-directory fallback when the DHT returns no providers.
+    pub origin_directory: Arc<dyn OriginDirectory>,
+    /// Resolves a provider `NodeId` to its bonded operator Ethereum address.
+    pub addr_resolver: Arc<dyn NodeAddressResolver>,
+    /// Buyer-side payment-channel service (opens/reuses the upstream channel).
+    pub buyer: Arc<dyn ChannelOpener>,
+    /// This node's DHT id, the lookup requester.
+    pub self_id: DhtNodeId,
+    /// EIP-712 domain verifying the delivery `slash_sig` (ADR 014 §1).
+    pub slash_domain: Eip712Domain,
+    /// Local per-peer reputation score store (folded on each pull outcome).
+    pub local_rep: Arc<LocalReputation>,
+    /// Outbound observation buffer the gossip publisher drains.
+    pub obs_buffer: Arc<ObservationBuffer>,
+    /// Aggregated network reputation (read for the combined selection score).
+    pub network_rep: Arc<NetworkReputation>,
+    /// Reputation blend weights for `combined_score`.
+    pub rep_cfg: NetworkReputationConfig,
+    /// Requester-side negative-probe cache (drops known-absent providers).
+    pub negative_cache: NegativeProbeCache,
+    /// Node metrics for the paid-pull observability counters (#831).
+    pub metrics: Arc<Metrics>,
+    /// Resolved pull tuning.
+    pub config: NodeOriginConfig,
+}
+
+impl std::fmt::Debug for NodeOriginDeps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeOriginDeps")
+            .field("self_id", &self.self_id)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Node-to-node pull-through [`Origin`]. Cheap to clone via the shared inner
+/// [`Arc`]; the runtime holds one and injects its dependencies once.
+#[derive(Debug, Clone)]
+pub struct NodeOrigin {
+    deps: Arc<OnceLock<NodeOriginDeps>>,
+}
+
+impl NodeOrigin {
+    /// Build an unprovisioned origin. `fetch` is a clean miss until
+    /// [`Self::provision`] supplies the dependencies.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            deps: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Supply the dependencies, enabling pull-through. Idempotent-safe: a second
+    /// call is ignored with a warning (the write-once `OnceLock` keeps the first
+    /// set), so a misconfigured double-provision can't silently swap deps under
+    /// an in-flight fetch.
+    pub fn provision(&self, deps: NodeOriginDeps) {
+        if self.deps.set(deps).is_err() {
+            warn!("NodeOrigin provisioned more than once; keeping the first dependency set");
+        }
+    }
+}
+
+impl Default for NodeOrigin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Origin for NodeOrigin {
+    fn fetch(
+        &self,
+        hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        let deps_lock = Arc::clone(&self.deps);
+        Box::pin(async move {
+            let Some(deps) = deps_lock.get() else {
+                // Pull-through not provisioned (feature disabled or the buyer
+                // bootstrap failed). A clean miss — the engine surfaces NotFound
+                // to the handler, which behaves as it did pre-#831. The engine
+                // enforces `max_bytes` on whatever any provisioned pull returns,
+                // so it is not consulted here.
+                return Ok(OriginFetch::NotFound);
+            };
+            let hash_bytes = *hash.as_bytes();
+            let providers = discover(deps, hash_bytes).await;
+            if providers.is_empty() {
+                deps.metrics.node_pull_no_providers();
+                debug!(%hash, "node-origin: no providers discovered for cache-miss pull");
+                return Ok(OriginFetch::NotFound);
+            }
+            deps.metrics.node_pull_attempt();
+            let ranked = probe_and_rank(deps, providers, hash_bytes).await;
+            match try_pull(deps, &ranked, hash_bytes).await {
+                Some(bytes) => Ok(OriginFetch::found_one_shot(bytes)),
+                None => Ok(OriginFetch::NotFound),
+            }
+        })
+    }
+
+    fn kind(&self) -> OriginKind {
+        OriginKind::Peer
+    }
+}
+
+/// Discover candidate providers for `hash`: the DHT iterative lookup first,
+/// falling back to the on-chain origin directory when the lookup converges
+/// empty (ADR 022 §`FIND_VALUE` Flow).
+async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> Vec<DhtNodeId> {
+    let target = DhtHash::from_bytes(hash_bytes);
+    let providers = crate::dht::find_providers(
+        &deps.endpoint,
+        &deps.routing_table,
+        &deps.staker_set,
+        &deps.negative_cache,
+        deps.self_id,
+        target,
+        deps.config.lookup,
+    )
+    .await;
+    if providers.is_empty() {
+        deps.origin_directory.lookup_origins(&target)
+    } else {
+        providers
+    }
+}
+
+/// Probe up to `probe_fanout` providers for rate + RTT, build a [`Candidate`]
+/// for each that reports holding the blob, and rank them by the combined
+/// reputation-weighted selection score.
+async fn probe_and_rank(
+    deps: &NodeOriginDeps,
+    providers: Vec<DhtNodeId>,
+    hash_bytes: [u8; 32],
+) -> Vec<Candidate> {
+    let now_secs = crate::payment_settlement::unix_now();
+    let mut candidates = Vec::new();
+    for peer in providers.into_iter().take(deps.config.probe_fanout) {
+        if let Some(candidate) = probe_candidate(deps, peer, hash_bytes, now_secs).await {
+            candidates.push(candidate);
+        }
+    }
+    rank_candidates(candidates)
+        .into_iter()
+        .map(|r| r.candidate)
+        .collect()
+}
+
+/// Probe a single provider, returning a ranked-ready [`Candidate`] iff it
+/// responds, validates, and reports holding the blob. Side effects: a failed
+/// probe scores the provider [`Outcome::Unreachable`]; a reachable-but-absent
+/// provider is recorded in the negative-probe cache.
+// Straight-line probe → classify → build; the tracing macros and the three
+// sequential drop-conditions inflate the cognitive-complexity metric past the
+// threshold (same inflation noted in `chain_staker_set`), and splitting the
+// validation further would obscure the flow rather than clarify it.
+#[allow(clippy::cognitive_complexity)]
+async fn probe_candidate(
+    deps: &NodeOriginDeps,
+    peer: DhtNodeId,
+    hash_bytes: [u8; 32],
+    now_secs: u64,
+) -> Option<Candidate> {
+    let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
+        // A staker-filtered routing entry should always decode; a failure
+        // implies upstream state corruption — skip rather than panic.
+        return None;
+    };
+    let (resp, rtt_ms) = match probe_once(
+        &deps.endpoint,
+        EndpointAddr::new(pk),
+        hash_bytes,
+        now_micros(),
+        deps.config.enable_0rtt,
+        None,
+        PROBE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(err) => {
+            // A failed probe is a reachability signal: the upstream could not be
+            // reached for this interaction (ADR 008 §Local Score).
+            debug!(%err, "node-origin: probe failed; scoring provider unreachable");
+            record_outcome(deps, pk, &Outcome::Unreachable);
+            return None;
+        }
+    };
+    // Shape + echoed-hash validation (ADR 005 / ADR 014 §1); a malformed or
+    // off-hash response is dropped, not scored.
+    if resp.validate().is_err() || resp.body.hash != hash_bytes {
+        return None;
+    }
+    if !resp.body.has_blob {
+        // Reachable but does not hold the blob — not a reputation event (no
+        // delivery attempted); cache the negative so the next lookup for this
+        // hash skips it within the TTL.
+        deps.negative_cache
+            .record_failure(peer, DhtHash::from_bytes(hash_bytes));
+        return None;
+    }
+    Some(Candidate {
+        node_id: *peer.as_bytes(),
+        rate_per_mb: resp.body.rate_per_mb,
+        rtt_ms: ms_to_u32(rtt_ms),
+        reputation: combined_reputation(deps, pk, now_secs),
+        // Region drives only the geo-diversity tie-break tier; left empty here
+        // (we do not consult the peer table on this path). A follow-up can
+        // populate it from the NodeAnnounce region.
+        region: String::new(),
+        stake: None,
+    })
+}
+
+/// Walk the ranked candidates (best-first), opening a channel and pulling from
+/// each until one delivers, bounded by [`MAX_PROVIDER_ATTEMPTS`]. Records a
+/// reputation outcome for every candidate that reaches `stream_fetch`;
+/// candidates skipped earlier for an unresolvable operator address or a local
+/// channel-open failure are intentionally not scored (neither is the provider's
+/// fault).
+async fn try_pull(
+    deps: &NodeOriginDeps,
+    ranked: &[Candidate],
+    hash_bytes: [u8; 32],
+) -> Option<Bytes> {
+    for candidate in ranked.iter().take(MAX_PROVIDER_ATTEMPTS) {
+        if let Some(bytes) = pull_from_candidate(deps, candidate, hash_bytes).await {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// Attempt a single paid pull from one candidate: resolve its operator address,
+/// open/reuse a buyer channel, `stream_fetch`, and record the reputation
+/// outcome. Returns the bytes on success, `None` (try the next) otherwise.
+// Sequential resolve → open → fetch → classify pipeline; the tracing macros and
+// the success/failure classification inflate the cognitive-complexity metric
+// past threshold (same inflation noted in `chain_staker_set`). Splitting it
+// would scatter a single linear flow across helpers.
+#[allow(clippy::cognitive_complexity)]
+async fn pull_from_candidate(
+    deps: &NodeOriginDeps,
+    candidate: &Candidate,
+    hash_bytes: [u8; 32],
+) -> Option<Bytes> {
+    let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
+        return None;
+    };
+    let Some(provider_addr) = deps
+        .addr_resolver
+        .address_of(&DhtNodeId::from_bytes(candidate.node_id))
+    else {
+        // No bonded address → we cannot safely open a channel to, or verify the
+        // `slash_sig` of, this provider. Skip rather than guess.
+        debug!("node-origin: candidate has no resolvable operator address; skipping");
+        return None;
+    };
+    let ctx = match deps
+        .buyer
+        .open_or_reuse_channel(provider_addr, deps.config.deposit_hint)
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            // A channel-open failure is OUR payment-side problem, not the
+            // provider's fault — don't tar its reputation; just try the next.
+            deps.metrics.node_pull_channel_open_failure();
+            debug!(%provider_addr, %err, "node-origin: buyer channel open/reuse failed");
+            return None;
+        }
+    };
+    let started = Instant::now();
+    match stream_fetch(
+        &deps.endpoint,
+        EndpointAddr::new(pk),
+        &ctx,
+        &deps.slash_domain,
+        provider_addr,
+        hash_bytes,
+        0,
+        now_micros(),
+        deps.config.pull_timeout,
+    )
+    .await
+    {
+        Ok(bytes) => {
+            record_outcome(
+                deps,
+                pk,
+                &Outcome::Delivered {
+                    bytes: bytes.len() as u64,
+                    elapsed: started.elapsed(),
+                },
+            );
+            Some(bytes)
+        }
+        Err(err) => {
+            // `stream_fetch` surfaces its whole-blob integrity failure with this
+            // message; treat that as corruption (the peer was reachable and paid,
+            // but served wrong bytes), everything else as an unreachable/transport
+            // failure. Classification by message is brittle — a typed
+            // `stream_fetch` error is a follow-up.
+            let outcome = if err.to_string().contains("do not match requested hash") {
+                Outcome::Corruption
+            } else {
+                Outcome::Unreachable
+            };
+            debug!(%provider_addr, %err, ?outcome, "node-origin: upstream pull failed");
+            record_outcome(deps, pk, &outcome);
+            None
+        }
+    }
+}
+
+/// The combined local+network reputation for `pk` at `now_secs`, as the `f32`
+/// the selection score consumes. An unseen peer scores neutral (local
+/// `initial_score`), so a cold provider ranks neither favoured nor excluded
+/// (ADR 008 §Cold-Start).
+#[allow(clippy::cast_possible_truncation)] // reputation ∈ [0,1]; f32 has ample precision for a ranking weight.
+fn combined_reputation(deps: &NodeOriginDeps, pk: PublicKey, now_secs: u64) -> f32 {
+    let local = deps.local_rep.score(pk);
+    let network = deps.network_rep.score(pk, now_secs);
+    combined_score(Some(local), network, &deps.rep_cfg) as f32
+}
+
+/// Fold a pull/probe outcome into BOTH the local EWMA score and the outbound
+/// observation buffer (ADR 008 §Local Score + §Gossip Protocol). The buffer
+/// feed is what makes the node *emit* reports about its upstreams.
+fn record_outcome(deps: &NodeOriginDeps, pk: PublicKey, outcome: &Outcome) {
+    deps.local_rep.record(pk, *outcome);
+    let report = match *outcome {
+        Outcome::Delivered { bytes, elapsed } => {
+            deps.metrics.node_pull_success();
+            ReportMetrics {
+                delivery_speed: Some(bytes_per_sec(bytes, elapsed)),
+                uptime_observed: Some(true),
+                data_correct: Some(true),
+            }
+        }
+        Outcome::Corruption => {
+            deps.metrics.node_pull_corruption();
+            ReportMetrics {
+                delivery_speed: None,
+                uptime_observed: Some(true),
+                data_correct: Some(false),
+            }
+        }
+        Outcome::Unreachable => {
+            deps.metrics.node_pull_unreachable();
+            ReportMetrics {
+                delivery_speed: None,
+                uptime_observed: Some(false),
+                data_correct: None,
+            }
+        }
+        // `Outcome` is `#[non_exhaustive]`: a future variant defaults to an
+        // all-`None` (no-signal) report rather than mis-attributing one of the
+        // three known shapes. Add an explicit arm when such a variant lands.
+        _ => ReportMetrics {
+            delivery_speed: None,
+            uptime_observed: None,
+            data_correct: None,
+        },
+    };
+    deps.obs_buffer.observe(pk, report);
+}
+
+/// Bytes-per-second as a saturating `u32`, with a 1 ms floor on elapsed so a
+/// sub-millisecond local-loopback delivery can't divide by ~zero.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)] // throughput metric; saturation + sign-safe (bytes ≥ 0, secs > 0) by construction.
+fn bytes_per_sec(bytes: u64, elapsed: Duration) -> u32 {
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let bps = bytes as f64 / secs;
+    if bps >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        bps as u32
+    }
+}
+
+/// Round-trip-time milliseconds as a saturating `u32` for the selection score.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // RTT ≥ 0; saturated below u32::MAX.
+fn ms_to_u32(rtt_ms: f64) -> u32 {
+    if rtt_ms >= f64::from(u32::MAX) {
+        u32::MAX
+    } else if rtt_ms <= 0.0 {
+        0
+    } else {
+        rtt_ms as u32
+    }
+}
+
+/// Current Unix time in microseconds for probe/stream request correlation. A
+/// pre-epoch clock saturates to `0` (the server's recency check rejects it)
+/// rather than panicking.
+fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// An unprovisioned `NodeOrigin` is a clean miss for any hash, so wiring it
+    /// into the engine chain before its dependencies exist (or with the feature
+    /// off) never disturbs the existing miss behaviour.
+    #[tokio::test]
+    async fn unprovisioned_fetch_is_not_found() {
+        let origin = NodeOrigin::new();
+        let got = origin.fetch(Hash::new(b"anything"), 1 << 20).await.unwrap();
+        assert!(matches!(got, OriginFetch::NotFound));
+        assert_eq!(origin.kind(), OriginKind::Peer);
+    }
+
+    /// Delivered → speed reported, reachable + correct.
+    #[test]
+    fn delivered_maps_to_full_positive_metrics() {
+        // 1 MiB in 100 ms ≈ 10.5 MB/s.
+        let speed = bytes_per_sec(1_048_576, Duration::from_millis(100));
+        assert!(speed > 9_000_000 && speed < 12_000_000, "speed = {speed}");
+    }
+
+    /// A sub-millisecond elapsed can't divide by zero; the 1 ms floor bounds it.
+    #[test]
+    fn bytes_per_sec_floors_tiny_elapsed() {
+        let speed = bytes_per_sec(1024, Duration::from_nanos(1));
+        assert_eq!(speed, bytes_per_sec(1024, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn ms_to_u32_saturates_and_floors() {
+        assert_eq!(ms_to_u32(-5.0), 0);
+        assert_eq!(ms_to_u32(42.9), 42);
+        assert_eq!(ms_to_u32(f64::from(u32::MAX) + 1.0), u32::MAX);
+    }
+}

@@ -24,6 +24,15 @@ pub enum OriginKind {
     Filesystem,
     /// Pull-through from an S3-compatible object store.
     S3,
+    /// Paid pull-through from another deCDN node over `cdn/client/v1`
+    /// (node-to-node cache-miss fill, #831). Unlike the other kinds this
+    /// egress is billed in USDC per MB (an upstream provider charges this
+    /// node), so an eviction-preview caller should treat a re-fetch from a
+    /// `Peer` origin as the most expensive option. This variant is
+    /// node-internal — it is never parsed from operator TOML (the
+    /// `[cache.origin]` table only accepts `http`/`filesystem`/`s3`); it
+    /// only ever appears in admin/eviction output to tag the network origin.
+    Peer,
 }
 
 impl OriginKind {
@@ -35,6 +44,7 @@ impl OriginKind {
             Self::Http => "http",
             Self::Filesystem => "filesystem",
             Self::S3 => "s3",
+            Self::Peer => "peer",
         }
     }
 }
@@ -72,6 +82,10 @@ mod tests {
             serde_json::to_string(&OriginKind::S3).expect("serialise"),
             "\"s3\""
         );
+        assert_eq!(
+            serde_json::to_string(&OriginKind::Peer).expect("serialise"),
+            "\"peer\""
+        );
     }
 
     /// Round-trip via JSON to lock both the serialise *and* deserialise
@@ -80,7 +94,12 @@ mod tests {
     /// still drift the operator-visible string.
     #[test]
     fn origin_kind_round_trips_through_json() {
-        for variant in [OriginKind::Http, OriginKind::Filesystem, OriginKind::S3] {
+        for variant in [
+            OriginKind::Http,
+            OriginKind::Filesystem,
+            OriginKind::S3,
+            OriginKind::Peer,
+        ] {
             let s = serde_json::to_string(&variant).expect("serialise");
             let back: OriginKind = serde_json::from_str(&s).expect("deserialise");
             assert_eq!(variant, back, "round-trip for {variant:?}");
@@ -93,7 +112,12 @@ mod tests {
     /// The two paths must not drift.
     #[test]
     fn origin_kind_as_str_and_display_match_serde_tag() {
-        for variant in [OriginKind::Http, OriginKind::Filesystem, OriginKind::S3] {
+        for variant in [
+            OriginKind::Http,
+            OriginKind::Filesystem,
+            OriginKind::S3,
+            OriginKind::Peer,
+        ] {
             let json = serde_json::to_string(&variant).expect("serialise");
             // JSON wraps the tag in quotes; strip them.
             let unquoted = json.trim_matches('"');
