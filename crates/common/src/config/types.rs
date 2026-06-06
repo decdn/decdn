@@ -101,9 +101,9 @@ pub struct DiscoveryConfig {
     /// that does not publish). Checked non-empty at resolution.
     pub dns_origin: Option<String>,
     /// Static peer address book seeded into a `MemoryLookup`, keyed by peer
-    /// `NodeId` (any iroh `NodeId` string — 64-char lowercase hex or z-base-32;
-    /// validated with the same parser the node uses at bring-up). Composes
-    /// alongside the pkarr/DNS leg when both are set.
+    /// `NodeId` (the canonical 64-char lowercase-hex form iroh emits; validated
+    /// with the same parser the node uses at bring-up). Composes alongside the
+    /// pkarr/DNS leg when both are set.
     pub peers: Option<std::collections::HashMap<String, DiscoveryPeer>>,
 }
 

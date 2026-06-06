@@ -390,6 +390,10 @@ fn summary_reports_discovery_without_leaking_secrets() -> anyhow::Result<()> {
     });
     let out = render(None, &cfg)?;
     anyhow::ensure!(
+        out.contains("discovery.pkarr_url:"),
+        "summary should emit the pkarr_url label: {out}"
+    );
+    anyhow::ensure!(
         out.contains("discovery.dns_origin:     discovery.example."),
         "summary should name dns_origin: {out}"
     );
@@ -408,6 +412,19 @@ fn summary_reports_discovery_without_leaking_secrets() -> anyhow::Result<()> {
     anyhow::ensure!(
         !out.contains("203.0.113.4:4433"),
         "peer addresses must not appear in summary: {out}"
+    );
+    Ok(())
+}
+
+#[test]
+fn summary_omits_discovery_lines_when_unset() -> anyhow::Result<()> {
+    // Default discovery is empty (the node uses the n0 pkarr/DNS default), so
+    // the summary must print no `discovery.*` lines at all.
+    let cfg = sample_resolved(|_| {});
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        !out.contains("discovery."),
+        "no discovery lines should appear when discovery is unset: {out}"
     );
     Ok(())
 }

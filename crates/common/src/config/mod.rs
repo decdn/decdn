@@ -559,7 +559,8 @@ fn resolve_network_into(
 /// every malformed entry into `bag`.
 ///
 /// Validation is a parse check (a parseable URL, a non-empty origin, a valid
-/// iroh `NodeId` — lowercase hex or z-base-32 — and a parseable `SocketAddr`)
+/// iroh `NodeId` — the canonical 64-char lowercase-hex form — and a parseable
+/// `SocketAddr`)
 /// using the same parsers the node uses; the authoritative build into iroh
 /// types happens in the `node` wiring layer (`build_endpoint`), per the
 /// discovery-provider seam in `adr/appendix-poc-production-seams.md`. Echoed
@@ -631,9 +632,9 @@ fn resolve_discovery_into(
 ///
 /// The `NodeId` is validated with the exact parser the node uses at bring-up
 /// (`iroh::PublicKey`, via `add_discovery_lookups`), not just a 64-hex shape
-/// check: `PublicKey::from_str` requires lowercase-hex (or z-base-32) *and* a
-/// valid Ed25519 curve point, so an uppercase or non-curve-point id that a bare
-/// hex check would accept must be rejected here too — otherwise it would pass
+/// check: `PublicKey::from_str` requires lowercase hex *and* a valid Ed25519
+/// curve point, so an uppercase or non-curve-point id that a bare hex check
+/// would accept must be rejected here too — otherwise it would pass
 /// `config validate` and then fail node startup. (Unlike `gossip.allowlist`,
 /// which decodes to bytes consumed directly, this path carries the id as a
 /// String the node re-parses, so the two checks must agree.)
@@ -647,8 +648,7 @@ fn resolve_discovery_peer(
             format!("network.discovery.peers[{node_id}]"),
             node_id.parse::<iroh::PublicKey>().map(|_| ()).map_err(|e| {
                 anyhow::anyhow!(
-                    "invalid NodeId (expected a 64-char lowercase-hex or z-base-32 iroh \
-                     NodeId): {e}"
+                    "invalid NodeId (expected a 64-char lowercase-hex iroh NodeId): {e}"
                 )
             }),
         )

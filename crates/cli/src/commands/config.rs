@@ -90,13 +90,16 @@ pub fn write_validate_summary<W: std::io::Write>(
         writeln!(w, "  relay_url:                {relay}")?;
     }
     // Operator-configurable discovery (#818); nothing printed when unset (the
-    // node then uses the n0 pkarr/DNS default). A pkarr_url is a relay endpoint
-    // whose only credential vector is `user:pass@` userinfo (auth is via the
-    // signed packet, not the URL path/query), so redact just the userinfo and
-    // keep the host visible for diagnostics — same `redact_userinfo` treatment
-    // the relay path uses, rather than the full `<redacted>` rpc_url gets (whose
-    // secret commonly lives in the path/query). dns_origin is a plain domain.
-    // Peer entries (id/relay/addrs) are not echoed (verbose) — only the count.
+    // node then uses the n0 pkarr/DNS default). A pkarr_url is an infra relay
+    // endpoint — pkarr authenticates by the Ed25519-signed packet, not a URL
+    // token — so its credentials, if any, are normally `user:pass@` userinfo.
+    // Redact that (host stays visible for diagnostics) rather than fully hiding
+    // it like rpc_url/otlp_endpoint, whose secret commonly lives in the path or
+    // query. Caveat: `redact_userinfo` does NOT scrub a path/query secret, so a
+    // nonstandard relay that put one there would still print it — acceptable
+    // given pkarr's auth model and that relays themselves print unredacted
+    // above. dns_origin is a plain domain. Peer entries (id/relay/addrs) are
+    // not echoed (verbose) — only the count.
     let discovery = &resolved.network.discovery;
     if let Some(pkarr) = &discovery.pkarr_url {
         writeln!(
@@ -243,7 +246,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # [network.discovery]
 # pkarr_url = "https://pkarr.example./"      # publish this node's signed address record here
 # dns_origin = "discovery.example."          # resolve peers via DNS TXT under this origin
-# Static peer address book (fully offline; keyed by NodeId — lowercase hex or z-base-32):
+# Static peer address book (fully offline; keyed by NodeId — 64-char lowercase hex):
 # [network.discovery.peers.0000000000000000000000000000000000000000000000000000000000000000]
 # relay_url = "https://relay.example./"
 # addrs = ["203.0.113.4:4433"]
