@@ -54,6 +54,10 @@ pub fn effective_source(
 /// Render the validation summary. Separated from [`config_validate`] so tests
 /// can capture the output into a buffer and assert on the printed contract —
 /// in particular that `rpc_url` and `otlp_endpoint` values never appear.
+// Linear "print each resolved config field" flow sitting right at the 100-line
+// boundary; splitting the writeln! sequence across helpers would obscure the
+// field-by-field narrative more than the length does.
+#[allow(clippy::too_many_lines)]
 pub fn write_validate_summary<W: std::io::Write>(
     w: &mut W,
     source: Option<&std::path::Path>,
