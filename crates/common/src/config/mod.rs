@@ -16,6 +16,7 @@ use errors::{IDENTITY_DATA_DIR, IDENTITY_REGION, one_section};
 
 use crate::cli::common::{self, expand_tilde};
 use crate::cli::run::RunArgs;
+use crate::redact::redact_userinfo;
 
 pub use errors::ConfigErrorBag;
 pub use resolved::{
@@ -474,7 +475,15 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
 /// `url::Url::parse` rejects `RelayUrl` rejects too — the validate-time gate is
 /// never stricter than bring-up (no false positives, e.g. a `relay://` scheme
 /// passes both), and bring-up's `RelayUrl` parse stays the authoritative gate
-/// for relay-specific shape. No `iroh` dependency is pulled into `common`.
+/// for relay-specific shape. The validation here uses only `url`, so the config
+/// module needs no `iroh` import (the `common` crate depends on `iroh`
+/// elsewhere, e.g. identity loading — this check does not).
+///
+/// A rejected entry is run through [`redact_userinfo`](crate::redact) before it
+/// is echoed, upholding the same "relay userinfo never reaches a log/error"
+/// invariant bring-up enforces — a credential-bearing typo
+/// (`relay://user:pass@bad host`) is exactly the malformed shape that lands on
+/// the error path.
 fn resolve_network_into(
     cli: &crate::cli::run::NetworkArgs,
     file: Option<&types::NetworkConfig>,
@@ -505,12 +514,13 @@ fn resolve_network_into(
 
     // Validate each resolved entry. The label is indexed (`network.relay_urls[i]`)
     // matching the `cache.origins[i]` convention; the offending entry is echoed
-    // verbatim, as the `config validate` summary already prints relay URLs.
+    // with userinfo redacted (a malformed entry can still carry `user:pass@`),
+    // mirroring bring-up's `parse_relay_urls`.
     for (i, entry) in relay_urls.iter().enumerate() {
         if let Err(e) = url::Url::parse(entry) {
             bag.push(
                 format!("network.relay_urls[{i}]"),
-                format!("invalid relay URL {entry:?}: {e}"),
+                format!("invalid relay URL {:?}: {e}", redact_userinfo(entry)),
             );
         }
     }
@@ -538,7 +548,17 @@ fn resolve_network(
     file: Option<&types::NetworkConfig>,
 ) -> ResolvedNetwork {
     let mut bag = ConfigErrorBag::new();
-    resolve_network_into(cli, file, &mut bag)
+    let resolved = resolve_network_into(cli, file, &mut bag);
+    // This shim discards the bag, so it must only be fed well-formed relay
+    // URLs. Trip loudly if a future caller passes a malformed entry whose
+    // problem would otherwise be silently dropped (the validation path proper
+    // is covered by the `resolve_network_*` tests that inspect the bag).
+    debug_assert_eq!(
+        bag.problem_count(),
+        0,
+        "resolve_network shim discards validation problems; use a bag-aware path"
+    );
+    resolved
 }
 
 /// Validate a user-supplied EVM contract address string.
@@ -6454,6 +6474,52 @@ mod tests {
         assert!(msg.contains("network.relay_urls[0]"), "{msg}");
         assert!(msg.contains("network.relay_urls[2]"), "{msg}");
         assert!(!msg.contains("network.relay_urls[1]"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_network_redacts_credentials_in_malformed_relay_error() {
+        // A malformed entry can still carry `user:pass@`; the validate-time
+        // error must not leak it, matching bring-up's `parse_relay_urls`
+        // invariant. `host:notaport` fails `url::Url::parse` (bad port), so it
+        // reaches the error arm with credentials attached.
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: Some(vec!["https://user:s3cret@host:notaport".to_string()]),
+            relay_url: None,
+            enable_0rtt: None,
+        };
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(msg.contains("network.relay_urls[0]"), "{msg}");
+        assert!(!msg.contains("s3cret"), "credentials leaked: {msg}");
+        assert!(!msg.contains("user:"), "userinfo leaked: {msg}");
+        assert!(
+            msg.contains("***@host"),
+            "redacted host should appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_network_validates_deprecated_relay_url_alias() {
+        // The deprecated singular `relay_url` alias folds into the resolved
+        // list and must be validated like a list entry — pins that every
+        // precedence branch feeds the parse gate, not just the list path.
+        let cli = empty_network_args();
+        let file = types::NetworkConfig {
+            bind_port: None,
+            relay_urls: None,
+            relay_url: Some("not a url".to_string()),
+            enable_0rtt: None,
+        };
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(
+            msg.contains("network.relay_urls[0]") && msg.contains("not a url"),
+            "alias entry must be validated: {msg}"
+        );
     }
 
     // ---- resolve_blockchain: CLI > file, missing-required errors ---------
