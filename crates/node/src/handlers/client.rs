@@ -59,7 +59,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
-use crate::receipt_log::{DownloadReceipt, ReceiptLog};
+use crate::receipt_log::{DownloadReceipt, ReceiptSink};
 use crate::region_accounting::RegionAccountant;
 
 /// Default per-connection concurrent-stream cap for `cdn/client/v1` (ADR 005
@@ -103,10 +103,13 @@ pub struct ClientHandler {
     /// `CapacityBond` EIP-712 domain for ephemeral `BindNodeId` verification.
     bind_domain: Eip712Domain,
     channel_state_store: Arc<dyn ChannelStateStore>,
-    /// Append-only audit log of served-and-paid blobs (issue #248). Written at
-    /// each voucher acceptance; a write failure is non-fatal (the payment
-    /// already committed to the fsynced channel store).
-    receipt_log: Arc<dyn ReceiptLog>,
+    /// Non-blocking sink for the served-and-paid audit log (issues #248, #803).
+    /// The voucher-accept path enqueues one receipt here *before* `VoucherAck`;
+    /// the actual disk write happens off the hot path in the background receipt
+    /// writer, so receipt-log I/O can never back-pressure paid delivery. A
+    /// dropped receipt (queue full) is non-fatal — the payment already committed
+    /// to the fsynced channel store.
+    receipt_sink: Arc<dyn ReceiptSink>,
     /// Per-channel state, hydrated from the store at construction. Outer mutex
     /// guards the map; each inner mutex serializes voucher application for one
     /// channel across its concurrent streams (ADR 003 §concurrent streams).
@@ -168,7 +171,7 @@ impl ClientHandler {
         voucher_domain: Eip712Domain,
         bind_domain: Eip712Domain,
         channel_state_store: Arc<dyn ChannelStateStore>,
-        receipt_log: Arc<dyn ReceiptLog>,
+        receipt_sink: Arc<dyn ReceiptSink>,
         rate_per_mb: Arc<AtomicU64>,
         delivery_floor: u64,
         delivery_ceiling: u64,
@@ -197,7 +200,7 @@ impl ClientHandler {
             voucher_domain,
             bind_domain,
             channel_state_store,
-            receipt_log,
+            receipt_sink,
             channels: Arc::new(Mutex::new(map)),
             redeem_hint: OnceLock::new(),
             voucher_activity: OnceLock::new(),
@@ -768,9 +771,10 @@ impl ClientHandler {
                 if let Some(activity) = self.voucher_activity.get() {
                     activity.touch(channel_id);
                 }
-                // Audit receipt for this served-and-paid interval (issue #248).
-                self.record_receipt(hash, delta_bytes, client_node_id, wire.nonce)
-                    .await;
+                // Audit receipt for this served-and-paid interval (issues #248,
+                // #803): a non-blocking enqueue before `VoucherAck`; the write
+                // happens off the hot path in the background receipt writer.
+                self.record_receipt(hash, delta_bytes, client_node_id, wire.nonce);
                 // Per-region bandwidth accounting (#750). Best-effort: an
                 // unattached accountant (tests / no admin surface) skips.
                 // `delta_bytes` is exactly the bytes paid for this interval.
@@ -823,25 +827,24 @@ impl ClientHandler {
         }
     }
 
-    /// Append one durable audit receipt for a served-and-paid voucher interval
-    /// (issue #248). Called only after `apply_voucher` committed the payment to
-    /// the fsynced channel store, so a receipt-log write failure is non-fatal —
-    /// logged and swallowed rather than failing the stream or double-charging
-    /// the client. The `voucher_nonce` is rendered as a decimal `uint256` from
-    /// the big-endian wire nonce; `client_node_id` is the iroh node id of the
-    /// paying peer; `delta_bytes` is the bytes this voucher covers.
+    /// Enqueue one audit receipt for a served-and-paid voucher interval (issues
+    /// #248, #803). Called only after `apply_voucher` committed the payment to
+    /// the fsynced channel store, so a dropped receipt is non-fatal — the
+    /// payment stands regardless.
     ///
-    /// The append is `write_all` + `flush` with **no fsync** (see the
-    /// [`crate::receipt_log`] durability note) under a sync `Mutex`, bounded to
-    /// roughly one call per voucher interval (~1 MiB). The blocking write is
-    /// offloaded to [`tokio::task::spawn_blocking`] and **awaited** so it never
-    /// runs on a runtime worker thread: awaiting (not fire-and-forget) preserves
-    /// receipt ordering relative to voucher acceptance and keeps the audit tail
-    /// from being dropped on runtime shutdown. The owned [`DownloadReceipt`] and
-    /// a clone of the `Arc<dyn ReceiptLog>` are moved into the closure, so the
-    /// borrow of `self` ends before the hop. Recording therefore stays ordered
-    /// with — and completes before — the `VoucherAck` (CLAUDE.md / ADR 003).
-    async fn record_receipt(
+    /// The receipt is handed to [`ReceiptSink::record`], a **non-blocking**
+    /// enqueue: the actual `write_all` + `flush` runs off the hot path in the
+    /// background receipt writer, so this never blocks before `VoucherAck` and a
+    /// slow or full disk cannot back-pressure delivery (the bug in #803).
+    /// Receipts are enqueued in voucher-acceptance order and the single writer
+    /// drains them FIFO, preserving the audit ordering and shutdown-tail
+    /// guarantees the previously-awaited inline write relied on (CLAUDE.md /
+    /// ADR 003).
+    ///
+    /// The `voucher_nonce` is rendered as a decimal `uint256` from the
+    /// big-endian wire nonce; `client_node_id` is the iroh node id of the paying
+    /// peer; `delta_bytes` is the bytes this voucher covers.
+    fn record_receipt(
         &self,
         hash: Hash,
         delta_bytes: u64,
@@ -856,22 +859,7 @@ impl ClientHandler {
             voucher_nonce,
             crate::payment_settlement::unix_now(),
         );
-        let receipt_log = Arc::clone(&self.receipt_log);
-        let append_res = tokio::task::spawn_blocking(move || receipt_log.append(&receipt)).await;
-        let write_res = match append_res {
-            Ok(res) => res,
-            Err(join_err) => Err(std::io::Error::other(join_err)),
-        };
-        if let Err(e) = write_res {
-            tracing::warn!(
-                %hash,
-                %client_node_id,
-                %voucher_nonce,
-                error = %e,
-                event = "download_receipt_write_failed",
-                "failed to append download receipt; payment already committed (audit log only)"
-            );
-        }
+        self.receipt_sink.record(receipt);
     }
 
     /// Load the configured rate and clamp it to the delivery bounds before

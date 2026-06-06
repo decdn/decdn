@@ -44,12 +44,13 @@ use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_fr
 use iroh::{Endpoint, EndpointAddr};
 
 mod support;
-use decdn_node::receipt_log::DownloadReceipt;
+use decdn_node::receipt_log::{DownloadReceipt, spawn_receipt_writer};
 use support::{
-    FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
-    build_handler_full_with_receipts, cache_with_blob, empty_cache, fresh_key, local_endpoint,
-    permissive_limiter, spawn_server,
+    BlockingReceiptLog, FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
+    build_handler_full_with_receipts, build_handler_full_with_sink, cache_with_blob, empty_cache,
+    fresh_key, local_endpoint, permissive_limiter, spawn_server,
 };
+use tokio_util::sync::CancellationToken;
 
 const CHAIN_ID: u64 = 421_614;
 const TOKEN: Address = Address::repeat_byte(0x22);
@@ -540,6 +541,109 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
     client_ep.close().await;
     server_ep.close().await;
     server_task.await?;
+    Ok(())
+}
+
+/// Issue #803: receipt-log I/O must never back-pressure paid delivery. Wired
+/// through the REAL `ChannelReceiptSink` + background writer (not the inline
+/// `DirectReceiptSink`), with the underlying log stalled on every `append`, the
+/// full blob must still deliver and hash-verify — the buggy pre-#803 code
+/// awaited the append inline before `VoucherAck`, so it would hang here. After
+/// releasing the stall and draining the writer, every receipt is recovered,
+/// proving the decoupling loses nothing on a clean shutdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<()> {
+    let payload = vec![0x3Cu8; 1_572_864]; // 1.5 MiB — two voucher appends.
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+
+    // The production sink: a bounded channel feeding a background writer whose
+    // log blocks on every append until we release it.
+    let blocking_log = Arc::new(BlockingReceiptLog::default());
+    let writer_shutdown = CancellationToken::new();
+    let (receipt_sink, writer_handle) = spawn_receipt_writer(
+        Arc::clone(&blocking_log) as Arc<dyn decdn_node::receipt_log::ReceiptLog>,
+        Arc::clone(&metrics),
+        writer_shutdown.clone(),
+    );
+    let handler = build_handler_full_with_sink(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        receipt_sink,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(Arc::clone(&client_signer), deposit);
+
+    // Delivery must complete while every receipt `append` is stalled. The outer
+    // timeout is the real assertion: the pre-#803 inline-await would hang.
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        stream_fetch(
+            &client_ep,
+            target,
+            &ctx,
+            &slash_domain(),
+            server_eth.address(),
+            *hash.as_bytes(),
+            0,
+            0x00c0_ffee,
+            Duration::from_secs(20),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("delivery hung while the receipt writer was stalled (#803)"))??;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+
+    // Release the stall and drain the writer; the audit receipts are not lost.
+    blocking_log.release();
+    writer_shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), writer_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("receipt writer did not drain after release"))??;
+    let recorded = blocking_log.snapshot();
+    let total: u64 = recorded.iter().map(DownloadReceipt::size).sum();
+    anyhow::ensure!(
+        total == payload.len() as u64,
+        "drained receipt sizes sum to {total}, expected {} ({} receipts)",
+        payload.len(),
+        recorded.len()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
     Ok(())
 }
 

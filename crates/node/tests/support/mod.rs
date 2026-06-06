@@ -26,7 +26,7 @@ use decdn_incentive::ChannelStateStore;
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
-use decdn_node::receipt_log::{DownloadReceipt, ReceiptLog};
+use decdn_node::receipt_log::{DirectReceiptSink, DownloadReceipt, ReceiptLog, ReceiptSink};
 use decdn_protocol::MAX_RATE_PER_MB;
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
@@ -170,6 +170,59 @@ impl ReceiptLog for FailingReceiptLog {
     }
 }
 
+/// A [`ReceiptLog`] whose `append` blocks until [`release`](Self::release) is
+/// called, recording what it eventually appends. Lets a test prove the
+/// paid-delivery hot path never waits on receipt-log I/O (#803): wired behind
+/// the real background-writer sink, delivery must complete even while every
+/// `append` is stalled here (the buggy pre-#803 code awaited the append inline).
+#[derive(Default)]
+pub struct BlockingReceiptLog {
+    state: std::sync::Mutex<BlockingReceiptState>,
+    released: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct BlockingReceiptState {
+    released: bool,
+    seen: Vec<DownloadReceipt>,
+}
+
+impl BlockingReceiptLog {
+    /// Unblock all current and future `append` calls.
+    pub fn release(&self) {
+        if let Ok(mut g) = self.state.lock() {
+            g.released = true;
+        }
+        self.released.notify_all();
+    }
+
+    /// Snapshot the receipts appended so far.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<DownloadReceipt> {
+        self.state
+            .lock()
+            .map(|g| g.seen.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl ReceiptLog for BlockingReceiptLog {
+    fn append(&self, receipt: &DownloadReceipt) -> std::io::Result<()> {
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("BlockingReceiptLog mutex poisoned"))?;
+        while !g.released {
+            g = self
+                .released
+                .wait(g)
+                .map_err(|_| std::io::Error::other("BlockingReceiptLog mutex poisoned"))?;
+        }
+        g.seen.push(receipt.clone());
+        Ok(())
+    }
+}
+
 /// Build a [`ClientHandler`] over `cache`/`store` with explicit domains and the
 /// `max_blob_size_bytes` (`0` == unlimited) / `max_concurrent_streams` knobs.
 /// Uses a throwaway in-memory receipt log; tests asserting receipt contents use
@@ -218,6 +271,42 @@ pub fn build_handler_full_with_receipts(
     max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
 ) -> anyhow::Result<Arc<ClientHandler>> {
+    // The handler enqueues through a `ReceiptSink`; wrap the test's synchronous
+    // `ReceiptLog` fake so receipts are appended inline and the test can assert
+    // them deterministically without standing up the background writer.
+    build_handler_full_with_sink(
+        server_id,
+        server_eth,
+        metrics,
+        limiter,
+        cache,
+        store,
+        Arc::new(DirectReceiptSink::new(receipt_log)),
+        rate,
+        domains,
+        max_blob_size_bytes,
+        max_concurrent_streams,
+    )
+}
+
+/// Like [`build_handler_full_with_receipts`] but wires an explicit
+/// [`ReceiptSink`] — e.g. the real background-writer sink from
+/// [`decdn_node::receipt_log::spawn_receipt_writer`] — so a test can exercise
+/// the production enqueue path instead of the synchronous [`DirectReceiptSink`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_handler_full_with_sink(
+    server_id: iroh::PublicKey,
+    server_eth: &Arc<PrivateKeySigner>,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    receipt_sink: Arc<dyn ReceiptSink>,
+    rate: u64,
+    domains: &HandlerDomains,
+    max_blob_size_bytes: u64,
+    max_concurrent_streams: usize,
+) -> anyhow::Result<Arc<ClientHandler>> {
     Ok(Arc::new(ClientHandler::new(
         server_id,
         Arc::clone(metrics),
@@ -228,7 +317,7 @@ pub fn build_handler_full_with_receipts(
         domains.voucher.clone(),
         domains.binding.clone(),
         store,
-        receipt_log,
+        receipt_sink,
         Arc::new(AtomicU64::new(rate)),
         0,
         MAX_RATE_PER_MB,

@@ -80,6 +80,12 @@ proptest = { workspace = true }
 # otherwise force us to use `libc::raise` directly.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 wiremock = { workspace = true }
+# `tests/client_loopback.rs` constructs a real `ChannelReceiptSink` via
+# `receipt_log::spawn_receipt_writer` (which takes a `CancellationToken`) to
+# prove the paid-delivery hot path never blocks on receipt-log I/O (#803).
+# Integration-test crates don't inherit the lib's normal deps, so it is also a
+# dev-dep here.
+tokio-util = { workspace = true }
 # `tests/probe_0rtt.rs` drives the server through the reusable
 # `probe_client::probe_once` 0-RTT helper (ADR 015) so the integration
 # test exercises the exact production client path. Dev-dep only — never
