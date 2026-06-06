@@ -92,6 +92,19 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "ADDR", env = "DECDN_CAPACITY_BOND_ADDRESS")]
     pub capacity_bond_address: Option<String>,
 
+    /// `OriginAssignment` contract address (0x-prefixed hex). Optional:
+    /// enables the chain-backed origin directory that gates DHT prefetch
+    /// (ADR 022). Must be set together with `publisher_registry_address`;
+    /// when both are unset the node uses the file-config origin directory.
+    #[arg(long, value_name = "ADDR", env = "DECDN_ORIGIN_ASSIGNMENT_ADDRESS")]
+    pub origin_assignment_address: Option<String>,
+
+    /// `PublisherRegistry` contract address (0x-prefixed hex). Optional;
+    /// pairs with `origin_assignment_address` for the chain-backed origin
+    /// directory (ADR 022).
+    #[arg(long, value_name = "ADDR", env = "DECDN_PUBLISHER_REGISTRY_ADDRESS")]
+    pub publisher_registry_address: Option<String>,
+
     /// `SlashJudge` contract address (0x-prefixed hex) — EIP-712
     /// `verifyingContract` for probe `slash_sig` (ADR 014).
     #[arg(long, value_name = "ADDR", env = "DECDN_SLASH_JUDGE_ADDRESS")]

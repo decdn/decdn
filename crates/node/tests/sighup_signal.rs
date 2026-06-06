@@ -55,6 +55,8 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: "http://localhost:8545".into(),
             eth_keystore: PathBuf::from("/tmp/keystore.json"),
             keystore_password_file: None,

@@ -51,6 +51,13 @@ pub struct ResolvedBlockchain {
     pub payment_channel_address: String,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: String,
+    /// `OriginAssignment` contract address. `Some` only when the operator
+    /// opts into the chain-backed origin directory (paired with
+    /// `publisher_registry_address`); `None` => file-config directory (ADR 022).
+    pub origin_assignment_address: Option<String>,
+    /// `PublisherRegistry` contract address. Set together with
+    /// `origin_assignment_address` (both-or-neither, enforced at resolution).
+    pub publisher_registry_address: Option<String>,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `slash_sig` signatures (ADR 014). Required (no default).
     pub slash_judge_address: String,
