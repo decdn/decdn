@@ -765,7 +765,7 @@ impl RuntimeReloadState {
             },
             network: ResolvedNetwork {
                 bind_port: 4433,
-                relay_url: None,
+                relay_urls: Vec::new(),
                 enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
@@ -1166,7 +1166,7 @@ fn log_ignored_other_sections(file: &decdn_common::config::FileConfig, prev: &Fi
         warn_ignored("identity.* (data_dir, region)");
     }
     if changed("network", file.network.as_ref(), prev.network.as_ref()) && file.network.is_some() {
-        warn_ignored("network.* (bind_port, relay_url, enable_0rtt)");
+        warn_ignored("network.* (bind_port, relay_urls, relay_url, enable_0rtt)");
     }
     if changed(
         "blockchain",
@@ -1247,7 +1247,7 @@ mod tests {
             },
             network: ResolvedNetwork {
                 bind_port: 4433,
-                relay_url: None,
+                relay_urls: Vec::new(),
                 enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {

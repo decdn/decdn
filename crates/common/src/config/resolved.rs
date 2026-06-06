@@ -1,7 +1,8 @@
 //! Fully resolved configuration with concrete types.
 //!
-//! Most fields are non-optional. `region` and `relay_url` remain
-//! `Option` because they have no universal default.
+//! Most fields are non-optional. `region` remains `Option` because it has no
+//! universal default; `relay_urls` is a (possibly empty) list — empty means
+//! "fall back to the n0 default relays".
 
 #![allow(dead_code)] // Fields will be consumed by the node runtime.
 
@@ -23,8 +24,12 @@ pub struct ResolvedIdentity {
 pub struct ResolvedNetwork {
     /// QUIC bind port.
     pub bind_port: u16,
-    /// iroh relay URL.
-    pub relay_url: Option<String>,
+    /// iroh relay URLs for NAT traversal. Empty => use the n0 default relays;
+    /// non-empty => swap in these self-hosted relays (`RelayMode::Custom`).
+    /// Reachability is probed at bring-up and logged but never fatal: an
+    /// all-unreachable set warns and proceeds (iroh retries in the background);
+    /// entries with no derivable host/port are skipped.
+    pub relay_urls: Vec<String>,
     /// QUIC 0-RTT master switch for `cdn/probe/v1` (ADR 015). Default `true`.
     pub enable_0rtt: bool,
 }

@@ -80,7 +80,9 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  bind_port:                {}",
         resolved.network.bind_port
     )?;
-    if let Some(relay) = &resolved.network.relay_url {
+    // One line per configured relay; nothing when the list is empty (the node
+    // then falls back to the n0 default relays).
+    for relay in &resolved.network.relay_urls {
         writeln!(w, "  relay_url:                {relay}")?;
     }
     writeln!(
@@ -200,6 +202,10 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [network]
 # bind_port = 4433
+# Multiple relays give redundancy/failover; reachability is probed at bring-up
+# and logged but never fatal (the node proceeds and iroh retries in the background).
+# relay_urls = ["https://relay-a.example.", "https://relay-b.example."]
+# Deprecated single-relay alias (folded into relay_urls when set):
 # relay_url = "https://relay.iroh.network."
 
 [blockchain]
