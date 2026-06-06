@@ -79,7 +79,10 @@ impl StakedReporterSet for NodeStakedReporterSet {
 struct StoredSettlement {
     amount_usdc: u128,
     settled_at_secs: u64,
-    /// Counterparty address if it was a staked node at settlement time.
+    /// Counterparty address when it counts toward diversity. The indexer sets
+    /// this from the counterparty's *current* `nodeIdOf(..).active` as a proxy
+    /// for staked-at-settlement-time (see `reputation_indexer` limitation
+    /// "current-membership staked proxy"), not its status at settlement.
     staked_counterparty: Option<[u8; 20]>,
 }
 
@@ -87,6 +90,23 @@ struct StoredSettlement {
 /// weeks). Records past this age are pruned on insert so the in-memory vec
 /// stays bounded — the engine already ignores them, this just caps memory.
 const SETTLEMENT_MAX_AGE_SECS: u64 = 52 * 7 * 24 * 3600;
+
+/// How long a computed `max_effective_settled_value` is reused before being
+/// recomputed. The max only *drifts down* via decay between settlements (and is
+/// invalidated immediately when a settlement is recorded), so a short TTL keeps
+/// the value fresh while collapsing a burst of inbound gossip reports into a
+/// single O(N) scan instead of one scan per report (#326 review: gossip
+/// hot-path denial-of-service). The decay half-life is ~6.9 weeks, so 60s of
+/// staleness is negligible for the relative reporter weights from this max.
+const MAX_VALUE_CACHE_TTL_SECS: u64 = 60;
+
+/// Cached `max_effective_settled_value`. `computed_at_secs == 0` means "stale,
+/// recompute on next read" (used to invalidate on a new settlement).
+#[derive(Debug, Default, Clone, Copy)]
+struct MaxValueCache {
+    value: f64,
+    computed_at_secs: u64,
+}
 
 /// Node-side [`SettlementSource`]: a reporter's settlement history keyed by
 /// `NodeId`, fed by [`crate::reputation_indexer::SettlementIndexer`] via
@@ -96,6 +116,10 @@ const SETTLEMENT_MAX_AGE_SECS: u64 = 52 * 7 * 24 * 3600;
 pub struct NodeSettlementSource {
     by_reporter: RwLock<HashMap<PublicKey, Vec<StoredSettlement>>>,
     min_counterparties: u32,
+    /// TTL-bounded cache for [`SettlementSource::max_effective_settled_value`],
+    /// which is otherwise an O(reporters × records) scan on every accepted
+    /// gossip report. Never held together with `by_reporter`.
+    max_cache: RwLock<MaxValueCache>,
 }
 
 impl NodeSettlementSource {
@@ -105,12 +129,14 @@ impl NodeSettlementSource {
         Self {
             by_reporter: RwLock::new(HashMap::new()),
             min_counterparties,
+            max_cache: RwLock::new(MaxValueCache::default()),
         }
     }
 
     /// Record a settlement attributed to `reporter` (called by the settlement
     /// indexer). Prunes the reporter's records older than the 52-week window on
-    /// insert to keep the in-memory vec bounded.
+    /// insert to keep the in-memory vec bounded, and invalidates the cached max
+    /// (a new settlement is the only thing that can raise it).
     pub fn record_settlement(
         &self,
         reporter: PublicKey,
@@ -119,17 +145,52 @@ impl NodeSettlementSource {
         staked_counterparty: Option<[u8; 20]>,
     ) {
         let cutoff = now_secs().saturating_sub(SETTLEMENT_MAX_AGE_SECS);
-        let mut guard = self
-            .by_reporter
+        {
+            let mut guard = self
+                .by_reporter
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let records = guard.entry(reporter).or_default();
+            records.push(StoredSettlement {
+                amount_usdc,
+                settled_at_secs,
+                staked_counterparty,
+            });
+            records.retain(|s| s.settled_at_secs >= cutoff);
+        }
+        // Force a recompute on the next read (value may have increased).
+        self.max_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .computed_at_secs = 0;
+    }
+
+    /// Recompute the max effective settled value across all reporters at `now`
+    /// and refresh the cache. The `by_reporter` read lock is released before the
+    /// `max_cache` write lock is taken, so the two are never held together.
+    fn recompute_max(&self, now: u64) -> f64 {
+        let value = {
+            let guard = self
+                .by_reporter
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .values()
+                .map(|stored| {
+                    effective_settled_value(
+                        &Self::records_for(stored, now),
+                        self.min_counterparties,
+                    )
+                })
+                .fold(0.0_f64, f64::max)
+        };
+        let mut cache = self
+            .max_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let records = guard.entry(reporter).or_default();
-        records.push(StoredSettlement {
-            amount_usdc,
-            settled_at_secs,
-            staked_counterparty,
-        });
-        records.retain(|s| s.settled_at_secs >= cutoff);
+        cache.value = value;
+        cache.computed_at_secs = now;
+        value
     }
 
     fn records_for(stored: &[StoredSettlement], now: u64) -> Vec<SettlementRecord> {
@@ -159,16 +220,20 @@ impl SettlementSource for NodeSettlementSource {
 
     fn max_effective_settled_value(&self) -> f64 {
         let now = now_secs();
-        let guard = self
-            .by_reporter
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard
-            .values()
-            .map(|stored| {
-                effective_settled_value(&Self::records_for(stored, now), self.min_counterparties)
-            })
-            .fold(0.0_f64, f64::max)
+        // Fast path: a recently-computed value is reused (the gossip hot path).
+        {
+            let cache = self
+                .max_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.computed_at_secs != 0
+                && now.saturating_sub(cache.computed_at_secs) < MAX_VALUE_CACHE_TTL_SECS
+            {
+                return cache.value;
+            }
+        }
+        // Slow path: stale or invalidated — recompute and refresh the cache.
+        self.recompute_max(now)
     }
 }
 
@@ -314,6 +379,32 @@ mod tests {
         assert!(src.max_effective_settled_value() > 0.0);
         let w = compute_reporter_weight(&src, reporter, 5);
         assert!(w > 0.0, "weight should be positive, got {w}");
+    }
+
+    #[test]
+    fn max_value_cache_invalidated_by_new_settlement() {
+        let src = NodeSettlementSource::new(5);
+        let now = now_secs();
+        // Prime the cache with one reporter's value.
+        for i in 0..5u8 {
+            src.record_settlement(pk(), 1_000_000, now, Some([i; 20]));
+        }
+        let first = src.max_effective_settled_value();
+        assert!(first > 0.0);
+        // A larger settlement from a new reporter must raise the cached max even
+        // though the previous read populated the TTL cache within the same
+        // second (record_settlement invalidates it).
+        let big = pk();
+        for i in 0..5u8 {
+            src.record_settlement(big, 1_000_000_000, now, Some([i + 100; 20]));
+        }
+        let second = src.max_effective_settled_value();
+        assert!(
+            second > first,
+            "new larger settlement should raise the cached max ({second} !> {first})"
+        );
+        // A repeat read (cache hit) returns the same value.
+        assert!((src.max_effective_settled_value() - second).abs() < 1e-9);
     }
 
     #[test]

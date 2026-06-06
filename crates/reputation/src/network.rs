@@ -267,7 +267,17 @@ impl NetworkReputation {
         let updated = (decayed + delta).clamp(0.0, 1.0);
         entry.score = updated;
         entry.last_update_secs = report.now_secs;
-        entry.distinct_reporters.insert(report.reporter);
+        // The set only gates the distinct-reporter threshold (`score` /
+        // `is_scored` test `len() >= min_distinct_reporters`), so once the
+        // threshold is reached there is nothing more to learn from new
+        // reporters — stop inserting to bound per-provider memory under large
+        // networks (Copilot review). Re-inserting an existing reporter is a
+        // no-op, so the cap never blocks an already-counted reporter.
+        if u32::try_from(entry.distinct_reporters.len()).unwrap_or(u32::MAX)
+            < self.config.min_distinct_reporters
+        {
+            entry.distinct_reporters.insert(report.reporter);
+        }
         updated
     }
 

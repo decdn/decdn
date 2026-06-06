@@ -1155,9 +1155,11 @@ pub async fn run(
     let decdn_gossip::GossipHandles {
         tasks: gossip_handles,
         announce_trigger,
-        // The immediate-publish trigger is unused until outbound capture wires
-        // the observation buffer to the delivery/probe hot paths (#326
-        // follow-up); the periodic publisher already runs.
+        // No publisher runs while `report_drain` is `None` above: the
+        // reputation publisher task (and therefore this immediate-publish
+        // trigger) is only spawned once outbound capture wires the observation
+        // buffer to the delivery/probe hot paths (#831). Until then the node
+        // aggregates inbound reports but emits none.
         reputation_publish_trigger: _,
     } = GossipService::spawn(
         ep.clone(),

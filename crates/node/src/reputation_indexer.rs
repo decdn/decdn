@@ -190,7 +190,10 @@ where
 
     // One-shot bring-up backfill: learn opens first (so settled events can find
     // their counterparty), then process settlements over the same window.
-    if let Some(start) = state.backfill_from.take() {
+    // `backfill_from` is only cleared *after* the window completes — a transient
+    // RPC error inside it returns `Err`, the watcher backs off, and the retry
+    // re-runs the full backfill rather than silently skipping it.
+    if let Some(start) = state.backfill_from {
         let to = payment
             .provider()
             .get_block_number()
@@ -227,7 +230,7 @@ where
                     event.provider,
                     event.routedAmount,
                 )
-                .await;
+                .await?;
             }
             info!(
                 start,
@@ -237,6 +240,9 @@ where
                 "settlement-indexer backfill complete"
             );
         }
+        // Reached only if every backfill RPC above succeeded; otherwise we
+        // returned `Err` with `backfill_from` still set, so the retry repeats it.
+        state.backfill_from = None;
     }
 
     // Filters established and (first cycle) backfill done — the indexer is live.
@@ -263,7 +269,7 @@ where
                         event.provider,
                         event.routedAmount,
                     )
-                    .await;
+                    .await?;
                 }
                 Some(Err(e)) => return Err(e).context("ChannelSettled stream"),
                 None => return Ok(()),
@@ -276,6 +282,12 @@ where
 /// per `channelId` (a channel settles once). Splits the chain-touching
 /// resolution from the pure crediting in [`apply_settlement`] so the crediting
 /// logic is unit-testable without a live chain.
+///
+/// A transient `nodeIdOf` RPC error is propagated as `Err` (the caller backs
+/// off and retries) and the channel is **not** marked seen, so the settlement
+/// is retried on the next cycle rather than silently dropped. Only a fully
+/// resolved settlement — or a genuinely unresolvable one (unbound key / amount
+/// overflow) — is marked seen.
 async fn process_settled<P>(
     capacity_bond: &CapacityBond::CapacityBondInstance<P>,
     settlement: &Arc<NodeSettlementSource>,
@@ -284,11 +296,12 @@ async fn process_settled<P>(
     channel_id: [u8; 32],
     provider_addr: Address,
     routed_amount: alloy::primitives::U256,
-) where
+) -> Result<()>
+where
     P: Provider + Clone,
 {
     if state.settled_seen.contains(&channel_id) {
-        return; // already credited (backfill/live overlap or resubscribe)
+        return Ok(()); // already credited (backfill/live overlap or resubscribe)
     }
     // Skip (don't saturate) an implausibly large amount: a `u128::MAX` would
     // poison `max_effective_settled_value` and drive every reporter's weight to
@@ -297,12 +310,12 @@ async fn process_settled<P>(
         metrics.reputation_indexer_amount_overflow();
         warn!(channel_id = %alloy::hex::encode(channel_id), "settlement amount exceeds u128; skipping");
         state.settled_seen.insert(channel_id);
-        return;
+        return Ok(());
     };
     let client_addr = state.channels.get(&channel_id).map(|(client, _)| *client);
-    let provider_node = resolve_binding(capacity_bond, metrics, provider_addr).await;
+    let provider_node = resolve_binding(capacity_bond, provider_addr).await?;
     let client_node = match client_addr {
-        Some(addr) => resolve_binding(capacity_bond, metrics, addr).await,
+        Some(addr) => resolve_binding(capacity_bond, addr).await?,
         None => None,
     };
     let credited = apply_settlement(
@@ -319,6 +332,7 @@ async fn process_settled<P>(
     if credited > 0 {
         metrics.reputation_indexer_settlements_credited(u64::from(credited));
     }
+    Ok(())
 }
 
 /// Credit both parties of one already-resolved settlement (pure; no chain).
@@ -364,34 +378,35 @@ fn apply_settlement(
 }
 
 /// Resolve an Ethereum address to its bound `(NodeId, active)` via
-/// `CapacityBond.nodeIdOf`. `None` when unbound, when the key is not a valid
-/// curve point, or on RPC error (logged + metered).
+/// `CapacityBond.nodeIdOf`.
+///
+/// - `Ok(Some(..))` — a live binding to a valid curve point.
+/// - `Ok(None)` — *permanently* unresolvable: no binding, or the bound bytes
+///   aren't a valid key. The caller may safely mark the settlement seen.
+/// - `Err(..)` — a *transient* RPC failure. The caller propagates this to the
+///   watcher loop's backoff-and-retry rather than dropping the settlement (the
+///   watcher meters it as an RPC failure on the retry boundary).
 async fn resolve_binding<P>(
     capacity_bond: &CapacityBond::CapacityBondInstance<P>,
-    metrics: &Arc<Metrics>,
     addr: Address,
-) -> Option<(PublicKey, bool)>
+) -> Result<Option<(PublicKey, bool)>>
 where
     P: Provider + Clone,
 {
-    match capacity_bond.nodeIdOf(addr).call().await {
-        Ok(resolved) => {
-            let bytes = resolved.nodeId.0;
-            if bytes == [0u8; 32] {
-                return None;
-            }
-            match PublicKey::from_bytes(&bytes) {
-                Ok(pk) => Some((pk, resolved.active)),
-                Err(err) => {
-                    debug!(%addr, %err, "settlement indexer: bound nodeId is not a valid key");
-                    None
-                }
-            }
-        }
+    let resolved = capacity_bond
+        .nodeIdOf(addr)
+        .call()
+        .await
+        .with_context(|| format!("nodeIdOf RPC for {addr}"))?;
+    let bytes = resolved.nodeId.0;
+    if bytes == [0u8; 32] {
+        return Ok(None);
+    }
+    match PublicKey::from_bytes(&bytes) {
+        Ok(pk) => Ok(Some((pk, resolved.active))),
         Err(err) => {
-            metrics.reputation_indexer_rpc_failure();
-            warn!(%addr, %err, "settlement indexer: nodeIdOf RPC failed; skipping party");
-            None
+            debug!(%addr, %err, "settlement indexer: bound nodeId is not a valid key");
+            Ok(None)
         }
     }
 }

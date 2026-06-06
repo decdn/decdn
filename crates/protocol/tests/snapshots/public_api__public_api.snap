@@ -149,6 +149,7 @@ pub async fn decdn_protocol::framing::write_frame<W: tokio::io::async_write::Asy
 pub mod decdn_protocol::gossip
 pub enum decdn_protocol::gossip::GossipPayload
 pub decdn_protocol::gossip::GossipPayload::NodeAnnounce(decdn_protocol::gossip::NodeAnnounce)
+pub decdn_protocol::gossip::GossipPayload::ReputationReport(decdn_protocol::gossip::ReputationReport)
 pub struct decdn_protocol::gossip::GossipEnvelope
 pub decdn_protocol::gossip::GossipEnvelope::payload: decdn_protocol::gossip::GossipPayload
 pub decdn_protocol::gossip::GossipEnvelope::version: u8
@@ -161,6 +162,20 @@ pub decdn_protocol::gossip::NodeAnnounceBody::region: alloc::string::String
 pub decdn_protocol::gossip::NodeAnnounceBody::timestamp_us: u64
 impl decdn_protocol::gossip::NodeAnnounceBody
 pub fn decdn_protocol::gossip::NodeAnnounceBody::signing_bytes(&self) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub struct decdn_protocol::gossip::ReportMetrics
+pub decdn_protocol::gossip::ReportMetrics::data_correct: core::option::Option<bool>
+pub decdn_protocol::gossip::ReportMetrics::delivery_speed: core::option::Option<u32>
+pub decdn_protocol::gossip::ReportMetrics::uptime_observed: core::option::Option<bool>
+pub struct decdn_protocol::gossip::ReputationReport
+pub decdn_protocol::gossip::ReputationReport::body: decdn_protocol::gossip::ReputationReportBody
+pub decdn_protocol::gossip::ReputationReport::signature: alloc::vec::Vec<u8>
+pub struct decdn_protocol::gossip::ReputationReportBody
+pub decdn_protocol::gossip::ReputationReportBody::metrics: decdn_protocol::gossip::ReportMetrics
+pub decdn_protocol::gossip::ReputationReportBody::provider: [u8; 32]
+pub decdn_protocol::gossip::ReputationReportBody::reporter: [u8; 32]
+pub decdn_protocol::gossip::ReputationReportBody::timestamp_secs: u64
+impl decdn_protocol::gossip::ReputationReportBody
+pub fn decdn_protocol::gossip::ReputationReportBody::signing_bytes(&self) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub const decdn_protocol::gossip::GOSSIP_VERSION: u8
 pub const decdn_protocol::gossip::SIGNATURE_LEN: usize
 pub mod decdn_protocol::identity
@@ -246,6 +261,7 @@ pub decdn_protocol::FrameError::TooLarge(u32)
 pub decdn_protocol::FrameError::Varint
 pub enum decdn_protocol::GossipPayload
 pub decdn_protocol::GossipPayload::NodeAnnounce(decdn_protocol::gossip::NodeAnnounce)
+pub decdn_protocol::GossipPayload::ReputationReport(decdn_protocol::gossip::ReputationReport)
 pub enum decdn_protocol::MessageValidationError
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen::len: usize
@@ -371,6 +387,20 @@ pub decdn_protocol::ProbeResponseBody::has_blob: bool
 pub decdn_protocol::ProbeResponseBody::hash: [u8; 32]
 pub decdn_protocol::ProbeResponseBody::rate_per_mb: u64
 pub decdn_protocol::ProbeResponseBody::timestamp_us: u64
+pub struct decdn_protocol::ReportMetrics
+pub decdn_protocol::ReportMetrics::data_correct: core::option::Option<bool>
+pub decdn_protocol::ReportMetrics::delivery_speed: core::option::Option<u32>
+pub decdn_protocol::ReportMetrics::uptime_observed: core::option::Option<bool>
+pub struct decdn_protocol::ReputationReport
+pub decdn_protocol::ReputationReport::body: decdn_protocol::gossip::ReputationReportBody
+pub decdn_protocol::ReputationReport::signature: alloc::vec::Vec<u8>
+pub struct decdn_protocol::ReputationReportBody
+pub decdn_protocol::ReputationReportBody::metrics: decdn_protocol::gossip::ReportMetrics
+pub decdn_protocol::ReputationReportBody::provider: [u8; 32]
+pub decdn_protocol::ReputationReportBody::reporter: [u8; 32]
+pub decdn_protocol::ReputationReportBody::timestamp_secs: u64
+impl decdn_protocol::gossip::ReputationReportBody
+pub fn decdn_protocol::gossip::ReputationReportBody::signing_bytes(&self) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub struct decdn_protocol::StoreAck
 pub decdn_protocol::StoreAck::accepted: bool
 pub decdn_protocol::StoreAck::hash: decdn_protocol::identity::ContentHash
