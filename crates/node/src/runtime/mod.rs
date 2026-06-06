@@ -186,17 +186,32 @@ async fn run_region_accounting_log(
                 return;
             }
             _ = ticker.tick() => {
-                for r in accountant.snapshot() {
-                    tracing::info!(
-                        event = "region_bandwidth",
-                        region = %r.region,
-                        bytes_in = r.bytes_in,
-                        bytes_out = r.bytes_out,
-                        "per-region bandwidth (cumulative since start)"
-                    );
-                }
+                log_region_snapshot(&accountant);
             }
         }
+    }
+}
+
+/// Emit one structured log line per region in the accountant's snapshot.
+/// On an empty snapshot, emits a single `trace` heartbeat so a scraper can
+/// distinguish an idle node (no traffic yet) from a dead log task.
+fn log_region_snapshot(accountant: &crate::region_accounting::RegionAccountant) {
+    let snapshot = accountant.snapshot();
+    if snapshot.is_empty() {
+        tracing::trace!(
+            event = "region_bandwidth_idle",
+            "per-region bandwidth: no traffic recorded yet"
+        );
+        return;
+    }
+    for r in snapshot {
+        tracing::info!(
+            event = "region_bandwidth",
+            region = %r.region,
+            bytes_in = r.bytes_in,
+            bytes_out = r.bytes_out,
+            "per-region bandwidth (cumulative since start)"
+        );
     }
 }
 

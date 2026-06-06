@@ -467,6 +467,9 @@ pub struct RegionBytes {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionStatsResponse {
     /// One entry per region observed since process start, sorted by region code.
+    /// `#[serde(default)]` keeps an older/partial server that omits the field
+    /// round-tripping as an empty list — matching the empty-when-unwired posture.
+    #[serde(default)]
     pub regions: Vec<RegionBytes>,
 }
 
@@ -892,6 +895,16 @@ mod tests {
         assert_eq!(only.region, "FR");
         assert_eq!(only.bytes_in, 0);
         assert_eq!(only.bytes_out, 0);
+    }
+
+    #[test]
+    fn region_stats_response_omitted_regions_defaults_empty() {
+        // An older/partial server that omits `regions` entirely must still
+        // deserialize, with the list defaulting to empty — same posture as a
+        // node with no accountant wired returning an empty snapshot.
+        let back: RegionStatsResponse =
+            serde_json::from_str("{}").expect("deserialize RegionStatsResponse without regions");
+        assert!(back.regions.is_empty());
     }
 
     /// Wire back-compat for `ChannelSnapshot.seconds_since_last_voucher`
