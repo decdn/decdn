@@ -36,18 +36,21 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::CacheEngine;
 use decdn_incentive::{
-    ChannelState, ChannelStateStore, MemoryChannelStateStore, bind_node_id_domain,
+    ChannelState, ChannelStateStore, MemoryChannelStateStore, StreamSlashData, bind_node_id_domain,
     slash_judge_domain, voucher_domain,
 };
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::metrics::Metrics;
-use decdn_protocol::ALPN_CLIENT;
-use iroh::EndpointAddr;
+use decdn_protocol::client::{
+    ChunkData, ClientMessage, StreamRequest, StreamResponse, StreamResponseBody,
+};
+use decdn_protocol::{ALPN_CLIENT, encode_stream_request, write_frame};
+use iroh::{Endpoint, EndpointAddr};
 
 mod support;
 use support::{
-    HandlerDomains, build_handler_full, cache_with_blob, fresh_key, local_endpoint,
-    permissive_limiter, spawn_server,
+    HandlerDomains, accept_one, build_handler_full, cache_with_blob, fresh_key, local_endpoint,
+    permissive_limiter, read_client_msg, spawn_server, write_client_msg,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -282,5 +285,377 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     // cleanly, so this only surfaces genuine background-task panics.
     task_b.await?;
     task_a.await?;
+    Ok(())
+}
+
+// ===========================================================================
+// Sad paths (#746)
+//
+// The happy path above proves the multi-hop flow works when every party is
+// honest and reachable. The triage for #746 also called out three failure
+// modes the revenue/correctness path must survive cleanly. Each is a *node-to-
+// node* fault: the downstream node is the `cdn/client/v1` requester
+// (`stream_fetch`) pulling from an upstream that is unreachable, abandoned
+// mid-stream by its own client, or dishonest about the bytes it serves.
+//
+// The raw framed-message primitives these tests hand-roll (`read_client_msg`,
+// `write_client_msg`, `accept_one`) live in `support` so the other client
+// binaries can share them; only the test-specific `lying_upstream` is local.
+// ===========================================================================
+
+/// Sad path: opening the upstream delivery channel fails (#746).
+///
+/// We model an unusable upstream as one that is reachable at the transport but
+/// refuses to serve: its accept loop takes the QUIC connection and immediately
+/// closes it, so the requester's connect or first read fails fast (which exact
+/// stage loses the race is timing-dependent; the test pins only that it fails
+/// *fast*, not at the deadline). This is a deterministic, millisecond-fast
+/// stand-in for the "unreachable / channel open
+/// fails" family — a genuinely dead UDP port works too, but whose failure mode
+/// (ICMP "port unreachable" vs. a silent multi-second handshake timeout) is
+/// environment-dependent and would make the test slow and flaky. The property
+/// under test is the requester contract: a failed upstream pull surfaces as a
+/// clean `Err` — never a panic, a hang past the deadline, or a partial/empty
+/// `Ok` — so the downstream node can in turn return an error to its own client.
+/// No voucher is ever signed because no delivery proceeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_channel_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
+    // Upstream A speaks `cdn/client/v1` but hangs up on every connection instead
+    // of serving — the requester sees the channel collapse before any bytes.
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let refuser = {
+        let ep_a = ep_a.clone();
+        tokio::spawn(async move {
+            while let Ok(conn) = accept_one(&ep_a).await {
+                conn.close(0u32.into(), b"refused");
+            }
+        })
+    };
+
+    // Downstream B dials A for a blob it cannot get.
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target_a = EndpointAddr::new(a_id).with_ip_addr(addr_a);
+    let ctx = fresh_context(
+        B256::repeat_byte(0xA1),
+        Arc::new(PrivateKeySigner::random()),
+    );
+
+    let result = stream_fetch(
+        &ep_b,
+        target_a,
+        &ctx,
+        &slash_domain(),
+        Address::repeat_byte(0x55), // expected upstream signer (never reached)
+        [0x42u8; 32],
+        0,
+        0x00de_ad01,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let err = result.err().ok_or_else(|| {
+        anyhow::anyhow!("a pull from a refusing upstream must fail, not return bytes")
+    })?;
+    // Pin the failure to a *fast* transport collapse (connect / open_bi / first
+    // read), not the deadline backstop: an error carrying "timed out" would mean
+    // the requester hung to the 10s limit instead of surfacing the refused
+    // channel — the "never a hang past the deadline" half of the contract, and
+    // the discriminator that stops this passing for the wrong reason.
+    anyhow::ensure!(
+        !err.to_string().contains("timed out"),
+        "pull should fail fast on the collapsed channel, not hang to the deadline: {err}"
+    );
+
+    ep_b.close().await;
+    ep_a.close().await; // ends the refuser's accept loop (its next accept yields None)
+    // Join rather than abort, so a panic inside the fake upstream surfaces here
+    // instead of being silently dropped — matching how the happy path joins its
+    // server tasks.
+    refuser.await?;
+    Ok(())
+}
+
+/// Sad path: the client disconnects mid-stream (#746).
+///
+/// A downstream node B (the real [`ClientHandler`]) is paid-serving a 1.5 MiB
+/// blob. Its client reads the signed response and one chunk, then aborts the
+/// connection before paying any voucher. Two properties must hold:
+///
+/// 1. The aborted pull advances **nothing** — B accepts no voucher, so the
+///    channel stays at nonce 0. No payment is fabricated for un-acked bytes and
+///    no half-open delivery is committed to the store.
+/// 2. The channel is **not wedged**: a subsequent honest pull on the *same*
+///    channel completes and advances it normally, proving the mid-stream abort
+///    left behind no poisoned per-channel lock or dangling delivery state (the
+///    serial accept loop, in particular, must recover to serve the next client).
+///
+/// [`ClientHandler`]: decdn_node::handlers::client::ClientHandler
+#[tokio::test(flavor = "multi_thread")]
+async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Result<()> {
+    let payload = vec![0x6Du8; PAYLOAD_LEN];
+    let hash = decdn_cache::Hash::new(&payload);
+    let (cache, hash_b, _cache_tmp) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_b == hash, "fixture hash mismatch");
+
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let b_eth = Arc::new(PrivateKeySigner::random());
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xC1);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id,
+        client_signer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+
+    let handler = build_server(b_id, &b_eth, cache, store.clone(), RATE_B)?;
+    let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let task_b = spawn_server(ep_b.clone(), handler);
+
+    // --- Abort: request, read the response + one chunk, then hang up ---------
+    {
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
+        let conn = client_ep
+            .connect(target_b, ALPN_CLIENT)
+            .await
+            .map_err(|e| anyhow::anyhow!("client connect: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = StreamRequest {
+            hash: *hash.as_bytes(),
+            channel_id: channel_id.into(),
+            byte_offset: 0,
+            timestamp_us: 0x00c0_ffee,
+        };
+        let req_bytes = encode_stream_request(&req, None)
+            .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
+        write_frame(&mut send, &req_bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
+
+        match read_client_msg(&mut recv).await? {
+            ClientMessage::StreamResponse(r) => {
+                anyhow::ensure!(r.body.ok, "expected an ok response, got {:?}", r.error);
+            }
+            _ => anyhow::bail!("expected a StreamResponse first"),
+        }
+        // Read at least one chunk so the abort is genuinely *mid*-stream, then
+        // drop without paying. The explicit close hands B a CONNECTION_CLOSE so
+        // its voucher read unblocks at once (vs. waiting on an idle timeout),
+        // freeing the serial accept loop to serve the honest pull below.
+        match read_client_msg(&mut recv).await? {
+            ClientMessage::ChunkData(_) => {}
+            _ => anyhow::bail!("expected a ChunkData mid-stream"),
+        }
+        conn.close(0u32.into(), b"client-abort");
+        client_ep.close().await;
+    }
+
+    // Property 1: no voucher accepted — the channel never advanced. Both nonce
+    // and bytes-delivered must still read zero (their initial state); checking
+    // bytes too rules out any partial accounting committed for the unpaid chunk.
+    let after_abort = store
+        .get(channel_id)?
+        .ok_or_else(|| anyhow::anyhow!("channel vanished after the abort"))?;
+    anyhow::ensure!(
+        after_abort.last_nonce() == U256::ZERO,
+        "an aborted pull advanced the channel to nonce {}",
+        after_abort.last_nonce()
+    );
+    anyhow::ensure!(
+        after_abort.last_bytes_delivered() == U256::ZERO,
+        "an aborted pull committed {} bytes of accounting",
+        after_abort.last_bytes_delivered()
+    );
+
+    // Property 2: the same channel still serves. A fresh-context honest pull
+    // completes and advances it (the abort left prior state at zero).
+    let (honest_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
+    let ctx = fresh_context(channel_id, Arc::clone(&client_signer));
+    let got = stream_fetch(
+        &honest_ep,
+        target_b,
+        &ctx,
+        &slash_domain(),
+        b_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_0d02,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "honest pull bytes mismatch"
+    );
+    assert_channel_advanced(&store, "reused after abort", channel_id, RATE_B)?;
+
+    honest_ep.close().await;
+    ep_b.close().await;
+    task_b.await?;
+    Ok(())
+}
+
+/// A protocol-correct but **dishonest** `cdn/client/v1` upstream: it signs a
+/// valid response for the requested hash, streams `served` (whose hash differs),
+/// reads and acks the closing voucher, and ends the stream cleanly — yet the
+/// bytes are wrong. This drives the requester all the way to its whole-blob
+/// integrity check. Handles exactly one connection, then returns.
+async fn lying_upstream(
+    ep: &Endpoint,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    served: &[u8],
+    rate_per_mb: u64,
+) -> anyhow::Result<()> {
+    let conn = accept_one(ep).await?;
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
+
+    // Echo the request's correlated fields back so the response validates
+    // (ADR 005): only the *bytes* are dishonest, not the framing.
+    let ClientMessage::StreamRequest(req) = read_client_msg(&mut recv).await? else {
+        anyhow::bail!("lying upstream: expected a StreamRequest");
+    };
+    let body = StreamResponseBody {
+        hash: req.hash,
+        ok: true,
+        rate_per_mb,
+        total_bytes: u64::try_from(served.len())
+            .map_err(|_| anyhow::anyhow!("served len overflows u64"))?,
+        channel_id: req.channel_id,
+        timestamp_us: req.timestamp_us,
+        redirect: None,
+    };
+    let slash_sig = StreamSlashData::from_response_body(&body)
+        .sign(eth.as_ref(), slash)
+        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+        .as_bytes()
+        .to_vec();
+    let resp = StreamResponse {
+        body,
+        error: None,
+        voucher_interval_mb: Some(1),
+        slash_sig,
+    };
+    write_client_msg(&mut send, &ClientMessage::StreamResponse(resp)).await?;
+
+    // The wrong bytes, streamed in `CHUNK_SIZE` chunks like the real handler (the
+    // requester rejects any chunk over the ceiling). `served` stays under one
+    // voucher interval, so exactly one closing voucher flows.
+    for chunk in served.chunks(decdn_protocol::CHUNK_SIZE) {
+        write_client_msg(
+            &mut send,
+            &ClientMessage::ChunkData(ChunkData {
+                bytes: chunk.to_vec(),
+            }),
+        )
+        .await?;
+    }
+
+    // Accept the closing voucher the requester pays for the bytes it received,
+    // so it proceeds to the integrity check (the unit under test) rather than
+    // bailing early on a rejected voucher.
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::Voucher(_) => {
+            write_client_msg(&mut send, &ClientMessage::VoucherAck).await?;
+        }
+        _ => anyhow::bail!("lying upstream: expected a Voucher"),
+    }
+    write_client_msg(&mut send, &ClientMessage::StreamEnd).await?;
+    let _ = send.finish();
+    // Hold the connection open until the requester has read `StreamEnd` and
+    // closed (it closes with `hash-mismatch` once its integrity check fails).
+    // Returning here would drop `conn` and abort the still-in-flight `StreamEnd`
+    // before it lands, surfacing a spurious "connection lost" instead.
+    conn.closed().await;
+    Ok(())
+}
+
+/// Sad path: the upstream returns bytes that don't match the requested hash
+/// (#746).
+///
+/// Content is BLAKE3-addressed and the requester verifies the whole-blob hash on
+/// a full fetch — but that defense had no node-to-node test. Here a malicious /
+/// buggy upstream plays the protocol perfectly (valid signed response, a paid and
+/// ack'd voucher, a clean `StreamEnd`) while serving content that hashes to the
+/// wrong value. The downstream requester MUST reject the delivery and return an
+/// `Err`, never surfacing the corrupt bytes to its caller. This guards the
+/// content-addressing invariant across a *paid* hop: a peer cannot substitute
+/// content for a hash, even after being paid for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
+    // What the downstream asks for...
+    let honest = vec![0x11u8; 4096];
+    let requested_hash = decdn_cache::Hash::new(&honest);
+    // ...vs. what the lying upstream actually serves (different content, sized
+    // under one voucher interval).
+    let served = vec![0x22u8; 2048];
+    anyhow::ensure!(
+        decdn_cache::Hash::new(&served) != requested_hash,
+        "the two fixture payloads must differ"
+    );
+
+    let upstream_eth = Arc::new(PrivateKeySigner::random());
+    let up_sk = fresh_key();
+    let up_id = up_sk.public();
+    let (ep_up, addr_up) = local_endpoint(up_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+
+    let liar = {
+        let ep_up = ep_up.clone();
+        let eth = Arc::clone(&upstream_eth);
+        let slash = slash_domain();
+        let served = served.clone();
+        tokio::spawn(async move { lying_upstream(&ep_up, &eth, &slash, &served, RATE_A).await })
+    };
+
+    // Downstream B pulls the (honest) hash; the bytes that arrive are wrong.
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(up_id).with_ip_addr(addr_up);
+    let ctx = fresh_context(
+        B256::repeat_byte(0xD1),
+        Arc::new(PrivateKeySigner::random()),
+    );
+    let result = stream_fetch(
+        &ep_b,
+        target,
+        &ctx,
+        &slash_domain(),
+        upstream_eth.address(),
+        *requested_hash.as_bytes(),
+        0,
+        0x00d1_0a01,
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a hash-mismatched delivery must be rejected"))?;
+    anyhow::ensure!(
+        err.to_string().contains("do not match requested hash"),
+        "error should be the integrity check, got: {err}"
+    );
+
+    ep_b.close().await;
+    // The liar reached `StreamEnd` before the requester bailed; surface any panic
+    // or protocol error it hit, bounded so a hang fails loudly rather than stalls.
+    match tokio::time::timeout(Duration::from_secs(5), liar).await {
+        Ok(joined) => {
+            joined.map_err(|e| anyhow::anyhow!("lying upstream task panicked: {e}"))??;
+        }
+        Err(_) => anyhow::bail!("lying upstream did not finish in time"),
+    }
+    ep_up.close().await;
     Ok(())
 }
