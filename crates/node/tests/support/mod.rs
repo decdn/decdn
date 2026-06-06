@@ -27,7 +27,9 @@ use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
 use decdn_node::receipt_log::{DirectReceiptSink, DownloadReceipt, ReceiptLog, ReceiptSink};
-use decdn_protocol::MAX_RATE_PER_MB;
+use decdn_protocol::client::ClientMessage;
+use decdn_protocol::{MAX_RATE_PER_MB, decode_message, encode_message, read_frame, write_frame};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
 
@@ -325,6 +327,43 @@ pub fn build_handler_full_with_sink(
         max_blob_size_bytes,
         max_concurrent_streams,
     )?))
+}
+
+/// Read one length-framed [`ClientMessage`] from `recv`. Mirrors the requester's
+/// private `client_requester::read_client_message`, exposed for the raw fake
+/// clients/servers the `cdn/client/v1` integration binaries hand-roll.
+pub async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
+    let frame = read_frame(recv)
+        .await
+        .map_err(|e| anyhow::anyhow!("read frame: {e}"))?;
+    let (msg, _rest) =
+        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    Ok(msg)
+}
+
+/// Write one length-framed [`ClientMessage`] to `send` (the write-side twin of
+/// [`read_client_msg`]).
+pub async fn write_client_msg(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Result<()> {
+    let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    write_frame(send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))
+}
+
+/// Accept exactly one inbound connection on `ep` — the [`spawn_server`] accept
+/// plumbing (`incoming.accept()` then `connecting.await`) factored out for the
+/// one-shot raw servers that don't run a full accept loop.
+pub async fn accept_one(ep: &Endpoint) -> anyhow::Result<Connection> {
+    let incoming = ep
+        .accept()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("endpoint closed before a connection arrived"))?;
+    let connecting = incoming
+        .accept()
+        .map_err(|e| anyhow::anyhow!("incoming accept: {e}"))?;
+    connecting
+        .await
+        .map_err(|e| anyhow::anyhow!("connecting await: {e}"))
 }
 
 /// Spawn a server endpoint running `handler`, accepting connections until the
