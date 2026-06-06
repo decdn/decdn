@@ -92,18 +92,21 @@ struct StoredSettlement {
 const SETTLEMENT_MAX_AGE_SECS: u64 = 52 * 7 * 24 * 3600;
 
 /// How long a computed `max_effective_settled_value` is reused before being
-/// recomputed. The max only *drifts down* via decay between settlements (and is
-/// invalidated immediately when a settlement is recorded), so a short TTL keeps
-/// the value fresh while collapsing a burst of inbound gossip reports into a
-/// single O(N) scan instead of one scan per report (#326 review: gossip
-/// hot-path denial-of-service). The decay half-life is ~6.9 weeks, so 60s of
-/// staleness is negligible for the relative reporter weights from this max.
+/// recomputed. Between settlements the max only *drifts down* via decay, and a
+/// new settlement invalidates the cache (best-effort — see `record_settlement`),
+/// so a short TTL keeps the value fresh while collapsing a burst of inbound
+/// gossip reports into a single O(N) scan instead of one scan per report (#326
+/// review: gossip hot-path denial-of-service). The decay half-life is ~6.9
+/// weeks, so 60s of staleness is negligible for the relative reporter weights
+/// from this max.
 const MAX_VALUE_CACHE_TTL_SECS: u64 = 60;
 
-/// Cached `max_effective_settled_value`. `computed_at_secs == 0` means "stale,
-/// recompute on next read" (used to invalidate on a new settlement).
-#[derive(Debug, Default, Clone, Copy)]
-struct MaxValueCache {
+/// A computed `max_effective_settled_value` and the wall-clock second it was
+/// computed at. Wrapped in `Option` at the cache site, where `None` is the
+/// stale/invalidated state — so there is no in-band sentinel (a genuine
+/// `computed_at_secs == 0` from a pre-epoch clock can't masquerade as stale).
+#[derive(Debug, Clone, Copy)]
+struct CachedMax {
     value: f64,
     computed_at_secs: u64,
 }
@@ -118,8 +121,11 @@ pub struct NodeSettlementSource {
     min_counterparties: u32,
     /// TTL-bounded cache for [`SettlementSource::max_effective_settled_value`],
     /// which is otherwise an O(reporters × records) scan on every accepted
-    /// gossip report. Never held together with `by_reporter`.
-    max_cache: RwLock<MaxValueCache>,
+    /// gossip report. `None` means stale/invalidated. Never held together with
+    /// `by_reporter`. Not keyed on `min_counterparties` — safe only because that
+    /// parameter is immutable after `new` (no setter); a future governance knob
+    /// that mutates it must also invalidate this cache.
+    max_cache: RwLock<Option<CachedMax>>,
 }
 
 impl NodeSettlementSource {
@@ -129,7 +135,7 @@ impl NodeSettlementSource {
         Self {
             by_reporter: RwLock::new(HashMap::new()),
             min_counterparties,
-            max_cache: RwLock::new(MaxValueCache::default()),
+            max_cache: RwLock::new(None),
         }
     }
 
@@ -158,11 +164,16 @@ impl NodeSettlementSource {
             });
             records.retain(|s| s.settled_at_secs >= cutoff);
         }
-        // Force a recompute on the next read (value may have increased).
-        self.max_cache
+        // Invalidate so the next read recomputes (value may have increased).
+        // Best-effort: a recompute already in flight (which released the
+        // `by_reporter` lock before this write) may publish its slightly-stale
+        // value afterwards, so the new max can take up to one TTL to appear.
+        // Benign — a too-low max only inflates reporter weights, which are
+        // capped, the same bounded error the TTL already tolerates.
+        *self
+            .max_cache
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .computed_at_secs = 0;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Recompute the max effective settled value across all reporters at `now`
@@ -184,12 +195,13 @@ impl NodeSettlementSource {
                 })
                 .fold(0.0_f64, f64::max)
         };
-        let mut cache = self
+        *self
             .max_cache
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.value = value;
-        cache.computed_at_secs = now;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedMax {
+            value,
+            computed_at_secs: now,
+        });
         value
     }
 
@@ -220,16 +232,17 @@ impl SettlementSource for NodeSettlementSource {
 
     fn max_effective_settled_value(&self) -> f64 {
         let now = now_secs();
-        // Fast path: a recently-computed value is reused (the gossip hot path).
+        // Fast path: a fresh (within-TTL) cached value is reused (the gossip
+        // hot path). `None` or an expired entry falls through to recompute.
         {
             let cache = self
                 .max_cache
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if cache.computed_at_secs != 0
-                && now.saturating_sub(cache.computed_at_secs) < MAX_VALUE_CACHE_TTL_SECS
+            if let Some(c) = *cache
+                && now.saturating_sub(c.computed_at_secs) < MAX_VALUE_CACHE_TTL_SECS
             {
-                return cache.value;
+                return c.value;
             }
         }
         // Slow path: stale or invalidated — recompute and refresh the cache.

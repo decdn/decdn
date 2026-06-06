@@ -470,6 +470,42 @@ mod tests {
     }
 
     #[test]
+    fn cap_does_not_regress_threshold_above_min_reporters() -> anyhow::Result<()> {
+        // Once `min_distinct_reporters` is met, `record` stops growing the
+        // distinct-reporter set (memory bound). Verify that capping the *set*
+        // does not cap *scoring*: further reporters past the threshold must keep
+        // the peer scored AND still move the EWMA score.
+        let nr = NetworkReputation::new(NetworkReputationConfig::default())?;
+        let prov = peer();
+        // Six distinct positive reporters (min is 3) drive the score up.
+        for _ in 0..6 {
+            nr.record(&full_report(prov, peer(), 0), 3.0);
+        }
+        ensure!(nr.is_scored(prov), "still scored past the threshold");
+        let high = nr.score(prov, 0);
+        ensure!(high > 0.5, "positive reports raised the score, got {high}");
+        // A 7th distinct reporter — past the set cap, so never inserted — that
+        // reports the peer as unreachable must still fold into the score.
+        nr.record(
+            &ReportInput {
+                provider: prov,
+                reporter: peer(),
+                delivery_speed: None,
+                uptime_observed: Some(false),
+                data_correct: None,
+                now_secs: 0,
+            },
+            3.0,
+        );
+        ensure!(
+            nr.score(prov, 0) < high,
+            "a capped (uninserted) reporter must still move the score"
+        );
+        ensure!(nr.is_scored(prov), "remains scored after the capped report");
+        Ok(())
+    }
+
+    #[test]
     fn positive_reports_raise_score_with_pm_005_clamp() -> anyhow::Result<()> {
         let nr = NetworkReputation::new(NetworkReputationConfig::default())?;
         let prov = peer();

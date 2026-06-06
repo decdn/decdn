@@ -32,16 +32,18 @@ pub(crate) const WEIGHT_CAP: f64 = 3.0;
 /// `amount_usdc` is in USDC base units (6-decimal). `age_secs` is
 /// `now - settled_at` measured by the trait impl at query time, keeping this
 /// crate clock-free and deterministic in tests. `staked_counterparty` is the
-/// counterparty's Ethereum address iff it was a staked `CapacityBond` node
-/// (ADR 008 §Counterparty validation); `None` excludes it from the
-/// distinct-counterparty count.
+/// counterparty's Ethereum address iff the [`SettlementSource`] deemed it a
+/// staked `CapacityBond` node (ADR 008 §Counterparty validation); `None`
+/// excludes it from the distinct-counterparty count. How "staked" is resolved
+/// (current vs at-settlement membership) is the source's concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettlementRecord {
     /// Settlement amount in USDC base units.
     pub amount_usdc: u128,
     /// Age of the settlement in seconds at query time.
     pub age_secs: u64,
-    /// Counterparty address if it was a staked node at settlement time.
+    /// Counterparty address if the source deemed it a staked node (see the
+    /// type-level note on how membership is resolved).
     pub staked_counterparty: Option<[u8; 20]>,
 }
 

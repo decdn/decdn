@@ -427,13 +427,16 @@ pub struct DecdnMetrics {
     /// e.g. the count holding flat while down-seconds climbs means the cache
     /// is frozen, not that the network genuinely lost operators.
     pub staker_set_active_count: Gauge,
-    /// `decdn_reputation_indexer_rpc_failures_total` (#326): times the
-    /// settlement indexer's event-stream subscription errored (→ backoff) or a
-    /// `nodeIdOf` party-resolution RPC failed (→ party skipped). A sustained
-    /// nonzero rate means the indexer is not ingesting settlements, so reporter
-    /// weights silently stay 0 and network scores never leave neutral — exactly
-    /// the dead-indexer condition that is otherwise log-only. Field has no
-    /// `_total` suffix because the `OpenMetrics` encoder appends it.
+    /// `decdn_reputation_indexer_rpc_failures_total` (#326): watcher-cycle
+    /// terminations — the settlement indexer's event-stream subscription errored
+    /// or a `nodeIdOf` party-resolution RPC failed. Both now propagate to the
+    /// same backoff-and-resubscribe path (a resolution failure no longer skips a
+    /// party in place; the un-credited settlement is retried), so a persistently
+    /// flaky RPC can bump this once per retry cycle. A sustained nonzero rate
+    /// means the indexer is not ingesting settlements, so reporter weights
+    /// silently stay 0 and network scores never leave neutral — exactly the
+    /// dead-indexer condition that is otherwise log-only. Field has no `_total`
+    /// suffix because the `OpenMetrics` encoder appends it.
     pub reputation_indexer_rpc_failures: Counter,
     /// `decdn_reputation_indexer_settlements_credited_total` (#326): party
     /// creditings applied to the settlement source (two per fully-resolved

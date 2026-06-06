@@ -259,8 +259,8 @@ where
                 None => return Ok(()),
             },
             ev = settled.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    process_settled(
+                Some(Ok((event, log))) => {
+                    if let Err(err) = process_settled(
                         capacity_bond,
                         settlement,
                         state,
@@ -269,7 +269,18 @@ where
                         event.provider,
                         event.routedAmount,
                     )
-                    .await?;
+                    .await
+                    {
+                        // A transient resolution error must not lose this live
+                        // event: `.watch()` resubscribes at head and never
+                        // replays it. Arm the backfill from this event's block
+                        // (the earliest pending one) so the next cycle
+                        // re-queries the window; `settled_seen` dedups anything
+                        // already credited. The channel was *not* marked seen
+                        // (process_settled returned before that), so it credits.
+                        arm_backfill_from_log(state, &log);
+                        return Err(err).context("ChannelSettled live event");
+                    }
                 }
                 Some(Err(e)) => return Err(e).context("ChannelSettled stream"),
                 None => return Ok(()),
@@ -283,11 +294,13 @@ where
 /// resolution from the pure crediting in [`apply_settlement`] so the crediting
 /// logic is unit-testable without a live chain.
 ///
-/// A transient `nodeIdOf` RPC error is propagated as `Err` (the caller backs
-/// off and retries) and the channel is **not** marked seen, so the settlement
-/// is retried on the next cycle rather than silently dropped. Only a fully
-/// resolved settlement — or a genuinely unresolvable one (unbound key / amount
-/// overflow) — is marked seen.
+/// A transient `nodeIdOf` RPC error is propagated as `Err` and the channel is
+/// **not** marked seen, so the settlement is retried rather than silently
+/// dropped: a backfill-path error leaves `backfill_from` set, and a live-path
+/// error re-arms `backfill_from` from the event's block (see the live arm in
+/// [`run_watcher_once`]), so either way the next cycle re-queries the window.
+/// Only a fully resolved settlement — or a genuinely unresolvable one (unbound
+/// key / amount overflow) — is marked seen.
 async fn process_settled<P>(
     capacity_bond: &CapacityBond::CapacityBondInstance<P>,
     settlement: &Arc<NodeSettlementSource>,
@@ -308,7 +321,11 @@ where
     // 0 (#326 review I2). Mark it seen so a re-delivery doesn't re-warn.
     let Ok(amount_usdc) = u128::try_from(routed_amount) else {
         metrics.reputation_indexer_amount_overflow();
-        warn!(channel_id = %alloy::hex::encode(channel_id), "settlement amount exceeds u128; skipping");
+        warn!(
+            channel_id = %alloy::hex::encode(channel_id),
+            %routed_amount,
+            "settlement amount exceeds u128; skipping"
+        );
         state.settled_seen.insert(channel_id);
         return Ok(());
     };
@@ -408,6 +425,20 @@ where
             debug!(%addr, %err, "settlement indexer: bound nodeId is not a valid key");
             Ok(None)
         }
+    }
+}
+
+/// Lower `state.backfill_from` to `log`'s block so the next watcher cycle
+/// re-queries from there. Keeps the earliest pending block if one is already
+/// armed. A log with no block number (should not happen for a confirmed event)
+/// leaves the backfill window unchanged — the worst case is the pre-existing,
+/// documented resubscribe-gap loss for that one event.
+fn arm_backfill_from_log(state: &mut IndexerState, log: &alloy::rpc::types::Log) {
+    if let Some(block) = log.block_number {
+        state.backfill_from = Some(match state.backfill_from {
+            Some(existing) => existing.min(block),
+            None => block,
+        });
     }
 }
 
