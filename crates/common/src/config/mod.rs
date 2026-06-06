@@ -84,6 +84,11 @@ const DEFAULT_PEER_TTL_SEC: u64 = 600;
 /// capping the fresh-keypair memory-DoS that the empty-allowlist
 /// stand-in would otherwise leave unbounded.
 const DEFAULT_MAX_PEER_TABLE_ENTRIES: u64 = 100_000;
+/// Default for subscribing to the global `cdn/reputation/v1` topic (ADR 008).
+const DEFAULT_SUBSCRIBE_REPUTATION: bool = true;
+/// Default interval between reputation-report publish ticks. Matches the ADR
+/// 008 1-hour per-(reporter, node) rate-limit window.
+const DEFAULT_REPUTATION_PUBLISH_INTERVAL_SEC: u64 = 3600;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
 /// Default per-source rate-limit refill (cells/second). A single source
@@ -1745,6 +1750,19 @@ fn resolve_gossip_into(
 
     let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
 
+    let subscribe_reputation = file
+        .and_then(|g| g.subscribe_reputation)
+        .unwrap_or(DEFAULT_SUBSCRIBE_REPUTATION);
+
+    let reputation_publish_interval_sec = file
+        .and_then(|g| g.reputation_publish_interval_sec)
+        .unwrap_or(DEFAULT_REPUTATION_PUBLISH_INTERVAL_SEC);
+    bag.check(
+        reputation_publish_interval_sec > 0,
+        "gossip.reputation_publish_interval_sec",
+        "gossip.reputation_publish_interval_sec must be > 0",
+    );
+
     let allowlist = file
         .and_then(|g| g.allowlist.as_ref())
         .map(|v| {
@@ -1761,6 +1779,8 @@ fn resolve_gossip_into(
         announce_interval_sec,
         peer_ttl_sec,
         subscribe_global,
+        subscribe_reputation,
+        reputation_publish_interval_sec,
         allowlist,
         max_peer_table_entries,
     }
@@ -2586,6 +2606,8 @@ mod tests {
             announce_interval_sec: 60,
             peer_ttl_sec: 600,
             subscribe_global,
+            subscribe_reputation: true,
+            reputation_publish_interval_sec: 3600,
             allowlist: Vec::new(),
             max_peer_table_entries: DEFAULT_MAX_PEER_TABLE_ENTRIES,
         }
@@ -2623,6 +2645,7 @@ mod tests {
             subscribe_global: Some(false),
             allowlist: None,
             max_peer_table_entries: Some(7),
+            ..Default::default()
         };
         let g = resolve_gossip(Some(&cfg))?;
         assert_eq!(g.announce_interval_sec, 42);
@@ -2639,9 +2662,36 @@ mod tests {
         assert_eq!(g.announce_interval_sec, DEFAULT_ANNOUNCE_INTERVAL_SEC);
         assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
         assert!(g.subscribe_global);
+        assert!(g.subscribe_reputation);
+        assert_eq!(
+            g.reputation_publish_interval_sec,
+            DEFAULT_REPUTATION_PUBLISH_INTERVAL_SEC
+        );
         assert!(g.allowlist.is_empty());
         assert_eq!(g.max_peer_table_entries, DEFAULT_MAX_PEER_TABLE_ENTRIES);
         Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_reputation_fields_file_override() -> anyhow::Result<()> {
+        let cfg = types::GossipConfig {
+            subscribe_reputation: Some(false),
+            reputation_publish_interval_sec: Some(120),
+            ..Default::default()
+        };
+        let g = resolve_gossip(Some(&cfg))?;
+        assert!(!g.subscribe_reputation);
+        assert_eq!(g.reputation_publish_interval_sec, 120);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_gossip_rejects_zero_reputation_publish_interval() {
+        let cfg = types::GossipConfig {
+            reputation_publish_interval_sec: Some(0),
+            ..Default::default()
+        };
+        assert!(resolve_gossip(Some(&cfg)).is_err());
     }
 
     #[test]

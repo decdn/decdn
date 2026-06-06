@@ -19,5 +19,7 @@ pub mod payment_settlement;
 pub mod prefetch;
 pub mod receipt_log;
 pub mod region_accounting;
+pub mod reputation_indexer;
+pub mod reputation_wiring;
 pub mod runtime;
 pub mod selection;

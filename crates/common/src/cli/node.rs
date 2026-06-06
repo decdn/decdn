@@ -59,6 +59,10 @@ pub enum NodeCommand {
     /// resolution and timeout semantics as `decdn node health`.
     #[command(name = "region-stats")]
     RegionStats(RegionStatsArgs),
+    /// Show a peer's network reputation score + per-region coverage from the
+    /// running node via `admin_v1_reputation` (#326, ADR 008). Same admin-URL
+    /// resolution and timeout semantics as `decdn node health`.
+    Reputation(ReputationArgs),
     /// Forcibly remove a single blob from the local cache (issue #279).
     /// Useful for DMCA takedown, corruption recovery, and storage
     /// reclamation.
@@ -282,6 +286,34 @@ pub struct EvictArgs {
     pub config: Option<PathBuf>,
 
     /// Emit the admin response body as JSON instead of a human-readable line.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node reputation <node-id>` — report a peer's network reputation
+/// score + regional coverage via `admin_v1_reputation` (#326).
+#[derive(Args, Debug)]
+pub struct ReputationArgs {
+    /// Hex `NodeId` (64 hex chars) of the peer to query. Optional `0x` / `0X`
+    /// prefix is tolerated; mixed case is accepted.
+    #[arg(value_name = "NODE_ID")]
+    pub node_id: String,
+
+    /// Base URL of the node's admin HTTP surface. See `health --admin-url`
+    /// for resolution precedence (flag → env → config → default).
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response body as JSON instead of the human-readable form.
     #[arg(long)]
     pub json: bool,
 

@@ -427,6 +427,25 @@ pub struct DecdnMetrics {
     /// e.g. the count holding flat while down-seconds climbs means the cache
     /// is frozen, not that the network genuinely lost operators.
     pub staker_set_active_count: Gauge,
+    /// `decdn_reputation_indexer_rpc_failures_total` (#326): times the
+    /// settlement indexer's event-stream subscription errored (→ backoff) or a
+    /// `nodeIdOf` party-resolution RPC failed (→ party skipped). A sustained
+    /// nonzero rate means the indexer is not ingesting settlements, so reporter
+    /// weights silently stay 0 and network scores never leave neutral — exactly
+    /// the dead-indexer condition that is otherwise log-only. Field has no
+    /// `_total` suffix because the `OpenMetrics` encoder appends it.
+    pub reputation_indexer_rpc_failures: Counter,
+    /// `decdn_reputation_indexer_settlements_credited_total` (#326): party
+    /// creditings applied to the settlement source (two per fully-resolved
+    /// settlement). A flat-zero counter alongside live `ChannelSettled` traffic
+    /// indicates a binding-resolution or correlation problem.
+    pub reputation_indexer_settlements_credited: Counter,
+    /// `decdn_reputation_indexer_amount_overflows_total` (#326): `ChannelSettled`
+    /// events whose `routedAmount` exceeded `u128` and were skipped rather than
+    /// saturated (a saturated value would poison the node-local credibility
+    /// denominator). Expected to stay 0; a nonzero value flags malformed/hostile
+    /// on-chain data.
+    pub reputation_indexer_amount_overflows: Counter,
     /// `1` if `prefetch.enabled`, else `0` (ADR 022 §Prefetch Decision;
     /// appendix-observability §Prefetch Metrics). Stable schema across nodes:
     /// every node reports the prefetch family regardless of whether the
@@ -827,6 +846,25 @@ impl Metrics {
         self.decdn
             .staker_set_active_count
             .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    /// Bump `reputation_indexer_rpc_failures_total` (#326): an indexer event
+    /// stream errored or a `nodeIdOf` resolution RPC failed. Pairs with the
+    /// per-failure `warn!` in `crate::reputation_indexer`.
+    pub fn reputation_indexer_rpc_failure(&self) {
+        self.decdn.reputation_indexer_rpc_failures.inc();
+    }
+
+    /// Bump `reputation_indexer_settlements_credited_total` (#326) by `n` party
+    /// creditings applied for one settlement (0, 1, or 2).
+    pub fn reputation_indexer_settlements_credited(&self, n: u64) {
+        self.decdn.reputation_indexer_settlements_credited.inc_by(n);
+    }
+
+    /// Bump `reputation_indexer_amount_overflows_total` (#326): a settlement
+    /// amount exceeded `u128` and was skipped (not saturated).
+    pub fn reputation_indexer_amount_overflow(&self) {
+        self.decdn.reputation_indexer_amount_overflows.inc();
     }
 
     pub fn connection_opened(&self) {

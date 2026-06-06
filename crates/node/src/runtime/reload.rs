@@ -815,6 +815,8 @@ impl RuntimeReloadState {
                 announce_interval_sec: 60,
                 peer_ttl_sec: 600,
                 subscribe_global: false,
+                subscribe_reputation: true,
+                reputation_publish_interval_sec: 3600,
                 allowlist: Vec::new(),
                 max_peer_table_entries: 100_000,
             },
@@ -1188,7 +1190,10 @@ fn log_ignored_other_sections(file: &decdn_common::config::FileConfig, prev: &Fi
         }
     }
     if changed("gossip", file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
-        warn_ignored("gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global)");
+        warn_ignored(
+            "gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global, \
+             subscribe_reputation, reputation_publish_interval_sec)",
+        );
     }
     if changed("dht", file.dht.as_ref(), prev.dht.as_ref()) && file.dht.is_some() {
         // `dht.*` (rate-limit caps, trusted IPs) is not currently
@@ -1298,6 +1303,8 @@ mod tests {
                 announce_interval_sec: 60,
                 peer_ttl_sec: 600,
                 subscribe_global: false,
+                subscribe_reputation: true,
+                reputation_publish_interval_sec: 3600,
                 allowlist: Vec::new(),
                 max_peer_table_entries: 100_000,
             },

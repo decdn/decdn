@@ -101,6 +101,8 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             announce_interval_sec: 60,
             peer_ttl_sec: 600,
             subscribe_global: false,
+            subscribe_reputation: true,
+            reputation_publish_interval_sec: 3600,
             allowlist: Vec::new(),
             max_peer_table_entries: 100_000,
         },

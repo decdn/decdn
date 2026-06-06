@@ -26,7 +26,8 @@ pub use framing::{
     FrameError, MAX_MESSAGE_SIZE, decode_message, encode_message, read_frame, write_frame,
 };
 pub use gossip::{
-    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, SIGNATURE_LEN,
+    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, ReportMetrics,
+    ReputationReport, ReputationReportBody, SIGNATURE_LEN,
 };
 pub use identity::{ContentHash, ID_LEN, NodeId};
 pub use message::{

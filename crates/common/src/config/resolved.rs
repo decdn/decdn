@@ -295,6 +295,12 @@ pub struct ResolvedGossip {
     pub peer_ttl_sec: u64,
     /// Whether to subscribe to and publish on `cdn/global/v1`.
     pub subscribe_global: bool,
+    /// Whether to subscribe to (and publish on) the global
+    /// `cdn/reputation/v1` topic (ADR 008). Independent of `region`.
+    pub subscribe_reputation: bool,
+    /// Interval between reputation-report publish ticks (seconds). Matches the
+    /// ADR 008 1-hour per-(reporter, node) rate limit by default.
+    pub reputation_publish_interval_sec: u64,
     /// Validated allowlist of accepted announcer node IDs. Empty = accept any
     /// signature-valid announce (local substitute for ADR 001 rule 2 until
     /// the on-chain staking registry contract lands).
