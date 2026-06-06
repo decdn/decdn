@@ -310,6 +310,77 @@ pub struct DecdnMetrics {
     /// `redemption_failures` does NOT move on these — this is the only signal.
     /// Operator-visible name: `decdn_settlement_auto_failures_total`.
     pub settlement_auto_failures: Counter,
+    /// `settleChannel` finalization-sweep passes that landed: the closed
+    /// channel cleared its dispute window and the provider's un-withdrawn
+    /// remainder was routed through the `FeeRouter` (a no-op when the channel
+    /// was already fully drawn via `withdraw`), and the pending-settle entry
+    /// was dropped (#810). The healthy terminal outcome of the seller
+    /// settlement lifecycle; a steady rate tracking closes means settlement is
+    /// landing. Distinct from `settlement_auto_triggered` (which counts only
+    /// the *`closeChannel`* that opens the window, a different lifecycle
+    /// stage). Operator-visible name: `decdn_settlement_finalize_ok_total`.
+    pub settlement_finalize_ok: Counter,
+    /// `settleChannel` finalization passes where `settleChannel().send()`
+    /// itself errored — an RPC timeout / network blip, not an on-chain
+    /// decision (#810). The pending entry is left in place and retried next
+    /// sweep, so a brief blip self-heals; a sustained rate means the RPC
+    /// endpoint is unhealthy and the provider's settled remainder is not being
+    /// routed. Operator-visible name:
+    /// `decdn_settlement_finalize_transient_send_total`.
+    pub settlement_finalize_transient_send: Counter,
+    /// `settleChannel` finalization passes where the submit succeeded but
+    /// `get_receipt()` errored before a receipt was observed (#810). Like
+    /// `..._transient_send` this is a transient RPC condition (the tx may well
+    /// have landed) and is retried next sweep; split from the send arm so an
+    /// operator can tell a submit-side from a receipt-side RPC fault. Operator-
+    /// visible name: `decdn_settlement_finalize_transient_receipt_total`.
+    pub settlement_finalize_transient_receipt: Counter,
+    /// `settleChannel` finalization passes whose receipt came back with
+    /// `status() == false` — an on-chain revert (#810). This is the RAW revert
+    /// count; `drop_pending_if_finalized` then re-reads the channel and the
+    /// outcome is broken out across the three `settlement_finalize_confirmed_*`
+    /// / `_restamped` / `_confirm_failed` counters below, so this total on its
+    /// own is NOT a "stuck settlement" signal — the benign co-settler race and
+    /// the dispute-extension re-stamp both land here. Distinct from the two
+    /// transient arms in that the revert is an on-chain decision, not an RPC
+    /// fault. Operator-visible name: `decdn_settlement_finalize_reverted_total`.
+    pub settlement_finalize_reverted: Counter,
+    /// Reverted `settleChannel` passes resolved as already-`Closed` on re-read:
+    /// a co-settler (typically the client claiming its refund) finalized the
+    /// channel first, so the obligation is genuinely retired and the pending
+    /// entry dropped (#810). Benign — together with `..._restamped` it accounts
+    /// for the reverts that need no action; only `..._confirm_failed` is the
+    /// stuck-settlement signal. Operator-visible name:
+    /// `decdn_settlement_finalize_confirmed_closed_total`.
+    pub settlement_finalize_confirmed_closed: Counter,
+    /// Reverted `settleChannel` passes resolved as still-`Closing` on re-read:
+    /// a `disputeChannel` extended `disputeDeadline` past the value stored at
+    /// close, so the sweep re-stamps the gate and retries after the new window
+    /// (#810). Also benign and self-healing; a steady rate just means disputes
+    /// are landing. Operator-visible name:
+    /// `decdn_settlement_finalize_restamped_total`.
+    pub settlement_finalize_restamped: Counter,
+    /// Reverted `settleChannel` passes that could NOT be resolved to a benign
+    /// terminal state, so the pending entry is kept for the next sweep (#810):
+    /// either the confirming `getChannel` re-read itself errored, or it
+    /// returned an unexpected non-terminal status (`Open` is unreachable for a
+    /// channel we closed, so seeing it means a contract/`channel_id`/reorg
+    /// anomaly). This is the genuinely-degraded signal the raw `..._reverted`
+    /// total cannot give on its own: a revert we cannot resolve. A sustained
+    /// rate (especially with a pending set that never drains) means settlement
+    /// is stuck and warrants investigation. Operator-visible name:
+    /// `decdn_settlement_finalize_confirm_failed_total`.
+    pub settlement_finalize_confirm_failed: Counter,
+    /// Pending-settle store writes the finalization path swallowed: a
+    /// `forget_pending` (after a landed or already-`Closed` settle) or a
+    /// `record_pending` re-stamp (after a dispute-extended revert) that
+    /// returned a `StoreError` (#810). The settlement itself is unaffected
+    /// on-chain — the cost is a redundant `settleChannel` next sweep (which
+    /// reverts and re-drops via the `Closed` path) or a stale gate — but a
+    /// non-zero rate flags a struggling `PendingSettleStore`, the same way
+    /// `watcher_persist_failures` does for the watcher. Operator-visible name:
+    /// `decdn_settlement_pending_persist_failures_total`.
+    pub settlement_pending_persist_failures: Counter,
     /// `decdn_staker_set_watcher_restarts_total` (#783): distinct drift
     /// windows the [`crate::dht::chain_staker_set`] watcher has entered —
     /// bumped once on the *transition* from a healthy cycle into the
@@ -542,6 +613,67 @@ impl Metrics {
     /// `settlement_auto_triggered` so a fire-vs-secured ratio is computable.
     pub fn settlement_auto_failure(&self) {
         self.decdn.settlement_auto_failures.inc();
+    }
+
+    /// A `settleChannel` finalization sweep landed: the dispute window cleared,
+    /// the provider remainder routed through the `FeeRouter`, and the pending
+    /// entry was dropped (#810). Pairs with the success `info!` in `try_settle`.
+    pub fn settlement_finalize_ok(&self) {
+        self.decdn.settlement_finalize_ok.inc();
+    }
+
+    /// A `settleChannel` finalization sweep could not submit — `send()` errored
+    /// on a transient RPC/network fault and the entry is retried next sweep
+    /// (#810). Pairs with the send-arm `warn!` in `try_settle`.
+    pub fn settlement_finalize_transient_send(&self) {
+        self.decdn.settlement_finalize_transient_send.inc();
+    }
+
+    /// A `settleChannel` finalization sweep submitted but `get_receipt()`
+    /// errored before a receipt was seen — a transient RPC fault, retried next
+    /// sweep (#810). Pairs with the receipt-arm `warn!` in `try_settle`.
+    pub fn settlement_finalize_transient_receipt(&self) {
+        self.decdn.settlement_finalize_transient_receipt.inc();
+    }
+
+    /// A `settleChannel` finalization sweep reverted on-chain
+    /// (`receipt.status() == false`, #810). Raw revert count; the cause is
+    /// classified afterward by `drop_pending_if_finalized` into the
+    /// `settlement_finalize_confirmed_closed` / `_restamped` / `_confirm_failed`
+    /// counters. Pairs with the revert-arm `warn!` in `try_settle`.
+    pub fn settlement_finalize_reverted(&self) {
+        self.decdn.settlement_finalize_reverted.inc();
+    }
+
+    /// A reverted `settleChannel` re-read as already-`Closed`: a co-settler
+    /// finalized first, the obligation is retired (#810). The benign
+    /// co-settler-race case. Pairs with the `Closed`-arm `info!` in
+    /// `drop_pending_if_finalized`.
+    pub fn settlement_finalize_confirmed_closed(&self) {
+        self.decdn.settlement_finalize_confirmed_closed.inc();
+    }
+
+    /// A reverted `settleChannel` re-read as still-`Closing`: a dispute
+    /// extended the window, the gate is re-stamped and retried (#810). Benign.
+    /// Pairs with the `Closing`-arm re-stamp in `drop_pending_if_finalized`.
+    pub fn settlement_finalize_restamped(&self) {
+        self.decdn.settlement_finalize_restamped.inc();
+    }
+
+    /// A reverted `settleChannel` left unresolved: the confirming `getChannel`
+    /// re-read errored, or returned an unexpected non-terminal status, so the
+    /// entry is kept (#810) — the genuinely-degraded signal. Pairs with the
+    /// read-error and unexpected-status `warn!`s in `drop_pending_if_finalized`.
+    pub fn settlement_finalize_confirm_failed(&self) {
+        self.decdn.settlement_finalize_confirm_failed.inc();
+    }
+
+    /// A finalization-path pending-settle store write (`forget_pending` or a
+    /// re-stamp `record_pending`) returned a `StoreError` and was swallowed
+    /// (#810). Pairs with the persist-failure `warn!` sites in
+    /// `forget_pending_logged` / `restamp_pending_logged`.
+    pub fn settlement_pending_persist_failure(&self) {
+        self.decdn.settlement_pending_persist_failures.inc();
     }
 
     /// The settlement watcher swallowed a channel-lifecycle persist failure
@@ -1228,6 +1360,81 @@ mod tests {
             has_metric_line(&text, "decdn_settlement_auto_failures_total", 2),
             "expected 2 failed closes:\n{text}"
         );
+    }
+
+    #[test]
+    fn settlement_finalize_counters_start_at_zero_and_increment() {
+        // #810. The `settleChannel` finalization-sweep counters: four
+        // `try_settle` outcome arms (ok / two transient / raw reverted), three
+        // post-revert resolution counters bumped by `drop_pending_if_finalized`
+        // (confirmed_closed / restamped / confirm_failed), and one shared
+        // pending-store persist-failure counter. All must be exposed at zero on
+        // a fresh registry (dashboards built before any sweep don't render
+        // `(no data)`) and increment independently so an operator can tell a
+        // flaky-RPC condition (`transient_*`, self-healing) from a raw revert
+        // and its benign-vs-degraded resolution. The OpenMetrics encoder
+        // appends `_total`, so the exported names are the suffixed forms
+        // asserted here; re-naming a field to include `_total` would emit
+        // `..._total_total`.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_settlement_finalize_ok_total",
+            "decdn_settlement_finalize_transient_send_total",
+            "decdn_settlement_finalize_transient_receipt_total",
+            "decdn_settlement_finalize_reverted_total",
+            "decdn_settlement_finalize_confirmed_closed_total",
+            "decdn_settlement_finalize_restamped_total",
+            "decdn_settlement_finalize_confirm_failed_total",
+            "decdn_settlement_pending_persist_failures_total",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "settlement-finalize counter {name} should start at zero:\n{text}"
+            );
+        }
+
+        // Distinct counts per counter so independence is observable (not a
+        // single shared bump): 1 / 2 / 3 / 4 / 5 / 6 / 7 / 8.
+        metrics.settlement_finalize_ok();
+        for _ in 0..2 {
+            metrics.settlement_finalize_transient_send();
+        }
+        for _ in 0..3 {
+            metrics.settlement_finalize_transient_receipt();
+        }
+        for _ in 0..4 {
+            metrics.settlement_finalize_reverted();
+        }
+        for _ in 0..5 {
+            metrics.settlement_finalize_confirmed_closed();
+        }
+        for _ in 0..6 {
+            metrics.settlement_finalize_restamped();
+        }
+        for _ in 0..7 {
+            metrics.settlement_finalize_confirm_failed();
+        }
+        for _ in 0..8 {
+            metrics.settlement_pending_persist_failure();
+        }
+
+        let text = metrics.encode().unwrap();
+        for (name, want) in [
+            ("decdn_settlement_finalize_ok_total", 1),
+            ("decdn_settlement_finalize_transient_send_total", 2),
+            ("decdn_settlement_finalize_transient_receipt_total", 3),
+            ("decdn_settlement_finalize_reverted_total", 4),
+            ("decdn_settlement_finalize_confirmed_closed_total", 5),
+            ("decdn_settlement_finalize_restamped_total", 6),
+            ("decdn_settlement_finalize_confirm_failed_total", 7),
+            ("decdn_settlement_pending_persist_failures_total", 8),
+        ] {
+            assert!(
+                has_metric_line(&text, name, want),
+                "expected {name} == {want}:\n{text}"
+            );
+        }
     }
 
     #[test]
