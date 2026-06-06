@@ -8,8 +8,15 @@
 //!
 //!   `PublisherRegistry.namespaceOf(H)` → `[namespaceId...]`
 //!     → `OriginAssignment.getOrigins(namespaceId)` → `[operator...]`
-//!     → `CapacityBond.nodeIdOf(operator)` → `(NodeId, active)`
-//!     → keep `active == true`
+//!     → `CapacityBond.nodeIdOf(operator)` → `NodeId` (binding only)
+//!     → keep operators the shared [`StakerSet`] reports `active`
+//!
+//! Note the split on the last two steps: `nodeIdOf` is read **only** to resolve
+//! the `operator → NodeId` binding (its `active` flag is ignored here), and the
+//! `active == true` filter is applied at lookup time via the shared
+//! [`StakerSet`] — which tracks the same `CapacityBond` active predicate but
+//! stays current without an `OriginAssignment` event (an operator can unbond
+//! while still listed as an origin). See "Why an event-fed cache" below.
 //!
 //! Per ADR 022, a hash with **no** claiming namespace falls back to the
 //! default-open allow-list (`OriginAssignment.getOrigins(0)`); a hash that is
@@ -30,7 +37,8 @@
 //!
 //! `ContentClaimed` is the only on-chain write mapping a hash to a namespace,
 //! so the `hash → namespaces` view is built by replaying `ContentClaimed` logs
-//! from genesis (windowed to respect provider `eth_getLogs` range caps). The
+//! from a configured start block (the `PublisherRegistry` deployment block;
+//! windowed to respect provider `eth_getLogs` range caps). The
 //! `namespace → operators` and default-open sets are snapshotted with direct
 //! `getOrigins` point reads for every namespace the replay surfaced (plus
 //! namespace 0), then kept current from `OriginAssignment` events. A
@@ -94,46 +102,59 @@ struct DirectoryCache {
 }
 
 impl DirectoryCache {
-    /// Operator addresses authorised as origins for `hash`: the union over the
-    /// hash's claiming namespaces, or — if the hash is unclaimed — the
-    /// default-open allow-list (ADR 022 § FIND\_VALUE Flow).
-    fn authorised_operators(&self, hash: &Hash) -> HashSet<Address> {
+    /// Map an authorised operator address to its bound `NodeId`, but only if the
+    /// [`StakerSet`] currently reports that node active. `None` when the operator
+    /// has no cached binding or is not active.
+    fn active_node_for(&self, op: &Address, staker_set: &dyn StakerSet) -> Option<NodeId> {
+        self.operator_node
+            .get(op)
+            .copied()
+            .filter(|node_id| staker_set.is_active(node_id))
+    }
+
+    /// Resolve `hash` to currently-active origin `NodeId`s: the operators
+    /// authorised across the hash's claiming namespaces (or, for an unclaimed
+    /// hash, the default-open allow-list per ADR 022 § FIND\_VALUE Flow), mapped
+    /// to active bound `NodeId`s. Returned sorted + deduplicated — two
+    /// namespaces may list the same operator, and a stable order keeps the set
+    /// deterministic for callers and tests.
+    fn resolve(&self, hash: &Hash, staker_set: &dyn StakerSet) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = match self.namespaces_of.get(hash) {
+            Some(namespaces) if !namespaces.is_empty() => namespaces
+                .iter()
+                .filter_map(|ns| self.origins_of_ns.get(ns))
+                .flatten()
+                .filter_map(|op| self.active_node_for(op, staker_set))
+                .collect(),
+            // No claiming namespace → default-open fallback. (An empty
+            // default-open set yields no origins: a truly-unclaimed hash.)
+            _ => self
+                .default_open
+                .iter()
+                .filter_map(|op| self.active_node_for(op, staker_set))
+                .collect(),
+        };
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    }
+
+    /// Whether at least one active authorised origin exists for `hash`. Iterates
+    /// the underlying sets directly and short-circuits on the first hit — no
+    /// allocation, since the prefetch authorized-origin gate only tests
+    /// emptiness on the (uncommon) lookup-miss path.
+    fn has_any(&self, hash: &Hash, staker_set: &dyn StakerSet) -> bool {
         match self.namespaces_of.get(hash) {
             Some(namespaces) if !namespaces.is_empty() => namespaces
                 .iter()
                 .filter_map(|ns| self.origins_of_ns.get(ns))
                 .flatten()
-                .copied()
-                .collect(),
-            // No claiming namespace → default-open fallback. (An empty
-            // default-open set yields no origins: a truly-unclaimed hash.)
-            _ => self.default_open.clone(),
+                .any(|op| self.active_node_for(op, staker_set).is_some()),
+            _ => self
+                .default_open
+                .iter()
+                .any(|op| self.active_node_for(op, staker_set).is_some()),
         }
-    }
-
-    /// Resolve `hash` to currently-active origin `NodeId`s. Maps each
-    /// authorised operator to its bound `NodeId` and keeps only those the
-    /// [`StakerSet`] reports active. Deduplicated (two namespaces may list the
-    /// same operator).
-    fn resolve(&self, hash: &Hash, staker_set: &dyn StakerSet) -> Vec<NodeId> {
-        self.authorised_operators(hash)
-            .iter()
-            .filter_map(|op| self.operator_node.get(op))
-            .filter(|node_id| staker_set.is_active(node_id))
-            .copied()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    /// Whether at least one active authorised origin exists for `hash`, without
-    /// materialising the candidate list (the prefetch authorized-origin gate
-    /// only tests emptiness).
-    fn has_any(&self, hash: &Hash, staker_set: &dyn StakerSet) -> bool {
-        self.authorised_operators(hash)
-            .iter()
-            .filter_map(|op| self.operator_node.get(op))
-            .any(|node_id| staker_set.is_active(node_id))
     }
 }
 
@@ -170,6 +191,7 @@ impl ChainOriginDirectory {
         origin_assignment_addr: Address,
         publisher_registry_addr: Address,
         capacity_bond_addr: Address,
+        replay_from_block: u64,
         staker_set: Arc<dyn StakerSet>,
         metrics: Arc<Metrics>,
     ) -> Result<Self>
@@ -182,7 +204,7 @@ impl ChainOriginDirectory {
             bond: CapacityBond::new(capacity_bond_addr, provider),
         };
 
-        let cache = bootstrap_cache(&contracts)
+        let cache = bootstrap_cache(&contracts, replay_from_block)
             .await
             .context("snapshot OriginAssignment / PublisherRegistry at bootstrap")?;
         info!(
@@ -192,7 +214,7 @@ impl ChainOriginDirectory {
             claimed_hashes = cache.namespaces_of.len(),
             "ChainOriginDirectory bootstrap snapshot complete"
         );
-        metrics.origin_directory_operator_count(cache.operator_node.len());
+        metrics.origin_directory_operator_count(authorized_operator_count(&cache));
 
         let cache = Arc::new(RwLock::new(cache));
         let watcher_handle = tokio::spawn(watcher_loop(
@@ -250,20 +272,28 @@ impl Drop for AbortOnDrop {
 /// Snapshot current chain state: replay `ContentClaimed` to learn the
 /// `hash → namespaces` map and the set of namespaces, then `getOrigins` each
 /// namespace (plus default-open) and resolve every operator's `NodeId`.
-async fn bootstrap_cache<P>(contracts: &Contracts<P>) -> Result<DirectoryCache>
+async fn bootstrap_cache<P>(
+    contracts: &Contracts<P>,
+    replay_from_block: u64,
+) -> Result<DirectoryCache>
 where
     P: Provider + Clone,
 {
     let mut cache = DirectoryCache::default();
 
-    // 1. hash → namespaces, via windowed ContentClaimed log replay.
+    // 1. hash → namespaces, via windowed ContentClaimed log replay starting at
+    //    `replay_from_block`. Operators SHOULD set this to the PublisherRegistry
+    //    deployment block (`blockchain.origin_directory_from_block`); the
+    //    default `0` is correct but scans the whole chain history in
+    //    `REPLAY_WINDOW_BLOCKS` windows, which is slow / RPC-heavy on an
+    //    established L2.
     let latest = contracts
         .publisher
         .provider()
         .get_block_number()
         .await
         .context("get_block_number for ContentClaimed replay")?;
-    let mut from = 0u64;
+    let mut from = replay_from_block;
     while from <= latest {
         let to = from.saturating_add(REPLAY_WINDOW_BLOCKS - 1).min(latest);
         let logs = contracts
@@ -502,7 +532,7 @@ where
             },
             ev = default_removed.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    remove_default_open(cache, event.operator);
+                    remove_default_open(cache, metrics, event.operator);
                 }
                 Some(Err(e)) => return Err(e).context("DefaultOpenOperatorRemoved stream"),
                 None => return Ok(()),
@@ -535,6 +565,7 @@ async fn on_content_claimed<P>(
                 write_cache(cache, |c| {
                     c.origins_of_ns.insert(namespace, ops.into_iter().collect());
                 });
+                publish_authorized_count(cache, metrics);
             }
             Err(err) => {
                 metrics.origin_directory_watcher_resolve_failure();
@@ -559,6 +590,7 @@ async fn on_assignment_activated<P>(
         c.origins_of_ns
             .insert(namespace, operators.into_iter().collect());
     });
+    publish_authorized_count(cache, metrics);
 }
 
 /// The default-open allow-list was replaced wholesale.
@@ -574,6 +606,7 @@ async fn on_default_open_replaced<P>(
     write_cache(cache, |c| {
         c.default_open = operators.into_iter().collect();
     });
+    publish_authorized_count(cache, metrics);
 }
 
 /// A single operator was added to the default-open allow-list.
@@ -589,6 +622,7 @@ async fn on_default_open_added<P>(
     write_cache(cache, |c| {
         c.default_open.insert(operator);
     });
+    publish_authorized_count(cache, metrics);
 }
 
 /// Remove an operator from a namespace's authorized set (revoke / prune).
@@ -603,14 +637,19 @@ fn remove_origin(
             set.remove(&operator);
         }
     });
-    metrics.origin_directory_operator_count(cache_operator_count(cache));
+    publish_authorized_count(cache, metrics);
 }
 
 /// Remove an operator from the default-open allow-list.
-fn remove_default_open(cache: &Arc<RwLock<DirectoryCache>>, operator: Address) {
+fn remove_default_open(
+    cache: &Arc<RwLock<DirectoryCache>>,
+    metrics: &Arc<Metrics>,
+    operator: Address,
+) {
     write_cache(cache, |c| {
         c.default_open.remove(&operator);
     });
+    publish_authorized_count(cache, metrics);
 }
 
 /// Resolve any not-yet-cached operators to their `NodeId` and store the
@@ -642,12 +681,29 @@ async fn resolve_and_store_operators<P>(
             }
         }
     }
-    metrics.origin_directory_operator_count(cache_operator_count(cache));
+    // NB: the authorised-operator gauge is published by the calling event
+    // handler AFTER it applies its set mutation — not here, where only the
+    // binding cache changed (bindings don't alter the authorised set).
 }
 
-/// Number of cached `operator → NodeId` bindings, for the size gauge.
-fn cache_operator_count(cache: &Arc<RwLock<DirectoryCache>>) -> usize {
-    read_cache(cache, |c| c.operator_node.len())
+/// Distinct operator addresses currently authorised as origins — the union of
+/// every namespace's operator set and the default-open allow-list. Unlike the
+/// monotonic `operator_node` binding cache, this rises on activate/add and
+/// falls on revoke/prune/remove/replace, so it tracks the directory's live
+/// authorised-origin surface.
+fn authorized_operator_count(c: &DirectoryCache) -> usize {
+    c.origins_of_ns
+        .values()
+        .flatten()
+        .chain(c.default_open.iter())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Recompute and publish the authorised-operator gauge. Call AFTER an event
+/// handler has applied its set mutation, so the gauge reflects the new state.
+fn publish_authorized_count(cache: &Arc<RwLock<DirectoryCache>>, metrics: &Arc<Metrics>) {
+    metrics.origin_directory_operator_count(read_cache(cache, authorized_operator_count));
 }
 
 /// Poison-tolerant `RwLock` write, mirroring [`read_cache`].
@@ -749,9 +805,8 @@ mod tests {
             &[(addr(0xA), nid(0xA)), (addr(0xB), nid(0xB))],
         );
         let stakers = StubStakers::new(&[nid(0xA), nid(0xB)]);
-        let mut got = c.resolve(&h(1), &stakers);
-        got.sort();
-        assert_eq!(got, vec![nid(0xA), nid(0xB)]);
+        // `resolve` returns sorted + deduplicated, so assert order directly.
+        assert_eq!(c.resolve(&h(1), &stakers), vec![nid(0xA), nid(0xB)]);
         assert!(c.has_any(&h(1), &stakers));
     }
 
@@ -765,12 +820,10 @@ mod tests {
             &[(addr(0xA), nid(0xA)), (addr(0xC), nid(0xC))],
         );
         let stakers = StubStakers::new(&[nid(0xA), nid(0xC)]);
-        let mut got = c.resolve(&h(1), &stakers);
-        got.sort();
         assert_eq!(
-            got,
+            c.resolve(&h(1), &stakers),
             vec![nid(0xA), nid(0xC)],
-            "A appears once despite two namespaces"
+            "A appears once despite two namespaces; output is sorted + deduped"
         );
     }
 
@@ -881,5 +934,27 @@ mod tests {
         assert!(c.default_open.contains(&addr(0xE)));
         c.default_open.remove(&addr(0xD));
         assert!(!c.default_open.contains(&addr(0xD)));
+    }
+
+    #[test]
+    fn authorized_operator_count_reflects_current_sets_and_decreases() {
+        // Distinct addresses across namespaces + default-open; A is shared
+        // between ns 7 and default-open, so it counts once: {A, B, C} = 3.
+        let mut c = cache_with(
+            &[],
+            &[(7, &[addr(0xA), addr(0xB)]), (8, &[addr(0xC)])],
+            &[addr(0xA)],
+            &[],
+        );
+        assert_eq!(authorized_operator_count(&c), 3);
+        // A revoke must DECREASE the count (the bug this fix addresses: the old
+        // gauge counted the monotonic binding cache and never dropped).
+        c.origins_of_ns.get_mut(&ns(7)).unwrap().remove(&addr(0xB));
+        assert_eq!(authorized_operator_count(&c), 2, "B removed → {{A, C}}");
+        // Removing A from ns 7 still leaves A in default-open → count unchanged.
+        c.origins_of_ns.get_mut(&ns(7)).unwrap().remove(&addr(0xA));
+        assert_eq!(authorized_operator_count(&c), 2, "A still in default-open");
+        c.default_open.remove(&addr(0xA));
+        assert_eq!(authorized_operator_count(&c), 1, "A fully removed → {{C}}");
     }
 }

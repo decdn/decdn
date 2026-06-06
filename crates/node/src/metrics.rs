@@ -449,9 +449,11 @@ pub struct DecdnMetrics {
     /// cycle; recomputed at scrape time from a monotonic `down_since`. A
     /// poisoned lock reports `i64::MAX` (alerting direction).
     pub origin_directory_watcher_down_seconds: Gauge,
-    /// `decdn_origin_directory_operator_count` (#651): number of cached
-    /// `operator → NodeId` bindings — the distinct authorised origins the
-    /// directory can currently resolve. Sampled on every binding change.
+    /// `decdn_origin_directory_operator_count` (#651): distinct operator
+    /// addresses currently authorised as origins across all namespaces plus the
+    /// default-open allow-list. Recomputed and sampled after every event that
+    /// mutates an authorised set, so it rises on activate/add and falls on
+    /// revoke/prune/remove/replace (unlike the monotonic binding cache).
     pub origin_directory_operator_count: Gauge,
     /// `1` if `prefetch.enabled`, else `0` (ADR 022 §Prefetch Decision;
     /// appendix-observability §Prefetch Metrics). Stable schema across nodes:

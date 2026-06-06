@@ -718,6 +718,7 @@ pub async fn run(
                     origin_assignment_addr,
                     publisher_registry_addr,
                     capacity_bond_addr,
+                    cfg.blockchain.origin_directory_from_block,
                     Arc::clone(&staker_set),
                     Arc::clone(&node_metrics),
                 )
@@ -2306,6 +2307,7 @@ mod tests {
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
                 publisher_registry_address: None,
+                origin_directory_from_block: 0,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,

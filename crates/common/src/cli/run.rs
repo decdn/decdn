@@ -94,8 +94,9 @@ pub struct BlockchainArgs {
 
     /// `OriginAssignment` contract address (0x-prefixed hex). Optional:
     /// enables the chain-backed origin directory that gates DHT prefetch
-    /// (ADR 022). Must be set together with `publisher_registry_address`;
-    /// when both are unset the node uses the file-config origin directory.
+    /// (ADR 022). Must be set together with `publisher_registry_address`.
+    /// When both are unset the origin directory is empty (deny-all): the
+    /// prefetch authorized-origin gate finds no on-chain origins.
     #[arg(long, value_name = "ADDR", env = "DECDN_ORIGIN_ASSIGNMENT_ADDRESS")]
     pub origin_assignment_address: Option<String>,
 

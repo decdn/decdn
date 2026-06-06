@@ -786,6 +786,12 @@ fn resolve_blockchain_into(
             parse_contract_address("publisher_registry_address", &v),
         )
     });
+    // File-only tuning for the chain-backed origin directory's log replay.
+    // Default `0` is correct but scans the whole chain; operators set this to
+    // the PublisherRegistry deployment block on an established L2.
+    let origin_directory_from_block = file
+        .and_then(|b| b.origin_directory_from_block)
+        .unwrap_or(0);
 
     // Required like the other contract addresses: a wrong/zero
     // `verifyingContract` silently produces `slash_sig`s no verifier accepts
@@ -931,6 +937,7 @@ fn resolve_blockchain_into(
         capacity_bond_address,
         origin_assignment_address,
         publisher_registry_address,
+        origin_directory_from_block,
         slash_judge_address,
         chain_id,
         rpc_watchdog_interval_sec,
@@ -3061,6 +3068,7 @@ mod tests {
     fn cfg_with_rpc(raw: &str) -> FileConfig {
         FileConfig {
             blockchain: Some(types::BlockchainConfig {
+                origin_directory_from_block: None,
                 origin_assignment_address: None,
                 publisher_registry_address: None,
                 rpc_url: Some(raw.to_string()),
@@ -3092,6 +3100,7 @@ mod tests {
         let home = home_str()?;
         let mut cfg = FileConfig {
             blockchain: Some(types::BlockchainConfig {
+                origin_directory_from_block: None,
                 origin_assignment_address: None,
                 publisher_registry_address: None,
                 slash_judge_address: Some("${HOME}/judge".to_string()),
@@ -3366,6 +3375,7 @@ mod tests {
             }),
             ("blockchain.rpc_url", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
+                    origin_directory_from_block: None,
                     origin_assignment_address: None,
                     publisher_registry_address: None,
                     rpc_url: Some(v.to_string()),
@@ -3374,6 +3384,7 @@ mod tests {
             }),
             ("blockchain.eth_keystore", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
+                    origin_directory_from_block: None,
                     origin_assignment_address: None,
                     publisher_registry_address: None,
                     eth_keystore: Some(PathBuf::from(v)),
@@ -3382,6 +3393,7 @@ mod tests {
             }),
             ("blockchain.payment_channel_address", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
+                    origin_directory_from_block: None,
                     origin_assignment_address: None,
                     publisher_registry_address: None,
                     payment_channel_address: Some(v.to_string()),
@@ -3390,6 +3402,7 @@ mod tests {
             }),
             ("blockchain.capacity_bond_address", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
+                    origin_directory_from_block: None,
                     origin_assignment_address: None,
                     publisher_registry_address: None,
                     capacity_bond_address: Some(v.to_string()),
@@ -6727,6 +6740,7 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: Some("https://file-loses.example/rpc".to_string()),
@@ -6759,6 +6773,7 @@ mod tests {
         let dir = data_dir_with_keystore()?;
         let cli = empty_blockchain_args();
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: Some("https://file-only.example/rpc".to_string()),
@@ -6978,6 +6993,7 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -7020,6 +7036,7 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -7061,6 +7078,7 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -7102,6 +7120,7 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -7165,6 +7184,7 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -7205,6 +7225,7 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -7240,6 +7261,7 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,

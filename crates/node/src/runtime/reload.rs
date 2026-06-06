@@ -771,6 +771,7 @@ impl RuntimeReloadState {
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
                 publisher_registry_address: None,
+                origin_directory_from_block: 0,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,
@@ -1256,6 +1257,7 @@ mod tests {
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
                 publisher_registry_address: None,
+                origin_directory_from_block: 0,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,
