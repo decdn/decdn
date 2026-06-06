@@ -112,6 +112,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         },
         dht: decdn_common::config::ResolvedDht::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
+        prefetch: decdn_common::config::ResolvedPrefetch::default(),
     }
 }
 

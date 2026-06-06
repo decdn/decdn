@@ -54,6 +54,10 @@ pub fn effective_source(
 /// Render the validation summary. Separated from [`config_validate`] so tests
 /// can capture the output into a buffer and assert on the printed contract —
 /// in particular that `rpc_url` and `otlp_endpoint` values never appear.
+// Linear "print each resolved config field" flow sitting right at the 100-line
+// boundary; splitting the writeln! sequence across helpers would obscure the
+// field-by-field narrative more than the length does.
+#[allow(clippy::too_many_lines)]
 pub fn write_validate_summary<W: std::io::Write>(
     w: &mut W,
     source: Option<&std::path::Path>,
@@ -161,6 +165,11 @@ pub fn write_validate_summary<W: std::io::Write>(
             otlp.len()
         )?;
     }
+    writeln!(
+        w,
+        "  prefetch_enabled:         {}",
+        resolved.prefetch.enabled
+    )?;
     Ok(())
 }
 
@@ -237,4 +246,18 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # admin_port = 9191                        # loopback-only; 0 disables (ADR 025)
 # region_accounting_interval_sec = 3600    # 0 disables the per-region bandwidth log (#750)
 # otlp_endpoint = "http://localhost:4317"  # requires --features otlp
+
+[prefetch]
+# ADR 022 speculative-prefetch operator policy. Disabled by default.
+# NOTE: this slice only *meters* — it records demand, runs the decision gates,
+# and exports metrics, but does not yet acquire content (the live acquisition
+# is the #650 follow-up). Setting enabled = true before then exercises the
+# decision/metrics path only; no prefetch bytes are fetched and no USDC spent.
+# enabled = false
+# require_authorized_origin = true          # require an authorized origin in the FIND_VALUE candidate set
+# budget_usdc_per_hour = 0                  # micro-USDC rolling-1h spend cap; 0 = never prefetch
+# find_value_threshold = 5                  # FIND_VALUE queries within the window that trip the trigger
+# threshold_window_secs = 300               # rolling-window length for the trigger
+# demand_quality_min_ratio = 0.1            # served/acquired auto-throttle floor
+# demand_quality_window_secs = 3600         # rolling-window length for the demand-quality predicate
 "#;

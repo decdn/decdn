@@ -685,14 +685,39 @@ pub async fn run(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    let dht_handler = Arc::new(DhtHandler::new(
-        secret_key.public(),
-        Arc::clone(&dht_rate_limiter),
-        Arc::clone(&limiter),
-        Arc::clone(&node_metrics),
-        Arc::clone(&staker_set),
-        Arc::clone(&record_store),
+    // Operator-policy prefetch engine (ADR 022 §Prefetch; #650). Off by
+    // default. The authorized-origin gate reads from an origin directory; the
+    // chain-backed / config-driven directory is the #650 follow-up, so until
+    // then the engine uses an empty `ConfigOriginDirectory` (the gate rejects
+    // every hash, which only matters once an operator sets `prefetch.enabled`).
+    // The enabled gauge is published regardless so dashboards have a uniform
+    // schema across enabled/disabled nodes (appendix-observability §Prefetch).
+    let prefetch_origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> = Arc::new(
+        crate::dht::origin::ConfigOriginDirectory::new(std::collections::HashMap::new()),
+    );
+    let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(
+        cfg.prefetch,
+        prefetch_origin_directory,
     ));
+    node_metrics.set_prefetch_enabled(prefetch_engine.enabled());
+    // Seed the demand-quality gauges once so they read a sane baseline
+    // (ratio = 1.0, throttle = false) rather than a misleading `0` on nodes that
+    // never hit a threshold-cross; the handler refreshes them only on a decision.
+    node_metrics.set_prefetch_quality(
+        prefetch_engine.policy().demand_quality_ratio(0),
+        prefetch_engine.policy().throttle_active(0),
+    );
+    let dht_handler = Arc::new(
+        DhtHandler::new(
+            secret_key.public(),
+            Arc::clone(&dht_rate_limiter),
+            Arc::clone(&limiter),
+            Arc::clone(&node_metrics),
+            Arc::clone(&staker_set),
+            Arc::clone(&record_store),
+        )
+        .with_prefetch(prefetch_engine),
+    );
 
     // The DHT handler builds its own routing table internally; grab a
     // shared handle so the bootstrap path + republish + bucket-refresh
@@ -2328,6 +2353,7 @@ mod tests {
             },
             dht: decdn_common::config::ResolvedDht::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
+            prefetch: decdn_common::config::ResolvedPrefetch::default(),
         };
         (tmp, cfg)
     }

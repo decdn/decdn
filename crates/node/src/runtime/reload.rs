@@ -826,6 +826,7 @@ impl RuntimeReloadState {
             },
             dht: decdn_common::config::ResolvedDht::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
+            prefetch: decdn_common::config::ResolvedPrefetch::default(),
         };
         Self::new(
             decdn_common::cli::run::PaymentArgs {
@@ -1308,6 +1309,7 @@ mod tests {
             },
             receipts: decdn_common::config::ResolvedReceipts::default(),
             dht: decdn_common::config::ResolvedDht::default(),
+            prefetch: decdn_common::config::ResolvedPrefetch::default(),
         }
     }
 

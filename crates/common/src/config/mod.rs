@@ -21,7 +21,7 @@ pub use errors::ConfigErrorBag;
 pub use resolved::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedGossip,
     ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment,
-    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedPrefetch, ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -162,6 +162,21 @@ pub const DEFAULT_RECEIPT_RETAINED_FILES: u32 = 4;
 /// bound is `(retained_files + 1) * max_file_bytes`.
 pub const MAX_RECEIPT_RETAINED_FILES: u32 = 100;
 
+/// Default `prefetch.enabled` (ADR 022 §Prefetch Decision): opt-in.
+pub const DEFAULT_PREFETCH_ENABLED: bool = false;
+/// Default `prefetch.require_authorized_origin`: closes the demand-supply Sybil.
+pub const DEFAULT_PREFETCH_REQUIRE_AUTHORIZED_ORIGIN: bool = true;
+/// Default `prefetch.budget_usdc_per_hour`: `0` => never prefetches.
+pub const DEFAULT_PREFETCH_BUDGET_USDC_PER_HOUR: u64 = 0;
+/// Default `prefetch.find_value_threshold` (ADR 022 §Prefetch Decision table).
+pub const DEFAULT_PREFETCH_FIND_VALUE_THRESHOLD: u32 = 5;
+/// Default `prefetch.threshold_window_secs` (ADR 022 §Prefetch Decision table).
+pub const DEFAULT_PREFETCH_THRESHOLD_WINDOW_SECS: u64 = 300;
+/// Default `prefetch.demand_quality_min_ratio` (ADR 022 §Prefetch Decision table).
+pub const DEFAULT_PREFETCH_DEMAND_QUALITY_MIN_RATIO: f64 = 0.1;
+/// Default `prefetch.demand_quality_window_secs` (ADR 022 §Prefetch Decision table).
+pub const DEFAULT_PREFETCH_DEMAND_QUALITY_WINDOW_SECS: u64 = 3600;
+
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -215,6 +230,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let security = resolve_security_into(file.security.as_ref(), &mut bag);
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
     let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
+    let prefetch = resolve_prefetch_into(file.prefetch.as_ref(), &mut bag);
 
     ensure_region_when_publishing_global_into(&identity, &gossip, &mut bag);
     validate_port_layout_into(&network, &observability, &mut bag);
@@ -232,6 +248,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         security,
         dht,
         receipts,
+        prefetch,
     })
 }
 
@@ -1733,6 +1750,77 @@ fn resolve_receipts_into(
     }
 }
 
+/// Single-section shim for direct unit tests; `resolve_config` uses the
+/// `_into` worker with the shared bag.
+#[cfg(test)]
+fn resolve_prefetch(file: Option<&types::PrefetchConfig>) -> anyhow::Result<ResolvedPrefetch> {
+    one_section(|bag| resolve_prefetch_into(file, bag))
+}
+
+/// Bag-threading worker for the `[prefetch]` section (ADR 022 §Prefetch
+/// Decision). Shares a bag with the other sections during startup so an
+/// operator sees every config problem in one pass; see `resolve_payment_into`.
+fn resolve_prefetch_into(
+    file: Option<&types::PrefetchConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedPrefetch {
+    let enabled = file
+        .and_then(|p| p.enabled)
+        .unwrap_or(DEFAULT_PREFETCH_ENABLED);
+    let require_authorized_origin = file
+        .and_then(|p| p.require_authorized_origin)
+        .unwrap_or(DEFAULT_PREFETCH_REQUIRE_AUTHORIZED_ORIGIN);
+    let budget_usdc_per_hour = file
+        .and_then(|p| p.budget_usdc_per_hour)
+        .unwrap_or(DEFAULT_PREFETCH_BUDGET_USDC_PER_HOUR);
+
+    let find_value_threshold = file
+        .and_then(|p| p.find_value_threshold)
+        .unwrap_or(DEFAULT_PREFETCH_FIND_VALUE_THRESHOLD);
+    bag.check(
+        find_value_threshold > 0,
+        "prefetch.find_value_threshold",
+        "prefetch.find_value_threshold must be > 0",
+    );
+
+    let threshold_window_secs = file
+        .and_then(|p| p.threshold_window_secs)
+        .unwrap_or(DEFAULT_PREFETCH_THRESHOLD_WINDOW_SECS);
+    bag.check(
+        threshold_window_secs > 0,
+        "prefetch.threshold_window_secs",
+        "prefetch.threshold_window_secs must be > 0",
+    );
+
+    let demand_quality_min_ratio = file
+        .and_then(|p| p.demand_quality_min_ratio)
+        .unwrap_or(DEFAULT_PREFETCH_DEMAND_QUALITY_MIN_RATIO);
+    bag.check(
+        demand_quality_min_ratio.is_finite() && (0.0..=1.0).contains(&demand_quality_min_ratio),
+        "prefetch.demand_quality_min_ratio",
+        "prefetch.demand_quality_min_ratio must be a finite number in [0.0, 1.0]",
+    );
+
+    let demand_quality_window_secs = file
+        .and_then(|p| p.demand_quality_window_secs)
+        .unwrap_or(DEFAULT_PREFETCH_DEMAND_QUALITY_WINDOW_SECS);
+    bag.check(
+        demand_quality_window_secs > 0,
+        "prefetch.demand_quality_window_secs",
+        "prefetch.demand_quality_window_secs must be > 0",
+    );
+
+    ResolvedPrefetch {
+        enabled,
+        require_authorized_origin,
+        budget_usdc_per_hour,
+        find_value_threshold,
+        threshold_window_secs,
+        demand_quality_min_ratio,
+        demand_quality_window_secs,
+    }
+}
+
 /// Resolve security / rate-limiting fields.
 ///
 /// Each numeric field accepts `0` as the "disable this layer" sentinel:
@@ -2563,6 +2651,50 @@ mod tests {
             err.contains("receipts.retained_files"),
             "error missing field context: {err}"
         );
+    }
+
+    #[test]
+    fn prefetch_defaults_match_adr() {
+        let r = resolve_prefetch(None).expect("defaults must resolve");
+        assert!(!r.enabled);
+        assert!(r.require_authorized_origin);
+        assert_eq!(r.budget_usdc_per_hour, 0);
+        assert_eq!(r.find_value_threshold, 5);
+        assert_eq!(r.threshold_window_secs, 300);
+        assert!((r.demand_quality_min_ratio - 0.1).abs() < f64::EPSILON);
+        assert_eq!(r.demand_quality_window_secs, 3600);
+    }
+
+    #[test]
+    fn prefetch_rejects_zero_threshold() {
+        let file = types::PrefetchConfig {
+            find_value_threshold: Some(0),
+            ..Default::default()
+        };
+        assert!(resolve_prefetch(Some(&file)).is_err());
+    }
+
+    #[test]
+    fn prefetch_rejects_ratio_above_one() {
+        let file = types::PrefetchConfig {
+            demand_quality_min_ratio: Some(1.5),
+            ..Default::default()
+        };
+        assert!(resolve_prefetch(Some(&file)).is_err());
+    }
+
+    #[test]
+    fn prefetch_rejects_zero_windows() {
+        let win = types::PrefetchConfig {
+            threshold_window_secs: Some(0),
+            ..Default::default()
+        };
+        assert!(resolve_prefetch(Some(&win)).is_err());
+        let dq = types::PrefetchConfig {
+            demand_quality_window_secs: Some(0),
+            ..Default::default()
+        };
+        assert!(resolve_prefetch(Some(&dq)).is_err());
     }
 
     #[test]
