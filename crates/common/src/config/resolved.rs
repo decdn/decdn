@@ -64,7 +64,7 @@ impl ResolvedDiscovery {
 /// One resolved static peer ([`ResolvedDiscovery::peers`]).
 #[derive(Debug, Clone)]
 pub struct ResolvedDiscoveryPeer {
-    /// Peer `NodeId`, 64-char hex (shape-validated at resolution).
+    /// Peer `NodeId` (lowercase hex or z-base-32; validated at resolution).
     pub node_id: String,
     /// Peer home relay URL, if configured.
     pub relay_url: Option<String>,

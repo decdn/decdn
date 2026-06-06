@@ -558,8 +558,9 @@ fn resolve_network_into(
 /// Resolve and shape-validate `[network.discovery]` (#818 scope 1), recording
 /// every malformed entry into `bag`.
 ///
-/// Validation is a *shape* check only (a parseable URL, a non-empty origin, a
-/// 64-hex `NodeId`, a parseable `SocketAddr`) — the authoritative build into iroh
+/// Validation is a parse check (a parseable URL, a non-empty origin, a valid
+/// iroh `NodeId` — lowercase hex or z-base-32 — and a parseable `SocketAddr`)
+/// using the same parsers the node uses; the authoritative build into iroh
 /// types happens in the `node` wiring layer (`build_endpoint`), per the
 /// discovery-provider seam in `adr/appendix-poc-production-seams.md`. Echoed
 /// URLs are run through [`redact_userinfo`](crate::redact) so a credential-
@@ -610,8 +611,10 @@ fn resolve_discovery_into(
         .filter_map(|(node_id, peer)| resolve_discovery_peer(node_id, peer, bag))
         .collect();
     // `HashMap` iteration order is nondeterministic; sort so the node build and
-    // any test assertions are stable.
-    peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    // any test assertions are stable. Unstable sort: peer node_ids are unique
+    // (HashMap keys), so stable ordering buys nothing and `sort_unstable_by`
+    // avoids the aux allocation.
+    peers.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
 
     ResolvedDiscovery {
         pkarr_url,

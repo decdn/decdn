@@ -374,10 +374,11 @@ fn summary_includes_prefetch_enabled() -> anyhow::Result<()> {
 #[test]
 fn summary_reports_discovery_without_leaking_secrets() -> anyhow::Result<()> {
     // #818: the summary names dns_origin and the peer count, redacts the
-    // pkarr_url (it can carry credentials), and never echoes peer addresses.
+    // pkarr_url userinfo (its only credential vector) while keeping the host
+    // visible for diagnostics, and never echoes peer addresses.
     let cfg = sample_resolved(|c| {
         c.network.discovery = decdn_common::config::ResolvedDiscovery {
-            pkarr_url: Some("https://pkarr.example/PKARR_SECRET_xyz".to_string()),
+            pkarr_url: Some("https://user:PKARR_SECRET_xyz@pkarr.example/".to_string()),
             dns_origin: Some("discovery.example.".to_string()),
             peers: vec![decdn_common::config::ResolvedDiscoveryPeer {
                 node_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -398,7 +399,11 @@ fn summary_reports_discovery_without_leaking_secrets() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         !out.contains("PKARR_SECRET_xyz"),
-        "pkarr_url value must never appear in summary: {out}"
+        "pkarr_url credentials must never appear in summary: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("***@pkarr.example/"),
+        "pkarr_url userinfo should be redacted with the host preserved: {out}"
     );
     anyhow::ensure!(
         !out.contains("203.0.113.4:4433"),
