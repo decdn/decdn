@@ -512,14 +512,27 @@ fn resolve_network_into(
         }
     };
 
-    // Validate each resolved entry. The label is indexed (`network.relay_urls[i]`)
-    // matching the `cache.origins[i]` convention; the offending entry is echoed
-    // with userinfo redacted (a malformed entry can still carry `user:pass@`),
-    // mirroring bring-up's `parse_relay_urls`.
+    // Validate each resolved entry. The label names the source the operator
+    // actually wrote: the indexed array field (`network.relay_urls[i]`, matching
+    // the `cache.origins[i]` convention) only when the list branch above was
+    // taken, otherwise the singular `network.relay_url` (the deprecated alias or
+    // `--relay-url`, which always resolve to a one-element vec) — reporting
+    // `relay_urls[0]` there would point at an array the operator never defined.
+    // The offending entry is echoed with userinfo redacted (a malformed entry
+    // can still carry `user:pass@`), mirroring bring-up's `parse_relay_urls`.
+    let from_array = cli.relay_url.is_none()
+        && file
+            .and_then(|n| n.relay_urls.as_ref())
+            .is_some_and(|l| !l.is_empty());
     for (i, entry) in relay_urls.iter().enumerate() {
         if let Err(e) = url::Url::parse(entry) {
+            let label = if from_array {
+                format!("network.relay_urls[{i}]")
+            } else {
+                "network.relay_url".to_string()
+            };
             bag.push(
-                format!("network.relay_urls[{i}]"),
+                label,
                 format!("invalid relay URL {:?}: {e}", redact_userinfo(entry)),
             );
         }
@@ -6504,8 +6517,10 @@ mod tests {
     #[test]
     fn resolve_network_validates_deprecated_relay_url_alias() {
         // The deprecated singular `relay_url` alias folds into the resolved
-        // list and must be validated like a list entry — pins that every
-        // precedence branch feeds the parse gate, not just the list path.
+        // list and must be validated — pins that every precedence branch feeds
+        // the parse gate, not just the list path. Its error is labelled under
+        // the singular `network.relay_url`, not the indexed array field the
+        // operator never wrote.
         let cli = empty_network_args();
         let file = types::NetworkConfig {
             bind_port: None,
@@ -6517,8 +6532,27 @@ mod tests {
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
         let msg = format!("{:#}", bag.into_result().unwrap_err());
         assert!(
-            msg.contains("network.relay_urls[0]") && msg.contains("not a url"),
-            "alias entry must be validated: {msg}"
+            msg.contains("network.relay_url:") && msg.contains("not a url"),
+            "alias entry must be validated under the singular label: {msg}"
+        );
+        assert!(
+            !msg.contains("network.relay_urls["),
+            "singular source must not be reported as an array index: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_network_validates_cli_relay_url_flag() {
+        // The CLI `--relay-url` singular flag is also validated and, like the
+        // alias, reported under the singular `network.relay_url` label.
+        let mut cli = empty_network_args();
+        cli.relay_url = Some("not a url".to_string());
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, None, &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(
+            msg.contains("network.relay_url:") && !msg.contains("network.relay_urls["),
+            "CLI singular source must use the singular label: {msg}"
         );
     }
 
