@@ -198,8 +198,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [network]
 # bind_port = 4433
-# Multiple relays give redundancy/failover; bring-up fails only if every
-# probeable relay is unreachable.
+# Multiple relays give redundancy/failover; reachability is probed at bring-up
+# and logged but never fatal (the node proceeds and iroh retries in the background).
 # relay_urls = ["https://relay-a.example.", "https://relay-b.example."]
 # Deprecated single-relay alias (folded into relay_urls when set):
 # relay_url = "https://relay.iroh.network."

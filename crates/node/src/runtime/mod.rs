@@ -1348,24 +1348,28 @@ async fn build_endpoint(
     // the operator's relays. Replacing the n0 DNS/pkarr leg too (full
     // self-hosted discovery) is deliberately out of scope for this change.
     // Multiple entries give redundancy/failover. A custom relay sits on the
-    // NAT-traversal critical path, so bring-up is gated on reachability: if
-    // every relay we could actually probe was unreachable, that is almost
-    // certainly misconfiguration and would otherwise degrade silently into
-    // unroutable connections, so we fail loudly here. A partially-reachable set
-    // proceeds (warning on the down relays) since iroh keeps retrying them in
-    // the background. The gossip service shares this endpoint
-    // (`build_gossip(ep.clone())`), so it inherits the same relay map for free.
+    // NAT-traversal critical path, so we probe reachability at bring-up — but
+    // the probe is advisory, never fatal: if every relay we could probe was
+    // unreachable we log a loud warning and proceed, trusting iroh's background
+    // retry, rather than turning a *transient* relay outage into a node outage
+    // (a correlated relay blip during a rolling restart must not wedge the
+    // fleet). Note the probe is a bare TCP connect, so it proves liveness of the
+    // host:port, not relay-protocol health — a fronting LB / reverse proxy can
+    // accept the connection while the relay behind it is unhealthy. The gossip
+    // service shares this endpoint (`build_gossip(ep.clone())`), so it inherits
+    // the same relay map for free.
     if !relay_urls.is_empty() {
         let relays = parse_relay_urls(relay_urls)?;
         let tally = probe_relays(&relays).await;
-        // Hard-fail only when at least one relay was actually probed and none
-        // were reachable. Relays we couldn't probe (no derivable host/port —
-        // iroh may still route them) are excluded from the gate rather than
-        // counted as failures, so an all-unprobeable set proceeds on trust.
+        // Advisory only: warn loudly when at least one relay was actually probed
+        // and none were reachable, but proceed regardless. Relays we couldn't
+        // probe (no derivable host/port — iroh may still route them) are
+        // excluded; their per-relay "skipping" warning already fired.
         if tally.reachable == 0 && tally.unprobeable < relays.len() {
-            anyhow::bail!(
+            tracing::warn!(
                 "none of the {} probeable network.relay_urls were reachable at bring-up; \
-                 check the URLs and that at least one relay is up",
+                 proceeding and letting iroh retry in the background — check the URLs and \
+                 that a relay is up, or clear network.relay_urls to fall back to the n0 relays",
                 relays.len().saturating_sub(tally.unprobeable)
             );
         }
@@ -2816,8 +2820,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_endpoint_fails_when_all_relays_unreachable() {
-        // A non-empty, all-unreachable relay set hard-fails bring-up.
+    async fn build_endpoint_binds_when_all_relays_unreachable() {
+        // A non-empty, all-unreachable relay set is advisory only: bring-up logs
+        // a warning and proceeds (iroh retries in the background) rather than
+        // failing, so a transient relay outage can't wedge node startup.
         let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_port = dead.local_addr().unwrap().port();
         drop(dead);
@@ -2825,13 +2831,10 @@ mod tests {
         let sk = SecretKey::generate();
         let transport = quic_transport_config().unwrap();
         let relays = vec![format!("http://127.0.0.1:{dead_port}")];
-        let err = build_endpoint(&sk, 0, &relays, transport)
+        let ep = build_endpoint(&sk, 0, &relays, transport)
             .await
-            .expect_err("all-unreachable relay set aborts bring-up");
-        assert!(
-            err.to_string().contains("reachable"),
-            "error should explain the reachability gate: {err}"
-        );
+            .expect("all-unreachable relay set proceeds with a warning");
+        ep.close().await;
     }
 
     #[tokio::test]

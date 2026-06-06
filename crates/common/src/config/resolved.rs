@@ -25,10 +25,10 @@ pub struct ResolvedNetwork {
     /// QUIC bind port.
     pub bind_port: u16,
     /// iroh relay URLs for NAT traversal. Empty => use the n0 default relays;
-    /// non-empty => swap in these self-hosted relays (`RelayMode::Custom`),
-    /// with bring-up gated on reachability — it fails only when every
-    /// probeable relay is unreachable (entries with no derivable host/port
-    /// are skipped, not counted as failures).
+    /// non-empty => swap in these self-hosted relays (`RelayMode::Custom`).
+    /// Reachability is probed at bring-up and logged but never fatal: an
+    /// all-unreachable set warns and proceeds (iroh retries in the background);
+    /// entries with no derivable host/port are skipped.
     pub relay_urls: Vec<String>,
     /// QUIC 0-RTT master switch for `cdn/probe/v1` (ADR 015). Default `true`.
     pub enable_0rtt: bool,
