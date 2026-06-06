@@ -60,6 +60,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 use crate::receipt_log::{DownloadReceipt, ReceiptSink};
+use crate::region_accounting::RegionAccountant;
 
 /// Default per-connection concurrent-stream cap for `cdn/client/v1` (ADR 005
 /// §Concurrent stream limits). The QUIC transport config also caps bidi
@@ -125,6 +126,11 @@ pub struct ClientHandler {
     /// an unattached handler just skips it and the channel reports "no
     /// activity since restart" to the operator.
     voucher_activity: OnceLock<Arc<VoucherActivity>>,
+    /// Per-region bandwidth accountant (issue #750), attached post-construction
+    /// via [`ClientHandler::attach_region_accountant`]. `None` until attached
+    /// (tests / no admin surface) — recording is best-effort, so an unattached
+    /// handler simply skips it.
+    region_accountant: OnceLock<Arc<RegionAccountant>>,
     rate_per_mb: Arc<AtomicU64>,
     delivery_floor: u64,
     delivery_ceiling: u64,
@@ -198,6 +204,7 @@ impl ClientHandler {
             channels: Arc::new(Mutex::new(map)),
             redeem_hint: OnceLock::new(),
             voucher_activity: OnceLock::new(),
+            region_accountant: OnceLock::new(),
             rate_per_mb,
             delivery_floor,
             delivery_ceiling,
@@ -222,6 +229,14 @@ impl ClientHandler {
     /// time so `decdn node channels` can report "time since last voucher".
     pub fn attach_voucher_activity(&self, activity: Arc<VoucherActivity>) {
         let _ = self.voucher_activity.set(activity);
+    }
+
+    /// Attach the per-region bandwidth accountant (issue #750). Called once
+    /// during runtime wiring; a second call is ignored (the `OnceLock` keeps
+    /// the first). After this, each accepted voucher records the delivered
+    /// bytes against the paying peer's region.
+    pub fn attach_region_accountant(&self, accountant: Arc<RegionAccountant>) {
+        let _ = self.region_accountant.set(accountant);
     }
 
     /// Register a channel observed on-chain via `ChannelOpened` (#327) so the
@@ -760,6 +775,12 @@ impl ClientHandler {
                 // #803): a non-blocking enqueue before `VoucherAck`; the write
                 // happens off the hot path in the background receipt writer.
                 self.record_receipt(hash, delta_bytes, client_node_id, wire.nonce);
+                // Per-region bandwidth accounting (#750). Best-effort: an
+                // unattached accountant (tests / no admin surface) skips.
+                // `delta_bytes` is exactly the bytes paid for this interval.
+                if let Some(acc) = self.region_accountant.get() {
+                    acc.record_served(&client_node_id.0, delta_bytes).await;
+                }
                 // Nonce-gap signal (#747): the voucher was accepted, but its
                 // nonce skipped values past the prior `last_nonce + 1`. The
                 // structured `tracing::warn!` already fired inside

@@ -316,6 +316,9 @@ pub struct ResolvedObservability {
     pub admin_port: Option<u16>,
     /// OTLP collector endpoint URL (if set, span export is enabled).
     pub otlp_endpoint: Option<String>,
+    /// Interval in seconds for the per-region bandwidth accounting log
+    /// (issue #750). `0` disables the periodic log.
+    pub region_accounting_interval_sec: u64,
 }
 
 /// Resolved `cdn/dht/v1` settings (ADR 022).

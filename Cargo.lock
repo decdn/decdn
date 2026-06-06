@@ -2705,6 +2705,7 @@ dependencies = [
  "alloy",
  "anyhow",
  "arc-swap",
+ "async-trait",
  "bytes",
  "clap",
  "decdn-cache",

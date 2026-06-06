@@ -53,6 +53,9 @@ const DEFAULT_METRICS_BIND: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ip
 /// the `node` crate so `decdn node <sub>` clients can fall back to the
 /// same default the server binds on, without duplicating the number.
 pub const DEFAULT_ADMIN_PORT: u16 = 9191;
+/// Default interval (seconds) for the per-region bandwidth accounting log
+/// (issue #750). One hour — the log is one snapshot line per region per tick.
+pub const DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC: u64 = 3600;
 /// Default interval between RPC connectivity watchdog probes. `0`
 /// disables the watchdog; absent in config => this value.
 const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
@@ -1583,6 +1586,10 @@ pub fn resolve_observability_into(
         );
     }
 
+    let region_accounting_interval_sec = file
+        .and_then(|o| o.region_accounting_interval_sec)
+        .unwrap_or(DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC);
+
     ResolvedObservability {
         log_level,
         log_format,
@@ -1590,6 +1597,7 @@ pub fn resolve_observability_into(
         metrics_bind,
         admin_port,
         otlp_endpoint,
+        region_accounting_interval_sec,
     }
 }
 
@@ -3104,6 +3112,7 @@ mod tests {
                     metrics_bind: None,
                     admin_port: None,
                     otlp_endpoint: Some(v.to_string()),
+                    region_accounting_interval_sec: None,
                 });
             }),
         ];
@@ -5391,6 +5400,7 @@ mod tests {
             metrics_bind: DEFAULT_METRICS_BIND,
             admin_port: None,
             otlp_endpoint: None,
+            region_accounting_interval_sec: DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
         }
     }
 
@@ -5402,6 +5412,7 @@ mod tests {
             metrics_bind: DEFAULT_METRICS_BIND,
             admin_port: Some(admin),
             otlp_endpoint: None,
+            region_accounting_interval_sec: DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
         }
     }
 
@@ -5414,6 +5425,41 @@ mod tests {
             obs.admin_port
         );
         anyhow::ensure!(obs.metrics_port == DEFAULT_METRICS_PORT);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_observability_defaults_region_accounting_interval() -> anyhow::Result<()> {
+        let obs = resolve_observability(&obs_cli(None, None), None)?;
+        assert_eq!(
+            obs.region_accounting_interval_sec,
+            DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC
+        );
+        Ok(())
+    }
+
+    /// A file-provided `region_accounting_interval_sec` must resolve to that
+    /// exact value — guards against a regression to `unwrap_or_default()` or a
+    /// hard-coded default. `0` (a valid, explicit "off"-ish setting) and `60`
+    /// must both pass through unchanged rather than snapping to the default.
+    #[test]
+    fn resolve_observability_honors_explicit_region_accounting_interval() -> anyhow::Result<()> {
+        for want in [0_u64, 60] {
+            let file = types::ObservabilityConfig {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+                region_accounting_interval_sec: Some(want),
+            };
+            let obs = resolve_observability(&obs_cli(None, None), Some(&file))?;
+            assert_eq!(
+                obs.region_accounting_interval_sec, want,
+                "explicit interval {want} must resolve unchanged"
+            );
+        }
         Ok(())
     }
 

@@ -439,6 +439,40 @@ pub struct ChannelsResponse {
     pub redeem_threshold_micro_usdc: u64,
 }
 
+/// Region-bucket key for traffic whose counterparty has no known region (#750).
+pub const UNKNOWN_REGION: &str = "UNKNOWN";
+
+/// One region's cumulative byte counters (issue #750). `region` is an
+/// ISO 3166-1 alpha-2 code (the peer's self-attested `NodeAnnounceBody.region`,
+/// ADR 030) or the [`UNKNOWN_REGION`] bucket for traffic whose counterparty
+/// has no known region (a non-peer end-client, or a peer not in the table).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionBytes {
+    /// ISO 3166-1 alpha-2 region code, or [`UNKNOWN_REGION`].
+    pub region: String,
+    /// Cumulative bytes this node has *pulled from* counterparties in this
+    /// region since process start. Reads `0` until node-to-node pull-through
+    /// is orchestrated (#750).
+    /// `#[serde(default)]` keeps older servers that omit the field round-tripping.
+    #[serde(default)]
+    pub bytes_in: u64,
+    /// Cumulative bytes this node has *served to* counterparties in this
+    /// region since process start.
+    #[serde(default)]
+    pub bytes_out: u64,
+}
+
+/// Response for `admin_v1_regionStats` (issue #750): per-region cumulative
+/// bytes-in / bytes-out, region-sorted. Empty when no accountant is wired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionStatsResponse {
+    /// One entry per region observed since process start, sorted by region code.
+    /// `#[serde(default)]` keeps an older/partial server that omits the field
+    /// round-tripping as an empty list — matching the empty-when-unwired posture.
+    #[serde(default)]
+    pub regions: Vec<RegionBytes>,
+}
+
 /// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
 /// Matches the standard JSON-RPC 2.0 `Invalid params` code.
 pub const INVALID_PARAMS_CODE: i32 = -32_602;
@@ -599,6 +633,15 @@ pub trait AdminRpc {
     /// cannot be read.
     #[method(name = "channels")]
     async fn channels(&self) -> RpcResult<ChannelsResponse>;
+
+    /// Return cumulative per-region bandwidth (issue #750): bytes served to
+    /// and pulled from each region, keyed by the counterparty peer's
+    /// self-attested `NodeAnnounceBody.region` (ADR 030), with a `"UNKNOWN"`
+    /// bucket for unattributable traffic. Totals are cumulative since process
+    /// start. Backs `decdn node region-stats`. Returns an empty list (not an
+    /// error) on a node with no accounting wired.
+    #[method(name = "regionStats")]
+    async fn region_stats(&self) -> RpcResult<RegionStatsResponse>;
 }
 
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].
@@ -813,6 +856,55 @@ mod tests {
         let second = back.channels.get(1).expect("second channel");
         assert_eq!(second.seconds_since_last_voucher, None);
         assert!(!second.settlement_eligible);
+    }
+
+    #[test]
+    fn region_stats_response_round_trips() {
+        let resp = RegionStatsResponse {
+            regions: vec![
+                RegionBytes {
+                    region: "DE".to_string(),
+                    bytes_in: 1_048_576,
+                    bytes_out: 5_242_880,
+                },
+                RegionBytes {
+                    region: "UNKNOWN".to_string(),
+                    bytes_in: 0,
+                    bytes_out: 2_097_152,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).expect("serialize RegionStatsResponse");
+        let back: RegionStatsResponse =
+            serde_json::from_str(&json).expect("deserialize RegionStatsResponse");
+        assert_eq!(back.regions.len(), 2);
+        let first = back.regions.first().expect("first region");
+        assert_eq!(first.region, "DE");
+        assert_eq!(first.bytes_in, 1_048_576);
+        assert_eq!(first.bytes_out, 5_242_880);
+    }
+
+    #[test]
+    fn region_stats_response_legacy_shape_defaults_zero() {
+        // An older/partial server that omits the byte fields must still
+        // deserialize, with the missing counters defaulting to zero.
+        let json = r#"{"regions":[{"region":"FR"}]}"#;
+        let back: RegionStatsResponse =
+            serde_json::from_str(json).expect("deserialize partial RegionStatsResponse");
+        let only = back.regions.first().expect("one region");
+        assert_eq!(only.region, "FR");
+        assert_eq!(only.bytes_in, 0);
+        assert_eq!(only.bytes_out, 0);
+    }
+
+    #[test]
+    fn region_stats_response_omitted_regions_defaults_empty() {
+        // An older/partial server that omits `regions` entirely must still
+        // deserialize, with the list defaulting to empty — same posture as a
+        // node with no accountant wired returning an empty snapshot.
+        let back: RegionStatsResponse =
+            serde_json::from_str("{}").expect("deserialize RegionStatsResponse without regions");
+        assert!(back.regions.is_empty());
     }
 
     /// Wire back-compat for `ChannelSnapshot.seconds_since_last_voucher`

@@ -22,8 +22,8 @@ use decdn_common::admin::{
     CONFIG_PATH_UNSET_CODE, ChannelSnapshot, ChannelsResponse, DHT_POISONED_CODE,
     DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
     HealthResponse, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE,
-    RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth, StatusResponse,
-    parse_hash_arg,
+    RecordStoreHealth, RegionStatsResponse, ReloadResponse, RepublishHealth, RoutingHealth,
+    StatusResponse, parse_hash_arg,
 };
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use decdn_incentive::{ChannelState, ChannelStateStore, VoucherActivity};
@@ -35,6 +35,7 @@ use tokio::sync::{Notify, RwLock, oneshot};
 
 use crate::dht::{RecordStore, RepublishScheduler, RoutingTable, StakerSet};
 use crate::metrics::Metrics;
+use crate::region_accounting::RegionAccountant;
 
 // Wire types live in `decdn_common::admin`. We import the server-side
 // trait, the request DTO, and the few error codes the server impl
@@ -120,6 +121,10 @@ pub struct AdminState {
     /// payment surface legitimately has zero channels to report, and the
     /// CLI's empty-table sentinel covers it.
     channels: Option<ChannelStatusHandles>,
+    /// Per-region bandwidth accountant (issue #750), attached via
+    /// [`AdminState::with_region_accountant`]. `None` → `region_stats` returns
+    /// an empty list (a node with no accounting wired has nothing to report).
+    region_accountant: Option<Arc<RegionAccountant>>,
 }
 
 /// Read-only payment-channel handles the `admin_v1_channels` handler
@@ -324,6 +329,7 @@ impl AdminState {
             metrics,
             dht: None,
             channels: None,
+            region_accountant: None,
         }
     }
 
@@ -344,6 +350,15 @@ impl AdminState {
     #[must_use]
     pub fn with_channels(mut self, channels: ChannelStatusHandles) -> Self {
         self.channels = Some(channels);
+        self
+    }
+
+    /// Attach the per-region bandwidth accountant so `admin_v1_regionStats`
+    /// can report its snapshot (issue #750). The production runtime calls this
+    /// once after `new`; without it, `region_stats` returns an empty list.
+    #[must_use]
+    pub fn with_region_accountant(mut self, accountant: Arc<RegionAccountant>) -> Self {
+        self.region_accountant = Some(accountant);
         self
     }
 }
@@ -723,6 +738,21 @@ impl AdminRpcServer for AdminRpcImpl {
         Ok(ChannelsResponse {
             channels,
             redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
+        })
+    }
+
+    /// Return cumulative per-region bandwidth counters (issue #750).
+    async fn region_stats(&self) -> RpcResult<RegionStatsResponse> {
+        // No accountant wired (unit tests / a node with no accounting surface):
+        // report an empty list, not an error — zero regions is legitimate and
+        // the CLI renders an empty-table sentinel for it.
+        let Some(acc) = self.state.region_accountant.as_ref() else {
+            return Ok(RegionStatsResponse {
+                regions: Vec::new(),
+            });
+        };
+        Ok(RegionStatsResponse {
+            regions: acc.snapshot(),
         })
     }
 }
@@ -2058,6 +2088,42 @@ mod tests {
         let resp = rpc.channels().await.expect("channels ok");
         assert!(resp.channels.is_empty());
         assert_eq!(resp.redeem_threshold_micro_usdc, 0);
+    }
+
+    #[tokio::test]
+    async fn region_stats_without_accountant_returns_empty() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state);
+        let resp = rpc.region_stats().await.expect("region_stats ok");
+        assert!(resp.regions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn region_stats_reports_attached_accountant_snapshot() {
+        use crate::region_accounting::{RegionAccountant, RegionResolver};
+
+        struct Fixed(String);
+        #[async_trait]
+        impl RegionResolver for Fixed {
+            async fn region_of(&self, _node_id: &[u8; 32]) -> Option<String> {
+                Some(self.0.clone())
+            }
+        }
+
+        let accountant = Arc::new(RegionAccountant::new(Arc::new(Fixed("DE".to_string()))));
+        accountant.record_served(&[1u8; 32], 4096).await;
+
+        let (state, _tmp) = state_with(vec![]).await;
+        let state = state.with_region_accountant(Arc::clone(&accountant));
+        let rpc = AdminRpcImpl::new(state);
+
+        let resp = rpc.region_stats().await.expect("region_stats ok");
+        let de = resp
+            .regions
+            .iter()
+            .find(|r| r.region == "DE")
+            .expect("DE bucket present");
+        assert_eq!(de.bytes_out, 4096);
     }
 
     /// End-to-end through the RPC method: a store seeded with two channels
