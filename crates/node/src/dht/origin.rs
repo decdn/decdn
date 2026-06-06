@@ -47,6 +47,16 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
     /// hash AND no default-open allow-list entry applies — i.e. the
     /// hash is truly unclaimed and unfindable via the directory.
     fn lookup_origins(&self, hash: &Hash) -> Vec<NodeId>;
+
+    /// Whether at least one authorised origin exists for `hash`, without
+    /// materialising the candidate list. The prefetch authorized-origin
+    /// gate (ADR 022 §Prefetch Decision) calls this on the threshold-cross
+    /// path purely to test emptiness; the default delegates to
+    /// `lookup_origins`, but `Vec`-backed implementations SHOULD override
+    /// to avoid the clone.
+    fn has_origin(&self, hash: &Hash) -> bool {
+        !self.lookup_origins(hash).is_empty()
+    }
 }
 
 /// File-config-driven [`OriginDirectory`] implementation.
@@ -103,6 +113,10 @@ impl OriginDirectory for ConfigOriginDirectory {
     fn lookup_origins(&self, hash: &Hash) -> Vec<NodeId> {
         self.origins.get(hash).cloned().unwrap_or_default()
     }
+
+    fn has_origin(&self, hash: &Hash) -> bool {
+        self.origins.get(hash).is_some_and(|o| !o.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +159,22 @@ mod tests {
         // "directory not initialised" via the empty result, NOT via
         // an Option.
         assert!(dir.lookup_origins(&h(3)).is_empty());
+    }
+
+    #[test]
+    fn has_origin_matches_lookup_emptiness_without_cloning() {
+        // The clone-free `has_origin` override must agree with
+        // `!lookup_origins(..).is_empty()` for the prefetch gate: present,
+        // absent, and the edge case of a hash mapped to an empty vec.
+        let mut m = HashMap::new();
+        m.insert(h(1), vec![nid(0xA)]);
+        m.insert(h(2), Vec::new()); // present key, no origins
+        let dir = ConfigOriginDirectory::new(m);
+        assert!(dir.has_origin(&h(1)));
+        assert!(!dir.has_origin(&h(2)));
+        assert!(!dir.has_origin(&h(3)));
+        for b in [1u8, 2, 3] {
+            assert_eq!(dir.has_origin(&h(b)), !dir.lookup_origins(&h(b)).is_empty());
+        }
     }
 }

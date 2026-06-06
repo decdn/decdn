@@ -5,8 +5,16 @@
 //! window is the non-suppressible demand signal that MAY trip a speculative
 //! prefetch.
 //!
-//! Pure: reads no clock, performs no I/O. The caller supplies a monotonic
-//! `now` (seconds) so tests are deterministic.
+//! Pure: reads no clock, performs no I/O. The caller injects `now` (seconds)
+//! so tests are deterministic. In production that clock is the node's
+//! wall-clock (`handlers::dht::now_us() / 1_000_000`), consistent with the
+//! rest of the DHT subsystem, whose record TTLs are wall-clock-anchored (ADR
+//! 022 §STORE Flow). It is therefore NOT guaranteed monotonic: an NTP step
+//! backward (or a mis-set clock reading `0`) makes `now` regress, which stalls
+//! window pruning (`now.saturating_sub(ts)` saturates to `0`). To keep a single
+//! hot hash's window from growing without bound while the clock is bad, each
+//! per-hash window is length-capped (see [`PopularityTracker::observe`]); the
+//! `MAX_TRACKED_HASHES` cap bounds only the number of *distinct* hashes.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -51,21 +59,40 @@ impl PopularityTracker {
     /// `false`; the trigger re-arms only after entries age out and the count
     /// crosses the threshold again. This keeps "demand crossed the threshold"
     /// a single event per burst rather than firing on every query above it.
+    ///
+    /// The window retains at most `threshold` timestamps — all the edge trigger
+    /// needs is whether the count has reached the threshold. Capping there also
+    /// bounds memory if the wall-clock regresses and pruning stalls (see the
+    /// module docstring), so a stuck/backward clock can't grow the window
+    /// without limit.
     pub fn observe(&mut self, hash: &HashKey, now: u64) -> bool {
         if !self.windows.contains_key(hash) && self.windows.len() >= self.max_hashes {
             self.evict_least_recent();
         }
+        let threshold = self.threshold;
         let window = self.windows.entry(*hash).or_default();
         Self::prune(window, self.window_secs, now);
+        let before = u32::try_from(window.len()).unwrap_or(u32::MAX);
         window.push_back(now);
-        // Exactly-equal, not `>=`: one timestamp is pushed per call, so the
-        // count rises by at most one — `== threshold` is the upward crossing.
-        // A count already past the threshold returns `false`.
-        u32::try_from(window.len()).unwrap_or(u32::MAX) == self.threshold
+        // Retain only the most-recent `threshold` timestamps (drop oldest).
+        // This is the bounded-length guard against clock regression and makes
+        // the count saturate at `threshold` — beyond it the trigger boolean is
+        // already determined.
+        while u32::try_from(window.len()).unwrap_or(u32::MAX) > threshold {
+            window.pop_front();
+        }
+        let after = u32::try_from(window.len()).unwrap_or(u32::MAX);
+        // Upward crossing: fire only on the transition from below the threshold
+        // to at/above it. Equivalent to `== threshold` while exactly one arrival
+        // is pushed per call, but robust to a future change that batches several
+        // arrivals into one call (which the old `== threshold` test would skip).
+        before < threshold && after >= threshold
     }
 
     /// Current in-window query count for `hash` at `now` (seconds), pruning
-    /// stale timestamps as a side effect. `0` for an untracked hash.
+    /// stale timestamps as a side effect. `0` for an untracked hash. Saturates
+    /// at the configured threshold, since [`observe`](Self::observe) retains
+    /// only the most-recent `threshold` timestamps.
     pub fn count(&mut self, hash: &HashKey, now: u64) -> u32 {
         let window_secs = self.window_secs;
         match self.windows.get_mut(hash) {
@@ -177,5 +204,33 @@ mod tests {
         assert_eq!(t.count(&h(1), 10), 0); // evicted
         assert_eq!(t.count(&h(2), 10), 1);
         assert_eq!(t.count(&h(3), 10), 1);
+    }
+
+    #[test]
+    fn evict_tie_break_removes_exactly_one_at_cap() {
+        // h1 and h2 share the same newest timestamp (5). `min_by_key` breaks the
+        // tie by HashMap iteration order, so which of the two is evicted is
+        // unspecified — but the invariant holds: the brand-new hash is admitted
+        // and exactly one tied hash is dropped (total stays at the cap of 2).
+        let mut t = PopularityTracker::new(1000, 2, 2);
+        t.observe(&h(1), 5);
+        t.observe(&h(2), 5); // tie on newest = 5
+        t.observe(&h(3), 10); // at cap + new hash => evict one of h1/h2
+        assert_eq!(t.count(&h(3), 10), 1, "new hash admitted");
+        let h1_gone = t.count(&h(1), 10) == 0;
+        let h2_gone = t.count(&h(2), 10) == 0;
+        assert!(h1_gone ^ h2_gone, "exactly one tied hash evicted");
+    }
+
+    #[test]
+    fn window_length_is_capped_at_threshold() {
+        // A backward clock stalls pruning (now.saturating_sub(ts) == 0), but the
+        // per-hash window must not grow past `threshold`. Hammer one hash at a
+        // frozen `now` well past the threshold and confirm the count saturates.
+        let mut t = PopularityTracker::new(300, 3, MAX_TRACKED_HASHES);
+        for _ in 0..1000 {
+            t.observe(&h(1), 0);
+        }
+        assert_eq!(t.count(&h(1), 0), 3, "window capped at threshold");
     }
 }

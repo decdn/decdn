@@ -1438,6 +1438,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prefetch_quality_gauges_clamp_and_track_throttle() {
+        let metrics = Metrics::new();
+
+        // Non-finite / negative ratios (a poisoned-lock fallback, or arithmetic
+        // upstream) must clamp the milli gauge to 0, never emit garbage — this
+        // exercises the `!is_finite()` / `<= 0.0` branch of set_prefetch_quality.
+        for bad in [f64::NAN, f64::NEG_INFINITY, -1.0] {
+            metrics.set_prefetch_quality(bad, false);
+            let text = metrics.encode().unwrap();
+            assert!(
+                has_metric_line(&text, "decdn_prefetch_demand_quality_ratio_milli", 0),
+                "ratio {bad} must clamp to 0, got:\n{text}"
+            );
+        }
+
+        // Healthy ratio scales ×1000, and the throttle gauge transitions
+        // 0 -> 1 -> 0 as `throttled` flips — no latch (level-triggered, ADR 022).
+        metrics.set_prefetch_quality(0.25, true);
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_prefetch_demand_quality_ratio_milli", 250),
+            "0.25 should scale to 250 milli, got:\n{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_prefetch_throttle_active", 1),
+            "throttle active should read 1, got:\n{text}"
+        );
+        metrics.set_prefetch_quality(1.0, false);
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_prefetch_throttle_active", 0),
+            "throttle must clear to 0 once recovered (no latch), got:\n{text}"
+        );
+    }
+
     #[tokio::test]
     async fn engine_bumps_surface_in_openmetrics_output() {
         use std::sync::Arc;

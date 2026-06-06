@@ -33,7 +33,9 @@ pub enum PrefetchDecision {
 pub enum SkipReason {
     /// `prefetch.enabled == false`.
     Disabled,
-    /// Demand-quality auto-throttle is latched active.
+    /// Demand-quality auto-throttle is active. Level-triggered: set while the
+    /// rolling `served / acquired` ratio is below the floor, cleared as soon as
+    /// it recovers (no hysteresis — ADR 022 "pauses until it recovers").
     Throttled,
     /// `require_authorized_origin` and no authorized origin for the hash.
     Unauthorized,
@@ -41,7 +43,14 @@ pub enum SkipReason {
     BudgetExhausted,
 }
 
-/// Rolling-window ledgers + throttle latch.
+/// Rolling-window ledgers backing the budget and demand-quality gates.
+///
+/// The demand-quality auto-throttle is **level-triggered, not latched**: it is
+/// active whenever the current rolling `served / acquired` ratio is below the
+/// floor and clears as soon as the ratio recovers, with no hysteresis band
+/// (ADR 022 §Prefetch Decision: "prefetch pauses until it recovers"). There is
+/// therefore no stored throttle bit — [`PrefetchPolicy::decide`] recomputes it
+/// from the live ledger on every call.
 #[derive(Debug, Default)]
 struct Ledgers {
     /// (`timestamp_secs`, `micro_usdc`) prefetch spends, oldest-first.
@@ -50,8 +59,6 @@ struct Ledgers {
     acquired: VecDeque<(u64, u64)>,
     /// (`timestamp_secs`, bytes) served from prefetched content, oldest-first.
     served: VecDeque<(u64, u64)>,
-    /// Whether the demand-quality auto-throttle is currently latched active.
-    throttled: bool,
 }
 
 /// Operator-policy prefetch decision engine.
@@ -95,9 +102,9 @@ impl PrefetchPolicy {
             Self::prune(&mut led.spend, BUDGET_WINDOW_SECS, now);
             Self::prune(&mut led.acquired, self.cfg.demand_quality_window_secs, now);
             Self::prune(&mut led.served, self.cfg.demand_quality_window_secs, now);
-            led.throttled = Self::compute_throttle(&led, self.cfg.demand_quality_min_ratio);
+            let throttled = Self::compute_throttle(&led, self.cfg.demand_quality_min_ratio);
             let spent: u64 = led.spend.iter().map(|(_, v)| *v).sum();
-            (led.throttled, spent)
+            (throttled, spent)
         };
 
         // Gate 2: demand-quality throttle.
@@ -105,8 +112,9 @@ impl PrefetchPolicy {
             return PrefetchDecision::Skip(SkipReason::Throttled);
         }
 
-        // Gate 3: authorized origin (ledger lock released above).
-        if self.cfg.require_authorized_origin && dir.lookup_origins(hash).is_empty() {
+        // Gate 3: authorized origin (ledger lock released above). `has_origin`
+        // tests presence without materialising the candidate `Vec`.
+        if self.cfg.require_authorized_origin && !dir.has_origin(hash) {
             return PrefetchDecision::Skip(SkipReason::Unauthorized);
         }
 
@@ -151,7 +159,8 @@ impl PrefetchPolicy {
         Self::ratio(&led)
     }
 
-    /// Whether the demand-quality throttle is latched active at `now`.
+    /// Whether the demand-quality throttle is active at `now`. Level-triggered:
+    /// recomputed from the live ledger, with no latched/stored throttle bit.
     #[must_use]
     pub fn throttle_active(&self, now: u64) -> bool {
         let Ok(mut led) = self.ledgers.lock() else {
@@ -301,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn throttle_latches_below_ratio_and_clears_on_recovery() {
+    fn throttle_activates_below_ratio_and_clears_on_recovery() {
         let p = PrefetchPolicy::new(cfg(true));
         // Acquire 1000 bytes, serve only 50 => ratio 0.05 < 0.1 => throttle.
         p.record_acquisition(10, 1_000, 0);

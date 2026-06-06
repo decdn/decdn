@@ -234,6 +234,10 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [prefetch]
 # ADR 022 speculative-prefetch operator policy. Disabled by default.
+# NOTE: this slice only *meters* — it records demand, runs the decision gates,
+# and exports metrics, but does not yet acquire content (the live acquisition
+# is the #650 follow-up). Setting enabled = true before then exercises the
+# decision/metrics path only; no prefetch bytes are fetched and no USDC spent.
 # enabled = false
 # require_authorized_origin = true          # require an authorized origin in the FIND_VALUE candidate set
 # budget_usdc_per_hour = 0                  # micro-USDC rolling-1h spend cap; 0 = never prefetch
