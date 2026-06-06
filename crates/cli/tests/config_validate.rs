@@ -101,6 +101,29 @@ fn validate_fails_for_malformed_relay_url() -> anyhow::Result<()> {
 }
 
 #[test]
+fn validate_fails_for_malformed_discovery_peer_addr() -> anyhow::Result<()> {
+    // #818 scope 1: a malformed `[network.discovery]` peer socket address must
+    // fail `config validate` up front and name the offending indexed field.
+    let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let body = format!(
+        "{VALID_CONFIG}\n[network.discovery.peers.{id}]\naddrs = [\"not-a-socket-addr\"]\n"
+    );
+    let dir = TempDir::new()?;
+    let path = write_config(&dir, &body)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+    let err = commands::config_validate(Some(&path), &args(dir.path())?)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains(&format!("network.discovery.peers[{id}].addrs[0]"))
+            && msg.contains("not-a-socket-addr"),
+        "error should name the malformed peer address: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
 fn validate_fails_when_required_field_missing() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let path = write_config(&dir, MISSING_RPC)?;
@@ -258,6 +281,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         network: ResolvedNetwork {
             bind_port: 4433,
             relay_urls: Vec::new(),
+            discovery: decdn_common::config::ResolvedDiscovery::default(),
             enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
@@ -343,6 +367,42 @@ fn summary_includes_prefetch_enabled() -> anyhow::Result<()> {
     anyhow::ensure!(
         out.contains("prefetch_enabled:         true"),
         "prefetch_enabled should reflect the resolved value: {out}"
+    );
+    Ok(())
+}
+
+#[test]
+fn summary_reports_discovery_without_leaking_secrets() -> anyhow::Result<()> {
+    // #818: the summary names dns_origin and the peer count, redacts the
+    // pkarr_url (it can carry credentials), and never echoes peer addresses.
+    let cfg = sample_resolved(|c| {
+        c.network.discovery = decdn_common::config::ResolvedDiscovery {
+            pkarr_url: Some("https://pkarr.example/PKARR_SECRET_xyz".to_string()),
+            dns_origin: Some("discovery.example.".to_string()),
+            peers: vec![decdn_common::config::ResolvedDiscoveryPeer {
+                node_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                relay_url: None,
+                addrs: vec!["203.0.113.4:4433".to_string()],
+            }],
+        };
+    });
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        out.contains("discovery.dns_origin:     discovery.example."),
+        "summary should name dns_origin: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("discovery.peers:          1"),
+        "summary should report the peer count: {out}"
+    );
+    anyhow::ensure!(
+        !out.contains("PKARR_SECRET_xyz"),
+        "pkarr_url value must never appear in summary: {out}"
+    );
+    anyhow::ensure!(
+        !out.contains("203.0.113.4:4433"),
+        "peer addresses must not appear in summary: {out}"
     );
     Ok(())
 }

@@ -30,8 +30,46 @@ pub struct ResolvedNetwork {
     /// all-unreachable set warns and proceeds (iroh retries in the background);
     /// entries with no derivable host/port are skipped.
     pub relay_urls: Vec<String>,
+    /// Operator-configurable address discovery (#818 scope 1). Empty
+    /// ([`ResolvedDiscovery::is_empty`]) => the node keeps the n0-hosted
+    /// pkarr/DNS default (`presets::N0`); otherwise the node builds on
+    /// `presets::Minimal` and composes only the providers configured here.
+    pub discovery: ResolvedDiscovery,
     /// QUIC 0-RTT master switch for `cdn/probe/v1` (ADR 015). Default `true`.
     pub enable_0rtt: bool,
+}
+
+/// Resolved discovery providers (#818). Strings are already shape-validated at
+/// resolution (`pkarr_url` a parseable URL, `dns_origin` non-empty, each peer
+/// `node_id` a valid iroh `NodeId`, each `addr` a `SocketAddr`); the node wiring
+/// layer parses them into iroh types — the discovery-provider seam, per
+/// `adr/appendix-poc-production-seams.md`.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedDiscovery {
+    /// pkarr relay URL to publish this node's address record to.
+    pub pkarr_url: Option<String>,
+    /// DNS origin domain to resolve peers from.
+    pub dns_origin: Option<String>,
+    /// Static peer address book, sorted by `node_id` for a deterministic build.
+    pub peers: Vec<ResolvedDiscoveryPeer>,
+}
+
+impl ResolvedDiscovery {
+    /// No discovery overrides configured => the node uses `presets::N0`.
+    pub const fn is_empty(&self) -> bool {
+        self.pkarr_url.is_none() && self.dns_origin.is_none() && self.peers.is_empty()
+    }
+}
+
+/// One resolved static peer ([`ResolvedDiscovery::peers`]).
+#[derive(Debug, Clone)]
+pub struct ResolvedDiscoveryPeer {
+    /// Peer `NodeId`, 64-char hex (shape-validated at resolution).
+    pub node_id: String,
+    /// Peer home relay URL, if configured.
+    pub relay_url: Option<String>,
+    /// Peer direct socket addresses (`host:port`).
+    pub addrs: Vec<String>,
 }
 
 /// Resolved blockchain fields.

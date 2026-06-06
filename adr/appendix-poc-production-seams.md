@@ -21,6 +21,10 @@ The question this appendix answers: **how does the codebase express the non-cont
 - **Contracts are not a seam.** The on-chain surface is production-shaped on every network, including the Sepolia testnet PoC. The only contract-side seam is *deployed contract vs in-process test double* for unit/integration harnesses with no chain — never "PoC stub contract → production contract." Simplified launch economics are the same contracts with different governance-set parameters (`FeeRouter.setShares(...)` etc., per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)), not a reduced surface.
 - **Solidity selection is outside Rust.** Which contract addresses a network points at is a Foundry deploy-script / chain-id-keyed-config concern — the standard Foundry pattern, not a Rust feature.
 
+### Discovery-provider seam (#818)
+
+Which NodeId→address discovery the iroh endpoint uses is selected **only** in the `node` runtime's wiring (`build_endpoint`), not in the leaf crates or the config schema. `common` config carries plain Strings (`network.discovery.{pkarr_url, dns_origin, peers}`), shape-validated at resolution (parseable URL, non-empty origin, 64-hex NodeId, parseable `SocketAddr`); the node parses them into iroh providers (`PkarrPublisher` / `DnsAddressLookup` / `MemoryLookup`) and composes them via `Endpoint::builder().address_lookup(..)`. Absent config keeps the n0-hosted default (`presets::N0`); present config builds on `presets::Minimal` and adds only the configured legs. Relay selection (`network.relay_urls`) is an independent, orthogonal seam built the same way — dropping the n0 *discovery* leg does not disable relays (when no custom relay map is set, the node restores the n0 relay default that `N0` would have applied). This is the same "plain data in the config crate, provider selection at the `node` composition boundary" pattern as the relay-map and origin-backend seams; the static peer map (`MemoryLookup`) supports fully n0-independent, offline networks.
+
 ## Consequences
 
 - Zero mode-conditional branches in domain-crate logic; the PoC/production difference is auditable in one place.

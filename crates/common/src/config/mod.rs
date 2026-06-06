@@ -20,9 +20,10 @@ use crate::redact::redact_userinfo;
 
 pub use errors::ConfigErrorBag;
 pub use resolved::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedGossip,
-    ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment,
-    ResolvedPrefetch, ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
+    ResolvedDiscoveryPeer, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
+    ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedPrefetch, ResolvedReceipts,
+    ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -538,6 +539,8 @@ fn resolve_network_into(
         }
     }
 
+    let discovery = resolve_discovery_into(file, bag);
+
     // No CLI flag: 0-RTT is an operational kill switch, not a per-invocation
     // tuning knob. File `network.enable_0rtt` > built-in default (`true`).
     let enable_0rtt = file
@@ -547,8 +550,134 @@ fn resolve_network_into(
     ResolvedNetwork {
         bind_port,
         relay_urls,
+        discovery,
         enable_0rtt,
     }
+}
+
+/// Resolve and shape-validate `[network.discovery]` (#818 scope 1), recording
+/// every malformed entry into `bag`.
+///
+/// Validation is a *shape* check only (a parseable URL, a non-empty origin, a
+/// 64-hex `NodeId`, a parseable `SocketAddr`) — the authoritative build into iroh
+/// types happens in the `node` wiring layer (`build_endpoint`), per the
+/// discovery-provider seam in `adr/appendix-poc-production-seams.md`. Echoed
+/// URLs are run through [`redact_userinfo`](crate::redact) so a credential-
+/// bearing typo never reaches an error string, matching the relay-URL path.
+///
+/// `pkarr_url` without `dns_origin` is rejected: publishing this node's record
+/// to a pkarr relay that no configured resolver reads from is a misconfiguration
+/// (the node would advertise into a namespace the fleet never resolves). The
+/// reverse — `dns_origin` alone — is valid (a resolve-only node).
+fn resolve_discovery_into(
+    file: Option<&types::NetworkConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedDiscovery {
+    let Some(disc) = file.and_then(|n| n.discovery.as_ref()) else {
+        return ResolvedDiscovery::default();
+    };
+
+    let pkarr_url = disc.pkarr_url.as_ref().and_then(|raw| {
+        bag.try_with(
+            "network.discovery.pkarr_url",
+            url::Url::parse(raw)
+                .map(|_| raw.clone())
+                .map_err(|e| anyhow::anyhow!("invalid URL {:?}: {e}", redact_userinfo(raw))),
+        )
+    });
+
+    let dns_origin = disc.dns_origin.as_ref().and_then(|raw| {
+        bag.check(
+            !raw.trim().is_empty(),
+            "network.discovery.dns_origin",
+            "must not be empty when set; omit the key instead",
+        )
+        .then(|| raw.clone())
+    });
+
+    bag.check(
+        !(disc.pkarr_url.is_some() && disc.dns_origin.is_none()),
+        "network.discovery.dns_origin",
+        "network.discovery.pkarr_url publishes this node's address record to a pkarr \
+         relay, but no network.discovery.dns_origin is configured to resolve peers from \
+         it; set dns_origin or remove pkarr_url",
+    );
+
+    let mut peers: Vec<ResolvedDiscoveryPeer> = disc
+        .peers
+        .iter()
+        .flatten()
+        .filter_map(|(node_id, peer)| resolve_discovery_peer(node_id, peer, bag))
+        .collect();
+    // `HashMap` iteration order is nondeterministic; sort so the node build and
+    // any test assertions are stable.
+    peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    ResolvedDiscovery {
+        pkarr_url,
+        dns_origin,
+        peers,
+    }
+}
+
+/// Shape-validate one `[network.discovery.peers.<id>]` entry, recording any
+/// problem into `bag`. Returns the resolved peer only when the `NodeId`, relay
+/// URL, and every socket address are well-formed; a bad entry is dropped from
+/// the address book but all of its problems are still recorded so an operator
+/// sees every fix needed at once.
+///
+/// The `NodeId` is validated with the exact parser the node uses at bring-up
+/// (`iroh::PublicKey`, via `add_discovery_lookups`), not just a 64-hex shape
+/// check: `PublicKey::from_str` requires lowercase-hex (or z-base-32) *and* a
+/// valid Ed25519 curve point, so an uppercase or non-curve-point id that a bare
+/// hex check would accept must be rejected here too — otherwise it would pass
+/// `config validate` and then fail node startup. (Unlike `gossip.allowlist`,
+/// which decodes to bytes consumed directly, this path carries the id as a
+/// String the node re-parses, so the two checks must agree.)
+fn resolve_discovery_peer(
+    node_id: &str,
+    peer: &types::DiscoveryPeer,
+    bag: &mut ConfigErrorBag,
+) -> Option<ResolvedDiscoveryPeer> {
+    let mut ok = bag
+        .try_with(
+            format!("network.discovery.peers[{node_id}]"),
+            node_id.parse::<iroh::PublicKey>().map(|_| ()).map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid NodeId (expected a 64-char lowercase-hex or z-base-32 iroh \
+                     NodeId): {e}"
+                )
+            }),
+        )
+        .is_some();
+
+    if let Some(relay) = peer.relay_url.as_ref() {
+        ok &= bag
+            .try_with(
+                format!("network.discovery.peers[{node_id}].relay_url"),
+                url::Url::parse(relay)
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("invalid URL {:?}: {e}", redact_userinfo(relay))),
+            )
+            .is_some();
+    }
+
+    for (i, addr) in peer.addrs.iter().enumerate() {
+        ok &= bag
+            .try_with(
+                format!("network.discovery.peers[{node_id}].addrs[{i}]"),
+                addr.parse::<std::net::SocketAddr>()
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("invalid socket address {addr:?}: {e}")),
+            )
+            .is_some();
+    }
+
+    ok.then(|| ResolvedDiscoveryPeer {
+        node_id: node_id.to_string(),
+        relay_url: peer.relay_url.clone(),
+        addrs: peer.addrs.clone(),
+    })
 }
 
 /// Infallible field-resolution shim for the unit tests that assert on resolved
@@ -3068,6 +3197,7 @@ mod tests {
                     "${HOME}/relay-b".to_string(),
                 ]),
                 relay_url: None,
+                discovery: None,
                 enable_0rtt: None,
             }),
             ..Default::default()
@@ -3298,6 +3428,7 @@ mod tests {
                     bind_port: None,
                     relay_urls: None,
                     relay_url: Some(v.to_string()),
+                    discovery: None,
                     enable_0rtt: None,
                 });
             }),
@@ -3306,6 +3437,7 @@ mod tests {
                     bind_port: None,
                     relay_urls: Some(vec![v.to_string()]),
                     relay_url: None,
+                    discovery: None,
                     enable_0rtt: None,
                 });
             }),
@@ -5648,6 +5780,7 @@ mod tests {
         ResolvedNetwork {
             bind_port: port,
             relay_urls: Vec::new(),
+            discovery: ResolvedDiscovery::default(),
             enable_0rtt: true,
         }
     }
@@ -6292,6 +6425,7 @@ mod tests {
             bind_port: Some(6666),
             relay_urls: None,
             relay_url: None,
+            discovery: None,
             enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
@@ -6306,6 +6440,7 @@ mod tests {
             relay_urls: None,
             // Deprecated singular alias folds into the resolved list.
             relay_url: Some("https://relay.example".to_string()),
+            discovery: None,
             enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
@@ -6326,6 +6461,7 @@ mod tests {
                 "https://relay-b.example".to_string(),
             ]),
             relay_url: None,
+            discovery: None,
             enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
@@ -6346,6 +6482,7 @@ mod tests {
             bind_port: None,
             relay_urls: Some(vec!["https://list.example".to_string()]),
             relay_url: Some("https://alias.example".to_string()),
+            discovery: None,
             enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
@@ -6365,6 +6502,7 @@ mod tests {
             bind_port: None,
             relay_urls: Some(vec!["https://list.example".to_string()]),
             relay_url: Some("https://alias.example".to_string()),
+            discovery: None,
             enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
@@ -6379,6 +6517,7 @@ mod tests {
             bind_port: None,
             relay_urls: Some(Vec::new()),
             relay_url: Some("https://alias.example".to_string()),
+            discovery: None,
             enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
@@ -6397,6 +6536,7 @@ mod tests {
             bind_port: None,
             relay_urls: None,
             relay_url: None,
+            discovery: None,
             enable_0rtt: None,
         };
         assert!(resolve_network(&cli, Some(&none)).enable_0rtt);
@@ -6407,6 +6547,7 @@ mod tests {
             bind_port: None,
             relay_urls: None,
             relay_url: None,
+            discovery: None,
             enable_0rtt: Some(false),
         };
         assert!(!resolve_network(&cli, Some(&off)).enable_0rtt);
@@ -6436,6 +6577,7 @@ mod tests {
                 "relay://no-port-host".to_string(),
             ]),
             relay_url: None,
+            discovery: None,
             enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
@@ -6454,6 +6596,7 @@ mod tests {
             bind_port: None,
             relay_urls: Some(vec!["not a url".to_string()]),
             relay_url: None,
+            discovery: None,
             enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
@@ -6478,6 +6621,7 @@ mod tests {
                 "also bad".to_string(),
             ]),
             relay_url: None,
+            discovery: None,
             enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
@@ -6500,6 +6644,7 @@ mod tests {
             bind_port: None,
             relay_urls: Some(vec!["https://user:s3cret@host:notaport".to_string()]),
             relay_url: None,
+            discovery: None,
             enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
@@ -6526,6 +6671,7 @@ mod tests {
             bind_port: None,
             relay_urls: None,
             relay_url: Some("not a url".to_string()),
+            discovery: None,
             enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
@@ -6554,6 +6700,364 @@ mod tests {
             msg.contains("network.relay_url:") && !msg.contains("network.relay_urls["),
             "CLI singular source must use the singular label: {msg}"
         );
+    }
+
+    // ---- resolve_discovery: operator-configurable discovery (#818 scope 1) ----
+
+    /// A valid 64-hex `NodeId` for peer-map tests (`iroh::PublicKey::FromStr`
+    /// accepts the hex form). Distinct nibbles so a wrong byte order would show.
+    const DISCOVERY_PEER_ID: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn network_with_discovery(discovery: types::DiscoveryConfig) -> types::NetworkConfig {
+        types::NetworkConfig {
+            bind_port: None,
+            relay_urls: None,
+            relay_url: None,
+            discovery: Some(discovery),
+            enable_0rtt: None,
+        }
+    }
+
+    #[test]
+    fn resolve_discovery_empty_when_absent() {
+        let cli = empty_network_args();
+        let resolved = resolve_network(&cli, None);
+        assert!(resolved.discovery.is_empty());
+    }
+
+    #[test]
+    fn resolve_discovery_accepts_pkarr_and_dns() {
+        let cli = empty_network_args();
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: Some("https://pkarr.example/".to_string()),
+            dns_origin: Some("discovery.example.".to_string()),
+            peers: None,
+        });
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
+        assert!(bag.into_result().is_ok());
+        assert_eq!(
+            resolved.discovery.pkarr_url.as_deref(),
+            Some("https://pkarr.example/")
+        );
+        assert_eq!(
+            resolved.discovery.dns_origin.as_deref(),
+            Some("discovery.example.")
+        );
+    }
+
+    #[test]
+    fn resolve_discovery_accepts_dns_only() {
+        // A resolve-only node (resolves peers via DNS, publishes nothing) is
+        // valid: only the reverse — publish without a resolver — is rejected.
+        let cli = empty_network_args();
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: None,
+            dns_origin: Some("discovery.example.".to_string()),
+            peers: None,
+        });
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
+        assert!(bag.into_result().is_ok());
+        assert!(resolved.discovery.pkarr_url.is_none());
+        assert_eq!(
+            resolved.discovery.dns_origin.as_deref(),
+            Some("discovery.example.")
+        );
+    }
+
+    #[test]
+    fn resolve_discovery_rejects_pkarr_without_dns() {
+        // Publishing to a pkarr relay with no resolver to read it back is a
+        // misconfiguration; the error points at the missing dns_origin.
+        let cli = empty_network_args();
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: Some("https://pkarr.example/".to_string()),
+            dns_origin: None,
+            peers: None,
+        });
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(msg.contains("network.discovery.dns_origin"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_discovery_rejects_malformed_pkarr_url() {
+        // A malformed pkarr_url can carry credentials; the error must name the
+        // field, echo the entry, and never leak userinfo.
+        let cli = empty_network_args();
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: Some("https://user:s3cret@host:notaport".to_string()),
+            dns_origin: Some("discovery.example.".to_string()),
+            peers: None,
+        });
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(msg.contains("network.discovery.pkarr_url"), "{msg}");
+        assert!(!msg.contains("s3cret"), "credentials leaked: {msg}");
+        assert!(
+            msg.contains("***@host"),
+            "redacted host should appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_discovery_rejects_empty_dns_origin() {
+        let cli = empty_network_args();
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: None,
+            dns_origin: Some("   ".to_string()),
+            peers: None,
+        });
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(msg.contains("network.discovery.dns_origin"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_discovery_accepts_valid_peers() {
+        // A peer with a relay URL and both a v4 and a bracketed-v6 direct addr.
+        let cli = empty_network_args();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            DISCOVERY_PEER_ID.to_string(),
+            types::DiscoveryPeer {
+                relay_url: Some("https://relay.example/".to_string()),
+                addrs: vec![
+                    "203.0.113.4:4433".to_string(),
+                    "[2001:db8::1]:4433".to_string(),
+                ],
+            },
+        );
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: None,
+            dns_origin: None,
+            peers: Some(peers),
+        });
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
+        assert!(bag.into_result().is_ok());
+        assert_eq!(resolved.discovery.peers.len(), 1);
+        let peer = resolved.discovery.peers.first().expect("one peer");
+        assert_eq!(peer.node_id, DISCOVERY_PEER_ID);
+        assert_eq!(peer.addrs.len(), 2);
+    }
+
+    #[test]
+    fn resolve_discovery_rejects_bad_node_id() {
+        let cli = empty_network_args();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            "not-a-node-id".to_string(),
+            types::DiscoveryPeer {
+                relay_url: None,
+                addrs: vec!["203.0.113.4:4433".to_string()],
+            },
+        );
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: None,
+            dns_origin: None,
+            peers: Some(peers),
+        });
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(
+            msg.contains("network.discovery.peers[not-a-node-id]"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_discovery_rejects_bad_socket_addr() {
+        let cli = empty_network_args();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            DISCOVERY_PEER_ID.to_string(),
+            types::DiscoveryPeer {
+                relay_url: None,
+                addrs: vec!["not-a-socket-addr".to_string()],
+            },
+        );
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: None,
+            dns_origin: None,
+            peers: Some(peers),
+        });
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(
+            msg.contains(&format!(
+                "network.discovery.peers[{DISCOVERY_PEER_ID}].addrs[0]"
+            )),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_discovery_coexists_peers_and_pkarr_dns() {
+        // All three providers set together is valid — they compose.
+        let cli = empty_network_args();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            DISCOVERY_PEER_ID.to_string(),
+            types::DiscoveryPeer {
+                relay_url: Some("https://relay.example/".to_string()),
+                addrs: Vec::new(),
+            },
+        );
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: Some("https://pkarr.example/".to_string()),
+            dns_origin: Some("discovery.example.".to_string()),
+            peers: Some(peers),
+        });
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
+        assert!(bag.into_result().is_ok());
+        assert!(resolved.discovery.pkarr_url.is_some());
+        assert!(resolved.discovery.dns_origin.is_some());
+        assert_eq!(resolved.discovery.peers.len(), 1);
+    }
+
+    #[test]
+    fn resolve_discovery_rejects_uppercase_node_id() {
+        // An uppercase 64-hex id parses under a bare hex check but iroh's
+        // `PublicKey::from_str` decodes lowercase-hex only — so validate must
+        // reject it, matching what the node would do at bring-up. Guards the
+        // validate==parse contract against a regression to a looser hex check.
+        let cli = empty_network_args();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            DISCOVERY_PEER_ID.to_uppercase(),
+            types::DiscoveryPeer {
+                relay_url: None,
+                addrs: vec!["203.0.113.4:4433".to_string()],
+            },
+        );
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: None,
+            dns_origin: None,
+            peers: Some(peers),
+        });
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(
+            msg.contains("network.discovery.peers[") && msg.contains("NodeId"),
+            "uppercase id must be rejected at validate, not at bring-up: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_discovery_rejects_malformed_peer_relay_url_and_redacts() {
+        // A peer relay_url is validated and, like the pkarr URL, can carry
+        // credentials — the error must name the field and not leak userinfo.
+        let cli = empty_network_args();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            DISCOVERY_PEER_ID.to_string(),
+            types::DiscoveryPeer {
+                relay_url: Some("https://user:s3cret@host:notaport".to_string()),
+                addrs: Vec::new(),
+            },
+        );
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: None,
+            dns_origin: None,
+            peers: Some(peers),
+        });
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(
+            msg.contains(&format!(
+                "network.discovery.peers[{DISCOVERY_PEER_ID}].relay_url"
+            )),
+            "{msg}"
+        );
+        assert!(!msg.contains("s3cret"), "credentials leaked: {msg}");
+        assert!(
+            msg.contains("***@host"),
+            "redacted host should appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_discovery_accumulates_every_bad_field_in_a_peer() {
+        // A single peer with both a bad relay_url and a bad addr records BOTH
+        // problems (not fail-fast), so an operator sees every fix at once.
+        let cli = empty_network_args();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            DISCOVERY_PEER_ID.to_string(),
+            types::DiscoveryPeer {
+                relay_url: Some("not a url".to_string()),
+                addrs: vec!["not-a-socket-addr".to_string()],
+            },
+        );
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: None,
+            dns_origin: None,
+            peers: Some(peers),
+        });
+        let mut bag = ConfigErrorBag::new();
+        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
+        assert_eq!(bag.problem_count(), 2, "both fields should be reported");
+        let msg = format!("{:#}", bag.into_result().unwrap_err());
+        assert!(
+            msg.contains(&format!(
+                "network.discovery.peers[{DISCOVERY_PEER_ID}].relay_url"
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "network.discovery.peers[{DISCOVERY_PEER_ID}].addrs[0]"
+            )),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_discovery_sorts_peers_by_node_id() {
+        // `peers` is sorted by node_id so the node build and tests are stable
+        // despite nondeterministic `HashMap` order. Two distinct valid ids.
+        let cli = empty_network_args();
+        let id_a = iroh::SecretKey::generate().public().to_string();
+        let id_b = iroh::SecretKey::generate().public().to_string();
+        let mut peers = std::collections::HashMap::new();
+        for id in [&id_a, &id_b] {
+            peers.insert(
+                id.clone(),
+                types::DiscoveryPeer {
+                    relay_url: Some("https://relay.example/".to_string()),
+                    addrs: Vec::new(),
+                },
+            );
+        }
+        let file = network_with_discovery(types::DiscoveryConfig {
+            pkarr_url: None,
+            dns_origin: None,
+            peers: Some(peers),
+        });
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
+        assert!(bag.into_result().is_ok());
+        assert_eq!(resolved.discovery.peers.len(), 2);
+        let ids: Vec<String> = resolved
+            .discovery
+            .peers
+            .iter()
+            .map(|p| p.node_id.clone())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "peers must be sorted by node_id");
     }
 
     // ---- resolve_blockchain: CLI > file, missing-required errors ---------
