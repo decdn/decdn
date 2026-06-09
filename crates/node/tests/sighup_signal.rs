@@ -52,6 +52,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         network: ResolvedNetwork {
             bind_port: 4433,
             relay_urls: Vec::new(),
+            discovery: decdn_common::config::ResolvedDiscovery::default(),
             enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
