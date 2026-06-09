@@ -688,16 +688,50 @@ pub async fn run(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Operator-policy prefetch engine (ADR 022 §Prefetch; #650). Off by
-    // default. The authorized-origin gate reads from an origin directory; the
-    // chain-backed / config-driven directory is the #650 follow-up, so until
-    // then the engine uses an empty `ConfigOriginDirectory` (the gate rejects
-    // every hash, which only matters once an operator sets `prefetch.enabled`).
-    // The enabled gauge is published regardless so dashboards have a uniform
-    // schema across enabled/disabled nodes (appendix-observability §Prefetch).
-    let prefetch_origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> = Arc::new(
-        crate::dht::origin::ConfigOriginDirectory::new(std::collections::HashMap::new()),
-    );
+    // Operator-policy prefetch engine (ADR 022 §Prefetch; #650/#651). Off by
+    // default. The authorized-origin gate reads from an origin directory: when
+    // the operator configures the OriginAssignment + PublisherRegistry
+    // addresses, use the chain-backed `ChainOriginDirectory` — a live,
+    // event-fed cache resolving hash → namespace → authorized origin → active
+    // NodeId (ADR 022 §FIND_VALUE Flow), reusing the already-bootstrapped
+    // `staker_set` for operator liveness. Without those addresses the engine
+    // falls back to an empty `ConfigOriginDirectory` (the gate rejects every
+    // hash, which only matters once an operator sets `prefetch.enabled`). The
+    // enabled gauge is published regardless so dashboards have a uniform schema
+    // across enabled/disabled nodes (appendix-observability §Prefetch).
+    let prefetch_origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> = match (
+        cfg.blockchain.origin_assignment_address.as_deref(),
+        cfg.blockchain.publisher_registry_address.as_deref(),
+    ) {
+        (Some(origin_addr), Some(publisher_addr)) => {
+            let origin_assignment_addr: Address = origin_addr.parse().with_context(|| {
+                format!(
+                    "blockchain.origin_assignment_address {origin_addr:?} is not a valid address"
+                )
+            })?;
+            let publisher_registry_addr: Address = publisher_addr.parse().with_context(|| {
+                format!(
+                    "blockchain.publisher_registry_address {publisher_addr:?} is not a valid address"
+                )
+            })?;
+            Arc::new(
+                crate::dht::ChainOriginDirectory::bootstrap(
+                    ProviderBuilder::new().connect_http(rpc_url.clone()),
+                    origin_assignment_addr,
+                    publisher_registry_addr,
+                    capacity_bond_addr,
+                    cfg.blockchain.origin_directory_from_block,
+                    Arc::clone(&staker_set),
+                    Arc::clone(&node_metrics),
+                )
+                .await
+                .context("ChainOriginDirectory bootstrap")?,
+            )
+        }
+        _ => Arc::new(crate::dht::origin::ConfigOriginDirectory::new(
+            std::collections::HashMap::new(),
+        )),
+    };
     let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(
         cfg.prefetch,
         prefetch_origin_directory,
@@ -2366,6 +2400,9 @@ mod tests {
                 enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
+                origin_assignment_address: None,
+                publisher_registry_address: None,
+                origin_directory_from_block: 0,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,

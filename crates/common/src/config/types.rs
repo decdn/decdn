@@ -133,6 +133,21 @@ pub struct BlockchainConfig {
     pub payment_channel_address: Option<String>,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
+    /// `OriginAssignment` contract address. Optional: when set (together with
+    /// `publisher_registry_address`), the node runs the chain-backed origin
+    /// directory that gates DHT prefetch (ADR 022). Both must be set or unset
+    /// together; unset => the origin directory is empty (deny-all) and the
+    /// prefetch authorized-origin gate finds no origins.
+    pub origin_assignment_address: Option<String>,
+    /// `PublisherRegistry` contract address. Pairs with
+    /// `origin_assignment_address` (see its docs).
+    pub publisher_registry_address: Option<String>,
+    /// Block height at which the chain-backed origin directory begins its
+    /// `ContentClaimed` log replay. SHOULD be the `PublisherRegistry`
+    /// deployment block; absent => `0`, which is correct but scans the entire
+    /// chain history (slow / RPC-heavy on an established L2). Only consulted
+    /// when the origin-directory addresses are set.
+    pub origin_directory_from_block: Option<u64>,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `ProbeResponse` / `StreamResponse` `slash_sig` signatures (ADR 014
     /// §1–2). Required: a wrong/zero address silently produces signatures no

@@ -878,6 +878,54 @@ fn resolve_blockchain_into(
         bag,
     );
 
+    // Optional chain-backed origin directory (ADR 022 §FIND_VALUE Flow):
+    // `OriginAssignment` + `PublisherRegistry`. Both-or-neither — the directory
+    // resolution chain needs both reads, so a lone address is an operator
+    // mistake worth catching at load rather than silently degrading. When both
+    // are unset the runtime uses an empty (deny-all) origin directory: the
+    // prefetch authorized-origin gate finds no on-chain origins.
+    let origin_assignment_raw = cli
+        .origin_assignment_address
+        .clone()
+        .or_else(|| file.and_then(|b| b.origin_assignment_address.clone()))
+        .filter(|s| !s.is_empty());
+    let publisher_registry_raw = cli
+        .publisher_registry_address
+        .clone()
+        .or_else(|| file.and_then(|b| b.publisher_registry_address.clone()))
+        .filter(|s| !s.is_empty());
+    if origin_assignment_raw.is_some() != publisher_registry_raw.is_some() {
+        let missing = if origin_assignment_raw.is_none() {
+            "blockchain.origin_assignment_address"
+        } else {
+            "blockchain.publisher_registry_address"
+        };
+        bag.push(
+            missing,
+            "blockchain.origin_assignment_address and blockchain.publisher_registry_address \
+             must be set together (the chain-backed origin directory needs both); \
+             set both or neither",
+        );
+    }
+    let origin_assignment_address = origin_assignment_raw.and_then(|v| {
+        bag.try_with(
+            "blockchain.origin_assignment_address",
+            parse_contract_address("origin_assignment_address", &v),
+        )
+    });
+    let publisher_registry_address = publisher_registry_raw.and_then(|v| {
+        bag.try_with(
+            "blockchain.publisher_registry_address",
+            parse_contract_address("publisher_registry_address", &v),
+        )
+    });
+    // File-only tuning for the chain-backed origin directory's log replay.
+    // Default `0` is correct but scans the whole chain; operators set this to
+    // the PublisherRegistry deployment block on an established L2.
+    let origin_directory_from_block = file
+        .and_then(|b| b.origin_directory_from_block)
+        .unwrap_or(0);
+
     // Required like the other contract addresses: a wrong/zero
     // `verifyingContract` silently produces `slash_sig`s no verifier accepts
     // (ADR 014 §1).
@@ -1020,6 +1068,9 @@ fn resolve_blockchain_into(
         keystore_password_file,
         payment_channel_address,
         capacity_bond_address,
+        origin_assignment_address,
+        publisher_registry_address,
+        origin_directory_from_block,
         slash_judge_address,
         chain_id,
         rpc_watchdog_interval_sec,
@@ -2355,6 +2406,14 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
             &mut b.capacity_bond_address,
             "blockchain.capacity_bond_address",
         )?;
+        expand_str(
+            &mut b.origin_assignment_address,
+            "blockchain.origin_assignment_address",
+        )?;
+        expand_str(
+            &mut b.publisher_registry_address,
+            "blockchain.publisher_registry_address",
+        )?;
         expand_str(&mut b.slash_judge_address, "blockchain.slash_judge_address")?;
     }
     if let Some(c) = cfg.cache.as_mut() {
@@ -3142,6 +3201,9 @@ mod tests {
     fn cfg_with_rpc(raw: &str) -> FileConfig {
         FileConfig {
             blockchain: Some(types::BlockchainConfig {
+                origin_directory_from_block: None,
+                origin_assignment_address: None,
+                publisher_registry_address: None,
                 rpc_url: Some(raw.to_string()),
                 ..Default::default()
             }),
@@ -3171,6 +3233,9 @@ mod tests {
         let home = home_str()?;
         let mut cfg = FileConfig {
             blockchain: Some(types::BlockchainConfig {
+                origin_directory_from_block: None,
+                origin_assignment_address: None,
+                publisher_registry_address: None,
                 slash_judge_address: Some("${HOME}/judge".to_string()),
                 ..Default::default()
             }),
@@ -3446,24 +3511,36 @@ mod tests {
             }),
             ("blockchain.rpc_url", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
+                    origin_directory_from_block: None,
+                    origin_assignment_address: None,
+                    publisher_registry_address: None,
                     rpc_url: Some(v.to_string()),
                     ..Default::default()
                 });
             }),
             ("blockchain.eth_keystore", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
+                    origin_directory_from_block: None,
+                    origin_assignment_address: None,
+                    publisher_registry_address: None,
                     eth_keystore: Some(PathBuf::from(v)),
                     ..Default::default()
                 });
             }),
             ("blockchain.payment_channel_address", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
+                    origin_directory_from_block: None,
+                    origin_assignment_address: None,
+                    publisher_registry_address: None,
                     payment_channel_address: Some(v.to_string()),
                     ..Default::default()
                 });
             }),
             ("blockchain.capacity_bond_address", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
+                    origin_directory_from_block: None,
+                    origin_assignment_address: None,
+                    publisher_registry_address: None,
                     capacity_bond_address: Some(v.to_string()),
                     ..Default::default()
                 });
@@ -6127,6 +6204,14 @@ mod tests {
             ("keystore_password_file", "DECDN_KEYSTORE_PASSWORD_FILE"),
             ("payment_channel_address", "DECDN_PAYMENT_CHANNEL_ADDRESS"),
             ("capacity_bond_address", "DECDN_CAPACITY_BOND_ADDRESS"),
+            (
+                "origin_assignment_address",
+                "DECDN_ORIGIN_ASSIGNMENT_ADDRESS",
+            ),
+            (
+                "publisher_registry_address",
+                "DECDN_PUBLISHER_REGISTRY_ADDRESS",
+            ),
             ("slash_judge_address", "DECDN_SLASH_JUDGE_ADDRESS"),
             ("chain_id", "DECDN_CHAIN_ID"),
             ("cache_dir", "DECDN_CACHE_DIR"),
@@ -6189,6 +6274,8 @@ mod tests {
     #[test]
     fn resolve_blockchain_names_correct_field_for_bad_address() -> anyhow::Result<()> {
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -6216,6 +6303,8 @@ mod tests {
     #[test]
     fn resolve_blockchain_names_correct_field_for_bad_payment_address() -> anyhow::Result<()> {
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -6241,9 +6330,111 @@ mod tests {
     }
 
     #[test]
+    fn resolve_blockchain_origin_directory_unset_resolves_to_none() -> anyhow::Result<()> {
+        // The chain-backed origin directory is opt-in: with neither address set
+        // both resolve to `None` (the runtime then uses an empty deny-all origin
+        // directory) and resolution succeeds.
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let dir = data_dir_with_keystore()?;
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert!(resolved.origin_assignment_address.is_none());
+        assert!(resolved.publisher_registry_address.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_origin_directory_both_set_resolves_to_some() -> anyhow::Result<()> {
+        let cli = BlockchainArgs {
+            origin_assignment_address: Some(GOOD_ADDR.to_string()),
+            publisher_registry_address: Some(GOOD_ADDR.to_string()),
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let dir = data_dir_with_keystore()?;
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert!(resolved.origin_assignment_address.is_some());
+        assert!(resolved.publisher_registry_address.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_origin_directory_requires_both_addresses() -> anyhow::Result<()> {
+        // A lone OriginAssignment address is an operator mistake: the directory
+        // resolution chain needs PublisherRegistry too. Resolution fails and
+        // names the *missing* field, not the one that was set.
+        let cli = BlockchainArgs {
+            origin_assignment_address: Some(GOOD_ADDR.to_string()),
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let dir = data_dir_with_keystore()?;
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected resolve_blockchain to fail on a lone origin-directory address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("publisher_registry_address"),
+            "error should name the missing publisher_registry_address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_origin_directory_lone_publisher_names_missing_origin()
+    -> anyhow::Result<()> {
+        // Symmetric to the above: only the publisher address is set, so the
+        // error must name the missing ORIGIN address (guards the field-naming
+        // branch in both directions).
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: Some(GOOD_ADDR.to_string()),
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let dir = data_dir_with_keystore()?;
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected resolve_blockchain to fail on a lone publisher address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("origin_assignment_address"),
+            "error should name the missing origin_assignment_address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resolve_blockchain_fails_when_keystore_missing() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -6272,6 +6463,8 @@ mod tests {
         let dir = data_dir_with_keystore()?;
         let bogus = dir.path().join("does-not-exist.json");
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: Some(bogus),
             keystore_password_file: None,
@@ -6299,6 +6492,8 @@ mod tests {
         let dir = TempDir::new()?;
         std::fs::create_dir(dir.path().join("keystore.json"))?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -6337,6 +6532,8 @@ mod tests {
 
     fn empty_blockchain_args() -> crate::cli::run::BlockchainArgs {
         crate::cli::run::BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
             keystore_password_file: None,
@@ -7069,6 +7266,8 @@ mod tests {
     fn resolve_blockchain_cli_rpc_url_overrides_file() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://cli-wins.example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7078,6 +7277,9 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://file-loses.example/rpc".to_string()),
             eth_keystore: None,
             payment_channel_address: None,
@@ -7108,6 +7310,9 @@ mod tests {
         let dir = data_dir_with_keystore()?;
         let cli = empty_blockchain_args();
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://file-only.example/rpc".to_string()),
             eth_keystore: None,
             payment_channel_address: Some(GOOD_ADDR.to_string()),
@@ -7136,6 +7341,8 @@ mod tests {
     fn resolve_blockchain_errors_when_rpc_url_missing() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
             keystore_password_file: None,
@@ -7159,6 +7366,8 @@ mod tests {
     fn resolve_blockchain_errors_when_payment_channel_address_missing() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7182,6 +7391,8 @@ mod tests {
     fn resolve_blockchain_errors_when_capacity_bond_address_missing() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7205,6 +7416,8 @@ mod tests {
     fn resolve_blockchain_errors_when_slash_judge_address_missing() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7228,6 +7441,8 @@ mod tests {
     fn resolve_blockchain_rejects_zero_slash_judge_address() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7251,6 +7466,8 @@ mod tests {
     fn resolve_blockchain_rejects_zero_chain_id() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7277,6 +7494,8 @@ mod tests {
         // an absent value rather than silently passing `""` to url::Url.
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some(String::new()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7300,6 +7519,8 @@ mod tests {
     fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7309,6 +7530,9 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
@@ -7338,6 +7562,8 @@ mod tests {
     fn resolve_blockchain_rejects_zero_redeem_threshold() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7347,6 +7573,9 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
@@ -7375,6 +7604,8 @@ mod tests {
     fn resolve_blockchain_rejects_zero_auto_settlement_threshold() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7384,6 +7615,9 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
@@ -7412,6 +7646,8 @@ mod tests {
     fn resolve_blockchain_rejects_zero_auto_settlement_voucher_nonce_span() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7421,6 +7657,9 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
@@ -7451,6 +7690,8 @@ mod tests {
         // node that never sets them behaves exactly as before #742.
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7469,6 +7710,8 @@ mod tests {
     fn resolve_blockchain_accepts_positive_auto_settlement_thresholds() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7478,6 +7721,9 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
@@ -7505,6 +7751,8 @@ mod tests {
         // `0` is the documented disable sentinel and must bypass the floor.
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7514,6 +7762,9 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
@@ -7536,6 +7787,8 @@ mod tests {
     fn resolve_blockchain_accepts_min_watchdog_interval() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
@@ -7545,6 +7798,9 @@ mod tests {
             chain_id: None,
         };
         let file = types::BlockchainConfig {
+            origin_directory_from_block: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
             payment_channel_address: None,
@@ -7574,6 +7830,8 @@ mod tests {
         // analogue at `resolve_gossip_applies_defaults_when_absent`.
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,

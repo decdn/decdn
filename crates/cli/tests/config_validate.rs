@@ -285,6 +285,9 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            origin_directory_from_block: 0,
             rpc_url: "https://rpc.example/SECRET_TOKEN_abc123".to_string(),
             eth_keystore: PathBuf::from("/var/lib/decdn/keystore.json"),
             keystore_password_file: None,

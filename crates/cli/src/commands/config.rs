@@ -136,6 +136,29 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  origin_assignment_address: {}",
+        resolved
+            .blockchain
+            .origin_assignment_address
+            .as_deref()
+            .unwrap_or("(unset — origin directory empty: prefetch gate finds no origins)")
+    )?;
+    writeln!(
+        w,
+        "  publisher_registry_address: {}",
+        resolved
+            .blockchain
+            .publisher_registry_address
+            .as_deref()
+            .unwrap_or("(unset — origin directory empty: prefetch gate finds no origins)")
+    )?;
+    writeln!(
+        w,
+        "  origin_directory_from_block: {}",
+        resolved.blockchain.origin_directory_from_block
+    )?;
+    writeln!(
+        w,
         "  rpc_watchdog_interval_sec: {}",
         resolved.blockchain.rpc_watchdog_interval_sec
     )?;
@@ -256,6 +279,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # eth_keystore = "~/.decdn/keystore.json"
 # payment_channel_address = ""       # REQUIRED: 0x-prefixed hex
 # capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex
+# origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; enables chain-backed origin directory for DHT prefetch (ADR 022). Set WITH publisher_registry_address.
+# publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; pairs with origin_assignment_address
+# origin_directory_from_block = 0    # OPTIONAL: ContentClaimed log-replay start; set to the PublisherRegistry deploy block (default 0 scans the whole chain)
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
