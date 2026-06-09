@@ -89,6 +89,31 @@ pub fn write_validate_summary<W: std::io::Write>(
     for relay in &resolved.network.relay_urls {
         writeln!(w, "  relay_url:                {relay}")?;
     }
+    // Operator-configurable discovery (#818); nothing printed when unset (the
+    // node then uses the n0 pkarr/DNS default). A pkarr_url is an infra relay
+    // endpoint — pkarr authenticates by the Ed25519-signed packet, not a URL
+    // token — so its credentials, if any, are normally `user:pass@` userinfo.
+    // Redact that (host stays visible for diagnostics) rather than fully hiding
+    // it like rpc_url/otlp_endpoint, whose secret commonly lives in the path or
+    // query. Caveat: `redact_userinfo` does NOT scrub a path/query secret, so a
+    // nonstandard relay that put one there would still print it — acceptable
+    // given pkarr's auth model and that relays themselves print unredacted
+    // above. dns_origin is a plain domain. Peer entries (id/relay/addrs) are
+    // not echoed (verbose) — only the count.
+    let discovery = &resolved.network.discovery;
+    if let Some(pkarr) = &discovery.pkarr_url {
+        writeln!(
+            w,
+            "  discovery.pkarr_url:      {}",
+            decdn_common::redact::redact_userinfo(pkarr)
+        )?;
+    }
+    if let Some(origin) = &discovery.dns_origin {
+        writeln!(w, "  discovery.dns_origin:     {origin}")?;
+    }
+    if !discovery.peers.is_empty() {
+        writeln!(w, "  discovery.peers:          {}", discovery.peers.len())?;
+    }
     writeln!(
         w,
         "  rpc_url:                  <redacted> ({} chars)",
@@ -108,6 +133,29 @@ pub fn write_validate_summary<W: std::io::Write>(
         w,
         "  capacity_bond_address: {}",
         resolved.blockchain.capacity_bond_address
+    )?;
+    writeln!(
+        w,
+        "  origin_assignment_address: {}",
+        resolved
+            .blockchain
+            .origin_assignment_address
+            .as_deref()
+            .unwrap_or("(unset — origin directory empty: prefetch gate finds no origins)")
+    )?;
+    writeln!(
+        w,
+        "  publisher_registry_address: {}",
+        resolved
+            .blockchain
+            .publisher_registry_address
+            .as_deref()
+            .unwrap_or("(unset — origin directory empty: prefetch gate finds no origins)")
+    )?;
+    writeln!(
+        w,
+        "  origin_directory_from_block: {}",
+        resolved.blockchain.origin_directory_from_block
     )?;
     writeln!(
         w,
@@ -216,12 +264,24 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # relay_urls = ["https://relay-a.example.", "https://relay-b.example."]
 # Deprecated single-relay alias (folded into relay_urls when set):
 # relay_url = "https://relay.iroh.network."
+# Operator-configurable address discovery (#818). Absent => n0-hosted pkarr/DNS.
+# Present => the node drops the n0 discovery leg and uses only what is set here.
+# [network.discovery]
+# pkarr_url = "https://pkarr.example./"      # publish this node's signed address record here
+# dns_origin = "discovery.example."          # resolve peers via DNS TXT under this origin
+# Static peer address book (fully offline; keyed by NodeId — 64-char lowercase hex):
+# [network.discovery.peers.0000000000000000000000000000000000000000000000000000000000000000]
+# relay_url = "https://relay.example./"
+# addrs = ["203.0.113.4:4433"]
 
 [blockchain]
 # rpc_url = ""                       # REQUIRED: Arbitrum Sepolia JSON-RPC URL
 # eth_keystore = "~/.decdn/keystore.json"
 # payment_channel_address = ""       # REQUIRED: 0x-prefixed hex
 # capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex
+# origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; enables chain-backed origin directory for DHT prefetch (ADR 022). Set WITH publisher_registry_address.
+# publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; pairs with origin_assignment_address
+# origin_directory_from_block = 0    # OPTIONAL: ContentClaimed log-replay start; set to the PublisherRegistry deploy block (default 0 scans the whole chain)
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog

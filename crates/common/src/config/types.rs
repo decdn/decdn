@@ -63,6 +63,12 @@ pub struct NetworkConfig {
     /// Deprecated single-relay alias for [`Self::relay_urls`]. When set and
     /// `relay_urls` is absent, it is folded into the list as a single entry.
     pub relay_url: Option<String>,
+    /// Operator-configurable address discovery (#818 scope 1). Absent => the
+    /// node uses the n0-hosted pkarr/DNS discovery (`presets::N0`, unchanged).
+    /// Present => the node drops the n0 discovery leg and composes only the
+    /// providers configured here (the wiring layer builds on `presets::Minimal`).
+    /// Relay selection ([`Self::relay_urls`]) is an independent, orthogonal knob.
+    pub discovery: Option<DiscoveryConfig>,
     /// Master switch for QUIC 0-RTT on `cdn/probe/v1` (ADR 015). Absent =>
     /// default (`true`). When `false`, probe clients fall back to plain
     /// 1-RTT `connect` (the effective downgrade — they emit no early
@@ -70,6 +76,50 @@ pub struct NetworkConfig {
     /// operational kill switch; replay safety for non-probe ALPNs is
     /// client-side (only the probe client emits 0-RTT), not gated here.
     pub enable_0rtt: Option<bool>,
+}
+
+/// Operator-configurable address-discovery providers (#818 scope 1).
+///
+/// Two mechanisms, selectable by which keys are present and combinable:
+/// - **Custom pkarr + DNS** ([`Self::pkarr_url`] + [`Self::dns_origin`]) —
+///   publish this node's signed address record to an operator-run pkarr relay
+///   and resolve peers via an operator-run DNS server. Closest to n0's model;
+///   supports dynamic addresses.
+/// - **Static peer map** ([`Self::peers`]) — a `MemoryLookup` address book
+///   supplied directly in config. Fully offline/isolated; addresses must be
+///   known ahead of time.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    /// pkarr relay URL this node PUBLISHES its signed address record to. Must
+    /// be paired with [`Self::dns_origin`] (a resolver for the same namespace):
+    /// publishing to a relay nothing resolves from is rejected at config
+    /// validation. Parse-checked as a URL at resolution.
+    pub pkarr_url: Option<String>,
+    /// DNS origin domain this node RESOLVES peer addresses from (TXT queries
+    /// `_iroh.<z32-id>.<dns_origin>`). Valid on its own (a resolve-only node
+    /// that does not publish). Checked non-empty at resolution.
+    pub dns_origin: Option<String>,
+    /// Static peer address book seeded into a `MemoryLookup`, keyed by peer
+    /// `NodeId` (the canonical 64-char lowercase-hex form iroh emits; validated
+    /// with the same parser the node uses at bring-up). Composes alongside the
+    /// pkarr/DNS leg when both are set.
+    pub peers: Option<std::collections::HashMap<String, DiscoveryPeer>>,
+}
+
+/// A single static peer entry for [`DiscoveryConfig::peers`]. To be useful at
+/// least one of [`Self::relay_url`] / [`Self::addrs`] should be set — an
+/// id-only entry yields a peer with no transport addresses to dial.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryPeer {
+    /// This peer's home relay URL (becomes a relay transport address).
+    pub relay_url: Option<String>,
+    /// Direct socket addresses for this peer (`host:port`, each becomes a
+    /// direct transport address). Each entry is parsed as a `SocketAddr` at
+    /// resolution.
+    #[serde(default)]
+    pub addrs: Vec<String>,
 }
 
 /// Blockchain section of the config file.
@@ -83,6 +133,21 @@ pub struct BlockchainConfig {
     pub payment_channel_address: Option<String>,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
+    /// `OriginAssignment` contract address. Optional: when set (together with
+    /// `publisher_registry_address`), the node runs the chain-backed origin
+    /// directory that gates DHT prefetch (ADR 022). Both must be set or unset
+    /// together; unset => the origin directory is empty (deny-all) and the
+    /// prefetch authorized-origin gate finds no origins.
+    pub origin_assignment_address: Option<String>,
+    /// `PublisherRegistry` contract address. Pairs with
+    /// `origin_assignment_address` (see its docs).
+    pub publisher_registry_address: Option<String>,
+    /// Block height at which the chain-backed origin directory begins its
+    /// `ContentClaimed` log replay. SHOULD be the `PublisherRegistry`
+    /// deployment block; absent => `0`, which is correct but scans the entire
+    /// chain history (slow / RPC-heavy on an established L2). Only consulted
+    /// when the origin-directory addresses are set.
+    pub origin_directory_from_block: Option<u64>,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `ProbeResponse` / `StreamResponse` `slash_sig` signatures (ADR 014
     /// §1–2). Required: a wrong/zero address silently produces signatures no
