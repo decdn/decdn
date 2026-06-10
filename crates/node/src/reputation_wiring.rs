@@ -281,17 +281,25 @@ pub struct NodeReputationSink {
     coverage: Arc<RegionalCoverage>,
     settlement: Arc<NodeSettlementSource>,
     peer_table: Arc<tokio::sync::RwLock<PeerTable>>,
+    /// Active-staker oracle (#864): a report's `provider` must be a current
+    /// staked node before it can create a network/coverage entry. Without this,
+    /// a staked but rate-limited reporter could name arbitrary 32-byte provider
+    /// ids and grow the aggregation maps unboundedly. Same authoritative source
+    /// that gates reporters via [`NodeStakedReporterSet`].
+    staker_set: Arc<dyn StakerSet>,
     min_counterparties: u32,
 }
 
 impl NodeReputationSink {
-    /// Build the sink from the aggregation state and the peer table (used to
-    /// resolve a reporter's attested region for regional coverage).
+    /// Build the sink from the aggregation state, the peer table (used to
+    /// resolve a reporter's attested region for regional coverage), and the
+    /// staker set (used to drop reports for non-staked providers, #864).
     pub const fn new(
         network: Arc<NetworkReputation>,
         coverage: Arc<RegionalCoverage>,
         settlement: Arc<NodeSettlementSource>,
         peer_table: Arc<tokio::sync::RwLock<PeerTable>>,
+        staker_set: Arc<dyn StakerSet>,
         min_counterparties: u32,
     ) -> Self {
         Self {
@@ -299,6 +307,7 @@ impl NodeReputationSink {
             coverage,
             settlement,
             peer_table,
+            staker_set,
             min_counterparties,
         }
     }
@@ -323,6 +332,17 @@ impl ReputationSink for NodeReputationSink {
         ) else {
             return;
         };
+        // #864: only rate providers that are current staked nodes. A report for
+        // an arbitrary 32-byte `provider` would otherwise create a network/
+        // coverage entry for a key that is not a real node — the unbounded-entry
+        // vector a staked-but-rate-limited reporter could exploit. Drop it the
+        // same way a malformed key is dropped above.
+        if !self
+            .staker_set
+            .is_active(&ProtocolNodeId::from_bytes(report.provider))
+        {
+            return;
+        }
         let now = now_secs();
         let weight =
             compute_reporter_weight(self.settlement.as_ref(), reporter, self.min_counterparties);
@@ -365,8 +385,18 @@ impl ReputationSink for NodeReputationSink {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::dht::staker_set::ConfigStakerSet;
     use decdn_reputation::NetworkReputationConfig;
     use iroh::SecretKey;
+    use std::collections::HashSet;
+
+    /// A staker set containing exactly `provider`, so the #864 provider-existence
+    /// guard in `accept` admits reports rating it.
+    fn staker_set_with(provider: PublicKey) -> Arc<ConfigStakerSet> {
+        Arc::new(ConfigStakerSet::new(HashSet::from([
+            ProtocolNodeId::from_bytes(*provider.as_bytes()),
+        ])))
+    }
 
     fn pk() -> PublicKey {
         SecretKey::generate().public()
@@ -475,6 +505,7 @@ mod tests {
             Arc::clone(&coverage),
             settlement,
             Arc::clone(&peer_table),
+            staker_set_with(provider),
             5,
         );
         for r in reporters {
@@ -517,8 +548,14 @@ mod tests {
             }
             reporters.push(r);
         }
-        let sink =
-            NodeReputationSink::new(Arc::clone(&network), coverage, settlement, peer_table, 5);
+        let sink = NodeReputationSink::new(
+            Arc::clone(&network),
+            coverage,
+            settlement,
+            peer_table,
+            staker_set_with(provider),
+            5,
+        );
         for r in reporters {
             sink.accept(ValidatedReport {
                 provider: *provider.as_bytes(),
@@ -533,6 +570,51 @@ mod tests {
         assert!(
             network.score(provider, now) > 0.5,
             "positive reports should raise the score above neutral"
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_drops_reports_for_non_staked_provider() {
+        // #864: identical to the weighted-reporter test above, but the provider
+        // is absent from the staker set. The guard drops every report, so no
+        // network entry is created — the provider stays unscored and neutral
+        // (where the staked case moved the score above 0.5).
+        let network = Arc::new(NetworkReputation::new(NetworkReputationConfig::default()).unwrap());
+        let coverage = Arc::new(RegionalCoverage::new(NetworkReputationConfig::default()).unwrap());
+        let settlement = Arc::new(NodeSettlementSource::new(5));
+        let peer_table = Arc::new(tokio::sync::RwLock::new(PeerTable::new(60_000_000, 128)));
+
+        let provider = pk();
+        let sink = NodeReputationSink::new(
+            Arc::clone(&network),
+            Arc::clone(&coverage),
+            Arc::clone(&settlement),
+            Arc::clone(&peer_table),
+            Arc::new(ConfigStakerSet::empty()), // provider not staked
+            5,
+        );
+        let now = now_secs();
+        for _ in 0..3 {
+            let r = pk();
+            for i in 0..5u8 {
+                settlement.record_settlement(r, 10_000_000, now, Some([i; 20]));
+            }
+            sink.accept(ValidatedReport {
+                provider: *provider.as_bytes(),
+                reporter: *r.as_bytes(),
+                delivery_speed: Some(10 * 1024 * 1024),
+                uptime_observed: Some(true),
+                data_correct: Some(true),
+                timestamp_secs: now,
+            });
+        }
+        assert!(
+            !network.is_scored(provider),
+            "a non-staked provider must never become scored"
+        );
+        assert!(
+            (network.score(provider, now) - 0.5).abs() < 1e-9,
+            "no entry created → score stays neutral"
         );
     }
 }
