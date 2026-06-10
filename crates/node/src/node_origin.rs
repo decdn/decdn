@@ -393,6 +393,11 @@ async fn pull_from_candidate(
         &mut progress,
     )
     .await;
+    // Capture the delivery duration before persistence: `record_progress` does a
+    // blocking fsync'd store write, and folding it into `elapsed` would inflate
+    // the delivery-speed reputation signal for a reason unrelated to the network
+    // pull.
+    let elapsed = started.elapsed();
     // Persist whatever the upstream acked, regardless of Ok/Err: a mid-stream
     // failure or a paid-but-corrupt (hash-mismatch) delivery can still have
     // advanced the upstream's accepted-voucher watermark. Skipping this is the
@@ -414,7 +419,7 @@ async fn pull_from_candidate(
                 pk,
                 &Outcome::Delivered {
                     bytes: bytes.len() as u64,
-                    elapsed: started.elapsed(),
+                    elapsed,
                 },
             );
             Some(bytes)
