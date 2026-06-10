@@ -648,13 +648,29 @@ async fn on_default_open_added<P>(
 }
 
 /// Remove an operator from a namespace's authorized set (revoke / prune).
+///
+/// `AssignmentRevoked` / `BlacklistedAssignmentPruned` carry a `namespaceId`
+/// that may be `0` (governance revoke or permissionless prune of a
+/// default-open operator). The default-open set lives in its own
+/// [`DirectoryCache::default_open`] field and is never keyed in
+/// `origins_of_ns`, so namespace 0 must dispatch to [`remove_default_open`] —
+/// otherwise the removal silently no-ops and a revoked/blacklisted operator
+/// lingers in the cached allow-list (#851).
 fn remove_origin(
     cache: &Arc<RwLock<DirectoryCache>>,
     metrics: &Arc<Metrics>,
     namespace: U256,
     operator: Address,
 ) {
+    if namespace == DEFAULT_OPEN_NAMESPACE {
+        remove_default_open(cache, metrics, operator);
+        return;
+    }
     write_cache(cache, |c| {
+        // A `None` here means the namespace was never cached (no claim or
+        // activation observed), so it already resolves to empty — the operator
+        // is not being served and there is nothing to drop. Unlike namespace 0
+        // (#851), this is not a live allow-list, so the no-op is correct.
         if let Some(set) = c.origins_of_ns.get_mut(&namespace) {
             set.remove(&operator);
         }
@@ -956,6 +972,64 @@ mod tests {
         assert!(c.default_open.contains(&addr(0xE)));
         c.default_open.remove(&addr(0xD));
         assert!(!c.default_open.contains(&addr(0xD)));
+    }
+
+    #[test]
+    fn revoke_namespace_zero_removes_from_default_open() {
+        // `AssignmentRevoked(0, op)` / `BlacklistedAssignmentPruned(0, op)` both
+        // route through `remove_origin` with `namespace == DEFAULT_OPEN_NAMESPACE`.
+        // The default-open set lives in its own field, never in `origins_of_ns`,
+        // so the removal must dispatch to `remove_default_open` (#851).
+        let metrics = Arc::new(Metrics::new());
+        let cache = Arc::new(RwLock::new(cache_with(
+            &[],
+            &[],
+            &[addr(0xA), addr(0xB)],
+            &[],
+        )));
+        remove_origin(&cache, &metrics, DEFAULT_OPEN_NAMESPACE, addr(0xA));
+        read_cache(&cache, |c| {
+            assert!(
+                !c.default_open.contains(&addr(0xA)),
+                "revoked operator must be dropped from the default-open set"
+            );
+            assert!(
+                c.default_open.contains(&addr(0xB)),
+                "other default-open operators are untouched"
+            );
+        });
+        // The removal must re-publish the authorised-operator gauge (the
+        // observability half of the fix: pre-#851 the no-op left it stale).
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_origin_directory_operator_count 1"),
+            "gauge must drop to 1 (only B remains) after a namespace-0 revoke:\n{text}"
+        );
+    }
+
+    #[test]
+    fn blacklist_prune_namespace_zero_leaves_nonzero_namespaces_intact() {
+        // A namespace-0 prune touches only the default-open set; an operator
+        // authorised in a specific (non-zero) namespace stays there.
+        let metrics = Arc::new(Metrics::new());
+        let cache = Arc::new(RwLock::new(cache_with(
+            &[],
+            &[(7, &[addr(0xA)])],
+            &[addr(0xA), addr(0xB)],
+            &[],
+        )));
+        remove_origin(&cache, &metrics, DEFAULT_OPEN_NAMESPACE, addr(0xA));
+        read_cache(&cache, |c| {
+            assert!(
+                !c.default_open.contains(&addr(0xA)),
+                "pruned operator must leave the default-open set"
+            );
+            assert!(
+                c.origins_of_ns[&ns(7)].contains(&addr(0xA)),
+                "namespace-0 prune must not touch a non-zero namespace's set"
+            );
+        });
     }
 
     // ---- Metric-wiring tests: the drift-surfacing guarantee this type exists
