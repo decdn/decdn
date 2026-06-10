@@ -5,7 +5,7 @@
 //! the full predicate (registered + bond ≥ minBond + no unbonding +
 //! not ejected; the `getActiveNodes` page is the un-filtered
 //! `_registeredAddrs` array per the contract's own comment), then runs
-//! a background task that follows the six membership-mutating events
+//! a background task that follows the five membership-mutating events
 //! and emits [`StakerChange`] for every observed transition.
 //!
 //! # Spec mapping
@@ -247,7 +247,7 @@ where
     Ok(active)
 }
 
-/// Background event-subscription loop. Subscribes to the six relevant
+/// Background event-subscription loop. Subscribes to the five relevant
 /// `CapacityBond` events and updates the cached active set on each
 /// observation. On stream failure (transport error, RPC timeout), the
 /// loop restarts the subscriptions with exponential backoff.
@@ -298,7 +298,7 @@ async fn watcher_loop<P>(
     }
 }
 
-/// Run one cycle of the watcher: open the six event filters, drain
+/// Run one cycle of the watcher: open the five event filters, drain
 /// them via `tokio::select!` until any one returns an error. Returns
 /// `Ok(())` if the streams ended cleanly (filter expiry / provider
 /// rotation); returns `Err` if a stream observed a transport-level
