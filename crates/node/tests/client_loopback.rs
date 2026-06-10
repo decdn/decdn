@@ -984,59 +984,51 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #327 boundary: a voucher for a channel the node has never persisted is
-/// rejected mid-stream with `VoucherRejected { WrongChannel }`, delivered
-/// cleanly so the client reads the reason (no QUIC reset).
+/// #327 boundary + #848 free-egress: a stream request for a channel the node has
+/// never persisted is refused *pre-serve* — the node signs `ok: false` with the
+/// delivery-side `NotFound` code and ships zero bytes. Previously it served up to
+/// one voucher interval (or the whole blob, if smaller) for free and only
+/// rejected the voucher mid-stream with `VoucherRejected { WrongChannel }`. The
+/// 1.5 MiB blob (larger than the voucher interval) proves the gate fires
+/// independent of blob size — not just for sub-interval blobs. Asserting on the
+/// server's `StreamResponse` (rather than the buyer's error string) proves the
+/// success path was never entered: an `ok: true` would have streamed bytes.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
-    let payload = b"unknown channel pays nothing".to_vec();
+    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB — would cross a voucher interval if served
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
-    let client_signer = Arc::new(PrivateKeySigner::random());
     // Empty store: the channel is unknown to the node.
-    let store = Arc::new(MemoryChannelStateStore::new());
-
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = Arc::new(PrivateKeySigner::random());
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
-    let handler = build_handler(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store_dyn,
-        RATE_PER_MB,
-    )?;
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
+    let store: Arc<dyn ChannelStateStore> = Arc::new(MemoryChannelStateStore::new());
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(client_signer, U256::from(10_000_000u64));
-
-    let err = stream_fetch(
-        &client_ep,
-        target,
-        &ctx,
-        &slash_domain(),
-        server_eth.address(),
-        *hash.as_bytes(),
-        0,
-        0x5678,
-        Duration::from_secs(10),
-    )
-    .await
-    .err()
-    .ok_or_else(|| anyhow::anyhow!("unknown channel must be rejected"))?;
-    anyhow::ensure!(
-        err.to_string().contains("WrongChannel") || err.to_string().contains("rejected"),
-        "error should surface the voucher rejection: {err}"
-    );
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        timestamp_us: 0x5678,
+    };
+    // No binding, no channel: the pure free-egress case (#848). Drive the raw
+    // path so we read the server's first reply directly.
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(
+                !resp.body.ok,
+                "unknown channel must be refused pre-serve, not served"
+            );
+            anyhow::ensure!(
+                matches!(
+                    resp.error,
+                    Some(decdn_protocol::client::StreamError::NotFound)
+                ),
+                "expected NotFound, got {:?}",
+                resp.error
+            );
+        }
+        other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
+    }
 
     client_ep.close().await;
     server_ep.close().await;
