@@ -57,7 +57,10 @@ use decdn_common::config::ResolvedSecurity;
 /// Each unique address would be a separate map key, both bypassing the
 /// rate limit and churning the eviction path so legitimate IPv4
 /// victims' buckets get flushed.
-fn source_key(ip: IpAddr) -> IpAddr {
+///
+/// Shared with the DHT per-IP limiter (`dht::rate_limit`), which had the
+/// same bypass (#841).
+pub(crate) fn source_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => {

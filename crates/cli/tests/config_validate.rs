@@ -139,6 +139,45 @@ fn validate_fails_when_required_field_missing() -> anyhow::Result<()> {
 }
 
 #[test]
+fn validate_fails_for_unknown_field_in_section() -> anyhow::Result<()> {
+    // #842: a typo'd key inside a known section must fail at load rather than
+    // silently keeping the default for the intended (security-relevant) knob.
+    let body = format!("{VALID_CONFIG}\n[gossip]\nsubscribe_globall = false\n");
+    let dir = TempDir::new()?;
+    let path = write_config(&dir, &body)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+    let err = commands::config_validate(Some(&path), &args(dir.path())?)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("subscribe_globall"),
+        "error should name the unknown key: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
+fn validate_fails_for_typoed_whole_section() -> anyhow::Result<()> {
+    // #842: a typo'd whole-section header (`[netork]` for `[network]`) is the
+    // highest-value catch — `deny_unknown_fields` on `FileConfig` rejects it
+    // instead of dropping the entire section.
+    let body = format!("{VALID_CONFIG}\n[netork]\nrelay_urls = [\"https://ok.example\"]\n");
+    let dir = TempDir::new()?;
+    let path = write_config(&dir, &body)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+    let err = commands::config_validate(Some(&path), &args(dir.path())?)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("netork"),
+        "error should name the unknown section: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
 fn validate_fails_when_env_var_unset() -> anyhow::Result<()> {
     // PID-suffixed name plus an up-front `var_os` check guarantees neither a
     // concurrent test nor ambient CI environment can silently satisfy the
@@ -515,6 +554,27 @@ fn summary_prints_one_line_per_relay() -> anyhow::Result<()> {
     anyhow::ensure!(
         out.contains("relay_url:                https://relay-b.example"),
         "{out}"
+    );
+    Ok(())
+}
+
+#[test]
+fn summary_redacts_relay_url_credentials() -> anyhow::Result<()> {
+    // #862: a relay entry carrying `user:pass@` userinfo must be redacted in
+    // the summary (host kept for diagnostics), the same treatment pkarr_url
+    // gets — the summary is the share-into-an-issue surface that's why rpc_url
+    // is hidden in the first place.
+    let cfg = sample_resolved(|c| {
+        c.network.relay_urls = vec!["https://user:RELAY_SECRET_xyz@relay.example:7842".into()];
+    });
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        !out.contains("RELAY_SECRET_xyz"),
+        "relay credentials must never appear in summary: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("***@relay.example:7842"),
+        "relay userinfo should be redacted with the host preserved: {out}"
     );
     Ok(())
 }

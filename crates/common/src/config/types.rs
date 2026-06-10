@@ -12,6 +12,7 @@ use crate::cli::common::{LogFormat, LogLevel};
 
 /// Top-level TOML configuration file structure.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Identity settings.
     pub identity: Option<IdentityConfig>,
@@ -42,6 +43,7 @@ pub struct FileConfig {
 
 /// Identity section of the config file.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
     /// Node data directory.
     pub data_dir: Option<PathBuf>,
@@ -51,6 +53,7 @@ pub struct IdentityConfig {
 
 /// Network section of the config file.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// QUIC bind port.
     pub bind_port: Option<u16>,
@@ -124,6 +127,7 @@ pub struct DiscoveryPeer {
 
 /// Blockchain section of the config file.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockchainConfig {
     /// JSON-RPC endpoint URL.
     pub rpc_url: Option<String>,
@@ -541,6 +545,7 @@ pub enum S3Credentials {
 
 /// Payment section of the config file.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PaymentConfig {
     /// Rate per MB in USDC base units.
     pub rate_per_mb: Option<u64>,
@@ -566,6 +571,7 @@ pub struct PaymentConfig {
 
 /// Gossip section of the config file (ADR 001).
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GossipConfig {
     /// Seconds between outgoing `NodeAnnounce` messages. Default 60.
     pub announce_interval_sec: Option<u64>,
@@ -637,6 +643,7 @@ pub struct GossipConfig {
 /// likely-typo. Setting `rate = 0` together with any `burst` value is
 /// fine; burst is unused once the layer is disabled.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Maximum number of concurrently in-flight QUIC handler tasks across
     /// all deCDN-authored ALPNs. New connections beyond this limit are
@@ -737,6 +744,7 @@ pub struct DhtRateLimitConfig {
 
 /// Observability section of the config file.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
     /// Log verbosity level.
     pub log_level: Option<LogLevel>,

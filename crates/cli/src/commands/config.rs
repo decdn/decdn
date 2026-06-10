@@ -85,9 +85,16 @@ pub fn write_validate_summary<W: std::io::Write>(
         resolved.network.bind_port
     )?;
     // One line per configured relay; nothing when the list is empty (the node
-    // then falls back to the n0 default relays).
+    // then falls back to the n0 default relays). Relay URLs can carry
+    // `user:pass@` userinfo, so redact it (host stays visible) — the same
+    // treatment pkarr_url gets below, and the reason rpc_url/otlp_endpoint are
+    // fully hidden in this same summary (#862).
     for relay in &resolved.network.relay_urls {
-        writeln!(w, "  relay_url:                {relay}")?;
+        writeln!(
+            w,
+            "  relay_url:                {}",
+            decdn_common::redact::redact_userinfo(relay)
+        )?;
     }
     // Operator-configurable discovery (#818); nothing printed when unset (the
     // node then uses the n0 pkarr/DNS default). A pkarr_url is an infra relay
@@ -97,7 +104,7 @@ pub fn write_validate_summary<W: std::io::Write>(
     // it like rpc_url/otlp_endpoint, whose secret commonly lives in the path or
     // query. Caveat: `redact_userinfo` does NOT scrub a path/query secret, so a
     // nonstandard relay that put one there would still print it — acceptable
-    // given pkarr's auth model and that relays themselves print unredacted
+    // given pkarr's auth model and that relays themselves redact userinfo
     // above. dns_origin is a plain domain. Peer entries (id/relay/addrs) are
     // not echoed (verbose) — only the count.
     let discovery = &resolved.network.discovery;

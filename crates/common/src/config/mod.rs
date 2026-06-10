@@ -527,6 +527,21 @@ fn resolve_network_into(
         }
     };
 
+    // #843: `--relay-url` (and `DECDN_RELAY_URL`, which clap folds into it)
+    // takes precedence over the file list, so a stale exported env var silently
+    // collapses a multi-entry `network.relay_urls` failover list (#795/#817) to
+    // the single env value. Warn rather than defeat relay redundancy quietly.
+    // `eprintln!` not `tracing::warn!`: tracing is not initialized at resolve
+    // time (see `validate_security_into`).
+    let file_relay_list_len = file.and_then(|n| n.relay_urls.as_ref()).map_or(0, Vec::len);
+    if cli.relay_url.is_some() && file_relay_list_len > 0 {
+        eprintln!(
+            "warning: --relay-url (or DECDN_RELAY_URL) overrides the \
+             {file_relay_list_len}-entry network.relay_urls list; multi-relay \
+             failover is disabled"
+        );
+    }
+
     // Validate each resolved entry. The label names the source the operator
     // actually wrote: the indexed array field (`network.relay_urls[i]`, matching
     // the `cache.origins[i]` convention) only when the list branch above was
@@ -2432,8 +2447,36 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
     if let Some(n) = cfg.network.as_mut() {
         expand_str(&mut n.relay_url, "network.relay_url")?;
         if let Some(urls) = n.relay_urls.as_mut() {
-            for url in urls.iter_mut() {
-                *url = expand_value(url, "network.relay_urls")?;
+            for (idx, url) in urls.iter_mut().enumerate() {
+                *url = expand_value(url, &format!("network.relay_urls[{idx}]"))?;
+            }
+        }
+        // #863: `[network.discovery]` fields were skipped by `${VAR}` expansion
+        // unlike their `relay_urls` sibling — `dns_origin = "${DNS_ORIGIN}"`
+        // passed the non-empty check and reached bring-up as a literal string,
+        // silently breaking peer resolution. Mirror the relay loop here.
+        if let Some(d) = n.discovery.as_mut() {
+            expand_str(&mut d.pkarr_url, "network.discovery.pkarr_url")?;
+            expand_str(&mut d.dns_origin, "network.discovery.dns_origin")?;
+            if let Some(peers) = d.peers.as_mut() {
+                // `HashMap` iteration order is nondeterministic; sort by peer id
+                // so that when two peers both carry a bad `${VAR}`, the `?`
+                // surfaces a stable error across runs. Mirrors the sort in
+                // `resolve_discovery_into`. Unstable sort: keys are unique.
+                let mut entries: Vec<_> = peers.iter_mut().collect();
+                entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                for (id, peer) in entries {
+                    expand_str(
+                        &mut peer.relay_url,
+                        &format!("network.discovery.peers[{id}].relay_url"),
+                    )?;
+                    for (idx, addr) in peer.addrs.iter_mut().enumerate() {
+                        *addr = expand_value(
+                            addr,
+                            &format!("network.discovery.peers[{id}].addrs[{idx}]"),
+                        )?;
+                    }
+                }
             }
         }
     }
@@ -3351,6 +3394,106 @@ mod tests {
         anyhow::ensure!(
             urls == &[format!("{home}/relay-a"), format!("{home}/relay-b")],
             "got: {urls:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_substitutes_discovery_fields() -> anyhow::Result<()> {
+        // #863: `[network.discovery]` fields (pkarr_url, dns_origin, and each
+        // peer's relay_url + addrs) must get the same `${VAR}` expansion as
+        // their `relay_urls` sibling, not pass through as literal strings.
+        let home = home_str()?;
+        let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            id.to_string(),
+            types::DiscoveryPeer {
+                relay_url: Some("${HOME}/peer-relay".to_string()),
+                addrs: vec!["${HOME}/addr-a".to_string(), "${HOME}/addr-b".to_string()],
+            },
+        );
+        let mut cfg = FileConfig {
+            network: Some(types::NetworkConfig {
+                bind_port: None,
+                relay_urls: None,
+                relay_url: None,
+                discovery: Some(types::DiscoveryConfig {
+                    pkarr_url: Some("${HOME}/pkarr".to_string()),
+                    dns_origin: Some("${HOME}/dns".to_string()),
+                    peers: Some(peers),
+                }),
+                enable_0rtt: None,
+            }),
+            ..Default::default()
+        };
+        expand_env(&mut cfg)?;
+        let d = cfg
+            .network
+            .as_ref()
+            .and_then(|n| n.discovery.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("discovery missing"))?;
+        anyhow::ensure!(d.pkarr_url.as_deref() == Some(format!("{home}/pkarr").as_str()));
+        anyhow::ensure!(d.dns_origin.as_deref() == Some(format!("{home}/dns").as_str()));
+        let peer = d
+            .peers
+            .as_ref()
+            .and_then(|p| p.get(id))
+            .ok_or_else(|| anyhow::anyhow!("peer missing"))?;
+        anyhow::ensure!(peer.relay_url.as_deref() == Some(format!("{home}/peer-relay").as_str()));
+        anyhow::ensure!(
+            peer.addrs == [format!("{home}/addr-a"), format!("{home}/addr-b")],
+            "got: {:?}",
+            peer.addrs
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_discovery_peer_error_order_is_deterministic() -> anyhow::Result<()> {
+        // #863 review: peers are stored in a `HashMap`, so without sorting the
+        // first env-expansion error surfaced when several peers are malformed
+        // would vary across runs. With two peers both carrying an unset var, the
+        // error must always name the lexicographically-smallest peer id.
+        let missing = "DECDN_UNSET_PEER_ORDER_VAR_ZZZ";
+        anyhow::ensure!(
+            std::env::var_os(missing).is_none(),
+            "test precondition violated: {missing} is set in the environment"
+        );
+        let placeholder = format!("${{{missing}}}");
+        let lo = "0000000000000000000000000000000000000000000000000000000000000000";
+        let hi = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let mut peers = std::collections::HashMap::new();
+        for id in [lo, hi] {
+            peers.insert(
+                id.to_string(),
+                types::DiscoveryPeer {
+                    relay_url: Some(placeholder.clone()),
+                    addrs: Vec::new(),
+                },
+            );
+        }
+        let mut cfg = FileConfig {
+            network: Some(types::NetworkConfig {
+                bind_port: None,
+                relay_urls: None,
+                relay_url: None,
+                discovery: Some(types::DiscoveryConfig {
+                    pkarr_url: None,
+                    dns_origin: None,
+                    peers: Some(peers),
+                }),
+                enable_0rtt: None,
+            }),
+            ..Default::default()
+        };
+        let err = expand_env(&mut cfg)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected expansion to fail"))?
+            .to_string();
+        anyhow::ensure!(
+            err.contains(&format!("network.discovery.peers[{lo}]")),
+            "error should name the lexicographically-smallest peer: {err}"
         );
         Ok(())
     }
@@ -6767,7 +6910,10 @@ mod tests {
     #[test]
     fn resolve_network_cli_relay_url_overrides_file_list() {
         // The singular `--relay-url` CLI flag takes precedence over the file
-        // list, preserving the existing single-relay override semantics.
+        // list, preserving the existing single-relay override semantics. This
+        // is also the #843 warning trigger (CLI/env relay set while a non-empty
+        // `relay_urls` list exists); the warning is stderr-only, matching the
+        // other untested `eprintln!` resolve warnings.
         let mut cli = empty_network_args();
         cli.relay_url = Some("https://cli.example".to_string());
         let file = types::NetworkConfig {
