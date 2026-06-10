@@ -15,10 +15,11 @@ use anyhow::Context;
 use decdn_cache::{
     CacheEngine, FilesystemOrigin, HttpOrigin, Origin, S3Credentials, S3Origin, S3OriginConfig,
 };
-use decdn_common::config::{ResolvedOrigin, ResolvedS3Credentials};
+use decdn_common::config::{ResolvedDiscovery, ResolvedOrigin, ResolvedS3Credentials};
+use iroh::address_lookup::{DnsAddressLookup, MemoryLookup, PkarrPublisher};
 use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
-use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::ALPN as GOSSIP_ALPN;
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinSet;
@@ -545,6 +546,7 @@ pub async fn run(
         &secret_key,
         cfg.network.bind_port,
         &cfg.network.relay_urls,
+        &cfg.network.discovery,
         transport_config,
     )
     .await
@@ -736,16 +738,50 @@ pub async fn run(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Operator-policy prefetch engine (ADR 022 §Prefetch; #650). Off by
-    // default. The authorized-origin gate reads from an origin directory; the
-    // chain-backed / config-driven directory is the #650 follow-up, so until
-    // then the engine uses an empty `ConfigOriginDirectory` (the gate rejects
-    // every hash, which only matters once an operator sets `prefetch.enabled`).
-    // The enabled gauge is published regardless so dashboards have a uniform
-    // schema across enabled/disabled nodes (appendix-observability §Prefetch).
-    let prefetch_origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> = Arc::new(
-        crate::dht::origin::ConfigOriginDirectory::new(std::collections::HashMap::new()),
-    );
+    // Operator-policy prefetch engine (ADR 022 §Prefetch; #650/#651). Off by
+    // default. The authorized-origin gate reads from an origin directory: when
+    // the operator configures the OriginAssignment + PublisherRegistry
+    // addresses, use the chain-backed `ChainOriginDirectory` — a live,
+    // event-fed cache resolving hash → namespace → authorized origin → active
+    // NodeId (ADR 022 §FIND_VALUE Flow), reusing the already-bootstrapped
+    // `staker_set` for operator liveness. Without those addresses the engine
+    // falls back to an empty `ConfigOriginDirectory` (the gate rejects every
+    // hash, which only matters once an operator sets `prefetch.enabled`). The
+    // enabled gauge is published regardless so dashboards have a uniform schema
+    // across enabled/disabled nodes (appendix-observability §Prefetch).
+    let prefetch_origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> = match (
+        cfg.blockchain.origin_assignment_address.as_deref(),
+        cfg.blockchain.publisher_registry_address.as_deref(),
+    ) {
+        (Some(origin_addr), Some(publisher_addr)) => {
+            let origin_assignment_addr: Address = origin_addr.parse().with_context(|| {
+                format!(
+                    "blockchain.origin_assignment_address {origin_addr:?} is not a valid address"
+                )
+            })?;
+            let publisher_registry_addr: Address = publisher_addr.parse().with_context(|| {
+                format!(
+                    "blockchain.publisher_registry_address {publisher_addr:?} is not a valid address"
+                )
+            })?;
+            Arc::new(
+                crate::dht::ChainOriginDirectory::bootstrap(
+                    ProviderBuilder::new().connect_http(rpc_url.clone()),
+                    origin_assignment_addr,
+                    publisher_registry_addr,
+                    capacity_bond_addr,
+                    cfg.blockchain.origin_directory_from_block,
+                    Arc::clone(&staker_set),
+                    Arc::clone(&node_metrics),
+                )
+                .await
+                .context("ChainOriginDirectory bootstrap")?,
+            )
+        }
+        _ => Arc::new(crate::dht::origin::ConfigOriginDirectory::new(
+            std::collections::HashMap::new(),
+        )),
+    };
     let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(
         cfg.prefetch,
         prefetch_origin_directory,
@@ -1715,10 +1751,32 @@ async fn build_endpoint(
     secret_key: &SecretKey,
     bind_port: u16,
     relay_urls: &[String],
+    discovery: &ResolvedDiscovery,
     transport_config: QuicTransportConfig,
 ) -> anyhow::Result<Endpoint> {
     let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
-    let mut builder = Endpoint::builder(presets::N0)
+
+    // Base preset selection is the discovery-provider seam (#818, see
+    // adr/appendix-poc-production-seams.md): with no `network.discovery` keys we
+    // keep `presets::N0` (n0-hosted pkarr/DNS lookup + n0 relay defaults,
+    // unchanged back-compat); with operator discovery configured we drop to
+    // `presets::Minimal` (crypto provider only) and compose exactly the
+    // configured lookup legs. Discovery and relay are independent legs:
+    // `Minimal` sets NO relay mode, so when no custom relay map is configured we
+    // must restore the n0 relay default the `N0` preset would have applied —
+    // dropping the n0 *discovery* leg must not silently disable relays. A custom
+    // `network.relay_urls` map (if any) is applied for both bases below.
+    let mut builder = if discovery.is_empty() {
+        Endpoint::builder(presets::N0)
+    } else {
+        let mut b = add_discovery_lookups(Endpoint::builder(presets::Minimal), discovery)?;
+        if relay_urls.is_empty() {
+            b = b.relay_mode(RelayMode::Default);
+        }
+        b
+    };
+
+    builder = builder
         .secret_key(secret_key.clone())
         .transport_config(transport_config)
         // ADR 015 §Session Ticket Management. In iroh this knob sizes
@@ -1732,12 +1790,12 @@ async fn build_endpoint(
         .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE);
 
     // A configured `network.relay_urls` list swaps the n0 default relay map for
-    // the operator's self-hosted relays (`RelayMode::Custom`). Only the relay
-    // leg is replaced — the `presets::N0` DNS address-lookup leg is left intact,
-    // so NodeId→address discovery still works while connectivity routes through
-    // the operator's relays. Replacing the n0 DNS/pkarr leg too (full
-    // self-hosted discovery) is deliberately out of scope for this change.
-    // Multiple entries give redundancy/failover. A custom relay sits on the
+    // the operator's self-hosted relays (`RelayMode::Custom`). The relay leg is
+    // independent of the discovery leg selected above: a custom relay map routes
+    // connectivity through the operator's relays while NodeId→address discovery
+    // uses whichever provider the base-preset branch wired (n0 pkarr/DNS, or the
+    // operator's `network.discovery` providers). Multiple entries give
+    // redundancy/failover. A custom relay sits on the
     // NAT-traversal critical path, so we probe reachability at bring-up — but
     // the probe is advisory, never fatal: if every relay we could probe was
     // unreachable we log a loud warning and proceed, trusting iroh's background
@@ -1772,6 +1830,76 @@ async fn build_endpoint(
         .bind()
         .await
         .map_err(|e| anyhow::anyhow!("endpoint bind {bind_addr} failed: {e}"))
+}
+
+/// Compose the operator-configured `network.discovery` address-lookup legs onto
+/// `builder` (#818 scope 1) — the `node`-side half of the discovery-provider
+/// seam: config resolution holds plain shape-validated Strings, and this is
+/// where they become iroh providers.
+///
+/// - `pkarr_url` + `dns_origin` wire a `PkarrPublisher` (this node publishes its
+///   signed address record) and a `DnsAddressLookup` (it resolves peers via DNS
+///   TXT). The endpoint builder pulls this node's secret key and TLS config into
+///   the publisher automatically, so we do not pass the key here.
+/// - `peers` seed a `MemoryLookup` static address book.
+///
+/// The `pkarr_url` (parsed as `url::Url`) and peer `node_id` (parsed as
+/// `iroh::PublicKey`) are re-parsed here with the exact parsers config
+/// resolution used, so a failure on those legs is an internal invariant break.
+/// A peer `relay_url` is parsed as the stricter `iroh::RelayUrl` here while
+/// resolution only checked it as a generic `url::Url` (mirroring the top-level
+/// `network.relay_urls` path, where bring-up's `RelayUrl` parse is the
+/// authoritative relay-shape gate) — so that leg can legitimately fail here on a
+/// relay-specific shape issue. Every failure is surfaced as a bring-up error
+/// (never a panic), and any echoed URL is `redact_userinfo`'d, upholding the
+/// same no-credentials-in-errors invariant as the relay path.
+fn add_discovery_lookups(
+    mut builder: iroh::endpoint::Builder,
+    discovery: &ResolvedDiscovery,
+) -> anyhow::Result<iroh::endpoint::Builder> {
+    if let Some(pkarr) = &discovery.pkarr_url {
+        let url = pkarr.parse::<url::Url>().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid network.discovery.pkarr_url {:?}: {e}",
+                redact_userinfo(pkarr)
+            )
+        })?;
+        builder = builder.address_lookup(PkarrPublisher::builder(url));
+    }
+    if let Some(origin) = &discovery.dns_origin {
+        builder = builder.address_lookup(DnsAddressLookup::builder(origin.clone()));
+    }
+    if !discovery.peers.is_empty() {
+        let mut infos = Vec::with_capacity(discovery.peers.len());
+        for peer in &discovery.peers {
+            let id = peer.node_id.parse::<PublicKey>().map_err(|e| {
+                anyhow::anyhow!("invalid network.discovery peer id {}: {e}", peer.node_id)
+            })?;
+            let mut addr = EndpointAddr::new(id);
+            if let Some(relay) = &peer.relay_url {
+                let relay_url = relay.parse::<RelayUrl>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid relay_url {:?} for network.discovery peer {}: {e}",
+                        redact_userinfo(relay),
+                        peer.node_id
+                    )
+                })?;
+                addr = addr.with_relay_url(relay_url);
+            }
+            for a in &peer.addrs {
+                let sock = a.parse::<std::net::SocketAddr>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid addr {a:?} for network.discovery peer {}: {e}",
+                        peer.node_id
+                    )
+                })?;
+                addr = addr.with_ip_addr(sock);
+            }
+            infos.push(addr);
+        }
+        builder = builder.address_lookup(MemoryLookup::from_endpoint_info(infos));
+    }
+    Ok(builder)
 }
 
 /// Parse the configured relay URL strings into `RelayUrl`s, surfacing the
@@ -2513,9 +2641,13 @@ mod tests {
             network: ResolvedNetwork {
                 bind_port: 4433,
                 relay_urls: Vec::new(),
+                discovery: decdn_common::config::ResolvedDiscovery::default(),
                 enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
+                origin_assignment_address: None,
+                publisher_registry_address: None,
+                origin_directory_from_block: 0,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,
@@ -3182,7 +3314,7 @@ mod tests {
             format!("http://127.0.0.1:{up_port}"),
             format!("http://127.0.0.1:{dead_port}"),
         ];
-        let ep = build_endpoint(&sk, 0, &relays, transport)
+        let ep = build_endpoint(&sk, 0, &relays, &ResolvedDiscovery::default(), transport)
             .await
             .expect("endpoint binds with at least one reachable relay");
         ep.close().await;
@@ -3200,7 +3332,7 @@ mod tests {
         let sk = SecretKey::generate();
         let transport = quic_transport_config().unwrap();
         let relays = vec![format!("http://127.0.0.1:{dead_port}")];
-        let ep = build_endpoint(&sk, 0, &relays, transport)
+        let ep = build_endpoint(&sk, 0, &relays, &ResolvedDiscovery::default(), transport)
             .await
             .expect("all-unreachable relay set proceeds with a warning");
         ep.close().await;
@@ -3214,9 +3346,66 @@ mod tests {
         let sk = SecretKey::generate();
         let transport = quic_transport_config().unwrap();
         let relays = vec!["relay://unprobeable-a".to_string()];
-        let ep = build_endpoint(&sk, 0, &relays, transport)
+        let ep = build_endpoint(&sk, 0, &relays, &ResolvedDiscovery::default(), transport)
             .await
             .expect("all-unprobeable relay set proceeds");
+        ep.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_endpoint_uses_n0_when_discovery_empty() {
+        // Empty discovery keeps the `presets::N0` base (back-compat). The preset
+        // choice isn't introspectable, so assert bring-up still binds cleanly.
+        let sk = SecretKey::generate();
+        let transport = quic_transport_config().unwrap();
+        let ep = build_endpoint(&sk, 0, &[], &ResolvedDiscovery::default(), transport)
+            .await
+            .expect("n0 endpoint binds with empty discovery");
+        ep.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_endpoint_binds_with_custom_discovery() {
+        // Custom pkarr+DNS plus a static peer drop the build onto
+        // `presets::Minimal` and compose the configured address-lookup legs; with
+        // no relay map the n0 relay default is restored. Exercises
+        // `add_discovery_lookups` end to end (publish/resolve are background/lazy,
+        // so binding does not require reaching the configured infra).
+        let sk = SecretKey::generate();
+        let transport = quic_transport_config().unwrap();
+        let peer_id = SecretKey::generate().public().to_string();
+        let discovery = ResolvedDiscovery {
+            pkarr_url: Some("https://pkarr.example/".to_string()),
+            dns_origin: Some("discovery.example.".to_string()),
+            peers: vec![decdn_common::config::ResolvedDiscoveryPeer {
+                node_id: peer_id,
+                relay_url: Some("https://relay.example/".to_string()),
+                addrs: vec!["203.0.113.4:4433".to_string()],
+            }],
+        };
+        let ep = build_endpoint(&sk, 0, &[], &discovery, transport)
+            .await
+            .expect("custom-discovery endpoint binds");
+        ep.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_endpoint_binds_with_discovery_and_custom_relay() {
+        // Discovery and a reachable custom relay together: both legs wire onto the
+        // Minimal base (custom relay map overrides the restored n0 default).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_port = listener.local_addr().unwrap().port();
+        let sk = SecretKey::generate();
+        let transport = quic_transport_config().unwrap();
+        let relays = vec![format!("http://127.0.0.1:{up_port}")];
+        let discovery = ResolvedDiscovery {
+            pkarr_url: None,
+            dns_origin: Some("discovery.example.".to_string()),
+            peers: Vec::new(),
+        };
+        let ep = build_endpoint(&sk, 0, &relays, &discovery, transport)
+            .await
+            .expect("discovery + custom relay endpoint binds");
         ep.close().await;
     }
 }

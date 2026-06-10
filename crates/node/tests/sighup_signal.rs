@@ -52,9 +52,13 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         network: ResolvedNetwork {
             bind_port: 4433,
             relay_urls: Vec::new(),
+            discovery: decdn_common::config::ResolvedDiscovery::default(),
             enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            origin_directory_from_block: 0,
             rpc_url: "http://localhost:8545".into(),
             eth_keystore: PathBuf::from("/tmp/keystore.json"),
             keystore_password_file: None,

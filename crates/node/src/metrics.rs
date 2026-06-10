@@ -506,6 +506,34 @@ pub struct DecdnMetrics {
     /// denominator). Expected to stay 0; a nonzero value flags malformed/hostile
     /// on-chain data.
     pub reputation_indexer_amount_overflows: Counter,
+    /// `decdn_origin_directory_watcher_restarts_total` (#651): distinct drift
+    /// windows the [`crate::dht::chain_origin_directory`] watcher has entered.
+    /// Same semantics as `staker_set_watcher_restarts` — bumped once on the
+    /// transition into the error/backoff state, not per backoff iteration.
+    /// During such a window the cached `namespace → operator` directory can
+    /// drift from chain state, and the prefetch authorized-origin gate reads
+    /// that cache, so sustained restarts gate real prefetch demand. The
+    /// `OpenMetrics` encoder appends the `_total` suffix.
+    pub origin_directory_watcher_restarts: Counter,
+    /// `decdn_origin_directory_watcher_resolve_failures_total` (#651): times a
+    /// `getOrigins` for a newly-claimed namespace OR a `nodeIdOf(operator)`
+    /// binding lookup failed, leaving an operator unmapped (and so unresolvable
+    /// as an origin) until a later event re-surfaces it. Does not trip a
+    /// backoff, so without this counter it would move no metric. Pairs with the
+    /// per-failure `warn!` in `chain_origin_directory`.
+    pub origin_directory_watcher_resolve_failures: Counter,
+    /// `decdn_origin_directory_watcher_down_seconds` (#651): true downtime —
+    /// seconds the origin-directory watcher has been in the error/backoff state
+    /// with no established filters. Reads `0` for the life of any established
+    /// cycle; recomputed at scrape time from a monotonic `down_since`. A
+    /// poisoned lock reports `i64::MAX` (alerting direction).
+    pub origin_directory_watcher_down_seconds: Gauge,
+    /// `decdn_origin_directory_operator_count` (#651): distinct operator
+    /// addresses currently authorised as origins across all namespaces plus the
+    /// default-open allow-list. Recomputed and sampled after every event that
+    /// mutates an authorised set, so it rises on activate/add and falls on
+    /// revoke/prune/remove/replace (unlike the monotonic binding cache).
+    pub origin_directory_operator_count: Gauge,
     /// `1` if `prefetch.enabled`, else `0` (ADR 022 §Prefetch Decision;
     /// appendix-observability §Prefetch Metrics). Stable schema across nodes:
     /// every node reports the prefetch family regardless of whether the
@@ -583,6 +611,11 @@ pub struct Metrics {
     /// `staker_set_watcher_down_since`: `None` while a cycle is healthy, `Some`
     /// only during an outage; backs `node_address_watcher_down_seconds`.
     node_address_watcher_down_since: Mutex<Option<Instant>>,
+    /// Monotonic instant at which the origin-directory watcher entered its
+    /// current error/backoff window (#651). `None` whenever a cycle is
+    /// established. Backs the `origin_directory_watcher_down_seconds` gauge,
+    /// recomputed at scrape time. Mirrors `staker_set_watcher_down_since`.
+    origin_directory_watcher_down_since: Mutex<Option<Instant>>,
 }
 
 impl Default for Metrics {
@@ -614,6 +647,7 @@ impl Metrics {
             session_ticket_peers: Mutex::new(HashSet::new()),
             staker_set_watcher_down_since: Mutex::new(None),
             node_address_watcher_down_since: Mutex::new(None),
+            origin_directory_watcher_down_since: Mutex::new(None),
         }
     }
 
@@ -1007,6 +1041,45 @@ impl Metrics {
         self.decdn.reputation_indexer_amount_overflows.inc();
     }
 
+    /// The origin-directory watcher's event stream errored and the loop is
+    /// about to back off (#651). Mirrors `staker_set_watcher_backoff_started`:
+    /// stamps `down_since` and counts exactly one restart per drift window.
+    pub fn origin_directory_watcher_backoff_started(&self) {
+        if let Ok(mut down_since) = self.origin_directory_watcher_down_since.lock()
+            && down_since.is_none()
+        {
+            *down_since = Some(Instant::now());
+            self.decdn.origin_directory_watcher_restarts.inc();
+        }
+    }
+
+    /// A `getOrigins` / `nodeIdOf` resolution failed, leaving an operator
+    /// unmapped in the origin directory (#651). Bumps
+    /// `origin_directory_watcher_resolve_failures_total`.
+    pub fn origin_directory_watcher_resolve_failure(&self) {
+        self.decdn.origin_directory_watcher_resolve_failures.inc();
+    }
+
+    /// Mark the origin-directory watcher's event-stream cycle as established
+    /// (#651): clears `down_since` so `origin_directory_watcher_down_seconds`
+    /// reads `0` for the life of this cycle.
+    pub fn origin_directory_watcher_cycle_established(&self) {
+        if let Ok(mut down_since) = self.origin_directory_watcher_down_since.lock() {
+            *down_since = None;
+        }
+    }
+
+    /// Publish the count of distinct operator addresses currently authorised as
+    /// origins — the union of every namespace's operator set and the
+    /// default-open allow-list (#651). Falls on revoke/prune/remove/replace,
+    /// unlike the monotonic `operator → NodeId` binding cache. The caller
+    /// recomputes this (`authorized_operator_count`) after each set mutation.
+    pub fn origin_directory_operator_count(&self, count: usize) {
+        self.decdn
+            .origin_directory_operator_count
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
     pub fn connection_opened(&self) {
         self.decdn.active_connections.inc();
     }
@@ -1295,6 +1368,17 @@ impl Metrics {
         self.decdn
             .node_address_watcher_down_seconds
             .set(node_addr_down_seconds);
+
+        // Same recompute for the origin-directory watcher (#651).
+        let origin_dir_down_seconds = match self.origin_directory_watcher_down_since.lock() {
+            Ok(down_since) => down_since
+                .map(|t| t.elapsed().as_secs())
+                .map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)),
+            Err(_) => i64::MAX,
+        };
+        self.decdn
+            .origin_directory_watcher_down_seconds
+            .set(origin_dir_down_seconds);
 
         let reg = self
             .registry

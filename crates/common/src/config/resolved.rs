@@ -30,8 +30,47 @@ pub struct ResolvedNetwork {
     /// all-unreachable set warns and proceeds (iroh retries in the background);
     /// entries with no derivable host/port are skipped.
     pub relay_urls: Vec<String>,
+    /// Operator-configurable address discovery (#818 scope 1). Empty
+    /// ([`ResolvedDiscovery::is_empty`]) => the node keeps the n0-hosted
+    /// pkarr/DNS default (`presets::N0`); otherwise the node builds on
+    /// `presets::Minimal` and composes only the providers configured here.
+    pub discovery: ResolvedDiscovery,
     /// QUIC 0-RTT master switch for `cdn/probe/v1` (ADR 015). Default `true`.
     pub enable_0rtt: bool,
+}
+
+/// Resolved discovery providers (#818). Strings are already shape-validated at
+/// resolution (`pkarr_url` a parseable URL, `dns_origin` non-empty, each peer
+/// `node_id` a valid iroh `NodeId`, each `addr` a `SocketAddr`); the node wiring
+/// layer parses them into iroh types — the discovery-provider seam, per
+/// `adr/appendix-poc-production-seams.md`.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedDiscovery {
+    /// pkarr relay URL to publish this node's address record to.
+    pub pkarr_url: Option<String>,
+    /// DNS origin domain to resolve peers from.
+    pub dns_origin: Option<String>,
+    /// Static peer address book, sorted by `node_id` for a deterministic build.
+    pub peers: Vec<ResolvedDiscoveryPeer>,
+}
+
+impl ResolvedDiscovery {
+    /// No discovery overrides configured => the node uses `presets::N0`.
+    pub const fn is_empty(&self) -> bool {
+        self.pkarr_url.is_none() && self.dns_origin.is_none() && self.peers.is_empty()
+    }
+}
+
+/// One resolved static peer ([`ResolvedDiscovery::peers`]).
+#[derive(Debug, Clone)]
+pub struct ResolvedDiscoveryPeer {
+    /// Peer `NodeId` (the canonical 64-char lowercase-hex form; validated at
+    /// resolution).
+    pub node_id: String,
+    /// Peer home relay URL, if configured.
+    pub relay_url: Option<String>,
+    /// Peer direct socket addresses (`host:port`).
+    pub addrs: Vec<String>,
 }
 
 /// Resolved blockchain fields.
@@ -51,6 +90,17 @@ pub struct ResolvedBlockchain {
     pub payment_channel_address: String,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: String,
+    /// `OriginAssignment` contract address. `Some` only when the operator
+    /// opts into the chain-backed origin directory (paired with
+    /// `publisher_registry_address`); `None` => empty deny-all directory, so
+    /// the prefetch authorized-origin gate finds no origins (ADR 022).
+    pub origin_assignment_address: Option<String>,
+    /// `PublisherRegistry` contract address. Set together with
+    /// `origin_assignment_address` (both-or-neither, enforced at resolution).
+    pub publisher_registry_address: Option<String>,
+    /// Starting block for the chain-backed origin directory's `ContentClaimed`
+    /// log replay (the `PublisherRegistry` deployment block). Defaults to `0`.
+    pub origin_directory_from_block: u64,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `slash_sig` signatures (ADR 014). Required (no default).
     pub slash_judge_address: String,

@@ -101,6 +101,29 @@ fn validate_fails_for_malformed_relay_url() -> anyhow::Result<()> {
 }
 
 #[test]
+fn validate_fails_for_malformed_discovery_peer_addr() -> anyhow::Result<()> {
+    // #818 scope 1: a malformed `[network.discovery]` peer socket address must
+    // fail `config validate` up front and name the offending indexed field.
+    let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let body = format!(
+        "{VALID_CONFIG}\n[network.discovery.peers.{id}]\naddrs = [\"not-a-socket-addr\"]\n"
+    );
+    let dir = TempDir::new()?;
+    let path = write_config(&dir, &body)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+    let err = commands::config_validate(Some(&path), &args(dir.path())?)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains(&format!("network.discovery.peers[{id}].addrs[0]"))
+            && msg.contains("not-a-socket-addr"),
+        "error should name the malformed peer address: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
 fn validate_fails_when_required_field_missing() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let path = write_config(&dir, MISSING_RPC)?;
@@ -258,9 +281,13 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         network: ResolvedNetwork {
             bind_port: 4433,
             relay_urls: Vec::new(),
+            discovery: decdn_common::config::ResolvedDiscovery::default(),
             enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            origin_directory_from_block: 0,
             rpc_url: "https://rpc.example/SECRET_TOKEN_abc123".to_string(),
             eth_keystore: PathBuf::from("/var/lib/decdn/keystore.json"),
             keystore_password_file: None,
@@ -348,6 +375,64 @@ fn summary_includes_prefetch_enabled() -> anyhow::Result<()> {
     anyhow::ensure!(
         out.contains("prefetch_enabled:         true"),
         "prefetch_enabled should reflect the resolved value: {out}"
+    );
+    Ok(())
+}
+
+#[test]
+fn summary_reports_discovery_without_leaking_secrets() -> anyhow::Result<()> {
+    // #818: the summary names dns_origin and the peer count, redacts the
+    // pkarr_url userinfo (its only credential vector) while keeping the host
+    // visible for diagnostics, and never echoes peer addresses.
+    let cfg = sample_resolved(|c| {
+        c.network.discovery = decdn_common::config::ResolvedDiscovery {
+            pkarr_url: Some("https://user:PKARR_SECRET_xyz@pkarr.example/".to_string()),
+            dns_origin: Some("discovery.example.".to_string()),
+            peers: vec![decdn_common::config::ResolvedDiscoveryPeer {
+                node_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                relay_url: None,
+                addrs: vec!["203.0.113.4:4433".to_string()],
+            }],
+        };
+    });
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        out.contains("discovery.pkarr_url:"),
+        "summary should emit the pkarr_url label: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("discovery.dns_origin:     discovery.example."),
+        "summary should name dns_origin: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("discovery.peers:          1"),
+        "summary should report the peer count: {out}"
+    );
+    anyhow::ensure!(
+        !out.contains("PKARR_SECRET_xyz"),
+        "pkarr_url credentials must never appear in summary: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("***@pkarr.example/"),
+        "pkarr_url userinfo should be redacted with the host preserved: {out}"
+    );
+    anyhow::ensure!(
+        !out.contains("203.0.113.4:4433"),
+        "peer addresses must not appear in summary: {out}"
+    );
+    Ok(())
+}
+
+#[test]
+fn summary_omits_discovery_lines_when_unset() -> anyhow::Result<()> {
+    // Default discovery is empty (the node uses the n0 pkarr/DNS default), so
+    // the summary must print no `discovery.*` lines at all.
+    let cfg = sample_resolved(|_| {});
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        !out.contains("discovery."),
+        "no discovery lines should appear when discovery is unset: {out}"
     );
     Ok(())
 }
