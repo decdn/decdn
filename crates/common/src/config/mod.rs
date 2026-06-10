@@ -527,6 +527,21 @@ fn resolve_network_into(
         }
     };
 
+    // #843: `--relay-url` (and `DECDN_RELAY_URL`, which clap folds into it)
+    // takes precedence over the file list, so a stale exported env var silently
+    // collapses a multi-entry `network.relay_urls` failover list (#795/#817) to
+    // the single env value. Warn rather than defeat relay redundancy quietly.
+    // `eprintln!` not `tracing::warn!`: tracing is not initialized at resolve
+    // time (see `validate_security_into`).
+    let file_relay_list_len = file.and_then(|n| n.relay_urls.as_ref()).map_or(0, Vec::len);
+    if cli.relay_url.is_some() && file_relay_list_len > 0 {
+        eprintln!(
+            "warning: --relay-url (or DECDN_RELAY_URL) overrides the \
+             {file_relay_list_len}-entry network.relay_urls list; multi-relay \
+             failover is disabled"
+        );
+    }
+
     // Validate each resolved entry. The label names the source the operator
     // actually wrote: the indexed array field (`network.relay_urls[i]`, matching
     // the `cache.origins[i]` convention) only when the list branch above was
@@ -6767,7 +6782,10 @@ mod tests {
     #[test]
     fn resolve_network_cli_relay_url_overrides_file_list() {
         // The singular `--relay-url` CLI flag takes precedence over the file
-        // list, preserving the existing single-relay override semantics.
+        // list, preserving the existing single-relay override semantics. This
+        // is also the #843 warning trigger (CLI/env relay set while a non-empty
+        // `relay_urls` list exists); the warning is stderr-only, matching the
+        // other untested `eprintln!` resolve warnings.
         let mut cli = empty_network_args();
         cli.relay_url = Some("https://cli.example".to_string());
         let file = types::NetworkConfig {
