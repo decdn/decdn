@@ -386,8 +386,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # buyer_deposit_micro_usdc = 10000000            # deposit when the buyer opens a node-to-node PaymentChannel on a miss (#744); default 10 USDC
 # buyer_max_approve = true                       # one-time max USDC approval for PaymentChannel at startup (#744); false to manage the allowance out-of-band
-# settlement_auto_threshold_micro_usdc = 0       # auto-closeChannel once un-redeemed µUSDC reaches this (#742); 0/unset disables, when set must be > 0
-# settlement_auto_by_voucher_nonce_span = 0      # auto-closeChannel once the un-redeemed nonce span reaches this (#742); 0/unset disables, when set must be > 0
+# settlement_auto_threshold_micro_usdc = 50000000   # auto-closeChannel once un-redeemed µUSDC reaches this (#742); leave unset/commented to disable — when set it must be > 0
+# settlement_auto_by_voucher_nonce_span = 1000       # auto-closeChannel once the un-redeemed nonce span reaches this (#742); leave unset/commented to disable — when set it must be > 0
 
 [cache]
 # cache_dir = "~/.decdn/cache"
