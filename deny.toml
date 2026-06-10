@@ -8,6 +8,10 @@ ignore = [
     "RUSTSEC-2023-0089",
     # paste: unmaintained, transitive via alloy-primitives
     "RUSTSEC-2024-0436",
+    # proc-macro-error2: unmaintained fork of proc-macro-error (itself already
+    # ignored above as RUSTSEC-2024-0370). Build-time-only proc-macro pulled via
+    # alloy-sol-macro -> alloy; no runtime exposure and no maintained successor.
+    "RUSTSEC-2026-0173",
     # hickory-proto / hickory-net DNS DoS bugs (O(n²) name compression and
     # NSEC3 unbounded loop). Both reachable through iroh's address-lookup
     # path, which the node runtime exercises in normal operation via
