@@ -875,7 +875,12 @@ impl CacheEngine {
     /// for DMCA-driven evicts the operator must be able to tell whether
     /// the takedown is durable, otherwise a node restart could resume
     /// serving the content.
-    pub fn evict(&self, hash: Hash) -> CacheResult<()> {
+    ///
+    /// Async because the durable append runs the blocking `fsync` on a
+    /// `spawn_blocking` thread rather than on the async runtime (#845): one
+    /// caller is the hash-mismatch path in pull-through, which executes on a
+    /// request-serving worker that must not stall on disk I/O.
+    pub async fn evict(&self, hash: Hash) -> CacheResult<()> {
         // Pre-check under one lock acquisition: short-circuit on
         // already-evicted (idempotent — don't grow `evicted.log` with a
         // duplicate line) and reject on cap (DoS bound on an unbounded
@@ -903,9 +908,21 @@ impl CacheEngine {
         // next open, which is idempotent. The opposite ordering would
         // briefly stop serving but lose durability if the fsync failed —
         // the worst-case scenario for a takedown.
-        append_evicted_log(&self.inner.evicted_log_path, hash).map_err(|err| {
-            CacheError::Store(anyhow::Error::from(err).context("persist eviction"))
-        })?;
+        //
+        // The append's `fsync` is blocking, so run it on a `spawn_blocking`
+        // thread (#845) to keep it off the async runtime — `evict` is reached
+        // from the request-serving hash-mismatch path. A panic in the blocking
+        // task (JoinError) and an I/O failure are both surfaced as `Err` so the
+        // operator never gets an `Ok` that silently skipped durable persistence.
+        let log_path = self.inner.evicted_log_path.clone();
+        tokio::task::spawn_blocking(move || append_evicted_log(&log_path, hash))
+            .await
+            .map_err(|join_err| {
+                CacheError::Store(anyhow::Error::new(join_err).context("persist eviction task"))
+            })?
+            .map_err(|err| {
+                CacheError::Store(anyhow::Error::from(err).context("persist eviction"))
+            })?;
 
         // `unwrap_or_else(PoisonError::into_inner)` rather than the project's
         // usual `if let Ok(...) = lock()` pattern: a poisoned lock here
@@ -1804,7 +1821,7 @@ impl CacheEngine {
             // mutex or a full evicted-set cap surfaces only as a
             // log line — the primary error returned to the
             // caller is still `HashMismatch`.
-            if let Err(evict_err) = self.evict(actual) {
+            if let Err(evict_err) = self.evict(actual).await {
                 tracing::warn!(
                     expected = %hash,
                     %actual,
@@ -1879,7 +1896,7 @@ impl CacheEngine {
             // log-evict the wrong hash so `engine.has(actual)` doesn't
             // surface attacker-chosen bytes between now and the next
             // GC sweep.
-            if let Err(evict_err) = self.evict(actual) {
+            if let Err(evict_err) = self.evict(actual).await {
                 tracing::warn!(
                     expected = %hash,
                     %actual,
@@ -2345,7 +2362,7 @@ mod tests {
             }
         }
         for h in &evicted {
-            engine.evict(*h)?;
+            engine.evict(*h).await?;
         }
 
         let actual: HashSet<Hash> = engine.iter_hashes().await?.into_iter().collect();
@@ -2675,7 +2692,7 @@ mod tests {
             "expected blob present before evict"
         );
 
-        engine.evict(hash)?;
+        engine.evict(hash).await?;
 
         anyhow::ensure!(engine.is_evicted(hash), "evict flag not set");
         anyhow::ensure!(
@@ -2707,7 +2724,7 @@ mod tests {
             let origin = Arc::new(StubOrigin::new(payload));
             let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 10).await?;
             let _ = engine.get(hash).await?;
-            engine.evict(hash)?;
+            engine.evict(hash).await?;
             engine.shutdown().await?;
         }
 
@@ -2750,7 +2767,7 @@ mod tests {
         let unknown = Hash::new(b"never seen");
         // Evicting a hash we've never cached is fine — operators may run
         // `decdn node evict` ahead of time as a precaution.
-        engine.evict(unknown)?;
+        engine.evict(unknown).await?;
         anyhow::ensure!(engine.is_evicted(unknown), "evict flag not set");
         Ok(())
     }
@@ -2768,12 +2785,12 @@ mod tests {
         let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         let hash = Hash::new(b"dup-evict");
 
-        engine.evict(hash)?;
+        engine.evict(hash).await?;
         let after_first = std::fs::read_to_string(&log_path)?;
         let lines_first = after_first.lines().count();
 
-        engine.evict(hash)?;
-        engine.evict(hash)?;
+        engine.evict(hash).await?;
+        engine.evict(hash).await?;
         let after_third = std::fs::read_to_string(&log_path)?;
         let lines_third = after_third.lines().count();
 
@@ -2822,7 +2839,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("evicted.log"))?;
 
         let hash = Hash::new(b"persist-fail");
-        match engine.evict(hash) {
+        match engine.evict(hash).await {
             Err(CacheError::Store(_)) => Ok(()),
             other => Err(anyhow::anyhow!(
                 "expected Store error from persistence failure, got {other:?}"
@@ -2915,7 +2932,7 @@ mod tests {
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
         let _ = engine.get(hash).await?;
-        engine.evict(hash)?;
+        engine.evict(hash).await?;
 
         let preview = engine.inspect(hash).await?;
         anyhow::ensure!(
@@ -3023,7 +3040,7 @@ mod tests {
         let _ = engine.get(hash).await?; // hit
         let _ = engine.get(hash).await?; // hit
         let _ = engine.get(unknown).await; // miss (origin NotFound)
-        engine.evict(hash)?;
+        engine.evict(hash).await?;
         let _ = engine.get(hash).await; // miss (evicted)
 
         anyhow::ensure!(cm.hits.get() == 2, "hits = {}", cm.hits.get());
@@ -3197,7 +3214,7 @@ mod tests {
 
         // Prime then evict so the next get hits the evicted branch in get().
         let _ = engine.get(hash).await?;
-        engine.evict(hash)?;
+        engine.evict(hash).await?;
         let misses_before = cm.misses.get();
 
         let Err(err) = engine.get(hash).await else {
@@ -3395,7 +3412,7 @@ mod tests {
             "held before evict"
         );
 
-        engine.evict(hash)?;
+        engine.evict(hash).await?;
         anyhow::ensure!(
             engine.try_probe_hold(hash).await? == ProbeHoldOutcome::Unavailable,
             "operator evict (DMCA) must win over a probe hold"
