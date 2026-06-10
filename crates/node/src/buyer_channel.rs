@@ -543,6 +543,22 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
         provider_addr: Address,
         deposit_hint: U256,
     ) -> Result<ChannelContext>;
+
+    /// Persist the cumulative voucher totals paid on `provider_addr`'s channel so
+    /// a later reuse or a restart resumes at the right `nonce` / `bytes` /
+    /// `amount` (#852). See [`BuyerChannelService::record_progress`].
+    ///
+    /// # Errors
+    ///
+    /// Errors if no channel is tracked for `provider_addr`, if the totals would
+    /// regress the stored state, or on store write failure.
+    fn record_progress(
+        &self,
+        provider_addr: Address,
+        nonce: U256,
+        bytes_delivered: U256,
+        amount: U256,
+    ) -> Result<()>;
 }
 
 #[async_trait::async_trait]
@@ -553,6 +569,16 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
         deposit_hint: U256,
     ) -> Result<ChannelContext> {
         BuyerChannelService::open_or_reuse_channel(self, provider_addr, deposit_hint).await
+    }
+
+    fn record_progress(
+        &self,
+        provider_addr: Address,
+        nonce: U256,
+        bytes_delivered: U256,
+        amount: U256,
+    ) -> Result<()> {
+        BuyerChannelService::record_progress(self, provider_addr, nonce, bytes_delivered, amount)
     }
 }
 
