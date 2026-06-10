@@ -636,6 +636,21 @@ impl ClientHandler {
         let channel_id = ChannelId::from(req.channel_id);
         let channel = self.channels.lock().await.get(&channel_id).cloned();
 
+        // An unknown / never-opened channel is refused *before* any bytes are
+        // signed or served. Otherwise up to one voucher interval (the negotiated
+        // cadence, by default 1 MB) — or the entire blob, if smaller — ships free
+        // before `collect_voucher` rejects with `WrongChannel` mid-stream (#848).
+        // The mid-stream `WrongChannel` reason cannot ride in the initial
+        // `StreamResponse`, so use the delivery-side `NotFound` here (also
+        // mirrors the owner-mismatch gate below and avoids leaking channel
+        // existence).
+        let Some(channel) = channel else {
+            tracing::warn!(%channel_id, "stream request on unknown channel; refusing pre-serve");
+            return self
+                .respond_error(&mut send, &req, StreamError::NotFound)
+                .await;
+        };
+
         // A verified client binding MUST match the channel's authorized client.
         // Otherwise this connection is requesting paid delivery on a channel it
         // does not own (its vouchers would fail `WrongSigner` regardless) — so
@@ -643,8 +658,8 @@ impl ClientHandler {
         // clients. Unbound connections fall back to the voucher-signature gate;
         // an on-chain NodeId→address lookup that would close the residual for
         // unbound peers is out of scope (#327).
-        if let (Some(client), Some(chan)) = (verified_client, channel.as_ref()) {
-            let owner = chan.lock().await.state.client;
+        if let Some(client) = verified_client {
+            let owner = channel.lock().await.state.client;
             if client != owner {
                 tracing::warn!(%client, %owner, "binding does not authorize this channel");
                 return self
@@ -683,7 +698,7 @@ impl ClientHandler {
             hash,
             req.byte_offset,
             channel_id,
-            channel.as_ref(),
+            Some(&channel),
             client_node_id,
             rate_per_mb,
             interval_mb,
@@ -795,7 +810,10 @@ impl ClientHandler {
     ) -> anyhow::Result<VoucherOutcome> {
         let wire = read_voucher(recv).await?;
 
-        // Unknown channel (#327 boundary): reject with the closest reason.
+        // Unknown channel (#327 boundary). Since #848, `serve_stream` refuses an
+        // unknown channel pre-serve, so this arm is unreachable from the sole
+        // caller (`deliver` always forwards `Some`); kept as a defensive backstop
+        // — reject with the closest mid-stream reason.
         let Some(channel) = channel else {
             self.write_reject(send, VoucherRejectReason::WrongChannel)
                 .await?;
