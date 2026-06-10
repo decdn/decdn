@@ -25,7 +25,7 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | FeeRouter | [026](026-tokenomics.md#adr-026-tokenomics) | Yes (transient) | USDC (transient; all three buckets transfer same-tx) | `AccessControl`, `ReentrancyGuard`, `Pausable` (three-bucket settlement distributor: 60% operator base / 30% buyback-and-burn / 10% treasury per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split); no epoch buckets, no claim windows) |
 | SlashAppeal | [026](026-tokenomics.md#adr-026-tokenomics), [028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) | Yes (TOKEN appeal bonds only) | TOKEN (appeal bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable` (slash-appeal state machine per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation): `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `grantAppeal` / `upholdAppeal` / `cleanupExpiredAppeal`; drives `CapacityBond`'s escrow-on-slash settle hooks) |
 | BuybackBurner | [018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (Balancer V3 swap-and-burn path; receives 30% of every settlement) |
-| ContentBlacklist | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` (full surface: hash-level — global + regional — operator-level — `addOrigin` / `removeOrigin` / `isOriginBlacklisted` — and the [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) API) |
+| ContentBlacklist | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` (full surface: hash-level — global + regional — operator-level — `addOperator` / `removeOperator` — origin-level — `isOriginBlacklisted` / `setOriginBlacklist` — and the [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals) API) |
 | PublisherRegistry | [002](002-content-addressing.md#adr-002-content-addressing) | No | — | `AccessControl` (no `ReentrancyGuard`: the contract makes no external calls and holds no funds, so a reentrancy guard would be dead weight — every function is pure storage bookkeeping) |
 | OriginAssignment | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` |
 | SlashJudge | [014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` |
@@ -397,7 +397,7 @@ graph LR
     GOV -->|"firstBondedAt / slashedAtEpoch (age_ramp, slash zero-out)"| CBOND
     GOV -->|"grantAppeal / upholdAppeal"| SA
     GOV -->|"setShares / setBuybackBurner / setTreasury / setWindowEpochs"| FR
-    CB -->|"ejectNode(operatorAddress)"| CBOND
+    CB -->|"ejectNode / unEjectNode(operatorAddress)"| CBOND
     OA -->|"isActive(operator)"| CBOND
     OA -->|"ownerOf(namespaceId)"| PR
     OA -->|"isOriginBlacklisted(operator)"| CB
@@ -427,7 +427,7 @@ graph LR
 | Governor | DecdnGovernor (self) | `setVoteCapBps(bps)`, `setAgeRampMonths(months)` — self-governance of the served-bytes vote-weight tunables ([ADR 036 § Formula](036-served-bytes-voting-weight.md#formula)); both checkpointed via `Checkpoints.Trace208` (snapshots read at proposal time) and emit `VoteCapBpsUpdated` / `AgeRampMonthsUpdated` | `onlyGovernance` (executed through the Governor's own timelock); `voteCapBps` bounded `[1%, 25%]` (100–2500 bps), `ageRampMonths` bounded `[1, 24]` | View: No / Setters: Yes |
 | Governor | SlashAppeal | `grantAppeal(slashId)`, `upholdAppeal(slashId)`, `setAppealBond(n)`, `setChallengerIncentivePool(addr)` | `GOVERNANCE_ROLE` on SlashAppeal | Yes |
 | Emergency multisig | SlashAppeal | `fastTrackAppeal(slashId)`, `rejectAppeal(slashId)` | `EMERGENCY_MULTISIG_ROLE` on SlashAppeal | Yes |
-| ContentBlacklist | CapacityBond | `ejectNode(operatorAddress)` | `BLACKLIST_ROLE` | Yes |
+| ContentBlacklist | CapacityBond | `ejectNode(operatorAddress)` (on `addOperator`; sets the permanent `blacklistEjected` latch), `unEjectNode(operatorAddress)` (on `removeOperator`; clears the latch — re-entry then follows the normal re-bond path per [ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) | `BLACKLIST_ROLE` | Yes |
 | OriginAssignment | CapacityBond | `isActive(operator)` | Public (read-only) | No |
 | OriginAssignment | PublisherRegistry | `ownerOf(namespaceId)` | Public (read-only) | No |
 | OriginAssignment | ContentBlacklist | `isOriginBlacklisted(operator)` | Public (read-only) | No |
@@ -439,7 +439,7 @@ graph LR
 | BuybackBurner | Balancer V3 Router | `swapSingleTokenExactIn(pool, tokenIn, tokenOut, exactAmountIn, minAmountOut, deadline, wethIsEth, userData)` | `BuybackBurner` self-approves the **Balancer V3 Vault** address (NOT the Router) during its initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. This is the V3 footgun; see [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) | Yes |
 | BuybackBurner | IERC20 (USDC, TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 
-**Note:** No contract calls governance functions on another deCDN contract. Cross-contract state mutations are limited to `ejectNode()`, `slash()`, `routeSettlement()`, `recordSettlement()`, and the escrow-on-slash settle hooks (`markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted`) — each protected by a dedicated role.
+**Note:** No contract calls governance functions on another deCDN contract. Cross-contract state mutations are limited to `ejectNode()`, `unEjectNode()`, `slash()`, `routeSettlement()`, `recordSettlement()`, and the escrow-on-slash settle hooks (`markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted`) — each protected by a dedicated role.
 
 #### Off-Chain Read API (Client / Node Bootstrap)
 
@@ -573,7 +573,7 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | Role | Contract | Authorized Functions | At-launch holder | Steady-state holder |
 | --- | --- | --- | --- | --- |
 | `DEFAULT_ADMIN_ROLE` | All contracts | Grant/revoke roles, set parameters | Deployer EOA | `TimelockController` (2-day delay) |
-| `BLACKLIST_ROLE` | CapacityBond | `ejectNode()` | ContentBlacklist contract | ContentBlacklist contract |
+| `BLACKLIST_ROLE` | CapacityBond | `ejectNode()`, `unEjectNode()` | ContentBlacklist contract | ContentBlacklist contract |
 | `GOVERNANCE_ROLE` | OriginAssignment | `activateAssignment()`, `revokeAssignment()`, `setMaxOriginsPerNamespace()`, `setAssignmentTimelock()`, `setDefaultOpenAllowlist()`, `addDefaultOpenOperator()`, `removeDefaultOpenOperator()`, `setDefaultOpenMaxOrigins()` | Admin | Governor via timelock |
 | `SLASH_ROLE` | CapacityBond | `slash()` | SlashJudge contract | SlashJudge contract |
 | `SETTLEMENT_REPORTER_ROLE` | CapacityBond | `recordSettlement(operator)` | FeeRouter | FeeRouter; see [§ Cross-Contract Call Graph](#cross-contract-call-graph) |
@@ -581,7 +581,7 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | `EMERGENCY_MULTISIG_ROLE` | SlashAppeal | `fastTrackAppeal(slashId)`, `rejectAppeal(slashId)` | Emergency multisig | 3-of-5 multisig ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)) |
 | `KEEPER_ROLE` | BuybackBurner | `executeBuyback()` | Admin / disabled | Keeper bot or governance |
 | `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount)` | PaymentChannel | PaymentChannel (and any future settlement-emitting contract) |
-| `GOVERNANCE_ROLE` | ContentBlacklist, FeeRouter, CapacityBond, SlashAppeal | `addHash()`, `removeHash()`, `addOrigin()`, `removeOrigin()`, `registerRegionalBody()` (ContentBlacklist); `setShares(...)`, `setBuybackBurner(...)`, `setTreasury(...)`, `setWindowEpochs(...)` (FeeRouter); `setMinBond`, `setMinCapacityMbps`, `setMaxCapacityMbps`, `setUnbondingPeriod`, `setK`, `setAlpha` (CapacityBond); `grantAppeal`, `upholdAppeal`, `setAppealBond`, `setChallengerIncentivePool` (SlashAppeal) | Admin | Governor via timelock |
+| `GOVERNANCE_ROLE` | ContentBlacklist, FeeRouter, CapacityBond, SlashAppeal | `addHash()`, `removeHash()`, `addOperator()`, `removeOperator()`, `registerRegionalBody()` (ContentBlacklist); `setShares(...)`, `setBuybackBurner(...)`, `setTreasury(...)`, `setWindowEpochs(...)` (FeeRouter); `setMinBond`, `setMinCapacityMbps`, `setMaxCapacityMbps`, `setUnbondingPeriod`, `setK`, `setAlpha` (CapacityBond); `grantAppeal`, `upholdAppeal`, `setAppealBond`, `setChallengerIncentivePool` (SlashAppeal) | Admin | Governor via timelock |
 | `EMERGENCY_ROLE` | ContentBlacklist (emergency functions), fund-holding contracts (`pause()`) | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()` (ContentBlacklist); `pause()` (Pausable contracts only) | Admin | 3-of-5 multisig (12-month sunset) |
 | Regional body | ContentBlacklist | `addHashRegional(region)` | Not registered at launch | Per-jurisdiction multisig |
 
@@ -640,7 +640,8 @@ Every state-mutating function that makes an external call is listed below with i
 | `finalizeUnappealedSlash(slashId)` | `IERC20.safeTransfer()` (50% challenger), `token.burn()` (50%) — after the filing window with no appeal | `nonReentrant`, `whenNotPaused`; permissionless |
 | `markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted` | escrow lock / distribute 50-50 / refund operator + recompute the multi-slash `slashedAtEpoch` watermark | `nonReentrant` (settle paths), `SLASH_APPEAL_ROLE` (held by `SlashAppeal`) |
 | `recordSettlement(operator)` | None (emits `SettlementRecorded(operator)`; no storage write) | `SETTLEMENT_REPORTER_ROLE` |
-| `ejectNode()` | None (state change only) | `BLACKLIST_ROLE` |
+| `ejectNode()` | None (state change only; always sets the permanent `blacklistEjected` latch, and sets the `ejected` master gate + node-deactivation effects on the first ejection — a no-op on those if the operator was already ejected) | `BLACKLIST_ROLE` |
+| `unEjectNode()` | None (state change only; clears the `blacklistEjected` latch, idempotent — re-entry follows the normal re-bond path) | `BLACKLIST_ROLE` |
 | `declaredMbps(operator)`, `firstBondedAt(operator)`, `slashedAtEpoch(operator)`, `isActive(operator)` | None (read-only) | N/A |
 
 #### SlashJudge

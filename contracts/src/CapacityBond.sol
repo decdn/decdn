@@ -205,6 +205,14 @@ contract CapacityBond is
     mapping(address operator => uint32) public lifetimeOffenseCount;
     mapping(address operator => bool) public ejected;
 
+    /// @notice Governance-blacklist ejection latch (ADR 011 § Hash Evasion and
+    ///         Origin Blacklisting). Set by the `BLACKLIST_ROLE` `ejectNode`
+    ///         path and is independent of the recoverable slash auto-ejection
+    ///         (ADR 026): while set, `bond()` MUST NOT clear `ejected`, so a
+    ///         blacklisted operator cannot self-reinstate by re-bonding. Cleared
+    ///         only by `unEjectNode` when governance lifts the blacklist.
+    mapping(address operator => bool) public blacklistEjected;
+
     /// @notice First-bond-time stamp per operator (ADR 036 § Formula —
     ///         `age_ramp` numerator). Set once on the first `bond` call that
     ///         lifts the operator's `activeBond` above zero; never overwritten.
@@ -392,6 +400,7 @@ contract CapacityBond is
     );
     event AutoEjected(address indexed operator, uint256 remainingBond);
     event EjectedByBlacklist(address indexed operator);
+    event BlacklistEjectionCleared(address indexed operator);
     event Reinstated(address indexed operator);
     event SettlementRecorded(address indexed operator);
     event MinBondUpdated(uint256 oldValue, uint256 newValue);
@@ -556,7 +565,10 @@ contract CapacityBond is
             _firstBondedAt[msg.sender] = uint64(block.timestamp);
         }
 
-        if (ejected[msg.sender] && newBalance >= minBond) {
+        // Slash auto-ejection (ADR 026) is recoverable by re-bonding, but a
+        // governance blacklist latch (ADR 011) is not — re-entry after a
+        // blacklist must go through `unEjectNode` first.
+        if (ejected[msg.sender] && !blacklistEjected[msg.sender] && newBalance >= minBond) {
             ejected[msg.sender] = false;
             emit Reinstated(msg.sender);
         }
@@ -1019,6 +1031,11 @@ contract CapacityBond is
 
     function ejectNode(address operator) external override onlyRole(BLACKLIST_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
+        // Set the governance latch UNCONDITIONALLY — an operator already
+        // slash-auto-ejected (`ejected == true`) would otherwise skip the
+        // one-time-effects block below and never get latched, leaving the
+        // self-reinstatement hole open.
+        blacklistEjected[operator] = true;
         if (!ejected[operator]) {
             ejected[operator] = true;
             emit EjectedByBlacklist(operator);
@@ -1026,6 +1043,19 @@ contract CapacityBond is
             if (nodeId != bytes32(0)) {
                 emit NodeAutoEjected(nodeId, activeBond[operator]);
             }
+        }
+    }
+
+    /// @notice Release the governance-blacklist ejection latch when governance
+    ///         lifts the blacklist (ADR 011). Clears only `blacklistEjected`;
+    ///         the operator re-enters the active set through the normal re-bond
+    ///         path (`bond()` reinstatement then `registerNode`), so a still
+    ///         slash-deficient operator stays ejected. Idempotent.
+    function unEjectNode(address operator) external override onlyRole(BLACKLIST_ROLE) {
+        if (operator == address(0)) revert ZeroAddress();
+        if (blacklistEjected[operator]) {
+            blacklistEjected[operator] = false;
+            emit BlacklistEjectionCleared(operator);
         }
     }
 
