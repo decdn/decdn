@@ -97,6 +97,8 @@ pub enum ReputationReject {
     FutureReport,
     #[error("reporter not in staked set")]
     NotStakedReporter,
+    #[error("reporter and provider are the same node (self-report)")]
+    SelfReport,
     #[error("rate limit: 1 report per (reporter, node) per hour exceeded")]
     RateLimitedPair,
     #[error("rate limit: {MAX_REPORTS_PER_REPORTER_PER_HR} reports per reporter per hour exceeded")]
@@ -118,6 +120,7 @@ impl ReputationReject {
             Self::StaleReport => "reputation_stale_report",
             Self::FutureReport => "reputation_future_report",
             Self::NotStakedReporter => "reputation_not_staked_reporter",
+            Self::SelfReport => "reputation_self_report",
             Self::RateLimitedPair => "reputation_rate_limited_pair",
             Self::RateLimitedReporter => "reputation_rate_limited_reporter",
         }
@@ -153,6 +156,15 @@ pub fn validate_reputation_envelope(
         return Err(ReputationReject::UnknownVariant);
     };
     let body = report.body;
+
+    // Reject self-reports (#861): a node signing a report about itself would
+    // fold a self-vote into its own network score AND fill one of the three
+    // distinct-reporter slots its score needs, dropping ADR 008's eclipse/Sybil
+    // external-identity cost from 3 to 2. A cheap 32-byte comparison, so it
+    // runs before the recency and signature checks.
+    if body.reporter == body.provider {
+        return Err(ReputationReject::SelfReport);
+    }
 
     // Recency window (ADR 008): reject stale or far-future reports before
     // spending verification cycles.
@@ -336,6 +348,7 @@ mod tests {
                 ReputationReject::StaleReport => "reputation_stale_report",
                 ReputationReject::FutureReport => "reputation_future_report",
                 ReputationReject::NotStakedReporter => "reputation_not_staked_reporter",
+                ReputationReject::SelfReport => "reputation_self_report",
                 ReputationReject::RateLimitedPair => "reputation_rate_limited_pair",
                 ReputationReject::RateLimitedReporter => "reputation_rate_limited_reporter",
             }
@@ -352,6 +365,7 @@ mod tests {
             ReputationReject::StaleReport,
             ReputationReject::FutureReport,
             ReputationReject::NotStakedReporter,
+            ReputationReject::SelfReport,
             ReputationReject::RateLimitedPair,
             ReputationReject::RateLimitedReporter,
         ] {
@@ -367,6 +381,20 @@ mod tests {
         assert_eq!(v.reporter, *sk.public().as_bytes());
         assert_eq!(v.provider, [9u8; 32]);
         assert_eq!(v.delivery_speed, Some(1_048_576));
+    }
+
+    #[test]
+    fn self_report_rejected() {
+        // #861: a node reporting on itself (reporter == provider) is rejected
+        // even with a valid signature from a staked reporter — it must not
+        // self-boost its score or fill a distinct-reporter slot.
+        let sk = SecretKey::generate();
+        let self_id = *sk.public().as_bytes();
+        let bytes = encode_signed(&sk, body(&sk, self_id, NOW));
+        assert_eq!(
+            validate_reputation_envelope(&bytes, NOW, &AllStaked),
+            Err(ReputationReject::SelfReport)
+        );
     }
 
     #[test]
