@@ -77,10 +77,11 @@ struct Inner {
     /// [`CacheEngine::get`] so an evicted blob is not served, even though
     /// the underlying iroh-blobs store may still hold the bytes —
     /// `Blobs::delete` is `pub(crate)` in iroh-blobs and reserved for the
-    /// GC task. Reclaim of disk bytes happens on the next iroh-blobs GC
-    /// sweep, configured via `cache.gc_interval_sec` (#518). On-demand
-    /// reclamation is tracked under #520, blocked on upstream exposing
-    /// the sweep API.
+    /// GC task. [`CacheEngine::evict`] deletes the blob's protecting named
+    /// tag(s) (#860), so reclaim of disk bytes then happens on the next
+    /// iroh-blobs GC sweep, configured via `cache.gc_interval_sec` (#518).
+    /// On-demand (synchronous) reclamation is tracked under #520, blocked on
+    /// upstream exposing the sweep API.
     ///
     /// Persisted alongside the iroh-blobs store at `<cache_dir>/evicted.log`
     /// on every successful [`CacheEngine::evict`] call so DMCA takedowns and
@@ -859,14 +860,18 @@ impl CacheEngine {
     /// respectively). The corresponding [`Self::access_times_snapshot`] entry
     /// is cleared so future LRU sweeps don't re-surface the hash.
     ///
-    /// This is a *logical* evict: `Blobs::delete` is `pub(crate)` in
-    /// iroh-blobs and reserved for the GC task, so the bytes remain on
-    /// disk until the next iroh-blobs GC sweep reclaims them (#518; the
-    /// sweep cadence is `cache.gc_interval_sec`, default 5min).
-    /// The operator-visible behavior — the
-    /// node stops serving the blob immediately — is what `decdn node evict`
-    /// (issue #279) needs for use cases like DMCA takedown and corruption
-    /// recovery.
+    /// Serving stops immediately via the logical-evicted set (`Blobs::delete`
+    /// is `pub(crate)` in iroh-blobs and reserved for the GC task, so the
+    /// bytes are not removed synchronously). `evict` deletes the blob's
+    /// protecting named tag(s) (#860) so the bytes become GC-eligible; the
+    /// disk is then reclaimed on the next iroh-blobs GC sweep — cadence
+    /// `cache.gc_interval_sec`, default 5min (#518) — *when periodic GC is
+    /// enabled*. With GC disabled (`gc_interval_sec == 0`) serving still stops
+    /// but the bytes stay on disk until a sweep is configured. The
+    /// operator-visible behavior — the node stops serving the blob
+    /// immediately, and reclaims its disk on the next sweep — is what `decdn
+    /// node evict` (issue #279) needs for use cases like DMCA takedown and
+    /// corruption recovery.
     ///
     /// Persisted: the eviction is appended (with `fsync`) to
     /// `<cache_dir>/evicted.log` before this call returns successfully, so
@@ -944,7 +949,86 @@ impl CacheEngine {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&hash);
+
+        // Disk reclaim (#860): serving has already stopped via the logical
+        // set above, but a successfully pulled-through blob carries a named
+        // tag that protects it from the iroh-blobs GC sweep forever. Delete
+        // that tag so the next sweep can actually reclaim the bytes — without
+        // this a DMCA evict retains the content on disk indefinitely. Two
+        // caveats on the reclaim, both intentional: GC must be enabled
+        // (`cache.gc_interval_sec > 0`); and a pull-through for the same hash
+        // that races this evict can re-create a protecting tag *after* the
+        // delete below (the commit path does not re-check `is_evicted`), in
+        // which case reclaim waits until that tag is itself cleared — serving
+        // still stays blocked via the logical set either way.
+        //
+        // Best-effort: the durable serve-blocking guarantee is already in
+        // place, so a tag-delete failure only delays reclaim (it can never
+        // resurrect serving) and must not turn a successful takedown into an
+        // `Err`. The failure is surfaced via `tag_drop_failures` + a warn so
+        // an operator can act; note nothing auto-retries it — a re-run of
+        // `evict()` short-circuits at the `contains` check above, and open()
+        // replay only reloads the logical set, so recovery is manual.
+        match self.drop_named_tags_for(hash).await {
+            Ok(deleted) => tracing::debug!(%hash, deleted, "evict: dropped protecting tags"),
+            Err(err) => {
+                if let Some(m) = &self.inner.metrics {
+                    m.tag_drop_failures.inc();
+                }
+                tracing::warn!(
+                    %hash,
+                    %err,
+                    "evict: failed to drop protecting tags; bytes stay GC-protected (not auto-retried)",
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Delete every named tag pointing at `hash`, making the underlying
+    /// bytes eligible for the iroh-blobs GC sweep.
+    ///
+    /// Pull-through promotes each cached blob to a named tag
+    /// ([`iroh_blobs::api::tags::Tags::create`] on the streaming path,
+    /// `add_bytes` on the drain path); iroh-blobs GC protects any blob
+    /// reachable from a tag, so the bytes are never reclaimed while a tag
+    /// survives. Tag names are opaque and store-assigned, so matches are
+    /// found by enumerating tags and comparing hashes. A hash can carry more
+    /// than one tag, so every match is removed (in practice the engine creates
+    /// one tag per cached hash — `get`/`populate` short-circuit on a hit and
+    /// in-flight pulls coalesce (#305) — but the loop is robust to a future
+    /// caller that tags the same hash twice). Returns the number of tags
+    /// deleted.
+    ///
+    /// Cost scales with the *total* tag set: iroh-blobs has no hash-indexed
+    /// tag lookup, so this lists every tag and filters in Rust. Fine at
+    /// operator-evict / mismatch rates; not something to call on a hot path.
+    async fn drop_named_tags_for(&self, hash: Hash) -> CacheResult<u64> {
+        let tags = self.inner.store.tags();
+        // Collect matching names before deleting so the (immutable) list
+        // stream is fully drained before any delete call — keeps the two
+        // store interactions sequential and easy to reason about.
+        let mut to_delete = Vec::new();
+        {
+            let mut stream = tags
+                .list()
+                .await
+                .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+            while let Some(info) = stream.next().await {
+                let info = info.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+                if info.hash == hash {
+                    to_delete.push(info.name);
+                }
+            }
+        }
+        let mut deleted = 0u64;
+        for name in to_delete {
+            deleted += tags
+                .delete(name)
+                .await
+                .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        }
+        Ok(deleted)
     }
 
     /// Read-only inspection of a hash's local cache state, used by
@@ -1804,34 +1888,23 @@ impl CacheEngine {
 
         let actual = temp_tag.hash();
         if actual != hash {
-            // Drop the temp tag without promotion → bytes become
-            // GC-eligible inside iroh-blobs (they're not protected
-            // once the `TempTag` drops). Deterministic protocol
-            // violation: a clean stream that hashed wrong is not a
-            // transport failure — retry won't help.
+            // Drop the temp tag without promotion → the wrong-hash bytes are
+            // never tagged, so they are GC-eligible inside iroh-blobs and the
+            // next sweep reclaims them. Deterministic protocol violation: a
+            // clean stream that hashed wrong is not a transport failure —
+            // retry won't help.
+            //
+            // We deliberately do NOT logically evict `actual`. The persisted
+            // evicted set is reserved for operator DMCA/corruption takedowns
+            // (#279); reusing it here would durably censor `actual` — and
+            // since content is BLAKE3-addressed, bytes whose hash is `actual`
+            // *are* the authorized content for `actual`. A malicious upstream
+            // that answers a pull for `hash` with a victim blob's bytes could
+            // otherwise make us permanently blacklist that legitimate blob
+            // (#853). The requested hash `hash` is correctly never committed;
+            // a later request for `actual` itself is served only if its bytes
+            // genuinely hash to `actual`, which is exactly correct.
             drop(temp_tag);
-            // Cache-poisoning mitigation: between the drop above
-            // and the next iroh-blobs GC sweep, the wrong-hash
-            // bytes are still resident in the store and
-            // `Blobs::has(actual)` would return `true`. An
-            // adversary who chose the bytes also chose `actual`,
-            // so a follow-up request for `actual` could otherwise
-            // serve content the operator never authorized. Add
-            // `actual` to the engine's logical-evicted set so
-            // `engine::has(actual)` and `engine::get(actual)`
-            // return absent regardless of what iroh-blobs
-            // currently has on disk. Best-effort: a poisoned
-            // mutex or a full evicted-set cap surfaces only as a
-            // log line — the primary error returned to the
-            // caller is still `HashMismatch`.
-            if let Err(evict_err) = self.evict(actual).await {
-                tracing::warn!(
-                    expected = %hash,
-                    %actual,
-                    err = %evict_err,
-                    "hash-mismatch logical-evict failed; engine.has(actual) may surface partial-import bytes until iroh-blobs GC runs",
-                );
-            }
             return Ok(PullThroughOutcome::HashMismatch { actual });
         }
 
@@ -1895,16 +1968,27 @@ impl CacheEngine {
         };
         let actual = tag.hash;
         if actual != hash {
-            // Same cache-poisoning mitigation as the streaming path:
-            // log-evict the wrong hash so `engine.has(actual)` doesn't
-            // surface attacker-chosen bytes between now and the next
-            // GC sweep.
-            if let Err(evict_err) = self.evict(actual).await {
+            // Unlike the streaming path (which drops an unpromoted `TempTag`),
+            // `add_bytes` already created a *persistent named tag* protecting
+            // these wrong-hash bytes from GC. Delete it so the bytes become
+            // GC-eligible — matching the streaming path's drop semantics and
+            // avoiding the unbounded-disk-growth leak (#837). Best-effort: a
+            // delete failure only delays reclaim, so it is logged, not
+            // propagated over the `HashMismatch` we owe the caller.
+            //
+            // As on the streaming path we do NOT logically evict `actual`:
+            // the persisted evicted set is for deliberate takedowns only, and
+            // logically evicting a content-addressed hash here is the
+            // durable-censorship vector in #853.
+            if let Err(err) = self.inner.store.tags().delete(tag.name).await {
+                if let Some(m) = &self.inner.metrics {
+                    m.tag_drop_failures.inc();
+                }
                 tracing::warn!(
                     expected = %hash,
                     %actual,
-                    err = %evict_err,
-                    "hash-mismatch logical-evict failed (drain path); engine.has(actual) may surface partial-import bytes until iroh-blobs GC runs",
+                    %err,
+                    "hash-mismatch tag delete failed (drain path); wrong-hash bytes stay GC-protected (not auto-retried)",
                 );
             }
             return Ok(PullThroughOutcome::HashMismatch { actual });
