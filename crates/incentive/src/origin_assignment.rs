@@ -57,7 +57,10 @@ mod sol_types {
             event AssignmentActivated(uint256 indexed namespaceId, address[] operators);
 
             /// A single `operator` was removed from `namespaceId`'s authorized
-            /// set (by the namespace owner or governance).
+            /// set (by the namespace owner or governance). `namespaceId` MAY be
+            /// `0`: a governance revoke of a default-open operator targets the
+            /// default-open allow-list, not a per-namespace set — consumers must
+            /// treat namespace 0 as the default-open set.
             event AssignmentRevoked(
                 uint256 indexed namespaceId,
                 address indexed operator,
@@ -66,6 +69,9 @@ mod sol_types {
 
             /// A blacklisted `operator` was pruned from `namespaceId`'s
             /// authorized set. Same cache effect as a revoke (remove one).
+            /// `namespaceId` MAY be `0`: the permissionless
+            /// `pruneBlacklistedAssignment(0, op)` path targets the default-open
+            /// allow-list — consumers must treat namespace 0 as that set.
             event BlacklistedAssignmentPruned(
                 uint256 indexed namespaceId,
                 address indexed operator,
