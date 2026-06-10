@@ -751,6 +751,31 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn high_s_voucher_rejected_at_apply() -> anyhow::Result<()> {
+        // A high-`s` voucher recovers the correct signer off-chain but is
+        // unsettleable on-chain (#836). `apply_voucher` must reject it via the
+        // transitive `recover_signer` guard and leave state untouched — this
+        // locks the channel-layer path the `voucher::tests` unit test cannot
+        // reach.
+        let (signer, mut state, domain, store) = fixture();
+        let signed = build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&signer, &domain)?;
+        let twin = SignedVoucher {
+            signature: crate::sig_canon::high_s_twin(&signed.signature),
+            ..signed
+        };
+        let err = err_of(state.apply_voucher(&twin, &domain, &store))?;
+        anyhow::ensure!(
+            matches!(err, ChannelError::Signature(VoucherError::InvalidSignature)),
+            "{err:?}"
+        );
+        anyhow::ensure!(
+            state.last_nonce == U256::ZERO,
+            "rejection must not advance state"
+        );
+        Ok(())
+    }
+
     /// Cover every `ChannelError` variant — `apply_voucher` must leave
     /// state untouched on each rejection path. Bytes for `v1` are `1_000`
     /// so a `bytes_delivered` decrease can be tested without going below

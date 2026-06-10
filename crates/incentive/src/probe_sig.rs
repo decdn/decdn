@@ -152,6 +152,11 @@ impl ProbeSlashData {
         signature: &Signature,
         domain: &Eip712Domain,
     ) -> Result<Address, ProbeSlashError> {
+        // Reject non-canonical high-`s` so the off-chain accept-set matches the
+        // on-chain `SlashJudge` verifiable-set (#836).
+        if crate::sig_canon::is_high_s(signature) {
+            return Err(ProbeSlashError::InvalidSignature);
+        }
         let hash = self.signing_hash(domain);
         signature
             .recover_address_from_prehash(&hash)
@@ -255,6 +260,24 @@ mod tests {
         anyhow::ensure!(
             matches!(err, ProbeSlashError::WrongSigner { .. }),
             "expected WrongSigner, got: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn high_s_probe_slash_signature_rejected() -> anyhow::Result<()> {
+        // High-`s` slash evidence verifies off-chain but fails at the on-chain
+        // `SlashJudge`; reject it so collected evidence stays settleable (#836).
+        let signer = PrivateKeySigner::random();
+        let domain = sample_domain();
+        let data = sample_data();
+        let sig = data.sign(&signer, &domain)?;
+        data.verify_signer(&sig, signer.address(), &domain)?; // low-s ok
+
+        let twin = crate::sig_canon::high_s_twin(&sig);
+        anyhow::ensure!(
+            data.recover_signer(&twin, &domain) == Err(ProbeSlashError::InvalidSignature),
+            "high-s probe slash twin must be rejected as InvalidSignature"
         );
         Ok(())
     }

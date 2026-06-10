@@ -32,6 +32,7 @@ pub mod payment_channel;
 pub mod probe_sig;
 pub mod publisher_registry;
 pub mod rate;
+mod sig_canon;
 pub mod store;
 pub mod stream_sig;
 pub mod voucher;

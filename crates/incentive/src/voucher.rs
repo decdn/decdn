@@ -158,6 +158,12 @@ impl SignedVoucher {
     /// Returns [`VoucherError::InvalidSignature`] if the signature is
     /// malformed (non-canonical `s`, invalid recovery id, etc.).
     pub fn recover_signer(&self, domain: &Eip712Domain) -> Result<Address, VoucherError> {
+        // Reject non-canonical high-`s` up front so the off-chain accept-set
+        // matches the on-chain verifiable-set (#836); alloy would otherwise
+        // silently normalize and accept it.
+        if crate::sig_canon::is_high_s(&self.signature) {
+            return Err(VoucherError::InvalidSignature);
+        }
         let hash = self.voucher.signing_hash(domain);
         self.signature
             .recover_address_from_prehash(&hash)
@@ -278,6 +284,28 @@ mod tests {
         anyhow::ensure!(
             matches!(err, VoucherError::InvalidSignature),
             "expected InvalidSignature, got: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn high_s_voucher_signature_rejected() -> anyhow::Result<()> {
+        // A malicious client can flip a valid voucher signature to its
+        // non-canonical high-`s` twin. alloy's recovery would normalize and
+        // accept it, but the on-chain `PaymentChannel` reverts (#836). The
+        // off-chain accept-set must match: reject the twin, accept the original.
+        let signer = PrivateKeySigner::random();
+        let domain = sample_domain();
+        let signed = sample_voucher().sign(&signer, &domain)?;
+        signed.verify_signer(signer.address(), &domain)?; // low-s original still valid
+
+        let twin = SignedVoucher {
+            signature: crate::sig_canon::high_s_twin(&signed.signature),
+            ..signed
+        };
+        anyhow::ensure!(
+            twin.recover_signer(&domain) == Err(VoucherError::InvalidSignature),
+            "high-s voucher twin must be rejected as InvalidSignature"
         );
         Ok(())
     }
