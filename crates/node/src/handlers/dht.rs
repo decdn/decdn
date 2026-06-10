@@ -66,6 +66,14 @@ const MAX_DHT_REQUESTS_PER_CONN: u32 = 256;
 /// past it; the existing post-loop `conn.closed()` flush then releases.
 const MAX_DHT_CONN_AGE: Duration = Duration::from_mins(5);
 
+/// Whether the per-connection accept loop has reached its budget (#845): the
+/// served-stream count cap or the connection-age deadline. Factored out of the
+/// `serve` loop so the unit test exercises the real gate the loop checks rather
+/// than a re-implementation of it.
+fn accept_budget_reached(served: u32, conn_age: Duration) -> bool {
+    served >= MAX_DHT_REQUESTS_PER_CONN || conn_age >= MAX_DHT_CONN_AGE
+}
+
 // ADR 013 application error codes (also defined in `handlers::probe`; the
 // codes are protocol-wide constants, not per-ALPN values).
 const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
@@ -242,10 +250,24 @@ impl DhtHandler {
         loop {
             // Stop accepting once this connection has consumed its per-conn
             // request budget or outlived the age deadline. Checked at the top
-            // so the previously-accepted stream is always served in full;
-            // breaking here lets the post-loop `conn.closed()` flush run and
-            // releases the dispatch permit.
-            if served >= MAX_DHT_REQUESTS_PER_CONN || conn_start.elapsed() >= MAX_DHT_CONN_AGE {
+            // so the previously-accepted stream is always served in full.
+            // Unlike the peer-close / idle-timeout break below (which the peer
+            // initiated), this is a resource-exhaustion close *we* initiate, so
+            // — mirroring `close_stream_with_rate_limit` and the client
+            // handler's permit-exhaustion close — signal the peer with
+            // `APP_ERR_RATE_LIMITED` and log which bound tripped rather than
+            // dropping further requests silently; the post-loop `conn.closed()`
+            // flush then returns and releases the dispatch permit.
+            if accept_budget_reached(served, conn_start.elapsed()) {
+                tracing::debug!(
+                    served,
+                    age_secs = conn_start.elapsed().as_secs(),
+                    "dht per-connection budget reached; closing to recycle the dispatch permit (#845)"
+                );
+                conn.close(
+                    VarInt::from_u32(APP_ERR_RATE_LIMITED),
+                    b"dht per-connection budget",
+                );
                 break;
             }
             // Peer closed the connection (`Ok(Err)`) or we hit the idle
@@ -883,53 +905,62 @@ fn peer_ip(conn: &Connection) -> Option<IpAddr> {
 mod tests {
     use super::*;
 
-    // The serve-loop accept cap (#845) is exercised end-to-end by the
-    // loopback harness in `tests/dht_loopback.rs` (which owns the live
-    // iroh connection-pair setup). Here we pin the bounding logic the loop
-    // relies on, so a future edit to either const can't silently disable
-    // the dispatch-permit-hygiene guard.
+    // These tests call the real `accept_budget_reached` gate the `serve`
+    // loop checks at the top of its body, so a future edit to the predicate
+    // or either const can't silently disable the dispatch-permit-hygiene
+    // guard (#845). They do NOT exercise the loop wiring end-to-end: the
+    // loopback harness in `tests/dht_loopback.rs` proves the accept loop
+    // serves multiple streams on one connection (the store→find roundtrip),
+    // but does not drive a connection to the 256-stream cap or the 5-minute
+    // age deadline — driving 256 live round-trips, with the cap a private
+    // const the integration crate can't reference, isn't worth the wall
+    // clock. The predicate test below is the behavioral guard for the gate.
 
-    /// Models the exact stop condition the serve loop checks at the top of
-    /// its body: accepting halts the instant the served count reaches the
-    /// cap, so the loop serves at most `MAX_DHT_REQUESTS_PER_CONN` streams
-    /// before releasing its dispatch permit. The cap must be a finite,
-    /// positive budget for this to terminate at the right count — a zero cap
-    /// would serve nothing and `u32::MAX` would reopen the unbounded-permit
-    /// hole #845 closes.
+    /// The gate stays open below both bounds and trips at each: the served
+    /// count reaching `MAX_DHT_REQUESTS_PER_CONN`, or the connection age
+    /// reaching `MAX_DHT_CONN_AGE`. Exercises the actual function the loop
+    /// calls, covering both the count and the (otherwise untested) age branch.
     #[test]
-    fn served_counter_stops_at_the_cap() {
-        let cap = MAX_DHT_REQUESTS_PER_CONN;
-        assert!(cap > 0, "a zero cap serves nothing");
-        assert!(
-            cap < u32::MAX,
-            "an unbounded cap reopens the dispatch-permit-pinning hole (#845)"
-        );
-        // Simulate the loop's accept gate (count branch only; the age
-        // branch is wall-clock, covered by `conn_age_deadline_is_non_zero`).
-        let mut served: u32 = 0;
-        let mut accepted: u32 = 0;
-        loop {
-            if served >= cap {
-                break;
-            }
-            // A stream was accepted and will be served this iteration.
-            served = served.saturating_add(1);
-            accepted = accepted.saturating_add(1);
-        }
-        assert_eq!(
-            accepted, cap,
-            "the loop serves exactly the per-conn budget, then stops accepting"
-        );
+    fn accept_budget_reached_trips_at_each_bound() {
+        // Open while under both bounds (a 1-second age is well under the
+        // multi-minute deadline; avoid `MAX_DHT_CONN_AGE - …` so clippy's
+        // `unchecked_time_subtraction` doesn't push an `.unwrap()` here).
+        assert!(!accept_budget_reached(0, Duration::ZERO));
+        assert!(!accept_budget_reached(
+            MAX_DHT_REQUESTS_PER_CONN - 1,
+            Duration::from_secs(1)
+        ));
+        // Count bound: trips exactly at the cap and stays tripped above it.
+        assert!(accept_budget_reached(
+            MAX_DHT_REQUESTS_PER_CONN,
+            Duration::ZERO
+        ));
+        assert!(accept_budget_reached(u32::MAX, Duration::ZERO));
+        // Age bound: trips at the deadline regardless of a low served count.
+        assert!(accept_budget_reached(0, MAX_DHT_CONN_AGE));
+        assert!(accept_budget_reached(
+            0,
+            MAX_DHT_CONN_AGE + Duration::from_secs(1)
+        ));
     }
 
-    /// The age deadline must be a non-zero duration: zero would break every
-    /// connection before its first stream, and the bound is what releases
-    /// the dispatch permit for a peer dribbling requests under the count cap.
+    /// Both bounds must be finite and positive: a zero count cap would serve
+    /// nothing, `u32::MAX` would reopen the unbounded-permit hole #845 closes,
+    /// and a zero age deadline would break every connection before its first
+    /// stream.
     #[test]
-    fn conn_age_deadline_is_non_zero() {
-        let deadline = MAX_DHT_CONN_AGE;
+    fn budget_bounds_are_sane() {
+        // Bind to locals so the comparisons aren't const-folded (clippy's
+        // `assertions_on_constants` is fatal under `-D warnings`).
+        let count_cap = MAX_DHT_REQUESTS_PER_CONN;
+        let age = MAX_DHT_CONN_AGE;
+        assert!(count_cap > 0, "a zero count cap serves nothing");
         assert!(
-            deadline > Duration::ZERO,
+            count_cap < u32::MAX,
+            "an unbounded count cap reopens the dispatch-permit-pinning hole (#845)"
+        );
+        assert!(
+            age > Duration::ZERO,
             "a zero age deadline would close every connection immediately"
         );
     }

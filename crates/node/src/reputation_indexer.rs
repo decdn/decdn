@@ -123,13 +123,20 @@ impl SettlementIndexer {
 const MAX_PENDING_SETTLED: usize = 4096;
 
 /// Upper bound on the `settled_seen` dedup set (#864). Unlike
-/// `pending_settled`, this is a pure dedup set with no re-credit/backfill
-/// rearm on eviction: dropping an entry only risks re-crediting a channel
-/// that settled long ago, and since the matching `channels` entry is
-/// already removed on credit (#867/#868), a re-delivered ancient
-/// settlement resolves to provider-only/no-op in practice. The oldest
-/// entries are the longest-settled, so FIFO eviction sheds exactly those.
-/// 65536 covers a very long settlement history before any entry ages out.
+/// `pending_settled`, eviction here carries no re-credit/backfill rearm —
+/// it just forgets that a channel was already credited. The oldest entries
+/// are the longest-settled, so FIFO eviction sheds exactly those. The
+/// residual risk: if an evicted channel's `ChannelSettled` is then
+/// re-delivered (a resubscribe/backfill overlap), `process_settled` no
+/// longer short-circuits and `apply_settlement` re-credits the **provider**
+/// (resolved from the never-removed on-chain `CapacityBond` binding) for
+/// that amount once more — the counterparty leg is lost since the `channels`
+/// entry was dropped on first credit (#864). That is a bounded
+/// reputation double-count, not a no-op, but it requires both a full
+/// `MAX_SETTLED_SEEN`-deep settlement history *and* a re-delivery of the
+/// specific aged-out event, so 65536 keeps it astronomically unlikely while
+/// capping memory. Eviction itself becomes routine once the set saturates,
+/// so it stays at `debug!` rather than `warn!` to avoid per-settlement noise.
 const MAX_SETTLED_SEEN: usize = 65_536;
 
 /// A live `ChannelSettled` observed before its `ChannelOpened`, parked until the
@@ -565,7 +572,8 @@ where
 /// — caller should no-op). On a genuinely new insert the id joins the FIFO
 /// order and the oldest (longest-settled) entries are evicted until the set is
 /// back under the bound; eviction is a pure dedup drop (no re-credit/backfill
-/// rearm, unlike `park_settled`).
+/// rearm, unlike `park_settled`) — see `MAX_SETTLED_SEEN` for the bounded
+/// re-credit risk a later re-delivery of an evicted id carries.
 fn mark_settled_seen(state: &mut IndexerState, channel_id: [u8; 32]) -> bool {
     if !state.settled_seen.insert(channel_id) {
         return false;

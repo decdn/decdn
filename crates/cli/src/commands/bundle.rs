@@ -706,6 +706,30 @@ mod tests {
         assert!(msg.contains("outside --input root"), "msg was: {msg}");
     }
 
+    // Finding B(a) corollary: an excluded directory that is *itself* an
+    // escaping symlink (not just a real dir containing one). With
+    // `follow_symlinks=true` walkdir reports the link target's type, so it
+    // presents as a directory; a recursive `tmp/**` exclude must keep its
+    // whole subtree out of the bundle without resolving any descendant and
+    // tripping the escape `bail!`.
+    #[cfg(unix)]
+    #[test]
+    fn collect_excluded_symlinked_dir_does_not_error() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(outside.path().join("payload")).unwrap();
+        std::fs::write(outside.path().join("payload/secret.txt"), b"s").unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // `tmp` is a symlink pointing outside the root at a real directory.
+        symlink(outside.path().join("payload"), dir.path().join("tmp")).unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"k").unwrap();
+
+        let paths = collect_paths(dir.path(), true, &["tmp/**"]).unwrap();
+        assert_eq!(paths, vec!["keep.txt".to_string()]);
+    }
+
     #[test]
     fn create_report_json_shape() {
         let report = CreateReport {
