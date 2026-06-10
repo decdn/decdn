@@ -301,10 +301,16 @@ impl GossipService {
 
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
+        // Our own `node_id`, so a subscriber can drop an echo of this node's
+        // own announce instead of inserting itself into its peer table (#845).
+        // `secret_key` is still owned here (it moves into the publisher below).
+        let self_node_id = *secret_key.public().as_bytes();
+
         for wiring in wirings {
             handles.push(subscriber_task(
                 wiring,
                 gossip.clone(),
+                self_node_id,
                 Arc::clone(&allowlist),
                 Arc::clone(&peer_table),
                 Arc::clone(&metrics),
@@ -455,6 +461,17 @@ async fn spawn_reputation_tasks(
     (tasks, trigger)
 }
 
+/// Whether `announce` is this node's own announce echoed back to it (#845).
+/// The subscriber drops these before [`dispatch_insert`] so a node never
+/// inserts itself into its own peer table. Factored out so the trivial-looking
+/// guard is exercised directly by a unit test.
+pub(crate) fn is_self_announce(
+    announce: &decdn_protocol::NodeAnnounce,
+    self_node_id: &[u8; 32],
+) -> bool {
+    announce.body.node_id == *self_node_id
+}
+
 /// Insert (or refresh) an already-validated announce into `table` and
 /// emit the matching metric. Pulled out of [`subscriber_task`] so the
 /// subscriber loop and the contract test exercise the *same* dispatch
@@ -519,6 +536,7 @@ const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 fn subscriber_task(
     wiring: TopicWiring,
     gossip: Gossip,
+    self_node_id: [u8; 32],
     allowlist: Arc<HashSet<[u8; 32]>>,
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
@@ -574,6 +592,14 @@ fn subscriber_task(
                 // moves between the two reads) and halves the syscall cost.
                 let now = now_us();
                 match validate_envelope(&msg.content, now, allowlist.as_ref()) {
+                    Ok(announce) if is_self_announce(&announce, &self_node_id) => {
+                        // Echo of our own announce (#845): drop it before it
+                        // reaches `dispatch_insert` — inserting ourselves into
+                        // our own peer table is never correct. Plumtree doesn't
+                        // route a message back to its origin today, so this is
+                        // latent defense-in-depth; the empty arm falls through
+                        // to the next loop iteration.
+                    }
                     Ok(announce) => {
                         let mut table = peer_table.write().await;
                         dispatch_insert(&mut table, announce, now, metrics.as_ref());
@@ -1175,6 +1201,35 @@ mod tests {
         assert!(table.get(&[1u8; 32]).is_some());
         assert!(table.get(&[2u8; 32]).is_some());
         assert!(table.get(&[3u8; 32]).is_none());
+    }
+
+    /// #845: the subscriber's self-announce guard drops an echo of this node's
+    /// own announce (so it never inserts itself into its peer table) while
+    /// admitting a peer's announce.
+    #[test]
+    fn is_self_announce_matches_only_own_node_id() {
+        let self_id = [7u8; 32];
+        let own = NodeAnnounce {
+            body: NodeAnnounceBody {
+                node_id: self_id,
+                region: "US".to_string(),
+                timestamp_us: 1,
+            },
+            signature: vec![0u8; 64],
+        };
+        let peer = NodeAnnounce {
+            body: NodeAnnounceBody {
+                node_id: [8u8; 32],
+                region: "US".to_string(),
+                timestamp_us: 1,
+            },
+            signature: vec![0u8; 64],
+        };
+        assert!(is_self_announce(&own, &self_id), "own announce is filtered");
+        assert!(
+            !is_self_announce(&peer, &self_id),
+            "a peer's announce is admitted"
+        );
     }
 
     /// Back-to-back `announce_now()` calls before the publisher consumes

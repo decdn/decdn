@@ -901,15 +901,23 @@ fn io_error_kind_in_source_chain(
 ///
 /// 1. `--admin-url` flag or the `DECDN_ADMIN_URL` env var (clap folds the
 ///    env into `args.admin_url`).
-/// 2. `observability.admin_port` from the TOML config file — either the
+/// 2. `DECDN_ADMIN_PORT` — the same env var the daemon reads for its admin
+///    bind (`common/src/cli/run.rs`). An env-only deployment (port set via
+///    env, no config file) would otherwise be unreachable: the CLI would
+///    dial the default 9191 and report "is the node running?" (#864). A
+///    malformed or `0` value errors rather than silently falling through.
+/// 3. `observability.admin_port` from the TOML config file — either the
 ///    caller's explicit path or the default `~/.decdn/node.toml`. An
 ///    explicit path that doesn't exist is an error; a missing default
 ///    path falls through. `admin_port = 0` in the file is an operator
 ///    opt-out and errors here rather than silently probing the default.
-/// 3. Default `http://127.0.0.1:9191`.
+/// 4. Default `http://127.0.0.1:9191`.
 fn resolve_admin_url(flag: Option<&str>, config_path: Option<&Path>) -> anyhow::Result<String> {
     if let Some(url) = flag {
         return Ok(url.to_string());
+    }
+    if let Some(url) = admin_url_from_env(std::env::var("DECDN_ADMIN_PORT").ok())? {
+        return Ok(url);
     }
     let (resolved_path, source) = match config_path {
         Some(p) => (Some(expand_tilde(p)), ConfigPathSource::Explicit),
@@ -921,6 +929,27 @@ fn resolve_admin_url(flag: Option<&str>, config_path: Option<&Path>) -> anyhow::
     let port =
         port_from_config_file(resolved_path.as_deref(), source)?.unwrap_or(DEFAULT_ADMIN_PORT);
     Ok(format!("http://127.0.0.1:{port}"))
+}
+
+/// Build the loopback admin URL from the raw `DECDN_ADMIN_PORT` env value, or
+/// `None` when the var is unset. Pure (takes the value rather than reading the
+/// environment) so the parse/validation logic is testable without mutating
+/// process-global state. A non-numeric value or `0` (the daemon's "admin
+/// disabled" sentinel) is an error — both indicate misconfiguration the
+/// operator should see rather than have masked by a fall-through to the
+/// config file or the built-in default.
+fn admin_url_from_env(raw: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let port: u16 = raw
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("DECDN_ADMIN_PORT is not a valid port number: {raw:?}"))?;
+    if port == 0 {
+        anyhow::bail!(
+            "DECDN_ADMIN_PORT=0 disables the admin server; pass --admin-url or set a non-zero port"
+        );
+    }
+    Ok(Some(format!("http://127.0.0.1:{port}")))
 }
 
 /// Read `observability.admin_port` from a TOML config file. Returns:
@@ -1484,6 +1513,32 @@ mod tests {
     fn resolve_admin_url_prefers_flag() {
         let got = resolve_admin_url(Some("http://custom:1234"), None).expect("flag path ok");
         assert_eq!(got, "http://custom:1234");
+    }
+
+    #[test]
+    fn admin_url_from_env_unset_is_none() {
+        assert_eq!(admin_url_from_env(None).expect("unset ok"), None);
+    }
+
+    #[test]
+    fn admin_url_from_env_valid_port_builds_loopback_url() {
+        assert_eq!(
+            admin_url_from_env(Some("9999".to_string())).expect("valid ok"),
+            Some("http://127.0.0.1:9999".to_string())
+        );
+        // Surrounding whitespace is tolerated (env values can carry it).
+        assert_eq!(
+            admin_url_from_env(Some(" 9999 ".to_string())).expect("trimmed ok"),
+            Some("http://127.0.0.1:9999".to_string())
+        );
+    }
+
+    #[test]
+    fn admin_url_from_env_zero_and_malformed_error() {
+        assert!(admin_url_from_env(Some("0".to_string())).is_err());
+        assert!(admin_url_from_env(Some("notaport".to_string())).is_err());
+        // Out of u16 range.
+        assert!(admin_url_from_env(Some("70000".to_string())).is_err());
     }
 
     #[test]
