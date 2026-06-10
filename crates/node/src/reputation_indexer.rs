@@ -29,7 +29,7 @@
 //!   counterparty's *current* `nodeIdOf(...).active`, not its status at
 //!   settlement time (carried over from #326).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -115,14 +115,39 @@ impl SettlementIndexer {
     }
 }
 
+/// Upper bound on parked `ChannelSettled`-before-`ChannelOpened` events (#864).
+/// Bounds the out-of-order buffer's memory; on overflow the oldest parked event
+/// is dropped and the backfill is re-armed from its block so the next cycle
+/// re-credits it (provider-only if its open still hasn't arrived). 4096 covers a
+/// generous burst of opens/settles racing in the same poll window.
+const MAX_PENDING_SETTLED: usize = 4096;
+
+/// A live `ChannelSettled` observed before its `ChannelOpened`, parked until the
+/// open arrives so the client party's reporter credit isn't dropped (#864).
+struct PendingSettled {
+    provider_addr: Address,
+    routed_amount: alloy::primitives::U256,
+    /// Settled-event block, used to re-arm backfill if the parked event is
+    /// evicted or its re-credit fails transiently.
+    block: Option<u64>,
+}
+
 /// Persistent across resubscribe cycles: channel→parties map, the settled-once
-/// dedup set, and whether the bring-up backfill still needs to run.
+/// dedup set, the out-of-order settled buffer, and whether the bring-up backfill
+/// still needs to run.
 struct IndexerState {
     /// `channelId → (client, provider)` learned from `ChannelOpened`.
     channels: HashMap<[u8; 32], (Address, Address)>,
     /// `channelId`s already credited, so a backfill/live overlap or a
     /// resubscribe never double-counts (a channel settles exactly once).
     settled_seen: HashSet<[u8; 32]>,
+    /// Live `ChannelSettled` events seen before their `ChannelOpened` (#864),
+    /// keyed by `channelId`; re-credited when the matching open arrives so the
+    /// client party isn't lost. Bounded by `MAX_PENDING_SETTLED`; kept in sync
+    /// with `pending_order` (the FIFO eviction order) by `take_pending` /
+    /// `park_settled`.
+    pending_settled: HashMap<[u8; 32], PendingSettled>,
+    pending_order: VecDeque<[u8; 32]>,
     /// `Some(start)` until the one-shot bring-up backfill has run.
     backfill_from: Option<u64>,
 }
@@ -139,6 +164,8 @@ async fn watcher_loop<P>(
     let mut state = IndexerState {
         channels: HashMap::new(),
         settled_seen: HashSet::new(),
+        pending_settled: HashMap::new(),
+        pending_order: VecDeque::new(),
         backfill_from: Some(backfill_from),
     };
     let mut backoff = WATCHER_INITIAL_BACKOFF;
@@ -164,7 +191,10 @@ async fn watcher_loop<P>(
 
 // Backfill + two-arm event loop; the dispatch is fundamentally a few branches
 // over two streams (same posture as `chain_staker_set::run_watcher_once`).
+// One-shot backfill followed by the live select reads as a single sequence;
+// splitting the backfill into its own function would obscure the bring-up flow.
 #[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines)]
 async fn run_watcher_once<P>(
     payment: &PaymentChannel::PaymentChannelInstance<P>,
     capacity_bond: &CapacityBond::CapacityBondInstance<P>,
@@ -251,16 +281,23 @@ where
         tokio::select! {
             ev = opened.next() => match ev {
                 Some(Ok((event, _log))) => {
-                    state
-                        .channels
-                        .insert(event.channelId.0, (event.client, event.provider));
+                    handle_opened(
+                        capacity_bond,
+                        settlement,
+                        state,
+                        metrics,
+                        event.channelId.0,
+                        event.client,
+                        event.provider,
+                    )
+                    .await?;
                 }
                 Some(Err(e)) => return Err(e).context("ChannelOpened stream"),
                 None => return Ok(()),
             },
             ev = settled.next() => match ev {
                 Some(Ok((event, log))) => {
-                    if let Err(err) = process_settled(
+                    handle_settled(
                         capacity_bond,
                         settlement,
                         state,
@@ -268,25 +305,95 @@ where
                         event.channelId.0,
                         event.provider,
                         event.routedAmount,
+                        log.block_number,
                     )
-                    .await
-                    {
-                        // A transient resolution error must not lose this live
-                        // event: `.watch()` resubscribes at head and never
-                        // replays it. Arm the backfill from this event's block
-                        // (the earliest pending one) so the next cycle
-                        // re-queries the window; `settled_seen` dedups anything
-                        // already credited. The channel was *not* marked seen
-                        // (process_settled returned before that), so it credits.
-                        arm_backfill_from_log(state, &log);
-                        return Err(err).context("ChannelSettled live event");
-                    }
+                    .await?;
                 }
                 Some(Err(e)) => return Err(e).context("ChannelSettled stream"),
                 None => return Ok(()),
             },
         }
     }
+}
+
+/// Live `ChannelOpened` handler: record the channel's parties, then credit any
+/// `ChannelSettled` that was parked before this open arrived (#864). A transient
+/// re-credit failure re-arms the backfill from the parked event's block so it is
+/// retried next cycle rather than lost.
+async fn handle_opened<P>(
+    capacity_bond: &CapacityBond::CapacityBondInstance<P>,
+    settlement: &Arc<NodeSettlementSource>,
+    state: &mut IndexerState,
+    metrics: &Arc<Metrics>,
+    channel_id: [u8; 32],
+    client: Address,
+    provider: Address,
+) -> Result<()>
+where
+    P: Provider + Clone,
+{
+    state.channels.insert(channel_id, (client, provider));
+    let Some(parked) = take_pending(state, &channel_id) else {
+        return Ok(());
+    };
+    if let Err(err) = process_settled(
+        capacity_bond,
+        settlement,
+        state,
+        metrics,
+        channel_id,
+        parked.provider_addr,
+        parked.routed_amount,
+    )
+    .await
+    {
+        if let Some(block) = parked.block {
+            arm_backfill_from_block(state, block);
+        }
+        return Err(err).context("parked ChannelSettled re-credit");
+    }
+    Ok(())
+}
+
+/// Live `ChannelSettled` handler. Parks the event when its `ChannelOpened`
+/// hasn't been observed (so the client party isn't dropped, #864); otherwise
+/// credits it. A transient resolution error re-arms the backfill from `block`,
+/// since `.watch()` resubscribes at head and never replays the event.
+#[allow(clippy::too_many_arguments)]
+async fn handle_settled<P>(
+    capacity_bond: &CapacityBond::CapacityBondInstance<P>,
+    settlement: &Arc<NodeSettlementSource>,
+    state: &mut IndexerState,
+    metrics: &Arc<Metrics>,
+    channel_id: [u8; 32],
+    provider: Address,
+    routed_amount: alloy::primitives::U256,
+    block: Option<u64>,
+) -> Result<()>
+where
+    P: Provider + Clone,
+{
+    if !state.settled_seen.contains(&channel_id) && !state.channels.contains_key(&channel_id) {
+        park_settled(state, channel_id, provider, routed_amount, block);
+        return Ok(());
+    }
+    if let Err(err) = process_settled(
+        capacity_bond,
+        settlement,
+        state,
+        metrics,
+        channel_id,
+        provider,
+        routed_amount,
+    )
+    .await
+    {
+        if let Some(block) = block {
+            arm_backfill_from_block(state, block);
+        }
+        return Err(err).context("ChannelSettled live event");
+    }
+    Ok(())
 }
 
 /// Resolve both parties (via chain RPC) then credit the settlement. Idempotent
@@ -436,18 +543,65 @@ where
     }
 }
 
-/// Lower `state.backfill_from` to `log`'s block so the next watcher cycle
-/// re-queries from there. Keeps the earliest pending block if one is already
-/// armed. A log with no block number (should not happen for a confirmed event)
-/// leaves the backfill window unchanged — the worst case is the pre-existing,
-/// documented resubscribe-gap loss for that one event.
-fn arm_backfill_from_log(state: &mut IndexerState, log: &alloy::rpc::types::Log) {
-    if let Some(block) = log.block_number {
-        state.backfill_from = Some(match state.backfill_from {
-            Some(existing) => existing.min(block),
-            None => block,
-        });
+/// Re-arm the one-shot backfill to re-query from `block` (taking the earliest of
+/// any already-armed start), so a settlement that couldn't be credited now is
+/// re-attempted next cycle. `settled_seen` dedups anything already credited.
+fn arm_backfill_from_block(state: &mut IndexerState, block: u64) {
+    state.backfill_from = Some(match state.backfill_from {
+        Some(existing) => existing.min(block),
+        None => block,
+    });
+}
+
+/// Park a live `ChannelSettled` whose `ChannelOpened` hasn't been observed yet
+/// (#864), keeping `pending_settled` and `pending_order` in sync and bounding
+/// the buffer at `MAX_PENDING_SETTLED`. On overflow the oldest parked event is
+/// dropped and the backfill re-armed from its block so it isn't lost — the next
+/// cycle re-credits it (provider-only if its open still hasn't arrived).
+fn park_settled(
+    state: &mut IndexerState,
+    channel_id: [u8; 32],
+    provider_addr: Address,
+    routed_amount: alloy::primitives::U256,
+    block: Option<u64>,
+) {
+    let entry = PendingSettled {
+        provider_addr,
+        routed_amount,
+        block,
+    };
+    if state.pending_settled.insert(channel_id, entry).is_none() {
+        // New key — append to the FIFO order. A duplicate (re-delivered settled
+        // before its open) just refreshes the payload in place.
+        state.pending_order.push_back(channel_id);
     }
+    while state.pending_settled.len() > MAX_PENDING_SETTLED {
+        let Some(evicted) = state.pending_order.pop_front() else {
+            break;
+        };
+        if let Some(dropped) = state.pending_settled.remove(&evicted) {
+            warn!(
+                channel_id = %alloy::hex::encode(evicted),
+                "pending-settled buffer full; evicting oldest and re-arming backfill (#864)"
+            );
+            if let Some(block) = dropped.block {
+                arm_backfill_from_block(state, block);
+            }
+        }
+    }
+}
+
+/// Remove a parked settled event from both `pending_settled` and the FIFO order,
+/// returning it if present. Keeps the two structures in sync so `pending_order`
+/// never accumulates stale ids.
+fn take_pending(state: &mut IndexerState, channel_id: &[u8; 32]) -> Option<PendingSettled> {
+    let removed = state.pending_settled.remove(channel_id);
+    if removed.is_some()
+        && let Some(pos) = state.pending_order.iter().position(|c| c == channel_id)
+    {
+        state.pending_order.remove(pos);
+    }
+    removed
 }
 
 /// Wall-clock seconds since the Unix epoch (settlement age reference).
@@ -461,6 +615,7 @@ fn now_secs() -> u64 {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use alloy::primitives::U256;
     use decdn_reputation::{SettlementSource, compute_reporter_weight};
     use iroh::SecretKey;
 
@@ -476,8 +631,65 @@ mod tests {
         IndexerState {
             channels: HashMap::new(),
             settled_seen: HashSet::new(),
+            pending_settled: HashMap::new(),
+            pending_order: VecDeque::new(),
             backfill_from: None,
         }
+    }
+
+    fn cid(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    #[test]
+    fn park_then_take_round_trips_and_keeps_order_in_sync() {
+        let mut state = empty_state();
+        park_settled(&mut state, cid(1), addr(1), U256::from(10), Some(100));
+        park_settled(&mut state, cid(2), addr(2), U256::from(20), Some(101));
+        assert_eq!(state.pending_settled.len(), 2);
+        assert_eq!(state.pending_order.len(), 2);
+
+        // A re-delivered settled for an already-parked channel refreshes in
+        // place — it must not double-count in the FIFO order.
+        park_settled(&mut state, cid(1), addr(1), U256::from(11), Some(100));
+        assert_eq!(state.pending_settled.len(), 2);
+        assert_eq!(state.pending_order.len(), 2);
+
+        let taken = take_pending(&mut state, &cid(1)).expect("cid(1) was parked");
+        assert_eq!(taken.provider_addr, addr(1));
+        assert_eq!(taken.routed_amount, U256::from(11));
+        // Both structures stay in sync — no stale id left behind in the order.
+        assert_eq!(state.pending_settled.len(), 1);
+        assert_eq!(state.pending_order.len(), 1);
+        assert_eq!(state.pending_order.front(), Some(&cid(2)));
+        assert!(take_pending(&mut state, &cid(1)).is_none());
+    }
+
+    #[test]
+    fn pending_buffer_is_bounded_and_evicts_oldest_arming_backfill() {
+        let mut state = empty_state();
+        // Fill exactly to capacity; oldest is block 1_000.
+        for i in 0..MAX_PENDING_SETTLED {
+            let id = u32::try_from(i).expect("fits u32");
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&id.to_be_bytes());
+            let block = 1_000 + u64::try_from(i).expect("fits u64");
+            park_settled(&mut state, key, addr(1), U256::from(1), Some(block));
+        }
+        assert_eq!(state.pending_settled.len(), MAX_PENDING_SETTLED);
+        assert!(state.backfill_from.is_none(), "no eviction yet");
+
+        // One more overflows: the oldest (block 1_000) is evicted and the
+        // backfill is re-armed from its block so its credit isn't lost.
+        park_settled(&mut state, cid(255), addr(2), U256::from(2), Some(9_999));
+        assert_eq!(state.pending_settled.len(), MAX_PENDING_SETTLED);
+        assert_eq!(state.pending_order.len(), MAX_PENDING_SETTLED);
+        assert_eq!(state.backfill_from, Some(1_000));
+        // The newest entry survived; the evicted oldest is gone.
+        assert!(state.pending_settled.contains_key(&cid(255)));
+        let mut oldest = [0u8; 32];
+        oldest[..4].copy_from_slice(&0u32.to_be_bytes());
+        assert!(!state.pending_settled.contains_key(&oldest));
     }
 
     #[test]
