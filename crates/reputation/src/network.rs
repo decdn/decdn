@@ -272,14 +272,17 @@ impl NetworkReputation {
             >= self.config.min_distinct_reporters;
         // Pre-threshold magnitude guard (#864): fold a report's sample into the
         // score only once at least `min_distinct_reporters` *distinct* weighted
-        // reporters have contributed. Otherwise a single staked reporter — rate-
-        // limited to 1/(pair·hour) but free to report repeatedly — could
-        // EWMA-drive the still-hidden score to an extreme value that two
-        // one-shot reporters then instantly reveal by crossing the visibility
-        // threshold. Below the threshold the score stays at neutral
-        // `initial_score` (decaying neutral is a no-op); only the monotonic
-        // timestamp advances. When the threshold-crossing report arrives the
-        // fold below begins from neutral, so no single reporter can dominate.
+        // reporters have contributed. Otherwise a single staked reporter — even
+        // bounded to one report per (pair·hour) by the gossip rate limiter —
+        // could, fold by fold over many hours, EWMA-drive the still-hidden score
+        // to an extreme value that two one-shot reporters then instantly reveal
+        // by crossing the visibility threshold. Below the threshold the score
+        // stays at neutral `initial_score` (decaying neutral is a no-op); only
+        // the monotonic timestamp advances. When the threshold-crossing report
+        // arrives the fold below begins from neutral, so no single reporter can
+        // pre-load the score that the third reporter reveals. (Post-threshold,
+        // each reporter's ongoing influence is bounded by the per-report ±delta
+        // clamp and decay, not by this guard.)
         if !reached_threshold {
             entry.last_update_secs = effective_now;
             return entry.score;
@@ -577,6 +580,31 @@ mod tests {
         ensure!(
             approx(revealed, 0.55),
             "first fold is a single clamped step from neutral, got {revealed}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threshold_of_one_folds_the_first_report() -> anyhow::Result<()> {
+        // Boundary for the #864 fold-ordering: with `min_distinct_reporters == 1`
+        // (the validated minimum) the pre-threshold guard must be a complete
+        // no-op — the very first report inserts the sole reporter and folds
+        // immediately. Guards against an off-by-one (`>` vs `>=`, or inserting
+        // after the threshold check) that would make folding never start.
+        let cfg = NetworkReputationConfig {
+            min_distinct_reporters: 1,
+            ..NetworkReputationConfig::default()
+        };
+        let nr = NetworkReputation::new(cfg)?;
+        let prov = peer();
+        let s = nr.record(&full_report(prov, peer(), 0), 3.0);
+        ensure!(
+            nr.is_scored(prov),
+            "scored after the first report at threshold 1"
+        );
+        ensure!(
+            approx(s, 0.55),
+            "first report folds a clamped +0.05 step from neutral, got {s}"
         );
         Ok(())
     }

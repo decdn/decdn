@@ -580,12 +580,22 @@ fn park_settled(
             break;
         };
         if let Some(dropped) = state.pending_settled.remove(&evicted) {
-            warn!(
-                channel_id = %alloy::hex::encode(evicted),
-                "pending-settled buffer full; evicting oldest and re-arming backfill (#864)"
-            );
+            // Re-arm the backfill from the evicted event's block so it is
+            // re-credited next cycle. A `None` block (should not occur for a
+            // confirmed `.watch()` event) can't be re-queried, so log that the
+            // credit is dropped unrecoverably rather than implying recovery.
             if let Some(block) = dropped.block {
+                warn!(
+                    channel_id = %alloy::hex::encode(evicted),
+                    block,
+                    "pending-settled buffer full; evicting oldest and re-arming backfill (#864)"
+                );
                 arm_backfill_from_block(state, block);
+            } else {
+                warn!(
+                    channel_id = %alloy::hex::encode(evicted),
+                    "pending-settled buffer full; evicting oldest with no block — credit dropped unrecoverably (#864)"
+                );
             }
         }
     }
