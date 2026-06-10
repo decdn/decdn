@@ -84,6 +84,9 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             gc_interval_sec: 0,
             max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
             stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
+            node_to_node_pull_through_enabled: false,
+            node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
+            node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
         },
         payment: ResolvedPayment {
             rate_per_mb: rate,

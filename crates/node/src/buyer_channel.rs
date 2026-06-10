@@ -525,6 +525,37 @@ impl<P: Provider + Clone + 'static> std::fmt::Debug for BuyerChannelService<P> {
     }
 }
 
+/// Object-safe seam over [`BuyerChannelService::open_or_reuse_channel`] (#831).
+///
+/// `BuyerChannelService` is generic over the alloy [`Provider`], but the
+/// node-to-node pull origin ([`crate::node_origin::NodeOrigin`]) is stored as an
+/// `Arc<dyn Origin>` and so cannot itself be generic. This trait erases the
+/// provider type so the origin can hold the bootstrapped service behind an
+/// `Arc<dyn ChannelOpener>` and open (or reuse) a buyer channel to an upstream
+/// provider on a cache-miss pull.
+#[async_trait::async_trait]
+pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
+    /// Open or reuse a buyer payment channel to `provider_addr`, funding a new
+    /// channel with `deposit_hint` (ignored on reuse). See
+    /// [`BuyerChannelService::open_or_reuse_channel`] for the full contract.
+    async fn open_or_reuse_channel(
+        &self,
+        provider_addr: Address,
+        deposit_hint: U256,
+    ) -> Result<ChannelContext>;
+}
+
+#[async_trait::async_trait]
+impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
+    async fn open_or_reuse_channel(
+        &self,
+        provider_addr: Address,
+        deposit_hint: U256,
+    ) -> Result<ChannelContext> {
+        BuyerChannelService::open_or_reuse_channel(self, provider_addr, deposit_hint).await
+    }
+}
+
 /// Read the current USDC allowance for the `PaymentChannel` spender and, if it
 /// has fallen below [`approval_floor`], issue a one-time max approval.
 async fn ensure_allowance<P: Provider + Clone>(

@@ -503,7 +503,22 @@ pub async fn run(
         receipt_writer_shutdown.clone(),
     );
 
-    let cache = build_cache(&cfg, Arc::clone(&node_metrics)).await?;
+    // Node-to-node pull-through origin (#831, ADR 001/022). Constructed empty up
+    // front so it can be appended to the cache's origin chain here; its
+    // dependencies (DHT, buyer channel, reputation handles) don't exist yet and
+    // are injected via `provision` once bring-up completes (below). When the
+    // feature is off it is never created and never enters the chain. The handle
+    // is retained to provision later.
+    let node_origin = cfg
+        .cache
+        .node_to_node_pull_through_enabled
+        .then(crate::node_origin::NodeOrigin::new);
+    let cache = build_cache(
+        &cfg,
+        Arc::clone(&node_metrics),
+        node_origin.clone().map(|o| Arc::new(o) as Arc<dyn Origin>),
+    )
+    .await?;
     // Attach the cache to the reload state so SIGHUP handlers can swap
     // the pinned-hashes set atomically (#276). Done immediately after
     // `build_cache` succeeds so a SIGHUP delivered during the rest of
@@ -614,6 +629,38 @@ pub async fn run(
             format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
         })?,
     );
+
+    // NodeId → bonded operator address resolver for node-to-node pulls (#831).
+    // Reads the same `CapacityBond` registration data as the staker set
+    // (`getActiveNodes` / `NodeRegistered` carry `ethAddress`). Built only when
+    // the feature is on; a bootstrap failure is NON-fatal — like the buyer
+    // service, node→node buying is opportunistic, so a failed resolver just
+    // leaves pull-through disabled rather than aborting the seller node. Held to
+    // provision the `NodeOrigin` below.
+    let node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>> =
+        if cfg.cache.node_to_node_pull_through_enabled {
+            match crate::dht::node_address::ChainNodeAddressDirectory::bootstrap(
+                ProviderBuilder::new().connect_http(rpc_url.clone()),
+                capacity_bond_addr,
+                Arc::clone(&node_metrics),
+            )
+            .await
+            {
+                Ok(dir) => Some(Arc::new(dir)),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        %capacity_bond_addr,
+                        "ChainNodeAddressDirectory bootstrap failed; node→node pull-through is \
+                         DISABLED for this process (cannot resolve provider payout addresses). \
+                         Restart to retry."
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     // Stake-lane probe-acceptance reservation (#757, ADR 003 §Admission and
     // Priority). Strictly operator opt-in: a policy is built only for a
@@ -869,29 +916,39 @@ pub async fn run(
     let voucher_activity = Arc::new(decdn_incentive::VoucherActivity::new());
     client_handler.attach_voucher_activity(Arc::clone(&voucher_activity));
     client_handler.attach_region_accountant(Arc::clone(&region_accountant));
+    // Arm the cache-miss pull-through hook (#831) when the feature is enabled.
+    // The deadline bounds how long a miss blocks the delivery path on the
+    // upstream pull before falling back to `NotFound`. Whether the pull can
+    // actually succeed additionally depends on the `NodeOrigin` being
+    // provisioned below (buyer service + address resolver bootstrapped); an
+    // unprovisioned origin just makes the `get` a fast miss.
+    if cfg.cache.node_to_node_pull_through_enabled {
+        client_handler.attach_pull_through(Duration::from_secs(cfg.cache.node_pull_timeout_sec));
+    }
 
     // On-chain buyer-side service (#744). When this node pulls content from an
     // upstream provider on a cache miss it pays via the same channel mechanism,
     // acting as the client: a separate wallet-filled provider signs `approve` /
     // `openChannel` / `reclaimExpired`. It shares the persistent store (a
     // distinct `buyer_channel_state_v1` table) and re-derives the voucher domain
-    // the handler consumed above. The cache-engine hook that *calls*
-    // `open_or_reuse_channel` needs provider-discovery (ADR 001/022) and is out
-    // of scope here; the service is held for the process lifetime so its reclaim
-    // sweep keeps running. `_buyer_channel_service` (leading underscore) keeps
-    // the binding — and thus its `AbortOnDrop` reclaim task — alive to shutdown.
+    // the handler consumed above. The cache-miss hook that *calls*
+    // `open_or_reuse_channel` is the `NodeOrigin` provisioned below (#831), gated
+    // on `cache.node_to_node_pull_through_enabled`; the service is also held for
+    // the process lifetime so its reclaim sweep keeps running even when
+    // pull-through is off. `buyer_channel_service` keeps the binding — and thus
+    // its `AbortOnDrop` reclaim task — alive to shutdown.
     //
     // Unlike the seller service, a buyer-bootstrap failure is NON-fatal: buying
-    // is opportunistic cost-recovery (and the cache-engine hook isn't wired yet),
-    // so a failed startup `approve` tx (e.g. insufficient gas) must not block the
-    // node's core seller function. Log and continue with the buyer path disabled.
+    // is opportunistic cost-recovery, so a failed startup `approve` tx (e.g.
+    // insufficient gas) must not block the node's core seller function. Log and
+    // continue with the buyer path disabled (and thus pull-through disabled).
     let buyer_wallet_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from((*eth_signer).clone()))
         .connect_http(rpc_url);
     let buyer_channel_store: Arc<dyn decdn_incentive::BuyerChannelStore> = Arc::new(
         crate::channel_store::BuyerChannelStoreHandle::new(Arc::clone(&concrete_channel_store)),
     );
-    let _buyer_channel_service = match crate::buyer_channel::BuyerChannelService::bootstrap(
+    let buyer_channel_service = match crate::buyer_channel::BuyerChannelService::bootstrap(
         buyer_wallet_provider,
         payment_channel_addr,
         eth_signer.address(),
@@ -903,7 +960,7 @@ pub async fn run(
     )
     .await
     {
-        Ok(service) => Some(service),
+        Ok(service) => Some(Arc::new(service)),
         Err(err) => {
             tracing::warn!(
                 %err,
@@ -1147,9 +1204,8 @@ pub async fn run(
     // (spawned after the gossip service below) feeds `settlement_source` with
     // network-wide `ChannelSettled` value so reporter weights are live; the
     // `network_reputation` / `regional_coverage` handles are retained for the
-    // `admin_v1_reputation` read API. Outbound report capture (feeding the
-    // observation buffer from delivery/probe outcomes) remains gated on the
-    // node-to-node pull-through orchestration — tracked by #831.
+    // `admin_v1_reputation` read API and for the combined selection score used
+    // by the node-to-node pull (#831).
     let reputation_cfg = decdn_reputation::NetworkReputationConfig::default();
     let min_counterparties = reputation_cfg.min_counterparties;
     let network_reputation = Arc::new(
@@ -1157,12 +1213,24 @@ pub async fn run(
             .context("network reputation config invalid")?,
     );
     let regional_coverage = Arc::new(
-        decdn_reputation::RegionalCoverage::new(reputation_cfg)
+        decdn_reputation::RegionalCoverage::new(reputation_cfg.clone())
             .context("regional coverage config invalid")?,
     );
     let settlement_source = Arc::new(crate::reputation_wiring::NodeSettlementSource::new(
         min_counterparties,
     ));
+    // Local per-peer EWMA score store and the outbound observation buffer (ADR
+    // 008 §Local Score / §Gossip Protocol, #831). The buffer is written only by
+    // the `NodeOrigin` pull path (provisioned below); `local_reputation` also
+    // feeds the combined selection score. Both constructed unconditionally (they
+    // are cheap and the admin API may read the local score), but the publisher
+    // that drains the buffer is only spawned when pull-through is enabled — see
+    // `report_drain` below.
+    let local_reputation = Arc::new(
+        decdn_reputation::LocalReputation::new(decdn_reputation::LocalReputationConfig::default())
+            .context("local reputation config invalid")?,
+    );
+    let observation_buffer = Arc::new(decdn_reputation::ObservationBuffer::new());
     let reputation_wiring = decdn_gossip::ReputationWiring {
         sink: Some(Arc::new(crate::reputation_wiring::NodeReputationSink::new(
             Arc::clone(&network_reputation),
@@ -1174,13 +1242,70 @@ pub async fn run(
         staked: Some(Arc::new(
             crate::reputation_wiring::NodeStakedReporterSet::new(Arc::clone(&staker_set)),
         )),
-        // Outbound report capture is not wired yet (#831): the delivery/probe
-        // hot paths don't feed an `ObservationBuffer`. Leaving `report_drain`
-        // `None` keeps the publisher task unspawned (the node aggregates inbound
-        // reports but emits none) instead of running a publisher that drains an
-        // unreachable, always-empty buffer.
-        report_drain: None,
+        // Outbound report capture (#831): the `NodeOrigin` pull path feeds
+        // `observation_buffer` with delivery/probe outcomes, so wire the drain —
+        // which spawns the gossip publisher — whenever pull-through is enabled.
+        // With the feature off nothing writes the buffer, so we leave the drain
+        // `None` and the publisher unspawned (the node still aggregates inbound
+        // reports), exactly as before #831.
+        report_drain: cfg.cache.node_to_node_pull_through_enabled.then(|| {
+            Arc::new(crate::reputation_wiring::NodeReportDrain::new(Arc::clone(
+                &observation_buffer,
+            ))) as Arc<dyn decdn_gossip::ReportDrain>
+        }),
     };
+
+    // Provision the node-to-node pull origin now that every dependency exists
+    // (#831). Only when the feature is on AND both the buyer service and the
+    // address resolver bootstrapped; otherwise the origin (if it was added to
+    // the cache chain) stays a clean miss. The origin shares its `OnceLock` with
+    // the clone already in the cache's origin chain, so this set is what
+    // actually arms pull-through.
+    if let Some(origin) = &node_origin {
+        if let (Some(buyer), Some(resolver)) = (
+            buyer_channel_service.as_ref(),
+            node_address_resolver.as_ref(),
+        ) {
+            origin.provision(crate::node_origin::NodeOriginDeps {
+                endpoint: ep.clone(),
+                routing_table: Arc::clone(&dht_routing),
+                staker_set: Arc::clone(&staker_set),
+                // Origin-directory fallback is empty for the initial network —
+                // DHT discovery is the primary path. Populating it from
+                // `dht.static_origins` is a follow-up.
+                origin_directory: Arc::new(crate::dht::ConfigOriginDirectory::empty())
+                    as Arc<dyn crate::dht::OriginDirectory>,
+                addr_resolver: Arc::clone(resolver),
+                buyer: Arc::clone(buyer) as Arc<dyn crate::buyer_channel::ChannelOpener>,
+                self_id: crate::dht::NodeId::from_bytes(*secret_key.public().as_bytes()),
+                slash_domain: decdn_incentive::slash_judge_domain(
+                    cfg.blockchain.chain_id,
+                    slash_judge_addr,
+                ),
+                local_rep: Arc::clone(&local_reputation),
+                obs_buffer: Arc::clone(&observation_buffer),
+                network_rep: Arc::clone(&network_reputation),
+                rep_cfg: reputation_cfg.clone(),
+                negative_cache: crate::dht::NegativeProbeCache::new(),
+                metrics: Arc::clone(&node_metrics),
+                config: crate::node_origin::NodeOriginConfig {
+                    probe_fanout: cfg.cache.node_pull_probe_fanout,
+                    pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
+                    enable_0rtt: cfg.network.enable_0rtt,
+                    deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
+                    lookup: crate::dht::LookupConfig::default(),
+                },
+            });
+            tracing::info!("node-to-node cache-miss pull-through provisioned and enabled (#831)");
+        } else {
+            tracing::warn!(
+                "cache.node_to_node_pull_through_enabled is set, but the buyer service or the \
+                 node-address resolver failed to bootstrap; pull-through stays DISABLED this \
+                 process (restart to retry)"
+            );
+        }
+    }
+
     // GossipService owns its own shutdown via this token (#805): cancelling
     // it makes the publisher / subscriber / TTL-sweeper loops return at a
     // clean await boundary, so the runtime no longer reaches in with
@@ -2001,6 +2126,7 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
 async fn build_cache(
     cfg: &ResolvedConfig,
     node_metrics: Arc<metrics::Metrics>,
+    node_origin: Option<Arc<dyn Origin>>,
 ) -> anyhow::Result<CacheEngine> {
     let mut origins: Vec<Arc<dyn Origin>> = Vec::with_capacity(cfg.cache.origins.len());
     for (idx, resolved) in cfg.cache.origins.iter().enumerate() {
@@ -2032,6 +2158,11 @@ async fn build_cache(
             ),
         };
         origins.push(backend);
+    }
+    // Append the node-to-node pull origin LAST so configured HTTP/FS/S3 origins
+    // are tried first and the paid network pull is the final fallback (#831).
+    if let Some(node_origin) = node_origin {
+        origins.push(node_origin);
     }
     let engine = CacheEngine::open_full(
         &cfg.cache.cache_dir,
@@ -2542,6 +2673,9 @@ mod tests {
                 gc_interval_sec: 0,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
+                node_to_node_pull_through_enabled: false,
+                node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
+                node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,
@@ -2609,7 +2743,7 @@ mod tests {
         // Construction must succeed end-to-end. A failure here means the
         // resolver-to-runtime conversion regressed or the SDK's lazy-
         // connect contract changed (and we'd be doing I/O at startup).
-        let _engine = build_cache(&cfg, metrics_handle)
+        let _engine = build_cache(&cfg, metrics_handle, None)
             .await
             .expect("S3 origin must construct without I/O");
     }
@@ -2640,7 +2774,7 @@ mod tests {
         let (_tmp, cfg) = cfg_with_origin(Some(ResolvedOrigin::S3(s3)));
         let metrics_handle = Arc::new(metrics::Metrics::new());
 
-        let _engine = build_cache(&cfg, metrics_handle)
+        let _engine = build_cache(&cfg, metrics_handle, None)
             .await
             .expect("S3 origin with static credentials must construct without I/O");
     }

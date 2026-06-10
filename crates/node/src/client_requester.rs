@@ -105,6 +105,23 @@ impl std::fmt::Debug for ChannelContext {
     }
 }
 
+/// The upstream delivered bytes whose whole-blob BLAKE3 hash did not match the
+/// requested content hash — a paid-but-corrupt delivery (the content-addressing
+/// invariant, ADR 014). Returned (via `anyhow`) by [`stream_fetch`] so callers
+/// can `downcast_ref` to classify corruption (e.g. a reputation `Corruption`
+/// outcome) without matching on the error message string. The `Display` text is
+/// kept stable for logs and the existing requester tests.
+#[derive(Debug)]
+pub struct HashMismatch;
+
+impl std::fmt::Display for HashMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("received bytes do not match requested hash")
+    }
+}
+
+impl std::error::Error for HashMismatch {}
+
 /// Fetch `hash` from `target` over `cdn/client/v1`, paying as bytes arrive.
 ///
 /// `expected_signer` is the delivering node's Ethereum address, used to verify
@@ -266,7 +283,9 @@ async fn fetch_inner(
     // resume caveat).
     if byte_offset == 0 && Hash::new(&blob) != Hash::from_bytes(hash) {
         conn.close(0u32.into(), b"hash-mismatch");
-        anyhow::bail!("received bytes do not match requested hash");
+        // Typed sentinel (not a bare string) so callers can `downcast_ref` to
+        // classify a paid-but-corrupt delivery; `Display` keeps the same text.
+        return Err(anyhow::Error::new(HashMismatch));
     }
     conn.close(0u32.into(), b"done");
     Ok(blob)

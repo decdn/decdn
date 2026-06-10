@@ -746,6 +746,11 @@ impl RuntimeReloadState {
     /// reload reads stays in one place — drift between two copies would
     /// give different test surfaces for the same code path.
     #[cfg(test)]
+    // One flat `ResolvedConfig` literal enumerating every reload-relevant field;
+    // it crossed 100 lines once both #651 (`discovery`) and #831 (node-pull cache
+    // knobs) added fields. Splitting the single struct literal across helpers
+    // would obscure which fields the reload path reads, not clarify it.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn for_test_with_setter(
         rate_per_mb: u64,
         level: decdn_common::cli::common::LogLevel,
@@ -798,6 +803,9 @@ impl RuntimeReloadState {
                 gc_interval_sec: 0,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
+                node_to_node_pull_through_enabled: false,
+                node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
+                node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
             },
             payment: ResolvedPayment {
                 rate_per_mb,
@@ -1290,6 +1298,9 @@ mod tests {
                 gc_interval_sec: 0,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
+                node_to_node_pull_through_enabled: false,
+                node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
+                node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
             },
             payment: ResolvedPayment {
                 rate_per_mb: rate,

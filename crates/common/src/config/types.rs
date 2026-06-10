@@ -333,6 +333,30 @@ pub struct CacheConfig {
     /// probe is shed whenever holds are enabled — regardless of current
     /// usage, not only under pressure.
     pub stake_lane_reserved_holds: Option<u64>,
+    /// Enable node-to-node paid cache-miss pull-through (#831, ADR 001/022).
+    /// Absent / `false` (the default) → a cache miss serves `NotFound` as
+    /// before. When `true` *and* the buyer-channel service bootstrapped, a
+    /// miss triggers DHT provider discovery → probe → ranked paid pull from an
+    /// upstream node, which populates the cache and is then served. OFF by
+    /// default for the initial network: enabling it makes the node front USDC
+    /// egress to fill misses (bounded by `blockchain.buyer_deposit_micro_usdc`
+    /// and the upstream's per-MB rate), and the serving path only triggers it
+    /// behind a valid, channel-bound client so an unpaid request cannot drive
+    /// egress.
+    pub node_to_node_pull_through_enabled: Option<bool>,
+    /// Number of discovered providers to probe before ranking on a
+    /// node-to-node pull (#831). Absent =>
+    /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`] (5). Higher widens
+    /// provider choice at the cost of more probe round trips per miss; `0`
+    /// probes none, so no pull can succeed (a way to disable the pull while
+    /// keeping the feature flag on).
+    pub node_pull_probe_fanout: Option<usize>,
+    /// Wall-clock timeout in seconds for a single upstream pull on a
+    /// node-to-node miss (#831). Absent =>
+    /// [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`] (20). Bounds how long a
+    /// miss blocks the serving path on one upstream before falling through to
+    /// the next ranked candidate (or `NotFound`).
+    pub node_pull_timeout_sec: Option<u64>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.

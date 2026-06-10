@@ -203,6 +203,18 @@ pub struct ResolvedCache {
     /// The runtime only builds a `StakeLanePolicy` when this is `> 0`, so the
     /// probe handler's hot path is unchanged for the default.
     pub stake_lane_reserved_holds: usize,
+    /// Enable node-to-node paid cache-miss pull-through (#831). Default
+    /// `false`. When `true` and the buyer-channel service bootstrapped, the
+    /// runtime provisions the `NodeOrigin` and the client handler triggers a
+    /// pull on a miss (behind a valid client channel). `cache.*` is
+    /// restart-required, so this is read once at bring-up.
+    pub node_to_node_pull_through_enabled: bool,
+    /// Providers probed before ranking on a node-to-node pull (#831). Default
+    /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`].
+    pub node_pull_probe_fanout: usize,
+    /// Per-pull wall-clock timeout in seconds for a node-to-node miss fill
+    /// (#831). Default [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`].
+    pub node_pull_timeout_sec: u64,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors

@@ -427,6 +427,63 @@ pub struct DecdnMetrics {
     /// e.g. the count holding flat while down-seconds climbs means the cache
     /// is frozen, not that the network genuinely lost operators.
     pub staker_set_active_count: Gauge,
+    /// `decdn_node_address_directory_size` (#831): current count of cached
+    /// `NodeId → operator address` bindings the node-to-node pull path resolves
+    /// against ([`crate::dht::node_address::ChainNodeAddressDirectory`]).
+    /// Sampled on every `NodeRegistered` / `NodeDeregistered` the watcher
+    /// applies. A binding the watcher misses (drift window) means the
+    /// orchestrator cannot pay that provider and skips it, so a collapsed or
+    /// frozen count here directly caps reachable upstream providers.
+    pub node_address_directory_size: Gauge,
+    /// `decdn_node_pull_attempts_total` (#831): node-to-node cache-miss pull
+    /// orchestrations that found ≥1 candidate provider to try. Denominator for
+    /// the success/corruption/unreachable rates below.
+    pub node_pull_attempts: Counter,
+    /// `decdn_node_pull_success_total` (#831): pulls that delivered verified
+    /// bytes from an upstream node.
+    pub node_pull_success: Counter,
+    /// `decdn_node_pull_no_providers_total` (#831): misses where discovery
+    /// (DHT plus the origin-directory fallback) surfaced no provider — the blob
+    /// is unavailable on the network, not a pull failure.
+    pub node_pull_no_providers: Counter,
+    /// `decdn_node_pull_corruption_total` (#831): an upstream served
+    /// hash-mismatched bytes for a paid pull (Byzantine / buggy provider). A
+    /// sustained nonzero rate means a peer is taking payment for wrong content;
+    /// the cache engine rejects the bytes, but the USDC was still spent.
+    pub node_pull_corruption: Counter,
+    /// `decdn_node_pull_unreachable_total` (#831): a probe or pull to a
+    /// candidate failed at the transport (scored [`Outcome::Unreachable`]).
+    ///
+    /// [`Outcome::Unreachable`]: decdn_reputation::Outcome::Unreachable
+    pub node_pull_unreachable: Counter,
+    /// `decdn_node_pull_channel_open_failures_total` (#831): a buyer
+    /// `open_or_reuse_channel` failed before a pull could start. This is the
+    /// node's own payment-side fault (gas, RPC, expired channel), NOT the
+    /// provider's — a sustained rate means node→node buying is wedged.
+    pub node_pull_channel_open_failures: Counter,
+    /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
+    /// attempts the delivery handler abandoned at its deadline. Distinguishes a
+    /// slow/wedged upstream from a genuine miss (both otherwise return
+    /// `NotFound`).
+    pub node_pull_through_timeouts: Counter,
+    /// `decdn_node_pull_through_errors_total` (#831): cache-engine errors (not
+    /// clean misses) hit while filling a miss on the delivery path — a real
+    /// store/pull fault, surfaced as `NotFound` to the client but logged + bumped
+    /// here so it isn't silent.
+    pub node_pull_through_errors: Counter,
+    /// `decdn_node_address_watcher_restarts_total` (#831): distinct drift windows
+    /// of the `NodeId → address` resolver's event watcher (mirrors the staker-set
+    /// watcher, #788). Edge-triggered once per outage, not per backoff iteration.
+    /// While down, fresh `NodeRegistered` bindings are missed → those providers
+    /// become unpayable and are silently skipped, so this is the signal that the
+    /// pull path's reachable-provider set may be capped by stale bindings.
+    pub node_address_watcher_restarts: Counter,
+    /// `decdn_node_address_watcher_down_seconds` (#831): seconds the
+    /// `NodeId → address` resolver watcher has been in its current error/backoff
+    /// window, recomputed at scrape from `node_address_watcher_down_since`. Reads
+    /// `0` across any established cycle; a poisoned lock reports `i64::MAX` (the
+    /// conservative alerting direction).
+    pub node_address_watcher_down_seconds: Gauge,
     /// `decdn_reputation_indexer_rpc_failures_total` (#326): watcher-cycle
     /// terminations — the settlement indexer's event-stream subscription errored
     /// or a `nodeIdOf` party-resolution RPC failed. Both now propagate to the
@@ -549,6 +606,11 @@ pub struct Metrics {
     /// `i64::MAX` down-seconds (the conservative, alerting direction for a
     /// downtime gauge — reporting `0` would mask an in-progress outage).
     staker_set_watcher_down_since: Mutex<Option<Instant>>,
+    /// Monotonic instant at which the `NodeId → address` resolver watcher
+    /// entered its current error/backoff window (#831). Same semantics as
+    /// `staker_set_watcher_down_since`: `None` while a cycle is healthy, `Some`
+    /// only during an outage; backs `node_address_watcher_down_seconds`.
+    node_address_watcher_down_since: Mutex<Option<Instant>>,
     /// Monotonic instant at which the origin-directory watcher entered its
     /// current error/backoff window (#651). `None` whenever a cycle is
     /// established. Backs the `origin_directory_watcher_down_seconds` gauge,
@@ -584,6 +646,7 @@ impl Metrics {
             started_at: Instant::now(),
             session_ticket_peers: Mutex::new(HashSet::new()),
             staker_set_watcher_down_since: Mutex::new(None),
+            node_address_watcher_down_since: Mutex::new(None),
             origin_directory_watcher_down_since: Mutex::new(None),
         }
     }
@@ -883,6 +946,80 @@ impl Metrics {
         self.decdn
             .staker_set_active_count
             .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    /// Publish the current cached `NodeId → operator address` binding count
+    /// (#831). Sampled on every binding change the node-address watcher applies,
+    /// so it tracks the cached view the pull path resolves against.
+    pub fn node_address_directory_size(&self, count: usize) {
+        self.decdn
+            .node_address_directory_size
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    /// A node-to-node pull orchestration found ≥1 candidate and is attempting a
+    /// fill (#831).
+    pub fn node_pull_attempt(&self) {
+        self.decdn.node_pull_attempts.inc();
+    }
+
+    /// A node-to-node pull delivered verified bytes (#831).
+    pub fn node_pull_success(&self) {
+        self.decdn.node_pull_success.inc();
+    }
+
+    /// A cache miss surfaced no provider from discovery (#831).
+    pub fn node_pull_no_providers(&self) {
+        self.decdn.node_pull_no_providers.inc();
+    }
+
+    /// An upstream served hash-mismatched bytes for a paid pull (#831).
+    pub fn node_pull_corruption(&self) {
+        self.decdn.node_pull_corruption.inc();
+    }
+
+    /// A probe or pull to a candidate failed at the transport (#831).
+    pub fn node_pull_unreachable(&self) {
+        self.decdn.node_pull_unreachable.inc();
+    }
+
+    /// A buyer channel open/reuse failed before a pull could start (#831).
+    pub fn node_pull_channel_open_failure(&self) {
+        self.decdn.node_pull_channel_open_failures.inc();
+    }
+
+    /// The delivery handler abandoned a pull-through at its deadline (#831).
+    pub fn node_pull_through_timeout(&self) {
+        self.decdn.node_pull_through_timeouts.inc();
+    }
+
+    /// A cache-engine error (not a clean miss) was hit filling a miss (#831).
+    pub fn node_pull_through_error(&self) {
+        self.decdn.node_pull_through_errors.inc();
+    }
+
+    /// Open a drift window for the `NodeId → address` resolver watcher (#831):
+    /// stamp `node_address_watcher_down_since` and, on the edge into the error
+    /// state, bump `node_address_watcher_restarts_total` exactly once. Mirrors
+    /// [`Self::staker_set_watcher_backoff_started`]; a poisoned lock skips the
+    /// update (the gauge then keeps climbing — the safe alerting direction).
+    pub fn node_address_watcher_backoff_started(&self) {
+        if let Ok(mut down_since) = self.node_address_watcher_down_since.lock()
+            && down_since.is_none()
+        {
+            *down_since = Some(Instant::now());
+            self.decdn.node_address_watcher_restarts.inc();
+        }
+    }
+
+    /// Mark the `NodeId → address` resolver watcher cycle established (#831):
+    /// clear `node_address_watcher_down_since` so `..._down_seconds` reads `0`
+    /// for the life of the cycle. Mirrors
+    /// [`Self::staker_set_watcher_cycle_established`].
+    pub fn node_address_watcher_cycle_established(&self) {
+        if let Ok(mut down_since) = self.node_address_watcher_down_since.lock() {
+            *down_since = None;
+        }
     }
 
     /// Bump `reputation_indexer_rpc_failures_total` (#326): an indexer event
@@ -1220,6 +1357,17 @@ impl Metrics {
             Err(_) => i64::MAX,
         };
         self.decdn.staker_set_watcher_down_seconds.set(down_seconds);
+
+        // Same recompute for the node-address resolver watcher (#831).
+        let node_addr_down_seconds = match self.node_address_watcher_down_since.lock() {
+            Ok(down_since) => down_since
+                .map(|t| t.elapsed().as_secs())
+                .map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)),
+            Err(_) => i64::MAX,
+        };
+        self.decdn
+            .node_address_watcher_down_seconds
+            .set(node_addr_down_seconds);
 
         // Same recompute for the origin-directory watcher (#651).
         let origin_dir_down_seconds = match self.origin_directory_watcher_down_since.lock() {

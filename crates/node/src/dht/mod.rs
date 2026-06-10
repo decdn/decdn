@@ -14,6 +14,7 @@ pub mod chain_staker_set;
 pub mod client;
 pub mod lookup;
 pub mod negative_cache;
+pub mod node_address;
 pub mod origin;
 pub mod publish;
 pub mod rate_limit;
@@ -28,6 +29,9 @@ pub use chain_origin_directory::ChainOriginDirectory;
 pub use chain_staker_set::ChainStakerSet;
 pub use lookup::{LookupConfig, find_providers};
 pub use negative_cache::NegativeProbeCache;
+pub use node_address::{
+    ChainNodeAddressDirectory, NodeAddressResolver, StaticNodeAddressDirectory,
+};
 pub use origin::{ConfigOriginDirectory, OriginDirectory};
 pub use publish::RepublishScheduler;
 pub use rate_limit::{DhtRateLimiter, DhtRejectLayer};
