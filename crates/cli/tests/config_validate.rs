@@ -559,6 +559,27 @@ fn summary_prints_one_line_per_relay() -> anyhow::Result<()> {
 }
 
 #[test]
+fn summary_redacts_relay_url_credentials() -> anyhow::Result<()> {
+    // #862: a relay entry carrying `user:pass@` userinfo must be redacted in
+    // the summary (host kept for diagnostics), the same treatment pkarr_url
+    // gets — the summary is the share-into-an-issue surface that's why rpc_url
+    // is hidden in the first place.
+    let cfg = sample_resolved(|c| {
+        c.network.relay_urls = vec!["https://user:RELAY_SECRET_xyz@relay.example:7842".into()];
+    });
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        !out.contains("RELAY_SECRET_xyz"),
+        "relay credentials must never appear in summary: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("***@relay.example:7842"),
+        "relay userinfo should be redacted with the host preserved: {out}"
+    );
+    Ok(())
+}
+
+#[test]
 fn summary_reports_explicit_source_path() -> anyhow::Result<()> {
     let cfg = sample_resolved(|_| {});
     let src = PathBuf::from("/etc/decdn/node.toml");
