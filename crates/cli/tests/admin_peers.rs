@@ -605,6 +605,82 @@ async fn cli_announce_surfaces_connection_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #845: a server that reports `triggered=false` (the announce was accepted
+/// but not queued) must surface as a non-zero exit, not a silent `Ok(())` with
+/// `announce_queued=false` on stdout. Well-formed nodes never return this shape
+/// (publisher-disabled is a distinct error code), so it is treated as failure.
+#[tokio::test]
+async fn cli_announce_reports_untriggered_as_error() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    let std_listener = listener.into_std()?;
+    let config = ServerConfig::builder().http_only().build();
+    let server = Server::builder()
+        .set_config(config)
+        .build_from_tcp(std_listener)
+        .map_err(|e| anyhow::anyhow!("build fake admin: {e}"))?;
+    let mut module = RpcModule::new(());
+    module.register_async_method("admin_v1_announce", |_p, _c, _e| async move {
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+            "triggered": false,
+        }))
+    })?;
+    let handle = server.start(module);
+
+    let args = AnnounceArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 5_000,
+    };
+    let err = commands::announce(&args, None)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected untriggered-announce error"))?
+        .to_string();
+    assert!(
+        err.contains("not queued") && err.contains("triggered=false"),
+        "error should explain the announce was not queued, got: {err}"
+    );
+
+    handle.stop().ok();
+    handle.stopped().await;
+    Ok(())
+}
+
+/// Counterpart to the above: `triggered=true` is the normal acceptance and
+/// must return `Ok(())` (exit 0).
+#[tokio::test]
+async fn cli_announce_triggered_is_ok() -> anyhow::Result<()> {
+    let (listener, addr) = bind_loopback().await?;
+    let std_listener = listener.into_std()?;
+    let config = ServerConfig::builder().http_only().build();
+    let server = Server::builder()
+        .set_config(config)
+        .build_from_tcp(std_listener)
+        .map_err(|e| anyhow::anyhow!("build fake admin: {e}"))?;
+    let mut module = RpcModule::new(());
+    module.register_async_method("admin_v1_announce", |_p, _c, _e| async move {
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+            "triggered": true,
+        }))
+    })?;
+    let handle = server.start(module);
+
+    let args = AnnounceArgs {
+        admin_url: Some(format!("http://{addr}")),
+        config: None,
+        json: false,
+        timeout_ms: 5_000,
+    };
+    commands::announce(&args, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("triggered=true should succeed, got: {e}"))?;
+
+    handle.stop().ok();
+    handle.stopped().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn cli_announce_rejects_zero_timeout() -> anyhow::Result<()> {
     let args = AnnounceArgs {

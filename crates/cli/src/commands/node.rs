@@ -242,6 +242,17 @@ pub async fn announce(
         println!("announce_queued={}", resp.triggered);
     }
 
+    // `triggered` is `true` on every well-formed non-error response — the
+    // publisher-disabled case returns a distinct error code, not `false`. A
+    // `false` therefore means the node accepted the RPC but reported the
+    // announce was *not* queued; treat that as a failure (stderr + non-zero
+    // exit) instead of silently exiting 0 with `announce_queued=false` (#845).
+    anyhow::ensure!(
+        resp.triggered,
+        "node accepted the request but reported the announce was not queued \
+         (triggered=false)"
+    );
+
     Ok(())
 }
 
