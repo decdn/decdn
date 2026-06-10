@@ -327,6 +327,8 @@ where
             "settlement amount exceeds u128; skipping"
         );
         state.settled_seen.insert(channel_id);
+        // The open→parties mapping is dead once a channel is marked seen (#864).
+        state.channels.remove(&channel_id);
         return Ok(());
     };
     let client_addr = state.channels.get(&channel_id).map(|(client, _)| *client);
@@ -372,6 +374,12 @@ fn apply_settlement(
     if !state.settled_seen.insert(channel_id) {
         return 0;
     }
+    // A channel settles exactly once, so its `ChannelOpened` parties mapping is
+    // consumed here and never read again. Drop it so `channels` doesn't grow for
+    // the whole process lifetime (#864); `settled_seen` continues to dedup. (A
+    // `ChannelSettled` seen before its `ChannelOpened` finds no entry to remove;
+    // re-crediting that late open is the separately-tracked #864 follow-up.)
+    state.channels.remove(&channel_id);
     let mut credited = 0u8;
     if let Some((provider_pk, _)) = provider_node {
         let counterparty = client_addr.and_then(|addr| {
@@ -508,6 +516,35 @@ mod tests {
                 .staked_counterparty,
             Some([1u8; 20])
         );
+    }
+
+    #[test]
+    fn settlement_drops_channels_entry_to_bound_growth() {
+        // #864: the open→parties mapping must not outlive the settlement that
+        // consumes it, or `channels` grows for the whole process lifetime.
+        let src = Arc::new(NodeSettlementSource::new(5));
+        let mut state = empty_state();
+        let channel_id = [3u8; 32];
+        state.channels.insert(channel_id, (addr(2), addr(1)));
+
+        apply_settlement(
+            &src,
+            &mut state,
+            channel_id,
+            10_000_000,
+            now_secs(),
+            addr(1),
+            Some((pk(), true)),
+            Some(addr(2)),
+            Some((pk(), true)),
+        );
+
+        assert!(
+            !state.channels.contains_key(&channel_id),
+            "channels entry must be removed once its settlement is credited"
+        );
+        // The settled-once dedup record persists so a re-delivery can't recredit.
+        assert!(state.settled_seen.contains(&channel_id));
     }
 
     #[test]

@@ -373,6 +373,14 @@ where
     // `T` is `#[serde(transparent)]` over `[u8; 32]` (or a bare `[u8; 32]`),
     // so the decoded length and per-element bytes are identical to the raw
     // wire form; the cap is the only thing this hook adds.
+    //
+    // Allocation safety (#845): the cap is enforced *after* `Vec::deserialize`,
+    // so a malicious peer's length prefix is untrusted at the point of decode.
+    // This is sound because the up-front allocation is bounded independently of
+    // that prefix — serde's `Vec` impl uses `size_hint::cautious`, which caps
+    // `with_capacity` to a small byte budget, and postcard streams elements
+    // (a giant length prefix with a truncated body errors at EOF long before
+    // the cap check). See `bounded_vec_giant_length_prefix_truncated_body_*`.
     let v = Vec::<T>::deserialize(d)?;
     if v.len() > max {
         return Err(de::Error::custom(format!(
@@ -716,6 +724,28 @@ mod tests {
             MAX_PROVIDERS_PER_HASH + 1
         );
         Ok(())
+    }
+
+    #[test]
+    fn bounded_vec_giant_length_prefix_truncated_body_does_not_overallocate() {
+        // #845: pin the allocation-safety assumption of `deserialize_bounded_vec`.
+        // An adversarial peer can send a `providers` length prefix claiming
+        // billions of elements with no element bytes behind it. Decoding must
+        // return an error (EOF) promptly without pre-allocating a multi-GB Vec
+        // from the untrusted length — serde's `cautious` capacity bounds the
+        // up-front allocation and postcard streams elements, so the body runs
+        // out before the cap check is ever reached. If this regressed to an
+        // unbounded `with_capacity(len)`, this test would OOM rather than fail.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0xFFu8; 32]); // `hash` field
+        // postcard LEB128 varint for u32::MAX (= 4_294_967_295) providers.
+        bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        // No provider bytes follow: the body is truncated immediately.
+        let decoded: Result<FindValueResponse, _> = postcard::from_bytes(&bytes);
+        assert!(
+            decoded.is_err(),
+            "giant length prefix + truncated body must error at decode, not allocate"
+        );
     }
 
     #[test]

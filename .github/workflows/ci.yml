@@ -275,6 +275,15 @@ jobs:
       - name: Run tests (with coverage instrumentation)
         run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass --no-clean
 
+      # REQUIRED step. `cargo llvm-cov nextest` does NOT run doctests, so the
+      # `compile_fail` guard at crates/node/src/receipt_log.rs (and any future
+      # runnable doctest) would never execute (#864). Run them explicitly here
+      # so a doctest regression fails the job and blocks the PR. Kept separate
+      # from the coverage run because doctests don't instrument cleanly under
+      # llvm-cov; coverage of doctested lines is not the goal — execution is.
+      - name: Run doctests
+        run: cargo test --doc --workspace
+
       # No continue-on-error: this only runs on push to main (post-merge), so
       # a failure paints main CI red rather than blocking a PR. Silent
       # degradation is worse than a visible red on main — a persistent upload

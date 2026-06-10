@@ -904,6 +904,28 @@ pub async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("admin bind {addr} failed: {e}"))?;
+    // Defense-in-depth for the unauthenticated admin RPC surface (#845),
+    // mirroring `metrics::bind` (#579). `to_canonical()` unwraps IPv4-mapped
+    // IPv6 (e.g. `::ffff:127.0.0.1`) so the dual-stack loopback form doesn't
+    // trip a false warning; `Ipv6Addr::is_loopback()` only matches `::1`.
+    let ip = addr.ip().to_canonical();
+    if !ip.is_loopback() {
+        if ip.is_unspecified() {
+            tracing::warn!(
+                %addr,
+                "admin server is binding all interfaces (non-loopback); the admin RPC is \
+                 unauthenticated and can drain channels, trigger announces, and read peer \
+                 state — gate it behind loopback or a private network"
+            );
+        } else {
+            tracing::warn!(
+                %addr,
+                "admin server is binding a non-loopback address; the admin RPC is \
+                 unauthenticated and can drain channels, trigger announces, and read peer \
+                 state — restrict reachability to trusted operators"
+            );
+        }
+    }
     tracing::info!(%addr, "admin server listening");
     Ok(listener)
 }
@@ -2382,5 +2404,49 @@ mod tests {
         let rpc = AdminRpcImpl::new(state.with_channels(handles));
         let err = rpc.channels().await.expect_err("expected store-load error");
         assert_eq!(err.code(), CHANNEL_STORE_ERROR_CODE);
+    }
+
+    /// `bind` accepts both loopback and non-loopback addresses; the
+    /// non-loopback path emits a `WARN` (#845) but never rejects. We can't
+    /// cheaply intercept the tracing emission, so this is a smoke test of
+    /// both branches plus IPv6 loopback — a future refactor that narrowed
+    /// the predicate to e.g. `addr.ip() == Ipv4Addr::LOCALHOST` would regress
+    /// on `::1` and break here visibly. Mirrors `metrics::bind`'s test.
+    #[tokio::test]
+    async fn bind_accepts_loopback_and_warns_on_non_loopback() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        // IPv4 loopback: warn-free.
+        let v4_loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let listener = bind(v4_loopback).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(
+            bound.ip().is_loopback(),
+            "IPv4 loopback bind should resolve to a loopback addr: got {bound}"
+        );
+        drop(listener);
+
+        // IPv6 loopback `::1`: also warn-free. Some hosts disable IPv6; skip
+        // rather than fail if the bind itself errors.
+        let v6_loopback = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+        if let Ok(listener) = bind(v6_loopback).await {
+            let bound = listener.local_addr().unwrap();
+            assert!(
+                bound.ip().is_loopback(),
+                "IPv6 loopback bind should resolve to a loopback addr: got {bound}"
+            );
+        }
+
+        // Unspecified (`0.0.0.0`): allowed, but the bind path WARNs. A
+        // regression that rejected unspecified would surface as a `bind`
+        // error here.
+        let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        let listener = bind(unspecified).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(
+            bound.ip().is_unspecified(),
+            "0.0.0.0 bind should resolve to the unspecified addr: got {bound}"
+        );
+        drop(listener);
     }
 }

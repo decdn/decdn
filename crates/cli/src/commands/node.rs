@@ -227,6 +227,20 @@ pub async fn announce(
         .await
         .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
 
+    // `triggered` is `true` on every well-formed non-error response — the
+    // publisher-disabled case returns a distinct error code, not `false`. A
+    // `false` therefore means the node accepted the RPC but reported the
+    // announce was *not* queued; treat that as a failure (stderr + non-zero
+    // exit) instead of silently exiting 0 with `announce_queued=false` (#845).
+    // Checked *before* any stdout emission so a failing run never prints a
+    // contradictory `announce_queued=false` / `"triggered": false` line —
+    // stdout carries only the success result.
+    anyhow::ensure!(
+        resp.triggered,
+        "node accepted the request but reported the announce was not queued \
+         (triggered=false)"
+    );
+
     if args.json {
         let pretty =
             serde_json::to_string_pretty(&resp).context("failed to encode announce response")?;

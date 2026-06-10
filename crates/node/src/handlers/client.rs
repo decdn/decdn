@@ -833,14 +833,28 @@ impl ClientHandler {
         // reason code for underpayment, so an underpaying voucher fails the
         // stream rather than looping — looping would deadlock, since the client
         // is blocked awaiting `VoucherAck` and cannot send a corrected voucher.
-        if let Err(RateError::Underpayment { .. }) = verify_rate(
+        //
+        // Match every `RateError` arm explicitly (#845): a non-`Underpayment`
+        // result was previously treated as acceptable and silently passed to
+        // `apply_voucher` (the only backstop). An exhaustive `match` makes a
+        // future variant a build failure here instead. `ZeroBytes`/`Overflow`
+        // cannot occur at this call site — `collect_voucher` runs only when
+        // `unvouchered > 0`, so `delta_bytes > 0` — but are rejected defensively.
+        match verify_rate(
             amount_delta,
             U256::from(delta_bytes),
             rate_per_mb,
             DEFAULT_TOLERANCE_BPS,
         ) {
-            drop(guard);
-            anyhow::bail!("voucher underpays for {delta_bytes} delivered bytes");
+            Ok(()) => {}
+            Err(RateError::Underpayment { .. }) => {
+                drop(guard);
+                anyhow::bail!("voucher underpays for {delta_bytes} delivered bytes");
+            }
+            Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
+                drop(guard);
+                anyhow::bail!("voucher fails rate check for {delta_bytes} delivered bytes: {e}");
+            }
         }
 
         let Ok(signed) = wire_voucher_to_signed(&wire, channel_id, guard.state.token, new_bytes)
