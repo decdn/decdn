@@ -52,6 +52,20 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Per-connection request cap (#845, ADR 022 §DHT Rate Limiting). The
+/// per-stream rate limiter throttles request *rate*, but a peer holding
+/// under the rate can still open streams forever and pin its dispatch
+/// permit (acquired once per connection in `serve`) for the whole process
+/// lifetime. Cap total served streams so the permit is recycled. Mirrors
+/// the hardcoded-constant precedent in `handlers::client` (`MAX_CLIENT_STREAMS`).
+const MAX_DHT_REQUESTS_PER_CONN: u32 = 256;
+/// Per-connection age deadline (#845, ADR 022 §DHT Rate Limiting). Bounds
+/// dispatch-permit hold time independent of the request count: a peer that
+/// dribbles requests just under the cap still releases its permit once the
+/// connection reaches this age. The serve loop stops accepting new streams
+/// past it; the existing post-loop `conn.closed()` flush then releases.
+const MAX_DHT_CONN_AGE: Duration = Duration::from_mins(5);
+
 // ADR 013 application error codes (also defined in `handlers::probe`; the
 // codes are protocol-wide constants, not per-ALPN values).
 const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
@@ -214,7 +228,26 @@ impl DhtHandler {
         // Iroh-side connection cap: DHT is short-lived request/response,
         // but a peer may bundle multiple requests on one connection. Accept
         // streams in a loop until the peer closes (or we time out waiting).
+        //
+        // Permit hygiene (#845): the dispatch permit above is held for the
+        // whole `serve` call, so an unbounded accept loop lets a peer staying
+        // under the per-stream rate limit pin a permit indefinitely. Bound
+        // both the total served streams (`MAX_DHT_REQUESTS_PER_CONN`) and the
+        // connection age (`MAX_DHT_CONN_AGE`) so the permit is always
+        // recycled; the loop is sequential (`handle_one` is awaited, not
+        // spawned), so a count + age cap — not a concurrency semaphore — is
+        // the right tool.
+        let conn_start = std::time::Instant::now();
+        let mut served: u32 = 0;
         loop {
+            // Stop accepting once this connection has consumed its per-conn
+            // request budget or outlived the age deadline. Checked at the top
+            // so the previously-accepted stream is always served in full;
+            // breaking here lets the post-loop `conn.closed()` flush run and
+            // releases the dispatch permit.
+            if served >= MAX_DHT_REQUESTS_PER_CONN || conn_start.elapsed() >= MAX_DHT_CONN_AGE {
+                break;
+            }
             // Peer closed the connection (`Ok(Err)`) or we hit the idle
             // accept timeout (`Err`) — both mean we're done serving this
             // connection; break the per-stream loop.
@@ -223,6 +256,7 @@ impl DhtHandler {
             else {
                 break;
             };
+            served = served.saturating_add(1);
             // Rate-limit per request (ADR 022 §DHT Rate Limiting). Re-read
             // `peer_ip` here so a relay→direct path switch over the
             // connection's lifetime engages the per-IP layer for
@@ -843,4 +877,60 @@ fn peer_ip(conn: &Connection) -> Option<IpAddr> {
                     _ => None,
                 })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The serve-loop accept cap (#845) is exercised end-to-end by the
+    // loopback harness in `tests/dht_loopback.rs` (which owns the live
+    // iroh connection-pair setup). Here we pin the bounding logic the loop
+    // relies on, so a future edit to either const can't silently disable
+    // the dispatch-permit-hygiene guard.
+
+    /// Models the exact stop condition the serve loop checks at the top of
+    /// its body: accepting halts the instant the served count reaches the
+    /// cap, so the loop serves at most `MAX_DHT_REQUESTS_PER_CONN` streams
+    /// before releasing its dispatch permit. The cap must be a finite,
+    /// positive budget for this to terminate at the right count — a zero cap
+    /// would serve nothing and `u32::MAX` would reopen the unbounded-permit
+    /// hole #845 closes.
+    #[test]
+    fn served_counter_stops_at_the_cap() {
+        let cap = MAX_DHT_REQUESTS_PER_CONN;
+        assert!(cap > 0, "a zero cap serves nothing");
+        assert!(
+            cap < u32::MAX,
+            "an unbounded cap reopens the dispatch-permit-pinning hole (#845)"
+        );
+        // Simulate the loop's accept gate (count branch only; the age
+        // branch is wall-clock, covered by `conn_age_deadline_is_non_zero`).
+        let mut served: u32 = 0;
+        let mut accepted: u32 = 0;
+        loop {
+            if served >= cap {
+                break;
+            }
+            // A stream was accepted and will be served this iteration.
+            served = served.saturating_add(1);
+            accepted = accepted.saturating_add(1);
+        }
+        assert_eq!(
+            accepted, cap,
+            "the loop serves exactly the per-conn budget, then stops accepting"
+        );
+    }
+
+    /// The age deadline must be a non-zero duration: zero would break every
+    /// connection before its first stream, and the bound is what releases
+    /// the dispatch permit for a peer dribbling requests under the count cap.
+    #[test]
+    fn conn_age_deadline_is_non_zero() {
+        let deadline = MAX_DHT_CONN_AGE;
+        assert!(
+            deadline > Duration::ZERO,
+            "a zero age deadline would close every connection immediately"
+        );
+    }
 }

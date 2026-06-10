@@ -7,7 +7,8 @@ pragma solidity 0.8.28;
 ///         accountant that `DecdnGovernor` reads for voting weight per ADR 036.
 /// @dev    Settlement: `PaymentChannel.settleChannel` forwards the operator's
 ///         full USDC balance to `routeSettlement`, which performs the
-///         60% operator / 30% buyback / 10% treasury split inline,
+///         default 60% operator / 30% buyback / 10% treasury split inline
+///         (governance-mutable within per-bucket bounds via `setShares`),
 ///         updates per-operator + global byte counters, and notifies
 ///         `CapacityBond.recordSettlement`.
 ///

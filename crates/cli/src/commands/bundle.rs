@@ -147,6 +147,27 @@ fn build_excluder(patterns: &[String]) -> anyhow::Result<GlobSet> {
         .map_err(|e| anyhow!("failed to build glob set: {e}"))
 }
 
+/// `filter_entry` predicate: whether the walker keeps (descends into /
+/// yields) a non-root entry at relative path `rel`. `is_dir` is the
+/// walker's lexical file type (does NOT follow symlinks). See the call
+/// site for the pruning rationale; the directory branch only prunes when
+/// the exclude pattern is recursive at this directory (sentinel-child
+/// probe) so a one-level `tmp/*` can't strand a deeper `tmp/sub/y`.
+fn keep_entry(rel: &Path, is_dir: bool, excluder: &GlobSet) -> bool {
+    if !excluder.is_match(rel) {
+        return true;
+    }
+    if !is_dir {
+        // Matched file/symlink: skip it before canonicalize.
+        return false;
+    }
+    // Matched directory: prune only if its whole subtree is excluded.
+    // `__decdn_subtree_probe__` is a synthetic leaf name — its only role is
+    // to distinguish a recursive pattern (`tmp/**`, which also matches the
+    // child) from a one-level one (`tmp/*`, which does not).
+    !excluder.is_match(rel.join("__decdn_subtree_probe__"))
+}
+
 fn collect_entries(
     root: &Path,
     follow_symlinks: bool,
@@ -156,7 +177,37 @@ fn collect_entries(
     let mut skipped_symlinks: u64 = 0;
     let mut total_size: u64 = 0;
 
-    let walker = WalkDir::new(root).follow_links(follow_symlinks).into_iter();
+    // Skip / prune excluded entries *lexically*, before any canonicalize.
+    // `filter_entry` runs on every yielded entry including the root: when
+    // the entry is the root (empty relative path) or `strip_prefix` can't
+    // produce a relative path, keep it — never prune the root. The match
+    // key mirrors the in-loop `excluder.is_match(&rel_str)` convention:
+    // globset's `Candidate` normalizes a `&Path` to its forward-slash form
+    // internally, so matching the relative `&Path` here is equivalent to
+    // matching the validated `rel_str` below (best-effort — the filter only
+    // decides descent, not the recorded `path` field, so it needn't run the
+    // stricter `validate_relpath`).
+    //
+    // A matched FILE/symlink is skipped here, before the canonicalize step —
+    // so an escaping symlink that the operator excluded (e.g. via `tmp/**`)
+    // is never resolved and cannot trip the escape `bail!` below.
+    //
+    // A matched DIRECTORY is pruned only when its WHOLE subtree is excluded,
+    // i.e. the pattern is recursive at this directory. We can't ask globset
+    // that directly, so we probe a synthetic descendant: if both the dir and
+    // `dir/<sentinel>` match, the pattern recurses (`tmp/**`) and pruning is
+    // sound; if only the dir matches (`tmp/*` matching the intermediate
+    // `tmp/sub`), pruning would strand non-excluded descendants like
+    // `tmp/sub/y`, so we keep descending and let the per-file check below
+    // skip only the entries that actually match.
+    let walker = WalkDir::new(root)
+        .follow_links(follow_symlinks)
+        .into_iter()
+        .filter_entry(|entry| match entry.path().strip_prefix(root) {
+            Ok(rel) if rel.as_os_str().is_empty() => true,
+            Ok(rel) => keep_entry(rel, entry.file_type().is_dir(), excluder),
+            Err(_) => true,
+        });
 
     for step in walker {
         // walkdir surfaces opendir/readdir errors and (with follow_links)
@@ -210,6 +261,10 @@ fn collect_entries(
             .map_err(|_| anyhow!("strip_prefix failed for {}", entry.path().display()))?;
         let rel_str = validate_relpath(rel)?;
 
+        // Cheap backstop: `filter_entry` above already pruned excluded
+        // subtrees lexically (before canonicalize), so this only ever runs
+        // on non-pruned entries. Keep it so the exclusion contract holds
+        // even if the pre-walk filter and this validated key ever diverge.
         if excluder.is_match(&rel_str) {
             continue;
         }
@@ -540,6 +595,115 @@ mod tests {
         );
         // …and the decoy file the symlink pointed at is untouched.
         assert_eq!(std::fs::read(&decoy).unwrap(), b"do not touch");
+    }
+
+    // Collect a canonical-rooted tree and return the set of bundle paths.
+    // Mirrors the production entry: canonicalize the root first so the
+    // `starts_with(root)` invariant in `collect_entries` holds.
+    fn collect_paths(
+        root: &Path,
+        follow_symlinks: bool,
+        exclude: &[&str],
+    ) -> anyhow::Result<Vec<String>> {
+        let canonical = std::fs::canonicalize(root)?;
+        let excluder =
+            build_excluder(&exclude.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())?;
+        let out = collect_entries(&canonical, follow_symlinks, &excluder)?;
+        Ok(out.entries.into_iter().map(|e| e.path).collect())
+    }
+
+    // Finding B(b): excluded regular files are absent from the bundle.
+    #[test]
+    fn collect_excludes_matched_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"k").unwrap();
+        std::fs::write(dir.path().join("drop.log"), b"d").unwrap();
+        let paths = collect_paths(dir.path(), false, &["*.log"]).unwrap();
+        assert_eq!(paths, vec!["keep.txt".to_string()]);
+    }
+
+    // Finding B(a): a recursively-excluded directory (`tmp/**`) is pruned —
+    // including nested files — so its whole subtree is absent from the
+    // bundle (and, below, an escaping symlink inside it is never visited so
+    // it can't trip the escape `bail!`).
+    #[test]
+    fn collect_prunes_recursively_excluded_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("tmp/sub")).unwrap();
+        std::fs::write(dir.path().join("tmp/a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("tmp/sub/b.txt"), b"b").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"k").unwrap();
+        let paths = collect_paths(dir.path(), false, &["tmp/**"]).unwrap();
+        assert_eq!(paths, vec!["keep.txt".to_string()]);
+    }
+
+    // Finding B(a) corollary: a one-level `tmp/*` excludes files directly
+    // under `tmp/` but must NOT prune the intermediate `tmp/sub` directory —
+    // deeper `tmp/sub/y` survives. Pins the sentinel-probe guard in
+    // `keep_entry` against a "prune any matched dir" simplification.
+    #[test]
+    fn collect_one_level_glob_keeps_deeper_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("tmp/sub")).unwrap();
+        std::fs::write(dir.path().join("tmp/x.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("tmp/sub/y.txt"), b"y").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"k").unwrap();
+        let mut paths = collect_paths(dir.path(), false, &["tmp/*"]).unwrap();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["keep.txt".to_string(), "tmp/sub/y.txt".to_string()]
+        );
+    }
+
+    // Finding B(a): a symlink that escapes the root but lives inside an
+    // excluded directory is pruned before canonicalize, so it does NOT
+    // hard-error even with --follow-symlinks, and the excluded dir's real
+    // files are also absent.
+    #[cfg(unix)]
+    #[test]
+    fn collect_excluded_dir_with_escaping_symlink_does_not_error() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"s").unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("tmp")).unwrap();
+        std::fs::write(dir.path().join("tmp/inner.txt"), b"i").unwrap();
+        // Escaping symlink buried inside the recursively-excluded `tmp/`
+        // directory.
+        symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("tmp/escape"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"k").unwrap();
+
+        // follow_symlinks=true would normally make an escaping symlink a
+        // hard error — but the excluded subtree is pruned lexically (before
+        // canonicalize) so the link is never resolved.
+        let paths = collect_paths(dir.path(), true, &["tmp/**"]).unwrap();
+        assert_eq!(paths, vec!["keep.txt".to_string()]);
+    }
+
+    // Finding B(c): a NON-excluded escaping symlink still hard-errors under
+    // --follow-symlinks — the escape `bail!` is preserved for genuinely
+    // walked escapes.
+    #[cfg(unix)]
+    #[test]
+    fn collect_non_excluded_escaping_symlink_errors() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"s").unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        symlink(outside.path().join("secret.txt"), dir.path().join("escape")).unwrap();
+
+        let err = collect_paths(dir.path(), true, &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("outside --input root"), "msg was: {msg}");
     }
 
     #[test]
