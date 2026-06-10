@@ -117,6 +117,11 @@ pub fn verify_binding(
         });
     }
     let sig = Signature::from_raw(signature).map_err(|_| BindError::Malformed)?;
+    // Reject non-canonical high-`s` so the off-chain accept-set matches the
+    // on-chain verifiable-set (#836).
+    if crate::sig_canon::is_high_s(&sig) {
+        return Err(BindError::Malformed);
+    }
     let hash = binding_signing_hash(node_id, nonce, domain);
     sig.recover_address_from_prehash(&hash)
         .map_err(|_| BindError::Malformed)
@@ -169,6 +174,27 @@ mod tests {
         let sig = sign_binding(&signer, node_id, EPHEMERAL_BINDING_NONCE, &domain)?;
         let recovered = verify_binding(node_id, EPHEMERAL_BINDING_NONCE, &sig, &domain)?;
         anyhow::ensure!(recovered == signer.address(), "recovered {recovered}");
+        Ok(())
+    }
+
+    #[test]
+    fn high_s_binding_signature_rejected() -> anyhow::Result<()> {
+        // The high-`s` twin of a valid binding recovers the same signer
+        // off-chain but reverts on-chain; reject it to keep the accept-set
+        // aligned with the on-chain verifiable-set (#836).
+        let signer = PrivateKeySigner::random();
+        let domain = sample_domain();
+        let node_id = B256::repeat_byte(0xAB);
+        let hash = binding_signing_hash(node_id, EPHEMERAL_BINDING_NONCE, &domain);
+        let sig = signer.sign_hash_sync(&hash)?;
+        verify_binding(node_id, EPHEMERAL_BINDING_NONCE, &sig.as_bytes(), &domain)?; // low-s ok
+
+        let twin = crate::sig_canon::high_s_twin(&sig).as_bytes().to_vec();
+        anyhow::ensure!(
+            verify_binding(node_id, EPHEMERAL_BINDING_NONCE, &twin, &domain)
+                == Err(BindError::Malformed),
+            "high-s binding twin must be rejected as Malformed"
+        );
         Ok(())
     }
 
