@@ -144,4 +144,23 @@ pub struct CacheMetrics {
     /// automatically, so the emitted name is
     /// `decdn_cache_gc_bytes_reclaimed_total`.
     pub gc_bytes_reclaimed: Counter,
+    /// Best-effort named-tag deletions that failed (#860/#837). Bumped when
+    /// `evict()` (DMCA/corruption takedown) or the drain-path hash-mismatch
+    /// arm cannot delete a blob's protecting named tag. Serving is unaffected
+    /// — an evict's logical-evicted set still blocks `get`/`has`, and a
+    /// mismatch still returns `HashMismatch` — but the bytes stay GC-protected
+    /// on disk because the tag survives, and nothing re-attempts the delete.
+    ///
+    /// Operator-actionable: any sustained nonzero rate means disk reclaim is
+    /// stuck. For an `evict()` failure that is a DMCA/compliance concern (the
+    /// takedown stopped serving but did not reclaim the bytes); for the drain
+    /// path it is the #837 unbounded-disk-growth leak under a hostile origin.
+    /// A persistently nonzero rate warrants investigating the iroh-blobs tag
+    /// store (a wedged store actor, I/O errors); the engine also emits a
+    /// `tracing::warn!` per failure.
+    ///
+    /// Field name omits `_total`: the `OpenMetrics` encoder appends it
+    /// automatically, so the emitted name is
+    /// `decdn_cache_tag_drop_failures_total`.
+    pub tag_drop_failures: Counter,
 }

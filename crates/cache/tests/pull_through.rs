@@ -90,7 +90,6 @@ async fn hash_mismatch_is_rejected_and_not_cached() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let expected = Hash::new(b"expected");
     let mismatched_payload: &[u8] = b"something else entirely";
-    let actual = Hash::new(mismatched_payload);
     Mock::given(method("GET"))
         .and(path(format!("/{}", expected.to_hex())))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
@@ -107,28 +106,255 @@ async fn hash_mismatch_is_rejected_and_not_cached() -> anyhow::Result<()> {
         !engine.has(expected).await?,
         "expected hash must not be cached"
     );
-    // Cache-poisoning mitigation: the wrong-hash bytes briefly land
-    // in iroh-blobs under `actual` (their own BLAKE3) when
-    // `add_stream` commits before we hash-check. The engine logically
-    // evicts `actual` on mismatch so neither `has(actual)` nor
-    // `get(actual)` reaches the partial bytes — the fix for the
-    // attack window the streaming refactor introduced.
+    // The wrong-hash bytes are made GC-eligible but their hash is NOT
+    // logically evicted: under BLAKE3 content-addressing those bytes *are*
+    // the authorized content for their own hash, so evicting it would durably
+    // censor a legitimate hash (#853). The non-censorship guarantee and the
+    // drain-path GC reclaim are covered by
+    // `streaming_mismatch_does_not_censor_actual_hash` and
+    // `drain_mismatch_tag_deleted_lets_gc_reclaim`.
+    Ok(())
+}
+
+/// #853 regression: a malicious upstream answers a pull for `expected`
+/// with the bytes of a *legitimate* blob `actual` it also holds. The
+/// mismatch must be rejected WITHOUT logically evicting `actual` — pre-fix
+/// the streaming path called `self.evict(actual)`, durably blacklisting a
+/// hash whose BLAKE3-addressed content is genuinely valid. Uses
+/// `build_engine_no_retry` (`buffered_max_bytes = 0`) to force the
+/// streaming path.
+#[tokio::test]
+async fn streaming_mismatch_does_not_censor_actual_hash() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let victim: &[u8] = b"a legitimate blob the attacker also holds";
+    let actual = Hash::new(victim);
+    let expected = Hash::new(b"what the client actually asked for");
+    // A pull for `expected` is answered with the victim's bytes (mismatch).
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", expected.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(victim))
+        .mount(&server)
+        .await;
+    // A correct content-addressed mount so `actual` is fetchable on its own.
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", actual.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(victim))
+        .mount(&server)
+        .await;
+
+    let (engine, _tmp) = build_engine_no_retry(&server.uri()).await?;
+
+    let err = err_of(engine.get(expected).await)?;
     anyhow::ensure!(
-        !engine.has(actual).await?,
-        "actual-hash bytes must be logically evicted (cache-poisoning mitigation)"
+        matches!(err, CacheError::HashMismatch { .. }),
+        "expected HashMismatch, got: {err:?}"
+    );
+    anyhow::ensure!(
+        !engine.inspect(actual).await?.already_evicted,
+        "actual must NOT be logically evicted on hash mismatch (#853 censorship vector)"
+    );
+    // The legitimate blob is still fully serveable — pre-fix this returned
+    // NotFound because `actual` was blacklisted in evicted.log.
+    let got = engine.get(actual).await?;
+    anyhow::ensure!(&got[..] == victim, "actual must serve its real bytes");
+    Ok(())
+}
+
+/// #837 regression (also covers the drain-path side of #853). The drain
+/// path commits via `add_bytes`, which creates a *named* tag that protects
+/// the wrong-hash bytes from GC forever. On mismatch the engine must delete
+/// that tag (not logically evict the hash) so the next sweep reclaims the
+/// disk. Uses `RetryPolicy::default()` (`buffered_max_bytes > 0`) so the
+/// small, Content-Length-bearing body takes the drain path.
+#[tokio::test]
+async fn drain_mismatch_tag_deleted_lets_gc_reclaim() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let expected = Hash::new(b"expected-drain");
+    let mismatched: &[u8] = b"a small body that fits the drain buffer but hashes wrong";
+    let actual = Hash::new(mismatched);
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", expected.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let metrics = Arc::new(CacheMetrics::default());
+    let gc_interval = Duration::from_millis(200);
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        vec![origin as Arc<dyn Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        Some(Arc::clone(&metrics)),
+        gc_interval,
+    )
+    .await?;
+
+    let err = err_of(engine.get(expected).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::HashMismatch { .. }),
+        "expected HashMismatch, got: {err:?}"
+    );
+
+    let pre = engine.inspect(actual).await?;
+    anyhow::ensure!(
+        pre.size_bytes.is_some(),
+        "drain-committed bytes must be on disk before GC runs"
+    );
+    anyhow::ensure!(
+        !pre.already_evicted,
+        "wrong-hash bytes must NOT be logically evicted (#853)"
+    );
+
+    let deadline = std::time::Instant::now() + gc_interval * 16;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(gc_interval).await;
+        if engine.inspect(actual).await?.size_bytes.is_none()
+            && metrics.gc_bytes_reclaimed.get() > 0
+        {
+            break;
+        }
+    }
+
+    anyhow::ensure!(
+        engine.inspect(actual).await?.size_bytes.is_none(),
+        "drain-path wrong-hash bytes must be GC-reclaimed once the named tag is deleted (#837)"
+    );
+    anyhow::ensure!(
+        metrics.gc_bytes_reclaimed.get() > 0,
+        "gc_bytes_reclaimed must be nonzero after reclaim; got {}",
+        metrics.gc_bytes_reclaimed.get()
+    );
+    Ok(())
+}
+
+/// #860 regression: a logically-evicted blob keeps its protecting named
+/// tag, so iroh-blobs GC can never reclaim its disk — contradicting the
+/// "reclaimed on the next GC sweep" guarantee. `evict()` must delete the
+/// tag so the sweep frees the bytes while serving stops immediately.
+#[tokio::test]
+async fn evict_makes_blob_gc_eligible() -> anyhow::Result<()> {
+    let payload: &[u8] = b"content to evict and reclaim";
+    let (server, hash) = serve_blob(payload).await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let metrics = Arc::new(CacheMetrics::default());
+    let gc_interval = Duration::from_millis(200);
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        vec![origin as Arc<dyn Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        Some(Arc::clone(&metrics)),
+        gc_interval,
+    )
+    .await?;
+
+    // Cache the blob (creates the protecting named tag), then evict it.
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload, "blob should be served from origin");
+    anyhow::ensure!(
+        engine.inspect(hash).await?.size_bytes.is_some(),
+        "blob must be on disk after caching"
+    );
+    engine.evict(hash).await?;
+    anyhow::ensure!(
+        engine.inspect(hash).await?.already_evicted,
+        "evict must logically stop serving"
+    );
+
+    let deadline = std::time::Instant::now() + gc_interval * 16;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(gc_interval).await;
+        if engine.inspect(hash).await?.size_bytes.is_none() && metrics.gc_bytes_reclaimed.get() > 0
+        {
+            break;
+        }
+    }
+
+    anyhow::ensure!(
+        engine.inspect(hash).await?.size_bytes.is_none(),
+        "evicted blob's bytes must be GC-reclaimed once its tag is deleted (#860)"
+    );
+    anyhow::ensure!(
+        metrics.gc_bytes_reclaimed.get() > 0,
+        "gc_bytes_reclaimed must be nonzero after reclaiming the evicted blob; got {}",
+        metrics.gc_bytes_reclaimed.get()
+    );
+    Ok(())
+}
+
+/// Companion to `evict_makes_blob_gc_eligible` that forces the *streaming*
+/// success path (`RetryPolicy::disabled()` ⇒ `buffered_max_bytes = 0`), so the
+/// blob is protected by a `tags().create()` tag rather than the drain path's
+/// `add_bytes` tag. Guards that `evict`'s `drop_named_tags_for` matches the
+/// streaming-promoted tag too — without this, a regression that only handled
+/// drain-path tags would still pass `evict_makes_blob_gc_eligible` (#860).
+#[tokio::test]
+async fn evict_makes_streaming_cached_blob_gc_eligible() -> anyhow::Result<()> {
+    let payload: &[u8] = b"streaming-cached content to evict and reclaim";
+    let (server, hash) = serve_blob(payload).await;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let metrics = Arc::new(CacheMetrics::default());
+    let gc_interval = Duration::from_millis(200);
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        vec![origin as Arc<dyn Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::disabled(),
+        Some(Arc::clone(&metrics)),
+        gc_interval,
+    )
+    .await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(&got[..] == payload, "blob should be served from origin");
+    anyhow::ensure!(
+        engine.inspect(hash).await?.size_bytes.is_some(),
+        "blob must be on disk after caching via the streaming path"
+    );
+    engine.evict(hash).await?;
+
+    let deadline = std::time::Instant::now() + gc_interval * 16;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(gc_interval).await;
+        if engine.inspect(hash).await?.size_bytes.is_none() && metrics.gc_bytes_reclaimed.get() > 0
+        {
+            break;
+        }
+    }
+
+    anyhow::ensure!(
+        engine.inspect(hash).await?.size_bytes.is_none(),
+        "streaming-cached evicted blob must be GC-reclaimed once its tag is deleted (#860)"
+    );
+    anyhow::ensure!(
+        metrics.gc_bytes_reclaimed.get() > 0,
+        "gc_bytes_reclaimed must be nonzero after reclaim; got {}",
+        metrics.gc_bytes_reclaimed.get()
     );
     Ok(())
 }
 
 /// Periodic iroh-blobs GC must reclaim the partial-import bytes left
 /// behind by a hash-mismatch pull-through (#518). Threat model: a
-/// hostile origin streams `max_blob_size_mb - 1` of garbage and errors
-/// on the last byte; the engine logically evicts the wrong-hash blob
-/// (`actual`) so `engine.has(actual)` returns false, but the bytes
-/// stay on disk under iroh-blobs' tag-less commit until the GC sweep
-/// fires. This test wires a 200ms GC interval and asserts that within
-/// a small handful of cycles the bytes really do leave disk and the
-/// `gc_*` metrics record the reclaim.
+/// hostile origin streams garbage that hashes wrong; the streaming path
+/// drops the unpromoted temp tag so the bytes are tag-less and
+/// GC-eligible, but they stay on disk until the GC sweep fires. The
+/// wrong-hash blob is deliberately NOT logically evicted (#853): under
+/// content-addressing its bytes are valid content for their own hash, so
+/// the persisted evicted set is reserved for operator takedowns. This
+/// test wires a 200ms GC interval and asserts that within a small handful
+/// of cycles the bytes really do leave disk and the `gc_*` metrics record
+/// the reclaim.
 #[tokio::test]
 async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
     let server = MockServer::start().await;
@@ -168,17 +394,16 @@ async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
     );
 
     // Pre-GC: iroh-blobs still holds the mismatched bytes under
-    // `actual`. `inspect` reads `BlobStatus` directly and ignores the
-    // engine's logical-evict log, so a `Some(_)` size here proves the
-    // disk-leak existed before GC ran.
+    // `actual`. `inspect` reads `BlobStatus` directly, so a `Some(_)` size
+    // here proves the disk-leak existed before GC ran.
     let pre = engine.inspect(actual).await?;
     anyhow::ensure!(
         pre.size_bytes.is_some(),
         "actual-hash bytes must be on disk before GC runs (got size_bytes = None)"
     );
     anyhow::ensure!(
-        pre.already_evicted,
-        "engine should have logically-evicted actual on hash mismatch"
+        !pre.already_evicted,
+        "wrong-hash bytes must NOT be logically evicted on mismatch (#853 censorship vector)"
     );
 
     // Wait for enough sweep cycles to (a) run the sweep that deletes
