@@ -224,6 +224,29 @@ impl ChannelState {
     /// voucher via [`VoucherApplied::is_gapped`], keeping `iroh-metrics` out of
     /// this leaf crate.
     ///
+    /// # Caller obligations
+    ///
+    /// **Rate consistency is NOT enforced here (#845).** This method advances
+    /// `last_amount`/`last_bytes_delivered` monotonically but does not check
+    /// that the per-voucher `amount_delta / bytes_delta` meets the advertised
+    /// `rate_per_mb`. The serving node MUST call [`crate::rate::verify_rate`]
+    /// (with `rate_per_mb` and a tolerance) *before* accepting a voucher and
+    /// delivering the bytes it pays for; `apply_voucher` is intentionally
+    /// rate-agnostic so the pricing policy lives at one call site.
+    ///
+    /// **Off-chain/on-chain divergence on zero-payment byte advance (#864).**
+    /// The guards above accept `amount == last_amount` while
+    /// `bytes_delivered` advances (the `amount >= last_amount` arm). The
+    /// on-chain `PaymentChannel` rejects exactly that shape: settle/dispute
+    /// revert with `ByteAdvanceWithoutPayment` when `byteDelta != 0 &&
+    /// claimedAmount == withdrawnAmount` (`_requireBytesTrackPayment`). With
+    /// `rate_per_mb == 0` — a legal config that `verify_rate` blesses — every
+    /// voucher takes this shape, so accepting it off-chain strands the close
+    /// path (no on-chain redemption is possible until channel expiry +
+    /// `reclaimExpired`). Operators serving for free should be aware that such
+    /// channels are unsettleable; this method does not reject the shape so the
+    /// off-chain state still mirrors what was signed.
+    ///
     /// # Errors
     ///
     /// See [`ChannelError`] for the full taxonomy. A persistent-store
