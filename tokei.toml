@@ -1,0 +1,2 @@
+# Exclude vendored git submodules from line counts (gitignore-style globs).
+exclude = ["contracts/lib/"]
