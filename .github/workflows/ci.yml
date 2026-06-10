@@ -278,11 +278,42 @@ jobs:
       # REQUIRED step. `cargo llvm-cov nextest` does NOT run doctests, so the
       # `compile_fail` guard at crates/node/src/receipt_log.rs (and any future
       # runnable doctest) would never execute (#864). Run them explicitly here
-      # so a doctest regression fails the job and blocks the PR. Kept separate
-      # from the coverage run because doctests don't instrument cleanly under
-      # llvm-cov; coverage of doctested lines is not the goal — execution is.
+      # so a doctest regression fails the job and blocks the PR.
+      #
+      # Exporting `cargo llvm-cov show-env` first is a caching fix, not
+      # cosmetics. The coverage step above builds the workspace under
+      # cargo-llvm-cov's RUSTC_WRAPPER (instrument-coverage + `--cfg=coverage`
+      # on the workspace crates). A bare `cargo test --doc` runs under a
+      # different rustc setup, so it cannot reuse those artifacts and recompiles
+      # the ENTIRE dependency graph from scratch — a full-graph rebuild that
+      # measured ~5.5 min in mid-2026 CI, on the same order as the instrumented
+      # test run itself, all of it on the critical-path `test` job. Exporting
+      # show-env runs the doctest build under the SAME wrapper, so it reuses the
+      # already-built instrumented dependency artifacts and only rebuilds the
+      # workspace crates for doctest extraction (not the full graph). The
+      # profraw the doctests emit is ignored: lcov.info was already written by
+      # the coverage step above, and doctest coverage is not the goal —
+      # execution is (collecting doctest coverage on stable would need nightly
+      # anyway).
+      #
+      # Capture-then-eval (not `source <(show-env)`): under `set -euo pipefail`
+      # a command substitution in a plain assignment propagates a non-zero exit,
+      # so a broken/renamed/missing show-env fails the step LOUDLY. Process
+      # substitution would not — `source <(...)` cannot observe the producer's
+      # exit code, so a failed show-env would silently revert to the slow
+      # un-cached build (the exact regression this fixes), with no signal. The
+      # `${RUSTC_WRAPPER:?}` guard then turns "show-env exited 0 but didn't set
+      # the wrapper" into a named hard failure, making cache reuse a checked
+      # invariant rather than a best-effort side effect. `--sh` is the current
+      # flag name; the former `--export-prefix` now emits a deprecation warning
+      # (taiki-e/install-action installs latest cargo-llvm-cov).
       - name: Run doctests
-        run: cargo test --doc --workspace
+        run: |
+          set -euo pipefail
+          cov_env="$(cargo llvm-cov show-env --sh)"
+          eval "$cov_env"
+          : "${RUSTC_WRAPPER:?cargo llvm-cov show-env did not export RUSTC_WRAPPER — doctest build would not reuse instrumented artifacts}"
+          cargo test --doc --workspace
 
       # No continue-on-error: this only runs on push to main (post-merge), so
       # a failure paints main CI red rather than blocking a PR. Silent
