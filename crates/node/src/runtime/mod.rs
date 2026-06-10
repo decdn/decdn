@@ -1237,6 +1237,7 @@ pub async fn run(
             Arc::clone(&regional_coverage),
             Arc::clone(&settlement_source),
             Arc::clone(&peer_table),
+            Arc::clone(&staker_set),
             min_counterparties,
         ))),
         staked: Some(Arc::new(

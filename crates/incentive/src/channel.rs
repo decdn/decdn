@@ -295,6 +295,14 @@ impl ChannelState {
         }
         // Signature check is last among the cheap-fail checks — it's the most
         // expensive in-memory step (ecrecover).
+        //
+        // EOA-only off-chain (#845): `verify_signer` recovers a 65-byte EOA
+        // signature via `ecrecover`, matching the stance of `probe_sig` and
+        // `bind_sig`. The on-chain `PaymentChannel` path also accepts ERC-1271
+        // smart-account signatures (via `SignatureChecker`), so this check is
+        // fail-closed — a smart-account client is un-servable off-chain. The
+        // ERC-1271 off-chain path needs an `isValidSignature` RPC call and is
+        // deferred (ADR 024 §Off-Chain ERC-1271 Verification).
         signed
             .verify_signer(self.client, domain)
             .map_err(ChannelError::Signature)?;

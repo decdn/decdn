@@ -518,6 +518,7 @@ impl AdminRpcServer for AdminRpcImpl {
             self.state
                 .cache
                 .evict(hash)
+                .await
                 .map_err(|err| cache_error_to_rpc(&err))?;
         }
 
@@ -1514,7 +1515,7 @@ mod tests {
         }) as Arc<dyn decdn_cache::Origin>;
         let cache = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
         let _ = cache.get(hash).await?;
-        cache.evict(hash)?;
+        cache.evict(hash).await?;
 
         let state = AdminState::new(
             Arc::new(RwLock::new(PeerTable::new(0, 0))),

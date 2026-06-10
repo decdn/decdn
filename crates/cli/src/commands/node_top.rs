@@ -332,6 +332,12 @@ struct MetricsPortObservability {
 /// can be `0.0.0.0` / `::`, and a client that dials that goes
 /// nowhere; the operator overrides the host explicitly via
 /// `--metrics-url` if they exposed metrics on a non-loopback address.
+///
+/// Precedence: `--metrics-url` flag → `DECDN_METRICS_PORT` env (the same var
+/// the daemon reads, `common/src/cli/run.rs`) → `observability.metrics_port`
+/// from the config file → default 9090. The env step (#864) keeps an env-only
+/// deployment reachable instead of dialing the default and reporting the node
+/// is down.
 pub(crate) fn resolve_metrics_url(
     flag: Option<&str>,
     config_path: Option<&Path>,
@@ -339,12 +345,34 @@ pub(crate) fn resolve_metrics_url(
     if let Some(url) = flag {
         return Ok(url.to_string());
     }
+    if let Some(url) = metrics_url_from_env(std::env::var("DECDN_METRICS_PORT").ok())? {
+        return Ok(url);
+    }
     let (resolved, source) = match config_path {
         Some(p) => (Some(expand_tilde(p)), ConfigPathSource::Explicit),
         None => (default_config_path(), ConfigPathSource::Default),
     };
     let port = port_from_config_file(resolved.as_deref(), source)?.unwrap_or(DEFAULT_METRICS_PORT);
     Ok(format!("http://127.0.0.1:{port}"))
+}
+
+/// Build the loopback metrics URL from the raw `DECDN_METRICS_PORT` env value,
+/// or `None` when unset. Pure (takes the value rather than reading the
+/// environment) so the parse/validation logic is testable without mutating
+/// process-global state. A non-numeric value or `0` is an error rather than a
+/// silent fall-through — port 0 cannot be dialed and signals misconfiguration.
+fn metrics_url_from_env(raw: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let port: u16 = raw
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("DECDN_METRICS_PORT is not a valid port number: {raw:?}"))?;
+    if port == 0 {
+        anyhow::bail!(
+            "DECDN_METRICS_PORT=0 cannot be dialed; pass --metrics-url or set a non-zero port"
+        );
+    }
+    Ok(Some(format!("http://127.0.0.1:{port}")))
 }
 
 fn port_from_config_file(
@@ -1211,6 +1239,30 @@ mod resolve_tests {
     fn resolve_metrics_url_prefers_flag() {
         let got = resolve_metrics_url(Some("http://custom:1234"), None).unwrap();
         assert_eq!(got, "http://custom:1234");
+    }
+
+    #[test]
+    fn metrics_url_from_env_unset_is_none() {
+        assert_eq!(metrics_url_from_env(None).unwrap(), None);
+    }
+
+    #[test]
+    fn metrics_url_from_env_valid_port_builds_loopback_url() {
+        assert_eq!(
+            metrics_url_from_env(Some("9999".to_string())).unwrap(),
+            Some("http://127.0.0.1:9999".to_string())
+        );
+        assert_eq!(
+            metrics_url_from_env(Some(" 9999 ".to_string())).unwrap(),
+            Some("http://127.0.0.1:9999".to_string())
+        );
+    }
+
+    #[test]
+    fn metrics_url_from_env_zero_and_malformed_error() {
+        assert!(metrics_url_from_env(Some("0".to_string())).is_err());
+        assert!(metrics_url_from_env(Some("notaport".to_string())).is_err());
+        assert!(metrics_url_from_env(Some("70000".to_string())).is_err());
     }
 
     #[test]

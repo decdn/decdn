@@ -1345,7 +1345,7 @@ async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
 async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
     let payload = b"evicted between probe and stream".to_vec();
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    cache.evict(hash)?; // logically gone: has() now false, is_evicted() true.
+    cache.evict(hash).await?; // logically gone: has() now false, is_evicted() true.
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task) =
         spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
