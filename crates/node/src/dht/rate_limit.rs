@@ -39,6 +39,7 @@ use std::time::Duration;
 use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota};
 
 use crate::dht::routing::NodeId;
+use crate::dispatch::source_key;
 use crate::metrics::Metrics;
 
 /// Resolved DHT rate-limit configuration. See ADR 022 §DHT Rate Limiting.
@@ -175,7 +176,10 @@ impl DhtRateLimiter {
             cap_per_peer: cfg.max_tracked_per_peer,
             pruning_per_ip: AtomicBool::new(false),
             pruning_per_peer: AtomicBool::new(false),
-            trusted_ips: cfg.trusted_ips.clone(),
+            // Store trusted entries under the same /64 mask the lookup applies
+            // (#841), so a configured IPv6 trusted address still matches a
+            // masked inbound key. IPv4 entries are unchanged.
+            trusted_ips: cfg.trusted_ips.iter().copied().map(source_key).collect(),
             metrics,
         }
     }
@@ -245,16 +249,19 @@ impl DhtRateLimiter {
         }
 
         // Layer 2 — per-IP. Skipped for relay-only connections and for
-        // trusted IPs.
-        if let (Some(ip), Some(limiter)) = (peer_ip, self.per_ip.as_ref())
-            && !self.trusted_ips.contains(&ip)
-        {
-            let result = limiter.check_key(&ip);
-            if prune {
-                self.maybe_prune_per_ip(limiter);
-            }
-            if result.is_err() {
-                return Err(DhtRejectLayer::PerIp);
+        // trusted IPs. The key is masked to its /64 prefix for IPv6 (#841) —
+        // the same mask the dispatch limiter applies — so an attacker rotating
+        // within one IPv6 allocation can't mint a fresh bucket per request.
+        if let (Some(ip), Some(limiter)) = (peer_ip, self.per_ip.as_ref()) {
+            let ip = source_key(ip);
+            if !self.trusted_ips.contains(&ip) {
+                let result = limiter.check_key(&ip);
+                if prune {
+                    self.maybe_prune_per_ip(limiter);
+                }
+                if result.is_err() {
+                    return Err(DhtRejectLayer::PerIp);
+                }
             }
         }
 
@@ -583,6 +590,58 @@ mod tests {
             lim.check(&peer(2), Some(ip(10, 0, 0, 1))),
             Err(DhtRejectLayer::Global)
         );
+    }
+
+    fn ip6(segments: [u16; 8]) -> IpAddr {
+        IpAddr::V6(std::net::Ipv6Addr::new(
+            segments[0],
+            segments[1],
+            segments[2],
+            segments[3],
+            segments[4],
+            segments[5],
+            segments[6],
+            segments[7],
+        ))
+    }
+
+    #[test]
+    fn per_ip_layer_masks_ipv6_to_slash_64() {
+        // #841: two distinct IPv6 addresses inside the same /64 must share one
+        // per-IP bucket — otherwise an attacker rotating within a /64 mints a
+        // fresh bucket per request and defeats the per-IP tier entirely.
+        let mut cfg = strict_cfg();
+        cfg.global_burst = u32::MAX;
+        cfg.global_rate_per_sec = 1e9;
+        cfg.per_peer_burst = u32::MAX;
+        cfg.per_peer_rate_per_sec = 1e9;
+        let lim = DhtRateLimiter::new(&cfg, metrics());
+        let a = Some(ip6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]));
+        let b = Some(ip6([0x2001, 0xdb8, 0, 0, 0xffff, 0xffff, 0xffff, 0xfffe]));
+        // Same /64 (only the host bits differ): second request hits per-IP.
+        assert_eq!(lim.check(&peer(1), a), Ok(()));
+        assert_eq!(lim.check(&peer(2), b), Err(DhtRejectLayer::PerIp));
+        // A different /64 lands in a fresh bucket and is admitted.
+        let c = Some(ip6([0x2001, 0xdb8, 0, 1, 0, 0, 0, 1]));
+        assert_eq!(lim.check(&peer(3), c), Ok(()));
+    }
+
+    #[test]
+    fn trusted_ipv6_matches_masked_inbound_key() {
+        // #841: a trusted IPv6 address must exempt any address in its /64, since
+        // the lookup key is masked — store the trusted entry under the same mask.
+        let mut cfg = strict_cfg();
+        cfg.global_burst = u32::MAX;
+        cfg.global_rate_per_sec = 1e9;
+        cfg.per_peer_burst = u32::MAX;
+        cfg.per_peer_rate_per_sec = 1e9;
+        cfg.trusted_ips
+            .insert(ip6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]));
+        let lim = DhtRateLimiter::new(&cfg, metrics());
+        // A different host in the trusted /64 is still exempt.
+        let other = Some(ip6([0x2001, 0xdb8, 0, 0, 0xaaaa, 0, 0, 9]));
+        assert_eq!(lim.check(&peer(1), other), Ok(()));
+        assert_eq!(lim.check(&peer(2), other), Ok(()));
     }
 
     #[test]
