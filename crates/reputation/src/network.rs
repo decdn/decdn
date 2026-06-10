@@ -256,6 +256,34 @@ impl NetworkReputation {
         // later `score(.., now)` apply extra decay. `decay_to` already saturates
         // elapsed at 0; this keeps the *stored* timestamp monotonic too.
         let effective_now = report.now_secs.max(entry.last_update_secs);
+        // Count this reporter toward the distinct set *before* deciding whether
+        // to fold, so the report that reaches the threshold is the first to move
+        // the score. The set only needs to reach the threshold (`score` /
+        // `is_scored` test `len() >= min_distinct_reporters`), so once there we
+        // stop inserting to bound per-provider memory under large networks
+        // (Copilot review). Re-inserting an existing reporter is a no-op, so the
+        // cap never blocks an already-counted reporter.
+        if u32::try_from(entry.distinct_reporters.len()).unwrap_or(u32::MAX)
+            < self.config.min_distinct_reporters
+        {
+            entry.distinct_reporters.insert(report.reporter);
+        }
+        let reached_threshold = u32::try_from(entry.distinct_reporters.len()).unwrap_or(u32::MAX)
+            >= self.config.min_distinct_reporters;
+        // Pre-threshold magnitude guard (#864): fold a report's sample into the
+        // score only once at least `min_distinct_reporters` *distinct* weighted
+        // reporters have contributed. Otherwise a single staked reporter — rate-
+        // limited to 1/(pair·hour) but free to report repeatedly — could
+        // EWMA-drive the still-hidden score to an extreme value that two
+        // one-shot reporters then instantly reveal by crossing the visibility
+        // threshold. Below the threshold the score stays at neutral
+        // `initial_score` (decaying neutral is a no-op); only the monotonic
+        // timestamp advances. When the threshold-crossing report arrives the
+        // fold below begins from neutral, so no single reporter can dominate.
+        if !reached_threshold {
+            entry.last_update_secs = effective_now;
+            return entry.score;
+        }
         let decayed = decay_to(
             entry.score,
             entry.last_update_secs,
@@ -272,17 +300,6 @@ impl NetworkReputation {
         let updated = (decayed + delta).clamp(0.0, 1.0);
         entry.score = updated;
         entry.last_update_secs = effective_now;
-        // The set only gates the distinct-reporter threshold (`score` /
-        // `is_scored` test `len() >= min_distinct_reporters`), so once the
-        // threshold is reached there is nothing more to learn from new
-        // reporters — stop inserting to bound per-provider memory under large
-        // networks (Copilot review). Re-inserting an existing reporter is a
-        // no-op, so the cap never blocks an already-counted reporter.
-        if u32::try_from(entry.distinct_reporters.len()).unwrap_or(u32::MAX)
-            < self.config.min_distinct_reporters
-        {
-            entry.distinct_reporters.insert(report.reporter);
-        }
         updated
     }
 
@@ -514,10 +531,53 @@ mod tests {
     fn positive_reports_raise_score_with_pm_005_clamp() -> anyhow::Result<()> {
         let nr = NetworkReputation::new(NetworkReputationConfig::default())?;
         let prov = peer();
-        // First full report from a 3x-weight reporter: sample 1.0 from 0.5,
-        // EWMA delta = 0.05*3*(1.0-0.5) = 0.075, clamped to +0.05 → 0.55.
+        // Default `min_distinct_reporters` is 3 (#864): the first two distinct
+        // reporters keep the score at neutral — folding only begins at the
+        // threshold, from neutral, so no single reporter can pre-load it.
+        let r1 = nr.record(&full_report(prov, peer(), 0), 3.0);
+        ensure!(approx(r1, 0.5), "pre-threshold stays neutral, got {r1}");
+        let r2 = nr.record(&full_report(prov, peer(), 0), 3.0);
+        ensure!(approx(r2, 0.5), "pre-threshold stays neutral, got {r2}");
+        // The third distinct reporter crosses the threshold and folds the first
+        // sample 1.0 from 0.5: EWMA delta = 0.05*3*(1.0-0.5) = 0.075, clamped to
+        // +0.05 → 0.55.
         let s = nr.record(&full_report(prov, peer(), 0), 3.0);
         ensure!(approx(s, 0.55), "got {s}");
+        Ok(())
+    }
+
+    #[test]
+    fn single_reporter_cannot_preload_score_before_threshold() -> anyhow::Result<()> {
+        // #864: one staked reporter folding the same provider many times must
+        // not move the *revealed* score — only the distinct-reporter set grows
+        // (and it caps at the threshold). The score stays neutral and unscored
+        // until `min_distinct_reporters` distinct reporters have contributed.
+        let nr = NetworkReputation::new(NetworkReputationConfig::default())?;
+        let prov = peer();
+        let solo = peer();
+        for _ in 0..50 {
+            let s = nr.record(&full_report(prov, solo, 0), 3.0);
+            ensure!(
+                approx(s, 0.5),
+                "solo reporter must not move the score, got {s}"
+            );
+        }
+        ensure!(!nr.is_scored(prov), "still unscored with a single reporter");
+        ensure!(approx(nr.score(prov, 0), 0.5), "revealed score is neutral");
+
+        // Two more distinct reporters cross the threshold; the score now reveals
+        // a single +0.05 step from neutral (the first fold), NOT an extreme
+        // pre-loaded value — proving the solo reporter never dominated.
+        nr.record(&full_report(prov, peer(), 0), 3.0);
+        let revealed = nr.record(&full_report(prov, peer(), 0), 3.0);
+        ensure!(
+            nr.is_scored(prov),
+            "scored once three distinct reporters seen"
+        );
+        ensure!(
+            approx(revealed, 0.55),
+            "first fold is a single clamped step from neutral, got {revealed}"
+        );
         Ok(())
     }
 
