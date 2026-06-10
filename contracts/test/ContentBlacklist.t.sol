@@ -15,6 +15,7 @@ import { Token } from "../src/Token.sol";
 ///      address, so the consumer reads region data off the same reference.
 contract MockEjector is ICapacityBondEjector, ICapacityBondRegionView {
     address[] public ejected;
+    address[] public unEjected;
 
     mapping(address => string) internal _regionHint;
     mapping(address => string) internal _regionPrev;
@@ -27,8 +28,16 @@ contract MockEjector is ICapacityBondEjector, ICapacityBondRegionView {
         ejected.push(operator);
     }
 
+    function unEjectNode(address operator) external override {
+        unEjected.push(operator);
+    }
+
     function ejectedCount() external view returns (uint256) {
         return ejected.length;
+    }
+
+    function unEjectedCount() external view returns (uint256) {
+        return unEjected.length;
     }
 
     function setRegion(address op, string memory current, string memory prev, uint64 lastChanged) external {
@@ -127,6 +136,37 @@ contract ContentBlacklistTest is Test {
         assertTrue(blacklist.isOperatorBlacklisted(operator));
         assertEq(bondMock.ejectedCount(), 1);
         assertEq(bondMock.ejected(0), operator);
+    }
+
+    function test_removeOperator_callsUnEjectOnCapacityBond() public {
+        vm.prank(admin);
+        blacklist.addOperator(operator);
+        assertEq(bondMock.ejectedCount(), 1);
+        // `addOperator` ejects but must NOT un-eject.
+        assertEq(bondMock.unEjectedCount(), 0);
+
+        vm.prank(admin);
+        blacklist.removeOperator(operator);
+        assertFalse(blacklist.isOperatorBlacklisted(operator));
+        assertEq(bondMock.unEjectedCount(), 1);
+        assertEq(bondMock.unEjected(0), operator);
+    }
+
+    /// @notice `removeOperator` calls `unEjectNode` UNCONDITIONALLY (idempotent)
+    ///         so it can re-sync a `CapacityBond` latch that was set without a
+    ///         matching local entry — even when the local flag is already clear.
+    function test_removeOperator_notBlacklisted_stillResyncsLatch() public {
+        vm.prank(admin);
+        blacklist.removeOperator(operator);
+        assertFalse(blacklist.isOperatorBlacklisted(operator));
+        assertEq(bondMock.unEjectedCount(), 1);
+        assertEq(bondMock.unEjected(0), operator);
+    }
+
+    function test_removeOperator_revertsZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(ContentBlacklist.ZeroAddress.selector);
+        blacklist.removeOperator(address(0));
     }
 
     function test_openBlacklistAppeal_revertsOnZeroRegion() public {

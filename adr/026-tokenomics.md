@@ -237,7 +237,7 @@ Group 4 (19% / 190M TOKEN) funds demand-side adoption — publishers serving con
 
 **Slashing rates.** 5% / 15% / 50% escalation tiers, lifetime offense counter (`uint32`, monotonically increasing), increasing reset periods, challenge-bond mechanics. Applied to the `CapacityBond`.
 
-**Auto-ejection.** At 50% of minimum bond for the operator's declared tier.
+**Auto-ejection.** At 50% of minimum bond for the operator's declared tier. This slash-driven auto-ejection is **recoverable** — re-bonding back to `minBond` clears the `ejected` flag. It does **not** override a concurrent governance blacklist, which sets a separate `blacklistEjected` latch that re-bonding cannot clear (see [ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)).
 
 **Escrow-on-slash.** The slashed TOKEN is **held in escrow by `CapacityBond`** — not distributed at slash time. `slash()` reduces the operator's `activeBond`/unbonding/unclaimed-credit and books the total into a per-`slashId` escrow record (stamping `slashedAtEpoch` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) and auto-ejecting as above), but transfers nothing. The escrow resolves at finality:
 

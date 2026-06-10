@@ -257,11 +257,23 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         }
     }
 
-    function removeOperator(address operator) external onlyRole(GOVERNANCE_ROLE) {
+    /// @dev `nonReentrant` for the same reason as `addOperator`: this makes an
+    ///      external state-changing call (`capacityBond.unEjectNode`) after a
+    ///      state write (M-4). `unEjectNode` is called UNCONDITIONALLY — outside
+    ///      the local-flag guard — and is idempotent: this re-syncs the two
+    ///      contracts even when `CapacityBond.blacklistEjected` was latched
+    ///      without a matching local entry (e.g. a `BLACKLIST_ROLE` holder that
+    ///      called `ejectNode` directly). The guarded form could never repair
+    ///      that drift, leaving the operator permanently latched and unable to
+    ///      re-bond. The local-flag guard still scopes the `isOperatorBlacklisted`
+    ///      clear + `OperatorBlacklistCleared` event to a genuine state change.
+    function removeOperator(address operator) external nonReentrant onlyRole(GOVERNANCE_ROLE) {
+        if (operator == address(0)) revert ZeroAddress();
         if (isOperatorBlacklisted[operator]) {
             isOperatorBlacklisted[operator] = false;
             emit OperatorBlacklistCleared(operator);
         }
+        capacityBond.unEjectNode(operator);
     }
 
     function setOriginBlacklist(address origin, bool blacklisted) external onlyRole(GOVERNANCE_ROLE) {

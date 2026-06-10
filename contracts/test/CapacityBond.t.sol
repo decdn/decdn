@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { Vm } from "forge-std/Vm.sol";
 
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { SlashStatus, SlashRecord } from "../src/SlashEscrowLib.sol";
@@ -59,6 +60,7 @@ contract CapacityBondTest is Test {
         vm.startPrank(admin);
         bond.grantRole(bond.SLASH_ROLE(), admin);
         bond.grantRole(bond.SLASH_APPEAL_ROLE(), admin);
+        bond.grantRole(bond.BLACKLIST_ROLE(), admin);
         token.transfer(operator, 200_000e18);
         vm.stopPrank();
 
@@ -245,6 +247,186 @@ contract CapacityBondTest is Test {
         assertEq(slashed, 110e18); // capped to at-risk (10 + 100), not 132e18
         assertEq(newActive, 0);
         assertEq(newUnbonding, 0);
+    }
+
+    // ── Blacklist-ejection latch (issue #850) ───────────────────────────────
+    // `ejected` is set by two mechanisms with different permanence: recoverable
+    // slash auto-ejection (ADR 026) and permanent governance blacklisting
+    // (ADR 011). `blacklistEjected` latches the second so `bond()` can't clear
+    // it. Drop the operator below `minBond/2` (25k) with three escalating slashes
+    // (50k → 47.5k → 40.375k → 20.1875k) where a slash auto-eject is needed.
+
+    /// @notice Core bug lock-in: a governance-blacklisted operator cannot
+    ///         self-reinstate by re-bonding above `minBond`.
+    function test_blacklistEjected_cannotSelfReinstateViaBond() public {
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+
+        vm.prank(admin);
+        bond.ejectNode(operator);
+        assertTrue(bond.ejected(operator));
+        assertTrue(bond.blacklistEjected(operator));
+        assertFalse(bond.isActive(operator));
+
+        // Re-bond well above `minBond` — the slash-recovery path must NOT fire
+        // while the governance latch is set.
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        assertTrue(bond.ejected(operator)); // still ejected — no self-reinstate
+        assertTrue(bond.blacklistEjected(operator));
+        assertFalse(bond.isActive(operator));
+    }
+
+    /// @notice Governance lifting the blacklist clears only the latch; the
+    ///         operator re-enters through the normal re-bond reinstatement.
+    function test_unEjectNode_clearsBlacklistLatch_thenRebondReinstates() public {
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        vm.prank(admin);
+        bond.ejectNode(operator);
+
+        vm.expectEmit(true, false, false, false, address(bond));
+        emit CapacityBond.BlacklistEjectionCleared(operator);
+        vm.prank(admin);
+        bond.unEjectNode(operator);
+        assertFalse(bond.blacklistEjected(operator));
+        assertTrue(bond.ejected(operator)); // latch cleared, master gate not
+
+        // A re-bond (balance already ≥ minBond) now reinstates via `bond()`.
+        vm.expectEmit(true, false, false, false, address(bond));
+        emit CapacityBond.Reinstated(operator);
+        vm.prank(operator);
+        bond.bond(1e18);
+        assertFalse(bond.ejected(operator));
+    }
+
+    function test_unEjectNode_onlyBlacklistRole() public {
+        _expectMissingRole(operator, bond.BLACKLIST_ROLE());
+        vm.prank(operator);
+        bond.unEjectNode(operator);
+    }
+
+    /// @notice Un-ejecting an operator that was never blacklist-ejected is a
+    ///         clean no-op (guarded; no revert, no state flip).
+    function test_unEjectNode_idempotentNoState() public {
+        vm.prank(admin);
+        bond.unEjectNode(operator);
+        assertFalse(bond.blacklistEjected(operator));
+        assertFalse(bond.ejected(operator));
+    }
+
+    /// @notice The latch is set even when the operator is ALREADY slash-ejected
+    ///         — proves `blacklistEjected` is written outside the
+    ///         `if (!ejected)` one-time-effects guard in `ejectNode`.
+    function test_ejectNode_setsBlacklistLatch_evenWhenAlreadySlashEjected() public {
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+
+        vm.startPrank(admin);
+        bond.slash(operator, challenger, 1); // 5%  → 47.5k
+        bond.slash(operator, challenger, 1); // 15% → 40.375k
+        bond.slash(operator, challenger, 1); // 50% → 20.1875k < 25k → auto-eject
+        vm.stopPrank();
+        assertTrue(bond.ejected(operator));
+        assertFalse(bond.blacklistEjected(operator));
+
+        vm.prank(admin);
+        bond.ejectNode(operator);
+        assertTrue(bond.blacklistEjected(operator));
+
+        // Re-bond above `minBond` still cannot reinstate.
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        assertTrue(bond.ejected(operator));
+    }
+
+    /// @notice Regression: a purely slash-auto-ejected operator (no blacklist)
+    ///         CAN still reinstate by re-bonding (ADR 026 recoverability).
+    function test_slashAutoEjected_canStillReinstateViaBond() public {
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+
+        vm.startPrank(admin);
+        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1);
+        vm.stopPrank();
+        assertTrue(bond.ejected(operator));
+        assertFalse(bond.blacklistEjected(operator));
+
+        vm.expectEmit(true, false, false, false, address(bond));
+        emit CapacityBond.Reinstated(operator);
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        assertFalse(bond.ejected(operator));
+    }
+
+    /// @notice End-to-end security property via the REAL gates: a registered,
+    ///         active operator who is blacklisted flips `isActive` to false and
+    ///         cannot re-register (`registerNode` reverts `OperatorEjected`)
+    ///         even after re-bonding above the curve. The `isActive` assertion
+    ///         here is load-bearing (the node WAS active), unlike the latch
+    ///         unit tests where the operator never registered.
+    function test_blacklistEjected_registerNodeBarred_isActiveFlips() public {
+        uint256 opPk = 0xBEEF1234;
+        address opAddr = vm.addr(opPk);
+
+        uint256 bonded = bond.bondRequired(1000);
+        vm.prank(admin);
+        token.transfer(opAddr, bonded * 2);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(bonded);
+        bond.declareMbps(1000);
+        vm.stopPrank();
+
+        vm.warp(1_000_000);
+        bytes32 nodeId = bytes32(uint256(0xB1AC5));
+        bytes memory bindingSig = _signBindNode(opPk, opAddr, nodeId);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "us-east", bindingSig, hex"01");
+        assertTrue(bond.isActive(opAddr)); // active before blacklist
+
+        vm.prank(admin);
+        bond.ejectNode(opAddr);
+        assertFalse(bond.isActive(opAddr)); // gate flips — not a tautology
+
+        // Re-bond well above the curve; the latch must keep both `isActive`
+        // false and `registerNode` barred.
+        vm.prank(opAddr);
+        bond.bond(bonded);
+        assertFalse(bond.isActive(opAddr));
+
+        bytes memory reSig = _signBindNode(opPk, opAddr, nodeId);
+        vm.prank(opAddr);
+        vm.expectRevert(CapacityBond.OperatorEjected.selector);
+        bond.registerNode(nodeId, hex"", "us-east", reSig, hex"01");
+    }
+
+    /// @notice The re-bond of a blacklisted operator must NOT emit `Reinstated`
+    ///         (the off-chain reactivation signal). Guards against a regression
+    ///         that emits the event while leaving `ejected` set.
+    function test_blacklistEjected_reBond_doesNotEmitReinstated() public {
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        vm.prank(admin);
+        bond.ejectNode(operator);
+
+        vm.recordLogs();
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 reinstatedSig = keccak256("Reinstated(address)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics[0] != reinstatedSig, "Reinstated must not fire while blacklisted");
+        }
+    }
+
+    function test_unEjectNode_revertsZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(CapacityBond.ZeroAddress.selector);
+        bond.unEjectNode(address(0));
     }
 
     /// `BondMath.reduceAtTier` against an operator with NO active bond — the
