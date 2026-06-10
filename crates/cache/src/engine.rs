@@ -882,10 +882,13 @@ impl CacheEngine {
     /// request-serving worker that must not stall on disk I/O.
     pub async fn evict(&self, hash: Hash) -> CacheResult<()> {
         // Pre-check under one lock acquisition: short-circuit on
-        // already-evicted (idempotent — don't grow `evicted.log` with a
-        // duplicate line) and reject on cap (DoS bound on an unbounded
-        // public-ish surface). The cap check is racy against concurrent
-        // evicts but the cap itself is a soft DoS bound, not a hard
+        // already-evicted (a sequential repeat-evict of the same hash returns
+        // here and never re-appends) and reject on cap (DoS bound on an
+        // unbounded public-ish surface). Both checks are best-effort against
+        // concurrency: the lock is released before the append below, so two
+        // evict() calls racing the *same* new hash can each pass and append a
+        // duplicate `evicted.log` line — harmless, since replay folds the log
+        // into a `HashSet`. The cap is likewise a soft DoS bound, not a hard
         // invariant — going +ε over by a handful of races is fine.
         {
             let guard = self

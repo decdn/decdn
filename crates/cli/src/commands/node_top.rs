@@ -360,7 +360,7 @@ pub(crate) fn resolve_metrics_url(
 /// or `None` when unset. Pure (takes the value rather than reading the
 /// environment) so the parse/validation logic is testable without mutating
 /// process-global state. A non-numeric value or `0` is an error rather than a
-/// silent fall-through — port 0 is undiallable and signals misconfiguration.
+/// silent fall-through — port 0 cannot be dialed and signals misconfiguration.
 fn metrics_url_from_env(raw: Option<String>) -> anyhow::Result<Option<String>> {
     let Some(raw) = raw else { return Ok(None) };
     let port: u16 = raw
@@ -369,7 +369,7 @@ fn metrics_url_from_env(raw: Option<String>) -> anyhow::Result<Option<String>> {
         .map_err(|_| anyhow::anyhow!("DECDN_METRICS_PORT is not a valid port number: {raw:?}"))?;
     if port == 0 {
         anyhow::bail!(
-            "DECDN_METRICS_PORT=0 is not a diallable port; pass --metrics-url or set a non-zero port"
+            "DECDN_METRICS_PORT=0 cannot be dialed; pass --metrics-url or set a non-zero port"
         );
     }
     Ok(Some(format!("http://127.0.0.1:{port}")))
