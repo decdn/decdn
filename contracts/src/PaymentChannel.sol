@@ -85,6 +85,11 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     // EIP-712 voucher typing (ADR 003 § EIP-712 Voucher Signature)
     // -----------------------------------------------------------------
 
+    /// @dev The typehash fixes only the voucher struct shape; cross-chain and
+    ///      cross-contract replay protection comes from the EIP-712 domain
+    ///      separator (chainId + this contract's address) bound in at
+    ///      sign/verify time by the inherited `EIP712` base, not from the
+    ///      typehash itself (ADR 003 § EIP-712 Voucher Signature).
     bytes32 public constant VOUCHER_TYPEHASH =
         keccak256("Voucher(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)");
 
