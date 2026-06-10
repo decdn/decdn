@@ -43,7 +43,7 @@ pub const fn default_buffered_max_bytes() -> u64 {
 /// disables the buffer-then-commit body-phase path (#519), forcing all
 /// body-phase failures through the abort+restart streaming path.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetryPolicy {
     /// Number of *retries* after the initial attempt. Total attempts =
     /// `max_retries + 1`. `0` disables retry.

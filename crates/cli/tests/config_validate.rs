@@ -139,6 +139,45 @@ fn validate_fails_when_required_field_missing() -> anyhow::Result<()> {
 }
 
 #[test]
+fn validate_fails_for_unknown_field_in_section() -> anyhow::Result<()> {
+    // #842: a typo'd key inside a known section must fail at load rather than
+    // silently keeping the default for the intended (security-relevant) knob.
+    let body = format!("{VALID_CONFIG}\n[gossip]\nsubscribe_globall = false\n");
+    let dir = TempDir::new()?;
+    let path = write_config(&dir, &body)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+    let err = commands::config_validate(Some(&path), &args(dir.path())?)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("subscribe_globall"),
+        "error should name the unknown key: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
+fn validate_fails_for_typoed_whole_section() -> anyhow::Result<()> {
+    // #842: a typo'd whole-section header (`[netork]` for `[network]`) is the
+    // highest-value catch — `deny_unknown_fields` on `FileConfig` rejects it
+    // instead of dropping the entire section.
+    let body = format!("{VALID_CONFIG}\n[netork]\nrelay_urls = [\"https://ok.example\"]\n");
+    let dir = TempDir::new()?;
+    let path = write_config(&dir, &body)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+    let err = commands::config_validate(Some(&path), &args(dir.path())?)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("netork"),
+        "error should name the unknown section: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
 fn validate_fails_when_env_var_unset() -> anyhow::Result<()> {
     // PID-suffixed name plus an up-front `var_os` check guarantees neither a
     // concurrent test nor ambient CI environment can silently satisfy the
