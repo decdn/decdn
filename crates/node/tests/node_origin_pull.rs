@@ -80,10 +80,81 @@ fn binding_dom() -> Eip712Domain {
     bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99))
 }
 
-/// A buyer-channel opener that hands back a fixed fresh-channel context, so the
-/// test exercises the pull without a chain or the real `BuyerChannelService`.
+/// A recorded `record_progress` call: `(provider, nonce, bytes_delivered, amount)`.
+type ProgressEntry = (Address, U256, U256, U256);
+
+/// A buyer-channel opener that stands in for the chain-backed
+/// `BuyerChannelService`, so the test exercises the pull without a chain.
+///
+/// It also models the #852 persistence loop: [`ChannelOpener::record_progress`]
+/// appends to `recorded`, and `open_or_reuse_channel` seeds the returned
+/// context's `prior_*` from the latest recorded entry for that provider — exactly
+/// what the real store-backed service does on reuse. A second pull therefore
+/// resumes from the first pull's watermark instead of re-signing a stale voucher.
 #[derive(Debug)]
 struct StubOpener {
+    channel_id: B256,
+    token: Address,
+    deposit: U256,
+    signer: Arc<PrivateKeySigner>,
+    voucher_domain: Eip712Domain,
+    /// `record_progress` calls in order — the test's view of what was persisted.
+    recorded: Arc<Mutex<Vec<ProgressEntry>>>,
+}
+
+#[async_trait]
+impl ChannelOpener for StubOpener {
+    async fn open_or_reuse_channel(
+        &self,
+        provider_addr: Address,
+        _deposit_hint: U256,
+    ) -> Result<ChannelContext> {
+        let recorded = self
+            .recorded
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?;
+        // Resume from the latest persisted watermark for this provider (fresh
+        // zeros if none) — the reuse path the #852 fix makes correct.
+        let (prior_nonce, prior_bytes_delivered, prior_amount) = recorded
+            .iter()
+            .rev()
+            .find(|(provider, ..)| *provider == provider_addr)
+            .map_or((U256::ZERO, U256::ZERO, U256::ZERO), |(_, n, b, a)| {
+                (*n, *b, *a)
+            });
+        Ok(ChannelContext {
+            channel_id: self.channel_id,
+            token: self.token,
+            deposit: self.deposit,
+            client_signer: Arc::clone(&self.signer),
+            voucher_domain: self.voucher_domain.clone(),
+            prior_nonce,
+            prior_bytes_delivered,
+            prior_amount,
+        })
+    }
+
+    fn record_progress(
+        &self,
+        provider_addr: Address,
+        nonce: U256,
+        bytes_delivered: U256,
+        amount: U256,
+    ) -> Result<()> {
+        self.recorded
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?
+            .push((provider_addr, nonce, bytes_delivered, amount));
+        Ok(())
+    }
+}
+
+/// An opener that hands back a fresh-channel context but whose `record_progress`
+/// always fails — models a store-write failure on the persist path so a test can
+/// assert the pull still delivers the paid-for bytes (#852: a persist failure
+/// must not fail the pull, only surface via the metric + warn).
+#[derive(Debug)]
+struct FailingRecordOpener {
     channel_id: B256,
     token: Address,
     deposit: U256,
@@ -92,7 +163,7 @@ struct StubOpener {
 }
 
 #[async_trait]
-impl ChannelOpener for StubOpener {
+impl ChannelOpener for FailingRecordOpener {
     async fn open_or_reuse_channel(
         &self,
         _provider_addr: Address,
@@ -108,6 +179,16 @@ impl ChannelOpener for StubOpener {
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
         })
+    }
+
+    fn record_progress(
+        &self,
+        _provider_addr: Address,
+        _nonce: U256,
+        _bytes_delivered: U256,
+        _amount: U256,
+    ) -> Result<()> {
+        anyhow::bail!("simulated buyer-channel store write failure")
     }
 }
 
@@ -202,13 +283,46 @@ fn spawn_a_server(
 /// origin directory), a static `addr_map` resolver, a fixed-channel opener, and
 /// real reputation/metrics handles. Tests vary `providers`/`addr_map` to drive
 /// the discovery / resolution / probe / pull branches.
-#[allow(clippy::too_many_arguments, clippy::expect_used)]
+///
+/// Returns the origin plus the [`StubOpener`]'s `recorded` log so a test can
+/// assert what voucher progress was persisted (#852).
+#[allow(clippy::too_many_arguments)]
 fn provisioned_origin(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hash: Hash,
     channel_id: B256,
     buyer_signer: &Arc<PrivateKeySigner>,
+    local_rep: &Arc<LocalReputation>,
+    obs_buffer: &Arc<ObservationBuffer>,
+    metrics: &Arc<Metrics>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+) -> (NodeOrigin, Arc<Mutex<Vec<ProgressEntry>>>) {
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(buyer_signer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin(
+        ep_b, b_dht, hash, buyer, local_rep, obs_buffer, metrics, providers, addr_map,
+    );
+    (origin, recorded)
+}
+
+/// Provision a `NodeOrigin` with stubbed discovery/resolver/reputation around a
+/// caller-supplied buyer `ChannelOpener`, so a test can inject any opener
+/// (recording, failing, …) without re-wiring the deps.
+#[allow(clippy::too_many_arguments, clippy::expect_used)]
+fn build_origin(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    hash: Hash,
+    buyer: Arc<dyn ChannelOpener>,
     local_rep: &Arc<LocalReputation>,
     obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
@@ -226,13 +340,7 @@ fn provisioned_origin(
         origin_directory: Arc::new(ConfigOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
-        buyer: Arc::new(StubOpener {
-            channel_id,
-            token: TOKEN,
-            deposit: U256::from(DEPOSIT_MICRO_USDC),
-            signer: Arc::clone(buyer_signer),
-            voucher_domain: voucher_dom(),
-        }) as Arc<dyn ChannelOpener>,
+        buyer,
         self_id: b_dht,
         slash_domain: slash_domain(),
         local_rep: Arc::clone(local_rep),
@@ -263,6 +371,15 @@ fn one_provider(
     let mut addr_map = HashMap::new();
     addr_map.insert(a_dht, a_eth_addr);
     (vec![a_dht], addr_map)
+}
+
+/// Snapshot the `StubOpener`'s persisted-progress log (the #852 watermark the
+/// pull path recorded via `record_progress`).
+fn progress_log(recorded: &Arc<Mutex<Vec<ProgressEntry>>>) -> Result<Vec<ProgressEntry>> {
+    let log = recorded
+        .lock()
+        .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?;
+    Ok(log.clone())
 }
 
 /// Assert a `decdn_<name> <value>` counter line is present in the metrics text.
@@ -355,7 +472,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let origin = provisioned_origin(
+    let (origin, recorded) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -405,6 +522,22 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     // Observability: the success + attempt counters moved.
     assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
+
+    // #852: the buyer persisted the channel's voucher watermark after the pull.
+    // 1.5 MiB at RATE 10/MiB over a 1-MiB interval ⇒ two vouchers: the closing
+    // one carries nonce 2, the full 1,572,864 bytes, and the cumulative amount 15
+    // (10 for the first MiB + 5 for the trailing half).
+    anyhow::ensure!(
+        progress_log(&recorded)?
+            == vec![(
+                a_eth.address(),
+                U256::from(2),
+                U256::from(total_bytes),
+                U256::from(15)
+            )],
+        "expected one persisted progress entry with the final voucher totals, got {:?}",
+        progress_log(&recorded)?
+    );
 
     ep_b.close().await;
     ep_a.close().await;
@@ -539,7 +672,7 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
-    let origin = provisioned_origin(
+    let (origin, recorded) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -562,6 +695,10 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
     anyhow::ensure!(
         obs_buffer.drain().is_empty(),
         "no reputation on a no-provider miss"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "no pull ⇒ no voucher acked ⇒ nothing to persist (#852 guard)"
     );
     assert_counter(&b_metrics, "node_pull_no_providers_total", 1)?;
     ep_b.close().await;
@@ -615,7 +752,7 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
     let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     // Provider discovered, but addr_map is EMPTY → unresolvable.
-    let origin = provisioned_origin(
+    let (origin, recorded) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -638,6 +775,10 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
     anyhow::ensure!(
         obs_buffer.drain().is_empty(),
         "an unresolvable provider must NOT be scored (not its fault)"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "skipped-before-pull ⇒ nothing persisted (#852 guard)"
     );
     ep_b.close().await;
     ep_a.close().await;
@@ -663,7 +804,7 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
         DhtNodeId::from_bytes(*a_id.as_bytes()),
         Address::repeat_byte(0x44),
     );
-    let origin = provisioned_origin(
+    let (origin, recorded) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -691,6 +832,10 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
     anyhow::ensure!(
         m.uptime_observed == Some(false) && m.data_correct.is_none(),
         "probe failure must score Unreachable, got {m:?}"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "an unprobeable provider is never paid ⇒ nothing persisted (#852 guard)"
     );
     assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
     ep_b.close().await;
@@ -742,7 +887,7 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let origin = provisioned_origin(
+    let (origin, recorded) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -777,6 +922,291 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
         local_rep.score(a_id)
     );
     assert_counter(&b_metrics, "node_pull_corruption_total", 1)?;
+
+    // #852: a paid-but-corrupt delivery still advanced the upstream's accepted
+    // voucher (it acked the closing voucher before we caught the hash mismatch),
+    // so the buyer MUST persist that watermark — otherwise the next reuse of this
+    // channel re-signs a stale voucher and is rejected. 4096 B over a 1-MiB
+    // interval ⇒ one closing voucher: nonce 1, 4096 bytes, amount 1.
+    anyhow::ensure!(
+        progress_log(&recorded)?
+            == vec![(
+                a_eth.address(),
+                U256::from(1),
+                U256::from(4096),
+                U256::from(1)
+            )],
+        "corrupt-but-paid delivery must persist its acked watermark, got {:?}",
+        progress_log(&recorded)?
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
+/// The #852 regression: a second cache-miss pull to the same provider **reuses**
+/// the buyer channel and resumes from the persisted voucher watermark, so it
+/// signs `nonce = 3, 4 …` (not a stale `nonce = 1`) and the upstream accepts it.
+///
+/// Before the fix, the first pull's progress was never persisted, so the second
+/// pull re-signed from zero and the upstream rejected it (`StaleNonce`) — the
+/// second fetch would be a `NotFound`. Here both fetches deliver the blob and the
+/// persisted log advances monotonically (nonce 2 → 4, bytes 1.5 MiB → 3 MiB).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
+    let payload = vec![0xABu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: holds the blob; serves probe + client over one endpoint. -----
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xA1);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let (origin, recorded) = provisioned_origin(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        channel_id,
+        &b_buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        providers,
+        addr_map,
+    );
+
+    // First pull: opens the channel, pays nonce 1..2, persists the watermark.
+    let first = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("first fetch failed: {e}"))?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("first fetch returned NotFound"))?;
+    anyhow::ensure!(
+        first.as_ref() == payload.as_slice(),
+        "first pull bytes mismatch"
+    );
+
+    // Second pull: REUSES the channel, resumes from the persisted watermark, and
+    // the upstream accepts the continued nonces — this is the bug's fix.
+    let second = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("second fetch failed: {e}"))?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "second fetch returned NotFound — stale voucher rejected (the #852 bug)"
+            )
+        })?;
+    anyhow::ensure!(
+        second.as_ref() == payload.as_slice(),
+        "second pull bytes mismatch"
+    );
+
+    // The persisted watermark advanced monotonically across the two pulls rather
+    // than resetting: nonce 2 → 4, cumulative bytes 1.5 MiB → 3 MiB, amount 15 → 30.
+    let log = progress_log(&recorded)?;
+    anyhow::ensure!(
+        log == vec![
+            (
+                a_eth.address(),
+                U256::from(2),
+                U256::from(total_bytes),
+                U256::from(15)
+            ),
+            (
+                a_eth.address(),
+                U256::from(4),
+                U256::from(2 * total_bytes),
+                U256::from(30),
+            ),
+        ],
+        "expected two monotonically-advancing progress entries, got {log:?}"
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
+/// A failure to persist the voucher watermark (#852) must NOT fail the pull — the
+/// bytes are already delivered and paid for — but it must surface via the
+/// `node_pull_progress_persist_failures` counter so an operator can see the
+/// channel is now at risk of stale-voucher rejection on its next reuse.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<()> {
+    let payload = vec![0xABu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: holds the blob; serves probe + client over one endpoint. -----
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xA1);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: NodeOrigin wired to an opener whose record_progress fails. ----
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let buyer = Arc::new(FailingRecordOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        providers,
+        addr_map,
+    );
+
+    // The pull delivers the verified bytes even though persisting the watermark
+    // failed — the persist error must not discard already-paid-for content.
+    let bytes = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch failed: {e}"))?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("persist failure must not turn the pull into NotFound"))?;
+    anyhow::ensure!(
+        bytes.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+
+    // …but the failure is observable: the delivery still scored a clean success,
+    // and the persist-failure counter moved exactly once.
+    assert_counter(&b_metrics, "node_pull_success_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_progress_persist_failures_total", 1)?;
 
     ep_b.close().await;
     ep_a.close().await;

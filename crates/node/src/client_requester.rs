@@ -105,6 +105,74 @@ impl std::fmt::Debug for ChannelContext {
     }
 }
 
+/// The channel's acked voucher watermark, threaded through [`stream_fetch_tracked`]
+/// as an out-param so the caller can persist what it paid (#852).
+///
+/// [`stream_fetch_tracked`] seeds the watermark from the channel's prior
+/// cumulative state (`seed`) and advances it after **each** `VoucherAck`
+/// (`commit_ack`) — so it always holds the
+/// **absolute** cumulative totals of the last *acked* voucher (not per-stream
+/// deltas), exactly the triple `BuyerChannelService::record_progress` expects.
+/// Because the update is in place after the ack, the latest acked totals survive
+/// an `Err` return or a timeout cancellation, so a mid-stream failure or a
+/// paid-but-corrupt delivery is still recorded against the upstream's committed
+/// watermark (ADR 003).
+///
+/// **Acked only.** The watermark tracks vouchers the upstream *acknowledged*. If
+/// the upstream commits a voucher (ADR 003: commit precedes the ack) but the ack
+/// is then lost — a dropped connection while reading it — the watermark lags by
+/// that one voucher; the next reuse re-signs a stale nonce and is rejected until
+/// the channel rotates. That residual is inherent to one-sided ack loss and is
+/// not closed here (it would need a reconciliation read of the upstream's
+/// committed nonce on the next open).
+///
+/// Read the persistable totals via [`VoucherProgress::acked`], which yields `None`
+/// when nothing was acked on this stream (so there is nothing to persist).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VoucherProgress {
+    /// Nonce of the last acked voucher (the channel's prior nonce until the first
+    /// ack on this stream).
+    nonce: U256,
+    /// Cumulative channel bytes paid for as of the last acked voucher.
+    bytes_delivered: U256,
+    /// Cumulative channel amount paid as of the last acked voucher.
+    amount: U256,
+    /// Count of vouchers acked on this stream.
+    vouchers_sent: u64,
+}
+
+impl VoucherProgress {
+    /// Seed the watermark from the channel's prior cumulative state (the last
+    /// voucher acked on earlier streams). `vouchers_sent` starts at `0` — it
+    /// counts acks on *this* stream.
+    const fn seed(ctx: &ChannelContext) -> Self {
+        Self {
+            nonce: ctx.prior_nonce,
+            bytes_delivered: ctx.prior_bytes_delivered,
+            amount: ctx.prior_amount,
+            vouchers_sent: 0,
+        }
+    }
+
+    /// Advance the watermark to an acked voucher's absolute cumulative totals.
+    /// All four fields move together; call this **only** once the upstream has
+    /// acked, so a signed-but-rejected voucher never moves the watermark.
+    const fn commit_ack(&mut self, nonce: U256, bytes_delivered: U256, amount: U256) {
+        self.nonce = nonce;
+        self.bytes_delivered = bytes_delivered;
+        self.amount = amount;
+        self.vouchers_sent = self.vouchers_sent.saturating_add(1);
+    }
+
+    /// The cumulative `(nonce, bytes_delivered, amount)` to persist via
+    /// `record_progress`, or `None` if no voucher was acked on this stream
+    /// (nothing new was paid, so there is nothing to record).
+    #[must_use]
+    pub fn acked(&self) -> Option<(U256, U256, U256)> {
+        (self.vouchers_sent > 0).then_some((self.nonce, self.bytes_delivered, self.amount))
+    }
+}
+
 /// The upstream delivered bytes whose whole-blob BLAKE3 hash did not match the
 /// requested content hash — a paid-but-corrupt delivery (the content-addressing
 /// invariant, ADR 014). Returned (via `anyhow`) by [`stream_fetch`] so callers
@@ -125,7 +193,9 @@ impl std::error::Error for HashMismatch {}
 /// Fetch `hash` from `target` over `cdn/client/v1`, paying as bytes arrive.
 ///
 /// `expected_signer` is the delivering node's Ethereum address, used to verify
-/// the response `slash_sig`. `byte_offset` resumes a partial fetch.
+/// the response `slash_sig`. `byte_offset` resumes a partial fetch. Use
+/// [`stream_fetch_tracked`] instead if you need to persist the voucher watermark
+/// the channel reached (#852); this convenience wrapper discards it.
 ///
 /// # Errors
 ///
@@ -144,6 +214,47 @@ pub async fn stream_fetch(
     timestamp_us: u64,
     timeout: Duration,
 ) -> anyhow::Result<Bytes> {
+    stream_fetch_tracked(
+        endpoint,
+        target,
+        ctx,
+        slash_domain,
+        expected_signer,
+        hash,
+        byte_offset,
+        timestamp_us,
+        timeout,
+        &mut VoucherProgress::default(),
+    )
+    .await
+}
+
+/// Like [`stream_fetch`], but reports the channel's acked voucher watermark via
+/// the `progress` out-param so the caller can persist what it paid (#852).
+///
+/// `progress` is updated in place with the cumulative `(nonce, bytes_delivered,
+/// amount)` of each acked voucher; it is threaded into `fetch_inner` by reference
+/// (not captured by value) so the writes made before a timeout cancellation
+/// persist. On return — `Ok`, `Err`, or timeout — it holds the last acked totals,
+/// so the caller can record progress even for a mid-stream failure or a
+/// paid-but-corrupt delivery. See [`VoucherProgress`].
+///
+/// # Errors
+///
+/// Same as [`stream_fetch`].
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_fetch_tracked(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &ChannelContext,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    timeout: Duration,
+    progress: &mut VoucherProgress,
+) -> anyhow::Result<Bytes> {
     let bytes = tokio::time::timeout(
         timeout,
         fetch_inner(
@@ -155,6 +266,7 @@ pub async fn stream_fetch(
             hash,
             byte_offset,
             timestamp_us,
+            progress,
         ),
     )
     .await
@@ -172,6 +284,7 @@ async fn fetch_inner(
     hash: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
+    progress: &mut VoucherProgress,
 ) -> anyhow::Result<Bytes> {
     // Full handshake — no 0-RTT on cdn/client/v1 (ADR 015).
     let conn = endpoint
@@ -227,13 +340,13 @@ async fn fetch_inner(
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
     let mut unvouchered: u64 = 0;
-    let mut vouchers_sent: u64 = 0;
-    // Running cumulative voucher state, seeded from the channel's prior state so
-    // each voucher's *delta* (not the rounded cumulative) covers its own bytes —
-    // otherwise two small streams that round to the same cumulative amount
-    // produce a zero-delta voucher the node rejects as underpayment.
-    let mut paid_bytes = ctx.prior_bytes_delivered;
-    let mut paid_amount = ctx.prior_amount;
+    // Seed the acked watermark from the channel's prior cumulative state (the last
+    // voucher acked on earlier streams). Each `self_pay` advances it after the
+    // upstream acks, so each voucher's *delta* (not the rounded cumulative) covers
+    // its own bytes — otherwise two small streams that round to the same
+    // cumulative amount produce a zero-delta voucher the node rejects as
+    // underpayment.
+    *progress = VoucherProgress::seed(ctx);
 
     loop {
         match read_client_message(&mut recv).await? {
@@ -258,17 +371,7 @@ async fn fetch_inner(
                 let boundary = unvouchered >= interval_bytes && interval_bytes > 0;
                 let closing = cumulative >= expected && unvouchered > 0;
                 if boundary || closing {
-                    self_pay(
-                        &mut send,
-                        &mut recv,
-                        ctx,
-                        rate_per_mb,
-                        cumulative,
-                        &mut paid_bytes,
-                        &mut paid_amount,
-                        &mut vouchers_sent,
-                    )
-                    .await?;
+                    self_pay(&mut send, &mut recv, ctx, rate_per_mb, cumulative, progress).await?;
                     unvouchered = 0;
                 }
             }
@@ -295,32 +398,31 @@ async fn fetch_inner(
 /// far (prior state + `stream_bytes` of this stream), then await `VoucherAck`.
 ///
 /// Vouchers are cumulative across the channel's lifetime. The amount is built up
-/// from `paid_amount` by adding `ceil(bytes_delta * rate / 1 MiB)` for the bytes
-/// since the previous voucher, so every voucher's *delta* covers its own bytes
-/// at the advertised rate (the node checks deltas, not the rounded cumulative).
-/// Seeding `paid_*`/nonce from [`ChannelContext`] `prior_*` is what lets a reused
-/// channel resume rather than regress.
-#[allow(clippy::too_many_arguments)]
+/// from `progress.amount` by adding `ceil(bytes_delta * rate / 1 MiB)` for the
+/// bytes since the previous voucher, so every voucher's *delta* covers its own
+/// bytes at the advertised rate (the node checks deltas, not the rounded
+/// cumulative). The watermark in `progress` (seeded from [`ChannelContext`]
+/// `prior_*`) is what lets a reused channel resume rather than regress. It
+/// advances via [`VoucherProgress::commit_ack`] **only after** the upstream acks,
+/// so a rejected voucher leaves the persisted watermark at the last acked value.
 async fn self_pay(
     send: &mut SendStream,
     recv: &mut RecvStream,
     ctx: &ChannelContext,
     rate_per_mb: u64,
     stream_bytes: u64,
-    paid_bytes: &mut U256,
-    paid_amount: &mut U256,
-    vouchers_sent: &mut u64,
+    progress: &mut VoucherProgress,
 ) -> anyhow::Result<()> {
-    *vouchers_sent = vouchers_sent.saturating_add(1);
-    let nonce = ctx.prior_nonce.saturating_add(U256::from(*vouchers_sent));
+    let next_count = progress.vouchers_sent.saturating_add(1);
+    let nonce = ctx.prior_nonce.saturating_add(U256::from(next_count));
     let new_bytes = ctx
         .prior_bytes_delivered
         .saturating_add(U256::from(stream_bytes));
-    let bytes_delta = new_bytes.saturating_sub(*paid_bytes);
+    let bytes_delta = new_bytes.saturating_sub(progress.bytes_delivered);
     let amount_delta = bytes_delta
         .saturating_mul(U256::from(rate_per_mb))
         .div_ceil(U256::from(MB_BYTES));
-    let amount = paid_amount.saturating_add(amount_delta);
+    let amount = progress.amount.saturating_add(amount_delta);
 
     let signed = Voucher {
         channel_id: ctx.channel_id,
@@ -331,8 +433,6 @@ async fn self_pay(
     }
     .sign(ctx.client_signer.as_ref(), &ctx.voucher_domain)
     .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}"))?;
-    *paid_bytes = new_bytes;
-    *paid_amount = amount;
 
     write_message(
         send,
@@ -340,7 +440,12 @@ async fn self_pay(
     )
     .await?;
     match read_client_message(recv).await? {
-        ClientMessage::VoucherAck => Ok(()),
+        // Commit the acked watermark only now: the upstream persists before it
+        // acks (ADR 003), so this is the cumulative total it has accepted.
+        ClientMessage::VoucherAck => {
+            progress.commit_ack(nonce, new_bytes, amount);
+            Ok(())
+        }
         ClientMessage::StreamError(e) => anyhow::bail!("voucher rejected: {e:?}"),
         other => anyhow::bail!("expected VoucherAck, got {}", variant_name(&other)),
     }

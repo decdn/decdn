@@ -461,6 +461,14 @@ pub struct DecdnMetrics {
     /// node's own payment-side fault (gas, RPC, expired channel), NOT the
     /// provider's — a sustained rate means node→node buying is wedged.
     pub node_pull_channel_open_failures: Counter,
+    /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
+    /// voucher but persisting the buyer channel's resume watermark
+    /// (`record_progress`) failed. The bytes were delivered, but the channel's
+    /// stored `nonce`/`bytes`/`amount` now lags what the upstream accepted — the
+    /// next reuse of this channel will re-sign a stale voucher and be rejected. A
+    /// non-zero count means a provider is at risk of becoming unusable until
+    /// channel rotation.
+    pub node_pull_progress_persist_failures: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
@@ -986,6 +994,12 @@ impl Metrics {
     /// A buyer channel open/reuse failed before a pull could start (#831).
     pub fn node_pull_channel_open_failure(&self) {
         self.decdn.node_pull_channel_open_failures.inc();
+    }
+
+    /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark
+    /// failed (#852); the channel's stored progress now lags the upstream.
+    pub fn node_pull_progress_persist_failure(&self) {
+        self.decdn.node_pull_progress_persist_failures.inc();
     }
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).

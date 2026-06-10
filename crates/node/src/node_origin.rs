@@ -55,7 +55,7 @@ use decdn_reputation::{
 };
 
 use crate::buyer_channel::ChannelOpener;
-use crate::client_requester::{HashMismatch, stream_fetch};
+use crate::client_requester::{HashMismatch, VoucherProgress, stream_fetch_tracked};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
@@ -379,7 +379,8 @@ async fn pull_from_candidate(
         }
     };
     let started = Instant::now();
-    match stream_fetch(
+    let mut progress = VoucherProgress::default();
+    let result = stream_fetch_tracked(
         &deps.endpoint,
         EndpointAddr::new(pk),
         &ctx,
@@ -389,9 +390,24 @@ async fn pull_from_candidate(
         0,
         now_micros(),
         deps.config.pull_timeout,
+        &mut progress,
     )
-    .await
+    .await;
+    // Persist whatever the upstream acked, regardless of Ok/Err: a mid-stream
+    // failure or a paid-but-corrupt (hash-mismatch) delivery can still have
+    // advanced the upstream's accepted-voucher watermark. Skipping this is the
+    // #852 bug — the channel re-signs a stale voucher on its next reuse and is
+    // rejected. The bytes are already paid for, so a persist failure must not
+    // fail the pull; surface it loudly instead (it breaks the next reuse).
+    if let Some((nonce, bytes_delivered, amount)) = progress.acked()
+        && let Err(err) = deps
+            .buyer
+            .record_progress(provider_addr, nonce, bytes_delivered, amount)
     {
+        deps.metrics.node_pull_progress_persist_failure();
+        warn!(%provider_addr, %err, "node-origin: failed to persist buyer voucher progress");
+    }
+    match result {
         Ok(bytes) => {
             record_outcome(
                 deps,
