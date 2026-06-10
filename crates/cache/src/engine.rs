@@ -80,8 +80,11 @@ struct Inner {
     /// GC task. [`CacheEngine::evict`] deletes the blob's protecting named
     /// tag(s) (#860), so reclaim of disk bytes then happens on the next
     /// iroh-blobs GC sweep, configured via `cache.gc_interval_sec` (#518).
-    /// On-demand (synchronous) reclamation is tracked under #520, blocked on
-    /// upstream exposing the sweep API.
+    /// Reclaim is therefore best-effort: it requires GC to be enabled *and*
+    /// the tag deletion to have succeeded — a failed delete leaves the bytes
+    /// GC-protected and is surfaced via `tag_drop_failures` (serving is
+    /// blocked regardless). On-demand (synchronous) reclamation is tracked
+    /// under #520, blocked on upstream exposing the sweep API.
     ///
     /// Persisted alongside the iroh-blobs store at `<cache_dir>/evicted.log`
     /// on every successful [`CacheEngine::evict`] call so DMCA takedowns and
@@ -867,11 +870,15 @@ impl CacheEngine {
     /// disk is then reclaimed on the next iroh-blobs GC sweep — cadence
     /// `cache.gc_interval_sec`, default 5min (#518) — *when periodic GC is
     /// enabled*. With GC disabled (`gc_interval_sec == 0`) serving still stops
-    /// but the bytes stay on disk until a sweep is configured. The
-    /// operator-visible behavior — the node stops serving the blob
-    /// immediately, and reclaims its disk on the next sweep — is what `decdn
-    /// node evict` (issue #279) needs for use cases like DMCA takedown and
-    /// corruption recovery.
+    /// but the bytes stay on disk until a sweep is configured. Reclaim is
+    /// best-effort in the other direction too: the tag deletion is not
+    /// allowed to fail the takedown, so if it errors the bytes remain
+    /// GC-protected (surfaced via `tag_drop_failures`) while serving stays
+    /// blocked. The operator-visible behavior — the node stops serving the
+    /// blob immediately, and reclaims its disk on the next sweep when GC is
+    /// enabled and the tag delete succeeded — is what `decdn node evict`
+    /// (issue #279) needs for use cases like DMCA takedown and corruption
+    /// recovery.
     ///
     /// Persisted: the eviction is appended (with `fsync`) to
     /// `<cache_dir>/evicted.log` before this call returns successfully, so
