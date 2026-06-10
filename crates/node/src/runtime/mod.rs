@@ -599,6 +599,9 @@ pub async fn run(
                     cfg.blockchain.capacity_bond_address
                 )
             })?;
+    // Reserved for the settlement indexer's read-only provider (#326); cloned
+    // here before `rpc_url` is moved into the wallet providers below.
+    let reputation_rpc_url = rpc_url.clone();
     let chain_provider = ProviderBuilder::new().connect_http(rpc_url.clone());
     let staker_set: Arc<dyn StakerSet> = Arc::new(
         ChainStakerSet::bootstrap(
@@ -1134,9 +1137,50 @@ pub async fn run(
         subscribe_global: cfg.gossip.subscribe_global,
         region: cfg.identity.region.clone(),
         allowlist: cfg.gossip.allowlist.iter().copied().collect::<HashSet<_>>(),
+        subscribe_reputation: cfg.gossip.subscribe_reputation,
+        reputation_publish_interval_sec: cfg.gossip.reputation_publish_interval_sec,
     };
     let gossip_metrics: Arc<dyn GossipMetrics> =
         Arc::new(NodeGossipMetrics::new(Arc::clone(&node_metrics)));
+
+    // Network reputation aggregation (ADR 008, #326). The settlement indexer
+    // (spawned after the gossip service below) feeds `settlement_source` with
+    // network-wide `ChannelSettled` value so reporter weights are live; the
+    // `network_reputation` / `regional_coverage` handles are retained for the
+    // `admin_v1_reputation` read API. Outbound report capture (feeding the
+    // observation buffer from delivery/probe outcomes) remains gated on the
+    // node-to-node pull-through orchestration — tracked by #831.
+    let reputation_cfg = decdn_reputation::NetworkReputationConfig::default();
+    let min_counterparties = reputation_cfg.min_counterparties;
+    let network_reputation = Arc::new(
+        decdn_reputation::NetworkReputation::new(reputation_cfg.clone())
+            .context("network reputation config invalid")?,
+    );
+    let regional_coverage = Arc::new(
+        decdn_reputation::RegionalCoverage::new(reputation_cfg)
+            .context("regional coverage config invalid")?,
+    );
+    let settlement_source = Arc::new(crate::reputation_wiring::NodeSettlementSource::new(
+        min_counterparties,
+    ));
+    let reputation_wiring = decdn_gossip::ReputationWiring {
+        sink: Some(Arc::new(crate::reputation_wiring::NodeReputationSink::new(
+            Arc::clone(&network_reputation),
+            Arc::clone(&regional_coverage),
+            Arc::clone(&settlement_source),
+            Arc::clone(&peer_table),
+            min_counterparties,
+        ))),
+        staked: Some(Arc::new(
+            crate::reputation_wiring::NodeStakedReporterSet::new(Arc::clone(&staker_set)),
+        )),
+        // Outbound report capture is not wired yet (#831): the delivery/probe
+        // hot paths don't feed an `ObservationBuffer`. Leaving `report_drain`
+        // `None` keeps the publisher task unspawned (the node aggregates inbound
+        // reports but emits none) instead of running a publisher that drains an
+        // unreachable, always-empty buffer.
+        report_drain: None,
+    };
     // GossipService owns its own shutdown via this token (#805): cancelling
     // it makes the publisher / subscriber / TTL-sweeper loops return at a
     // clean await boundary, so the runtime no longer reaches in with
@@ -1147,6 +1191,12 @@ pub async fn run(
     let decdn_gossip::GossipHandles {
         tasks: gossip_handles,
         announce_trigger,
+        // No publisher runs while `report_drain` is `None` above: the
+        // reputation publisher task (and therefore this immediate-publish
+        // trigger) is only spawned once outbound capture wires the observation
+        // buffer to the delivery/probe hot paths (#831). Until then the node
+        // aggregates inbound reports but emits none.
+        reputation_publish_trigger: _,
     } = GossipService::spawn(
         ep.clone(),
         secret_key.clone(),
@@ -1155,9 +1205,67 @@ pub async fn run(
         Arc::clone(&peer_table),
         gossip_metrics,
         gossip_shutdown.clone(),
+        reputation_wiring,
     )
     .await
     .context("gossip service failed to start")?;
+
+    // Network-wide settlement indexer (ADR 008, #326): feeds `settlement_source`
+    // so reporter weights are live. Held for the process lifetime (its
+    // `AbortOnDrop` stops the chain watcher on shutdown). Only runs when
+    // reputation gossip is enabled. A bootstrap RPC failure is non-fatal —
+    // reputation is best-effort, so the node still starts (weights stay 0).
+    let _settlement_indexer = if cfg.gossip.subscribe_reputation {
+        match crate::reputation_indexer::SettlementIndexer::bootstrap(
+            ProviderBuilder::new().connect_http(reputation_rpc_url),
+            payment_channel_addr,
+            capacity_bond_addr,
+            Arc::clone(&settlement_source),
+            Arc::clone(&node_metrics),
+        )
+        .await
+        {
+            Ok(indexer) => Some(indexer),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "settlement indexer bootstrap failed; reputation reporter weights will stay 0"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Periodic reputation-map eviction sweep (ADR 008 §Decay; #326 review I3):
+    // bound the in-memory network-score and regional-coverage maps by dropping
+    // entries that have decayed to neutral and been idle past the horizon. A
+    // cheap retain pass at a slow cadence; only runs with reputation enabled,
+    // and exits cleanly on the gossip shutdown token.
+    if cfg.gossip.subscribe_reputation {
+        let net = Arc::clone(&network_reputation);
+        let cov = Arc::clone(&regional_coverage);
+        let sweep_shutdown = gossip_shutdown.clone();
+        tasks.spawn(async move {
+            // 6h: entries are only eligible once idle > 26 weeks, so the sweep
+            // cadence is non-critical; this keeps the retain cost negligible.
+            let mut ticker = tokio::time::interval(std::time::Duration::from_hours(6));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = sweep_shutdown.cancelled() => return,
+                    _ = ticker.tick() => {}
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                net.evict(now);
+                cov.evict(now);
+            }
+        });
+    }
 
     // Drain trigger for `admin_v1_drain` (issue #244). Constructed
     // unconditionally so the admin handler always has a live target —
@@ -1212,7 +1320,13 @@ pub async fn run(
             voucher_activity: Arc::clone(&voucher_activity),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         })
-        .with_region_accountant(Arc::clone(&region_accountant));
+        .with_region_accountant(Arc::clone(&region_accountant))
+        // Reputation introspection for `admin_v1_reputation` (#326). Shares the
+        // same aggregation state the gossip reputation sink updates.
+        .with_reputation(admin::ReputationStatusHandles {
+            network: Arc::clone(&network_reputation),
+            coverage: Arc::clone(&regional_coverage),
+        });
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");
@@ -2449,6 +2563,8 @@ mod tests {
                 announce_interval_sec: 60,
                 peer_ttl_sec: 600,
                 subscribe_global: false,
+                subscribe_reputation: true,
+                reputation_publish_interval_sec: 3600,
                 allowlist: Vec::new(),
                 max_peer_table_entries: 100_000,
             },

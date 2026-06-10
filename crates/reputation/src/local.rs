@@ -38,6 +38,16 @@ pub enum ConfigError {
         reachability: f64,
         sum: f64,
     },
+    /// A `u32` parameter fell below its required minimum (network config).
+    #[error("{field} must be >= {min}, got {value}")]
+    BelowMinimum {
+        field: &'static str,
+        min: u32,
+        value: u32,
+    },
+    /// The local/network blend weights did not sum to 1.0 (network config).
+    #[error("local_weight + network_weight must sum to 1.0; got {local} + {network} = {sum}")]
+    SplitDoesNotSumToOne { local: f64, network: f64, sum: f64 },
 }
 
 /// Outcome of a single delivery interaction with a peer.
@@ -168,14 +178,20 @@ impl LocalReputation {
     }
 
     fn interaction_score(&self, outcome: Outcome) -> f64 {
+        let w = crate::interaction::InteractionWeights {
+            speed: self.config.speed_weight,
+            correctness: self.config.correctness_weight,
+            reachability: self.config.reachability_weight,
+        };
         match outcome {
+            // speed 0, correctness 0, reachability 0
             Outcome::Unreachable => 0.0,
-            Outcome::Corruption => self.config.reachability_weight,
+            // reachable but the bytes failed verification: only reachability
+            Outcome::Corruption => crate::interaction::interaction_score(w, 0.0, 0.0, 1.0),
+            // correctly delivered: full correctness + reachability, scaled speed
             Outcome::Delivered { bytes, elapsed } => {
                 let speed = speed_score(bytes, elapsed, self.config.expected_bps);
-                self.config.speed_weight * speed
-                    + self.config.correctness_weight
-                    + self.config.reachability_weight
+                crate::interaction::interaction_score(w, speed, 1.0, 1.0)
             }
         }
     }
@@ -190,18 +206,10 @@ impl LocalReputation {
     }
 }
 
-// u64→f64 loses precision above 2^53 (~9 PB) — far above any plausible
-// single transfer; the result is then clamped to [0, 1] so any drift above
-// 2^53 rounds within the saturated range and cannot escape the score envelope.
-#[allow(clippy::cast_precision_loss)]
+// Thin wrapper over the shared formula so local and network paths cannot
+// drift (see [`crate::interaction`]).
 fn speed_score(bytes: u64, elapsed: Duration, expected_bps: u64) -> f64 {
-    let secs = elapsed.as_secs_f64();
-    if !secs.is_finite() || secs <= 0.0 || expected_bps == 0 {
-        return 0.0;
-    }
-    let actual_bps = bytes as f64 / secs;
-    let expected = expected_bps as f64;
-    (actual_bps / expected).clamp(0.0, 1.0)
+    crate::interaction::speed_score_from_transfer(bytes, elapsed, expected_bps)
 }
 
 fn validate(c: &LocalReputationConfig) -> Result<(), ConfigError> {

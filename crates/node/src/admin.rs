@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::U256;
 use alloy::signers::local::PrivateKeySigner;
@@ -21,12 +21,14 @@ use decdn_common::admin::{
     AdminRpcServer, AnnounceResponse, BucketStat, CACHE_ERROR_CODE, CHANNEL_STORE_ERROR_CODE,
     CONFIG_PATH_UNSET_CODE, ChannelSnapshot, ChannelsResponse, DHT_POISONED_CODE,
     DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
-    HealthResponse, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE,
-    RecordStoreHealth, RegionStatsResponse, ReloadResponse, RepublishHealth, RoutingHealth,
-    StatusResponse, parse_hash_arg,
+    HealthResponse, INVALID_PARAMS_CODE, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse,
+    RELOAD_ERROR_CODE, REPUTATION_UNAVAILABLE_CODE, RecordStoreHealth, RegionStatsResponse,
+    ReloadResponse, RepublishHealth, ReputationCoverage, ReputationRequest, ReputationResponse,
+    RoutingHealth, StatusResponse, parse_hash_arg,
 };
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use decdn_incentive::{ChannelState, ChannelStateStore, VoucherActivity};
+use decdn_reputation::{NetworkReputation, RegionalCoverage};
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::{Server, ServerConfig};
 use jsonrpsee::types::ErrorObjectOwned;
@@ -125,6 +127,10 @@ pub struct AdminState {
     /// [`AdminState::with_region_accountant`]. `None` → `region_stats` returns
     /// an empty list (a node with no accounting wired has nothing to report).
     region_accountant: Option<Arc<RegionAccountant>>,
+    /// Reputation introspection handles backing `admin_v1_reputation` (#326),
+    /// attached via [`AdminState::with_reputation`]. `None` (no reputation
+    /// wired / unit tests) → `reputation` returns [`REPUTATION_UNAVAILABLE_CODE`].
+    reputation: Option<ReputationStatusHandles>,
 }
 
 /// Read-only payment-channel handles the `admin_v1_channels` handler
@@ -199,6 +205,17 @@ impl std::fmt::Debug for DhtStatusHandles {
             .field("refresh_interval", &self.refresh_interval)
             .finish_non_exhaustive()
     }
+}
+
+/// Read-only reputation handles backing `admin_v1_reputation` (#326). Both are
+/// `Arc` clones of the aggregation state the gossip reputation sink already
+/// updates, so attaching this to [`AdminState`] adds read access, not ownership.
+#[derive(Debug, Clone)]
+pub struct ReputationStatusHandles {
+    /// Network reputation aggregator — read for a peer's score + scored-flag.
+    pub network: Arc<NetworkReputation>,
+    /// Regional-coverage map — read for a peer's per-region coverage.
+    pub coverage: Arc<RegionalCoverage>,
 }
 
 /// One-shot trigger that lets `admin_v1_drain` wake the runtime's main
@@ -330,6 +347,7 @@ impl AdminState {
             dht: None,
             channels: None,
             region_accountant: None,
+            reputation: None,
         }
     }
 
@@ -359,6 +377,16 @@ impl AdminState {
     #[must_use]
     pub fn with_region_accountant(mut self, accountant: Arc<RegionAccountant>) -> Self {
         self.region_accountant = Some(accountant);
+        self
+    }
+
+    /// Attach reputation introspection handles so `admin_v1_reputation` can
+    /// report a peer's network score + regional coverage (#326). The production
+    /// runtime calls this once after `new`; without it, `reputation` returns
+    /// [`REPUTATION_UNAVAILABLE_CODE`].
+    #[must_use]
+    pub fn with_reputation(mut self, reputation: ReputationStatusHandles) -> Self {
+        self.reputation = Some(reputation);
         self
     }
 }
@@ -755,6 +783,64 @@ impl AdminRpcServer for AdminRpcImpl {
             regions: acc.snapshot(),
         })
     }
+
+    async fn reputation(&self, req: ReputationRequest) -> RpcResult<ReputationResponse> {
+        let pk = parse_node_id_arg(&req.node_id)?;
+        let Some(rep) = self.state.reputation.as_ref() else {
+            return Err(ErrorObjectOwned::owned(
+                REPUTATION_UNAVAILABLE_CODE,
+                "reputation subsystem not wired on this node",
+                None::<()>,
+            ));
+        };
+        let now = now_secs();
+        let mut regions: Vec<ReputationCoverage> = rep
+            .coverage
+            .covered_regions(pk, now)
+            .into_iter()
+            .map(|(region, score)| ReputationCoverage {
+                region: String::from_utf8_lossy(&region).into_owned(),
+                score,
+            })
+            .collect();
+        // Region-sorted for stable output (mirrors `region_stats`). Keys are
+        // unique (one bucket per region), so unstable sort is sufficient.
+        regions.sort_unstable_by(|a, b| a.region.cmp(&b.region));
+        Ok(ReputationResponse {
+            network_score: rep.network.score(pk, now),
+            scored: rep.network.is_scored(pk),
+            regions,
+        })
+    }
+}
+
+/// Parse a 64-hex `NodeId` request argument into an `iroh::PublicKey`. Tolerates
+/// a `0x`/`0X` prefix and mixed case; returns [`INVALID_PARAMS_CODE`] on a
+/// malformed length, non-hex, or non-curve-point key (mirrors [`parse_hash_arg`]).
+fn parse_node_id_arg(hex: &str) -> Result<iroh::PublicKey, ErrorObjectOwned> {
+    let invalid = |msg: String| ErrorObjectOwned::owned(INVALID_PARAMS_CODE, msg, None::<()>);
+    let trimmed = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
+    let bytes = alloy::primitives::hex::decode(trimmed)
+        .map_err(|err| invalid(format!("invalid node_id {hex:?}: {err}")))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        invalid(format!(
+            "invalid node_id {hex:?}: expected 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        ))
+    })?;
+    iroh::PublicKey::from_bytes(&arr)
+        .map_err(|err| invalid(format!("node_id {hex:?} is not a valid key: {err}")))
+}
+
+/// Wall-clock seconds since the Unix epoch, for reputation score/coverage
+/// lazy-decay queries (the engine works in seconds).
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Build the wire `ChannelSnapshot` list from loaded channel states, the
@@ -946,6 +1032,61 @@ mod tests {
             Arc::new(crate::metrics::Metrics::new()),
         );
         (state, tmp)
+    }
+
+    fn rep_handles() -> ReputationStatusHandles {
+        let cfg = decdn_reputation::NetworkReputationConfig::default();
+        ReputationStatusHandles {
+            network: Arc::new(
+                decdn_reputation::NetworkReputation::new(cfg.clone()).expect("valid cfg"),
+            ),
+            coverage: Arc::new(decdn_reputation::RegionalCoverage::new(cfg).expect("valid cfg")),
+        }
+    }
+
+    fn fresh_node_id_hex() -> String {
+        alloy::primitives::hex::encode(iroh::SecretKey::generate().public().as_bytes())
+    }
+
+    #[tokio::test]
+    async fn reputation_unavailable_without_handle() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state);
+        let err = rpc
+            .reputation(ReputationRequest {
+                node_id: fresh_node_id_hex(),
+            })
+            .await
+            .expect_err("no reputation handle wired");
+        assert_eq!(err.code(), REPUTATION_UNAVAILABLE_CODE);
+    }
+
+    #[tokio::test]
+    async fn reputation_bad_hex_is_invalid_params() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state.with_reputation(rep_handles()));
+        let err = rpc
+            .reputation(ReputationRequest {
+                node_id: "not-hex".to_string(),
+            })
+            .await
+            .expect_err("malformed node_id");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+    }
+
+    #[tokio::test]
+    async fn reputation_unscored_peer_is_neutral() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state.with_reputation(rep_handles()));
+        let resp = rpc
+            .reputation(ReputationRequest {
+                node_id: fresh_node_id_hex(),
+            })
+            .await
+            .expect("valid query");
+        assert!(!resp.scored, "an unseen peer is unscored");
+        assert!((resp.network_score - 0.5).abs() < 1e-9, "neutral default");
+        assert!(resp.regions.is_empty());
     }
 
     #[tokio::test]

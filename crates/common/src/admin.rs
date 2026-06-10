@@ -473,6 +473,42 @@ pub struct RegionStatsResponse {
     pub regions: Vec<RegionBytes>,
 }
 
+/// Request body for `admin_v1_reputation` (#326). `node_id` is the 64-hex
+/// `NodeId` (mixed case accepted, optional `0x`/`0X` prefix tolerated) of the
+/// peer whose reputation to read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReputationRequest {
+    /// Hex of the 32-byte `NodeId` to query.
+    pub node_id: String,
+}
+
+/// One region's coverage score for a queried operator (ADR 008
+/// §Regional-Coverage Reputation Signal).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReputationCoverage {
+    /// ISO 3166-1 alpha-2 region code.
+    pub region: String,
+    /// Coverage score in `[0, 1]` (same scale as the main score).
+    pub score: f32,
+}
+
+/// Response body for `admin_v1_reputation` (#326).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReputationResponse {
+    /// The node's gossip-aggregated network-tier score in `[0, 1]`. The local
+    /// tier and the `combined_score` blend are not yet wired (#831), so this is
+    /// the raw network score; neutral `0.5` until the node has been scored by
+    /// enough distinct reporters.
+    pub network_score: f64,
+    /// Whether the node has met the minimum-distinct-reporter threshold; until
+    /// then `network_score` is the neutral default rather than a real rating.
+    pub scored: bool,
+    /// Per-region coverage signal for this operator, region-sorted. Empty when
+    /// the operator has no coverage signal.
+    #[serde(default)]
+    pub regions: Vec<ReputationCoverage>,
+}
+
 /// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
 /// Matches the standard JSON-RPC 2.0 `Invalid params` code.
 pub const INVALID_PARAMS_CODE: i32 = -32_602;
@@ -527,6 +563,12 @@ pub const DHT_POISONED_CODE: i32 = -32_006;
 /// now" from a generic transport failure. The server also logs the
 /// underlying store error.
 pub const CHANNEL_STORE_ERROR_CODE: i32 = -32_007;
+
+/// JSON-RPC error code: `admin_v1_reputation` was called on a node whose
+/// reputation subsystem is not wired (e.g. a test/CLI-only invocation, or
+/// `gossip.subscribe_reputation = false`). Benign config state, distinct from a
+/// generic failure so an operator gets "no reputation to report on".
+pub const REPUTATION_UNAVAILABLE_CODE: i32 = -32_008;
 
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
@@ -642,6 +684,15 @@ pub trait AdminRpc {
     /// error) on a node with no accounting wired.
     #[method(name = "regionStats")]
     async fn region_stats(&self) -> RpcResult<RegionStatsResponse>;
+
+    /// Return a node's network reputation score, scored-flag, and per-region
+    /// coverage (#326, ADR 008). `network_score` is the raw gossip-aggregated
+    /// network-tier score (the local tier / `combined_score` blend is unwired —
+    /// #831), neutral `0.5` until enough distinct reporters have rated the node.
+    /// Returns [`INVALID_PARAMS_CODE`] for a malformed `node_id` and
+    /// [`REPUTATION_UNAVAILABLE_CODE`] when the reputation subsystem is not wired.
+    #[method(name = "reputation")]
+    async fn reputation(&self, req: ReputationRequest) -> RpcResult<ReputationResponse>;
 }
 
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].

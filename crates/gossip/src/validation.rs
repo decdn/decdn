@@ -20,12 +20,10 @@ pub enum AnnounceReject {
     DecodeFailed,
     #[error("unknown envelope version")]
     UnknownVersion,
-    /// Reserved for the day [`GossipPayload`] grows a second variant. With
-    /// only `NodeAnnounce` defined, postcard decode of an unknown
-    /// discriminant surfaces as [`Self::DecodeFailed`] (no reachable path
-    /// emits this variant today). Kept in the enum + `label()` so adding a
-    /// manual discriminant peek later is a pure code change that doesn't
-    /// rename any Prometheus label.
+    /// The envelope decoded to a [`GossipPayload`] variant other than
+    /// `NodeAnnounce` (e.g. a `ReputationReport`, which has its own
+    /// [`crate::reputation::validate_reputation_envelope`] path). Reached now
+    /// that the enum has more than one variant.
     #[error("unknown gossip payload variant")]
     UnknownVariant,
     #[error("signature length != {SIGNATURE_LEN}")]
@@ -170,8 +168,9 @@ pub fn validate_envelope<S: std::hash::BuildHasher>(
         return Err(AnnounceReject::OversizeTrailingBytes);
     }
 
-    // Only one variant today; future variants will need their own handling.
-    #[allow(irrefutable_let_patterns)]
+    // This validator handles only `NodeAnnounce`; a `ReputationReport`
+    // envelope on this path is the wrong variant (the reputation topic has its
+    // own `validate_reputation_envelope`).
     let GossipPayload::NodeAnnounce(announce) = env.payload else {
         return Err(AnnounceReject::UnknownVariant);
     };
@@ -452,6 +451,38 @@ mod tests {
         );
         allow.insert(*sk.public().as_bytes());
         assert!(validate_envelope(&bytes, 1_700_000_000_000_000, &allow).is_ok());
+    }
+
+    /// Now that `GossipPayload` has a second variant, a `ReputationReport`
+    /// envelope fed to the `NodeAnnounce` validator must hit the (newly
+    /// reachable) `UnknownVariant` arm rather than being mis-accepted. Guards
+    /// the two validators against cross-accepting each other's payloads.
+    #[test]
+    fn reputation_report_envelope_rejected_as_unknown_variant() {
+        use decdn_protocol::{ReportMetrics, ReputationReport, ReputationReportBody};
+        let sk = fresh_key();
+        let body = ReputationReportBody {
+            provider: [2u8; 32],
+            reporter: *sk.public().as_bytes(),
+            metrics: ReportMetrics {
+                delivery_speed: None,
+                uptime_observed: Some(true),
+                data_correct: Some(true),
+            },
+            timestamp_secs: 1_700_000_000,
+        };
+        let signature = sk
+            .sign(&body.signing_bytes().expect("body encode"))
+            .to_bytes()
+            .to_vec();
+        let bytes = encode(&GossipEnvelope {
+            version: GOSSIP_VERSION,
+            payload: GossipPayload::ReputationReport(ReputationReport { body, signature }),
+        });
+        assert_eq!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            Err(AnnounceReject::UnknownVariant)
+        );
     }
 
     #[test]

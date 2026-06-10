@@ -48,8 +48,8 @@ pub struct GossipEnvelope {
 pub enum GossipPayload {
     /// discriminant 0 — asserted by `gossip_payload_node_announce_is_zero`
     NodeAnnounce(NodeAnnounce),
-    // Reserved for later steps (append only):
-    //   ReputationReport(ReputationReport)   // discriminant 1
+    /// discriminant 1 — asserted by `gossip_payload_reputation_report_is_one`
+    ReputationReport(ReputationReport),
 }
 
 /// Signed `NodeAnnounce` gossip message (ADR 001).
@@ -82,6 +82,60 @@ pub struct NodeAnnounceBody {
 }
 
 impl NodeAnnounceBody {
+    /// Canonical bytes to sign/verify: `postcard::to_allocvec(self)`.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+}
+
+/// Signed `ReputationReport` gossip message (ADR 008 §Gossip Protocol).
+///
+/// A node broadcasts one of these about a `provider` it has interacted with.
+/// `signature` is Ed25519 over `body.signing_bytes()` using the key identified
+/// by `body.reporter`. Verification is performed outside this crate (in the
+/// `decdn-gossip` crate). Mirrors the [`NodeAnnounce`] signed-split so future
+/// unsigned fields can be added to [`ReputationReport`] without invalidating
+/// existing signatures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReputationReport {
+    /// Signed body. Its wire layout is frozen per ADR 013.
+    pub body: ReputationReportBody,
+    /// Ed25519 signature over `postcard::to_allocvec(&body)`. Always
+    /// [`SIGNATURE_LEN`] bytes; the verify path rejects other lengths.
+    pub signature: Vec<u8>,
+}
+
+/// Signed fields of a [`ReputationReport`]. Layout is frozen per ADR 013 —
+/// future additions go on [`ReputationReport`] as optional unsigned fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReputationReportBody {
+    /// The node being rated (its Ed25519 public key / iroh `NodeId`), 32 bytes.
+    pub provider: [u8; 32],
+    /// The reporting node's Ed25519 public key, 32 bytes. Must equal the key
+    /// that produced `signature`.
+    pub reporter: [u8; 32],
+    /// Observed quality metrics for `provider`.
+    pub metrics: ReportMetrics,
+    /// Seconds since Unix epoch when the report was generated. Receivers reject
+    /// reports outside the `max_report_age + clock_skew` window (ADR 008).
+    pub timestamp_secs: u64,
+}
+
+/// Quality metrics carried by a [`ReputationReport`] (ADR 008 §Gossip Protocol).
+///
+/// All fields are optional so a reporter can omit signals it did not observe;
+/// a missing or negative signal scores its component as `0.0` at the receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportMetrics {
+    /// Observed delivery rate in bytes/sec, or `None` if not measured.
+    pub delivery_speed: Option<u32>,
+    /// Whether the provider was reachable, or `None` if not observed.
+    pub uptime_observed: Option<bool>,
+    /// Whether delivered bytes passed BLAKE3 verification, or `None`.
+    pub data_correct: Option<bool>,
+}
+
+impl ReputationReportBody {
     /// Canonical bytes to sign/verify: `postcard::to_allocvec(self)`.
     pub fn signing_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
         postcard::to_allocvec(self)
@@ -137,6 +191,51 @@ mod tests {
         // First byte is the version, second byte is the payload discriminant.
         assert_eq!(bytes.first().copied(), Some(GOSSIP_VERSION));
         assert_eq!(bytes.get(1).copied(), Some(0u8));
+        Ok(())
+    }
+
+    fn sample_report_body() -> ReputationReportBody {
+        ReputationReportBody {
+            provider: [2u8; 32],
+            reporter: [3u8; 32],
+            metrics: ReportMetrics {
+                delivery_speed: Some(1_048_576),
+                uptime_observed: Some(true),
+                data_correct: Some(true),
+            },
+            timestamp_secs: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn reputation_report_body_roundtrip() -> Result<(), postcard::Error> {
+        let body = sample_report_body();
+        let bytes = postcard::to_allocvec(&body)?;
+        let decoded: ReputationReportBody = postcard::from_bytes(&bytes)?;
+        assert_eq!(body, decoded);
+        Ok(())
+    }
+
+    #[test]
+    fn gossip_payload_reputation_report_is_one() -> Result<(), postcard::Error> {
+        let env = GossipEnvelope {
+            version: GOSSIP_VERSION,
+            payload: GossipPayload::ReputationReport(ReputationReport {
+                body: sample_report_body(),
+                signature: vec![0u8; 64],
+            }),
+        };
+        let bytes = postcard::to_allocvec(&env)?;
+        // First byte is the version, second byte is the payload discriminant.
+        assert_eq!(bytes.first().copied(), Some(GOSSIP_VERSION));
+        assert_eq!(bytes.get(1).copied(), Some(1u8));
+        Ok(())
+    }
+
+    #[test]
+    fn reputation_report_signing_bytes_are_postcard_of_body() -> Result<(), postcard::Error> {
+        let body = sample_report_body();
+        assert_eq!(body.signing_bytes()?, postcard::to_allocvec(&body)?);
         Ok(())
     }
 
