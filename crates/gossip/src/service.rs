@@ -392,6 +392,18 @@ async fn spawn_reputation_tasks(
         report_drain,
     } = reputation;
     if !cfg.subscribe_reputation {
+        // The publisher only runs alongside the reputation topic subscription,
+        // so `subscribe_reputation = false` silently drops a wired report drain:
+        // the node keeps buffering outbound observations that never publish
+        // (#864). Warn so this opt-out-only inert combination is visible — it
+        // cannot arise at defaults (both live).
+        if report_drain.is_some() {
+            tracing::warn!(
+                "gossip: report drain wired but subscribe_reputation = false; outbound \
+                 reputation reports will accumulate and never publish — enable \
+                 gossip.subscribe_reputation to drain them"
+            );
+        }
         return (Vec::new(), None);
     }
     let (Some(sink), Some(staked)) = (sink, staked) else {
@@ -1379,6 +1391,75 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+        for handle in handles.tasks {
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("gossip task must exit promptly after cancel, not hang")
+                .expect("gossip task must exit cleanly, not panic");
+        }
+    }
+
+    /// #864 — a wired report drain with `subscribe_reputation = false` is the
+    /// one inert opt-out combination: the reputation topic is not joined, so
+    /// the publisher never spawns and the drain silently accumulates. The
+    /// bring-up path `warn!`s (not asserted here — capturing tracing output
+    /// needs a dedicated subscriber, same as the bind tests); this guards the
+    /// observable consequence: no reputation tasks and no publish trigger even
+    /// though a drain was supplied.
+    #[tokio::test]
+    async fn report_drain_with_reputation_disabled_spawns_no_publisher() {
+        use iroh::endpoint::presets;
+
+        struct Drain;
+        impl ReportDrain for Drain {
+            fn drain(&self) -> Vec<([u8; 32], decdn_protocol::ReportMetrics)> {
+                Vec::new()
+            }
+        }
+
+        let ep = Endpoint::builder(presets::Minimal)
+            .bind()
+            .await
+            .expect("bind minimal endpoint");
+        let gossip = build_gossip(ep.clone());
+        let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
+        let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
+        let shutdown = CancellationToken::new();
+        // `subscribe_reputation` defaults to false in `cfg`; wire only the drain.
+        let config = cfg(true, Some("US"));
+        assert!(!config.subscribe_reputation);
+        let wiring = ReputationWiring {
+            sink: None,
+            staked: None,
+            report_drain: Some(Arc::new(Drain)),
+        };
+
+        let handles = GossipService::spawn(
+            ep,
+            SecretKey::generate(),
+            gossip,
+            config,
+            peer_table,
+            metrics,
+            shutdown.clone(),
+            wiring,
+        )
+        .await
+        .expect("gossip service should start");
+
+        assert!(
+            handles.reputation_publish_trigger.is_none(),
+            "drain dropped when reputation gossip is off ⇒ no publish trigger"
+        );
+        // global sub + region sub + NodeAnnounce publisher + TTL sweeper; the
+        // reputation subscriber + publisher are both absent.
+        assert_eq!(
+            handles.tasks.len(),
+            4,
+            "no reputation tasks when subscribe_reputation = false"
+        );
+
         shutdown.cancel();
         for handle in handles.tasks {
             tokio::time::timeout(Duration::from_secs(2), handle)
