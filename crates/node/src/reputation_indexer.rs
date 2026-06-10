@@ -122,6 +122,23 @@ impl SettlementIndexer {
 /// generous burst of opens/settles racing in the same poll window.
 const MAX_PENDING_SETTLED: usize = 4096;
 
+/// Upper bound on the `settled_seen` dedup set (#864). Unlike
+/// `pending_settled`, eviction here carries no re-credit/backfill rearm —
+/// it just forgets that a channel was already credited. The oldest entries
+/// are the longest-settled, so FIFO eviction sheds exactly those. The
+/// residual risk: if an evicted channel's `ChannelSettled` is then
+/// re-delivered (a resubscribe/backfill overlap), `process_settled` no
+/// longer short-circuits and `apply_settlement` re-credits the **provider**
+/// (resolved from the never-removed on-chain `CapacityBond` binding) for
+/// that amount once more — the counterparty leg is lost since the `channels`
+/// entry was dropped on first credit (#864). That is a bounded
+/// reputation double-count, not a no-op, but it requires both a full
+/// `MAX_SETTLED_SEEN`-deep settlement history *and* a re-delivery of the
+/// specific aged-out event, so 65536 keeps it astronomically unlikely while
+/// capping memory. Eviction itself becomes routine once the set saturates,
+/// so it stays at `debug!` rather than `warn!` to avoid per-settlement noise.
+const MAX_SETTLED_SEEN: usize = 65_536;
+
 /// A live `ChannelSettled` observed before its `ChannelOpened`, parked until the
 /// open arrives so the client party's reporter credit isn't dropped (#864).
 struct PendingSettled {
@@ -140,7 +157,12 @@ struct IndexerState {
     channels: HashMap<[u8; 32], (Address, Address)>,
     /// `channelId`s already credited, so a backfill/live overlap or a
     /// resubscribe never double-counts (a channel settles exactly once).
+    /// Bounded by `MAX_SETTLED_SEEN` (#864); kept in sync with
+    /// `settled_seen_order` (the FIFO eviction order) by `mark_settled_seen`.
     settled_seen: HashSet<[u8; 32]>,
+    /// FIFO insertion order for `settled_seen`, so the bound evicts the
+    /// longest-settled (oldest) channel ids first (#864).
+    settled_seen_order: VecDeque<[u8; 32]>,
     /// Live `ChannelSettled` events seen before their `ChannelOpened` (#864),
     /// keyed by `channelId`; re-credited when the matching open arrives so the
     /// client party isn't lost. Bounded by `MAX_PENDING_SETTLED`; kept in sync
@@ -164,6 +186,7 @@ async fn watcher_loop<P>(
     let mut state = IndexerState {
         channels: HashMap::new(),
         settled_seen: HashSet::new(),
+        settled_seen_order: VecDeque::new(),
         pending_settled: HashMap::new(),
         pending_order: VecDeque::new(),
         backfill_from: Some(backfill_from),
@@ -433,7 +456,7 @@ where
             %routed_amount,
             "settlement amount exceeds u128; skipping"
         );
-        state.settled_seen.insert(channel_id);
+        mark_settled_seen(state, channel_id);
         // The open→parties mapping is dead once a channel is marked seen (#864).
         state.channels.remove(&channel_id);
         return Ok(());
@@ -478,7 +501,7 @@ fn apply_settlement(
     client_addr: Option<Address>,
     client_node: Option<(PublicKey, bool)>,
 ) -> u8 {
-    if !state.settled_seen.insert(channel_id) {
+    if !mark_settled_seen(state, channel_id) {
         return 0;
     }
     // A channel settles exactly once, so its `ChannelOpened` parties mapping is
@@ -541,6 +564,32 @@ where
             Ok(None)
         }
     }
+}
+
+/// Mark a `channelId` seen for dedup, bounding the set at `MAX_SETTLED_SEEN`
+/// (#864). Returns `true` when the id was newly inserted (caller should treat
+/// the settlement as fresh), `false` when it was already present (a duplicate
+/// — caller should no-op). On a genuinely new insert the id joins the FIFO
+/// order and the oldest (longest-settled) entries are evicted until the set is
+/// back under the bound; eviction is a pure dedup drop (no re-credit/backfill
+/// rearm, unlike `park_settled`) — see `MAX_SETTLED_SEEN` for the bounded
+/// re-credit risk a later re-delivery of an evicted id carries.
+fn mark_settled_seen(state: &mut IndexerState, channel_id: [u8; 32]) -> bool {
+    if !state.settled_seen.insert(channel_id) {
+        return false;
+    }
+    state.settled_seen_order.push_back(channel_id);
+    while state.settled_seen.len() > MAX_SETTLED_SEEN {
+        let Some(evicted) = state.settled_seen_order.pop_front() else {
+            break;
+        };
+        state.settled_seen.remove(&evicted);
+        debug!(
+            channel_id = %alloy::hex::encode(evicted),
+            "settled-seen dedup set full; evicting oldest (longest-settled) entry (#864)"
+        );
+    }
+    true
 }
 
 /// Re-arm the one-shot backfill to re-query from `block` (taking the earliest of
@@ -641,6 +690,7 @@ mod tests {
         IndexerState {
             channels: HashMap::new(),
             settled_seen: HashSet::new(),
+            settled_seen_order: VecDeque::new(),
             pending_settled: HashMap::new(),
             pending_order: VecDeque::new(),
             backfill_from: None,
@@ -700,6 +750,67 @@ mod tests {
         let mut oldest = [0u8; 32];
         oldest[..4].copy_from_slice(&0u32.to_be_bytes());
         assert!(!state.pending_settled.contains_key(&oldest));
+    }
+
+    #[test]
+    fn settled_seen_is_bounded_and_evicts_oldest() {
+        // #864: the dedup set must not grow unbounded for the process
+        // lifetime. Insert MAX + N distinct ids and assert the set is
+        // pinned at the cap with the FIFO order kept consistent.
+        let mut state = empty_state();
+        let overflow = 100usize;
+        for i in 0..(MAX_SETTLED_SEEN + overflow) {
+            let id = u64::try_from(i).expect("fits u64");
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&id.to_be_bytes());
+            assert!(mark_settled_seen(&mut state, key), "each id is new");
+        }
+        assert_eq!(
+            state.settled_seen.len(),
+            MAX_SETTLED_SEEN,
+            "the dedup set is pinned at its bound"
+        );
+        // The set and its FIFO order stay in lockstep (no stale ids).
+        assert_eq!(
+            state.settled_seen_order.len(),
+            MAX_SETTLED_SEEN,
+            "the FIFO order tracks the set exactly"
+        );
+        // The first `overflow` ids (the oldest) were evicted; the newest survive.
+        let mut oldest = [0u8; 32];
+        oldest[..8].copy_from_slice(&0u64.to_be_bytes());
+        assert!(
+            !state.settled_seen.contains(&oldest),
+            "the longest-settled id is evicted first"
+        );
+        let mut newest = [0u8; 32];
+        newest[..8].copy_from_slice(
+            &u64::try_from(MAX_SETTLED_SEEN + overflow - 1)
+                .expect("fits u64")
+                .to_be_bytes(),
+        );
+        assert!(
+            state.settled_seen.contains(&newest),
+            "the most-recently-settled id survives"
+        );
+    }
+
+    #[test]
+    fn mark_settled_seen_is_idempotent_for_duplicates() {
+        // A re-delivered (duplicate) settlement must not double-count in
+        // the FIFO order, mirroring `park_settled`'s in-place refresh.
+        let mut state = empty_state();
+        assert!(mark_settled_seen(&mut state, cid(1)), "first insert is new");
+        assert!(
+            !mark_settled_seen(&mut state, cid(1)),
+            "the duplicate is reported as not-new"
+        );
+        assert_eq!(state.settled_seen.len(), 1);
+        assert_eq!(
+            state.settled_seen_order.len(),
+            1,
+            "a duplicate must not push a second FIFO entry"
+        );
     }
 
     #[test]

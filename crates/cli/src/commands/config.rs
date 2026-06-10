@@ -84,6 +84,11 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  bind_port:                {}",
         resolved.network.bind_port
     )?;
+    writeln!(
+        w,
+        "  enable_0rtt:              {}",
+        resolved.network.enable_0rtt
+    )?;
     // One line per configured relay; nothing when the list is empty (the node
     // then falls back to the n0 default relays). Relay URLs can carry
     // `user:pass@` userinfo, so redact it (host stays visible) — the same
@@ -169,6 +174,14 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  rpc_watchdog_interval_sec: {}",
         resolved.blockchain.rpc_watchdog_interval_sec
     )?;
+    match resolved.blockchain.settlement_auto_threshold_micro_usdc {
+        Some(v) => writeln!(w, "  settlement_auto_threshold_micro_usdc: {v}")?,
+        None => writeln!(w, "  settlement_auto_threshold_micro_usdc: disabled")?,
+    }
+    match resolved.blockchain.settlement_auto_by_voucher_nonce_span {
+        Some(v) => writeln!(w, "  settlement_auto_by_voucher_nonce_span: {v}")?,
+        None => writeln!(w, "  settlement_auto_by_voucher_nonce_span: disabled")?,
+    }
     writeln!(
         w,
         "  cache_dir:                {}",
@@ -204,6 +217,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  voucher_interval_mb:      {}",
+        resolved.payment.voucher_interval_mb
+    )?;
+    writeln!(
+        w,
         "  log_level:                {}",
         resolved.observability.log_level
     )?;
@@ -211,6 +229,11 @@ pub fn write_validate_summary<W: std::io::Write>(
         w,
         "  metrics_port:             {}",
         resolved.observability.metrics_port
+    )?;
+    writeln!(
+        w,
+        "  metrics_bind:             {}",
+        resolved.observability.metrics_bind
     )?;
     match resolved.observability.admin_port {
         Some(p) => writeln!(w, "  admin_port:               {p}")?,
@@ -229,6 +252,64 @@ pub fn write_validate_summary<W: std::io::Write>(
             otlp.len()
         )?;
     }
+    // Surface the kill-switch / rate-limit knobs of the otherwise-silent
+    // sections — the throttles an operator most needs to confirm, not every
+    // field. All numeric/bool/bind-addr, so no secret-redaction concern.
+    writeln!(
+        w,
+        "  security.max_concurrent_handlers: {}",
+        resolved.security.max_concurrent_handlers
+    )?;
+    writeln!(
+        w,
+        "  security.per_source_rate_per_sec: {}",
+        resolved.security.per_source_rate_per_sec
+    )?;
+    writeln!(
+        w,
+        "  security.per_source_burst: {}",
+        resolved.security.per_source_burst
+    )?;
+    writeln!(
+        w,
+        "  dht.per_peer_rate_per_sec: {}",
+        resolved.dht.per_peer_rate_per_sec
+    )?;
+    writeln!(
+        w,
+        "  dht.global_rate_per_sec:  {}",
+        resolved.dht.global_rate_per_sec
+    )?;
+    writeln!(
+        w,
+        "  gossip.subscribe_global:  {}",
+        resolved.gossip.subscribe_global
+    )?;
+    writeln!(
+        w,
+        "  gossip.subscribe_reputation: {}",
+        resolved.gossip.subscribe_reputation
+    )?;
+    writeln!(
+        w,
+        "  gossip.reputation_publish_interval_sec: {}",
+        resolved.gossip.reputation_publish_interval_sec
+    )?;
+    writeln!(
+        w,
+        "  gossip.max_peer_table_entries: {}",
+        resolved.gossip.max_peer_table_entries
+    )?;
+    writeln!(
+        w,
+        "  receipts.max_file_bytes:  {}",
+        resolved.receipts.max_file_bytes
+    )?;
+    writeln!(
+        w,
+        "  receipts.retained_files:  {}",
+        resolved.receipts.retained_files
+    )?;
     writeln!(
         w,
         "  prefetch_enabled:         {}",
@@ -275,6 +356,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [network]
 # bind_port = 4433
+# enable_0rtt = true                 # QUIC 0-RTT for cdn/probe/v1 (ADR 015); set false to require a full handshake
 # Multiple relays give redundancy/failover; reachability is probed at bring-up
 # and logged but never fatal (the node proceeds and iroh retries in the background).
 # relay_urls = ["https://relay-a.example.", "https://relay-b.example."]
@@ -301,11 +383,30 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
+# redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
+# buyer_deposit_micro_usdc = 10000000            # deposit when the buyer opens a node-to-node PaymentChannel on a miss (#744); default 10 USDC
+# buyer_max_approve = true                       # one-time max USDC approval for PaymentChannel at startup (#744); false to manage the allowance out-of-band
+# settlement_auto_threshold_micro_usdc = 50000000   # auto-closeChannel once un-redeemed µUSDC reaches this (#742); leave unset/commented to disable — when set it must be > 0
+# settlement_auto_by_voucher_nonce_span = 1000       # auto-closeChannel once the un-redeemed nonce span reaches this (#742); leave unset/commented to disable — when set it must be > 0
 
 [cache]
 # cache_dir = "~/.decdn/cache"
 # cache_size_mb = 10240
 # max_blob_size_mb = 1024
+# pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
+# user_agent = "decdn-node/<version>"      # User-Agent on HTTP origin pull-through (#435); default embeds the crate version
+# Pull-through origin (singular). Mutually exclusive with the plural [[cache.origins]] form below.
+# Empty => no pull-through; cache misses return NoOrigin.
+# [cache.origin]
+# kind = "http"
+# url = "https://origin.example/"
+# Multi-origin fallback (#284), tried in order on a miss:
+# [[cache.origins]]
+# kind = "http"
+# url = "https://primary.example/"
+# Origin pull-through retry policy (#285); restart-required.
+# [cache.origin_retry]
+# max_retries = 3
 # gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518)
 # max_probe_holds = 256                    # probe eviction-hold budget (ADR 005 §Hold budget); 0 disables has_blob:true
 # stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
@@ -317,14 +418,46 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rate_per_mb = 10
 # delivery_floor = 0                       # local rate-bounds clamp lower bound (ADR 005)
 # delivery_ceiling = 1000000000000         # local rate-bounds clamp upper bound; must be >= 1
+# voucher_interval_mb = 1                  # voucher cadence advertised on cdn/client/v1 (ADR 003); range 1..=MAX_VOUCHER_INTERVAL_MB
 
 [observability]
 # log_level = "info"
 # log_format = "pretty"
 # metrics_port = 9090
+# metrics_bind = "127.0.0.1"               # IP the metrics HTTP server binds; default loopback only
 # admin_port = 9191                        # loopback-only; 0 disables (ADR 025)
 # region_accounting_interval_sec = 3600    # 0 disables the per-region bandwidth log (#750)
 # otlp_endpoint = "http://localhost:4317"  # requires --features otlp
+
+[gossip]
+# announce_interval_sec = 60                # seconds between outgoing NodeAnnounce messages (ADR 001)
+# peer_ttl_sec = 600                        # evict a peer-table entry after this long unrefreshed
+# subscribe_global = true                   # subscribe/publish on cdn/global/v1
+# subscribe_reputation = true               # subscribe/publish on cdn/reputation/v1 (ADR 008)
+# reputation_publish_interval_sec = 3600    # reputation-report publish cadence; matches the ADR 008 1-hour rate limit
+# allowlist = []                            # accepted announcer node IDs (64-char hex); empty = accept any signature-valid announce
+# max_peer_table_entries = 100000           # hard cap on PeerTable entries (#577); must be > 0
+
+[security]
+# max_concurrent_handlers = 256             # global cap on in-flight QUIC handler tasks; 0 disables the cap
+# per_source_rate_per_sec = 100.0           # per-source rate-limit refill (cells/sec); 0.0 disables the layer
+# per_source_burst = 200                    # per-source burst capacity; required > 0 when the rate is > 0
+# max_tracked_sources = 4096                # cap on tracked sources in the keyed limiter; 0 = unbounded
+
+[dht.rate_limit]
+# per_peer_rate_per_sec = 20.0              # per-peer (NodeId) sustained rate (ADR 022); 0.0 disables the layer
+# per_peer_burst = 40                       # per-peer burst capacity; required > 0 when the rate is > 0
+# per_ip_rate_per_sec = 100.0               # per-IP sustained rate; 0.0 disables
+# per_ip_burst = 200                        # per-IP burst capacity
+# global_rate_per_sec = 1000.0              # global inbound DHT sustained rate; 0.0 disables
+# global_burst = 2000                       # global inbound DHT burst capacity
+# trusted_ips = []                          # IPs that bypass the per-IP layer only (ADR 022 §Trusted-IP exemption)
+# max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
+# max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
+
+[receipts]
+# max_file_bytes = 134217728                # rotate the download-receipt log at this size (#802); default 128 MiB
+# retained_files = 4                        # rotated backup receipt files retained (#802); 0 keeps none
 
 [prefetch]
 # ADR 022 speculative-prefetch operator policy. Disabled by default.
@@ -340,3 +473,27 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # demand_quality_min_ratio = 0.1            # served/acquired auto-throttle floor
 # demand_quality_window_secs = 3600         # rolling-window length for the demand-quality predicate
 "#;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    // The shipped template must parse under `deny_unknown_fields`: every
+    // uncommented line is a real section header or field. Locks the four
+    // new sections' header names (`[gossip]`, `[security]`,
+    // `[dht.rate_limit]`, `[receipts]`) against typos that would only
+    // surface when an operator uncommented a knob.
+    #[test]
+    fn default_config_template_parses() {
+        let parsed: config::FileConfig = toml::from_str(DEFAULT_CONFIG)
+            .expect("DEFAULT_CONFIG template must parse as FileConfig");
+        // Only bare section headers are uncommented, so every section is
+        // Some but each field stays at its built-in default (None on the
+        // wire form). Spot-check the four added sections are recognized.
+        assert!(parsed.gossip.is_some(), "[gossip] header parsed");
+        assert!(parsed.security.is_some(), "[security] header parsed");
+        assert!(parsed.dht.is_some(), "[dht.rate_limit] header parsed");
+        assert!(parsed.receipts.is_some(), "[receipts] header parsed");
+    }
+}
