@@ -104,7 +104,9 @@ struct BackgroundFill {
     budget: Duration,
     /// Hashes with a background fill currently running, so repeated foreground
     /// misses on the same hash don't spawn duplicate warming tasks. A std mutex
-    /// (no await held); a poisoned lock simply disables spawning.
+    /// (no await held); a poisoned lock is recovered rather than disabling the
+    /// feature — the dedup set holds no torn state to fear (only `insert`/`remove`
+    /// ever take it).
     inflight: Arc<std::sync::Mutex<HashSet<Hash>>>,
 }
 
@@ -117,24 +119,32 @@ struct BgInflightGuard {
 
 impl Drop for BgInflightGuard {
     fn drop(&mut self) {
-        if let Ok(mut set) = self.inflight.lock() {
-            set.remove(&self.hash);
-        }
+        // Recover a poisoned lock so the claim is ALWAYS released — otherwise a
+        // panic elsewhere would strand this hash in the set, permanently
+        // disabling its background fill.
+        let mut set = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.remove(&self.hash);
     }
 }
 
 /// Claim `hash` for a background fill (#859), returning a [`BgInflightGuard`]
 /// the caller must hold for the lifetime of the spawned warm task — dropping it
-/// releases the claim. Returns `None` if a fill is already in flight for `hash`,
-/// or the lock is poisoned (degrade to no-spawn). Fusing the claim with its
-/// releaser makes "armed" and "holds a guard" the same fact: a caller cannot arm
-/// without receiving the releaser (an unreleasable leak), nor release without
-/// arming.
+/// releases the claim. Returns `None` only if a fill is already in flight for
+/// `hash` (a poisoned lock is recovered, not treated as a claim failure). Fusing
+/// the claim with its releaser makes "armed" and "holds a guard" the same fact: a
+/// caller cannot arm without receiving the releaser (an unreleasable leak), nor
+/// release without arming.
 fn arm_background_fill(
     inflight: &Arc<std::sync::Mutex<HashSet<Hash>>>,
     hash: Hash,
 ) -> Option<BgInflightGuard> {
-    let claimed = inflight.lock().is_ok_and(|mut set| set.insert(hash));
+    let claimed = inflight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(hash);
     claimed.then(|| BgInflightGuard {
         hash,
         inflight: Arc::clone(inflight),
@@ -366,8 +376,11 @@ impl ClientHandler {
                         tracing::debug!(%hash, "background cache-fill populated blob");
                     }
                     Ok(Err(e)) => {
+                        // Covers every populate error (clean miss, no origin, AND
+                        // store/I/O fault), so the message stays neutral; the
+                        // cause rides in `error`.
                         metrics.node_pull_through_background_failed();
-                        tracing::debug!(%hash, error = %e, "background cache-fill found no source");
+                        tracing::debug!(%hash, error = %e, "background cache-fill did not complete");
                     }
                     Err(_) => {
                         metrics.node_pull_through_background_failed();
@@ -433,19 +446,16 @@ impl ClientHandler {
         }
     }
 
-    /// Handle a foreground pull-through deadline expiry (#859). Meters the
-    /// timeout, serves the blob if it landed in the store in the race, and
-    /// otherwise spawns a background warm before reporting the miss. Returns
-    /// whether the blob is now present.
+    /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if
+    /// it landed in the store in the race; otherwise meters the abandoned pull and
+    /// spawns a background warm before reporting the miss. Returns whether the blob
+    /// is now present.
     async fn on_pull_through_timeout(&self, hash: Hash, timeout: Duration) -> bool {
-        // A deadline hit is distinct from a genuine miss: meter it so a
-        // slow/wedged upstream is distinguishable from "not on network".
-        self.metrics.node_pull_through_timeout();
         // Race: the fill may have landed in the store at the instant the outer
-        // deadline fired. If so, serve it — no warming needed. A `has` *error* is
-        // a real store fault, not a clean race-loss: surface it like the
-        // populate-engine-error arm above rather than silently treating the store
-        // as empty, then fall through to the best-effort warm.
+        // deadline fired. If so, serve it — this was NOT an abandoned pull, so do
+        // not count a timeout. A `has` *error* is a real store fault, not a clean
+        // race-loss: surface it like the populate-engine-error arm above rather
+        // than silently treating the store as empty, then fall through to the warm.
         match self.cache.has(hash).await {
             Ok(true) => return true,
             Ok(false) => {}
@@ -454,6 +464,10 @@ impl ClientHandler {
                 tracing::warn!(%hash, error = %e, "node-to-node pull-through store lookup failed after deadline");
             }
         }
+        // Genuinely abandoned at the deadline (metered here, after the race check,
+        // so a blob that landed in time isn't over-counted as a timeout): this
+        // distinguishes a slow/wedged upstream from "not on network".
+        self.metrics.node_pull_through_timeout();
         tracing::debug!(%hash, ?timeout, "node-to-node pull-through timed out");
         // The foreground future was dropped (its partial pull discarded); keep
         // warming the cache in the background for future requests. Best-effort
