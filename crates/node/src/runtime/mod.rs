@@ -917,13 +917,30 @@ pub async fn run(
     client_handler.attach_voucher_activity(Arc::clone(&voucher_activity));
     client_handler.attach_region_accountant(Arc::clone(&region_accountant));
     // Arm the cache-miss pull-through hook (#831) when the feature is enabled.
-    // The deadline bounds how long a miss blocks the delivery path on the
-    // upstream pull before falling back to `NotFound`. Whether the pull can
-    // actually succeed additionally depends on the `NodeOrigin` being
-    // provisioned below (buyer service + address resolver bootstrapped); an
-    // unprovisioned origin just makes the `get` a fast miss.
+    // The outer deadline bounds how long a miss blocks the delivery path before
+    // falling back to `NotFound`. It is *derived* from the per-candidate budget
+    // (`node_pull_timeout_sec`) rather than equal to it: the handler wraps the
+    // whole `discover → probe → rank → pull` fetch in one `tokio::time::timeout`,
+    // so an outer deadline equal to the per-candidate timeout would cancel the
+    // fetch the instant candidate #1 stalls, before the `MAX_PROVIDER_ATTEMPTS`
+    // fallback loop ever reaches candidates #2..N (#859). `outer_pull_deadline`
+    // budgets all N per-candidate budgets plus one-time discovery slack. Whether
+    // the pull can actually succeed additionally depends on the `NodeOrigin`
+    // being provisioned below (buyer service + address resolver bootstrapped);
+    // an unprovisioned origin just makes the `get` a fast miss.
+    //
+    // The token cancels the detached background cache-fill tasks (#859) the
+    // handler spawns when the foreground deadline fires; it is cancelled in the
+    // shutdown sequence below alongside `gossip_shutdown`.
+    let pull_through_bg_shutdown = CancellationToken::new();
     if cfg.cache.node_to_node_pull_through_enabled {
-        client_handler.attach_pull_through(Duration::from_secs(cfg.cache.node_pull_timeout_sec));
+        let per_candidate = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
+        let outer_deadline = crate::selection::outer_pull_deadline(per_candidate);
+        client_handler.attach_pull_through(outer_deadline);
+        // Background fill keeps warming the cache after the delivery path gives
+        // up; it gets a full fresh outer-deadline budget to complete from
+        // scratch (the foreground future was dropped, taking its partial work).
+        client_handler.attach_background_fill(pull_through_bg_shutdown.clone(), outer_deadline);
     }
 
     // On-chain buyer-side service (#744). When this node pulls content from an
@@ -1591,6 +1608,16 @@ pub async fn run(
         tracing::warn!(%err, "router shutdown reported an error");
     }
     gossip_shutdown.cancel();
+    // Cancel any in-flight background cache-fill tasks (#859): the router has
+    // drained, so warming the cache for future requests is moot. They observe
+    // the token at their next await and exit; being advisory, they are not
+    // joined into the drain below. A warm already inside `cache.populate` may
+    // therefore still complete a store write concurrently with the `cache`
+    // shutdown/flush further down — which is safe: iroh-blobs store writes are
+    // self-contained (the same write shape as the foreground delivery path,
+    // already drained above), so a late warm write either lands intact or is
+    // dropped, never corrupting the store.
+    pull_through_bg_shutdown.cancel();
     // The router has drained, so no further vouchers — and therefore no further
     // receipts — will be produced. Signal the receipt writer to flush whatever
     // is already enqueued and exit; it is awaited in the drain phase below so

@@ -412,7 +412,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
 # node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
-# node_pull_timeout_sec = 20               # per-upstream pull timeout on a node-to-node miss (#831)
+# node_pull_timeout_sec = 20               # per-upstream pull timeout on a node-to-node miss; the overall pull-through deadline is derived to allow trying every ranked upstream before falling back (#831, #859)
 
 [payment]
 # rate_per_mb = 10

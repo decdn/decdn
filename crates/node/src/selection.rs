@@ -7,10 +7,52 @@
 
 use rand::RngExt;
 use std::collections::HashSet;
+use std::time::Duration;
 
 /// Maximum providers to attempt before reporting a fetch failure to the
 /// caller (issue #322 — "max 3 provider attempts before returning error").
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
+
+/// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential
+/// per-candidate stream budgets when computing the outer pull-through deadline
+/// (#859). It covers the *one-time* discover → probe → rank overhead that runs
+/// under the outer deadline but is not a per-candidate stream (probing is
+/// concurrent, bounded by a single probe timeout, so it does not scale with the
+/// attempt count). A tunable judgement value: small relative to one per-candidate
+/// budget so it doesn't materially inflate worst-case miss latency.
+///
+/// Note what it does *not* model: per-candidate `open_or_reuse_channel`
+/// (potentially an on-chain `openChannel` tx, once per attempt) is not bounded by
+/// the per-candidate `pull_timeout`, so on a cold cache with a slow L2 the outer
+/// deadline can still preempt before the last candidate. That is a known
+/// fragility at *small* configured per-candidate budgets, not a regression: it is
+/// still strictly better than the pre-#859 `outer == per_candidate` wiring, which
+/// killed the fallback after a single stall.
+pub const PULL_THROUGH_OUTER_SLACK: Duration = Duration::from_secs(10);
+
+/// Outer deadline for a node-to-node pull-through, derived from the configured
+/// *per-candidate* timeout (`cache.node_pull_timeout_sec`).
+///
+/// The delivery handler wraps the whole `discover → probe → rank → pull` fetch
+/// in a single `tokio::time::timeout`. For the sequential `MAX_PROVIDER_ATTEMPTS`
+/// fallback loop to actually reach candidates #2..N when candidate #1 *stalls*,
+/// this outer deadline must strictly exceed the sum of all per-candidate *stream*
+/// budgets — otherwise both clocks (sourced from the same config value before
+/// #859) expire together and the outer timeout cancels the whole fetch at the
+/// instant candidate #1's own timeout fires, killing the fallback. We therefore
+/// budget `MAX_PROVIDER_ATTEMPTS × per_candidate` plus [`PULL_THROUGH_OUTER_SLACK`]
+/// of one-time discovery overhead. The strict-exceed guarantee is over the
+/// per-candidate *stream* budgets; see [`PULL_THROUGH_OUTER_SLACK`] for what the
+/// slack does and does not absorb (notably per-candidate channel-open).
+/// `node_pull_timeout_sec` keeps its documented per-upstream meaning; only the
+/// derived outer backstop grows.
+#[must_use]
+pub fn outer_pull_deadline(per_candidate: Duration) -> Duration {
+    let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
+    per_candidate
+        .saturating_mul(attempts)
+        .saturating_add(PULL_THROUGH_OUTER_SLACK)
+}
 
 /// Reputation floor in the score denominator (ADR 001).
 const REPUTATION_FLOOR: f32 = 0.1;
@@ -343,6 +385,39 @@ pub fn top_n_with_floor(
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    // #859 regression guard: the derived outer pull-through deadline must
+    // strictly exceed the sum of all per-candidate budgets, so the outer
+    // `tokio::time::timeout` can never preempt the `MAX_PROVIDER_ATTEMPTS`
+    // fallback loop when an early candidate stalls.
+    #[test]
+    fn outer_pull_deadline_exceeds_all_per_candidate_budgets() {
+        let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
+        for per_secs in [1_u64, 5, 20, 60] {
+            let per = Duration::from_secs(per_secs);
+            let outer = outer_pull_deadline(per);
+            let all_candidates = per.saturating_mul(attempts);
+            assert!(
+                outer > all_candidates,
+                "outer {outer:?} must exceed {MAX_PROVIDER_ATTEMPTS}×{per:?}"
+            );
+            // And it equals exactly N×per + the discovery slack.
+            assert_eq!(outer, all_candidates + PULL_THROUGH_OUTER_SLACK);
+        }
+    }
+
+    // A zero per-candidate budget still yields a positive outer deadline (the
+    // slack), and a saturating multiply can't panic on absurd inputs.
+    #[test]
+    fn outer_pull_deadline_handles_edges() {
+        assert_eq!(
+            outer_pull_deadline(Duration::ZERO),
+            PULL_THROUGH_OUTER_SLACK
+        );
+        // Saturates to MAX rather than overflowing/panicking — guards against a
+        // future switch to non-saturating arithmetic.
+        assert_eq!(outer_pull_deadline(Duration::MAX), Duration::MAX);
+    }
 
     // ADR 001 multiplier table: rep=1.0 → 1×, 0.8 → 1.56×, 0.5 → 4×, 0.3 → 11.1×, 0.1 → 100×.
 

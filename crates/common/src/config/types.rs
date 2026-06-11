@@ -359,7 +359,10 @@ pub struct CacheConfig {
     /// node-to-node miss (#831). Absent =>
     /// [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`] (20). Bounds how long a
     /// miss blocks the serving path on one upstream before falling through to
-    /// the next ranked candidate (or `NotFound`).
+    /// the next ranked candidate (or `NotFound`). This is the *per-upstream*
+    /// budget; the overall pull-through deadline is derived as roughly
+    /// `MAX_PROVIDER_ATTEMPTS ×` it plus a fixed discovery allowance, so the
+    /// fallback loop reaches every ranked candidate (#859).
     pub node_pull_timeout_sec: Option<u64>,
 }
 
