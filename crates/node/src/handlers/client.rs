@@ -28,7 +28,7 @@
 //! accounting must not run on replayable early data, so `on_accepting` always
 //! takes the full handshake.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -56,6 +56,7 @@ use iroh::PublicKey;
 use iroh::endpoint::{Accepting, Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
@@ -87,6 +88,67 @@ struct ChannelDeliveryState {
     state: ChannelState,
     /// Channel-wide cumulative bytes delivered as of the last accepted voucher.
     bytes_delivered_cumulative: U256,
+}
+
+/// Detached background cache-fill state (#859), attached post-construction via
+/// [`ClientHandler::attach_background_fill`]. When the foreground delivery
+/// deadline fires on a node-to-node miss, the handler spawns a task to keep
+/// warming the cache from a slow-but-available upstream for future requests.
+struct BackgroundFill {
+    /// Cancelled on node shutdown so in-flight warm tasks stop cooperatively at
+    /// their next await rather than being left to run past drain.
+    cancel: CancellationToken,
+    /// Fresh budget granted to a background fill (it re-pulls from scratch — the
+    /// foreground future was dropped, taking its partial work). Reuses the
+    /// derived outer pull-through deadline.
+    budget: Duration,
+    /// Hashes with a background fill currently running, so repeated foreground
+    /// misses on the same hash don't spawn duplicate warming tasks. A std mutex
+    /// (no await held); a poisoned lock is recovered rather than disabling the
+    /// feature — the dedup set holds no torn state to fear (only `insert`/`remove`
+    /// ever take it).
+    inflight: Arc<std::sync::Mutex<HashSet<Hash>>>,
+}
+
+/// RAII guard that clears a hash from [`BackgroundFill::inflight`] when its warm
+/// task ends (success, failure, or shutdown cancel), re-arming future misses.
+struct BgInflightGuard {
+    hash: Hash,
+    inflight: Arc<std::sync::Mutex<HashSet<Hash>>>,
+}
+
+impl Drop for BgInflightGuard {
+    fn drop(&mut self) {
+        // Recover a poisoned lock so the claim is ALWAYS released — otherwise a
+        // panic elsewhere would strand this hash in the set, permanently
+        // disabling its background fill.
+        let mut set = self
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.remove(&self.hash);
+    }
+}
+
+/// Claim `hash` for a background fill (#859), returning a [`BgInflightGuard`]
+/// the caller must hold for the lifetime of the spawned warm task — dropping it
+/// releases the claim. Returns `None` only if a fill is already in flight for
+/// `hash` (a poisoned lock is recovered, not treated as a claim failure). Fusing
+/// the claim with its releaser makes "armed" and "holds a guard" the same fact: a
+/// caller cannot arm without receiving the releaser (an unreleasable leak), nor
+/// release without arming.
+fn arm_background_fill(
+    inflight: &Arc<std::sync::Mutex<HashSet<Hash>>>,
+    hash: Hash,
+) -> Option<BgInflightGuard> {
+    let claimed = inflight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(hash);
+    claimed.then(|| BgInflightGuard {
+        hash,
+        inflight: Arc::clone(inflight),
+    })
 }
 
 /// `cdn/client/v1` paid-delivery handler.
@@ -142,6 +204,12 @@ pub struct ClientHandler {
     /// existence, which is public — is the anti-proxy-abuse gate: a client
     /// without an owned channel cannot make this node front upstream egress.
     pull_through: OnceLock<Duration>,
+    /// Background cache-fill state (#859), attached post-construction via
+    /// [`ClientHandler::attach_background_fill`]. Unset (the default — feature
+    /// off, and in tests) means a foreground pull-through deadline simply
+    /// returns `NotFound` with no warming. When set, the deadline additionally
+    /// spawns a detached task to keep filling the cache from a slow upstream.
+    background_fill: OnceLock<BackgroundFill>,
     rate_per_mb: Arc<AtomicU64>,
     delivery_floor: u64,
     delivery_ceiling: u64,
@@ -217,6 +285,7 @@ impl ClientHandler {
             voucher_activity: OnceLock::new(),
             region_accountant: OnceLock::new(),
             pull_through: OnceLock::new(),
+            background_fill: OnceLock::new(),
             rate_per_mb,
             delivery_floor,
             delivery_ceiling,
@@ -259,6 +328,67 @@ impl ClientHandler {
     /// back to `NotFound`.
     pub fn attach_pull_through(&self, timeout: Duration) {
         let _ = self.pull_through.set(timeout);
+    }
+
+    /// Attach background cache-fill (#859). Called once during runtime wiring
+    /// when pull-through is enabled; a second call is ignored. After this, a
+    /// foreground pull-through deadline additionally spawns a detached task
+    /// (cancelled via `cancel` on shutdown, bounded by `budget`) to keep warming
+    /// the cache from a slow upstream for future requests.
+    pub fn attach_background_fill(&self, cancel: CancellationToken, budget: Duration) {
+        let _ = self.background_fill.set(BackgroundFill {
+            cancel,
+            budget,
+            inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        });
+    }
+
+    /// Spawn a detached background cache-fill for `hash` (#859), unless one is
+    /// already running for it or the feature is unattached. The foreground
+    /// delivery path has already given up; this re-pulls from scratch on a fresh
+    /// budget so a slow-but-available upstream still warms the cache. Best-effort
+    /// — never blocks the caller and never affects the foreground result.
+    fn maybe_spawn_background_fill(&self, hash: Hash) {
+        let Some(bg) = self.background_fill.get() else {
+            return;
+        };
+        // Dedup: only the first miss for a hash claims it and receives the guard
+        // that releases the claim when the spawned task ends.
+        let Some(guard) = arm_background_fill(&bg.inflight, hash) else {
+            return;
+        };
+        let cache = self.cache.clone();
+        let metrics = Arc::clone(&self.metrics);
+        let cancel = bg.cancel.clone();
+        let budget = bg.budget;
+        self.metrics.node_pull_through_background_spawned();
+        tokio::spawn(async move {
+            // Dropped on task exit (any branch), clearing the inflight entry.
+            let _guard = guard;
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    tracing::debug!(%hash, "background cache-fill cancelled on shutdown");
+                }
+                result = tokio::time::timeout(budget, cache.populate(hash)) => match result {
+                    Ok(Ok(())) => {
+                        metrics.node_pull_through_background_succeeded();
+                        tracing::debug!(%hash, "background cache-fill populated blob");
+                    }
+                    Ok(Err(e)) => {
+                        // Covers every populate error (clean miss, no origin, AND
+                        // store/I/O fault), so the message stays neutral; the
+                        // cause rides in `error`.
+                        metrics.node_pull_through_background_failed();
+                        tracing::debug!(%hash, error = %e, "background cache-fill did not complete");
+                    }
+                    Err(_) => {
+                        metrics.node_pull_through_background_failed();
+                        tracing::debug!(%hash, ?budget, "background cache-fill timed out");
+                    }
+                },
+            }
+        });
     }
 
     /// Whether `req` is authorized to trigger a paid pull-through (#831): it must
@@ -312,14 +442,38 @@ impl ClientHandler {
                 tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a cache-engine error");
                 false
             }
-            Err(_) => {
-                // A deadline hit is distinct from a genuine miss: meter it so a
-                // slow/wedged upstream is distinguishable from "not on network".
-                self.metrics.node_pull_through_timeout();
-                tracing::debug!(%hash, ?timeout, "node-to-node pull-through timed out");
-                false
+            Err(_) => self.on_pull_through_timeout(hash, timeout).await,
+        }
+    }
+
+    /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if
+    /// it landed in the store in the race; otherwise meters the abandoned pull and
+    /// spawns a background warm before reporting the miss. Returns whether the blob
+    /// is now present.
+    async fn on_pull_through_timeout(&self, hash: Hash, timeout: Duration) -> bool {
+        // Race: the fill may have landed in the store at the instant the outer
+        // deadline fired. If so, serve it — this was NOT an abandoned pull, so do
+        // not count a timeout. A `has` *error* is a real store fault, not a clean
+        // race-loss: surface it like the populate-engine-error arm above rather
+        // than silently treating the store as empty, then fall through to the warm.
+        match self.cache.has(hash).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => {
+                self.metrics.node_pull_through_error();
+                tracing::warn!(%hash, error = %e, "node-to-node pull-through store lookup failed after deadline");
             }
         }
+        // Genuinely abandoned at the deadline (metered here, after the race check,
+        // so a blob that landed in time isn't over-counted as a timeout): this
+        // distinguishes a slow/wedged upstream from "not on network".
+        self.metrics.node_pull_through_timeout();
+        tracing::debug!(%hash, ?timeout, "node-to-node pull-through timed out");
+        // The foreground future was dropped (its partial pull discarded); keep
+        // warming the cache in the background for future requests. Best-effort
+        // and non-blocking — the client still gets `NotFound` now.
+        self.maybe_spawn_background_fill(hash);
+        false
     }
 
     /// Register a channel observed on-chain via `ChannelOpened` (#327) so the
@@ -1193,5 +1347,42 @@ async fn read_voucher(recv: &mut RecvStream) -> anyhow::Result<decdn_protocol::c
         Ok((ClientMessage::Voucher(v), _)) => Ok(v),
         Ok((_, _)) => anyhow::bail!("expected ClientMessage::Voucher"),
         Err(e) => anyhow::bail!("voucher decode failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #859: the handler-layer dedup set spawns at most one background warm per
+    // in-flight hash, and re-arms once the spawned task's guard releases.
+    #[test]
+    fn background_fill_dedup_and_rearm() {
+        let inflight = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let hash = Hash::new(b"background-fill-dedup");
+
+        // The first foreground timeout claims the hash → caller receives a guard.
+        let guard = arm_background_fill(&inflight, hash);
+        assert!(guard.is_some(), "first claim must succeed");
+        // A concurrent timeout for the same hash is deduped while the guard lives.
+        assert!(
+            arm_background_fill(&inflight, hash).is_none(),
+            "a second claim while the first is in flight must be deduped"
+        );
+        // A different hash is independent.
+        let other_guard = arm_background_fill(&inflight, Hash::new(b"other-hash"));
+        assert!(
+            other_guard.is_some(),
+            "a distinct hash claims independently"
+        );
+
+        // The spawned task's guard releases the claim when it (and the task) ends.
+        drop(guard);
+        // A later miss on the released hash re-arms and spawns again.
+        assert!(
+            arm_background_fill(&inflight, hash).is_some(),
+            "the hash re-arms once its guard releases"
+        );
+        drop(other_guard);
     }
 }

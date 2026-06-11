@@ -66,6 +66,9 @@ const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// 1.5 MiB → crosses one 1-MiB voucher interval plus a closing voucher.
 const PAYLOAD_LEN: usize = 1_572_864;
 const RATE: u64 = 10;
+/// A strictly-cheaper quote than [`RATE`] so the stalling provider ranks #1 in
+/// the selection score (#859 fallthrough test).
+const STALL_RATE: u64 = RATE / 2;
 
 const fn slash_verifying() -> Address {
     Address::repeat_byte(0x11)
@@ -329,6 +332,36 @@ fn build_origin(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
 ) -> NodeOrigin {
+    build_origin_with_timeout(
+        ep_b,
+        b_dht,
+        hash,
+        buyer,
+        local_rep,
+        obs_buffer,
+        metrics,
+        providers,
+        addr_map,
+        Duration::from_secs(20),
+    )
+}
+
+/// [`build_origin`] with an explicit per-candidate `pull_timeout`, so a test can
+/// drive a *short* deadline and exercise the stall-then-fallthrough path (#859)
+/// without a 20-second wait.
+#[allow(clippy::too_many_arguments, clippy::expect_used)]
+fn build_origin_with_timeout(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    hash: Hash,
+    buyer: Arc<dyn ChannelOpener>,
+    local_rep: &Arc<LocalReputation>,
+    obs_buffer: &Arc<ObservationBuffer>,
+    metrics: &Arc<Metrics>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+    pull_timeout: Duration,
+) -> NodeOrigin {
     let mut dir = HashMap::new();
     dir.insert(DhtHash::from_bytes(*hash.as_bytes()), providers);
 
@@ -354,7 +387,7 @@ fn build_origin(
         metrics: Arc::clone(metrics),
         config: NodeOriginConfig {
             probe_fanout: 5,
-            pull_timeout: Duration::from_secs(20),
+            pull_timeout,
             enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
@@ -660,6 +693,220 @@ fn spawn_a_lying_server(
             }
         }
     })
+}
+
+/// Spawn a provider that answers probes truthfully but *stalls* on the client
+/// stream: it accepts the bidi stream and reads the request, then never sends a
+/// `StreamResponse` and holds the send side open, so the buyer's `stream_fetch`
+/// blocks until its per-candidate `pull_timeout` fires. Models the slow-stall
+/// failure shape whose outer-deadline interaction #859 fixes.
+fn spawn_a_stalling_server(
+    ep: iroh::Endpoint,
+    s_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    total_bytes: u64,
+    rate: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let eth = Arc::clone(&s_eth);
+            let dom = slash.clone();
+            if conn.alpn() == ALPN_PROBE {
+                tokio::spawn(async move {
+                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    // `_send` is held (not `_`) so the response stream is neither
+                    // finished nor reset — the buyer keeps blocking on its read
+                    // rather than seeing EOF. Read the request, then go quiet
+                    // until the buyer gives up and drops the connection.
+                    if let Ok((_send, mut recv)) = conn.accept_bi().await {
+                        let _ = read_frame(&mut recv).await;
+                        conn.closed().await;
+                    }
+                });
+            }
+        }
+    })
+}
+
+/// #859: when the best-ranked candidate *stalls* (answers the probe, then never
+/// serves bytes), the per-candidate `pull_timeout` must abandon it and the loop
+/// must fall through to the next ranked candidate, which delivers. This proves
+/// the mechanism the fix relies on — a per-candidate budget that the (separately
+/// derived) outer deadline can no longer preempt.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)]
+async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
+    let payload = vec![0xCDu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Honest node A: holds the blob; serves probe + client at `RATE`. ------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xA2);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Stalling node S: quotes a CHEAPER rate so it ranks first (strictly
+    //     cheaper ⇒ lower selection score ⇒ ranked #1), then stalls on the
+    //     client stream. ---------------------------------------------------------
+    let s_sk = fresh_key();
+    let s_id = s_sk.public();
+    let s_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s, addr_s) =
+        local_endpoint(s_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_s = spawn_a_stalling_server(
+        ep_s.clone(),
+        Arc::clone(&s_eth),
+        slash_domain(),
+        total_bytes,
+        STALL_RATE,
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    // Prime B's iroh address cache for BOTH providers (NodeId-only dialing).
+    for (id, addr) in [(a_id, addr_a), (s_id, addr_s)] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(id).with_ip_addr(addr),
+            *hash.as_bytes(),
+            1,
+            false,
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+
+    let s_dht = DhtNodeId::from_bytes(*s_id.as_bytes());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let mut addr_map = HashMap::new();
+    addr_map.insert(s_dht, s_eth.address());
+    addr_map.insert(a_dht, a_eth.address());
+
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        vec![s_dht, a_dht],
+        addr_map,
+        // Short per-candidate budget so the stall is abandoned quickly. With the
+        // pre-#859 wiring an equal outer deadline would have cancelled the whole
+        // fetch here; at the `NodeOrigin` level there is no outer wrapper, so this
+        // exercises the per-candidate fallthrough the fix preserves.
+        Duration::from_secs(1),
+    );
+
+    // The orchestration must abandon the staller and deliver from A.
+    let fetched = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
+    let bytes = fetched
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected the blob from the honest fallback candidate"))?;
+    anyhow::ensure!(
+        bytes.as_ref() == payload.as_slice(),
+        "pulled bytes mismatch"
+    );
+
+    // Two outcomes recorded: the staller scored unreachable, A scored a clean
+    // delivery — proof BOTH candidates were attempted, in rank order.
+    let drained = obs_buffer.drain();
+    anyhow::ensure!(
+        drained.len() == 2,
+        "expected two observations (staller + honest), got {}",
+        drained.len()
+    );
+    let (_, staller_m) = drained
+        .iter()
+        .find(|(p, _)| *p == s_id)
+        .ok_or_else(|| anyhow::anyhow!("no observation about the staller"))?;
+    anyhow::ensure!(
+        staller_m.uptime_observed == Some(false),
+        "staller should score as unreachable, got {staller_m:?}"
+    );
+    let (_, honest_m) = drained
+        .iter()
+        .find(|(p, _)| *p == a_id)
+        .ok_or_else(|| anyhow::anyhow!("no observation about the honest provider"))?;
+    anyhow::ensure!(
+        honest_m.data_correct == Some(true) && honest_m.uptime_observed == Some(true),
+        "honest provider should score a clean delivery, got {honest_m:?}"
+    );
+    assert_counter(&b_metrics, "node_pull_success_total", 1)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    ep_s.close().await;
+    task_a.await?;
+    task_s.await?;
+    Ok(())
 }
 
 /// A miss with no discoverable provider degrades to a clean `NotFound`, records

@@ -1880,3 +1880,152 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
     server_task.await?;
     Ok(())
 }
+
+// ===========================================================================
+// #859 — handler-level outer-deadline regression. `ClientHandler::try_pull_through`
+// wraps the whole pull in ONE `tokio::time::timeout`. Before #859 that outer
+// deadline was set EQUAL to the per-candidate budget (`node_pull_timeout_sec`),
+// so a pull needing more than one per-candidate budget's wall-clock (e.g.
+// candidate #1 stalls a full budget, then #2 delivers) was cancelled before it
+// could finish. The derived `outer_pull_deadline` (N×per + slack) must
+// accommodate it. A single slow origin taking longer than one per-candidate
+// budget models that scenario through the real handler — the layer the bug
+// actually lived in (the NodeOrigin-level fallthrough test cannot, since
+// `NodeOrigin::fetch` has no outer wrapper).
+// ===========================================================================
+
+/// An origin that returns the blob after a fixed delay — models a pull whose
+/// total wall-clock exceeds one per-candidate budget (stall-then-fallback).
+#[derive(Debug)]
+struct SlowOrigin {
+    payload: Vec<u8>,
+    delay: Duration,
+}
+
+impl decdn_cache::Origin for SlowOrigin {
+    fn fetch(
+        &self,
+        _hash: decdn_cache::Hash,
+        _max_bytes: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<decdn_cache::origin::OriginFetch, decdn_cache::OriginPullError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let payload = self.payload.clone();
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(decdn_cache::origin::OriginFetch::found_one_shot(
+                payload.into(),
+            ))
+        })
+    }
+
+    fn kind(&self) -> decdn_cache::OriginKind {
+        decdn_cache::OriginKind::Peer
+    }
+}
+
+/// Drive one authorized owner request for a hash served only by a `SlowOrigin`
+/// taking `origin_delay`, with the handler's outer pull-through deadline set to
+/// `outer_deadline`. Returns whether the foreground pull completed and filled the
+/// store (probed via a cloned cache handle after the response settles). No
+/// background fill is attached, so this isolates the foreground outer-deadline
+/// behaviour (a background warm could otherwise fill the store after the fact and
+/// mask the broken case).
+async fn pull_through_fills_under_deadline(
+    outer_deadline: Duration,
+    origin_delay: Duration,
+) -> anyhow::Result<bool> {
+    let payload = vec![0x5Au8; 4096];
+    let want = decdn_cache::Hash::new(&payload);
+    let cache_tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(
+        cache_tmp.path(),
+        vec![Arc::new(SlowOrigin {
+            payload: payload.clone(),
+            delay: origin_delay,
+        }) as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    let cache_probe = cache.clone();
+
+    let (store, owner, _deposit) = seeded_store()?;
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_full(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+    )?;
+    handler.attach_pull_through(outer_deadline);
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let req = StreamRequest {
+        hash: *want.as_bytes(),
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        timestamp_us: 0x0091_1001,
+    };
+    let owner_sk = fresh_key();
+    let owner_node_id = B256::from(*owner_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(owner_sk, vec![]).await?;
+    let ext_owner = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: owner.address().into(),
+            binding_signature: sign_binding_for(&owner, owner_node_id)?,
+        }),
+        ..Default::default()
+    };
+    // The handler answers only after `try_pull_through` resolves (populate
+    // completes or the outer deadline fires), so the store state is settled by
+    // the time this returns.
+    let _ = raw_request(&client_ep, target, &req, Some(&ext_owner)).await?;
+    client_ep.close().await;
+
+    let filled = cache_probe.has(want).await?;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(filled)
+}
+
+/// #859 regression: a slow pull (1.5s) exceeding one 1s per-candidate budget is
+/// abandoned by an outer deadline equal to that budget (the pre-#859 wiring), but
+/// completes under the derived `outer_pull_deadline`. This is the only test in
+/// the suite that fails if `attach_pull_through` is re-wired to the per-candidate
+/// value (re-introducing #859).
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Result<()> {
+    let per = Duration::from_secs(1);
+    let slow = Duration::from_millis(1500); // > per, well under outer_pull_deadline(per)
+
+    // Pre-#859 wiring: outer == per_candidate cancels the slow pull → store empty.
+    anyhow::ensure!(
+        !pull_through_fills_under_deadline(per, slow).await?,
+        "an outer deadline equal to the per-candidate budget must abandon the slow pull (the #859 bug)"
+    );
+    // Fixed wiring: the derived outer deadline accommodates it → store filled.
+    anyhow::ensure!(
+        pull_through_fills_under_deadline(decdn_node::selection::outer_pull_deadline(per), slow)
+            .await?,
+        "the derived outer deadline must let a pull exceeding one per-candidate budget complete"
+    );
+    Ok(())
+}

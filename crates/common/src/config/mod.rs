@@ -160,6 +160,10 @@ pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
 /// Default wall-clock bound (seconds) on a single upstream pull during a
 /// node-to-node cache-miss fill (#831). Matches the integration-test budget;
 /// a slow upstream is abandoned for the next ranked candidate at this deadline.
+/// This is the *per-upstream* budget: the node derives the overall pull-through
+/// deadline as roughly `MAX_PROVIDER_ATTEMPTS ×` it plus a fixed discovery
+/// allowance, so the fallback loop can reach every ranked candidate before the
+/// serving path gives up (#859).
 pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 
 /// Default size at which the download-receipt log rotates (#802): 128 MiB.

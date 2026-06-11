@@ -479,6 +479,19 @@ pub struct DecdnMetrics {
     /// store/pull fault, surfaced as `NotFound` to the client but logged + bumped
     /// here so it isn't silent.
     pub node_pull_through_errors: Counter,
+    /// `decdn_node_pull_through_background_spawned_total` (#859): detached
+    /// background cache-fill tasks spawned after the foreground delivery
+    /// deadline fired, to keep warming the cache from a slow-but-available
+    /// upstream for future requests.
+    pub node_pull_through_background_spawned: Counter,
+    /// `decdn_node_pull_through_background_succeeded_total` (#859): background
+    /// cache-fills that populated the blob into the store.
+    pub node_pull_through_background_succeeded: Counter,
+    /// `decdn_node_pull_through_background_failed_total` (#859): background
+    /// cache-fills that gave up (engine error, clean miss, or their own
+    /// deadline) without populating the blob. Cancellation on shutdown is not
+    /// counted as a failure.
+    pub node_pull_through_background_failed: Counter,
     /// `decdn_node_address_watcher_restarts_total` (#831): distinct drift windows
     /// of the `NodeId → address` resolver's event watcher (mirrors the staker-set
     /// watcher, #788). Edge-triggered once per outage, not per backoff iteration.
@@ -1010,6 +1023,22 @@ impl Metrics {
     /// A cache-engine error (not a clean miss) was hit filling a miss (#831).
     pub fn node_pull_through_error(&self) {
         self.decdn.node_pull_through_errors.inc();
+    }
+
+    /// A detached background cache-fill was spawned after the foreground
+    /// delivery deadline fired (#859).
+    pub fn node_pull_through_background_spawned(&self) {
+        self.decdn.node_pull_through_background_spawned.inc();
+    }
+
+    /// A background cache-fill populated the blob into the store (#859).
+    pub fn node_pull_through_background_succeeded(&self) {
+        self.decdn.node_pull_through_background_succeeded.inc();
+    }
+
+    /// A background cache-fill gave up without populating the blob (#859).
+    pub fn node_pull_through_background_failed(&self) {
+        self.decdn.node_pull_through_background_failed.inc();
     }
 
     /// Open a drift window for the `NodeId → address` resolver watcher (#831):
