@@ -815,16 +815,20 @@ async fn serve_then_reject_voucher(
             .map_err(|e| anyhow::anyhow!("decode voucher: {e}"))?
             .0
     };
-    if let ClientMessage::Voucher(_) = voucher_msg {
-        write_frame(
-            &mut send,
-            &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::StaleNonce,
-            }))?,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("write voucher rejection: {e}"))?;
-    }
+    // Fail fast on a protocol regression: if the buyer stops presenting a closing
+    // voucher here, surface it as a clear assertion rather than a silent no-op
+    // that the buyer would only see as a confusing timeout/EOF.
+    let ClientMessage::Voucher(_) = voucher_msg else {
+        anyhow::bail!("voucher-rejecting upstream: expected a Voucher");
+    };
+    write_frame(
+        &mut send,
+        &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {
+            reason: VoucherRejectReason::StaleNonce,
+        }))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write voucher rejection: {e}"))?;
     let _ = send.finish();
     conn.closed().await;
     Ok(())

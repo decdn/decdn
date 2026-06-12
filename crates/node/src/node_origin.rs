@@ -614,9 +614,12 @@ mod tests {
     /// The whole #857 fix hinges on `pull_from_candidate` recovering the buyer-side
     /// sentinels via `downcast_ref` after they round-trip through `anyhow::Error`
     /// (the timeout path even double-wraps via `??`). Pin that contract at the
-    /// boundary so a future `.context()` wrapper or a changed error path fails here
-    /// — a localized failure — rather than as a confusing "honest provider got
-    /// tarred" assertion three layers up in the integration tests.
+    /// boundary — using the SAME `downcast_ref` call production uses — so a future
+    /// change to the sentinel type or a switch away from `downcast_ref` fails here,
+    /// a localized failure, rather than as a confusing "honest provider got tarred"
+    /// assertion three layers up. The last case proves `downcast_ref` still finds
+    /// the sentinel through a `.context()` layer (anyhow walks the chain), so a
+    /// future wrap in the propagation path would not silently break classification.
     #[test]
     fn buyer_side_sentinels_survive_anyhow_downcast() {
         let timeout: anyhow::Error = anyhow::Error::new(PullTimeout {
@@ -630,5 +633,10 @@ mod tests {
         });
         assert!(rejected.downcast_ref::<UpstreamVoucherRejected>().is_some());
         assert!(rejected.downcast_ref::<PullTimeout>().is_none());
+
+        // Even with an added context layer, the plain `downcast_ref` the
+        // orchestrator uses still recovers the sentinel (no `root_cause()` needed).
+        let wrapped = timeout.context("added context in some future propagation path");
+        assert!(wrapped.downcast_ref::<PullTimeout>().is_some());
     }
 }
