@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
-use iroh::SecretKey;
+use iroh::{PublicKey, SecretKey};
 use rand::Rng;
 
 const KEY_FILE_NAME: &str = "node.secret";
@@ -158,6 +158,107 @@ pub fn move_aside(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(bak)
 }
 
+/// A freshly-generated node key written to a temp file in `data_dir`, not yet
+/// committed to `node.secret`.
+///
+/// Staging (generate + write the temp) is separated from committing
+/// (archive-old + rename) so a multi-file rotation can generate **all** key
+/// material before touching any canonical file — a failure while generating the
+/// *second* secret then leaves the first untouched rather than half-rotated
+/// (#844). Produced by [`stage_node_key`]; finished with [`Self::commit`].
+///
+/// Dropping a [`StagedNodeKey`] without committing removes the temp file, so an
+/// abandoned stage never litters `data_dir`.
+#[must_use = "a staged node key must be committed (or it is discarded on drop)"]
+pub struct StagedNodeKey {
+    tmp: PathBuf,
+    final_path: PathBuf,
+    key: SecretKey,
+    committed: bool,
+}
+
+impl std::fmt::Debug for StagedNodeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never format the secret key.
+        f.debug_struct("StagedNodeKey")
+            .field("final_path", &self.final_path)
+            .field("committed", &self.committed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StagedNodeKey {
+    /// The public key of the staged secret, for logging the node id before the
+    /// commit lands.
+    #[must_use]
+    pub fn public(&self) -> PublicKey {
+        self.key.public()
+    }
+
+    /// Commit the staged key: archive any existing `node.secret` (so the
+    /// operator key-rotation runbook keeps the prior material, mirroring the
+    /// no-stage path) and atomically rename the temp into place.
+    ///
+    /// Returns the archive path if a prior key was moved aside, or `None` when
+    /// there was nothing to archive (fresh install).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if archiving the prior key or the rename fails. On a
+    /// rename failure the temp file is left for the `Drop` handler to clean up.
+    pub fn commit(mut self) -> anyhow::Result<Option<PathBuf>> {
+        let bak = if self.final_path.exists() {
+            Some(move_aside(&self.final_path)?)
+        } else {
+            None
+        };
+        fs::rename(&self.tmp, &self.final_path).with_context(|| {
+            format!(
+                "failed to rename {} -> {}",
+                self.tmp.display(),
+                self.final_path.display()
+            )
+        })?;
+        self.committed = true;
+        Ok(bak)
+    }
+}
+
+impl Drop for StagedNodeKey {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Best-effort: an abandoned stage must not leave key material behind.
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+/// Generate a fresh node key and write it to a temp file in `data_dir` (mode
+/// `0o600` on Unix) **without** touching `node.secret`. Validates or securely
+/// creates `data_dir` with the same `0o700` semantics as [`load_or_generate`].
+///
+/// The returned [`StagedNodeKey`] is committed via [`StagedNodeKey::commit`].
+/// This is the staged counterpart of [`load_or_generate`]'s generate path, used
+/// by `decdn key-gen` so the node key and the eth keystore are both generated
+/// before either canonical file is replaced (#844).
+///
+/// # Errors
+///
+/// Returns an error if `data_dir` cannot be validated or created, or if writing
+/// the temp file fails.
+pub fn stage_node_key(data_dir: &Path) -> anyhow::Result<StagedNodeKey> {
+    ensure_data_dir(data_dir)?;
+    let final_path = key_path(data_dir);
+    let key = fresh_secret_key();
+    let tmp = write_temp(&final_path, &key.to_bytes())?;
+    Ok(StagedNodeKey {
+        tmp,
+        final_path,
+        key,
+        committed: false,
+    })
+}
+
 /// Reject `data_dir` if it isn't a directory or if any group/other permission
 /// bit is set.
 ///
@@ -275,12 +376,33 @@ pub fn fresh_secret_key() -> SecretKey {
 /// mode 0600 from the start (via `OpenOptionsExt::mode`) so the key material is
 /// never briefly exposed under a permissive umask.
 fn write_atomic(path: &Path, bytes: &[u8; KEY_LEN]) -> anyhow::Result<()> {
+    let tmp = write_temp(path, bytes)?;
+    if let Err(e) = fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))
+    {
+        // The rename never happened, so the staged temp is still on disk —
+        // remove it so a partial write doesn't accumulate in `data_dir`.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write `bytes` to a freshly-created `<path>.tmp.<suffix>` sibling (mode 0600
+/// on Unix from creation, then fsync'd) and return that temp path **without**
+/// renaming it into place. The caller commits by renaming `tmp` → `path`, or
+/// drops it by removing the file. This is the staging half of [`write_atomic`],
+/// shared with [`stage_node_key`] so a multi-file rotation can generate all key
+/// material before touching any canonical file (#844).
+///
+/// On any error the temp file is cleaned up before returning.
+fn write_temp(path: &Path, bytes: &[u8; KEY_LEN]) -> anyhow::Result<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("key path {} has no parent directory", path.display()))?;
     // Unique temp name per writer: pid + 8 random hex chars. Avoids the race
     // where two concurrent writers clobber each other's temp file. The rename
-    // step is still atomic on Unix, so only one final `path` will exist.
+    // step (in the caller) is atomic on Unix, so only one final `path` will exist.
     let suffix = {
         let mut s = [0u8; 4];
         rand::rng().fill_bytes(&mut s);
@@ -326,15 +448,16 @@ fn write_atomic(path: &Path, bytes: &[u8; KEY_LEN]) -> anyhow::Result<()> {
             fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
         }
 
-        fs::rename(&tmp, path)
-            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     })();
 
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    match result {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    result
 }
 
 #[cfg(test)]
