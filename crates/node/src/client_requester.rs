@@ -378,9 +378,11 @@ async fn fetch_inner(
     // A `total_bytes` below `byte_offset` would underflow `expected` to `0`
     // (saturating), so the loop ends on the first `StreamEnd` and returns an
     // empty buffer. On a resumed fetch (`byte_offset > 0`) the whole-blob hash
-    // check is skipped, so that empty/short buffer would surface as success — a
-    // silent verification bypass. A legitimate server always claims
-    // `total_bytes >= byte_offset`; reject anything less before the loop.
+    // check is skipped, so that empty buffer would surface as success — a silent
+    // verification bypass. A legitimate server always claims
+    // `total_bytes >= byte_offset`; reject anything less before the loop. (A
+    // non-empty but *short* delivery is caught by the completeness check after
+    // the loop.)
     if resp.body.total_bytes < byte_offset {
         anyhow::bail!(
             "server claimed total_bytes ({}) below the requested byte_offset ({})",
@@ -441,6 +443,18 @@ async fn fetch_inner(
     }
 
     let blob = buf.freeze();
+    // On a resumed fetch (`byte_offset > 0`) the whole-blob hash check below is
+    // skipped, so a truncated delivery — fewer than `expected` bytes before
+    // `StreamEnd` — would otherwise surface as a successful short read. The
+    // server's `total_bytes` is the only completeness signal without the hash,
+    // so require the full promised remainder. A full fetch (`byte_offset == 0`)
+    // is covered by the hash check and may legitimately be shorter than an
+    // over-claimed `total_bytes` as long as the bytes hash correctly, so this
+    // is scoped to resumes only (#840).
+    if byte_offset > 0 && cumulative < expected {
+        conn.close(0u32.into(), b"short-delivery");
+        anyhow::bail!("server sent {cumulative} of {expected} promised bytes before StreamEnd");
+    }
     // Whole-blob integrity check on a full fetch (see module docs for the
     // resume caveat).
     if byte_offset == 0 && Hash::new(&blob) != Hash::from_bytes(hash) {
