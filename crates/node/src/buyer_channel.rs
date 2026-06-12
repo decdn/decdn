@@ -442,7 +442,13 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// Persist the cumulative voucher totals after a delivery exchange so a
     /// later reuse (or a restart) resumes the channel at the right `nonce` /
     /// `bytes` / `amount`. The caller reports the totals of the last voucher it
-    /// signed on `provider_addr`'s channel.
+    /// signed on `provider_addr`'s channel; `channel_id` is the channel the
+    /// voucher was signed against.
+    ///
+    /// If the persisted row's `channel_id` no longer matches (the provider's
+    /// slot was replaced by a newer open between the delivery and this write),
+    /// the stale progress is logged and dropped — `Ok(())`, not an error,
+    /// because writing it would clobber the live replacement channel's record.
     ///
     /// # Errors
     ///
@@ -600,7 +606,12 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
 
     /// Persist the cumulative voucher totals paid on `provider_addr`'s channel so
     /// a later reuse or a restart resumes at the right `nonce` / `bytes` /
-    /// `amount` (#852). See [`BuyerChannelService::record_progress`].
+    /// `amount` (#852); `channel_id` is the channel the totals were signed
+    /// against. See [`BuyerChannelService::record_progress`].
+    ///
+    /// A `channel_id` that no longer matches the persisted row (the slot was
+    /// replaced by a newer open) is a non-error stale write: implementations
+    /// MUST skip it and return `Ok(())` rather than clobber the replacement.
     ///
     /// # Errors
     ///

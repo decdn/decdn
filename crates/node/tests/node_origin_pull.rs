@@ -142,11 +142,19 @@ impl ChannelOpener for StubOpener {
     fn record_progress(
         &self,
         provider_addr: Address,
-        _channel_id: B256,
+        channel_id: B256,
         nonce: U256,
         bytes_delivered: U256,
         amount: U256,
     ) -> Result<()> {
+        // The orchestrator must persist progress against the channel it pulled
+        // on — i.e. the id from the `ChannelContext` it just opened/reused.
+        // Asserts the `ctx.channel_id` plumbing at the pull call site (#838).
+        anyhow::ensure!(
+            channel_id == self.channel_id,
+            "record_progress channel_id {channel_id} != opened channel {}",
+            self.channel_id
+        );
         self.recorded
             .lock()
             .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?

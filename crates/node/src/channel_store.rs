@@ -1034,7 +1034,7 @@ impl PersistentChannelStateStore {
         write_txn
             .set_durability(Durability::Immediate)
             .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        let outcome = {
+        {
             let mut table = write_txn
                 .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
@@ -1045,30 +1045,30 @@ impl PersistentChannelStateStore {
                 .get(&key)
                 .map_err(|err| StoreError::Backend(format!("get: {err}")))?
             else {
+                // No-write outcomes return early so the uncommitted write txn is
+                // aborted on drop — avoiding a pointless `Durability::Immediate`
+                // fsync on a transaction that changed nothing.
                 return Ok(AdvanceOutcome::UnknownProvider);
             };
             let mut state = decode_buyer_record(key, value_guard.value())?;
             // Drop the borrow of `table` held by `value_guard` before mutating.
             drop(value_guard);
             if state.channel_id != channel_id {
-                AdvanceOutcome::ChannelMismatch
-            } else if let Err(err) = state.advance(nonce, bytes_delivered, amount) {
-                AdvanceOutcome::Regressed(err)
-            } else {
-                let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&state))
-                    .map_err(|err| {
-                        StoreError::Codec(format!("buyer record postcard encode: {err}"))
-                    })?;
-                table
-                    .insert(&key, encoded.as_slice())
-                    .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-                AdvanceOutcome::Advanced
+                return Ok(AdvanceOutcome::ChannelMismatch);
             }
-        };
+            if let Err(err) = state.advance(nonce, bytes_delivered, amount) {
+                return Ok(AdvanceOutcome::Regressed(err));
+            }
+            let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&state))
+                .map_err(|err| StoreError::Codec(format!("buyer record postcard encode: {err}")))?;
+            table
+                .insert(&key, encoded.as_slice())
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        }
         write_txn
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(outcome)
+        Ok(AdvanceOutcome::Advanced)
     }
 
     /// Atomically add `additional` to the committed deposit for `provider`'s
@@ -1104,7 +1104,7 @@ impl PersistentChannelStateStore {
         write_txn
             .set_durability(Durability::Immediate)
             .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        let outcome = {
+        let new_deposit = {
             let mut table = write_txn
                 .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
@@ -1112,28 +1112,27 @@ impl PersistentChannelStateStore {
                 .get(&key)
                 .map_err(|err| StoreError::Backend(format!("get: {err}")))?
             else {
+                // No-write outcome returns early so the uncommitted write txn is
+                // aborted on drop — no pointless `Durability::Immediate` fsync.
                 return Ok(DepositOutcome::UnknownProvider);
             };
             let mut state = decode_buyer_record(key, value_guard.value())?;
             drop(value_guard);
-            if state.channel_id == channel_id {
-                state.deposit = state.deposit.saturating_add(additional);
-                let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&state))
-                    .map_err(|err| {
-                        StoreError::Codec(format!("buyer record postcard encode: {err}"))
-                    })?;
-                table
-                    .insert(&key, encoded.as_slice())
-                    .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-                DepositOutcome::Added(state.deposit)
-            } else {
-                DepositOutcome::ChannelMismatch
+            if state.channel_id != channel_id {
+                return Ok(DepositOutcome::ChannelMismatch);
             }
+            state.deposit = state.deposit.saturating_add(additional);
+            let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&state))
+                .map_err(|err| StoreError::Codec(format!("buyer record postcard encode: {err}")))?;
+            table
+                .insert(&key, encoded.as_slice())
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+            state.deposit
         };
         write_txn
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(outcome)
+        Ok(DepositOutcome::Added(new_deposit))
     }
 }
 
