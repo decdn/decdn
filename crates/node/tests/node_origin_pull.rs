@@ -1146,6 +1146,15 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
     }) as Arc<dyn ChannelOpener>;
+    // Map both candidates to distinct regions so the snapshot proves the stalled
+    // candidate (Err arm) records no `bytes_in` while only the delivered honest
+    // fallback (Ok arm) is counted (#858).
+    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
+        HashMap::from([
+            (*s_id.as_bytes(), "XX".to_string()),
+            (*a_id.as_bytes(), "DE".to_string()),
+        ]),
+    ))));
     let origin = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
@@ -1154,7 +1163,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         &local_rep,
         &obs_buffer,
         &b_metrics,
-        &empty_region_accountant(),
+        &region_accountant,
         vec![s_dht, a_dht],
         addr_map,
         // Short per-candidate budget so the stall is abandoned quickly. With the
@@ -1217,6 +1226,21 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     // return, so it must not also land in any sibling buyer-side bucket.
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
+
+    // #858: the stalled candidate S (Err arm) records no `bytes_in`; only the
+    // delivered honest fallback A (Ok arm, region "DE") is counted — no "XX"
+    // bucket appears. Guards the "failed pulls are not counted" contract and
+    // multi-candidate attribution in one assertion.
+    anyhow::ensure!(
+        region_accountant.snapshot()
+            == vec![RegionBytes {
+                region: "DE".to_string(),
+                bytes_in: total_bytes,
+                bytes_out: 0,
+            }],
+        "expected only DE bytes_in == {total_bytes} (S exonerated, not counted), got {:?}",
+        region_accountant.snapshot()
+    );
 
     ep_b.close().await;
     ep_a.close().await;
