@@ -38,7 +38,9 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_channel::PaymentChannel;
-use decdn_incentive::{BuyerChannelState, BuyerChannelStore};
+use decdn_incentive::{
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, DepositOutcome,
+};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -440,7 +442,13 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// Persist the cumulative voucher totals after a delivery exchange so a
     /// later reuse (or a restart) resumes the channel at the right `nonce` /
     /// `bytes` / `amount`. The caller reports the totals of the last voucher it
-    /// signed on `provider_addr`'s channel.
+    /// signed on `provider_addr`'s channel; `channel_id` is the channel the
+    /// voucher was signed against.
+    ///
+    /// If the persisted row's `channel_id` no longer matches (the provider's
+    /// slot was replaced by a newer open between the delivery and this write),
+    /// the stale progress is logged and dropped — `Ok(())`, not an error,
+    /// because writing it would clobber the live replacement channel's record.
     ///
     /// # Errors
     ///
@@ -450,22 +458,44 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     pub fn record_progress(
         &self,
         provider_addr: Address,
+        channel_id: ChannelId,
         nonce: U256,
         bytes_delivered: U256,
         amount: U256,
     ) -> Result<()> {
-        let mut state = self
+        // Advance the committed watermark inside one write txn so a concurrent
+        // `top_up` (or another `record_progress`) cannot clobber this write or
+        // regress the persisted voucher watermark (#838).
+        match self
             .store
-            .get_by_provider(provider_addr)
-            .context("look up buyer channel for progress")?
-            .with_context(|| format!("record_progress for unknown provider {provider_addr}"))?;
-        state
-            .advance(nonce, bytes_delivered, amount)
-            .with_context(|| format!("advance progress for provider {provider_addr}"))?;
-        self.store
-            .record(&state)
-            .context("persist buyer channel progress")?;
-        Ok(())
+            .advance_progress(provider_addr, channel_id, nonce, bytes_delivered, amount)
+            .context("advance buyer channel progress")?
+        {
+            AdvanceOutcome::Advanced => Ok(()),
+            AdvanceOutcome::UnknownProvider => {
+                anyhow::bail!("record_progress for unknown provider {provider_addr}")
+            }
+            // The provider's slot was replaced by a newer open between the
+            // delivery and this write. Recording stale progress onto the new
+            // channel would be wrong; the older channel's record is gone, so this
+            // is not an escalation (it mirrors the reclaim sweep's
+            // `forget_if_channel` miss) and must not fail the already-paid pull.
+            // But a delivered-and-paid voucher's progress was dropped, and a
+            // *sustained* rate here would mean a `channel_id`-plumbing bug rather
+            // than the rare benign mid-pull replacement — so `warn!`, not
+            // `debug!`, to keep it observable.
+            AdvanceOutcome::ChannelMismatch => {
+                warn!(
+                    provider = %provider_addr,
+                    %channel_id,
+                    "record_progress: provider channel replaced by a newer open; \
+                     skipping stale progress write"
+                );
+                Ok(())
+            }
+            AdvanceOutcome::Regressed(err) => Err(anyhow::Error::new(err))
+                .with_context(|| format!("advance progress for provider {provider_addr}")),
+        }
     }
 
     /// Run one reclaim-sweep pass synchronously: reclaim the deposit of every
@@ -482,17 +512,25 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     ///
     /// # Errors
     ///
-    /// Errors if no channel is tracked for `provider_addr`, or if the `topUp`
-    /// transaction fails (submit, revert, or receipt).
+    /// Errors if no channel is tracked for `provider_addr` *before* the RPC, or
+    /// if the `topUp` transaction fails (submit, revert, or receipt).
+    ///
+    /// A row that vanishes or is replaced by a newer open *after* the on-chain
+    /// `topUp` lands is logged (with the tx hash) for reconciliation and returns
+    /// `Ok(())`, not an error — the funds are already escrowed on-chain against
+    /// the topped-up channel, so failing here would not unwind them.
     pub async fn top_up(&self, provider_addr: Address, additional: U256) -> Result<()> {
-        let mut state = self
+        // Read the channel_id BEFORE the RPC — we need it for `topUp` and as the
+        // channel-id guard on the post-RPC write.
+        let channel_id = self
             .store
             .get_by_provider(provider_addr)
             .context("look up buyer channel for top-up")?
-            .with_context(|| format!("top_up for unknown provider {provider_addr}"))?;
+            .with_context(|| format!("top_up for unknown provider {provider_addr}"))?
+            .channel_id;
         let receipt = self
             .contract
-            .topUp(state.channel_id, additional)
+            .topUp(channel_id, additional)
             .send()
             .await
             .context("submit topUp")?
@@ -500,19 +538,58 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             .await
             .context("await topUp receipt")?;
         if !receipt.status() {
-            anyhow::bail!("topUp reverted for channel {}", state.channel_id);
+            anyhow::bail!("topUp reverted for channel {channel_id}");
         }
-        state.deposit = state.deposit.saturating_add(additional);
-        self.store
-            .record(&state)
-            .context("persist buyer channel top-up")?;
-        info!(
-            provider = %provider_addr,
-            channel_id = %state.channel_id,
-            new_deposit = %state.deposit,
-            "topped up buyer channel"
-        );
-        Ok(())
+        let tx = receipt.transaction_hash;
+        // Add to the *committed* deposit inside a write txn (never the pre-RPC
+        // snapshot), channel-id-guarded so a concurrent advance/reuse during the
+        // RPC is not clobbered (#838). USDC is not fee-on-transfer, so the local
+        // `+= additional` always matches the contract's `+= received`.
+        match self
+            .store
+            .add_deposit(provider_addr, channel_id, additional)
+            .context("persist buyer channel top-up")?
+        {
+            DepositOutcome::Added(new_deposit) => {
+                info!(
+                    provider = %provider_addr,
+                    %channel_id,
+                    %new_deposit,
+                    %tx,
+                    "topped up buyer channel"
+                );
+                Ok(())
+            }
+            // The on-chain topUp already credited `channel_id`, but the local row
+            // vanished during the RPC. Funds are escrowed on-chain with zero
+            // local tracking — `error!` (matching `open_and_persist`'s
+            // escrowed-but-untracked posture) and surface the tx for reconcile.
+            DepositOutcome::UnknownProvider => {
+                error!(
+                    provider = %provider_addr,
+                    %channel_id,
+                    %additional,
+                    %tx,
+                    "top_up: on-chain topUp landed but no local channel record exists to credit; \
+                     deposit is escrowed on-chain and untracked — reconcile against the tx"
+                );
+                Ok(())
+            }
+            // A row still exists (for a different channel), so the provider stays
+            // reclaimable — less severe than `UnknownProvider`, hence `warn!`.
+            DepositOutcome::ChannelMismatch => {
+                warn!(
+                    provider = %provider_addr,
+                    %channel_id,
+                    %additional,
+                    %tx,
+                    "top_up: provider channel replaced during the topUp RPC; the on-chain deposit \
+                     was credited to the topped-up channel but the local record now tracks a \
+                     different channel — reconcile against the tx"
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -546,7 +623,12 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
 
     /// Persist the cumulative voucher totals paid on `provider_addr`'s channel so
     /// a later reuse or a restart resumes at the right `nonce` / `bytes` /
-    /// `amount` (#852). See [`BuyerChannelService::record_progress`].
+    /// `amount` (#852); `channel_id` is the channel the totals were signed
+    /// against. See [`BuyerChannelService::record_progress`].
+    ///
+    /// A `channel_id` that no longer matches the persisted row (the slot was
+    /// replaced by a newer open) is a non-error stale write: implementations
+    /// MUST skip it and return `Ok(())` rather than clobber the replacement.
     ///
     /// # Errors
     ///
@@ -555,6 +637,7 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
     fn record_progress(
         &self,
         provider_addr: Address,
+        channel_id: ChannelId,
         nonce: U256,
         bytes_delivered: U256,
         amount: U256,
@@ -574,11 +657,19 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
     fn record_progress(
         &self,
         provider_addr: Address,
+        channel_id: ChannelId,
         nonce: U256,
         bytes_delivered: U256,
         amount: U256,
     ) -> Result<()> {
-        BuyerChannelService::record_progress(self, provider_addr, nonce, bytes_delivered, amount)
+        BuyerChannelService::record_progress(
+            self,
+            provider_addr,
+            channel_id,
+            nonce,
+            bytes_delivered,
+            amount,
+        )
     }
 }
 

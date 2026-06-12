@@ -413,9 +413,13 @@ async fn pull_from_candidate(
     // rejected. The bytes are already paid for, so a persist failure must not
     // fail the pull; surface it loudly instead (it breaks the next reuse).
     if let Some((nonce, bytes_delivered, amount)) = progress.acked()
-        && let Err(err) = deps
-            .buyer
-            .record_progress(provider_addr, nonce, bytes_delivered, amount)
+        && let Err(err) = deps.buyer.record_progress(
+            provider_addr,
+            ctx.channel_id,
+            nonce,
+            bytes_delivered,
+            amount,
+        )
     {
         deps.metrics.node_pull_progress_persist_failure();
         warn!(%provider_addr, %err, "node-origin: failed to persist buyer voucher progress");

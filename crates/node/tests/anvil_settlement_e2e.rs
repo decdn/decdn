@@ -814,6 +814,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // told to record.
     buyer_service.record_progress(
         node_addr,
+        buyer_id,
         U256::from(1u64),
         U256::from(MIB / 2),
         U256::from(5u64),

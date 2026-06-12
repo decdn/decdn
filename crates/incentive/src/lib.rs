@@ -42,7 +42,10 @@ pub use bind_sig::{
     BindError, CAPACITY_BOND_DOMAIN_NAME, CAPACITY_BOND_DOMAIN_VERSION, EPHEMERAL_BINDING_NONCE,
     bind_node_id_domain, binding_signing_hash, verify_binding,
 };
-pub use buyer_channel::{BuyerChannelState, BuyerChannelStore, MemoryBuyerChannelStore};
+pub use buyer_channel::{
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerProgressError, DepositOutcome,
+    MemoryBuyerChannelStore,
+};
 pub use channel::{ChannelError, ChannelId, ChannelState, VoucherApplied};
 pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
