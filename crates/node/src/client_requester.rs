@@ -32,7 +32,9 @@ use alloy::signers::local::PrivateKeySigner;
 use bytes::{Bytes, BytesMut};
 use decdn_cache::Hash;
 use decdn_incentive::{BuyerChannelState, StreamSlashData, Voucher, signed_to_wire_voucher};
-use decdn_protocol::client::{ClientMessage, StreamRequest, StreamResponse};
+use decdn_protocol::client::{
+    ClientMessage, StreamError, StreamRequest, StreamResponse, VoucherRejectReason,
+};
 use decdn_protocol::{
     ALPN_CLIENT, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, decode_message, encode_message, read_frame,
     write_frame,
@@ -214,6 +216,53 @@ impl std::fmt::Display for BlobTooLargeClaim {
 
 impl std::error::Error for BlobTooLargeClaim {}
 
+/// Typed sentinel for the buyer's own per-candidate pull deadline firing (#857).
+/// Returned (not a bare string) so the pull orchestrator can `downcast_ref` and
+/// recognize that the timeout is OUR local deadline — a possibly mis-sized
+/// configuration value — not evidence the provider is unreachable, and so must
+/// not tar the provider's reputation locally or over gossip. `Display` keeps the
+/// stable `timed out` text for logs (and for the `!contains("timed out")`
+/// negative assertion in `node_to_node_pull_through`'s deadline test).
+#[derive(Debug)]
+pub struct PullTimeout {
+    pub after: Duration,
+}
+
+impl std::fmt::Display for PullTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stream_fetch timed out after {:?}", self.after)
+    }
+}
+
+impl std::error::Error for PullTimeout {}
+
+/// Typed sentinel for the upstream rejecting a voucher we presented mid-stream
+/// (#857) — e.g. a stale nonce (#852), deposit exhaustion, or a wrong-channel
+/// mismatch. This is OUR payment-side fault, not the provider's, so the pull
+/// orchestrator `downcast_ref`s it to skip the candidate WITHOUT recording a
+/// reputation observation (mirroring the buyer channel-open-failure arm). Named
+/// with the `Upstream` prefix to disambiguate from the protocol-level
+/// `StreamError::VoucherRejected` reason enum, whose `reason` it carries verbatim
+/// (the `Copy` `VoucherRejectReason`, not a lossy stringification) so a future
+/// caller can branch on retry-vs-top-up-vs-abandon without re-parsing a message.
+/// `Display` keeps the stable `voucher rejected` text for logs.
+#[derive(Debug)]
+pub struct UpstreamVoucherRejected {
+    pub reason: VoucherRejectReason,
+}
+
+impl std::fmt::Display for UpstreamVoucherRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The `{:?}` rendering of the reason is load-bearing: the loopback tests
+        // assert `.contains("RetryLater")` / `.contains("Expired")` on this string.
+        // A custom `Display` for `VoucherRejectReason` would have to reproduce the
+        // variant names verbatim, so keep the Debug rendering here.
+        write!(f, "voucher rejected: {:?}", self.reason)
+    }
+}
+
+impl std::error::Error for UpstreamVoucherRejected {}
+
 /// Fetch `hash` from `target` over `cdn/client/v1`, paying as bytes arrive.
 ///
 /// `expected_signer` is the delivering node's Ethereum address, used to verify
@@ -301,7 +350,7 @@ pub async fn stream_fetch_tracked(
         ),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("stream_fetch timed out after {timeout:?}"))??;
+    .map_err(|_| anyhow::Error::new(PullTimeout { after: timeout }))??;
     Ok(bytes)
 }
 
@@ -519,7 +568,17 @@ async fn self_pay(
             progress.commit_ack(nonce, new_bytes, amount);
             Ok(())
         }
-        ClientMessage::StreamError(e) => anyhow::bail!("voucher rejected: {e:?}"),
+        // Only a `VoucherRejected` is OUR payment-side fault. Carry its typed
+        // reason so the orchestrator can exonerate the provider (#857). Any OTHER
+        // `StreamError` here is the upstream violating the ack protocol (only
+        // `VoucherAck`/`VoucherRejected` are valid in reply to a voucher), so it
+        // stays a bare error and is classified as provider-attributable upstream.
+        ClientMessage::StreamError(StreamError::VoucherRejected { reason }) => {
+            Err(anyhow::Error::new(UpstreamVoucherRejected { reason }))
+        }
+        ClientMessage::StreamError(e) => {
+            anyhow::bail!("unexpected stream error awaiting voucher ack: {e:?}")
+        }
         other => anyhow::bail!("expected VoucherAck, got {}", variant_name(&other)),
     }
 }
