@@ -618,7 +618,8 @@ pub struct DecdnMetrics {
     /// deliberately evicted between probe and stream (#279). One `Counter` per
     /// reason — like the `dispatch_rejected_*` convention — because the metrics
     /// backend has no per-field labels, and the wire `StreamError` deliberately
-    /// conflates the three `NotFound` reasons below (#876). Visible name:
+    /// conflates the three `NotFound` reasons (`cache_miss`, `unknown_channel`,
+    /// `owner_mismatch`) (#876). Visible name:
     /// `decdn_serve_stream_rejected_evicted_since_probe_total`.
     pub serve_stream_rejected_evicted_since_probe: Counter,
     /// `serve_stream` requests refused because the blob is absent and

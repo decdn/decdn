@@ -1233,9 +1233,10 @@ impl ClientHandler {
 
     /// Send a signed `StreamResponse { ok: false, error }` (delivery-side
     /// failure), then finish the stream. `reason` is the single source of truth:
-    /// it both selects the per-reason metric (finer-grained than the wire, which
-    /// conflates the three `NotFound` cases to avoid leaking channel existence)
-    /// and derives the wire `StreamError` via `wire_error()` (#876). The metric
+    /// it both selects the per-reason metric (finer-grained than the wire for the
+    /// three `NotFound` cases, which collapse to one code to avoid leaking channel
+    /// existence) and derives the wire `StreamError` via `wire_error()` (#876).
+    /// The metric
     /// is bumped before the network write so a refusal is counted even if the
     /// client has already gone and the write fails.
     async fn respond_error(
