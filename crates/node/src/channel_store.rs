@@ -31,7 +31,9 @@ use decdn_common::identity;
 use decdn_incentive::store::{
     ChannelStateStore, PendingSettle, PendingSettleStore, StoreError, WatcherCheckpointStore,
 };
-use decdn_incentive::{BuyerChannelState, BuyerChannelStore, ChannelId, ChannelState};
+use decdn_incentive::{
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, ChannelState, DepositOutcome,
+};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -994,6 +996,145 @@ impl PersistentChannelStateStore {
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
         Ok(deleted)
     }
+
+    /// Atomically advance the committed progress for `provider`'s channel
+    /// inside a single write transaction (read → channel-id guard → advance
+    /// against the committed watermark → write). See
+    /// [`BuyerChannelStore::advance_progress`].
+    fn buyer_advance_progress(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+        nonce: U256,
+        bytes_delivered: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        let key: [u8; 20] = provider.into();
+
+        // Do not implicitly create the table on a never-written store
+        // (`WriteTransaction::open_table` would).
+        {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+            match read_txn.open_table(BUYER_CHANNEL_TABLE) {
+                Ok(_) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Ok(AdvanceOutcome::UnknownProvider);
+                }
+                Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+            }
+        }
+
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        let outcome = {
+            let mut table = write_txn
+                .open_table(BUYER_CHANNEL_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            // Read the committed row inside the same (serialised) write txn so
+            // the advance is checked against — and written over — the committed
+            // watermark, never a stale in-memory snapshot.
+            let Some(value_guard) = table
+                .get(&key)
+                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+            else {
+                return Ok(AdvanceOutcome::UnknownProvider);
+            };
+            let mut state = decode_buyer_record(key, value_guard.value())?;
+            // Drop the borrow of `table` held by `value_guard` before mutating.
+            drop(value_guard);
+            if state.channel_id != channel_id {
+                AdvanceOutcome::ChannelMismatch
+            } else if let Err(err) = state.advance(nonce, bytes_delivered, amount) {
+                AdvanceOutcome::Regressed(err)
+            } else {
+                let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&state))
+                    .map_err(|err| {
+                        StoreError::Codec(format!("buyer record postcard encode: {err}"))
+                    })?;
+                table
+                    .insert(&key, encoded.as_slice())
+                    .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+                AdvanceOutcome::Advanced
+            }
+        };
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(outcome)
+    }
+
+    /// Atomically add `additional` to the committed deposit for `provider`'s
+    /// channel inside a single write transaction. See
+    /// [`BuyerChannelStore::add_deposit`].
+    fn buyer_add_deposit(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+        additional: U256,
+    ) -> Result<DepositOutcome, StoreError> {
+        let key: [u8; 20] = provider.into();
+
+        // Do not implicitly create the table on a never-written store.
+        {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+            match read_txn.open_table(BUYER_CHANNEL_TABLE) {
+                Ok(_) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Ok(DepositOutcome::UnknownProvider);
+                }
+                Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+            }
+        }
+
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        let outcome = {
+            let mut table = write_txn
+                .open_table(BUYER_CHANNEL_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            let Some(value_guard) = table
+                .get(&key)
+                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+            else {
+                return Ok(DepositOutcome::UnknownProvider);
+            };
+            let mut state = decode_buyer_record(key, value_guard.value())?;
+            drop(value_guard);
+            if state.channel_id == channel_id {
+                state.deposit = state.deposit.saturating_add(additional);
+                let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&state))
+                    .map_err(|err| {
+                        StoreError::Codec(format!("buyer record postcard encode: {err}"))
+                    })?;
+                table
+                    .insert(&key, encoded.as_slice())
+                    .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+                DepositOutcome::Added(state.deposit)
+            } else {
+                DepositOutcome::ChannelMismatch
+            }
+        };
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(outcome)
+    }
 }
 
 /// [`BuyerChannelStore`] adapter over the shared [`PersistentChannelStateStore`].
@@ -1038,6 +1179,28 @@ impl BuyerChannelStore for BuyerChannelStoreHandle {
 
     fn get_by_provider(&self, provider: Address) -> Result<Option<BuyerChannelState>, StoreError> {
         self.inner.buyer_get_by_provider(provider)
+    }
+
+    fn advance_progress(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+        nonce: U256,
+        bytes_delivered: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.inner
+            .buyer_advance_progress(provider, channel_id, nonce, bytes_delivered, amount)
+    }
+
+    fn add_deposit(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+        additional: U256,
+    ) -> Result<DepositOutcome, StoreError> {
+        self.inner
+            .buyer_add_deposit(provider, channel_id, additional)
     }
 }
 
@@ -2118,6 +2281,162 @@ mod tests {
         // Matching channel id → deleted.
         anyhow::ensure!(handle.forget_if_channel(s.provider, s.channel_id)?);
         anyhow::ensure!(handle.get_by_provider(s.provider)?.is_none());
+        Ok(())
+    }
+
+    /// #838: interleaving `add_deposit` with `advance_progress` on the same
+    /// provider row must lose neither the deposit accrual nor the watermark
+    /// advance. The pre-fix `get → mutate → record` (read outside the write txn)
+    /// would clobber one writer with the other's stale snapshot; the atomic
+    /// in-txn mutators serialise correctly.
+    #[test]
+    fn buyer_concurrent_top_up_and_progress_preserve_both() -> anyhow::Result<()> {
+        const N: u64 = 300;
+        let dir = data_dir()?;
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+            PersistentChannelStateStore::open(dir.path())?,
+        ));
+        let mut base = buyer_sample(6);
+        base.deposit = U256::from(1_000u64);
+        base.last_nonce = U256::ZERO;
+        base.last_bytes_delivered = U256::ZERO;
+        base.last_amount = U256::ZERO;
+        handle.record(&base)?;
+        let (provider, channel_id) = (base.provider, base.channel_id);
+
+        let depositor = handle.clone();
+        let deposit_thread = std::thread::spawn(move || -> anyhow::Result<()> {
+            for _ in 0..N {
+                let outcome = depositor.add_deposit(provider, channel_id, U256::from(1u64))?;
+                anyhow::ensure!(
+                    matches!(outcome, DepositOutcome::Added(_)),
+                    "deposit outcome {outcome:?}"
+                );
+            }
+            Ok(())
+        });
+        let advancer = handle.clone();
+        let progress_thread = std::thread::spawn(move || -> anyhow::Result<()> {
+            for i in 1..=N {
+                let outcome = advancer.advance_progress(
+                    provider,
+                    channel_id,
+                    U256::from(i),
+                    U256::from(i) * U256::from(1_024u64),
+                    U256::from(i) * U256::from(10u64),
+                )?;
+                anyhow::ensure!(
+                    outcome == AdvanceOutcome::Advanced,
+                    "advance outcome {outcome:?}"
+                );
+            }
+            Ok(())
+        });
+        deposit_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("deposit thread panicked"))??;
+        progress_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("progress thread panicked"))??;
+
+        let final_row = handle
+            .get_by_provider(provider)?
+            .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
+        anyhow::ensure!(
+            final_row.deposit == U256::from(1_000u64) + U256::from(N),
+            "lost a top-up: deposit = {}",
+            final_row.deposit
+        );
+        anyhow::ensure!(
+            final_row.last_nonce == U256::from(N),
+            "watermark not fully advanced: last_nonce = {}",
+            final_row.last_nonce
+        );
+        Ok(())
+    }
+
+    /// #838: a stale `advance_progress` reporting totals below the committed
+    /// watermark is rejected and leaves the committed watermark intact.
+    #[test]
+    fn buyer_advance_progress_cannot_regress_committed_watermark() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+            PersistentChannelStateStore::open(dir.path())?,
+        ));
+        let mut s = buyer_sample(8);
+        s.last_nonce = U256::from(9u64);
+        s.last_bytes_delivered = U256::from(9_000u64);
+        s.last_amount = U256::from(90u64);
+        handle.record(&s)?;
+
+        let outcome = handle.advance_progress(
+            s.provider,
+            s.channel_id,
+            U256::from(5u64),
+            U256::from(5_000u64),
+            U256::from(50u64),
+        )?;
+        anyhow::ensure!(
+            matches!(outcome, AdvanceOutcome::Regressed(_)),
+            "stale progress must be rejected, got {outcome:?}"
+        );
+        let stored = handle
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
+        anyhow::ensure!(
+            stored.last_nonce == U256::from(9u64),
+            "committed watermark regressed to {}",
+            stored.last_nonce
+        );
+        Ok(())
+    }
+
+    /// #838: the atomic mutators are channel-id guarded (a row replaced by a
+    /// newer open for the same provider is not clobbered) and report unknown
+    /// providers without creating the table.
+    #[test]
+    fn buyer_advance_and_deposit_guard_on_channel_and_provider() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+            PersistentChannelStateStore::open(dir.path())?,
+        ));
+        // Unknown provider on a never-written store → UnknownProvider, no table.
+        let ghost = buyer_sample(1);
+        anyhow::ensure!(
+            handle.advance_progress(
+                ghost.provider,
+                ghost.channel_id,
+                U256::from(1u64),
+                U256::from(1u64),
+                U256::from(1u64)
+            )? == AdvanceOutcome::UnknownProvider
+        );
+        anyhow::ensure!(
+            handle.add_deposit(ghost.provider, ghost.channel_id, U256::from(1u64))?
+                == DepositOutcome::UnknownProvider
+        );
+
+        let s = buyer_sample(9);
+        handle.record(&s)?;
+        let other_channel =
+            b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        anyhow::ensure!(
+            handle.advance_progress(
+                s.provider,
+                other_channel,
+                U256::from(99u64),
+                U256::from(99u64),
+                U256::from(99u64)
+            )? == AdvanceOutcome::ChannelMismatch
+        );
+        anyhow::ensure!(
+            handle.add_deposit(s.provider, other_channel, U256::from(1u64))?
+                == DepositOutcome::ChannelMismatch
+        );
+        let stored = handle
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
+        anyhow::ensure!(stored == s, "mismatched calls must not mutate the row");
         Ok(())
     }
 }

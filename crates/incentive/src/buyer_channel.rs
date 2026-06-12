@@ -167,7 +167,7 @@ impl BuyerChannelState {
 
 /// Failure mode for [`BuyerChannelState::advance`]: a reported cumulative total
 /// regressed below the recorded one (a caller bug — vouchers never decrease).
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum BuyerProgressError {
     /// `field`'s reported value `got` is below the recorded value.
     #[error("buyer channel {field} regressed: recorded {recorded}, got {got}")]
@@ -179,6 +179,39 @@ pub enum BuyerProgressError {
         /// The reported (lower) value that was rejected.
         got: U256,
     },
+}
+
+/// Outcome of an atomic [`BuyerChannelStore::advance_progress`].
+///
+/// The read-check-advance-write happens inside one serialized write
+/// transaction, so these variants describe the committed-row decision rather
+/// than a backend fault (those surface as [`StoreError`], as with
+/// [`BuyerChannelStore::forget_if_channel`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvanceOutcome {
+    /// The committed row was advanced and re-persisted durably.
+    Advanced,
+    /// No row exists for the provider (the channel was never recorded or its
+    /// table does not exist yet).
+    UnknownProvider,
+    /// The committed row is for a different channel — the provider's slot was
+    /// replaced by a newer open. The caller should treat this as stale and
+    /// must NOT escalate (writing would clobber the live replacement).
+    ChannelMismatch,
+    /// The reported totals would regress the committed watermark — a real
+    /// caller bug (vouchers never decrease). Carries the rejecting error.
+    Regressed(BuyerProgressError),
+}
+
+/// Outcome of an atomic [`BuyerChannelStore::add_deposit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepositOutcome {
+    /// `additional` was added to the committed deposit; carries the new total.
+    Added(U256),
+    /// No row exists for the provider.
+    UnknownProvider,
+    /// The committed row is for a different channel (stale; NOT escalated).
+    ChannelMismatch,
 }
 
 /// Durable backing store for [`BuyerChannelState`], keyed by provider address.
@@ -250,6 +283,51 @@ pub trait BuyerChannelStore: Send + Sync {
     /// Returns a [`StoreError`] if the backing store is unreadable or the
     /// record is corrupt.
     fn get_by_provider(&self, provider: Address) -> Result<Option<BuyerChannelState>, StoreError>;
+
+    /// Atomically advance the committed progress for `provider`'s channel.
+    ///
+    /// Reads the row, verifies its `channel_id` still equals `channel_id` (the
+    /// channel the caller actually paid on), runs [`BuyerChannelState::advance`]
+    /// against the **committed** `last_*` watermark, and writes the advanced row
+    /// back — all inside one serialized write transaction. This closes the
+    /// lost-update / watermark-regression race that a separate
+    /// `get_by_provider` → mutate → [`Self::record`] sequence exposes when a
+    /// concurrent writer (e.g. [`Self::add_deposit`]) touches the same row in
+    /// the gap. MUST commit durably.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] only on a backend/codec fault. The committed-row
+    /// decision (advanced / unknown / replaced / regressed) is the `Ok` value.
+    fn advance_progress(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+        nonce: U256,
+        bytes_delivered: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, StoreError>;
+
+    /// Atomically add `additional` to the committed deposit for `provider`'s
+    /// channel.
+    ///
+    /// Reads the **committed** deposit inside the write transaction (never a
+    /// stale snapshot), verifies the row's `channel_id` still equals
+    /// `channel_id`, `saturating_add`s `additional`, and writes back. Used after
+    /// the on-chain `topUp` receipt lands so the persisted deposit is derived
+    /// from the committed row even if a concurrent writer advanced it during the
+    /// RPC. MUST commit durably.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] only on a backend/codec fault; the committed-row
+    /// decision is the `Ok` value.
+    fn add_deposit(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+        additional: U256,
+    ) -> Result<DepositOutcome, StoreError>;
 }
 
 /// In-memory [`BuyerChannelStore`] for tests and the trait's reference
@@ -332,6 +410,50 @@ impl BuyerChannelStore for MemoryBuyerChannelStore {
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
         Ok(guard.get(&provider).cloned())
+    }
+
+    fn advance_progress(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+        nonce: U256,
+        bytes_delivered: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        let Some(state) = guard.get_mut(&provider) else {
+            return Ok(AdvanceOutcome::UnknownProvider);
+        };
+        if state.channel_id != channel_id {
+            return Ok(AdvanceOutcome::ChannelMismatch);
+        }
+        match state.advance(nonce, bytes_delivered, amount) {
+            Ok(()) => Ok(AdvanceOutcome::Advanced),
+            Err(err) => Ok(AdvanceOutcome::Regressed(err)),
+        }
+    }
+
+    fn add_deposit(
+        &self,
+        provider: Address,
+        channel_id: ChannelId,
+        additional: U256,
+    ) -> Result<DepositOutcome, StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        let Some(state) = guard.get_mut(&provider) else {
+            return Ok(DepositOutcome::UnknownProvider);
+        };
+        if state.channel_id != channel_id {
+            return Ok(DepositOutcome::ChannelMismatch);
+        }
+        state.deposit = state.deposit.saturating_add(additional);
+        Ok(DepositOutcome::Added(state.deposit))
     }
 }
 
@@ -487,6 +609,125 @@ mod tests {
             address!("00000000000000000000000000000000000000ff"),
             s.channel_id
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn advance_progress_advances_committed_watermark() -> anyhow::Result<()> {
+        let store = MemoryBuyerChannelStore::new();
+        let mut s = sample(1);
+        s.last_nonce = U256::ZERO;
+        s.last_bytes_delivered = U256::ZERO;
+        s.last_amount = U256::ZERO;
+        store.record(&s)?;
+
+        let outcome = store.advance_progress(
+            s.provider,
+            s.channel_id,
+            U256::from(3u64),
+            U256::from(3_000u64),
+            U256::from(30u64),
+        )?;
+        anyhow::ensure!(outcome == AdvanceOutcome::Advanced, "got {outcome:?}");
+        let stored = store
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("missing row"))?;
+        anyhow::ensure!(stored.last_nonce == U256::from(3u64));
+        anyhow::ensure!(stored.last_bytes_delivered == U256::from(3_000u64));
+        anyhow::ensure!(stored.last_amount == U256::from(30u64));
+        Ok(())
+    }
+
+    #[test]
+    fn advance_progress_rejects_regression_without_writing() -> anyhow::Result<()> {
+        let store = MemoryBuyerChannelStore::new();
+        let mut s = sample(1);
+        s.last_nonce = U256::from(9u64);
+        s.last_bytes_delivered = U256::from(9_000u64);
+        s.last_amount = U256::from(90u64);
+        store.record(&s)?;
+
+        // A stale writer reporting a lower nonce must be rejected and must NOT
+        // regress the committed watermark.
+        let outcome = store.advance_progress(
+            s.provider,
+            s.channel_id,
+            U256::from(5u64),
+            U256::from(5_000u64),
+            U256::from(50u64),
+        )?;
+        anyhow::ensure!(
+            matches!(outcome, AdvanceOutcome::Regressed(BuyerProgressError::Regressed { field, .. }) if field == "nonce"),
+            "got {outcome:?}"
+        );
+        let stored = store
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("missing row"))?;
+        anyhow::ensure!(stored.last_nonce == U256::from(9u64), "watermark regressed");
+        Ok(())
+    }
+
+    #[test]
+    fn advance_and_deposit_guard_on_channel_and_provider() -> anyhow::Result<()> {
+        let store = MemoryBuyerChannelStore::new();
+        let s = sample(1);
+        store.record(&s)?;
+        let other_channel =
+            b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let unknown = address!("00000000000000000000000000000000000000ff");
+
+        // Channel-id mismatch → stale, no write.
+        anyhow::ensure!(
+            store.advance_progress(
+                s.provider,
+                other_channel,
+                U256::from(99u64),
+                U256::from(99u64),
+                U256::from(99u64)
+            )? == AdvanceOutcome::ChannelMismatch
+        );
+        anyhow::ensure!(
+            store.add_deposit(s.provider, other_channel, U256::from(1u64))?
+                == DepositOutcome::ChannelMismatch
+        );
+        let stored = store
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("missing row"))?;
+        anyhow::ensure!(stored == s, "mismatched calls must not mutate the row");
+
+        // Unknown provider → UnknownProvider, no write.
+        anyhow::ensure!(
+            store.advance_progress(
+                unknown,
+                s.channel_id,
+                U256::from(1u64),
+                U256::from(1u64),
+                U256::from(1u64)
+            )? == AdvanceOutcome::UnknownProvider
+        );
+        anyhow::ensure!(
+            store.add_deposit(unknown, s.channel_id, U256::from(1u64))?
+                == DepositOutcome::UnknownProvider
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_deposit_accumulates_committed_deposit() -> anyhow::Result<()> {
+        let store = MemoryBuyerChannelStore::new();
+        let mut s = sample(1);
+        s.deposit = U256::from(100u64);
+        store.record(&s)?;
+
+        let outcome = store.add_deposit(s.provider, s.channel_id, U256::from(40u64))?;
+        anyhow::ensure!(
+            outcome == DepositOutcome::Added(U256::from(140u64)),
+            "got {outcome:?}"
+        );
+        let stored = store
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("missing row"))?;
+        anyhow::ensure!(stored.deposit == U256::from(140u64));
         Ok(())
     }
 }

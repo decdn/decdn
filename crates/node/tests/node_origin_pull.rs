@@ -142,6 +142,7 @@ impl ChannelOpener for StubOpener {
     fn record_progress(
         &self,
         provider_addr: Address,
+        _channel_id: B256,
         nonce: U256,
         bytes_delivered: U256,
         amount: U256,
@@ -189,6 +190,7 @@ impl ChannelOpener for FailingRecordOpener {
     fn record_progress(
         &self,
         _provider_addr: Address,
+        _channel_id: B256,
         _nonce: U256,
         _bytes_delivered: U256,
         _amount: U256,
