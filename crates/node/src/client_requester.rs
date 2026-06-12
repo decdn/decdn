@@ -375,6 +375,19 @@ async fn fetch_inner(
             ceiling: max_blob_size_bytes,
         }));
     }
+    // A `total_bytes` below `byte_offset` would underflow `expected` to `0`
+    // (saturating), so the loop ends on the first `StreamEnd` and returns an
+    // empty buffer. On a resumed fetch (`byte_offset > 0`) the whole-blob hash
+    // check is skipped, so that empty/short buffer would surface as success — a
+    // silent verification bypass. A legitimate server always claims
+    // `total_bytes >= byte_offset`; reject anything less before the loop.
+    if resp.body.total_bytes < byte_offset {
+        anyhow::bail!(
+            "server claimed total_bytes ({}) below the requested byte_offset ({})",
+            resp.body.total_bytes,
+            byte_offset
+        );
+    }
 
     let rate_per_mb = resp.body.rate_per_mb;
     let interval_bytes = resp
