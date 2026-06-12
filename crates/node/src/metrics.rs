@@ -469,6 +469,22 @@ pub struct DecdnMetrics {
     /// ceiling), so it does not tar the provider's reputation. A sustained rate
     /// means this node's ceiling is below the content it is trying to warm.
     pub node_pull_too_large: Counter,
+    /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit this
+    /// node's own per-candidate `pull_timeout` deadline. Like a channel-open
+    /// failure this is a buyer-side condition (a possibly mis-sized local
+    /// timeout), NOT evidence the provider is unreachable, so it does NOT tar the
+    /// provider's reputation locally or over gossip. Distinct from
+    /// `node_pull_through_timeouts` (the delivery handler's own serving deadline).
+    /// A sustained rate means this node's `pull_timeout` is too tight for the
+    /// upstreams it selects.
+    pub node_pull_timeout: Counter,
+    /// `decdn_node_pull_voucher_rejected_total` (#857): an upstream rejected a
+    /// voucher this node presented mid-pull (a stale nonce per #852, deposit
+    /// exhaustion, or a channel mismatch). This is the node's own payment-side
+    /// fault, NOT the provider's, so it does NOT tar the provider's reputation. A
+    /// sustained rate means this node's buyer channels are drifting out of sync
+    /// with what upstreams accept.
+    pub node_pull_voucher_rejected: Counter,
     /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
     /// voucher but persisting the buyer channel's resume watermark
     /// (`record_progress`) failed. The bytes were delivered, but the channel's
@@ -1022,6 +1038,18 @@ impl Metrics {
     /// (#840). A buyer-side policy decision, so it does not score the provider.
     pub fn node_pull_too_large(&self) {
         self.decdn.node_pull_too_large.inc();
+    }
+
+    /// A buyer→upstream pull hit this node's own `pull_timeout` deadline (#857).
+    /// A buyer-side condition, so it does not score the provider's reputation.
+    pub fn node_pull_timeout(&self) {
+        self.decdn.node_pull_timeout.inc();
+    }
+
+    /// An upstream rejected a voucher this node presented mid-pull (#857) — a
+    /// buyer payment-side fault, so it does not score the provider's reputation.
+    pub fn node_pull_voucher_rejected(&self) {
+        self.decdn.node_pull_voucher_rejected.inc();
     }
 
     /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark

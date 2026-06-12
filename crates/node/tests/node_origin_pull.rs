@@ -41,7 +41,9 @@ use decdn_node::dht::{
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps};
 use decdn_node::probe_client::probe_once;
-use decdn_protocol::client::{ChunkData, ClientMessage, StreamResponse, StreamResponseBody};
+use decdn_protocol::client::{
+    ChunkData, ClientMessage, StreamError, StreamResponse, StreamResponseBody, VoucherRejectReason,
+};
 use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
 use decdn_protocol::{
     ALPN_CLIENT, ALPN_PROBE, CHUNK_SIZE, ProbeMessage, decode_message, encode_message, read_frame,
@@ -739,6 +741,161 @@ fn spawn_a_lying_server(
     })
 }
 
+/// A protocol-correct upstream that serves the *right* bytes but rejects the
+/// closing voucher with `StreamError(VoucherRejected { StaleNonce })` instead of
+/// `VoucherAck` — the buyer-side payment failure of #857/#852. Drives the
+/// requester to `UpstreamVoucherRejected`. Modelled on [`serve_wrong_bytes`] but
+/// serving the correct payload so the failure is unambiguously the voucher leg,
+/// not corruption.
+async fn serve_then_reject_voucher(
+    conn: Connection,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    served: &[u8],
+    rate: u64,
+) -> Result<()> {
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
+    let req_msg = {
+        let frame = read_frame(&mut recv)
+            .await
+            .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
+        decode_message::<ClientMessage>(&frame)
+            .map_err(|e| anyhow::anyhow!("decode request: {e}"))?
+            .0
+    };
+    let ClientMessage::StreamRequest(req) = req_msg else {
+        anyhow::bail!("voucher-rejecting upstream: expected a StreamRequest");
+    };
+    let body = StreamResponseBody {
+        hash: req.hash,
+        ok: true,
+        rate_per_mb: rate,
+        total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
+        channel_id: req.channel_id,
+        timestamp_us: req.timestamp_us,
+        redirect: None,
+    };
+    let slash_sig = StreamSlashData::from_response_body(&body)
+        .sign(eth.as_ref(), slash)
+        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+        .as_bytes()
+        .to_vec();
+    let resp = StreamResponse {
+        body,
+        error: None,
+        voucher_interval_mb: Some(1),
+        slash_sig,
+    };
+    write_frame(
+        &mut send,
+        &encode_message(&ClientMessage::StreamResponse(resp))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    for chunk in served.chunks(CHUNK_SIZE) {
+        write_frame(
+            &mut send,
+            &encode_message(&ClientMessage::ChunkData(ChunkData {
+                bytes: chunk.to_vec(),
+            }))?,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
+    }
+    // Reject the closing voucher instead of acking it — the buyer's own payment
+    // fault, surfaced as a mid-stream `StreamError`.
+    let voucher_msg = {
+        let frame = read_frame(&mut recv)
+            .await
+            .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
+        decode_message::<ClientMessage>(&frame)
+            .map_err(|e| anyhow::anyhow!("decode voucher: {e}"))?
+            .0
+    };
+    if let ClientMessage::Voucher(_) = voucher_msg {
+        write_frame(
+            &mut send,
+            &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {
+                reason: VoucherRejectReason::StaleNonce,
+            }))?,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("write voucher rejection: {e}"))?;
+    }
+    let _ = send.finish();
+    conn.closed().await;
+    Ok(())
+}
+
+/// Spawn A serving probes truthfully but rejecting the buyer's voucher on the
+/// client stream, for the #857 voucher-rejection exoneration test.
+fn spawn_a_voucher_rejecting_server(
+    ep: iroh::Endpoint,
+    a_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    served: Vec<u8>,
+    advertised_bytes: u64,
+    rate: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let eth = Arc::clone(&a_eth);
+            let dom = slash.clone();
+            let served = served.clone();
+            if conn.alpn() == ALPN_PROBE {
+                tokio::spawn(async move {
+                    let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    let _ = serve_then_reject_voucher(conn, &eth, &dom, &served, rate).await;
+                });
+            }
+        }
+    })
+}
+
+/// Spawn a provider that answers probes truthfully but HARD-FAILS the client
+/// stream at the transport: it accepts the connection and immediately closes it,
+/// so the buyer's `stream_fetch` errors on connect/read rather than stalling to a
+/// timeout. Models a genuine reachability failure (NOT a `PullTimeout`,
+/// `UpstreamVoucherRejected`, or `HashMismatch`) — the #857 regression guard that
+/// such failures must STILL score `Unreachable` and the fix did not over-exonerate.
+fn spawn_a_probe_ok_client_dead_server(
+    ep: iroh::Endpoint,
+    a_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    total_bytes: u64,
+    rate: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let eth = Arc::clone(&a_eth);
+            let dom = slash.clone();
+            if conn.alpn() == ALPN_PROBE {
+                tokio::spawn(async move {
+                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
+                });
+            } else {
+                // Kill the client stream immediately: close the connection before
+                // any `StreamResponse`, so the buyer's read fails at the transport.
+                conn.close(0u32.into(), b"dead");
+            }
+        }
+    })
+}
+
 /// Spawn a provider that answers probes truthfully but *stalls* on the client
 /// stream: it accepts the bidi stream and reads the request, then never sends a
 /// `StreamResponse` and holds the send side open, so the buyer's `stream_fetch`
@@ -920,21 +1077,29 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         "pulled bytes mismatch"
     );
 
-    // Two outcomes recorded: the staller scored unreachable, A scored a clean
-    // delivery — proof BOTH candidates were attempted, in rank order.
+    // Only ONE observation: the honest fallback's clean delivery. The staller hit
+    // OUR per-candidate `pull_timeout`, which is a buyer-side deadline (a possibly
+    // mis-sized local config), not evidence the provider is unreachable — so it
+    // records NO reputation observation, local or gossiped (#857). That it was
+    // attempted at all is proven by the `node_pull_timeout` counter below.
     let drained = obs_buffer.drain();
     anyhow::ensure!(
-        drained.len() == 2,
-        "expected two observations (staller + honest), got {}",
+        drained.len() == 1,
+        "expected one observation (honest fallback only; the timed-out staller is exonerated), got {}",
         drained.len()
     );
-    let (_, staller_m) = drained
-        .iter()
-        .find(|(p, _)| *p == s_id)
-        .ok_or_else(|| anyhow::anyhow!("no observation about the staller"))?;
     anyhow::ensure!(
-        staller_m.uptime_observed == Some(false),
-        "staller should score as unreachable, got {staller_m:?}"
+        !drained.iter().any(|(p, _)| *p == s_id),
+        "the timed-out staller must NOT be gossiped about (#857)"
+    );
+    // The other half of the fix: no LOCAL EWMA hit either. `record_outcome` writes
+    // the gossip buffer and the local score together, so a future split that
+    // re-introduced a local-only timeout penalty would pass the obs-buffer check
+    // above but fail here. The staller stays at the neutral cold-start 0.5.
+    anyhow::ensure!(
+        (local_rep.score(s_id) - 0.5).abs() < f64::EPSILON,
+        "the timed-out staller's local score must stay neutral, got {}",
+        local_rep.score(s_id)
     );
     let (_, honest_m) = drained
         .iter()
@@ -945,6 +1110,8 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         "honest provider should score a clean delivery, got {honest_m:?}"
     );
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_timeout_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
 
     ep_b.close().await;
     ep_a.close().await;
@@ -1231,6 +1398,192 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
         "corrupt-but-paid delivery must persist its acked watermark, got {:?}",
         progress_log(&recorded)?
     );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
+/// #857 over the real orchestration: an upstream serves the *correct* bytes but
+/// rejects the buyer's closing voucher (a stale nonce / our payment fault). The
+/// pull must fail to a clean `NotFound`, and — crucially — the provider must NOT
+/// be tarred: a voucher rejection is OUR payment-side fault, so no observation is
+/// emitted (local or gossiped), the local score stays neutral, and only the
+/// buyer-side `node_pull_voucher_rejected` counter moves (no unreachable, no
+/// corruption). Before the fix, this self-inflicted failure mapped to
+/// `Outcome::Unreachable` and defamed the honest provider network-wide.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
+    let payload = vec![0x33u8; 4096];
+    let hash = Hash::new(&payload);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let task_a = spawn_a_voucher_rejecting_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        payload.clone(),
+        total_bytes,
+        RATE,
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let (origin, _recorded) = provisioned_origin(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        B256::repeat_byte(0xA1),
+        &b_buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        providers,
+        addr_map,
+    );
+
+    let got = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a rejected voucher must not surface bytes (NotFound)"
+    );
+    // The provider is NOT tarred: no observation, score stays neutral at 0.5.
+    anyhow::ensure!(
+        obs_buffer.drain().is_empty(),
+        "a buyer-side voucher rejection must not emit a reputation observation (#857)"
+    );
+    anyhow::ensure!(
+        (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
+        "provider score must stay neutral after a voucher rejection, got {}",
+        local_rep.score(a_id)
+    );
+    // Observability: the attempt was made and the voucher-rejected counter moved;
+    // no success, no unreachable, no corruption.
+    assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_success_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
+/// #857 regression guard (the over-exoneration direction): a provider that
+/// answers the probe truthfully but then HARD-FAILS the client stream at the
+/// transport (connection closed before any `StreamResponse`) is a GENUINE
+/// reachability failure — not a timeout, voucher rejection, or hash mismatch — so
+/// it MUST still score `Outcome::Unreachable`. This pins the boundary the fix
+/// narrowed: the new exoneration arms must not swallow real transport failures.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> {
+    let payload = vec![0x44u8; 4096];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_probe_ok_client_dead_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let (origin, _recorded) = provisioned_origin(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        B256::repeat_byte(0xA1),
+        &b_buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        providers,
+        addr_map,
+    );
+
+    let got = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a dead client stream must not surface bytes (NotFound)"
+    );
+    // The transport failure IS scored against the provider: an observation with
+    // uptime_observed:false is emitted and the local score drops below neutral.
+    let drained = obs_buffer.drain();
+    let (peer, m) = drained
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("expected an Unreachable observation"))?;
+    anyhow::ensure!(*peer == a_id, "observation about wrong peer");
+    anyhow::ensure!(
+        m.uptime_observed == Some(false) && m.data_correct.is_none(),
+        "a real transport failure must score Unreachable, got {m:?}"
+    );
+    anyhow::ensure!(
+        local_rep.score(a_id) < 0.5,
+        "a transport failure must drop the local score below neutral, got {}",
+        local_rep.score(a_id)
+    );
+    // The fix did NOT over-exonerate: this counts as unreachable, not as one of
+    // the new buyer-side buckets.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_timeout_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
     ep_b.close().await;
     ep_a.close().await;

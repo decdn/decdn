@@ -56,7 +56,8 @@ use decdn_reputation::{
 
 use crate::buyer_channel::ChannelOpener;
 use crate::client_requester::{
-    BlobTooLargeClaim, HashMismatch, VoucherProgress, stream_fetch_tracked,
+    BlobTooLargeClaim, HashMismatch, PullTimeout, UpstreamVoucherRejected, VoucherProgress,
+    stream_fetch_tracked,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -442,10 +443,33 @@ async fn pull_from_candidate(
                 debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
                 return None;
             }
+            // OUR own per-candidate deadline firing — a possibly mis-sized local
+            // `pull_timeout`, not evidence the provider is unreachable. Like the
+            // channel-open failure above, record it for observability but don't
+            // tar its reputation locally or over gossip (#857).
+            if err.downcast_ref::<PullTimeout>().is_some() {
+                deps.metrics.node_pull_timeout();
+                debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; not tarring upstream reputation");
+                return None;
+            }
+            // The upstream rejected a voucher WE presented — a stale nonce (#852),
+            // deposit exhaustion, or a channel mismatch. That is our payment-side
+            // fault, not the provider's, so skip the candidate without recording a
+            // reputation observation (#857).
+            if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
+                deps.metrics.node_pull_voucher_rejected();
+                debug!(%provider_addr, %err, "node-origin: upstream rejected our voucher (our payment fault); not tarring upstream reputation");
+                return None;
+            }
             // A whole-blob hash mismatch (the typed `HashMismatch` sentinel,
             // matched by `downcast_ref` — not a brittle message string) means the
             // peer was reachable and paid but served wrong bytes → Corruption;
-            // everything else is an unreachable/transport failure.
+            // everything else is an unreachable/transport failure. The one residual
+            // buyer-side error that still lands here is a failure to sign/encode our
+            // OWN voucher (`self_pay`): that signals a catastrophic local fault (a
+            // broken signer), not the routine honest-provider mis-scoring #857
+            // fixes, so it is intentionally not exonerated — a single stray
+            // `Unreachable` is negligible next to a node whose payment side is dead.
             let outcome = if err.downcast_ref::<HashMismatch>().is_some() {
                 Outcome::Corruption
             } else {
@@ -585,5 +609,26 @@ mod tests {
         assert_eq!(ms_to_u32(-5.0), 0);
         assert_eq!(ms_to_u32(42.9), 42);
         assert_eq!(ms_to_u32(f64::from(u32::MAX) + 1.0), u32::MAX);
+    }
+
+    /// The whole #857 fix hinges on `pull_from_candidate` recovering the buyer-side
+    /// sentinels via `downcast_ref` after they round-trip through `anyhow::Error`
+    /// (the timeout path even double-wraps via `??`). Pin that contract at the
+    /// boundary so a future `.context()` wrapper or a changed error path fails here
+    /// — a localized failure — rather than as a confusing "honest provider got
+    /// tarred" assertion three layers up in the integration tests.
+    #[test]
+    fn buyer_side_sentinels_survive_anyhow_downcast() {
+        let timeout: anyhow::Error = anyhow::Error::new(PullTimeout {
+            after: Duration::from_secs(3),
+        });
+        assert!(timeout.downcast_ref::<PullTimeout>().is_some());
+        assert!(timeout.downcast_ref::<HashMismatch>().is_none());
+
+        let rejected: anyhow::Error = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: decdn_protocol::client::VoucherRejectReason::StaleNonce,
+        });
+        assert!(rejected.downcast_ref::<UpstreamVoucherRejected>().is_some());
+        assert!(rejected.downcast_ref::<PullTimeout>().is_none());
     }
 }
