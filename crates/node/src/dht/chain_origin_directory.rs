@@ -144,9 +144,11 @@ struct DirectoryCache {
     /// `hash → namespaceIds that claimed it` (from `ContentClaimed`). A hash
     /// absent here has no claiming namespace and falls back to default-open.
     namespaces_of: HashMap<Hash, HashSet<U256>>,
-    /// `namespaceId → authorized operator addresses` for non-zero namespaces
-    /// (from `getOrigins` snapshot + `AssignmentActivated` / `*Revoked` /
-    /// `*Pruned` deltas).
+    /// `namespaceId → authorized operator addresses` for non-zero namespaces.
+    /// Snapshotted via `getOrigins` and kept current by authoritative `getOrigins`
+    /// re-reads on each assignment event — never incremental deltas (see the
+    /// module header). The only per-operator delete is the fail-closed
+    /// [`delta_remove_origin`] fallback when a removal-triggered re-read errors.
     origins_of_ns: HashMap<U256, HashSet<Address>>,
     /// The default-open allow-list (namespace 0).
     default_open: HashSet<Address>,
@@ -513,11 +515,36 @@ struct WatcherState {
     resync_from: Option<u64>,
 }
 
-/// Advance the observed-block cursor from an event log's block number (best
-/// effort — a pending log with no block number leaves the cursor unchanged).
-fn advance_block(state: &mut WatcherState, block_number: Option<u64>) {
-    if let Some(bn) = block_number {
-        state.last_block = state.last_block.max(bn);
+impl WatcherState {
+    /// Advance the observed-block cursor from an event log's block number (best
+    /// effort — a pending log with no block number leaves the cursor unchanged).
+    fn advance_block(&mut self, block_number: Option<u64>) {
+        if let Some(bn) = block_number {
+            self.last_block = self.last_block.max(bn);
+        }
+    }
+
+    /// Arm the re-arm resync from the current cursor. Centralises the
+    /// `resync_from == last_block` invariant so the two states can never drift.
+    const fn arm_resync(&mut self) {
+        self.resync_from = Some(self.last_block);
+    }
+
+    /// Run the re-arm resync pass if armed, then disarm — but only on a fully
+    /// successful pass. A propagated RPC error leaves `resync_from` set so the
+    /// next cycle repeats the whole pass. Folds the scanned head into the cursor.
+    async fn apply_resync<R: OriginChainReads>(
+        &mut self,
+        reads: &R,
+        cache: &Arc<RwLock<DirectoryCache>>,
+        metrics: &Arc<Metrics>,
+    ) -> Result<()> {
+        if let Some(start) = self.resync_from {
+            let head = resync_pass(reads, cache, metrics, start).await?;
+            self.last_block = self.last_block.max(head);
+            self.resync_from = None;
+        }
+        Ok(())
     }
 }
 
@@ -554,7 +581,7 @@ async fn watcher_loop<P>(
                 // The error tore the filters down and we are about to sleep, so
                 // events in the backoff window are genuinely lost — arm the
                 // resync to recover them on the next cycle.
-                state.resync_from = Some(state.last_block);
+                state.arm_resync();
                 metrics.origin_directory_watcher_backoff_started();
                 warn!(
                     %err,
@@ -586,7 +613,22 @@ async fn resync_pass<R: OriginChainReads>(
     // Floor the replay at `head - MAX_RESYNC_REPLAY_BLOCKS` so a stale `start`
     // (old `last_block` on a quiet network) cannot trigger an unbounded scan.
     let floor = head.saturating_sub(MAX_RESYNC_REPLAY_BLOCKS);
-    let mut from = start.saturating_sub(REORG_OVERLAP).max(floor);
+    let unclamped = start.saturating_sub(REORG_OVERLAP);
+    if unclamped < floor {
+        // The gap exceeded the replay cap: a `ContentClaimed` in the dropped
+        // [unclamped, floor) tail is not replayed (the authoritative getOrigins
+        // re-read below is unaffected, so no revoke is lost — see the constant
+        // doc). Surface it so a long outage's truncated claim coverage is visible.
+        metrics.origin_directory_watcher_resolve_failure();
+        warn!(
+            unclamped,
+            floor,
+            head,
+            "re-arm resync replay clamped to MAX_RESYNC_REPLAY_BLOCKS; claims in the \
+             dropped tail resolve as unclaimed until re-surfaced"
+        );
+    }
+    let mut from = unclamped.max(floor);
     while from <= head {
         let to = from.saturating_add(REPLAY_WINDOW_BLOCKS - 1).min(head);
         for (hash, namespace) in reads.content_claimed(from, to).await? {
@@ -693,11 +735,7 @@ where
     // transient RPC error leaves it armed and the next cycle repeats it. Any
     // event arriving during this pass is captured by the streams above and
     // drained (idempotently re-read) once the select loop starts.
-    if let Some(start) = state.resync_from {
-        let head = resync_pass(contracts, cache, metrics, start).await?;
-        state.last_block = state.last_block.max(head);
-        state.resync_from = None;
-    }
+    state.apply_resync(contracts, cache, metrics).await?;
 
     metrics.origin_directory_watcher_cycle_established();
 
@@ -705,7 +743,7 @@ where
         tokio::select! {
             ev = content_claimed.next() => match ev {
                 Some(Ok((event, log))) => {
-                    advance_block(state, log.block_number);
+                    state.advance_block(log.block_number);
                     on_content_claimed(
                         contracts, cache, metrics,
                         Hash::from_bytes(event.blake3Hash.0), event.namespaceId,
@@ -716,7 +754,7 @@ where
             },
             ev = activated.next() => match ev {
                 Some(Ok((event, log))) => {
-                    advance_block(state, log.block_number);
+                    state.advance_block(log.block_number);
                     on_namespace_changed(contracts, cache, metrics, event.namespaceId).await;
                 }
                 Some(Err(e)) => return Err(e).context("AssignmentActivated stream"),
@@ -724,7 +762,7 @@ where
             },
             ev = revoked.next() => match ev {
                 Some(Ok((event, log))) => {
-                    advance_block(state, log.block_number);
+                    state.advance_block(log.block_number);
                     on_origin_removed(
                         contracts, cache, metrics, event.namespaceId, event.operator,
                     ).await;
@@ -734,7 +772,7 @@ where
             },
             ev = pruned.next() => match ev {
                 Some(Ok((event, log))) => {
-                    advance_block(state, log.block_number);
+                    state.advance_block(log.block_number);
                     on_origin_removed(
                         contracts, cache, metrics, event.namespaceId, event.operator,
                     ).await;
@@ -744,7 +782,7 @@ where
             },
             ev = default_updated.next() => match ev {
                 Some(Ok((_event, log))) => {
-                    advance_block(state, log.block_number);
+                    state.advance_block(log.block_number);
                     on_default_open_changed(contracts, cache, metrics).await;
                 }
                 Some(Err(e)) => return Err(e).context("DefaultOpenAllowlistUpdated stream"),
@@ -752,7 +790,7 @@ where
             },
             ev = default_added.next() => match ev {
                 Some(Ok((_event, log))) => {
-                    advance_block(state, log.block_number);
+                    state.advance_block(log.block_number);
                     on_default_open_changed(contracts, cache, metrics).await;
                 }
                 Some(Err(e)) => return Err(e).context("DefaultOpenOperatorAdded stream"),
@@ -760,7 +798,7 @@ where
             },
             ev = default_removed.next() => match ev {
                 Some(Ok((event, log))) => {
-                    advance_block(state, log.block_number);
+                    state.advance_block(log.block_number);
                     on_origin_removed(
                         contracts, cache, metrics, DEFAULT_OPEN_NAMESPACE, event.operator,
                     ).await;
@@ -817,8 +855,10 @@ async fn resync_default_open<R: OriginChainReads>(
 /// A new `(hash, namespace)` claim. Record the mapping and, for a not-yet-known
 /// namespace, authoritatively read its current operator set so the hash resolves
 /// immediately. On `getOrigins` failure the namespace is left unpopulated (the
-/// hash resolves to empty, fail-closed) and self-heals on the next event for that
-/// namespace or the next re-arm resync.
+/// hash resolves to empty, fail-closed). Recovery is guaranteed by the next
+/// re-arm resync pass — which re-reads every namespace in `namespaces_of`, this
+/// one included — or by a subsequent claim / assignment-mutation on the same
+/// namespace; an unrelated event for a *different* namespace does not heal it.
 async fn on_content_claimed<R: OriginChainReads>(
     reads: &R,
     cache: &Arc<RwLock<DirectoryCache>>,
@@ -1661,11 +1701,105 @@ mod tests {
             last_block: 10,
             resync_from: None,
         };
-        advance_block(&mut state, Some(25));
+        state.advance_block(Some(25));
         assert_eq!(state.last_block, 25);
-        advance_block(&mut state, Some(20)); // lower block does not regress.
+        state.advance_block(Some(20)); // lower block does not regress.
         assert_eq!(state.last_block, 25);
-        advance_block(&mut state, None); // pending log leaves it unchanged.
+        state.advance_block(None); // pending log leaves it unchanged.
         assert_eq!(state.last_block, 25);
+    }
+
+    #[tokio::test]
+    async fn apply_resync_clears_arm_and_advances_cursor_on_success() {
+        // The security-load-bearing wiring: a successful pass disarms the resync
+        // and folds the scanned head into the cursor.
+        let metrics = Arc::new(Metrics::new());
+        let cache = shared(cache_with(&[(h(1), &[7])], &[(7, &[addr(0xC)])], &[], &[]));
+        let reads = StubReads::new()
+            .origins(&[(7, &[addr(0xA)])]) // chain truth dropped C
+            .bindings(&[(addr(0xA), nid(0xA))])
+            .head(500);
+        let mut state = WatcherState {
+            last_block: 100,
+            resync_from: None,
+        };
+        state.arm_resync();
+        assert_eq!(
+            state.resync_from,
+            Some(100),
+            "arm_resync ties resync_from to the cursor"
+        );
+        state.apply_resync(&reads, &cache, &metrics).await.unwrap();
+        assert_eq!(state.resync_from, None, "a successful pass disarms");
+        assert_eq!(
+            state.last_block, 500,
+            "the scanned head advances the cursor"
+        );
+        read_cache(&cache, |c| {
+            assert!(
+                !c.origins_of_ns[&ns(7)].contains(&addr(0xC)),
+                "resync applied chain truth"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn apply_resync_stays_armed_when_pass_errors() {
+        // A mid-pass getOrigins failure must leave resync_from armed so the next
+        // cycle repeats the whole pass; the cursor must not advance.
+        let metrics = Arc::new(Metrics::new());
+        let cache = shared(cache_with(&[(h(1), &[7])], &[(7, &[addr(0xC)])], &[], &[]));
+        let reads = StubReads::new().head(500).fail_origins(&[7]);
+        let mut state = WatcherState {
+            last_block: 100,
+            resync_from: Some(100),
+        };
+        let result = state.apply_resync(&reads, &cache, &metrics).await;
+        assert!(result.is_err(), "the error propagates");
+        assert_eq!(
+            state.resync_from,
+            Some(100),
+            "the resync stays armed for retry"
+        );
+        assert_eq!(
+            state.last_block, 100,
+            "the cursor does not advance on a failed pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_resync_is_a_noop_when_not_armed() {
+        let metrics = Arc::new(Metrics::new());
+        // A namespace whose re-read errors: if apply_resync wrongly ran the pass
+        // it would return Err and the `unwrap` below would panic. It must not,
+        // because `resync_from` is None.
+        let cache = shared(cache_with(&[(h(1), &[7])], &[(7, &[addr(0xC)])], &[], &[]));
+        let reads = StubReads::new().head(500).fail_origins(&[7]);
+        let mut state = WatcherState {
+            last_block: 42,
+            resync_from: None,
+        };
+        state.apply_resync(&reads, &cache, &metrics).await.unwrap();
+        assert_eq!(state.last_block, 42, "cursor unchanged when not armed");
+        assert_eq!(state.resync_from, None);
+    }
+
+    #[test]
+    fn delta_remove_origin_unknown_namespace_is_a_noop() {
+        // The fail-closed fallback for a namespace never cached must not panic or
+        // create an entry — the operator already resolves to empty there.
+        let metrics = Arc::new(Metrics::new());
+        let cache = shared(cache_with(&[], &[(7, &[addr(0xA)])], &[], &[]));
+        delta_remove_origin(&cache, &metrics, ns(99), addr(0xB));
+        read_cache(&cache, |c| {
+            assert!(
+                !c.origins_of_ns.contains_key(&ns(99)),
+                "no phantom entry created"
+            );
+            assert!(
+                c.origins_of_ns[&ns(7)].contains(&addr(0xA)),
+                "other namespaces untouched"
+            );
+        });
     }
 }

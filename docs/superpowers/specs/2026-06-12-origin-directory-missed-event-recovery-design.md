@@ -104,21 +104,33 @@ dispatch shrinks to: namespace events → `resync_namespace`; default-open event
   `bootstrap`), and updated to `max(last_block, log.block_number)` on every
   observed event (the `_log` currently discarded at `:506` etc. carries
   `block_number: Option<u64>`, as used by `reputation_indexer.rs:331`).
-- On a watcher error, `watcher_loop` sets `resync_from = Some(last_block)` before
-  sleeping/backoff (the `Err` arm at `:420-429`). The first cycle after bootstrap
-  has `resync_from == None` (bootstrap already snapshotted), so no redundant
-  resync on the happy path.
-- At the **top of `run_watcher_once`, before establishing the watch filters**: if
-  `resync_from` is `Some(start)`, run a **resync pass**:
-  1. Incremental `ContentClaimed` replay over `[start − REORG_OVERLAP, head]`
-     (windowed by `REPLAY_WINDOW_BLOCKS`, as bootstrap does) — catches new
-     `hash → namespace` claims missed during the outage. New namespaces are
-     resync'd as they surface.
-  2. `resync_namespace(ns)` for **every known namespace** in `origins_of_ns`.
+- On a watcher **error** only, `watcher_loop` arms `resync_from = Some(last_block)`
+  before sleeping/backoff. A *clean* re-subscribe does **not** arm — see the
+  filters-first ordering below, which buffers across that gap. The first cycle
+  after bootstrap has `resync_from == None` (bootstrap already snapshotted), so no
+  redundant resync on the happy path.
+- In `run_watcher_once`, **establish the seven `.watch()` filters first**, then —
+  if `resync_from` is `Some(start)` — run the **resync pass**, then go live. (This
+  is the one place the implementation deliberately improves on the original draft,
+  which ran the resync before the filters: installing the filters first means any
+  event emitted *during* the resync RPC buffers in the streams and is drained — as
+  an idempotent re-read — once the select loop starts, rather than falling into a
+  fresh gap. This mirrors `reputation_indexer`'s filters-then-backfill order.) The
+  resync pass:
+  1. Incremental `ContentClaimed` replay over
+     `[max(start − REORG_OVERLAP, head − MAX_RESYNC_REPLAY_BLOCKS), head]`
+     (windowed by `REPLAY_WINDOW_BLOCKS`) — catches new `hash → namespace` claims
+     missed during the outage. The `MAX_RESYNC_REPLAY_BLOCKS` floor bounds the
+     scan when `last_block` is stale; a clamp emits a `warn!` + resolve-failure
+     metric so the truncated tail is visible. New namespaces are resync'd as they
+     surface.
+  2. `resync_namespace(ns)` for **every known/claimed namespace** (sorted, for
+     deterministic error reporting), reflecting any revoke/prune lost in the gap.
   3. `resync_default_open()`.
-  4. Set `last_block = head` and **clear `resync_from = None` only after the whole
-     pass succeeds** — a transient RPC failure leaves it `Some` so the next retry
-     repeats the full pass (the `reputation_indexer` discipline).
+  4. Fold `head` into `last_block` and **clear `resync_from = None` only after the
+     whole pass succeeds** — a transient RPC failure leaves it `Some` so the next
+     retry repeats the full pass (the `reputation_indexer` discipline). This
+     arm/clear logic lives in `WatcherState::apply_resync`, unit-tested directly.
 
 `REORG_OVERLAP` is a small fixed lookback (a handful of blocks) so a reorg around
 the gap boundary cannot drop a `ContentClaimed`. Re-replaying a few already-seen
