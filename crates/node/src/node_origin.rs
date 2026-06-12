@@ -455,7 +455,11 @@ async fn pull_from_candidate(
             // The upstream rejected a voucher WE presented — a stale nonce (#852),
             // deposit exhaustion, or a channel mismatch. That is our payment-side
             // fault, not the provider's, so skip the candidate without recording a
-            // reputation observation (#857).
+            // reputation observation (#857). This arm is intentionally reason-
+            // agnostic: every `VoucherRejectReason` abandons the candidate. The
+            // typed reason is carried for future per-reason handling (e.g. honoring
+            // `RetryLater` by resending the same voucher rather than abandoning),
+            // which is not yet wired — same terminal behavior as the pre-#857 code.
             if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
                 deps.metrics.node_pull_voucher_rejected();
                 debug!(%provider_addr, %err, "node-origin: upstream rejected our voucher (our payment fault); not tarring upstream reputation");

@@ -1116,6 +1116,10 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
     assert_counter(&b_metrics, "node_pull_timeout_total", 1)?;
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    // Symmetry with the voucher/transport tests: the timeout is a single early
+    // return, so it must not also land in any sibling buyer-side bucket.
+    assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
     ep_b.close().await;
     ep_a.close().await;
