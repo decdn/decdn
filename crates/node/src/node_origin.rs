@@ -55,7 +55,9 @@ use decdn_reputation::{
 };
 
 use crate::buyer_channel::ChannelOpener;
-use crate::client_requester::{HashMismatch, VoucherProgress, stream_fetch_tracked};
+use crate::client_requester::{
+    BlobTooLargeClaim, HashMismatch, VoucherProgress, stream_fetch_tracked,
+};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
@@ -77,6 +79,10 @@ pub struct NodeOriginConfig {
     pub probe_fanout: usize,
     /// Wall-clock bound on a single upstream pull (`stream_fetch`).
     pub pull_timeout: Duration,
+    /// Buyer-side blob-size ceiling (`cache.max_blob_size_mb` × MB), `0` = unlimited.
+    /// Mirrors the serving-side `BlobTooLarge` gate; rejects an oversized server
+    /// `total_bytes` claim before buffering (#840).
+    pub max_blob_size_bytes: u64,
     /// ADR 015 master switch (`network.enable_0rtt`) for the probe handshake.
     pub enable_0rtt: bool,
     /// Desired deposit for a freshly-opened buyer channel
@@ -390,6 +396,7 @@ async fn pull_from_candidate(
         0,
         now_micros(),
         deps.config.pull_timeout,
+        deps.config.max_blob_size_bytes,
         &mut progress,
     )
     .await;
@@ -425,6 +432,16 @@ async fn pull_from_candidate(
             Some(bytes)
         }
         Err(err) => {
+            // An oversized-blob claim is OUR ceiling, not the provider's fault —
+            // it may legitimately serve larger blobs to nodes configured with a
+            // higher `max_blob_size`. Like the channel-open failure above, record
+            // it for observability but don't tar its reputation; just try the
+            // next candidate (#840).
+            if err.downcast_ref::<BlobTooLargeClaim>().is_some() {
+                deps.metrics.node_pull_too_large();
+                debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
+                return None;
+            }
             // A whole-blob hash mismatch (the typed `HashMismatch` sentinel,
             // matched by `downcast_ref` — not a brittle message string) means the
             // peer was reachable and paid but served wrong bytes → Corruption;

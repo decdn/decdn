@@ -190,6 +190,30 @@ impl std::fmt::Display for HashMismatch {
 
 impl std::error::Error for HashMismatch {}
 
+/// Typed sentinel for a server that claimed a `total_bytes` above the buyer's
+/// `max_blob_size_bytes` ceiling (#840). Returned (not a bare string) so the
+/// pull orchestrator can `downcast_ref` and classify it as a buyer-side policy
+/// rejection — distinct from a hash mismatch or an unreachable peer — rather
+/// than mis-attributing it to the provider's reputation. `Display` carries
+/// `BlobTooLarge` so logs and the existing requester tests can match on it.
+#[derive(Debug)]
+pub struct BlobTooLargeClaim {
+    pub claimed: u64,
+    pub ceiling: u64,
+}
+
+impl std::fmt::Display for BlobTooLargeClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "server claimed {} bytes, exceeding max_blob_size {} bytes (BlobTooLarge)",
+            self.claimed, self.ceiling
+        )
+    }
+}
+
+impl std::error::Error for BlobTooLargeClaim {}
+
 /// Fetch `hash` from `target` over `cdn/client/v1`, paying as bytes arrive.
 ///
 /// `expected_signer` is the delivering node's Ethereum address, used to verify
@@ -224,6 +248,11 @@ pub async fn stream_fetch(
         byte_offset,
         timestamp_us,
         timeout,
+        // No buyer-side blob-size ceiling on this test/loopback helper. The
+        // production pull path does not go through here — it calls
+        // `stream_fetch_tracked` directly (`node_origin::pull_from_candidate`)
+        // with its configured `max_blob_size_bytes`.
+        0,
         &mut VoucherProgress::default(),
     )
     .await
@@ -253,6 +282,7 @@ pub async fn stream_fetch_tracked(
     byte_offset: u64,
     timestamp_us: u64,
     timeout: Duration,
+    max_blob_size_bytes: u64,
     progress: &mut VoucherProgress,
 ) -> anyhow::Result<Bytes> {
     let bytes = tokio::time::timeout(
@@ -266,6 +296,7 @@ pub async fn stream_fetch_tracked(
             hash,
             byte_offset,
             timestamp_us,
+            max_blob_size_bytes,
             progress,
         ),
     )
@@ -284,6 +315,7 @@ async fn fetch_inner(
     hash: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
+    max_blob_size_bytes: u64,
     progress: &mut VoucherProgress,
 ) -> anyhow::Result<Bytes> {
     // Full handshake — no 0-RTT on cdn/client/v1 (ADR 015).
@@ -328,6 +360,35 @@ async fn fetch_inner(
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
+    }
+    // Reject an oversized server-claimed `total_bytes` before allocating or
+    // entering the receive loop — `total_bytes` is server-controlled and
+    // `StreamResponse::validate()` does not bound it, so the in-loop
+    // `cumulative > expected` guard alone would let one inflated promise drive
+    // us toward OOM. Mirrors the serving-side `BlobTooLarge` gate
+    // (handlers/client.rs); `0` = unlimited (#840). Typed sentinel so the pull
+    // orchestrator classifies it as a buyer-side policy rejection, not provider
+    // misbehavior.
+    if max_blob_size_bytes > 0 && resp.body.total_bytes > max_blob_size_bytes {
+        return Err(anyhow::Error::new(BlobTooLargeClaim {
+            claimed: resp.body.total_bytes,
+            ceiling: max_blob_size_bytes,
+        }));
+    }
+    // A `total_bytes` below `byte_offset` would underflow `expected` to `0`
+    // (saturating), so the loop ends on the first `StreamEnd` and returns an
+    // empty buffer. On a resumed fetch (`byte_offset > 0`) the whole-blob hash
+    // check is skipped, so that empty buffer would surface as success — a silent
+    // verification bypass. A legitimate server always claims
+    // `total_bytes >= byte_offset`; reject anything less before the loop. (A
+    // non-empty but *short* delivery is caught by the completeness check after
+    // the loop.)
+    if resp.body.total_bytes < byte_offset {
+        anyhow::bail!(
+            "server claimed total_bytes ({}) below the requested byte_offset ({})",
+            resp.body.total_bytes,
+            byte_offset
+        );
     }
 
     let rate_per_mb = resp.body.rate_per_mb;
@@ -382,6 +443,18 @@ async fn fetch_inner(
     }
 
     let blob = buf.freeze();
+    // On a resumed fetch (`byte_offset > 0`) the whole-blob hash check below is
+    // skipped, so a truncated delivery — fewer than `expected` bytes before
+    // `StreamEnd` — would otherwise surface as a successful short read. The
+    // server's `total_bytes` is the only completeness signal without the hash,
+    // so require the full promised remainder. A full fetch (`byte_offset == 0`)
+    // is covered by the hash check and may legitimately be shorter than an
+    // over-claimed `total_bytes` as long as the bytes hash correctly, so this
+    // is scoped to resumes only (#840).
+    if byte_offset > 0 && cumulative < expected {
+        conn.close(0u32.into(), b"short-delivery");
+        anyhow::bail!("server sent {cumulative} of {expected} promised bytes before StreamEnd");
+    }
     // Whole-blob integrity check on a full fetch (see module docs for the
     // resume caveat).
     if byte_offset == 0 && Hash::new(&blob) != Hash::from_bytes(hash) {

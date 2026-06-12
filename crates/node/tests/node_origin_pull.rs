@@ -317,6 +317,47 @@ fn provisioned_origin(
     (origin, recorded)
 }
 
+/// Like [`provisioned_origin`], but the buyer enforces a `max_blob_size_bytes`
+/// ceiling — drives the production `pull_from_candidate` path against the
+/// buyer-side gate (#840).
+#[allow(clippy::too_many_arguments)]
+fn provisioned_origin_with_ceiling(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    hash: Hash,
+    channel_id: B256,
+    buyer_signer: &Arc<PrivateKeySigner>,
+    local_rep: &Arc<LocalReputation>,
+    obs_buffer: &Arc<ObservationBuffer>,
+    metrics: &Arc<Metrics>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+    max_blob_size_bytes: u64,
+) -> NodeOrigin {
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(buyer_signer),
+        voucher_domain: voucher_dom(),
+        recorded,
+    }) as Arc<dyn ChannelOpener>;
+    build_origin_with_timeout(
+        ep_b,
+        b_dht,
+        hash,
+        buyer,
+        local_rep,
+        obs_buffer,
+        metrics,
+        providers,
+        addr_map,
+        Duration::from_secs(20),
+        max_blob_size_bytes,
+    )
+}
+
 /// Provision a `NodeOrigin` with stubbed discovery/resolver/reputation around a
 /// caller-supplied buyer `ChannelOpener`, so a test can inject any opener
 /// (recording, failing, …) without re-wiring the deps.
@@ -343,6 +384,7 @@ fn build_origin(
         providers,
         addr_map,
         Duration::from_secs(20),
+        0,
     )
 }
 
@@ -361,6 +403,7 @@ fn build_origin_with_timeout(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
+    max_blob_size_bytes: u64,
 ) -> NodeOrigin {
     let mut dir = HashMap::new();
     dir.insert(DhtHash::from_bytes(*hash.as_bytes()), providers);
@@ -388,6 +431,7 @@ fn build_origin_with_timeout(
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout,
+            max_blob_size_bytes,
             enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
@@ -860,6 +904,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         // fetch here; at the `NodeOrigin` level there is no outer wrapper, so this
         // exercises the per-candidate fallthrough the fix preserves.
         Duration::from_secs(1),
+        0,
     );
 
     // The orchestration must abandon the staller and deliver from A.
@@ -1186,6 +1231,135 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
         "corrupt-but-paid delivery must persist its acked watermark, got {:?}",
         progress_log(&recorded)?
     );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
+/// #840 over the real orchestration: an honest upstream holds and would serve a
+/// blob larger than B's `max_blob_size` ceiling. The buyer must reject the
+/// oversized `total_bytes` claim before buffering — the fetch is a clean
+/// `NotFound`, the `node_pull_too_large` counter moves, and (crucially) the
+/// provider is NOT scored: a buyer-side ceiling is OUR policy, not the provider's
+/// fault, so no observation is emitted and its local score stays neutral.
+///
+/// This exercises `pull_from_candidate` passing `deps.config.max_blob_size_bytes`
+/// (the loopback test calls `stream_fetch_tracked` directly and bypasses it).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()> {
+    let payload = vec![0xABu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+    // Buyer ceiling well below the 1.5 MiB blob → the gate fires.
+    let ceiling: u64 = 1_048_576;
+    anyhow::ensure!(total_bytes > ceiling, "fixture must exceed the ceiling");
+
+    // --- Node A: honest, unlimited server holding the blob. -------------------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xA1);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0, // server ceiling unlimited — it would happily serve the full blob.
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: dial-only endpoint with a sub-blob ceiling. ------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let origin = provisioned_origin_with_ceiling(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        channel_id,
+        &b_buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        providers,
+        addr_map,
+        ceiling,
+    );
+
+    let got = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "an over-ceiling claim must not surface bytes (NotFound)"
+    );
+    // The provider is NOT tarred: no observation, score stays at the neutral 0.5.
+    anyhow::ensure!(
+        obs_buffer.drain().is_empty(),
+        "a buyer-side ceiling rejection must not emit a reputation observation"
+    );
+    anyhow::ensure!(
+        (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
+        "provider score must stay neutral after a ceiling rejection, got {}",
+        local_rep.score(a_id)
+    );
+    // Observability: the attempt was made and the too-large counter moved; no
+    // success, no unreachable, no corruption.
+    assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_too_large_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_success_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
     ep_b.close().await;
     ep_a.close().await;

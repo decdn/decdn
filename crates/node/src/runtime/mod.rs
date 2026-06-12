@@ -1309,6 +1309,10 @@ pub async fn run(
                 config: crate::node_origin::NodeOriginConfig {
                     probe_fanout: cfg.cache.node_pull_probe_fanout,
                     pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
+                    max_blob_size_bytes: cfg
+                        .cache
+                        .max_blob_size_mb
+                        .saturating_mul(decdn_protocol::MB_BYTES),
                     enable_0rtt: cfg.network.enable_0rtt,
                     deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
                     lookup: crate::dht::LookupConfig::default(),

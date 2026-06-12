@@ -34,7 +34,9 @@ use decdn_incentive::{
     ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore,
     bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
-use decdn_node::client_requester::{ChannelContext, stream_fetch};
+use decdn_node::client_requester::{
+    ChannelContext, VoucherProgress, stream_fetch, stream_fetch_tracked,
+};
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
@@ -1323,6 +1325,99 @@ async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
     anyhow::ensure!(
         err.to_string().contains("BlobTooLarge") || err.to_string().contains("refused"),
         "error should surface BlobTooLarge: {err}"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Buyer-side size gate (#840): the inverse of `client_blob_too_large_is_refused`.
+/// The server has no ceiling and is willing to serve an 8 KiB blob, but the
+/// *buyer* passes its own `max_blob_size_bytes`. The buyer must reject the
+/// server's oversized `total_bytes` claim before entering the receive loop, so
+/// no bytes are buffered or paid (see `fetch_inner`'s ceiling gate for why
+/// `StreamResponse::validate()` alone is insufficient).
+#[tokio::test(flavor = "multi_thread")]
+async fn buyer_rejects_oversized_total_bytes() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 8192];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    // Server ceiling 0 (unlimited) — it would happily serve all 8192 bytes.
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let mut progress = VoucherProgress::default();
+    // Buyer ceiling 4096 < 8192 promised → reject before buffering.
+    let err = stream_fetch_tracked(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c1,
+        Duration::from_secs(10),
+        4096,
+        &mut progress,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("oversized total_bytes must be refused by the buyer"))?;
+    anyhow::ensure!(
+        err.to_string().contains("BlobTooLarge"),
+        "error should surface the buyer-side BlobTooLarge ceiling: {err}"
+    );
+    // Rejected before the receive loop: no voucher was ever acked/paid.
+    anyhow::ensure!(
+        progress.acked().is_none(),
+        "no voucher should be paid when the buyer rejects up front: {:?}",
+        progress.acked()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Boundary of the buyer-side gate (#840): the ceiling is inclusive. A blob
+/// whose `total_bytes` exactly equals `max_blob_size_bytes` must be accepted
+/// (the gate is `total_bytes > ceiling`, strict) — guards against a `>` → `>=`
+/// regression that would silently reject every exactly-ceiling-sized blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 8192];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let mut progress = VoucherProgress::default();
+    // Buyer ceiling == promised size (8192) → accepted, full blob delivered.
+    let got = stream_fetch_tracked(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c2,
+        Duration::from_secs(10),
+        8192,
+        &mut progress,
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "exact-ceiling blob must deliver intact"
     );
 
     client_ep.close().await;
