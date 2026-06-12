@@ -103,11 +103,11 @@ impl RegionAccountant {
 
     /// Record `bytes` pulled IN from `peer`, bucketed by `peer`'s region.
     ///
-    /// **Forward-compatible seam (#750):** node-to-node paid pull-through is
-    /// not orchestrated in production yet (the serving handler returns
-    /// `NotFound` on a local miss; cache pull-through targets opaque S3/R2
-    /// origins with no region). The future pull orchestrator calls this; until
-    /// then `bytes_in` reads `0` in production.
+    /// The inbound counterpart of [`record_served`](Self::record_served): the
+    /// node-to-node pull orchestrator (#831) calls this on each delivered
+    /// cache-miss pull-through, so `bytes_in` reconciles pull spend by upstream
+    /// region (#858). Cache pull-through against opaque S3/R2 origins has no
+    /// resolvable region and is not recorded here.
     pub async fn record_pulled(&self, peer: &[u8; 32], bytes: u64) {
         let region = self.region_for(peer).await;
         self.bump(region, Direction::In, bytes);

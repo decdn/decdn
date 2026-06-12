@@ -1306,6 +1306,7 @@ pub async fn run(
                 rep_cfg: reputation_cfg.clone(),
                 negative_cache: crate::dht::NegativeProbeCache::new(),
                 metrics: Arc::clone(&node_metrics),
+                region_accountant: Arc::clone(&region_accountant),
                 config: crate::node_origin::NodeOriginConfig {
                     probe_fanout: cfg.cache.node_pull_probe_fanout,
                     pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
