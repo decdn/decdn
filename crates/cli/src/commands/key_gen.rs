@@ -74,8 +74,10 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     // half-rotated; the keystore error below is annotated with that fact and the
     // recovery path so the operator isn't misled into thinking nothing changed.
     println!("node id: {}", staged_key.public());
-    // A node-key commit failure here is clean: the keystore hasn't been touched,
-    // so nothing is half-rotated — let it propagate as-is.
+    // A node-key commit failure here is clean: `commit` is fail-safe (it restores
+    // the archived prior key if its install rename fails), and the keystore hasn't
+    // been touched yet — so a failure leaves the old pair intact, not half-rotated.
+    // Let it propagate as-is.
     if let Some(bak) = staged_key.commit()? {
         println!("archived previous node key -> {}", bak.display());
     }
