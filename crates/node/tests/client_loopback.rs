@@ -1002,8 +1002,8 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
 
     // Empty store: the channel is unknown to the node.
     let store: Arc<dyn ChannelStateStore> = Arc::new(MemoryChannelStateStore::new());
-    let (target, _server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let req = StreamRequest {
@@ -1031,6 +1031,17 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
         }
         other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
     }
+
+    // The wire `NotFound` is deliberately ambiguous, so the server-side
+    // reason counter is the only place this is distinguishable from a cache
+    // miss or owner mismatch (#876).
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_unknown_channel_total 1"
+        ),
+        "unknown-channel refusal must bump its reason counter"
+    );
 
     client_ep.close().await;
     server_ep.close().await;
@@ -1235,6 +1246,28 @@ async fn spawn_handler_server(
     Endpoint,
     tokio::task::JoinHandle<()>,
 )> {
+    let (target, server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_metrics(cache, store, rate, max_blob, max_streams).await?;
+    Ok((target, server_eth, server_ep, server_task))
+}
+
+/// As `spawn_handler_server`, but also returns the server's `Arc<Metrics>` so a
+/// test can assert a reject counter advanced (#876). The reject path signs a
+/// deliberately lossy wire error, so the counter is the only server-side place
+/// the precise reason is observable.
+async fn spawn_handler_server_with_metrics(
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    rate: u64,
+    max_blob: u64,
+    max_streams: usize,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<PrivateKeySigner>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
@@ -1254,7 +1287,14 @@ async fn spawn_handler_server(
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_eth, server_ep, server_task))
+    Ok((target, server_eth, server_ep, server_task, metrics))
+}
+
+/// True if `encoded` (`OpenMetrics` text from `Metrics::encode`) contains `line`
+/// as a full line — mirrors the `has_metric_line` helper in `metrics.rs` so the
+/// reject counters are asserted on an exact `name value` match, not a substring.
+fn metric_line_present(encoded: &str, line: &str) -> bool {
+    encoded.lines().any(|l| l == line)
 }
 
 /// Minimal raw client for the binding paths the honest `stream_fetch` requester
@@ -1303,8 +1343,8 @@ async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     // max_blob_size 4096 < 8192-byte payload → the size gate refuses delivery.
-    let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 4096, 16).await?;
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 4096, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(signer, deposit);
@@ -1325,6 +1365,13 @@ async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
     anyhow::ensure!(
         err.to_string().contains("BlobTooLarge") || err.to_string().contains("refused"),
         "error should surface BlobTooLarge: {err}"
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_blob_too_large_total 1"
+        ),
+        "oversized-blob refusal must bump its reason counter (#876)"
     );
 
     client_ep.close().await;
@@ -1434,8 +1481,8 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     cache.evict(hash).await?; // logically gone: has() now false, is_evicted() true.
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(signer, deposit);
@@ -1456,6 +1503,13 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
     anyhow::ensure!(
         err.to_string().contains("EvictedSinceProbe") || err.to_string().contains("refused"),
         "error should surface EvictedSinceProbe: {err}"
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_evicted_since_probe_total 1"
+        ),
+        "evicted-since-probe refusal must bump its reason counter (#876)"
     );
 
     client_ep.close().await;
@@ -1519,8 +1573,8 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     // The channel is owned by `seeded_store`'s signer; the binding attests a
     // different address (`intruder`), so it must not authorize this channel.
     let (store, _owner, _deposit) = seeded_store()?;
-    let (target, _server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -1558,6 +1612,17 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
         }
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
     }
+
+    // Wire-indistinguishable from a cache miss or unknown channel (all
+    // `NotFound`), so only the reason counter proves the owner-mismatch arm
+    // ran (#876).
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_owner_mismatch_total 1"
+        ),
+        "owner-mismatch refusal must bump its reason counter"
+    );
 
     client_ep.close().await;
     server_ep.close().await;
@@ -1691,6 +1756,16 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
     anyhow::ensure!(
         err.to_string().contains("refused") || err.to_string().contains("NotFound"),
         "error should surface the delivery refusal: {err}"
+    );
+    // Wire-indistinguishable from an unknown channel or owner mismatch (all
+    // `NotFound`); the reason counter is the only proof the cache-miss arm ran
+    // (#876). No pull-through is configured, so `!filled` is deterministic.
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_cache_miss_total 1"
+        ),
+        "cache-miss refusal must bump its reason counter"
     );
 
     client_ep.close().await;

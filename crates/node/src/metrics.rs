@@ -614,6 +614,38 @@ pub struct DecdnMetrics {
     /// `1` while the demand-quality auto-throttle suppresses prefetch, else
     /// `0`. Visible name: `decdn_prefetch_throttle_active`.
     pub prefetch_throttle_active: Gauge,
+    /// Paid-delivery (`serve_stream`) requests refused because the blob was
+    /// deliberately evicted between probe and stream (#279). One `Counter` per
+    /// reason — like the `dispatch_rejected_*` convention — because the metrics
+    /// backend has no per-field labels, and the wire `StreamError` deliberately
+    /// conflates the three `NotFound` reasons (`cache_miss`, `unknown_channel`,
+    /// `owner_mismatch`) (#876). Visible name:
+    /// `decdn_serve_stream_rejected_evicted_since_probe_total`.
+    pub serve_stream_rejected_evicted_since_probe: Counter,
+    /// `serve_stream` requests refused because the blob is absent and
+    /// pull-through was unavailable or failed to fill it. Visible name:
+    /// `decdn_serve_stream_rejected_cache_miss_total`.
+    pub serve_stream_rejected_cache_miss: Counter,
+    /// `serve_stream` requests refused by a local store fault (`has`/`inspect`
+    /// error, or a present blob reporting no size) — surfaced to the client as
+    /// `InternalError`, not a signed absence. Visible name:
+    /// `decdn_serve_stream_rejected_internal_error_total`.
+    pub serve_stream_rejected_internal_error: Counter,
+    /// `serve_stream` requests refused because the blob exceeds the configured
+    /// `max_blob_size_bytes`. Visible name:
+    /// `decdn_serve_stream_rejected_blob_too_large_total`.
+    pub serve_stream_rejected_blob_too_large: Counter,
+    /// `serve_stream` requests refused on an unknown / never-opened channel
+    /// (#848). Wire-indistinguishable from `cache_miss`/`owner_mismatch` (all
+    /// signed as `NotFound` to avoid leaking channel existence), so this
+    /// server-side counter is the only place the distinction lives — a rising
+    /// value isolates an unknown-channel abuse campaign. Visible name:
+    /// `decdn_serve_stream_rejected_unknown_channel_total`.
+    pub serve_stream_rejected_unknown_channel: Counter,
+    /// `serve_stream` requests refused because a verified client binding does
+    /// not authorize the named channel (#327). Visible name:
+    /// `decdn_serve_stream_rejected_owner_mismatch_total`.
+    pub serve_stream_rejected_owner_mismatch: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -1038,6 +1070,41 @@ impl Metrics {
     /// (#840). A buyer-side policy decision, so it does not score the provider.
     pub fn node_pull_too_large(&self) {
         self.decdn.node_pull_too_large.inc();
+    }
+
+    /// Record a paid-delivery (`serve_stream`) request refused because the
+    /// blob was evicted between probe and stream (#876).
+    pub fn serve_stream_rejected_evicted_since_probe(&self) {
+        self.decdn.serve_stream_rejected_evicted_since_probe.inc();
+    }
+
+    /// Record a `serve_stream` request refused on a cache miss that
+    /// pull-through could not fill (#876).
+    pub fn serve_stream_rejected_cache_miss(&self) {
+        self.decdn.serve_stream_rejected_cache_miss.inc();
+    }
+
+    /// Record a `serve_stream` request refused by a local store fault,
+    /// surfaced as `InternalError` (#876).
+    pub fn serve_stream_rejected_internal_error(&self) {
+        self.decdn.serve_stream_rejected_internal_error.inc();
+    }
+
+    /// Record a `serve_stream` request refused because the blob exceeds
+    /// `max_blob_size_bytes` (#876).
+    pub fn serve_stream_rejected_blob_too_large(&self) {
+        self.decdn.serve_stream_rejected_blob_too_large.inc();
+    }
+
+    /// Record a `serve_stream` request refused on an unknown channel (#876).
+    pub fn serve_stream_rejected_unknown_channel(&self) {
+        self.decdn.serve_stream_rejected_unknown_channel.inc();
+    }
+
+    /// Record a `serve_stream` request refused because the client binding did
+    /// not authorize the named channel (#876).
+    pub fn serve_stream_rejected_owner_mismatch(&self) {
+        self.decdn.serve_stream_rejected_owner_mismatch.inc();
     }
 
     /// A buyer→upstream pull hit this node's own `pull_timeout` deadline (#857).
@@ -1755,6 +1822,47 @@ mod tests {
             has_metric_line(&text, "decdn_voucher_nonce_gaps_total", 2),
             "expected 2 gap events (one bump each, not gap-size weighted):\n{text}"
         );
+    }
+
+    #[test]
+    fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
+        // #876. Each `serve_stream` reject branch maps to a distinct counter
+        // because the metrics backend has no per-field labels and the wire
+        // `StreamError` deliberately conflates the three `NotFound` reasons.
+        // The exported names carry the encoder-appended `_total` suffix. All six
+        // must be exposed at zero on a fresh registry (so dashboards don't read
+        // `(no data)`) and each method must bump exactly its own counter.
+        let metrics = Metrics::new();
+        let reasons = [
+            "decdn_serve_stream_rejected_evicted_since_probe_total",
+            "decdn_serve_stream_rejected_cache_miss_total",
+            "decdn_serve_stream_rejected_internal_error_total",
+            "decdn_serve_stream_rejected_blob_too_large_total",
+            "decdn_serve_stream_rejected_unknown_channel_total",
+            "decdn_serve_stream_rejected_owner_mismatch_total",
+        ];
+        let text = metrics.encode().unwrap();
+        for name in reasons {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "reject counter {name} should be exposed at zero on a fresh registry:\n{text}"
+            );
+        }
+
+        metrics.serve_stream_rejected_evicted_since_probe();
+        metrics.serve_stream_rejected_cache_miss();
+        metrics.serve_stream_rejected_internal_error();
+        metrics.serve_stream_rejected_blob_too_large();
+        metrics.serve_stream_rejected_unknown_channel();
+        metrics.serve_stream_rejected_owner_mismatch();
+
+        let text = metrics.encode().unwrap();
+        for name in reasons {
+            assert!(
+                has_metric_line(&text, name, 1),
+                "reject counter {name} should read exactly 1 after one bump:\n{text}"
+            );
+        }
     }
 
     #[test]

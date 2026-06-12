@@ -151,6 +151,39 @@ fn arm_background_fill(
     })
 }
 
+/// Server-side classification of a `serve_stream` refusal, used to pick the
+/// per-reason reject counter (#876). Finer-grained than the wire `StreamError`:
+/// `CacheMiss`, `UnknownChannel`, and `OwnerMismatch` all ship as `NotFound` on
+/// the wire (to avoid leaking channel existence), but are distinct here so an
+/// operator can, e.g., isolate an unknown-channel abuse campaign.
+#[derive(Debug, Clone, Copy)]
+enum ServeRejectReason {
+    EvictedSinceProbe,
+    CacheMiss,
+    InternalError,
+    BlobTooLarge,
+    UnknownChannel,
+    OwnerMismatch,
+}
+
+impl ServeRejectReason {
+    /// The wire `StreamError` a refusal for this reason signs to the client.
+    /// The reason is the single source of truth: `CacheMiss`, `UnknownChannel`,
+    /// and `OwnerMismatch` deliberately collapse to one `NotFound` here so the
+    /// three are wire-indistinguishable (no channel-existence leak), while the
+    /// finer split survives only in the per-reason metric (#876). Keeping the
+    /// mapping on the type makes an inconsistent error/reason pairing
+    /// unrepresentable at the call sites.
+    const fn wire_error(self) -> StreamError {
+        match self {
+            Self::CacheMiss | Self::UnknownChannel | Self::OwnerMismatch => StreamError::NotFound,
+            Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
+            Self::InternalError => StreamError::InternalError,
+            Self::BlobTooLarge => StreamError::BlobTooLarge,
+        }
+    }
+}
+
 /// `cdn/client/v1` paid-delivery handler.
 pub struct ClientHandler {
     node_id: PublicKey,
@@ -717,7 +750,7 @@ impl ClientHandler {
                 // hash an operator deliberately evicted (#279).
                 if self.cache.is_evicted(hash) {
                     return self
-                        .respond_error(&mut send, &req, StreamError::EvictedSinceProbe)
+                        .respond_error(&mut send, &req, ServeRejectReason::EvictedSinceProbe)
                         .await;
                 }
                 // Node-to-node cache-miss pull-through (#831). Fronting upstream
@@ -743,14 +776,14 @@ impl ClientHandler {
                 };
                 if !filled {
                     return self
-                        .respond_error(&mut send, &req, StreamError::NotFound)
+                        .respond_error(&mut send, &req, ServeRejectReason::CacheMiss)
                         .await;
                 }
             }
             Err(e) => {
                 tracing::warn!(%hash, error = %e, "cache `has` lookup failed on delivery path");
                 return self
-                    .respond_error(&mut send, &req, StreamError::InternalError)
+                    .respond_error(&mut send, &req, ServeRejectReason::InternalError)
                     .await;
             }
         }
@@ -767,7 +800,7 @@ impl ClientHandler {
             Err(e) => {
                 tracing::warn!(%hash, error = %e, "cache `inspect` failed on delivery path");
                 return self
-                    .respond_error(&mut send, &req, StreamError::InternalError)
+                    .respond_error(&mut send, &req, ServeRejectReason::InternalError)
                     .await;
             }
         };
@@ -777,12 +810,12 @@ impl ClientHandler {
                 "blob present per `has` but `inspect` reports no size; treating as fault"
             );
             return self
-                .respond_error(&mut send, &req, StreamError::InternalError)
+                .respond_error(&mut send, &req, ServeRejectReason::InternalError)
                 .await;
         };
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
             return self
-                .respond_error(&mut send, &req, StreamError::BlobTooLarge)
+                .respond_error(&mut send, &req, ServeRejectReason::BlobTooLarge)
                 .await;
         }
 
@@ -801,7 +834,7 @@ impl ClientHandler {
         let Some(channel) = channel else {
             tracing::warn!(%channel_id, "stream request on unknown channel; refusing pre-serve");
             return self
-                .respond_error(&mut send, &req, StreamError::NotFound)
+                .respond_error(&mut send, &req, ServeRejectReason::UnknownChannel)
                 .await;
         };
 
@@ -817,7 +850,7 @@ impl ClientHandler {
             if client != owner {
                 tracing::warn!(%client, %owner, "binding does not authorize this channel");
                 return self
-                    .respond_error(&mut send, &req, StreamError::NotFound)
+                    .respond_error(&mut send, &req, ServeRejectReason::OwnerMismatch)
                     .await;
             }
         }
@@ -1199,13 +1232,32 @@ impl ClientHandler {
     }
 
     /// Send a signed `StreamResponse { ok: false, error }` (delivery-side
-    /// failure), then finish the stream.
+    /// failure), then finish the stream. `reason` is the single source of truth:
+    /// it both selects the per-reason metric (finer-grained than the wire for the
+    /// three `NotFound` cases, which collapse to one code to avoid leaking channel
+    /// existence) and derives the wire `StreamError` via `wire_error()` (#876).
+    /// The metric
+    /// is bumped before the network write so a refusal is counted even if the
+    /// client has already gone and the write fails.
     async fn respond_error(
         &self,
         send: &mut SendStream,
         req: &StreamRequest,
-        error: StreamError,
+        reason: ServeRejectReason,
     ) -> anyhow::Result<()> {
+        match reason {
+            ServeRejectReason::EvictedSinceProbe => {
+                self.metrics.serve_stream_rejected_evicted_since_probe();
+            }
+            ServeRejectReason::CacheMiss => self.metrics.serve_stream_rejected_cache_miss(),
+            ServeRejectReason::InternalError => self.metrics.serve_stream_rejected_internal_error(),
+            ServeRejectReason::BlobTooLarge => self.metrics.serve_stream_rejected_blob_too_large(),
+            ServeRejectReason::UnknownChannel => {
+                self.metrics.serve_stream_rejected_unknown_channel();
+            }
+            ServeRejectReason::OwnerMismatch => self.metrics.serve_stream_rejected_owner_mismatch(),
+        }
+        let error = reason.wire_error();
         let rate_per_mb = self.clamped_rate();
         let body = StreamResponseBody {
             hash: req.hash,
