@@ -126,7 +126,7 @@ pub struct NodeOriginDeps {
     /// Node metrics for the paid-pull observability counters (#831).
     pub metrics: Arc<Metrics>,
     /// Per-region byte accountant; the inbound (`bytes_in`) counterpart of the
-    /// serve path's `record_served`. Fed on each delivered pull (#858).
+    /// serve path's `record_served`. Fed on each delivered pull.
     pub region_accountant: Arc<crate::region_accounting::RegionAccountant>,
     /// Resolved pull tuning.
     pub config: NodeOriginConfig,
@@ -437,7 +437,7 @@ async fn pull_from_candidate(
                     elapsed,
                 },
             );
-            // Inbound counterpart of the serve path's `record_served` (#858).
+            // Inbound counterpart of the serve path's `record_served`.
             // Payment is incremental — one voucher per interval — but the
             // whole-blob hash check upstream guarantees the returned buffer
             // equals the paid cumulative on a full `Ok` delivery, so `bytes.len()`

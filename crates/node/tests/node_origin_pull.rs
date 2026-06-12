@@ -296,7 +296,7 @@ fn spawn_a_server(
     })
 }
 
-/// Static node-id → region map for the region accountant (#858), mirroring the
+/// Static node-id → region map for the region accountant, mirroring the
 /// in-crate `StubResolver` so a test can drive `record_pulled` into an
 /// assertable region bucket.
 struct StubRegionResolver(HashMap<[u8; 32], String>);
@@ -352,7 +352,7 @@ fn provisioned_origin(
 }
 
 /// Like [`provisioned_origin`], but with a caller-supplied region accountant so a
-/// test can assert that a delivered pull feeds `bytes_in` (#858).
+/// test can assert that a delivered pull feeds `bytes_in`.
 #[allow(clippy::too_many_arguments)]
 fn provisioned_origin_with_accountant(
     ep_b: &iroh::Endpoint,
@@ -629,7 +629,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     // Resolve upstream A to a known region so the delivered pull's inbound bytes
-    // land in an assertable bucket (#858).
+    // land in an assertable bucket.
     let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
         HashMap::from([(*a_id.as_bytes(), "DE".to_string())]),
     ))));
@@ -701,7 +701,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         progress_log(&recorded)?
     );
 
-    // #858: the delivered pull fed the region accountant's inbound counter for
+    // The delivered pull fed the region accountant's inbound counter for
     // upstream A's region — the gap that left `bytes_in` stuck at 0.
     anyhow::ensure!(
         region_accountant.snapshot()
@@ -1148,7 +1148,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     }) as Arc<dyn ChannelOpener>;
     // Map both candidates to distinct regions so the snapshot proves the stalled
     // candidate (Err arm) records no `bytes_in` while only the delivered honest
-    // fallback (Ok arm) is counted (#858).
+    // fallback (Ok arm) is counted.
     let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
         HashMap::from([
             (*s_id.as_bytes(), "XX".to_string()),
@@ -1227,7 +1227,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
-    // #858: the stalled candidate S (Err arm) records no `bytes_in`; only the
+    // The stalled candidate S (Err arm) records no `bytes_in`; only the
     // delivered honest fallback A (Ok arm, region "DE") is counted — no "XX"
     // bucket appears. Guards the "failed pulls are not counted" contract and
     // multi-candidate attribution in one assertion.
