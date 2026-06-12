@@ -477,10 +477,15 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             }
             // The provider's slot was replaced by a newer open between the
             // delivery and this write. Recording stale progress onto the new
-            // channel would be wrong; the older channel's record is gone. Not an
-            // escalation — mirrors the reclaim sweep's `forget_if_channel` miss.
+            // channel would be wrong; the older channel's record is gone, so this
+            // is not an escalation (it mirrors the reclaim sweep's
+            // `forget_if_channel` miss) and must not fail the already-paid pull.
+            // But a delivered-and-paid voucher's progress was dropped, and a
+            // *sustained* rate here would mean a `channel_id`-plumbing bug rather
+            // than the rare benign mid-pull replacement — so `warn!`, not
+            // `debug!`, to keep it observable.
             AdvanceOutcome::ChannelMismatch => {
-                debug!(
+                warn!(
                     provider = %provider_addr,
                     %channel_id,
                     "record_progress: provider channel replaced by a newer open; \
@@ -507,11 +512,16 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     ///
     /// # Errors
     ///
-    /// Errors if no channel is tracked for `provider_addr`, or if the `topUp`
-    /// transaction fails (submit, revert, or receipt).
+    /// Errors if no channel is tracked for `provider_addr` *before* the RPC, or
+    /// if the `topUp` transaction fails (submit, revert, or receipt).
+    ///
+    /// A row that vanishes or is replaced by a newer open *after* the on-chain
+    /// `topUp` lands is logged (with the tx hash) for reconciliation and returns
+    /// `Ok(())`, not an error — the funds are already escrowed on-chain against
+    /// the topped-up channel, so failing here would not unwind them.
     pub async fn top_up(&self, provider_addr: Address, additional: U256) -> Result<()> {
         // Read the channel_id BEFORE the RPC — we need it for `topUp` and as the
-        // compare-and-swap guard on the post-RPC write.
+        // channel-id guard on the post-RPC write.
         let channel_id = self
             .store
             .get_by_provider(provider_addr)
@@ -530,9 +540,11 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         if !receipt.status() {
             anyhow::bail!("topUp reverted for channel {channel_id}");
         }
+        let tx = receipt.transaction_hash;
         // Add to the *committed* deposit inside a write txn (never the pre-RPC
         // snapshot), channel-id-guarded so a concurrent advance/reuse during the
-        // RPC is not clobbered (#838).
+        // RPC is not clobbered (#838). USDC is not fee-on-transfer, so the local
+        // `+= additional` always matches the contract's `+= received`.
         match self
             .store
             .add_deposit(provider_addr, channel_id, additional)
@@ -543,32 +555,37 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                     provider = %provider_addr,
                     %channel_id,
                     %new_deposit,
+                    %tx,
                     "topped up buyer channel"
                 );
                 Ok(())
             }
-            // The on-chain topUp already credited `channel_id`, but the local
-            // row vanished/rotated during the RPC. Funds are escrowed on-chain;
-            // warn loudly for reconciliation rather than fail (same posture as
-            // an escrowed-but-untracked open).
+            // The on-chain topUp already credited `channel_id`, but the local row
+            // vanished during the RPC. Funds are escrowed on-chain with zero
+            // local tracking — `error!` (matching `open_and_persist`'s
+            // escrowed-but-untracked posture) and surface the tx for reconcile.
             DepositOutcome::UnknownProvider => {
-                warn!(
+                error!(
                     provider = %provider_addr,
                     %channel_id,
                     %additional,
+                    %tx,
                     "top_up: on-chain topUp landed but no local channel record exists to credit; \
-                     deposit is escrowed on-chain and untracked — reconcile"
+                     deposit is escrowed on-chain and untracked — reconcile against the tx"
                 );
                 Ok(())
             }
+            // A row still exists (for a different channel), so the provider stays
+            // reclaimable — less severe than `UnknownProvider`, hence `warn!`.
             DepositOutcome::ChannelMismatch => {
                 warn!(
                     provider = %provider_addr,
                     %channel_id,
                     %additional,
+                    %tx,
                     "top_up: provider channel replaced during the topUp RPC; the on-chain deposit \
                      was credited to the topped-up channel but the local record now tracks a \
-                     different channel — reconcile"
+                     different channel — reconcile against the tx"
                 );
                 Ok(())
             }

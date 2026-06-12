@@ -167,7 +167,7 @@ impl BuyerChannelState {
 
 /// Failure mode for [`BuyerChannelState::advance`]: a reported cumulative total
 /// regressed below the recorded one (a caller bug — vouchers never decrease).
-#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BuyerProgressError {
     /// `field`'s reported value `got` is below the recorded value.
     #[error("buyer channel {field} regressed: recorded {recorded}, got {got}")]
@@ -187,7 +187,12 @@ pub enum BuyerProgressError {
 /// transaction, so these variants describe the committed-row decision rather
 /// than a backend fault (those surface as [`StoreError`], as with
 /// [`BuyerChannelStore::forget_if_channel`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `#[must_use]`: the variant is the only signal that nothing was persisted
+/// (`UnknownProvider` / `ChannelMismatch`) or that the totals regressed — a
+/// dropped outcome silently looks like success.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
 pub enum AdvanceOutcome {
     /// The committed row was advanced and re-persisted durably.
     Advanced,
@@ -204,7 +209,12 @@ pub enum AdvanceOutcome {
 }
 
 /// Outcome of an atomic [`BuyerChannelStore::add_deposit`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `#[must_use]` for the same reason as [`AdvanceOutcome`]: a dropped
+/// `ChannelMismatch` / `UnknownProvider` silently looks like a successful
+/// credit.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
 pub enum DepositOutcome {
     /// `additional` was added to the committed deposit; carries the new total.
     Added(U256),
@@ -647,23 +657,41 @@ mod tests {
         s.last_amount = U256::from(90u64);
         store.record(&s)?;
 
-        // A stale writer reporting a lower nonce must be rejected and must NOT
-        // regress the committed watermark.
-        let outcome = store.advance_progress(
-            s.provider,
-            s.channel_id,
-            U256::from(5u64),
-            U256::from(5_000u64),
-            U256::from(50u64),
-        )?;
-        anyhow::ensure!(
-            matches!(outcome, AdvanceOutcome::Regressed(BuyerProgressError::Regressed { field, .. }) if field == "nonce"),
-            "got {outcome:?}"
-        );
-        let stored = store
-            .get_by_provider(s.provider)?
-            .ok_or_else(|| anyhow::anyhow!("missing row"))?;
-        anyhow::ensure!(stored.last_nonce == U256::from(9u64), "watermark regressed");
+        // Each cumulative field's regression must surface through the wrapper as
+        // `AdvanceOutcome::Regressed` with the right field — and must NOT touch
+        // the committed watermark. The reported nonce is held at-or-above the
+        // committed value so the *bytes*/*amount* branches of `advance` are the
+        // ones that trip (nonce is checked first).
+        let cases = [
+            (
+                (U256::from(5u64), U256::from(5_000u64), U256::from(50u64)),
+                "nonce",
+            ),
+            (
+                (U256::from(9u64), U256::from(8_999u64), U256::from(90u64)),
+                "bytes_delivered",
+            ),
+            (
+                (U256::from(9u64), U256::from(9_000u64), U256::from(89u64)),
+                "amount",
+            ),
+        ];
+        for ((nonce, bytes, amount), expected_field) in cases {
+            let outcome = store.advance_progress(s.provider, s.channel_id, nonce, bytes, amount)?;
+            anyhow::ensure!(
+                matches!(outcome, AdvanceOutcome::Regressed(BuyerProgressError::Regressed { field, .. }) if field == expected_field),
+                "expected {expected_field} regression, got {outcome:?}"
+            );
+            let stored = store
+                .get_by_provider(s.provider)?
+                .ok_or_else(|| anyhow::anyhow!("missing row"))?;
+            anyhow::ensure!(
+                stored.last_nonce == U256::from(9u64)
+                    && stored.last_bytes_delivered == U256::from(9_000u64)
+                    && stored.last_amount == U256::from(90u64),
+                "watermark regressed after rejecting {expected_field}"
+            );
+        }
         Ok(())
     }
 

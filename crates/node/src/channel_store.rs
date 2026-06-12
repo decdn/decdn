@@ -2354,6 +2354,58 @@ mod tests {
         Ok(())
     }
 
+    /// #838: the atomic mutators honour the `Durability::Immediate` "MUST commit
+    /// durably" contract — an `advance_progress` + `add_deposit` survive a store
+    /// close/reopen, while a no-write `ChannelMismatch` persists nothing.
+    #[test]
+    fn buyer_advance_and_deposit_survive_reopen() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let s = buyer_sample(2);
+        let other_channel =
+            b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        {
+            let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+                PersistentChannelStateStore::open(dir.path())?,
+            ));
+            handle.record(&s)?;
+            anyhow::ensure!(
+                handle.advance_progress(
+                    s.provider,
+                    s.channel_id,
+                    s.last_nonce + U256::from(3u64),
+                    s.last_bytes_delivered + U256::from(3_000u64),
+                    s.last_amount + U256::from(30u64),
+                )? == AdvanceOutcome::Advanced
+            );
+            anyhow::ensure!(
+                handle.add_deposit(s.provider, s.channel_id, U256::from(40u64))?
+                    == DepositOutcome::Added(s.deposit + U256::from(40u64))
+            );
+            // A mismatched (no-write) call must leave nothing extra to persist.
+            anyhow::ensure!(
+                handle.add_deposit(s.provider, other_channel, U256::from(1u64))?
+                    == DepositOutcome::ChannelMismatch
+            );
+        }
+        // Reopen from the same directory: the committed advance + deposit survive.
+        let handle = BuyerChannelStoreHandle::new(std::sync::Arc::new(
+            PersistentChannelStateStore::open(dir.path())?,
+        ));
+        let reopened = handle
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("row vanished across reopen"))?;
+        anyhow::ensure!(reopened.last_nonce == s.last_nonce + U256::from(3u64));
+        anyhow::ensure!(
+            reopened.last_bytes_delivered == s.last_bytes_delivered + U256::from(3_000u64)
+        );
+        anyhow::ensure!(reopened.last_amount == s.last_amount + U256::from(30u64));
+        anyhow::ensure!(
+            reopened.deposit == s.deposit + U256::from(40u64),
+            "mismatched call must not have altered the deposit"
+        );
+        Ok(())
+    }
+
     /// #838: a stale `advance_progress` reporting totals below the committed
     /// watermark is rejected and leaves the committed watermark intact.
     #[test]
