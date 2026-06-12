@@ -60,13 +60,17 @@
 //! Watcher stream failure (mid-run) → `warn!` + exponential backoff (1s → 60s),
 //! re-establishing filters. This opens a drift window surfaced by
 //! `decdn_origin_directory_watcher_restarts_total` (edge-triggered, one per
-//! window) and `..._down_seconds` (true downtime). On every re-subscription the
-//! watcher runs a **re-arm resync pass** before going live (#855): it replays
-//! `ContentClaimed` from the last observed block (catching claims emitted during
-//! the outage) and re-reads `getOrigins` for every known namespace and the
-//! default-open set, so a `*Revoked` / `*Pruned` / `*Removed` lost during the
-//! backoff window is recovered instead of lingering for the process lifetime. The
-//! pass is cleared only on full success, so a transient RPC error repeats it.
+//! window) and `..._down_seconds` (true downtime). Each cycle installs the seven
+//! filters **first** (so events buffer server-side from that point on) and only
+//! *then*, if the previous cycle ended in an error, runs a **re-arm resync pass**
+//! before going live (#855): it replays `ContentClaimed` from the last observed
+//! block — bounded by `MAX_RESYNC_REPLAY_BLOCKS` — to catch claims emitted during
+//! the backoff window, and re-reads `getOrigins` for every known namespace and
+//! the default-open set, so a `*Revoked` / `*Pruned` / `*Removed` lost during the
+//! filter-less backoff window is recovered instead of lingering for the process
+//! lifetime. The pass is cleared only on full success, so a transient RPC error
+//! repeats it. A *clean* re-subscribe needs no resync — the filters are
+//! re-installed before any other work, so the brief gap is covered by buffering.
 //!
 //! A narrower silent-drift source: a per-event `getOrigins` or `nodeIdOf` RPC
 //! failure is surfaced by `decdn_origin_directory_watcher_resolve_failures_total`
@@ -109,6 +113,17 @@ const REPLAY_WINDOW_BLOCKS: u64 = 9_000;
 /// `namespaces_of` insert is a set op). Arbitrum Sepolia reorgs are shallow, so
 /// a small fixed overlap suffices.
 const REORG_OVERLAP: u64 = 12;
+
+/// Upper bound on the re-arm resync's `ContentClaimed` replay span. `last_block`
+/// only advances on observed events, so on a quiet network it can lag real time
+/// by a long way; without a cap a re-subscription would rescan that whole span.
+/// The security-critical leg — the authoritative `getOrigins` re-read of every
+/// known namespace — is unaffected by this cap (it always reflects current
+/// membership), so bounding the replay only risks a *claim* (`hash → namespace`)
+/// emitted in the dropped tail of an outage longer than this window resolving to
+/// default-open until it is re-surfaced, matching the documented
+/// `getLogs`-resync posture.
+const MAX_RESYNC_REPLAY_BLOCKS: u64 = 100_000;
 
 /// The default-open allow-list lives at namespace 0 (ADR 022 § FIND\_VALUE
 /// Flow). A claimed hash never resolves here; only a hash with no claiming
@@ -489,9 +504,12 @@ struct WatcherState {
     /// snapshot block). The re-arm resync replays `ContentClaimed` from here, so
     /// a claim emitted during an outage window is recovered.
     last_block: u64,
-    /// `Some(start)` when the next cycle must run the re-arm resync pass before
-    /// going live. Set on every re-subscription (clean or error); cleared only
-    /// after a fully-successful pass so a transient RPC error repeats it.
+    /// `Some(start)` when the next cycle must run the re-arm resync pass after
+    /// re-establishing the filters but before going live. Armed only on a stream
+    /// **error** — that is the one path with a filter-less backoff window where
+    /// events are genuinely lost; a clean re-subscribe buffers across the gap
+    /// because the new filters are installed first. Cleared only after a
+    /// fully-successful pass, so a transient RPC error repeats it.
     resync_from: Option<u64>,
 }
 
@@ -528,12 +546,14 @@ async fn watcher_loop<P>(
             Ok(()) => {
                 debug!("origin-directory watcher stream ended cleanly; restarting subscription");
                 backoff = WATCHER_INITIAL_BACKOFF;
-                // Any re-subscription (even a clean end) re-arms the resync:
-                // events between the old stream's end and the new head-watch
-                // would otherwise be lost. Cheap when nothing changed.
-                state.resync_from = Some(state.last_block);
+                // No re-arm: the next cycle installs the filters before doing
+                // anything else, so events across this clean re-subscribe buffer
+                // server-side rather than falling into a gap.
             }
             Err(err) => {
+                // The error tore the filters down and we are about to sleep, so
+                // events in the backoff window are genuinely lost — arm the
+                // resync to recover them on the next cycle.
                 state.resync_from = Some(state.last_block);
                 metrics.origin_directory_watcher_backoff_started();
                 warn!(
@@ -563,7 +583,10 @@ async fn resync_pass<R: OriginChainReads>(
     start: u64,
 ) -> Result<u64> {
     let head = reads.head_block().await?;
-    let mut from = start.saturating_sub(REORG_OVERLAP);
+    // Floor the replay at `head - MAX_RESYNC_REPLAY_BLOCKS` so a stale `start`
+    // (old `last_block` on a quiet network) cannot trigger an unbounded scan.
+    let floor = head.saturating_sub(MAX_RESYNC_REPLAY_BLOCKS);
+    let mut from = start.saturating_sub(REORG_OVERLAP).max(floor);
     while from <= head {
         let to = from.saturating_add(REPLAY_WINDOW_BLOCKS - 1).min(head);
         for (hash, namespace) in reads.content_claimed(from, to).await? {
@@ -574,14 +597,19 @@ async fn resync_pass<R: OriginChainReads>(
         from = to.saturating_add(1);
     }
     // Authoritatively re-read every namespace we know a claim for (reflecting any
-    // revoke/prune lost in the gap) plus the default-open set.
-    let namespaces: HashSet<U256> = read_cache(cache, |c| {
+    // revoke/prune lost in the gap) plus the default-open set. Sorted so the
+    // iteration order — and which error surfaces first if a re-read fails mid-pass
+    // — is deterministic across runs.
+    let mut namespaces: Vec<U256> = read_cache(cache, |c| {
         c.origins_of_ns
             .keys()
             .copied()
             .chain(c.namespaces_of.values().flatten().copied())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect()
     });
+    namespaces.sort_unstable();
     for namespace in namespaces {
         resync_namespace(reads, cache, metrics, namespace).await?;
     }
@@ -589,10 +617,11 @@ async fn resync_pass<R: OriginChainReads>(
     Ok(head)
 }
 
-/// Run one cycle of the watcher: if armed, run the re-arm resync pass; then open
-/// the seven event filters and drain them via `tokio::select!`, re-reading the
-/// authoritative set for whatever each event signals changed, until any one
-/// returns an error.
+/// Run one cycle of the watcher: open the seven event filters **first** (so any
+/// event emitted during the subsequent resync RPC buffers in the streams rather
+/// than falling into a gap), then — if armed — run the re-arm resync pass, then
+/// drain the filters via `tokio::select!`, re-reading the authoritative set for
+/// whatever each event signals changed, until any one returns an error.
 #[allow(
     // 7-arm event-dispatch loop across two contracts is fundamentally
     // complex/long; splitting the filter setup from the select obscures the
@@ -609,14 +638,6 @@ async fn run_watcher_once<P>(
 where
     P: Provider + Clone,
 {
-    // Re-arm resync: re-establish authoritative state over the gap before going
-    // live. Cleared only on full success, so a transient RPC error repeats it.
-    if let Some(start) = state.resync_from {
-        let head = resync_pass(contracts, cache, metrics, start).await?;
-        state.last_block = state.last_block.max(head);
-        state.resync_from = None;
-    }
-
     let mut content_claimed = contracts
         .publisher
         .ContentClaimed_filter()
@@ -666,6 +687,17 @@ where
         .await
         .context("watch DefaultOpenOperatorRemoved")?
         .into_stream();
+
+    // Filters are now installed and buffering. Re-establish authoritative state
+    // over the outage gap before going live; cleared only on full success, so a
+    // transient RPC error leaves it armed and the next cycle repeats it. Any
+    // event arriving during this pass is captured by the streams above and
+    // drained (idempotently re-read) once the select loop starts.
+    if let Some(start) = state.resync_from {
+        let head = resync_pass(contracts, cache, metrics, start).await?;
+        state.last_block = state.last_block.max(head);
+        state.resync_from = None;
+    }
 
     metrics.origin_directory_watcher_cycle_established();
 
@@ -1448,6 +1480,29 @@ mod tests {
                 c.resolve(&h(9), &stakers),
                 vec![nid(0xB)],
                 "claim + origins emitted during the gap must be recovered"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn resync_pass_replay_is_capped_below_the_floor() {
+        // A stale `start` (far below `head - MAX_RESYNC_REPLAY_BLOCKS`) must not
+        // trigger an unbounded scan: a claim older than the floor is not replayed.
+        // (The authoritative getOrigins leg still runs and is unaffected.)
+        let metrics = Arc::new(Metrics::new());
+        let cache = shared(cache_with(&[], &[], &[], &[]));
+        let head = MAX_RESYNC_REPLAY_BLOCKS + 200_000;
+        let reads = StubReads::new()
+            .origins(&[(8, &[addr(0xB)])])
+            .bindings(&[(addr(0xB), nid(0xB))])
+            // Claim sits well below the floor (head - cap) → outside the window.
+            .claims(&[(50, h(9), 8)])
+            .head(head);
+        resync_pass(&reads, &cache, &metrics, 10).await.unwrap();
+        read_cache(&cache, |c| {
+            assert!(
+                !c.namespaces_of.contains_key(&h(9)),
+                "a claim older than the replay floor must not be scanned"
             );
         });
     }
