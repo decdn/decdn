@@ -443,7 +443,7 @@ async fn pull_from_candidate(
             // equals the paid cumulative on a full `Ok` delivery, so `bytes.len()`
             // is the per-pull byte count to attribute by region. Note this tracks
             // *delivered* bytes, not *spent*: a partially-paid failed pull (the
-            // `Err` arm) still persists its voucher watermark above (#852) but is
+            // `Err` arm) still persists its voucher watermark above but is
             // intentionally not region-counted, so `bytes_in` diverges from
             // on-chain spend on failed pulls by design.
             deps.region_accountant
