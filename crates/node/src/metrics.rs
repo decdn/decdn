@@ -461,6 +461,14 @@ pub struct DecdnMetrics {
     /// node's own payment-side fault (gas, RPC, expired channel), NOT the
     /// provider's — a sustained rate means node→node buying is wedged.
     pub node_pull_channel_open_failures: Counter,
+    /// `decdn_node_pull_too_large_total` (#840): a selected upstream claimed a
+    /// `total_bytes` above this node's `max_blob_size` ceiling, so the buyer
+    /// rejected it before buffering. Like a channel-open failure this is a
+    /// buyer-side policy decision, NOT necessarily provider misbehavior (the
+    /// provider may legitimately serve larger blobs to nodes with a higher
+    /// ceiling), so it does not tar the provider's reputation. A sustained rate
+    /// means this node's ceiling is below the content it is trying to warm.
+    pub node_pull_too_large: Counter,
     /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
     /// voucher but persisting the buyer channel's resume watermark
     /// (`record_progress`) failed. The bytes were delivered, but the channel's
@@ -1007,6 +1015,13 @@ impl Metrics {
     /// A buyer channel open/reuse failed before a pull could start (#831).
     pub fn node_pull_channel_open_failure(&self) {
         self.decdn.node_pull_channel_open_failures.inc();
+    }
+
+    /// A selected upstream claimed a `total_bytes` above this node's
+    /// `max_blob_size` ceiling and the buyer rejected it before buffering
+    /// (#840). A buyer-side policy decision, so it does not score the provider.
+    pub fn node_pull_too_large(&self) {
+        self.decdn.node_pull_too_large.inc();
     }
 
     /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark
