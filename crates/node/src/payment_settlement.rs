@@ -633,8 +633,10 @@ async fn send_close<P: Provider + Clone>(
 /// so the settle sweep can finalize the provider's un-withdrawn remainder once
 /// the window elapses (PR #743 review). Best-effort: a failed read or write is
 /// logged, not fatal — the close already secured the claim, and a missed entry
-/// only means the node won't auto-settle (the client still can, or the next
-/// run re-derives nothing — the remainder simply waits).
+/// only means this path won't auto-settle (the client still can). A lost write
+/// is now recoverable across a restart: the next boot's closing-reconciliation
+/// backfill (#839, [`backfill_closing_channels`]) re-derives the obligation for
+/// a still-`Closing` channel (modulo that scan's documented boot-floor caveat).
 async fn record_pending_after_close<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     pending_store: &Arc<dyn PendingSettleStore>,
@@ -661,14 +663,19 @@ async fn record_pending_after_close<P: Provider + Clone>(
         settle_after,
     };
     if let Err(err) = pending_store.record_pending(&entry) {
-        // Unlike the getChannel arm this is not re-derivable: the channel is
-        // forgotten right after close, so a lost write means no record this
-        // channel ever needed settling. Same operator remedy.
+        // A lost write here is now recoverable across a restart: the channel is
+        // still `Closing` on-chain, so the next boot's closing-reconciliation
+        // backfill (#839, `backfill_closing_channels`) re-reads its status and
+        // re-derives this entry — independent of the local forget. The manual
+        // remedy below only bites if the channel also leaves `Closing` (settles)
+        // before that next reconciliation runs, or for the boot-floor residual
+        // documented at the backfill call site.
         error!(
             %err, %channel_id, settle_after,
             "failed to persist pending-settle entry — \
-             if clientRefund==0 the remainder will not auto-settle, \
-             call settleChannel(<channel_id>) manually after the dispute window"
+             if clientRefund==0 the remainder will not auto-settle until the next \
+             boot's closing-reconciliation backfill; or call settleChannel(<channel_id>) \
+             manually after the dispute window"
         );
     } else {
         info!(
@@ -820,14 +827,16 @@ enum CycleOutcome {
     /// An event filter ended cleanly (filter expiry / provider rotation).
     /// Resubscribe immediately with backoff reset.
     StreamEnded,
-    /// A live `ChannelOpened` for this node failed to persist; the checkpoint is
-    /// held below its block and `backfill_from` re-armed. We return early (rather
-    /// than draining on) so the outer loop resubscribes and the next cycle's
-    /// backfill re-covers the channel *without* waiting for an unrelated
-    /// stream-end or restart — otherwise a healthy never-resubscribing stream
-    /// would strand that client (vouchers rejected `WrongChannel`) indefinitely
-    /// (#751 MEDIUM-1). Resubscribe is paced by backoff so a *durable* store
-    /// failure backs off exponentially instead of hot-looping the backfill.
+    /// A live event handler re-armed the bring-up backfill and returned early so
+    /// the outer loop resubscribes and the next cycle's backfill re-covers the
+    /// gap *without* waiting for an unrelated stream-end or restart. Two triggers:
+    /// a `ChannelOpened` that failed to persist (the scan checkpoint is also held
+    /// below its block, else a healthy never-resubscribing stream would strand
+    /// that client with vouchers rejected `WrongChannel` indefinitely, #751
+    /// MEDIUM-1); or a `ChannelCloseInitiated` whose reconcile failed (#839, the
+    /// checkpoint is *not* held — it is open-tied — only `backfill_from` is
+    /// re-armed). Resubscribe is paced by backoff so a *durable* store/RPC failure
+    /// backs off exponentially instead of hot-looping the backfill.
     RecoveryPending,
 }
 
@@ -871,12 +880,13 @@ async fn watcher_loop<P: Provider + Clone>(
                 backoff = WATCHER_INITIAL_BACKOFF;
             }
             Ok(CycleOutcome::RecoveryPending) => {
-                // A live open failed to persist; `backfill_from` is re-armed.
-                // Resubscribe so the next cycle's backfill re-covers it, but pace
-                // it with backoff so a persistent store failure doesn't hot-loop.
+                // A live open-persist or close-reconcile failed; `backfill_from`
+                // is re-armed. Resubscribe so the next cycle's backfill re-covers
+                // it, but pace it with backoff so a persistent store/RPC failure
+                // doesn't hot-loop.
                 warn!(
                     backoff_secs = backoff.as_secs(),
-                    "watcher holding checkpoint after a failed open-persist; resubscribing to re-run the backfill"
+                    "watcher re-armed the bring-up backfill after a failed live persist/reconcile; resubscribing to re-run it"
                 );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(WATCHER_MAX_BACKOFF);
@@ -965,6 +975,23 @@ async fn run_watcher_once<P: Provider + Clone>(
             .await
             .context("read head block for ChannelOpened backfill")?;
         backfill_opened_channels(contract, self_address, usdc_token, handler, start, to).await?;
+        // Closing-reconciliation backfill (#839): over the same range, re-derive
+        // the pending-settle obligation for any provider-owned channel left
+        // `Closing` — a close whose `record_pending` never landed (crash gap) or
+        // a client-initiated close during downtime. Idempotent, and propagates so
+        // a failure re-arms `backfill_from` alongside the opened backfill below.
+        //
+        // Floor caveat: this reuses the `ChannelOpened` scan checkpoint as its
+        // start, and that checkpoint only advances on *open* persistence — so it
+        // is a true floor for a *downtime* gap (every close while down is above
+        // it) but NOT a per-close completeness guarantee. A close whose live
+        // reconcile failed can sit below a checkpoint later advanced by an
+        // unrelated open; the live arm re-arms the backfill on failure (see the
+        // `close_initiated` arm) to recover it within this process, but a crash in
+        // that window still requires a manual `settleChannel`. This does NOT
+        // advance the checkpoint — that stays tied solely to `ChannelOpened`
+        // persistence (see `advance_checkpoint`).
+        backfill_closing_channels(contract, self_address, pending_store, start, to).await?;
         *backfill_from = None;
         // The gap is now scanned through `to`; persist it so the next boot
         // resumes from here (the #751 downtime floor). `to` is the live-filter
@@ -1076,14 +1103,62 @@ async fn run_watcher_once<P: Provider + Clone>(
                 None => return Ok(CycleOutcome::StreamEnded),
             },
             ev = close_initiated.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    // Dispute monitor is deferred (#324); observe-only. Does NOT
-                    // advance the scan checkpoint — only the `opened` arm does.
+                Some(Ok((event, log))) => {
+                    // Dispute monitor is deferred (#324); observe-only there.
                     debug!(
                         channel_id = %event.channelId,
                         initiator = %event.initiator,
                         "ChannelCloseInitiated observed (dispute monitor deferred, #324)"
                     );
+                    // Record the settle obligation for any provider-owned close
+                    // (#839) — including a *client*-initiated one, which our own
+                    // close path (`record_pending_after_close`) never sees. The
+                    // event isn't provider-indexed, so `reconcile_closing_channel`
+                    // re-reads to confirm `provider == self`. Idempotent overwrite,
+                    // so double-covering our own closes is harmless. Does NOT
+                    // advance the scan checkpoint — only the `opened` arm does.
+                    if let Err(err) = reconcile_closing_channel(
+                        contract,
+                        self_address,
+                        pending_store,
+                        event.channelId,
+                    )
+                    .await
+                    {
+                        // A swallowed failure here is a lost settle obligation: the
+                        // closing backfill's floor is the *opened* checkpoint, which
+                        // a later open can advance past this close's block, so the
+                        // next boot's scan may never re-cover it. Re-arm the bring-up
+                        // backfill from this block and resubscribe so the *next cycle*
+                        // re-records it within this process (backoff-paced). Unlike
+                        // the `opened` arm, this is not crash-proof: an earlier open
+                        // in this cycle may already have advanced the *persisted*
+                        // checkpoint past this block (the two streams aren't mutually
+                        // ordered), so a crash before the retry lands leaves the
+                        // residual manual-`settleChannel` gap noted at the backfill
+                        // call site. The re-arm closes the common (no-crash) case.
+                        //
+                        // Block fallback differs from the `opened` arm: there a
+                        // missing `block_number` falls back to `checkpoint_hw`,
+                        // safe-by-construction because that arm's own block-ordered
+                        // stream keeps `checkpoint_hw <= failed`. Here `checkpoint_hw`
+                        // is *open*-advanced and unordered against this close, so it
+                        // could exceed the close block and re-arm *above* it —
+                        // silently skipping the close. An unconfirmed log (no block)
+                        // is rare, so fall back to `0`: an idempotent, backoff-paced
+                        // full re-scan that cannot overshoot.
+                        metrics.watcher_persist_failure();
+                        let failed = log.block_number.unwrap_or(0);
+                        *backfill_from =
+                            Some(backfill_from.map_or(failed, |b| b.min(failed)));
+                        warn!(
+                            %err,
+                            channel_id = %event.channelId,
+                            block = failed,
+                            "failed to record pending-settle for observed close; re-arming backfill and resubscribing",
+                        );
+                        return Ok(CycleOutcome::RecoveryPending);
+                    }
                 }
                 Some(Err(e)) => return Err(e).context("ChannelCloseInitiated stream"),
                 None => return Ok(CycleOutcome::StreamEnded),
@@ -1135,6 +1210,145 @@ async fn apply_channel_opened(
         deposit = %event.deposit,
         "{via}"
     );
+    Ok(())
+}
+
+/// Decide whether a fetched channel obliges this node to record a pending
+/// settlement (#839). The pure half of [`reconcile_closing_channel`], so the
+/// provider/status gate is unit-testable without an RPC provider (the codebase
+/// keeps on-chain orchestration in the anvil e2e and the decision logic here).
+///
+/// Returns `Some` iff this node is the channel's `provider` **and** the channel
+/// is still `Closing`: an already-`Closed` channel was settled (by us or a
+/// co-settler) and owes nothing, and an `Open` channel hasn't been closed. The
+/// deadline is the on-chain `disputeDeadline`, so a dispute extension
+/// (`disputeChannel` bumps it) is honored every time this is re-derived.
+fn pending_settle_for_closing(
+    channel_id: ChannelId,
+    provider: Address,
+    self_address: Address,
+    status: PaymentChannel::Status,
+    dispute_deadline: u64,
+) -> Option<PendingSettle> {
+    if provider != self_address || !matches!(status, PaymentChannel::Status::Closing) {
+        return None;
+    }
+    Some(PendingSettle {
+        channel_id,
+        settle_after: dispute_deadline,
+    })
+}
+
+/// Re-derive and durably persist the pending-settle obligation for a channel
+/// that is `Closing` on-chain and provided by this node (#839). Records *every*
+/// owned `Closing` channel regardless of draw level (no `clientRefund` gate);
+/// the case that actually strands value — and the one #839 names — is a
+/// fully-drawn channel (`clientRefund == 0`), where the client has no incentive
+/// to settle, so its un-withdrawn remainder would otherwise wait for a manual
+/// operator `settleChannel`. Closes two gaps that leave the settle sweep
+/// ([`settle_pass`]) with no record to act on:
+///
+/// 1. **Crash gap.** [`record_pending_after_close`] persists the obligation in a
+///    *separate* step after our own `closeChannel` receipt lands; a crash (or a
+///    `getChannel`/`record_pending` failure) in between loses it, and the
+///    `ChannelOpened` bring-up backfill can't recover it — the channel is
+///    `Closing`, not `Open`. [`backfill_closing_channels`] replays it at boot.
+/// 2. **Client-initiated close.** `closeChannel` is callable by *either* party,
+///    so a client can move our channel to `Closing` without us ever recording
+///    the obligation (the live watcher arm was observe-only). The live arm now
+///    routes through here too.
+///
+/// `getChannel` is the authoritative deadline source (honors a later
+/// `disputeChannel` extension), and `record_pending` overwrites idempotently —
+/// so re-running every boot, and on every close event, is safe. Both failure
+/// legs (the `getChannel` read and the `record_pending` write) propagate as an
+/// `Err`: the backfill caller retries the whole scan, and the live arm re-arms
+/// the backfill and resubscribes (see the `close_initiated` arm) rather than
+/// swallowing the loss — recovery within the process is reliable, but the
+/// boot-floor caveat at [`backfill_closing_channels`]' call site means a crash
+/// in the retry window can still leave a manual-`settleChannel` residual.
+async fn reconcile_closing_channel<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    self_address: Address,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    channel_id: ChannelId,
+) -> Result<()> {
+    let ch = contract
+        .getChannel(channel_id)
+        .call()
+        .await
+        .with_context(|| format!("getChannel for closing reconciliation of {channel_id}"))?;
+    let Some(entry) = pending_settle_for_closing(
+        channel_id,
+        ch.provider,
+        self_address,
+        ch.status,
+        ch.disputeDeadline,
+    ) else {
+        return Ok(());
+    };
+    pending_store
+        .record_pending(&entry)
+        .with_context(|| format!("record pending-settle for closing channel {channel_id}"))?;
+    info!(
+        %channel_id,
+        settle_after = entry.settle_after,
+        "reconciled closing channel into the pending-settle set"
+    );
+    Ok(())
+}
+
+/// Bring-up backfill (#839): record a [`PendingSettle`] for every channel this
+/// node provides that is `Closing` on-chain in `[from_block, to_block]`,
+/// rebuilding the obligation set the settle sweep drains. Recovers both the
+/// crash gap (a close whose `record_pending` never landed) and any
+/// client-initiated close that occurred while the node was down — see
+/// [`reconcile_closing_channel`].
+///
+/// Mirrors [`backfill_opened_channels`]: the range is walked in
+/// [`MAX_BACKFILL_BLOCK_SPAN`]-block windows (one `eth_getLogs` each, via
+/// alloy's `.query()`) so a long downtime gap doesn't exceed RPC range caps, and
+/// every failure mode (invalid range, the `get_logs` RPC, a per-channel
+/// `getChannel`/persist error) returns `Err` so the caller retries the whole
+/// backfill via the watcher backoff with `backfill_from` still set.
+async fn backfill_closing_channels<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    self_address: Address,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    from_block: u64,
+    to_block: u64,
+) -> Result<()> {
+    check_backfill_range(from_block, to_block)?;
+    for (window_start, window_end) in
+        backfill_windows(from_block, to_block, MAX_BACKFILL_BLOCK_SPAN)
+    {
+        let logs = contract
+            .ChannelCloseInitiated_filter()
+            .from_block(window_start)
+            .to_block(window_end)
+            .query()
+            .await
+            .with_context(|| {
+                format!("backfill ChannelCloseInitiated over [{window_start}, {window_end}]")
+            })?;
+        debug!(
+            from_block = window_start,
+            to_block = window_end,
+            count = logs.len(),
+            "scanned ChannelCloseInitiated logs for closing-reconciliation backfill window"
+        );
+        for (event, _log) in logs {
+            // `ChannelCloseInitiated` is not provider-indexed (the closer is
+            // `initiator`, which may be the client), so `reconcile_closing_channel`
+            // re-reads the channel to confirm `provider == self` and that it is
+            // still `Closing` before recording.
+            reconcile_closing_channel(contract, self_address, pending_store, event.channelId)
+                .await
+                .with_context(|| {
+                    format!("backfill reconcile closing channel {}", event.channelId)
+                })?;
+        }
+    }
     Ok(())
 }
 
@@ -2890,6 +3104,79 @@ mod tests {
             failures(&metrics),
             1,
             "a stranded-but-closed channel must increment the failure counter so the leak is observable"
+        );
+    }
+
+    // ---- closing-channel reconciliation gate (#839) ---------------------------
+
+    #[test]
+    fn reconcile_records_pending_for_owned_closing_channel() {
+        // The recovery case: a channel we provide, still `Closing` on-chain →
+        // record a PendingSettle stamped with the on-chain disputeDeadline.
+        let me = Address::repeat_byte(0x11);
+        let channel_id = ChannelId::from([7u8; 32]);
+        let entry = pending_settle_for_closing(
+            channel_id,
+            me,
+            me,
+            PaymentChannel::Status::Closing,
+            1_700_000_123,
+        );
+        assert_eq!(
+            entry,
+            Some(PendingSettle {
+                channel_id,
+                settle_after: 1_700_000_123,
+            }),
+            "an owned Closing channel must produce a pending-settle entry carrying the on-chain deadline"
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_foreign_channel() {
+        // Closing, but some other node is the provider — not our obligation.
+        let me = Address::repeat_byte(0x11);
+        let other = Address::repeat_byte(0x22);
+        assert_eq!(
+            pending_settle_for_closing(
+                ChannelId::from([7u8; 32]),
+                other,
+                me,
+                PaymentChannel::Status::Closing,
+                1_700_000_123,
+            ),
+            None,
+            "a channel whose provider != self must not be recorded"
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_non_closing_status() {
+        // Ours, but already Closed (settled by us or a co-settler) or still Open
+        // (never closed) — nothing is owed in either terminal/initial state.
+        let me = Address::repeat_byte(0x11);
+        let channel_id = ChannelId::from([7u8; 32]);
+        assert_eq!(
+            pending_settle_for_closing(
+                channel_id,
+                me,
+                me,
+                PaymentChannel::Status::Closed,
+                1_700_000_123,
+            ),
+            None,
+            "an already-Closed channel owes no settlement"
+        );
+        assert_eq!(
+            pending_settle_for_closing(
+                channel_id,
+                me,
+                me,
+                PaymentChannel::Status::Open,
+                1_700_000_123,
+            ),
+            None,
+            "an Open channel has not been closed"
         );
     }
 

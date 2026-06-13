@@ -293,12 +293,15 @@ pub struct DecdnMetrics {
     /// being withdrawn and warrants investigating the RPC / wallet. Operator-
     /// visible name: `decdn_redemption_failures_total`.
     pub redemption_failures: Counter,
-    /// Channel-lifecycle persists the settlement watcher swallowed: a failed
-    /// `register_open_channel` / `update_channel_deposit` / `forget_channel`
-    /// from the live event stream (#751). The watcher logs and continues (the
-    /// channel stays observable on-chain and a later event or the bring-up
-    /// backfill re-drives it), but a non-zero rate flags a struggling channel
-    /// store. Operator-visible name: `decdn_watcher_persist_failures_total`.
+    /// Channel-lifecycle reconciliation the settlement watcher could not apply
+    /// from the live event stream: a failed `register_open_channel` /
+    /// `update_channel_deposit` / `forget_channel` store write (#751), or a
+    /// failed closing-reconciliation on a `ChannelCloseInitiated` (#839) — which
+    /// is a `getChannel` read *or* a `record_pending` write, so this counter is
+    /// not store-writes-only. The watcher re-drives the failure (a later event,
+    /// the bring-up backfill, or — for the close arm — an immediate re-arm +
+    /// resubscribe), but a non-zero rate flags a struggling channel store or RPC.
+    /// Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
     /// Channels the seller path proactively `closeChannel`d because an
     /// operator-configured auto-settlement trigger fired — the un-redeemed
