@@ -82,6 +82,10 @@ pub fn keystore_path(data_dir: &Path) -> PathBuf {
 /// JSON keystore, and persist it to `<data_dir>/keystore.json` with mode
 /// `0o600`. Returns the EIP-55 `Address` derived from the new key.
 ///
+/// A thin wrapper over [`stage_keystore`] + [`StagedKeystore::commit`]: all the
+/// generation (RNG, encryption, chmod) happens before any existing keystore is
+/// archived, so an encryption failure leaves the prior `keystore.json` in place.
+///
 /// # Errors
 ///
 /// Returns an error if `data_dir` exists with insecure permissions; if the
@@ -94,31 +98,113 @@ pub fn generate_and_persist(
     force: bool,
 ) -> anyhow::Result<Address> {
     let target = keystore_path(data_dir);
+    if !force && target.exists() {
+        anyhow::bail!(
+            "eth keystore already exists at {}; pass --force to overwrite",
+            target.display()
+        );
+    }
+    let staged = stage_keystore(data_dir, password)?;
+    let address = staged.address();
+    // Commit archives any existing keystore (the `force` case) and renames the
+    // staged temp into place. The bak path is dropped here; the `decdn key-gen`
+    // CLI uses the staged API directly to log it.
+    staged.commit()?;
+    Ok(address)
+}
 
+/// A freshly-generated, fully-encrypted keystore written to a temp file in
+/// `data_dir`, not yet committed to `keystore.json`.
+///
+/// Staging (generate + encrypt + chmod the temp) is separated from committing
+/// (archive-old + rename) so a multi-file key rotation can generate **all** key
+/// material before touching any canonical file — an encryption failure then
+/// leaves the prior keystore (and the sibling `node.secret`) untouched rather
+/// than half-rotated (#844). Produced by [`stage_keystore`]; finished with
+/// [`Self::commit`].
+///
+/// Dropping a [`StagedKeystore`] without committing removes the temp file, so an
+/// abandoned stage never litters `data_dir`.
+#[must_use = "a staged keystore must be committed (or it is discarded on drop)"]
+// `derive(Debug)` is safe only because every field is non-secret: the secret key
+// is already encrypted into the temp file and `key_bytes` is zeroed in
+// `stage_keystore`. If a secret field is ever added, hand-write `Debug` to omit
+// it (as `StagedNodeKey` does).
+#[derive(Debug)]
+pub struct StagedKeystore {
+    tmp: PathBuf,
+    target: PathBuf,
+    address: Address,
+    committed: bool,
+}
+
+impl StagedKeystore {
+    /// The EIP-55 address derived from the staged key, for logging before the
+    /// commit lands.
+    #[must_use]
+    pub const fn address(&self) -> Address {
+        self.address
+    }
+
+    /// Commit the staged keystore: archive any existing `keystore.json` (so the
+    /// operator key-rotation runbook keeps the prior ciphertext) and atomically
+    /// rename the temp into place.
+    ///
+    /// Returns the archive path if a prior keystore was moved aside, or `None`
+    /// when there was nothing to archive (fresh install).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if archiving the prior keystore or the install rename
+    /// fails. The commit is **fail-safe** via
+    /// [`decdn_common::identity::install_staged`]: if the install rename fails
+    /// after the prior keystore was archived, the archive is restored
+    /// (best-effort) so the old keystore stays live, and the error states whether
+    /// the restore succeeded or `keystore.json` is now missing. On any error the
+    /// staged temp is removed by the `Drop` handler (`committed` stays `false`).
+    pub fn commit(mut self) -> anyhow::Result<Option<PathBuf>> {
+        // Archiving (inside `install_staged`) keeps the prior ciphertext rather
+        // than destroying it: the operator key-rotation runbook
+        // (`appendix-operator-key-rotation.md` §5) relies on rollback to the prior
+        // key, and the offline-archive requirement applies symmetrically here.
+        let bak = decdn_common::identity::install_staged(&self.tmp, &self.target)?;
+        self.committed = true;
+        Ok(bak)
+    }
+}
+
+impl Drop for StagedKeystore {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Best-effort: an abandoned stage must not leave a keystore behind.
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+/// Generate a fresh secp256k1 keypair and encrypt it into a temp keystore file
+/// in `data_dir` (mode `0o600` on Unix) **without** touching `keystore.json`.
+/// Validates or securely creates `data_dir` with the same `0o700` semantics as
+/// [`decdn_common::identity::load_or_generate`].
+///
+/// The returned [`StagedKeystore`] is committed via [`StagedKeystore::commit`].
+/// Used by `decdn key-gen` so the keystore and the node key are both generated
+/// before either canonical file is replaced (#844).
+///
+/// # Errors
+///
+/// Returns an error if `data_dir` cannot be validated or created, or if
+/// encryption or the chmod fails. The temp file is cleaned up on any failure
+/// path; partial writes never accumulate in `data_dir`.
+pub fn stage_keystore(data_dir: &Path, password: &str) -> anyhow::Result<StagedKeystore> {
     // Validate (or create+validate) `data_dir` with the same semantics as
     // `identity::load_or_generate`: shared via the public helper so the
     // node.secret and keystore.json paths stay in lock-step.
     decdn_common::identity::ensure_data_dir(data_dir)?;
 
-    if target.exists() {
-        if !force {
-            anyhow::bail!(
-                "eth keystore already exists at {}; pass --force to overwrite",
-                target.display()
-            );
-        }
-        // Archive the old keystore rather than destroying it: the operator
-        // key-rotation runbook (`appendix-operator-key-rotation.md` §5) relies
-        // on rollback to the prior key, and the runbook's offline-archive
-        // requirement applies symmetrically to the eth side. The bak path is
-        // returned for caller logging.
-        let _bak = decdn_common::identity::move_aside(&target)?;
-    }
-
     // Alloy's `encrypt_keystore` writes the file in-place inside `data_dir`
-    // with the given name. Use a unique temp name + chmod + rename so we end
-    // with a properly-permissioned `keystore.json` even under concurrent
-    // writers and crashed-mid-encrypt runs.
+    // with the given name. Use a unique temp name + chmod so we end with a
+    // properly-permissioned file that the caller renames into place.
     let temp_name = temp_filename();
 
     // 32 cryptographically random bytes for the secp256k1 secret. We sample
@@ -130,7 +216,7 @@ pub fn generate_and_persist(
     let mut key_bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut key_bytes);
 
-    let result: anyhow::Result<Address> = (|| {
+    let result: anyhow::Result<StagedKeystore> = (|| {
         let mut alloy_rng = OsRng;
         let (signer, _emitted_name) = PrivateKeySigner::encrypt_keystore(
             data_dir,
@@ -142,22 +228,19 @@ pub fn generate_and_persist(
         .with_context(|| format!("failed to encrypt eth keystore at {}", data_dir.display()))?;
 
         let temp_path = data_dir.join(&temp_name);
-        // Atomic-write window: alloy's `encrypt_keystore` writes the temp
-        // file with default umask perms (typically ~0o644). The chmod below
-        // closes that window before the rename. The window is bounded by
-        // `data_dir = 0o700`, so only the owner can traverse the directory
-        // — equivalent to legitimate-user access.
+        // alloy's `encrypt_keystore` writes the temp file with default umask
+        // perms (typically ~0o644). The chmod below tightens it before the
+        // commit's rename. The window is bounded by `data_dir = 0o700`, so only
+        // the owner can traverse the directory — equivalent to legitimate-user
+        // access.
         chmod_keystore_file(&temp_path)?;
 
-        fs::rename(&temp_path, &target).with_context(|| {
-            format!(
-                "failed to rename {} -> {}",
-                temp_path.display(),
-                target.display()
-            )
-        })?;
-
-        Ok(signer.address())
+        Ok(StagedKeystore {
+            tmp: temp_path,
+            target: keystore_path(data_dir),
+            address: signer.address(),
+            committed: false,
+        })
     })();
 
     if result.is_err() {
