@@ -5,7 +5,7 @@
 
 ## Amendment (2026-06-13, #847): window ends at the last fully-elapsed epoch
 
-The vote window ends at the **last fully-elapsed epoch** as of the proposal-snapshot timepoint — `endEpoch(t) = epoch(t) - 1` — rather than at `epoch(t)`, the in-progress epoch. `FeeRouter.routeSettlement` only ever increments the *current* epoch's bucket, so an in-progress epoch's tally keeps changing after a proposal snapshot. Reading it in `_getVotes`/`quorum`/`proposalThreshold` violated the OpenZeppelin `Governor` snapshot invariant (weight must be immutable after the snapshot): an operator could settle bytes mid-vote and raise its own already-counted weight, and two voters casting at different times saw different totals/quorum. Counting only elapsed epochs — whose buckets are immutable forever — restores determinism with no change to `FeeRouter`.
+The vote window ends at the **last fully-elapsed epoch** as of the proposal-snapshot timepoint — `endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1` (the `∅` epoch-0 case ⇒ empty window ⇒ weight 0; see § Formula) — rather than at `epoch(t)`, the in-progress epoch. `FeeRouter.routeSettlement` only ever increments the *current* epoch's bucket, so an in-progress epoch's tally keeps changing after a proposal snapshot. Reading it in `_getVotes`/`quorum`/`proposalThreshold` violated the OpenZeppelin `Governor` snapshot invariant (weight must be immutable after the snapshot): an operator could settle bytes mid-vote and raise its own already-counted weight, and two voters casting at different times saw different totals/quorum. Counting only elapsed epochs — whose buckets are immutable forever — restores determinism with no change to `FeeRouter`.
 
 Consequences of the shift, both bounded by one epoch (≤ 1 week):
 

@@ -167,7 +167,11 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         uint256 snapshot = uint256(clock()) - 1;
         (uint64 endEpoch, bool hasElapsed) = _endEpoch(snapshot);
         if (!hasElapsed) return 0;
-        uint64 n = feeRouter.windowEpochsAt(uint48(snapshot));
+        // SafeCast (consistent with the `timepoint.toUint48()` reads in `quorum`
+        // / `_cappedServed`); `snapshot = clock() - 1 ≤ uint48.max - 1` so it
+        // never reverts, but the checked cast keeps aderyn's unsafe-cast detector
+        // satisfied and the downcast intent explicit.
+        uint64 n = feeRouter.windowEpochsAt(snapshot.toUint48());
         uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
         return (total * PROPOSAL_THRESHOLD_NUMERATOR) / PROPOSAL_THRESHOLD_DENOMINATOR;
     }
