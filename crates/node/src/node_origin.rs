@@ -125,6 +125,9 @@ pub struct NodeOriginDeps {
     pub negative_cache: NegativeProbeCache,
     /// Node metrics for the paid-pull observability counters (#831).
     pub metrics: Arc<Metrics>,
+    /// Per-region byte accountant; the inbound (`bytes_in`) counterpart of the
+    /// serve path's `record_served`. Fed on each delivered pull (#858).
+    pub region_accountant: Arc<crate::region_accounting::RegionAccountant>,
     /// Resolved pull tuning.
     pub config: NodeOriginConfig,
 }
@@ -434,6 +437,18 @@ async fn pull_from_candidate(
                     elapsed,
                 },
             );
+            // Inbound counterpart of the serve path's `record_served` (#858).
+            // Payment is incremental — one voucher per interval — but the
+            // whole-blob hash check upstream guarantees the returned buffer
+            // equals the paid cumulative on a full `Ok` delivery, so `bytes.len()`
+            // is the per-pull byte count to attribute by region. Note this tracks
+            // *delivered* bytes, not *spent*: a partially-paid failed pull (the
+            // `Err` arm) still persists its voucher watermark above (#852) but is
+            // intentionally not region-counted, so `bytes_in` diverges from
+            // on-chain spend on failed pulls by design.
+            deps.region_accountant
+                .record_pulled(&candidate.node_id, bytes.len() as u64)
+                .await;
             Some(bytes)
         }
         Err(err) => {

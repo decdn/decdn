@@ -26,6 +26,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use decdn_cache::Hash;
 use decdn_cache::origin::{Origin, OriginFetch};
+use decdn_common::admin::RegionBytes;
 use decdn_incentive::{
     ChannelState, ChannelStateStore, MemoryChannelStateStore, ProbeSlashData, StreamSlashData,
     bind_node_id_domain, slash_judge_domain, voucher_domain,
@@ -41,6 +42,7 @@ use decdn_node::dht::{
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps};
 use decdn_node::probe_client::probe_once;
+use decdn_node::region_accounting::{RegionAccountant, RegionResolver};
 use decdn_protocol::client::{
     ChunkData, ClientMessage, StreamError, StreamResponse, StreamResponseBody, VoucherRejectReason,
 };
@@ -294,6 +296,26 @@ fn spawn_a_server(
     })
 }
 
+/// Static node-id → region map for the region accountant (#858), mirroring the
+/// in-crate `StubResolver` so a test can drive `record_pulled` into an
+/// assertable region bucket.
+struct StubRegionResolver(HashMap<[u8; 32], String>);
+
+#[async_trait]
+impl RegionResolver for StubRegionResolver {
+    async fn region_of(&self, node_id: &[u8; 32]) -> Option<String> {
+        self.0.get(node_id).cloned()
+    }
+}
+
+/// A region accountant resolving nothing — every pull buckets into
+/// `UNKNOWN_REGION`. Used by the tests that don't assert region totals.
+fn empty_region_accountant() -> Arc<RegionAccountant> {
+    Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
+        HashMap::new(),
+    ))))
+}
+
 /// Build B's `NodeOrigin` with stubbed discovery (`providers` for `hash` via the
 /// origin directory), a static `addr_map` resolver, a fixed-channel opener, and
 /// real reputation/metrics handles. Tests vary `providers`/`addr_map` to drive
@@ -314,6 +336,37 @@ fn provisioned_origin(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
 ) -> (NodeOrigin, Arc<Mutex<Vec<ProgressEntry>>>) {
+    provisioned_origin_with_accountant(
+        ep_b,
+        b_dht,
+        hash,
+        channel_id,
+        buyer_signer,
+        local_rep,
+        obs_buffer,
+        metrics,
+        &empty_region_accountant(),
+        providers,
+        addr_map,
+    )
+}
+
+/// Like [`provisioned_origin`], but with a caller-supplied region accountant so a
+/// test can assert that a delivered pull feeds `bytes_in` (#858).
+#[allow(clippy::too_many_arguments)]
+fn provisioned_origin_with_accountant(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    hash: Hash,
+    channel_id: B256,
+    buyer_signer: &Arc<PrivateKeySigner>,
+    local_rep: &Arc<LocalReputation>,
+    obs_buffer: &Arc<ObservationBuffer>,
+    metrics: &Arc<Metrics>,
+    region_accountant: &Arc<RegionAccountant>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+) -> (NodeOrigin, Arc<Mutex<Vec<ProgressEntry>>>) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
         channel_id,
@@ -324,7 +377,16 @@ fn provisioned_origin(
         recorded: Arc::clone(&recorded),
     }) as Arc<dyn ChannelOpener>;
     let origin = build_origin(
-        ep_b, b_dht, hash, buyer, local_rep, obs_buffer, metrics, providers, addr_map,
+        ep_b,
+        b_dht,
+        hash,
+        buyer,
+        local_rep,
+        obs_buffer,
+        metrics,
+        region_accountant,
+        providers,
+        addr_map,
     );
     (origin, recorded)
 }
@@ -363,6 +425,7 @@ fn provisioned_origin_with_ceiling(
         local_rep,
         obs_buffer,
         metrics,
+        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -382,6 +445,7 @@ fn build_origin(
     local_rep: &Arc<LocalReputation>,
     obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
+    region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
 ) -> NodeOrigin {
@@ -393,6 +457,7 @@ fn build_origin(
         local_rep,
         obs_buffer,
         metrics,
+        region_accountant,
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -412,6 +477,7 @@ fn build_origin_with_timeout(
     local_rep: &Arc<LocalReputation>,
     obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
+    region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
@@ -440,6 +506,7 @@ fn build_origin_with_timeout(
         rep_cfg: NetworkReputationConfig::default(),
         negative_cache: NegativeProbeCache::new(),
         metrics: Arc::clone(metrics),
+        region_accountant: Arc::clone(region_accountant),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout,
@@ -561,7 +628,12 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, recorded) = provisioned_origin(
+    // Resolve upstream A to a known region so the delivered pull's inbound bytes
+    // land in an assertable bucket (#858).
+    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
+        HashMap::from([(*a_id.as_bytes(), "DE".to_string())]),
+    ))));
+    let (origin, recorded) = provisioned_origin_with_accountant(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -570,6 +642,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         &local_rep,
         &obs_buffer,
         &b_metrics,
+        &region_accountant,
         providers,
         addr_map,
     );
@@ -626,6 +699,19 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
             )],
         "expected one persisted progress entry with the final voucher totals, got {:?}",
         progress_log(&recorded)?
+    );
+
+    // #858: the delivered pull fed the region accountant's inbound counter for
+    // upstream A's region — the gap that left `bytes_in` stuck at 0.
+    anyhow::ensure!(
+        region_accountant.snapshot()
+            == vec![RegionBytes {
+                region: "DE".to_string(),
+                bytes_in: total_bytes,
+                bytes_out: 0,
+            }],
+        "expected DE bytes_in == {total_bytes}, got {:?}",
+        region_accountant.snapshot()
     );
 
     ep_b.close().await;
@@ -1060,6 +1146,15 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
     }) as Arc<dyn ChannelOpener>;
+    // Map both candidates to distinct regions so the snapshot proves the stalled
+    // candidate (Err arm) records no `bytes_in` while only the delivered honest
+    // fallback (Ok arm) is counted (#858).
+    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
+        HashMap::from([
+            (*s_id.as_bytes(), "XX".to_string()),
+            (*a_id.as_bytes(), "DE".to_string()),
+        ]),
+    ))));
     let origin = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
@@ -1068,6 +1163,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         &local_rep,
         &obs_buffer,
         &b_metrics,
+        &region_accountant,
         vec![s_dht, a_dht],
         addr_map,
         // Short per-candidate budget so the stall is abandoned quickly. With the
@@ -1130,6 +1226,21 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     // return, so it must not also land in any sibling buyer-side bucket.
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
+
+    // #858: the stalled candidate S (Err arm) records no `bytes_in`; only the
+    // delivered honest fallback A (Ok arm, region "DE") is counted — no "XX"
+    // bucket appears. Guards the "failed pulls are not counted" contract and
+    // multi-candidate attribution in one assertion.
+    anyhow::ensure!(
+        region_accountant.snapshot()
+            == vec![RegionBytes {
+                region: "DE".to_string(),
+                bytes_in: total_bytes,
+                bytes_out: 0,
+            }],
+        "expected only DE bytes_in == {total_bytes} (S exonerated, not counted), got {:?}",
+        region_accountant.snapshot()
+    );
 
     ep_b.close().await;
     ep_a.close().await;
@@ -1978,6 +2089,7 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         &local_rep,
         &obs_buffer,
         &b_metrics,
+        &empty_region_accountant(),
         providers,
         addr_map,
     );
