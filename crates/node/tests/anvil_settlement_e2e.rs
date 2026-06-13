@@ -1167,6 +1167,10 @@ async fn run_e2e() -> anyhow::Result<()> {
         "downtime-opened channel was not registered after restart — #751 checkpoint backfill failed"
     );
     drop(service2);
+    // `AbortOnDrop` aborts asynchronously, so let the aborted watcher fully wind
+    // down before the no-pending precondition below — otherwise a lingering
+    // service2 tick could race the upcoming open+close.
+    tokio::task::yield_now().await;
 
     // ============================================================
     // CLOSING RECONCILIATION (#839) — two gaps the fix closes. First (boot scan):
@@ -1348,6 +1352,17 @@ async fn run_e2e() -> anyhow::Result<()> {
         "live-arm PendingSettle deadline {} must equal the on-chain disputeDeadline {}",
         live_recovered.settle_after,
         live_ch.disputeDeadline
+    );
+    // Pin the recovery to the *direct* reconcile path, not the re-arm+resubscribe
+    // failure path (whose longer round-trip the 60s poll above could otherwise
+    // mask): no watcher persist/reconcile failure was recorded across the whole
+    // run. Mirrors the auto-settle block's `_auto_failures_total 0` guard.
+    let watcher_metrics = metrics.encode()?;
+    anyhow::ensure!(
+        watcher_metrics
+            .lines()
+            .any(|l| l == "decdn_watcher_persist_failures_total 0"),
+        "live-arm recovery must use the clean reconcile path (no watcher persist failures):\n{watcher_metrics}"
     );
     drop(service3);
 

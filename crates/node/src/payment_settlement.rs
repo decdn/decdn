@@ -663,14 +663,19 @@ async fn record_pending_after_close<P: Provider + Clone>(
         settle_after,
     };
     if let Err(err) = pending_store.record_pending(&entry) {
-        // Unlike the getChannel arm this is not re-derivable: the channel is
-        // forgotten right after close, so a lost write means no record this
-        // channel ever needed settling. Same operator remedy.
+        // A lost write here is now recoverable across a restart: the channel is
+        // still `Closing` on-chain, so the next boot's closing-reconciliation
+        // backfill (#839, `backfill_closing_channels`) re-reads its status and
+        // re-derives this entry — independent of the local forget. The manual
+        // remedy below only bites if the channel also leaves `Closing` (settles)
+        // before that next reconciliation runs, or for the boot-floor residual
+        // documented at the backfill call site.
         error!(
             %err, %channel_id, settle_after,
             "failed to persist pending-settle entry — \
-             if clientRefund==0 the remainder will not auto-settle, \
-             call settleChannel(<channel_id>) manually after the dispute window"
+             if clientRefund==0 the remainder will not auto-settle until the next \
+             boot's closing-reconciliation backfill; or call settleChannel(<channel_id>) \
+             manually after the dispute window"
         );
     } else {
         info!(
@@ -1132,8 +1137,18 @@ async fn run_watcher_once<P: Provider + Clone>(
                         // ordered), so a crash before the retry lands leaves the
                         // residual manual-`settleChannel` gap noted at the backfill
                         // call site. The re-arm closes the common (no-crash) case.
+                        //
+                        // Block fallback differs from the `opened` arm: there a
+                        // missing `block_number` falls back to `checkpoint_hw`,
+                        // safe-by-construction because that arm's own block-ordered
+                        // stream keeps `checkpoint_hw <= failed`. Here `checkpoint_hw`
+                        // is *open*-advanced and unordered against this close, so it
+                        // could exceed the close block and re-arm *above* it —
+                        // silently skipping the close. An unconfirmed log (no block)
+                        // is rare, so fall back to `0`: an idempotent, backoff-paced
+                        // full re-scan that cannot overshoot.
                         metrics.watcher_persist_failure();
-                        let failed = log.block_number.unwrap_or(checkpoint_hw);
+                        let failed = log.block_number.unwrap_or(0);
                         *backfill_from =
                             Some(backfill_from.map_or(failed, |b| b.min(failed)));
                         warn!(
