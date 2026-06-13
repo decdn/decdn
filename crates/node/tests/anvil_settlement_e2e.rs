@@ -1494,7 +1494,7 @@ async fn run_deploy_script(
             Ok(out) if forge_script_body_completed(&out.stdout) => {
                 if attempt == DEPLOY_ATTEMPTS {
                     anyhow::bail!(
-                        "forge script DeployProtocol failed in the broadcast phase on all {DEPLOY_ATTEMPTS} attempts (script body completed each time):\n{}\n{}",
+                        "forge script DeployProtocol failed after {DEPLOY_ATTEMPTS} attempts; the final attempt completed the script body but exited non-zero during broadcast:\n{}\n{}",
                         String::from_utf8_lossy(&out.stdout),
                         String::from_utf8_lossy(&out.stderr)
                     );
@@ -1515,7 +1515,7 @@ async fn run_deploy_script(
             Err(timeout) => {
                 if attempt == DEPLOY_ATTEMPTS {
                     anyhow::bail!(
-                        "forge script DeployProtocol stalled on all {DEPLOY_ATTEMPTS} attempts (timed out after {timeout:?})"
+                        "forge script DeployProtocol failed after {DEPLOY_ATTEMPTS} attempts; the final attempt stalled (timed out after {timeout:?})"
                     );
                 }
                 tracing::warn!(
