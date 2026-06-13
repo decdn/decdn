@@ -245,4 +245,29 @@ mod tests {
         verify_rate(U256::ZERO, one_mb(), 1_000, 50_000)?;
         Ok(())
     }
+
+    /// `verify_rate` at zero tolerance is the hard price floor the serving node
+    /// applies after the advertised-rate check (#846): a positive `floor`
+    /// rejects byte inflation with no slack, while a `floor` of `0` is inert
+    /// (the default / free-serving config, where the always-`>= 1` on-chain
+    /// floor is the authoritative enforcement instead).
+    #[test]
+    fn price_floor_rejects_byte_inflation() -> anyhow::Result<()> {
+        let floor = 1u64;
+
+        // The headline attack shape: 1 µUSDC stamped against 2^200 bytes. A zero
+        // floor accepts it (inert); a positive floor at zero tolerance rejects.
+        let inflated = U256::ONE << 200;
+        verify_rate(U256::ONE, inflated, 0, 0)?; // floor 0: inert, passes
+        let err = err_of(verify_rate(U256::ONE, inflated, floor, 0))?; // floor 1: rejects
+        anyhow::ensure!(matches!(err, RateError::Underpayment { .. }), "{err:?}");
+
+        // Exactly at the floor (1 µUSDC for 1 MB) passes with zero tolerance.
+        verify_rate(U256::ONE, one_mb(), floor, 0)?;
+        // One byte over the per-µUSDC budget for that amount is rejected — no
+        // tolerance headroom, unlike the advertised-rate check's 1%.
+        let err = err_of(verify_rate(U256::ONE, one_mb() + U256::ONE, floor, 0))?;
+        anyhow::ensure!(matches!(err, RateError::Underpayment { .. }), "{err:?}");
+        Ok(())
+    }
 }

@@ -8,6 +8,7 @@ import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import { IFeeRouterSettlement } from "./interfaces/IFeeRouterSettlement.sol";
 import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
@@ -70,6 +71,11 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     uint256 internal constant MAX_VOUCHER_INTERVAL_CEILING = 1024;
     uint256 internal constant MIN_DEPOSIT_FLOOR = 1;
 
+    /// @dev 1 MB in bytes (binary MB, ADR 005 / `rate::BYTES_PER_MB`). Used to
+    ///      convert the MB-denominated `deliveryFloor` into the per-byte price
+    ///      floor enforced at settlement (`_advanceClaimWatermark`).
+    uint256 internal constant BYTES_PER_MB = 1_048_576;
+
     /// @dev Deployment defaults for the governable params ADR 016 § step 8 does
     ///      not pass as constructor args. `minDeposit` = 1 USDC (6 decimals) —
     ///      the dust floor of ADR 003 § Deposit Economics; `maxVoucherIntervalMb`
@@ -120,8 +126,13 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     /// @notice Advisory max negotiable voucher interval in MB (bounded [1, 1024]).
     uint256 public maxVoucherIntervalMb;
 
-    /// @dev Advisory rate bounds in USDC base units; not enforced at settlement
-    ///      (ADR 003 § Rate Bounds Refresh), exposed via `getRateBounds`.
+    /// @dev Rate bounds in USDC base units per MB, exposed via `getRateBounds`.
+    ///      `deliveryFloor` is the per-byte price floor ENFORCED at settlement
+    ///      (`_advanceClaimWatermark` requires `amount * BYTES_PER_MB >=
+    ///      bytesDelivered * deliveryFloor`), closing the served-byte
+    ///      vote-weight inflation of ADR 036 (#846). `deliveryCeiling` stays
+    ///      advisory — a coordination ceiling nodes self-apply, not enforced
+    ///      on-chain (ADR 003 § Rate Bounds Refresh).
     uint256 internal deliveryFloor;
     uint256 internal deliveryCeiling;
 
@@ -209,6 +220,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     error AmountRegression(uint256 amount, uint256 claimedAmount);
     error BytesRegression(uint256 bytesDelivered, uint256 claimedBytes);
     error AmountExceedsDeposit(uint256 amount, uint256 deposit);
+    error RateFloorViolation(uint256 amount, uint256 bytesDelivered, uint256 deliveryFloor);
     error NothingToWithdraw();
     error ByteAdvanceWithoutPayment(uint256 byteDelta);
     error ZeroAmount();
@@ -225,8 +237,9 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     /// @param feeRouter_          Initial settlement router; must be a deployed contract.
     /// @param disputeWindow_      Initial dispute window (seconds; bounded [12h, 72h]).
     /// @param maxChannelDuration_ Initial channel lifetime (seconds; bounded [7d, 365d]).
-    /// @param deliveryFloor_      Advisory rate floor (USDC base units; >= 1).
-    /// @param deliveryCeiling_    Advisory rate ceiling (USDC base units; > floor).
+    /// @param deliveryFloor_      Per-byte price floor enforced at settlement
+    ///                            (USDC base units per MB; >= 1).
+    /// @param deliveryCeiling_    Advisory rate ceiling (USDC base units per MB; > floor).
     /// @param admin               `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder
     ///                            (the deployer; handed to the Timelock post-deploy).
     constructor(
@@ -596,6 +609,14 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///      `closeChannel` passes `false` so a party can always close at the
     ///      current watermark (`nonce ==`), otherwise a channel with no newer
     ///      voucher would be unclosable until `expiresAt`.
+    ///
+    ///      Enforces the per-byte price floor `deliveryFloor` on the cumulative
+    ///      `amount / bytesDelivered` ratio (#846): without it a voucher could
+    ///      stamp arbitrary served bytes for ~zero USDC, and since ADR 036
+    ///      sources governance vote weight from those bytes, an operator
+    ///      self-paying could mint near-free voting power. The check is the
+    ///      single chokepoint for `withdraw`, `closeChannel`, and
+    ///      `disputeChannel`, so all settlement entry points are bound.
     function _advanceClaimWatermark(
         Channel storage ch,
         uint256 amount,
@@ -609,6 +630,16 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         if (amount < ch.claimedAmount) revert AmountRegression(amount, ch.claimedAmount);
         if (bytesDelivered < ch.claimedBytes) revert BytesRegression(bytesDelivered, ch.claimedBytes);
         if (amount > ch.deposit) revert AmountExceedsDeposit(amount, ch.deposit);
+
+        // Per-byte price floor: require `amount * BYTES_PER_MB >= bytesDelivered
+        // * deliveryFloor`. Evaluated as a bytes ceiling via `Math.mulDiv` so a
+        // malicious `bytesDelivered` near `type(uint256).max` reverts with a
+        // clean `RateFloorViolation` rather than an arithmetic panic.
+        // `deliveryFloor >= MIN_DEPOSIT_FLOOR (1)` makes the divisor non-zero;
+        // `amount == 0` yields `maxBytes == 0`, so the zero-voucher close
+        // (`amount == 0 && bytesDelivered == 0`) still passes.
+        uint256 maxBytes = Math.mulDiv(amount, BYTES_PER_MB, deliveryFloor);
+        if (bytesDelivered > maxBytes) revert RateFloorViolation(amount, bytesDelivered, deliveryFloor);
 
         ch.claimedAmount = amount;
         ch.claimedNonce = nonce;

@@ -164,6 +164,7 @@ contract PaymentChannelTest is Test {
     uint256 internal constant DELIVERY_FLOOR = 1;
     uint256 internal constant DELIVERY_CEILING = 1000;
     uint256 internal constant DEPOSIT = 1000e6;
+    uint256 internal constant BYTES_PER_MB = 1_048_576;
 
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 internal constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
@@ -661,6 +662,175 @@ contract PaymentChannelTest is Test {
     }
 
     // -----------------------------------------------------------------
+    // Rate floor enforcement (#846): `amount * BYTES_PER_MB >= bytes * floor`
+    // -----------------------------------------------------------------
+
+    /// @dev The headline attack: `amount = 1`, `bytesDelivered = 2^256-1`. Must
+    ///      revert with a clean `RateFloorViolation`, never an arithmetic panic
+    ///      (the `Math.mulDiv` bytes-ceiling makes the comparison overflow-safe).
+    function test_rateFloor_revertsOnMaxBytesAttack() public {
+        bytes32 id = _open();
+        uint256 hugeBytes = type(uint256).max;
+        bytes memory sig = _sign(id, 1, 1, hugeBytes);
+        vm.prank(provider);
+        vm.expectRevert(
+            abi.encodeWithSelector(PaymentChannel.RateFloorViolation.selector, 1, hugeBytes, DELIVERY_FLOOR)
+        );
+        channel.closeChannel(id, 1, 1, hugeBytes, sig);
+    }
+
+    /// @dev Same near-free inflation via the absurd `2^200` byte count from the
+    ///      issue, exercised on the `withdraw` entry point.
+    function test_rateFloor_withdraw_revertsOnInflatedBytes() public {
+        bytes32 id = _open();
+        uint256 inflated = 2 ** 200;
+        bytes memory sig = _sign(id, 1, 1, inflated);
+        vm.prank(provider);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateFloorViolation.selector, 1, inflated, DELIVERY_FLOOR));
+        channel.withdraw(id, 1, 1, inflated, sig);
+    }
+
+    /// @dev The floor binds `disputeChannel` too (shared `_advanceClaimWatermark`
+    ///      chokepoint). Close honestly, then dispute with a sub-floor voucher.
+    function test_rateFloor_dispute_revertsOnInflatedBytes() public {
+        bytes32 id = _open();
+        // Honest close first (nonce 1): 10 base units permits up to 10*BYTES_PER_MB
+        // bytes; 5M is comfortably above the floor.
+        channelCloseHonest(id, 10, 1, 5_000_000);
+        // Dispute keeps the amount (allowed: `amount >= claimedAmount`) and a
+        // higher nonce, but inflates bytes past `10 * BYTES_PER_MB` (~10.49M).
+        uint256 inflated = 20_000_000;
+        bytes memory sig = _sign(id, 10, 2, inflated);
+        vm.prank(client);
+        vm.expectRevert(
+            abi.encodeWithSelector(PaymentChannel.RateFloorViolation.selector, 10, inflated, DELIVERY_FLOOR)
+        );
+        channel.disputeChannel(id, 10, 2, inflated, sig);
+    }
+
+    /// @dev Boundary: `bytes == amount * BYTES_PER_MB / floor` passes; `+1` reverts.
+    function test_rateFloor_boundaryExact() public {
+        uint256 amount = 100;
+        uint256 maxBytes = amount * BYTES_PER_MB / DELIVERY_FLOOR;
+
+        bytes32 idOk = _open();
+        vm.prank(provider);
+        channel.closeChannel(idOk, amount, 1, maxBytes, _sign(idOk, amount, 1, maxBytes));
+        assertEq(channel.getChannel(idOk).claimedBytes, maxBytes);
+
+        bytes32 idBad = _open();
+        bytes memory sig = _sign(idBad, amount, 1, maxBytes + 1);
+        vm.prank(provider);
+        vm.expectRevert(
+            abi.encodeWithSelector(PaymentChannel.RateFloorViolation.selector, amount, maxBytes + 1, DELIVERY_FLOOR)
+        );
+        channel.closeChannel(idBad, amount, 1, maxBytes + 1, sig);
+    }
+
+    /// @dev An honest voucher at the expected market rate (10 base units/MB, 10×
+    ///      the floor) settles untouched, and the zero-voucher close still works.
+    function test_rateFloor_honestPathUnaffected() public {
+        bytes32 id = _open();
+        // 40_000_000 bytes ≈ 38.15 MB → 390 base units at the $0.01/GB market rate.
+        channelCloseHonest(id, 390, 1, 40_000_000);
+        assertEq(channel.getChannel(id).claimedBytes, 40_000_000);
+
+        bytes32 idZero = _open();
+        vm.prank(provider);
+        channel.closeChannel(idZero, 0, 0, 0, "");
+        assertEq(channel.getChannel(idZero).claimedBytes, 0);
+    }
+
+    /// @dev With a non-unit floor the bytes ceiling `mulDiv(amount, BYTES_PER_MB,
+    ///      floor)` truncates DOWN, so the protocol never over-admits a fractional
+    ///      byte: `maxBytes` passes, `maxBytes + 1` reverts even though the exact
+    ///      rational boundary lies between them.
+    function test_rateFloor_truncatesDownAtNonUnitFloor() public {
+        vm.prank(admin);
+        channel.setRateBounds(3, DELIVERY_CEILING);
+
+        uint256 amount = 100;
+        // 100 * 1_048_576 / 3 = 34_952_533 (rounded down from 34_952_533.33).
+        uint256 maxBytes = amount * BYTES_PER_MB / 3;
+
+        bytes32 idOk = _open();
+        vm.prank(provider);
+        channel.closeChannel(idOk, amount, 1, maxBytes, _sign(idOk, amount, 1, maxBytes));
+        assertEq(channel.getChannel(idOk).claimedBytes, maxBytes);
+
+        bytes32 idBad = _open();
+        bytes memory sig = _sign(idBad, amount, 1, maxBytes + 1);
+        vm.prank(provider);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateFloorViolation.selector, amount, maxBytes + 1, 3));
+        channel.closeChannel(idBad, amount, 1, maxBytes + 1, sig);
+    }
+
+    /// @dev Governance raising `deliveryFloor` rejects a voucher that was valid at
+    ///      the old floor — the floor is a live, tunable settlement constraint.
+    function test_rateFloor_governanceRaisingFloorRejects() public {
+        // At floor 1, a 1-base-unit voucher may claim up to BYTES_PER_MB bytes.
+        bytes32 idOld = _open();
+        vm.prank(provider);
+        channel.closeChannel(idOld, 1, 1, BYTES_PER_MB, _sign(idOld, 1, 1, BYTES_PER_MB));
+
+        // Raise the floor to 2: the same voucher now exceeds the per-byte price.
+        vm.prank(admin);
+        channel.setRateBounds(2, DELIVERY_CEILING);
+
+        bytes32 idNew = _open();
+        bytes memory sig = _sign(idNew, 1, 1, BYTES_PER_MB);
+        vm.prank(provider);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateFloorViolation.selector, 1, BYTES_PER_MB, 2));
+        channel.closeChannel(idNew, 1, 1, BYTES_PER_MB, sig);
+    }
+
+    /// @dev Routed served bytes can never exceed `amount * BYTES_PER_MB / floor`,
+    ///      so vote-weight inflation (ADR 036) costs proportional real USDC. Settle
+    ///      at the maximum the floor permits for the paid amount and assert the
+    ///      routed bytes equal that ceiling — the bound is load-bearing here, not
+    ///      slack: one more byte for the same `amount` would have reverted.
+    function test_rateFloor_routedBytesBoundedByPaidAmount() public {
+        bytes32 id = _open();
+        uint256 amount = 100;
+        uint256 maxBytes = amount * BYTES_PER_MB / DELIVERY_FLOOR;
+        vm.prank(provider);
+        channel.closeChannel(id, amount, 1, maxBytes, _sign(id, amount, 1, maxBytes));
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+        channel.settleChannel(id);
+        assertEq(router.totalBytes(), maxBytes);
+        assertEq(router.totalBytes(), amount * BYTES_PER_MB / DELIVERY_FLOOR);
+    }
+
+    /// @dev Fuzz: a close reverts iff `bytesDelivered > amount * BYTES_PER_MB /
+    ///      floor`, straddling the boundary so both branches are exercised.
+    function testFuzz_rateFloor_revertIffBelowFloor(uint256 amount, uint256 bytesDelivered) public {
+        amount = bound(amount, 1, DEPOSIT);
+        uint256 maxBytes = amount * BYTES_PER_MB / DELIVERY_FLOOR;
+        bytesDelivered = bound(bytesDelivered, 0, 2 * maxBytes);
+
+        bytes32 id = _open();
+        bytes memory sig = _sign(id, amount, 1, bytesDelivered);
+        vm.prank(provider);
+        if (bytesDelivered > maxBytes) {
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    PaymentChannel.RateFloorViolation.selector, amount, bytesDelivered, DELIVERY_FLOOR
+                )
+            );
+            channel.closeChannel(id, amount, 1, bytesDelivered, sig);
+        } else {
+            channel.closeChannel(id, amount, 1, bytesDelivered, sig);
+            assertEq(channel.getChannel(id).claimedBytes, bytesDelivered);
+        }
+    }
+
+    /// @dev Close a channel with a provider-signable honest voucher (helper).
+    function channelCloseHonest(bytes32 id, uint256 amount, uint256 nonce, uint256 bytesDelivered) internal {
+        vm.prank(provider);
+        channel.closeChannel(id, amount, nonce, bytesDelivered, _sign(id, amount, nonce, bytesDelivered));
+    }
+
+    // -----------------------------------------------------------------
     // Fuzz — settlement conservation
     // -----------------------------------------------------------------
 
@@ -674,8 +844,12 @@ contract PaymentChannelTest is Test {
     ) public {
         wAmount = bound(wAmount, 1, DEPOSIT - 1);
         cAmount = bound(cAmount, wAmount + 1, DEPOSIT);
-        wBytes = bound(wBytes, 1, 1_000_000_000);
-        cBytes = bound(cBytes, wBytes, 2_000_000_000);
+        // Keep both watermarks above the enforced per-byte floor (#846): the max
+        // bytes claimable at `amount` is `amount * BYTES_PER_MB / deliveryFloor`.
+        // `cAmount > wAmount` guarantees `cAmount * BYTES_PER_MB >= wBytes`, so
+        // the cumulative-close range stays non-empty.
+        wBytes = bound(wBytes, 1, wAmount * BYTES_PER_MB);
+        cBytes = bound(cBytes, wBytes, cAmount * BYTES_PER_MB);
 
         bytes32 id = _open();
         vm.prank(provider);
@@ -696,7 +870,9 @@ contract PaymentChannelTest is Test {
     /// @dev Settling a plain close refunds `deposit - claimed` and routes `claimed`.
     function testFuzz_settle_refundEqualsDepositMinusClaimed(uint256 amount, uint256 bytesDelivered) public {
         amount = bound(amount, 1, DEPOSIT);
-        bytesDelivered = bound(bytesDelivered, 1, 1_000_000_000);
+        // Keep the pair above the enforced per-byte floor (#846): the max bytes
+        // claimable for `amount` is `amount * BYTES_PER_MB / deliveryFloor`.
+        bytesDelivered = bound(bytesDelivered, 1, amount * BYTES_PER_MB);
         bytes32 id = _open();
         vm.prank(provider);
         channel.closeChannel(id, amount, 1, bytesDelivered, _sign(id, amount, 1, bytesDelivered));

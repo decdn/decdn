@@ -489,20 +489,32 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 
 `PaymentChannel` does not hold a fee-percentage parameter. Bucket-share bounds (60/30/10 with per-share bounds 40–90 / 5–50 / 0–30) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
 
-**Rate bounds are in USDC base units (6 decimals).** The contract stores a single `RateBounds` struct with `deliveryFloor` and `deliveryCeiling`.
+**Rate bounds are in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor` and `deliveryCeiling`. `deliveryFloor` is the per-byte price floor **enforced at settlement** (see [Rate-floor enforcement](#rate-floor-enforcement) below); `deliveryCeiling` is an advisory coordination ceiling nodes self-apply (a node would not knowingly overpay, so a hard maximum buys no on-chain safety and risks rejecting legitimate high-egress pricing).
 
 **Initial rate bounds:**
 
 | Parameter | Value (USD/MB) | USDC base units | Rationale |
 | --- | --- | --- | --- |
-| `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. Prevents zero-rate free-riding while imposing no practical constraint on legitimate pricing. Nodes are expected to set rates well above this floor; the floor is purely an anti-zero safeguard, not a recommended price. |
+| `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. **Enforced at settlement** (#846) — the contract rejects any voucher whose cumulative `amount / bytesDelivered` falls below this floor, so claiming served bytes always costs proportional USDC. Prevents zero-rate free-riding and the served-byte vote-weight inflation of [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), while imposing no practical constraint on legitimate pricing (nodes set rates well above it; the floor is an anti-zero safeguard, not a recommended price). |
 | `deliveryCeiling` | $0.001/MB | 1,000 | 100× expected market rate. Accommodates origin-backed nodes with high-egress backends (e.g., S3 at $0.09/GB) while remaining well above any legitimate pricing scenario ($1.00/GB vs Akamai's ~$0.12–0.20/GB). |
 
 The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, DecdnGovernor in production (see [ADR 009](009-governance.md#adr-009-governance-model)).
 
+### Rate-floor enforcement
+
+`_advanceClaimWatermark` (the single voucher-validation chokepoint shared by `withdraw`, `closeChannel`, and `disputeChannel`) enforces the per-byte floor on the **cumulative** claim watermark:
+
+```
+require:  amount * BYTES_PER_MB >= bytesDelivered * deliveryFloor      (BYTES_PER_MB = 1_048_576, ADR 005)
+```
+
+evaluated overflow-safely as `bytesDelivered <= Math.mulDiv(amount, BYTES_PER_MB, deliveryFloor)` so a voucher carrying `bytesDelivered` near `type(uint256).max` reverts with `RateFloorViolation` rather than an arithmetic panic. Because `deliveryFloor >= 1` the divisor is non-zero, and `amount == 0` admits only `bytesDelivered == 0` (the zero-voucher close still works). The check uses **zero tolerance** — the floor sits 10× below the expected market rate, so honest traffic clears it by ≥10× and needs no rounding headroom (the off-chain 1% tolerance applies to the *advertised* `rate_per_mb`, not this floor).
+
+This binds served bytes to real USDC: stamping `B` bytes requires cumulatively claiming `>= B / 1_048_576` base units, restoring the proportional-cost assumption [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) relies on (#846). Serving nodes mirror the same floor off-chain (a zero-tolerance `verify_rate` against `delivery_floor`) before countersigning, so an honest node never accepts a voucher the chain would reject. The earlier design treated rate bounds as purely advisory; this is the one bound promoted to binding.
+
 ### Rate Bounds Refresh
 
-Nodes must keep their local `RateBounds` copy current so advertised `rate_per_mb` stays within governance-set bounds. Because rate bounds are advisory coordination parameters — the contract does not verify rate compliance during settlement or slashing — the refresh strategy is lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)), where serving blacklisted content is a slashable offense.
+Nodes must keep their local `RateBounds` copy current so advertised `rate_per_mb` stays within governance-set bounds. The contract enforces only the `deliveryFloor` (as the per-byte price floor at settlement, above); `deliveryCeiling` remains an advisory coordination parameter the contract does not verify. The refresh strategy is therefore lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)), where serving blacklisted content is a slashable offense.
 
 **Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `PaymentChannel` contract and update the local cache immediately. Governance actions are infrequent (days to weeks), so high-frequency polling would be wasteful.
 
@@ -921,7 +933,7 @@ The `token` field (ERC-20 address) is in the signed EIP-712 typed data to preven
 - **Carried through `closeChannel` / `disputeChannel` to `settleChannel`.** Recorded in `channel.claimedBytes` and forwarded as the `bytesDelivered` argument to `FeeRouter.routeSettlement` at settlement.
 - **Cross-channel consistency.** A voucher signed for one channel is bound by its EIP-712 typed data; `bytesDelivered` is part of that signed payload and cannot be replayed against a different channel.
 
-The router does not validate `bytesDelivered` against any oracle of physical delivery — the value is whatever the client signed. The defense is structural: per-byte settlement revenue requires real client USDC inflow rather than self-attested byte counts (on-chain settlement is capped at `channel.deposit`, with `closeChannel` / `disputeChannel` reverting on `amount > deposit` per [§ Fee Routing on Disputed Closes](#fee-routing-on-disputed-closes)), and governance vote weight is sourced from the same per-byte counter ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), so the same constraint binds vote-buying via wash trades.
+The router does not validate `bytesDelivered` against any oracle of physical delivery — the value is whatever the client signed. The defense is twofold. **Structurally**, per-byte settlement revenue requires real client USDC inflow rather than self-attested byte counts (on-chain settlement is capped at `channel.deposit`, with `closeChannel` / `disputeChannel` reverting on `amount > deposit` per [§ Fee Routing on Disputed Closes](#fee-routing-on-disputed-closes)). **Quantitatively**, `_advanceClaimWatermark` enforces the `deliveryFloor` per-byte price floor (see [Rate-floor enforcement](#rate-floor-enforcement)), so a voucher cannot decouple a large `bytesDelivered` from a tiny `amount` — claiming `B` bytes costs `>= B / 1_048_576` base units regardless of the `channel.deposit` ceiling. Without the floor, the `amount <= deposit` cap alone is insufficient: an operator can deposit a small amount and still stamp arbitrarily many bytes at `amount = 1`. Governance vote weight is sourced from the same floor-bound per-byte counter ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), so both wash-trade revenue and vote-buying are bound by proportional real USDC (#846).
 
 ## Slashing and Channel Interactions
 

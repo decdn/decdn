@@ -983,7 +983,7 @@ impl ClientHandler {
     /// client resends the same voucher on a fresh stream (ADR 003 §332). Only an
     /// underpayment fails the stream: no wire reason exists for it, and the
     /// client is blocked awaiting `VoucherAck` so it cannot resend mid-stream.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn collect_voucher(
         &self,
         send: &mut SendStream,
@@ -1059,6 +1059,45 @@ impl ClientHandler {
             Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
                 drop(guard);
                 anyhow::bail!("voucher fails rate check for {delta_bytes} delivered bytes: {e}");
+            }
+        }
+
+        // Hard per-byte price floor (#846). The check above enforces the node's
+        // *advertised* `rate_per_mb` with `DEFAULT_TOLERANCE_BPS` (1%) slack;
+        // this one re-checks the same delta against `delivery_floor` with ZERO
+        // tolerance, so a synced node's accept decision is bit-identical to the
+        // on-chain `PaymentChannel` `RateFloorViolation` settlement guard. The
+        // net effect over the advertised check is rejecting the narrow
+        // `(floor - 1%, floor)` band the chain would reject at settlement, so a
+        // synced node never countersigns a voucher it then cannot redeem.
+        //
+        // Scope of protection follows `delivery_floor`, the local stand-in for
+        // on-chain `getRateBounds()` (ADR 005): when synced from the chain it is
+        // `>= MIN_DEPOSIT_FLOOR (1)` and this check is live; at its default of
+        // `0` (also the deliberate free-serving config, #864) `verify_rate`'s
+        // RHS is `0` so the check is inert — the always-`>= 1` on-chain floor is
+        // the authoritative enforcement in that case. Match every arm for the
+        // same reason as the advertised check (#845): `delta_bytes > 0` here, so
+        // `ZeroBytes`/`Overflow` are unreachable, but an exhaustive `match`
+        // makes a future `RateError` variant a build failure rather than a
+        // silent accept.
+        match verify_rate(
+            amount_delta,
+            U256::from(delta_bytes),
+            self.delivery_floor,
+            0,
+        ) {
+            Ok(()) => {}
+            Err(RateError::Underpayment { .. }) => {
+                self.metrics.voucher_rate_floor_rejected();
+                drop(guard);
+                anyhow::bail!(
+                    "voucher below protocol rate floor for {delta_bytes} delivered bytes"
+                );
+            }
+            Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
+                drop(guard);
+                anyhow::bail!("voucher fails floor check for {delta_bytes} delivered bytes: {e}");
             }
         }
 
