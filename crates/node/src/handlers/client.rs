@@ -983,7 +983,7 @@ impl ClientHandler {
     /// client resends the same voucher on a fresh stream (ADR 003 §332). Only an
     /// underpayment fails the stream: no wire reason exists for it, and the
     /// client is blocked awaiting `VoucherAck` so it cannot resend mid-stream.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn collect_voucher(
         &self,
         send: &mut SendStream,
@@ -1059,6 +1059,43 @@ impl ClientHandler {
             Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
                 drop(guard);
                 anyhow::bail!("voucher fails rate check for {delta_bytes} delivered bytes: {e}");
+            }
+        }
+
+        // Hard per-byte price floor (#846), checked on the CUMULATIVE watermark
+        // the voucher carries (`amount` / `new_bytes`) — not the per-voucher
+        // delta — so it mirrors the on-chain `PaymentChannel`
+        // `_advanceClaimWatermark` `RateFloorViolation` guard exactly: the chain
+        // floors `bytesDelivered <= mulDiv(amount, BYTES_PER_MB, deliveryFloor)`
+        // on the cumulative claim, never on a single delta. The advertised check
+        // above is per-delta at 1% tolerance; this is the cumulative floor at
+        // ZERO tolerance, so a synced node never countersigns a voucher it then
+        // cannot redeem — including the case where an earlier under-floor voucher
+        // (accepted while the floor was 0) drags the watermark below the floor
+        // even though the latest delta alone would clear it. A per-delta check
+        // would both miss that (false accept) and reject a delta drawing down an
+        // earlier overpayment surplus the chain would settle (false reject).
+        //
+        // Scope follows `delivery_floor`, the local stand-in for on-chain
+        // `getRateBounds()` (ADR 005): synced from the chain it is `>=
+        // MIN_DEPOSIT_FLOOR (1)` and the check is live; at its default `0` (the
+        // deliberate free-serving config, #864) `verify_rate`'s RHS is `0`, so it
+        // is inert and the always-`>= 1` on-chain floor is authoritative.
+        // `new_bytes >= delta_bytes > 0`, so `ZeroBytes` cannot occur; match
+        // every arm anyway (#845) so a future `RateError` variant is a build
+        // failure rather than a silent accept.
+        match verify_rate(amount, new_bytes, self.delivery_floor, 0) {
+            Ok(()) => {}
+            Err(RateError::Underpayment { .. }) => {
+                self.metrics.voucher_rate_floor_rejected();
+                drop(guard);
+                anyhow::bail!(
+                    "voucher below protocol rate floor for {delta_bytes} delivered bytes"
+                );
+            }
+            Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
+                drop(guard);
+                anyhow::bail!("voucher fails floor check for {delta_bytes} delivered bytes: {e}");
             }
         }
 
