@@ -701,7 +701,9 @@ pub async fn open_progressive_pull(
 }
 
 impl UpstreamPull {
-    /// Bytes promised by the upstream for this stream (`total_bytes`).
+    /// Bytes this stream will deliver: the upstream's promised `total_bytes`
+    /// minus the requested `byte_offset` (the full `total_bytes` for a fresh
+    /// fetch, the remaining suffix for a resumed one).
     #[must_use]
     pub const fn expected(&self) -> u64 {
         self.expected

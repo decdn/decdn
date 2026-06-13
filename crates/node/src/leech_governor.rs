@@ -22,7 +22,7 @@
 //! start, and the per-peer table is bounded (`MAX_TRACKED_PEERS`) so a churn
 //! of distinct peers cannot grow it without bound.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::metrics::Metrics;
@@ -74,6 +74,11 @@ struct LeechState {
     /// Node-wide bytes served (saturating); recoups the global budget.
     global_served: u64,
     peers: HashMap<[u8; 32], PeerLeech>,
+    /// LRU index ordered by each peer's `last_tick`, so the least-recently
+    /// touched peer (the eviction victim) is the first entry — `O(log n)` to
+    /// find and evict, rather than an `O(n)` scan of `peers`. Ticks are unique
+    /// and monotonic, so the map holds exactly one entry per tracked peer.
+    lru: BTreeMap<u64, [u8; 32]>,
     /// Monotonic LRU clock.
     tick: u64,
 }
@@ -181,22 +186,33 @@ impl LeechState {
 
     /// Ensure a per-peer entry exists, stamp its last-touch tick, and return a
     /// copy. Evicts the least-recently-touched peer first if the table is full
-    /// and `peer` is new — an active leecher is touched every chunk and so is
-    /// never the eviction victim.
+    /// and `peer` is new — an active leecher is touched every chunk, so its tick
+    /// is always recent and it is never the eviction victim. The `lru` index
+    /// keeps both the victim lookup and the re-stamp `O(log n)`.
     fn touch(&mut self, peer: &[u8; 32], tick: u64) -> PeerLeech {
-        if !self.peers.contains_key(peer)
-            && self.peers.len() >= MAX_TRACKED_PEERS
-            && let Some(victim) = self
-                .peers
-                .iter()
-                .min_by_key(|(_, p)| p.last_tick)
-                .map(|(k, _)| *k)
+        if let Some(entry) = self.peers.get_mut(peer) {
+            // Existing peer: move its LRU position from the old tick to `tick`.
+            let old_tick = entry.last_tick;
+            entry.last_tick = tick;
+            let copy = *entry;
+            self.lru.remove(&old_tick);
+            self.lru.insert(tick, *peer);
+            return copy;
+        }
+        // New peer: evict the least-recently-touched first if the table is full.
+        if self.peers.len() >= MAX_TRACKED_PEERS
+            && let Some((&victim_tick, &victim)) = self.lru.iter().next()
         {
+            self.lru.remove(&victim_tick);
             self.peers.remove(&victim);
         }
-        let entry = self.peers.entry(*peer).or_default();
-        entry.last_tick = tick;
-        *entry
+        let entry = PeerLeech {
+            last_tick: tick,
+            ..Default::default()
+        };
+        self.peers.insert(*peer, entry);
+        self.lru.insert(tick, *peer);
+        entry
     }
 }
 
@@ -284,6 +300,30 @@ mod tests {
         assert!(
             !gov.may_pull(&PEER_A),
             "share ratio still caps the peer with the global cap off"
+        );
+    }
+
+    #[test]
+    fn full_table_evicts_lru_and_keeps_the_active_peer() {
+        // initial 1_000, ratio 100% (1.0×): a peer's allowance grows with
+        // service, so an evicted-and-reset peer is observably different from one
+        // that kept its history.
+        let gov = governor(0, 1_000, 100);
+        gov.record_served(&PEER_A, 10_000); // A's allowance is now ~11_000
+        // Fill the table past capacity with distinct one-touch peers, keeping A
+        // the most-recently-used on every step so it is never the victim.
+        for i in 0..(MAX_TRACKED_PEERS as u64 + 10) {
+            let mut id = [0xFFu8; 32];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            gov.record_served(&id, 1);
+            gov.may_pull(&PEER_A); // touch A so its tick stays the most recent
+        }
+        // A survived with its history intact: it may still pull well past a fresh
+        // peer's initial 1_000-byte allowance. An evicted-and-reset A refuses here.
+        gov.record_pulled(&PEER_A, 5_000);
+        assert!(
+            gov.may_pull(&PEER_A),
+            "the continuously-active peer must survive eviction with its history intact"
         );
     }
 
