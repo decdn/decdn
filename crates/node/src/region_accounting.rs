@@ -104,9 +104,9 @@ impl RegionAccountant {
     /// Record `bytes` pulled IN from `peer`, bucketed by `peer`'s region.
     ///
     /// The inbound counterpart of [`record_served`](Self::record_served): the
-    /// node-to-node pull orchestrator calls this on each delivered
+    /// node-to-node pull orchestrator (#831) calls this on each delivered
     /// cache-miss pull-through, so `bytes_in` reconciles pull spend by upstream
-    /// region. Cache pull-through against opaque S3/R2 origins has no
+    /// region (#858). Cache pull-through against opaque S3/R2 origins has no
     /// resolvable region and is not recorded here.
     pub async fn record_pulled(&self, peer: &[u8; 32], bytes: u64) {
         let region = self.region_for(peer).await;
