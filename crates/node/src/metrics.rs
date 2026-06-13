@@ -529,6 +529,48 @@ pub struct DecdnMetrics {
     /// deadline) without populating the blob. Cancellation on shutdown is not
     /// counted as a failure.
     pub node_pull_through_background_failed: Counter,
+    /// `decdn_node_pull_through_window_paused_total` (#856): times the
+    /// window-paced serve loop paused the upstream pull because the per-request
+    /// unrecouped frontier (`bytes pulled − bytes paid`) reached the effective
+    /// window — `pull_ahead_bytes`, floored at one voucher interval — and it waited
+    /// for the downstream voucher to clear. A high rate is benign (the window is
+    /// doing its job pacing speculation); a flat zero under real pull-through
+    /// traffic means the window never binds.
+    pub node_pull_through_window_paused: Counter,
+    /// `decdn_node_pull_through_leech_budget_paused_total` (#856): speculative
+    /// pull-throughs refused or paused because the node-wide unrecouped-leech
+    /// budget (`max_unrecouped_leech_bytes`) was exhausted. A sustained rate means
+    /// aggregate speculative spend is hitting the operator's circuit breaker.
+    pub node_pull_through_leech_budget_paused: Counter,
+    /// `decdn_node_pull_through_share_ratio_paused_total` (#856): speculative
+    /// pull-throughs refused because a single requesting peer exceeded its
+    /// `share_ratio` ceiling (pulled-vs-served). Isolates concentrated
+    /// single-peer manufactured-demand abuse.
+    pub node_pull_through_share_ratio_paused: Counter,
+    /// `decdn_node_pull_through_client_abandoned_total` (#856): window-paced
+    /// serves the requesting client dropped or underpaid mid-pull, so the node
+    /// aborted the upstream pull and abandoned the partial fill. The per-request
+    /// loss is bounded to `pull_ahead_bytes`; a sustained rate flags a leech.
+    pub node_pull_through_client_abandoned: Counter,
+    /// `decdn_node_pull_through_tee_finalize_failed_total` (#856): a window-paced
+    /// serve delivered (and was paid for) the full blob, but promoting the teed
+    /// bytes into the local cache failed (store fault, tee-layer hash mismatch, or
+    /// import-task join failure). The client got correct bytes; the node forfeits
+    /// the warm-cache benefit and does NOT become a holder. A sustained rate means
+    /// the node is paying upstream egress on every pull-through and caching none of
+    /// it — investigate the store / `data_dir`. Field has no `_total` suffix
+    /// because the `OpenMetrics` encoder appends it.
+    pub node_pull_through_tee_finalize_failed: Counter,
+    /// `decdn_node_pull_through_upstream_verify_failed_total` (#856): a window-paced
+    /// serve forwarded an upstream stream that then failed its whole-blob hash
+    /// check at finalization (a corrupt or short upstream — the bait-and-switch
+    /// case). The teed blob is dropped (never cached) and the client's own
+    /// end-to-end hash check rejects the truncated stream. Distinct from
+    /// `node_pull_corruption` (the buffered orchestration's own check) — this is
+    /// the fused serve path. A sustained rate means clients are being served
+    /// corrupt-upstream bytes through this node. Field has no `_total` suffix
+    /// because the `OpenMetrics` encoder appends it.
+    pub node_pull_through_upstream_verify_failed: Counter,
     /// `decdn_node_address_watcher_restarts_total` (#831): distinct drift windows
     /// of the `NodeId → address` resolver's event watcher (mirrors the staker-set
     /// watcher, #788). Edge-triggered once per outage, not per backoff iteration.
@@ -659,6 +701,14 @@ pub struct DecdnMetrics {
     /// not authorize the named channel (#327). Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
     pub serve_stream_rejected_owner_mismatch: Counter,
+    /// `serve_stream` cache-miss requests refused before any upstream pull
+    /// because the requesting channel's remaining deposit could not cover the
+    /// worst-case blob cost at the node's rate (#856 pre-flight deposit guard).
+    /// Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so this
+    /// server-side counter is the only place the distinction lives — a rising
+    /// value isolates near-empty-deposit pull-through abuse. Visible name:
+    /// `decdn_serve_stream_rejected_insufficient_deposit_total`.
+    pub serve_stream_rejected_insufficient_deposit: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -1125,6 +1175,49 @@ impl Metrics {
     /// not authorize the named channel (#876).
     pub fn serve_stream_rejected_owner_mismatch(&self) {
         self.decdn.serve_stream_rejected_owner_mismatch.inc();
+    }
+
+    /// Record a `serve_stream` cache-miss refused by the pre-flight deposit guard
+    /// (#856): the requesting channel could not cover the worst-case blob cost,
+    /// so no upstream pull was started.
+    pub fn serve_stream_rejected_insufficient_deposit(&self) {
+        self.decdn.serve_stream_rejected_insufficient_deposit.inc();
+    }
+
+    /// The window-paced serve loop paused the upstream pull at `pull_ahead_bytes`
+    /// to wait for the downstream voucher to clear (#856).
+    pub fn node_pull_through_window_paused(&self) {
+        self.decdn.node_pull_through_window_paused.inc();
+    }
+
+    /// A speculative pull-through was refused/paused by the node-wide
+    /// unrecouped-leech budget (#856).
+    pub fn node_pull_through_leech_budget_paused(&self) {
+        self.decdn.node_pull_through_leech_budget_paused.inc();
+    }
+
+    /// A speculative pull-through was refused because a peer exceeded its
+    /// `share_ratio` ceiling (#856).
+    pub fn node_pull_through_share_ratio_paused(&self) {
+        self.decdn.node_pull_through_share_ratio_paused.inc();
+    }
+
+    /// A window-paced serve was abandoned because the requesting client dropped
+    /// or underpaid mid-pull (#856).
+    pub fn node_pull_through_client_abandoned(&self) {
+        self.decdn.node_pull_through_client_abandoned.inc();
+    }
+
+    /// A window-paced serve delivered the full blob but failed to promote it into
+    /// the local cache (#856).
+    pub fn node_pull_through_tee_finalize_failed(&self) {
+        self.decdn.node_pull_through_tee_finalize_failed.inc();
+    }
+
+    /// A window-paced serve forwarded an upstream stream that failed its whole-blob
+    /// hash check at finalization (#856).
+    pub fn node_pull_through_upstream_verify_failed(&self) {
+        self.decdn.node_pull_through_upstream_verify_failed.inc();
     }
 
     /// A buyer→upstream pull hit this node's own `pull_timeout` deadline (#857).
@@ -1860,6 +1953,7 @@ mod tests {
             "decdn_serve_stream_rejected_blob_too_large_total",
             "decdn_serve_stream_rejected_unknown_channel_total",
             "decdn_serve_stream_rejected_owner_mismatch_total",
+            "decdn_serve_stream_rejected_insufficient_deposit_total",
         ];
         let text = metrics.encode().unwrap();
         for name in reasons {
@@ -1875,6 +1969,7 @@ mod tests {
         metrics.serve_stream_rejected_blob_too_large();
         metrics.serve_stream_rejected_unknown_channel();
         metrics.serve_stream_rejected_owner_mismatch();
+        metrics.serve_stream_rejected_insufficient_deposit();
 
         let text = metrics.encode().unwrap();
         for name in reasons {

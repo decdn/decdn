@@ -88,6 +88,25 @@ pub fn verify_rate(
     }
 }
 
+/// Minimum payment (in token base units) required to cover `bytes` delivered
+/// at `rate_per_mb`, i.e. `ceil(bytes * rate_per_mb / BYTES_PER_MB)`.
+///
+/// This is the exact lower bound [`verify_rate`] enforces at zero tolerance and
+/// the same arithmetic the buyer's voucher signer uses to price an interval
+/// (`bytes * rate / MB`, rounded up). It is intended for pre-flight cost
+/// estimation — e.g. gating a speculative pull on the requesting channel's
+/// remaining deposit covering the worst-case blob cost (#856).
+///
+/// Saturating on the (practically unreachable) multiply overflow: a saturated
+/// `U256::MAX` ceiling makes any finite deposit look insufficient, which is the
+/// safe, conservative direction for a guard.
+#[must_use]
+pub fn min_payment(bytes: u64, rate_per_mb: u64) -> U256 {
+    U256::from(bytes)
+        .saturating_mul(U256::from(rate_per_mb))
+        .div_ceil(U256::from(BYTES_PER_MB))
+}
+
 /// Failure modes for [`verify_rate`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RateError {
@@ -268,6 +287,62 @@ mod tests {
         // tolerance headroom, unlike the advertised-rate check's 1%.
         let err = err_of(verify_rate(U256::ONE, one_mb() + U256::ONE, floor, 0))?;
         anyhow::ensure!(matches!(err, RateError::Underpayment { .. }), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn min_payment_exact_megabyte() {
+        // 1 MB at 100 µUSDC/MB costs exactly 100.
+        assert_eq!(min_payment(BYTES_PER_MB, 100), U256::from(100u64));
+        // 10 MB at 1000 costs 10_000.
+        assert_eq!(min_payment(10 * BYTES_PER_MB, 1000), U256::from(10_000u64));
+    }
+
+    #[test]
+    fn min_payment_sub_megabyte_rounds_up() {
+        // 0.5 MB at 1000 → 500 exactly (divides evenly).
+        assert_eq!(min_payment(BYTES_PER_MB / 2, 1000), U256::from(500u64));
+        // 1 byte at rate 1 → ceil(1/1_048_576) = 1, never zero for a priced byte.
+        assert_eq!(min_payment(1, 1), U256::ONE);
+        // One byte over a whole MB rounds the partial MB up.
+        assert_eq!(min_payment(BYTES_PER_MB + 1, 1), U256::from(2u64));
+    }
+
+    #[test]
+    fn min_payment_zero_rate_is_free() {
+        assert_eq!(min_payment(u64::MAX, 0), U256::ZERO);
+    }
+
+    #[test]
+    fn min_payment_zero_bytes_is_zero() {
+        assert_eq!(min_payment(0, 1_000_000), U256::ZERO);
+    }
+
+    #[test]
+    fn min_payment_large_blob_no_overflow() {
+        // A 64 GiB blob at a high rate stays well within U256 and does not panic.
+        let bytes = 64u64 * 1024 * 1024 * 1024;
+        let got = min_payment(bytes, 1_000_000);
+        // ceil(bytes * 1e6 / MB) == bytes/MB * 1e6 for an exact-MB blob.
+        assert_eq!(
+            got,
+            U256::from(bytes / BYTES_PER_MB) * U256::from(1_000_000u64)
+        );
+    }
+
+    /// The deposit-guard contract (#856): `min_payment` is the lower bound a
+    /// zero-tolerance `verify_rate` accepts, so paying exactly `min_payment`
+    /// for the bytes always clears the rate floor.
+    #[test]
+    fn min_payment_clears_zero_tolerance_rate() -> anyhow::Result<()> {
+        for &(bytes, rate) in &[
+            (BYTES_PER_MB, 1000u64),
+            (BYTES_PER_MB / 3, 777),
+            (3 * BYTES_PER_MB + 17, 100),
+        ] {
+            let amount = min_payment(bytes, rate);
+            verify_rate(amount, U256::from(bytes), rate, 0)?;
+        }
         Ok(())
     }
 }

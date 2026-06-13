@@ -37,6 +37,10 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
+# Incremental whole-blob BLAKE3 for the window-paced pull-through (#856): the
+# fused pull-and-forward path hashes chunks as they stream rather than buffering
+# the blob to call `Hash::new`. Same BLAKE3 iroh-blobs addresses with.
+blake3 = { workspace = true }
 iroh-gossip = { workspace = true }
 iroh-metrics = { workspace = true }
 tokio = { workspace = true }

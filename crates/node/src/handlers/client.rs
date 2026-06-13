@@ -28,7 +28,7 @@
 //! accounting must not run on replayable early data, so `on_accepting` always
 //! takes the full handshake.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -36,8 +36,8 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{CacheEngine, CacheError, Hash};
-use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, verify_rate};
+use decdn_cache::{CacheEngine, CacheError, Hash, TeeOpen, TeeSink};
+use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
     ChannelId, ChannelState, ChannelStateStore, StreamSlashData, VoucherActivity, verify_binding,
@@ -59,7 +59,9 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::dispatch::{ConnectionLimiter, RejectReason};
+use crate::leech_governor::LeechGovernor;
 use crate::metrics::Metrics;
+use crate::node_origin::{NodeOrigin, NodeProgressivePull};
 use crate::receipt_log::{DownloadReceipt, ReceiptSink};
 use crate::region_accounting::RegionAccountant;
 
@@ -73,6 +75,10 @@ pub const MAX_CLIENT_STREAMS: usize = 100;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Fallback overall deadline for opening a window-paced pull (#856) when no
+/// pull-through deadline is configured. In practice the runtime always attaches
+/// one alongside the window provider, so this only guards a misconfiguration.
+const WINDOW_PULL_FALLBACK_DEADLINE: Duration = Duration::from_mins(1);
 
 // QUIC application error codes (ADR 013 §Application Error Codes). A clean
 // voucher rejection does NOT use these — it writes a `StreamError` frame and
@@ -164,6 +170,7 @@ enum ServeRejectReason {
     BlobTooLarge,
     UnknownChannel,
     OwnerMismatch,
+    InsufficientDeposit,
 }
 
 impl ServeRejectReason {
@@ -176,7 +183,14 @@ impl ServeRejectReason {
     /// unrepresentable at the call sites.
     const fn wire_error(self) -> StreamError {
         match self {
-            Self::CacheMiss | Self::UnknownChannel | Self::OwnerMismatch => StreamError::NotFound,
+            // `InsufficientDeposit` collapses to `NotFound` alongside the other
+            // miss reasons (#856): it must be wire-indistinguishable so a probing
+            // client cannot map out other clients' channel balances; the
+            // distinction survives only in the per-reason metric.
+            Self::CacheMiss
+            | Self::UnknownChannel
+            | Self::OwnerMismatch
+            | Self::InsufficientDeposit => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             Self::BlobTooLarge => StreamError::BlobTooLarge,
@@ -243,6 +257,24 @@ pub struct ClientHandler {
     /// returns `NotFound` with no warming. When set, the deadline additionally
     /// spawns a detached task to keep filling the cache from a slow upstream.
     background_fill: OnceLock<BackgroundFill>,
+    /// Window-paced node→node pull-through provider (#856), attached
+    /// post-construction via [`ClientHandler::attach_window_pull_through`]. When
+    /// set (alongside `pull_through`), a cache miss for an offset-0 request that
+    /// proves channel ownership is served by fusing a progressive upstream pull
+    /// with downstream delivery — forwarding each chunk to the paying client and
+    /// teeing it into the cache — so per-request speculative exposure is bounded
+    /// to `pull_ahead_bytes` instead of the whole blob. Unset keeps the buffered
+    /// `populate` path (`pull_through`) or a plain `NotFound`.
+    pull_through_origin: OnceLock<Arc<NodeOrigin>>,
+    /// Per-request pipeline window in bytes (#856, ADR 037 `pull_ahead_bytes`),
+    /// set with [`ClientHandler::attach_window_pull_through`]. The window-paced
+    /// loop pulls at most this many bytes ahead of cleared downstream payment.
+    pull_ahead_bytes: OnceLock<u64>,
+    /// Node-wide seed-leech caps (#856, ADR 037), attached via
+    /// [`ClientHandler::attach_leech_governor`]. Consulted before/while a
+    /// speculative pull-through proceeds and credited from the voucher path.
+    /// Unset (tests / feature off) leaves only the per-request window.
+    leech_governor: OnceLock<Arc<LeechGovernor>>,
     rate_per_mb: Arc<AtomicU64>,
     delivery_floor: u64,
     delivery_ceiling: u64,
@@ -319,6 +351,9 @@ impl ClientHandler {
             region_accountant: OnceLock::new(),
             pull_through: OnceLock::new(),
             background_fill: OnceLock::new(),
+            pull_through_origin: OnceLock::new(),
+            pull_ahead_bytes: OnceLock::new(),
+            leech_governor: OnceLock::new(),
             rate_per_mb,
             delivery_floor,
             delivery_ceiling,
@@ -374,6 +409,25 @@ impl ClientHandler {
             budget,
             inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
         });
+    }
+
+    /// Attach the window-paced node→node pull-through provider (#856). Called
+    /// once during runtime wiring when pull-through is enabled and the
+    /// `NodeOrigin` is provisioned; a second call is ignored. After this, an
+    /// offset-0 cache-miss request that proves channel ownership is served by the
+    /// fused pull-and-forward path bounded by `pull_ahead_bytes`, instead of the
+    /// buffered `populate` path.
+    pub fn attach_window_pull_through(&self, origin: Arc<NodeOrigin>, pull_ahead_bytes: u64) {
+        let _ = self.pull_through_origin.set(origin);
+        let _ = self.pull_ahead_bytes.set(pull_ahead_bytes);
+    }
+
+    /// Attach the node-wide seed-leech caps governor (#856). Called once during
+    /// runtime wiring; a second call is ignored. After this, speculative
+    /// pull-throughs are gated by the global unrecouped-leech budget and per-peer
+    /// share ratio, and the voucher path credits served bytes to it.
+    pub fn attach_leech_governor(&self, governor: Arc<LeechGovernor>) {
+        let _ = self.leech_governor.set(governor);
     }
 
     /// Spawn a detached background cache-fill for `hash` (#859), unless one is
@@ -476,6 +530,34 @@ impl ClientHandler {
                 false
             }
             Err(_) => self.on_pull_through_timeout(hash, timeout).await,
+        }
+    }
+
+    /// Wait for a concurrent fill of `hash` to land, then report whether the blob
+    /// is now present (#856 coalescing). Used when [`CacheEngine::open_tee_sink`]
+    /// reported [`TeeOpen::InFlight`]: another request is already pulling this
+    /// hash, so we MUST NOT open a second upstream pull (no double spend). The
+    /// coalescing [`CacheEngine::populate`] (via [`Self::try_pull_through`]) waits
+    /// on the same in-flight entry and re-checks presence; if no pull-through
+    /// deadline is configured it degrades to a plain presence check.
+    async fn await_coalesced_fill(&self, hash: Hash) -> bool {
+        match self.pull_through.get().copied() {
+            Some(timeout) => self.try_pull_through(hash, timeout).await,
+            None => self.cache.has(hash).await.unwrap_or(false),
+        }
+    }
+
+    /// Whether a speculative pull may proceed for `peer` under the seed-leech caps
+    /// (#856). Always `true` when no governor is attached.
+    fn leech_may_pull(&self, peer: &[u8; 32]) -> bool {
+        self.leech_governor.get().is_none_or(|g| g.may_pull(peer))
+    }
+
+    /// Account `bytes` speculatively pulled for `peer` under the seed-leech caps
+    /// (#856). No-op when no governor is attached.
+    fn leech_record_pulled(&self, peer: &[u8; 32], bytes: u64) {
+        if let Some(g) = self.leech_governor.get() {
+            g.record_pulled(peer, bytes);
         }
     }
 
@@ -768,16 +850,62 @@ impl ClientHandler {
                 // not yet, so chained pull-through is a follow-up.) On a
                 // successful fill, fall through to the normal size-gate +
                 // delivery path; otherwise it stays a `NotFound`.
-                let filled = match self.pull_through.get().copied() {
-                    Some(timeout) if self.pull_authorized(&req, verified_client).await => {
-                        self.try_pull_through(hash, timeout).await
+                //
+                // Window-paced pull-through (#856, ADR 037) is the preferred path
+                // when its provider is attached: instead of buffering the whole
+                // blob via `populate` and only THEN serving (fronting 100% of the
+                // upstream cost before any downstream voucher), it fuses the
+                // upstream pull with downstream delivery so the per-request
+                // exposure is bounded to `pull_ahead_bytes`. It requires an
+                // offset-0 request (the incremental whole-blob hash is only valid
+                // from 0); a resumed miss falls back to the buffered path.
+                if let Some(origin) = self.pull_through_origin.get()
+                    && req.byte_offset == 0
+                    && self.pull_authorized(&req, verified_client).await
+                {
+                    match self.cache.open_tee_sink(hash) {
+                        TeeOpen::Owner(tee) => {
+                            // Boxed: the fused serve future is large; keep it off
+                            // the `serve_stream` stack frame (clippy::large_futures).
+                            return Box::pin(self.serve_via_window_pull_through(
+                                send,
+                                recv,
+                                &req,
+                                &ext,
+                                hash,
+                                client_node_id,
+                                Arc::clone(origin),
+                                tee,
+                            ))
+                            .await;
+                        }
+                        // A concurrent fill for this hash is already running
+                        // (#305): do NOT open a second upstream pull (no double
+                        // spend). Wait for it via the coalescing `populate`, then
+                        // fall through to serve from the store; if it does not
+                        // land, report the miss.
+                        TeeOpen::InFlight => {
+                            if !self.await_coalesced_fill(hash).await {
+                                return self
+                                    .respond_error(&mut send, &req, ServeRejectReason::CacheMiss)
+                                    .await;
+                            }
+                        }
                     }
-                    _ => false,
-                };
-                if !filled {
-                    return self
-                        .respond_error(&mut send, &req, ServeRejectReason::CacheMiss)
-                        .await;
+                } else {
+                    // Buffered pull-through (#831): the pre-#856 path, used when
+                    // the window provider is unattached or for a resumed request.
+                    let filled = match self.pull_through.get().copied() {
+                        Some(timeout) if self.pull_authorized(&req, verified_client).await => {
+                            self.try_pull_through(hash, timeout).await
+                        }
+                        _ => false,
+                    };
+                    if !filled {
+                        return self
+                            .respond_error(&mut send, &req, ServeRejectReason::CacheMiss)
+                            .await;
+                    }
                 }
             }
             Err(e) => {
@@ -891,6 +1019,386 @@ impl ClientHandler {
             interval_mb,
         )
         .await
+    }
+
+    /// Serve a cache miss by fusing a window-paced upstream pull with downstream
+    /// delivery (#856, ADR 037): forward each upstream chunk to the paying client
+    /// and tee it into the cache, pacing the upstream spend by the downstream's
+    /// vouchers so per-request speculative exposure is bounded to
+    /// `pull_ahead_bytes` rather than the whole blob. The caller has already
+    /// proven channel ownership, confirmed `byte_offset == 0`, and claimed the
+    /// tee sink. Terminal: consumes `send`/`recv`.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_via_window_pull_through(
+        &self,
+        mut send: SendStream,
+        mut recv: RecvStream,
+        req: &StreamRequest,
+        ext: &StreamRequestExt,
+        hash: Hash,
+        client_node_id: B256,
+        origin: Arc<NodeOrigin>,
+        tee: TeeSink,
+    ) -> anyhow::Result<()> {
+        // Resolve the owning channel (existence + ownership already proven by
+        // `pull_authorized`) — needed for the deposit guard and the downstream
+        // voucher collection.
+        let channel_id = ChannelId::from(req.channel_id);
+        let Some(channel) = self.channels.lock().await.get(&channel_id).cloned() else {
+            tee.abandon();
+            return self
+                .respond_error(&mut send, req, ServeRejectReason::UnknownChannel)
+                .await;
+        };
+
+        let rate_per_mb = self.clamped_rate();
+
+        // (1) Pre-flight deposit guard: refuse the speculative pull if the channel
+        // provably cannot pay the cost it would front. With a finite
+        // `max_blob_size_bytes` the ceiling is the worst-case whole-blob cost. When
+        // the size cap is unbounded (`0`) there is no whole-blob ceiling, so the
+        // guard falls back to the per-request speculative *window* cost — it must
+        // never fully fail open, or disabling the size cap would silently disable
+        // deposit protection and let a near-empty channel trigger an unbounded
+        // speculative pull (#856). The window is `pull_ahead_bytes` floored at one
+        // voucher interval, matching `window_forward_loop`.
+        let guard_bytes = if self.max_blob_size_bytes > 0 {
+            self.max_blob_size_bytes
+        } else {
+            let interval_bytes = self.voucher_interval_mb.saturating_mul(MB_BYTES).max(1);
+            self.pull_ahead_bytes
+                .get()
+                .copied()
+                .unwrap_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES)
+                .max(interval_bytes)
+        };
+        let ceiling = min_payment(guard_bytes, rate_per_mb);
+        let (deposit, last_amount) = {
+            let guard = channel.lock().await;
+            (guard.state.deposit, guard.state.last_amount())
+        };
+        if deposit.saturating_sub(last_amount) < ceiling {
+            tee.abandon();
+            return self
+                .respond_error(&mut send, req, ServeRejectReason::InsufficientDeposit)
+                .await;
+        }
+
+        // (2) Seed-leech admission: global unrecouped budget + per-peer share
+        // ratio. `may_pull` bumps its own pause metric on refusal.
+        let peer = client_node_id.0;
+        if !self.leech_may_pull(&peer) {
+            tee.abandon();
+            return self
+                .respond_error(&mut send, req, ServeRejectReason::CacheMiss)
+                .await;
+        }
+
+        // (3) Open the progressive upstream pull, bounded by the pull-through
+        // deadline so a slow/absent upstream can't pin the stream.
+        let deadline = self
+            .pull_through
+            .get()
+            .copied()
+            .unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
+        let (header, pull) =
+            match tokio::time::timeout(deadline, origin.open_progressive_pull(hash)).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    tee.abandon();
+                    self.maybe_spawn_background_fill(hash);
+                    return self
+                        .respond_error(&mut send, req, ServeRejectReason::CacheMiss)
+                        .await;
+                }
+                Err(_elapsed) => {
+                    tee.abandon();
+                    self.metrics.node_pull_through_timeout();
+                    self.maybe_spawn_background_fill(hash);
+                    return self
+                        .respond_error(&mut send, req, ServeRejectReason::CacheMiss)
+                        .await;
+                }
+            };
+        let total_bytes = header.total_bytes;
+
+        // (4) Size gate on the upstream-claimed total.
+        if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
+            pull.abandon(None);
+            tee.abandon();
+            return self
+                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge)
+                .await;
+        }
+
+        // (5) Voucher-interval negotiation (ADR 003), then sign + send the
+        // response up front — it commits to `total_bytes`, now known from the
+        // upstream header.
+        let interval_mb = match ext.voucher_interval_mb {
+            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
+            None => self.voucher_interval_mb,
+        };
+        let body = StreamResponseBody {
+            hash: req.hash,
+            ok: true,
+            rate_per_mb,
+            total_bytes,
+            channel_id: req.channel_id,
+            timestamp_us: req.timestamp_us,
+            redirect: None,
+        };
+        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
+            .await?;
+
+        // (6) Fused window-paced loop. Boxed to keep the large loop future off
+        // this frame (clippy::large_futures).
+        Box::pin(self.window_forward_loop(
+            &mut send,
+            &mut recv,
+            hash,
+            channel_id,
+            &channel,
+            client_node_id,
+            rate_per_mb,
+            interval_mb,
+            total_bytes,
+            pull,
+            tee,
+        ))
+        .await
+    }
+
+    /// The fused pull-forward-pay loop (#856). Pulls upstream chunks (teeing each
+    /// to the cache and forwarding to the client) but keeps the unrecouped frontier
+    /// (`pulled − paid`) within the window, collecting one downstream voucher per
+    /// interval to recoup before pulling further. A client that drops or underpays
+    /// costs at most one window of upstream spend.
+    ///
+    /// Precise bound: the window is checked at the top of the pull phase, *before*
+    /// fetching the next chunk, so the realized frontier can overshoot by up to one
+    /// `pull_chunk_bytes` chunk (the chunk that crosses the threshold). The
+    /// documented `pull_ahead_bytes` exposure is therefore exact only to within one
+    /// chunk — negligible at the default ~1 MiB window vs `CHUNK_SIZE`, but the
+    /// "≤ one window" claims elsewhere mean "≤ window + one chunk".
+    // The pull-ahead / recoup / finalize phases are one linear flow; splitting
+    // them across helpers would scatter the shared loop state (frontier counters,
+    // pending intervals) and obscure the bound, so the length/complexity is
+    // intrinsic.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
+    async fn window_forward_loop(
+        &self,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        hash: Hash,
+        channel_id: ChannelId,
+        channel: &Arc<Mutex<ChannelDeliveryState>>,
+        client_node_id: B256,
+        rate_per_mb: u64,
+        interval_mb: u64,
+        total_bytes: u64,
+        mut pull: NodeProgressivePull,
+        mut tee: TeeSink,
+    ) -> anyhow::Result<()> {
+        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        // The window must be at least one interval so the loop can always make
+        // progress (pull a full interval, then collect its voucher); a configured
+        // `pull_ahead_bytes` above that lets the pull run further ahead.
+        let window = self
+            .pull_ahead_bytes
+            .get()
+            .copied()
+            .unwrap_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES)
+            .max(interval_bytes);
+        let peer = client_node_id.0;
+
+        let mut pulled: u64 = 0;
+        let mut served_paid: u64 = 0;
+        // Bytes forwarded since the last completed interval (the sub-interval
+        // remainder), and the completed-but-unpaid interval deltas awaiting
+        // collection — together these are the unrecouped frontier.
+        let mut unvouchered: u64 = 0;
+        let mut pending: VecDeque<u64> = VecDeque::new();
+        let mut upstream_done = false;
+
+        loop {
+            let pulled_at_iter_start = pulled;
+            // --- pull-ahead phase: forward chunks until the window is reached,
+            // the caps refuse, or the upstream is exhausted ---
+            let mut window_hit = false;
+            while !upstream_done && pulled < total_bytes {
+                if pulled.saturating_sub(served_paid) >= window {
+                    window_hit = true;
+                    break;
+                }
+                if !self.leech_may_pull(&peer) {
+                    break;
+                }
+                match pull.next_chunk().await {
+                    Ok(Some(chunk)) => {
+                        let len = chunk.len() as u64;
+                        // Charge the speculative spend to the seed-leech governor
+                        // and advance the window frontier the instant the upstream
+                        // is paid for this chunk (inside `next_chunk`), BEFORE the
+                        // fallible tee/forward below. Recording only after a
+                        // successful forward would under-count already-paid bytes
+                        // on the abandon paths, leaving the abuse caps blind to
+                        // spend the node really incurred (#856).
+                        pulled = pulled.saturating_add(len);
+                        self.leech_record_pulled(&peer, len);
+                        if let Err(e) = tee.write(&chunk).await {
+                            pull.abandon(None);
+                            tee.abandon();
+                            return Err(anyhow::anyhow!("cache tee write failed: {e}"));
+                        }
+                        if let Err(e) = self
+                            .write_message(
+                                send,
+                                &ClientMessage::ChunkData(ChunkData {
+                                    bytes: chunk.to_vec(),
+                                }),
+                            )
+                            .await
+                        {
+                            // Downstream dropped mid-pull (the #856 shape): stop
+                            // the upstream spend and persist the buyer watermark
+                            // (#852, via `abandon`) before surfacing the error.
+                            self.abandon_window_serve(pull, tee);
+                            return Err(e);
+                        }
+                        unvouchered = unvouchered.saturating_add(len);
+                        if unvouchered >= interval_bytes {
+                            pending.push_back(unvouchered);
+                            unvouchered = 0;
+                        }
+                    }
+                    // Upstream ended before the promised total — a short delivery.
+                    // Stop pulling; `pull.finish()` below surfaces it.
+                    Ok(None) => upstream_done = true,
+                    Err(e) => {
+                        // Upstream fault mid-pull: abandon both sides and reset the
+                        // downstream stream so the client retries elsewhere.
+                        pull.abandon(Some(&e));
+                        tee.abandon();
+                        return Err(e);
+                    }
+                }
+            }
+            if window_hit {
+                self.metrics.node_pull_through_window_paused();
+            }
+
+            // --- recoup phase: collect ONE downstream voucher per outer
+            // iteration to free the window — a completed interval (drained in
+            // order), else the closing partial once the whole blob is pulled. A
+            // short upstream never earns a closing voucher from the client. ---
+            let done_pulling = upstream_done || pulled >= total_bytes;
+            let to_collect = if let Some(delta) = pending.pop_front() {
+                Some(delta)
+            } else if done_pulling && pulled >= total_bytes && unvouchered > 0 {
+                let closing = unvouchered;
+                unvouchered = 0;
+                Some(closing)
+            } else {
+                None
+            };
+            if let Some(delta) = to_collect {
+                match self
+                    .collect_voucher(
+                        send,
+                        recv,
+                        hash,
+                        channel_id,
+                        Some(channel),
+                        client_node_id,
+                        rate_per_mb,
+                        delta,
+                    )
+                    .await
+                {
+                    Ok(VoucherOutcome::Accepted) => {
+                        served_paid = served_paid.saturating_add(delta);
+                    }
+                    Ok(VoucherOutcome::Rejected) => {
+                        self.abandon_window_serve(pull, tee);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        // A transport drop (the #856 client-disconnect shape) or an
+                        // underpayment bail. Stop the upstream spend, PERSIST the
+                        // buyer watermark for what we paid (#852, via `abandon`),
+                        // and surface the error so the stream resets.
+                        self.abandon_window_serve(pull, tee);
+                        return Err(e);
+                    }
+                }
+            }
+
+            // Livelock guard (#856): an iteration that neither pulled a chunk (a
+            // seed-leech cap denied the speculative pull) nor collected a voucher,
+            // with the blob not yet fully pulled, cannot make progress — the cap
+            // will keep denying with nothing to recoup. Refuse to continue the
+            // speculative pull (ADR 037 §Seed-leech caps) rather than spin with no
+            // await point (which would starve the runtime): drop the partial fill
+            // and reset the stream so the client retries (per-request loss stays
+            // bounded by the window). The pause cause is already metered by
+            // `may_pull`.
+            let made_pull_progress = pulled > pulled_at_iter_start;
+            if !made_pull_progress && to_collect.is_none() && !done_pulling {
+                pull.abandon(None);
+                tee.abandon();
+                let _ = send.finish();
+                return Ok(());
+            }
+
+            // Done when there is nothing left to pull and nothing left to collect
+            // (full delivery), or the upstream came up short (no closing voucher).
+            if pending.is_empty() && done_pulling && (unvouchered == 0 || pulled < total_bytes) {
+                break;
+            }
+        }
+
+        // Finalize: verify the upstream (whole-blob hash) and, on success, promote
+        // the teed blob so this node becomes a discoverable holder.
+        match pull.finish().await {
+            Ok(()) => {
+                if let Err(e) = tee.finish().await {
+                    // Bytes were already served and paid; a store-side promote
+                    // failure only forfeits the warm-cache benefit. Meter it so a
+                    // node that is paying upstream egress but caching nothing is
+                    // alertable, not just a debug-able log line.
+                    self.metrics.node_pull_through_tee_finalize_failed();
+                    tracing::warn!(%hash, error = %e, "window pull-through tee finalize failed; blob served but not cached");
+                }
+                self.write_message(send, &ClientMessage::StreamEnd).await?;
+                let _ = send.finish();
+                Ok(())
+            }
+            Err(e) => {
+                // Corrupt or short upstream: do NOT promote the blob. The
+                // downstream runs its own end-to-end hash check and rejects;
+                // close the send side cleanly so it observes the (short) end.
+                tee.abandon();
+                self.metrics.node_pull_through_upstream_verify_failed();
+                tracing::warn!(%hash, error = %e, "window pull-through upstream failed final verification; not caching");
+                let _ = send.finish();
+                Ok(())
+            }
+        }
+    }
+
+    /// The #856 abandonment path: the downstream client underpaid or dropped
+    /// mid-pull. Stop the upstream spend immediately (exposure ≤ one window),
+    /// drop the partial fill, and meter it. The rejection was already written to
+    /// the client by `collect_voucher`, so the caller just returns `Ok(())`.
+    fn abandon_window_serve(&self, pull: NodeProgressivePull, tee: TeeSink) {
+        pull.abandon(None);
+        tee.abandon();
+        self.metrics.node_pull_through_client_abandoned();
     }
 
     /// Stream blob bytes in `voucher_interval_mb`-sized batches, pausing to
@@ -1147,6 +1655,14 @@ impl ClientHandler {
                 if let Some(acc) = self.region_accountant.get() {
                     acc.record_served(&client_node_id.0, delta_bytes).await;
                 }
+                // Credit the served bytes against the seed-leech caps (#856) for
+                // BOTH cache-hit and window-paced pull-through serves: this
+                // recoups the node-wide unrecouped-leech budget and raises the
+                // paying peer's per-peer share-ratio allowance. Best-effort —
+                // unattached (tests / feature off) just skips.
+                if let Some(gov) = self.leech_governor.get() {
+                    gov.record_served(&client_node_id.0, delta_bytes);
+                }
                 // Nonce-gap signal (#747): the voucher was accepted, but its
                 // nonce skipped values past the prior `last_nonce + 1`. The
                 // structured `tracing::warn!` already fired inside
@@ -1293,6 +1809,9 @@ impl ClientHandler {
                 self.metrics.serve_stream_rejected_unknown_channel();
             }
             ServeRejectReason::OwnerMismatch => self.metrics.serve_stream_rejected_owner_mismatch(),
+            ServeRejectReason::InsufficientDeposit => {
+                self.metrics.serve_stream_rejected_insufficient_deposit();
+            }
         }
         let error = reason.wire_error();
         let rate_per_mb = self.clamped_rate();

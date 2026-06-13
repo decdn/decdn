@@ -215,6 +215,17 @@ pub struct ResolvedCache {
     /// Per-pull wall-clock timeout in seconds for a node-to-node miss fill
     /// (#831). Default [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`].
     pub node_pull_timeout_sec: u64,
+    /// Window-paced pull-through pipeline window in bytes (#856, ADR 037
+    /// `pull_ahead_bytes`). Default [`crate::config::DEFAULT_PULL_AHEAD_BYTES`].
+    /// Bounds per-request speculative loss to this window.
+    pub pull_ahead_bytes: u64,
+    /// Node-wide unrecouped-leech budget in bytes (#856, ADR 037
+    /// `max_unrecouped_leech_bytes`). Default
+    /// [`crate::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES`]; `0` disables.
+    pub max_unrecouped_leech_bytes: u64,
+    /// Per-peer share ratio as a percentage (#856, ADR 037 `share_ratio`;
+    /// `100` == 1.0×). Default [`crate::config::DEFAULT_PULL_SHARE_RATIO_PERCENT`].
+    pub pull_share_ratio_percent: u64,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors

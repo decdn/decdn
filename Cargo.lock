@@ -2706,6 +2706,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "blake3",
  "bytes",
  "clap",
  "decdn-cache",
