@@ -1062,31 +1062,29 @@ impl ClientHandler {
             }
         }
 
-        // Hard per-byte price floor (#846). The check above enforces the node's
-        // *advertised* `rate_per_mb` with `DEFAULT_TOLERANCE_BPS` (1%) slack;
-        // this one re-checks the same delta against `delivery_floor` with ZERO
-        // tolerance, so a synced node's accept decision is bit-identical to the
-        // on-chain `PaymentChannel` `RateFloorViolation` settlement guard. The
-        // net effect over the advertised check is rejecting the narrow
-        // `(floor - 1%, floor)` band the chain would reject at settlement, so a
-        // synced node never countersigns a voucher it then cannot redeem.
+        // Hard per-byte price floor (#846), checked on the CUMULATIVE watermark
+        // the voucher carries (`amount` / `new_bytes`) — not the per-voucher
+        // delta — so it mirrors the on-chain `PaymentChannel`
+        // `_advanceClaimWatermark` `RateFloorViolation` guard exactly: the chain
+        // floors `bytesDelivered <= mulDiv(amount, BYTES_PER_MB, deliveryFloor)`
+        // on the cumulative claim, never on a single delta. The advertised check
+        // above is per-delta at 1% tolerance; this is the cumulative floor at
+        // ZERO tolerance, so a synced node never countersigns a voucher it then
+        // cannot redeem — including the case where an earlier under-floor voucher
+        // (accepted while the floor was 0) drags the watermark below the floor
+        // even though the latest delta alone would clear it. A per-delta check
+        // would both miss that (false accept) and reject a delta drawing down an
+        // earlier overpayment surplus the chain would settle (false reject).
         //
-        // Scope of protection follows `delivery_floor`, the local stand-in for
-        // on-chain `getRateBounds()` (ADR 005): when synced from the chain it is
-        // `>= MIN_DEPOSIT_FLOOR (1)` and this check is live; at its default of
-        // `0` (also the deliberate free-serving config, #864) `verify_rate`'s
-        // RHS is `0` so the check is inert — the always-`>= 1` on-chain floor is
-        // the authoritative enforcement in that case. Match every arm for the
-        // same reason as the advertised check (#845): `delta_bytes > 0` here, so
-        // `ZeroBytes`/`Overflow` are unreachable, but an exhaustive `match`
-        // makes a future `RateError` variant a build failure rather than a
-        // silent accept.
-        match verify_rate(
-            amount_delta,
-            U256::from(delta_bytes),
-            self.delivery_floor,
-            0,
-        ) {
+        // Scope follows `delivery_floor`, the local stand-in for on-chain
+        // `getRateBounds()` (ADR 005): synced from the chain it is `>=
+        // MIN_DEPOSIT_FLOOR (1)` and the check is live; at its default `0` (the
+        // deliberate free-serving config, #864) `verify_rate`'s RHS is `0`, so it
+        // is inert and the always-`>= 1` on-chain floor is authoritative.
+        // `new_bytes >= delta_bytes > 0`, so `ZeroBytes` cannot occur; match
+        // every arm anyway (#845) so a future `RateError` variant is a build
+        // failure rather than a silent accept.
+        match verify_rate(amount, new_bytes, self.delivery_floor, 0) {
             Ok(()) => {}
             Err(RateError::Underpayment { .. }) => {
                 self.metrics.voucher_rate_floor_rejected();

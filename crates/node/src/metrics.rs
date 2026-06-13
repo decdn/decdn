@@ -163,13 +163,14 @@ pub struct DecdnMetrics {
     /// validation). Operator-visible name:
     /// `decdn_rate_bounds_clamp_events_total`.
     pub rate_bounds_clamp_events: Counter,
-    /// Vouchers refused because their `amount_delta / bytes_delta` fell below
-    /// the configured per-byte price floor (`delivery_floor`) at zero tolerance,
-    /// mirroring the on-chain `PaymentChannel` `RateFloorViolation` settlement
-    /// check (#846). Only increments when `delivery_floor > 0` (i.e. the node
-    /// has synced on-chain bounds); at the default floor of `0` the check is
-    /// inert and this stays zero regardless of voucher quality. A non-zero count
-    /// means a counterparty signed a voucher this node could not redeem on-chain.
+    /// Vouchers refused because their cumulative `amount / bytes_delivered`
+    /// watermark fell below the configured per-byte price floor (`delivery_floor`)
+    /// at zero tolerance, mirroring the on-chain `PaymentChannel`
+    /// `RateFloorViolation` settlement check (which likewise floors the cumulative
+    /// claim, #846). Only increments when `delivery_floor > 0` (i.e. the node has
+    /// synced on-chain bounds); at the default floor of `0` the check is inert and
+    /// this stays zero regardless of voucher quality. A non-zero count means a
+    /// counterparty signed a voucher this node could not redeem on-chain.
     /// Operator-visible name: `decdn_voucher_rate_floor_rejections_total`.
     pub voucher_rate_floor_rejections: Counter,
     /// `cdn/dht/v1` requests rejected by the per-peer (`NodeId`) token
