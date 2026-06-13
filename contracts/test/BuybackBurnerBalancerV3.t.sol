@@ -23,6 +23,14 @@ contract MockUSDC is ERC20 {
     }
 }
 
+contract MockHighDecimalsToken is ERC20 {
+    constructor() ERC20("X", "X") { }
+
+    function decimals() public pure override returns (uint8) {
+        return 19;
+    }
+}
+
 /// @notice Minimal Balancer V3 Vault mock. Holds the pool's token set + their
 ///         scaled-18 live balances, and exposes `pull` (the leg the Router
 ///         drives) which uses the BuybackBurner's scoped allowance — mirroring
@@ -76,10 +84,10 @@ contract MockBalancerV3WeightedPool {
     }
 }
 
-/// @notice Minimal Balancer V3 Router mock. Asserts the caller scoped its USDC
-///         allowance to the Vault to exactly `exactAmountIn`, drives the Vault
-///         pull, enforces `minAmountOut`, and pays `amountOut` TOKEN out of its
-///         own (pre-funded) balance.
+/// @notice Minimal Balancer V3 Router mock. Records the caller's USDC allowance
+///         to the Vault in `observedAllowance` (the test asserts it equals
+///         `exactAmountIn`), drives the Vault pull, enforces `minAmountOut`, and
+///         pays `amountOut` TOKEN out of its own (pre-funded) balance.
 contract MockBalancerV3Router {
     MockBalancerV3Vault internal vault;
 
@@ -484,6 +492,23 @@ contract BuybackBurnerBalancerV3Test is Test {
             abi.encodeWithSelector(BuybackBurnerBalancerV3.BuybackBandInverted.selector, MIN_BUYBACK, MIN_BUYBACK - 1)
         );
         bb.setMaxBuybackAmount(MIN_BUYBACK - 1);
+    }
+
+    function test_constructor_revertsOnUsdcDecimalsAbove18() public {
+        MockHighDecimalsToken bad = new MockHighDecimalsToken();
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnerBalancerV3.UnsupportedTokenDecimals.selector, uint8(19)));
+        new BuybackBurnerBalancerV3(IERC20(address(bad)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_poke_revertsWhenPoolUnwired() public {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.pool_ = address(0);
+        cfg.vault_ = address(0);
+        BuybackBurnerBalancerV3 bb2 =
+            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        vm.expectRevert(BuybackBurner.PoolNotWired.selector);
+        bb2.poke();
     }
 
     function test_getAccumulatedFees_reportsUsdcBalance() public view {

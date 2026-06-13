@@ -150,6 +150,7 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
     error CapFractionOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error TwapWindowTooShort(uint256 value, uint256 floor);
     error BuybackBandInverted(uint256 minAmount, uint256 maxAmount);
+    error UnsupportedTokenDecimals(uint8 decimals);
     error PoolStateInvalid();
 
     // -----------------------------------------------------------------
@@ -203,7 +204,12 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         slippageBps = cfg.slippageBps_;
         epochLiquidityCapFraction = cfg.epochLiquidityCapFraction_;
 
-        usdcTo18 = 10 ** (18 - IERC20Metadata(address(usdc_)).decimals());
+        // Constructor read + immutable write — no reentrancy surface; aderyn's
+        // external-call-then-state-write heuristic false-positives in a ctor.
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        uint8 usdcDecimals = IERC20Metadata(address(usdc_)).decimals();
+        if (usdcDecimals > 18) revert UnsupportedTokenDecimals(usdcDecimals);
+        usdcTo18 = 10 ** (18 - usdcDecimals);
     }
 
     // -----------------------------------------------------------------
@@ -255,6 +261,7 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
     ///         samples between buybacks so the floor isn't dominated by a single
     ///         stale observation across a long gap.
     function poke() external {
+        if (balancerPool == address(0) || balancerVault == address(0)) revert PoolNotWired();
         _updateTwapAccumulator();
     }
 
@@ -437,7 +444,11 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
     ///      out = TOKEN. Balances are Vault `*Scaled18`; weights are 1e18.
     function _spotPrice() internal view returns (uint256) {
         (uint256 balUsdc18, uint256 balToken18, uint256 wUsdc, uint256 wToken) = _poolState();
-        return Math.mulDiv(wUsdc * balToken18, WAD, balUsdc18 * wToken);
+        // = (wUsdc * balToken18 * WAD) / (balUsdc18 * wToken), nested through
+        // `mulDiv` so neither product is formed in plain uint256 (no
+        // pre-multiplication overflow for large pools). WAD is applied first to
+        // preserve precision before the weight ratio.
+        return Math.mulDiv(Math.mulDiv(balToken18, WAD, balUsdc18), wUsdc, wToken);
     }
 
     function _usdcDepthRaw() internal view returns (uint256) {
