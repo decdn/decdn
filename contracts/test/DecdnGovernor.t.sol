@@ -76,13 +76,21 @@ contract DecdnGovernorTest is Test {
         assertEq(gov.getVotes(operator, EPOCH * 20), 0);
     }
 
-    // Base time large enough that subtracting 365 days does not underflow,
-    // and bytes set at the query-epoch (`tp / EPOCH`).
+    // Base time large enough that subtracting 365 days does not underflow.
+    // Bytes are seeded at the last fully-elapsed epoch (`tp / EPOCH - 1`),
+    // which is the window endpoint the Governor reads after #847 — settlements
+    // in the in-progress epoch (`tp / EPOCH`) are deliberately not counted.
     uint256 internal constant BASE = 2 * 365 days;
     uint256 internal immutable tp = BASE + 1;
 
+    /// @dev Epoch the vote window ends on after #847: the last fully-elapsed
+    ///      epoch as of `tp`.
+    function _endEpoch() internal view returns (uint64) {
+        return uint64(tp / EPOCH) - 1;
+    }
+
     function _setBytesAtTimepoint(address op, uint256 served, uint256 total) internal {
-        uint64 e = uint64(tp / EPOCH);
+        uint64 e = _endEpoch();
         feeRouter.setBytes(op, e, served);
         feeRouter.setTotalBytes(e, total);
     }
@@ -108,8 +116,9 @@ contract DecdnGovernorTest is Test {
         bond.setFirstBondedAt(operator, uint64(BASE - 180 days));
         _setBytesAtTimepoint(operator, 100_000, 1_000_000);
         // Mock stores the raw encoded value; pass `actualEpoch + 1` to mirror
-        // the real CapacityBond's +1 stamp convention.
-        bond.setSlashedAtEpoch(operator, uint64(tp / EPOCH) + 1);
+        // the real CapacityBond's +1 stamp convention. The slash lands on the
+        // window endpoint (`_endEpoch()`), so the stamp is `_endEpoch() + 1`.
+        bond.setSlashedAtEpoch(operator, _endEpoch() + 1);
         assertEq(gov.getVotes(operator, tp), 0);
     }
 
@@ -118,9 +127,10 @@ contract DecdnGovernorTest is Test {
         bond.setFirstBondedAt(operator, uint64(BASE - 365 days));
         _setBytesAtTimepoint(operator, 100_000, 1_000_000);
 
-        // Slash at actual epoch 5; current window of 13 ends near (BASE / EPOCH) ≈ 104.
-        // Slash falls well before windowStart, so vote weight is non-zero.
-        // Pass `actualEpoch + 1` per the +1-offset convention.
+        // Slash at actual epoch 5; the window of 13 ends at `_endEpoch()` and so
+        // starts at `_endEpoch() + 1 - WINDOW` (≈ 91). Slash falls well before
+        // windowStart, so vote weight is non-zero. Pass `actualEpoch + 1` per the
+        // +1-offset convention.
         bond.setSlashedAtEpoch(operator, 5 + 1);
         assertGt(gov.getVotes(operator, tp), 0);
     }
@@ -136,14 +146,16 @@ contract DecdnGovernorTest is Test {
 
     function test_quorum_isFourPercentOfTotalBytesInWindow() public {
         vm.warp(BASE + 2);
-        feeRouter.setTotalBytes(uint64(tp / EPOCH), 1_000_000);
+        // Seed the last fully-elapsed epoch the window reads (#847).
+        feeRouter.setTotalBytes(_endEpoch(), 1_000_000);
         assertEq(gov.quorum(tp), 40_000);
     }
 
     function test_proposalThreshold_isPointOnePercent() public {
         vm.warp(BASE + 2);
-        // proposalThreshold uses clock() - 1 = block.timestamp - 1.
-        feeRouter.setTotalBytes(uint64((block.timestamp - 1) / EPOCH), 1_000_000);
+        // proposalThreshold uses clock() - 1 = block.timestamp - 1, and reads
+        // the last fully-elapsed epoch of that snapshot (#847).
+        feeRouter.setTotalBytes(uint64((block.timestamp - 1) / EPOCH) - 1, 1_000_000);
         assertEq(gov.proposalThreshold(), 1000);
     }
 
@@ -267,5 +279,132 @@ contract DecdnGovernorTest is Test {
         // The historical snapshot weight must NOT change — the slash is
         // beyond `endEpoch` of the historical window.
         assertEq(gov.getVotes(operator, tp), historicalWeight);
+    }
+
+    /// @notice #847 regression — the core defect. A settlement landing in the
+    ///         in-progress epoch (`tp / EPOCH`) after a proposal snapshot must
+    ///         NOT change the weight read at that snapshot. Because the window
+    ///         now ends at the last fully-elapsed epoch and `routeSettlement`
+    ///         only ever writes the current bucket, the snapshot read is
+    ///         immutable. This assertion FAILS on the pre-#847 code (which read
+    ///         the live current-epoch bucket) and PASSES after the fix.
+    function test_getVotes_immuneToCurrentEpochSettlement() public {
+        vm.warp(BASE + 2);
+        bond.setFirstBondedAt(operator, uint64(BASE - 365 days));
+        _setBytesAtTimepoint(operator, 100_000, 1_000_000);
+
+        uint256 w0 = gov.getVotes(operator, tp);
+        assertEq(w0, 50_000); // 5% cap of 1M, full ramp.
+
+        // Simulate a mid-vote settlement: the node settles a large byte count
+        // into the CURRENT (in-progress) epoch bucket — the mock analogue of
+        // `FeeRouter.routeSettlement` writing `block.timestamp / epochLength`.
+        uint64 currentEpoch = uint64(tp / EPOCH);
+        feeRouter.setBytes(operator, currentEpoch, 1_000_000_000);
+        feeRouter.setTotalBytes(currentEpoch, 1_000_000_000);
+
+        // Weight at the snapshot is unchanged — the current epoch is excluded.
+        assertEq(gov.getVotes(operator, tp), w0);
+        // Quorum (also windowed) is likewise unaffected by the in-progress epoch.
+        assertEq(gov.quorum(tp), 40_000);
+    }
+
+    /// @notice #847 edge — before any epoch has fully elapsed (snapshot inside
+    ///         epoch 0), the window is empty: weight, quorum, and threshold all
+    ///         return 0 without underflowing `uint64` in `_endEpoch`.
+    function test_getVotes_zeroBeforeFirstElapsedEpoch() public {
+        // A timepoint strictly inside epoch 0.
+        uint256 early = EPOCH - 1;
+        bond.setFirstBondedAt(operator, 0);
+        // Even with bytes seeded in epoch 0, nothing is counted yet.
+        feeRouter.setBytes(operator, 0, 100_000);
+        feeRouter.setTotalBytes(0, 1_000_000);
+
+        assertEq(gov.getVotes(operator, early), 0);
+        assertEq(gov.quorum(early), 0);
+
+        // proposalThreshold reads `clock() - 1`; warp into epoch 0 so the
+        // snapshot is still pre-first-elapsed-epoch.
+        vm.warp(EPOCH - 1);
+        assertEq(gov.proposalThreshold(), 0);
+    }
+
+    /// @notice #847 accepted trade-off — a slash recorded in the in-progress
+    ///         epoch does NOT zero a proposal snapshotted earlier in that same
+    ///         epoch; it takes effect once the epoch elapses (the slash window
+    ///         tracks the byte window). Encoded so a future reader does not
+    ///         "tighten" it back and silently reintroduce the snapshot-mutation
+    ///         defect via the slash leg.
+    function test_slash_inCurrentEpoch_doesNotZeroEarlierSnapshot() public {
+        vm.warp(BASE + 2);
+        bond.setFirstBondedAt(operator, uint64(BASE - 365 days));
+        _setBytesAtTimepoint(operator, 100_000, 1_000_000);
+
+        uint256 w0 = gov.getVotes(operator, tp);
+        assertGt(w0, 0);
+
+        // Slash stamped in the CURRENT (in-progress) epoch: actualEpoch =
+        // tp/EPOCH, stamp = tp/EPOCH + 1. That epoch is > `_endEpoch()`, so the
+        // historical snapshot at `tp` is unaffected.
+        bond.setSlashedAtEpoch(operator, uint64(tp / EPOCH) + 1);
+        assertEq(gov.getVotes(operator, tp), w0);
+    }
+
+    /// @notice #847 boundary — the slash window's lower edge is inclusive. A
+    ///         slash at exactly `windowStart` zeroes the vote; one epoch earlier
+    ///         does not. Pins the `>=` bound that the `endEpoch` shift perturbs
+    ///         (only the upper `== endEpoch` edge was previously asserted).
+    function test_getVotes_slashAtWindowStartBoundary() public {
+        vm.warp(BASE + 2);
+        bond.setFirstBondedAt(operator, uint64(BASE - 365 days));
+        _setBytesAtTimepoint(operator, 100_000, 1_000_000);
+
+        uint64 windowStart = _endEpoch() + 1 - WINDOW;
+
+        // Slash exactly at windowStart (stamp = actualEpoch + 1) → in window → 0.
+        bond.setSlashedAtEpoch(operator, windowStart + 1);
+        assertEq(gov.getVotes(operator, tp), 0);
+
+        // One epoch before windowStart → outside the window → non-zero.
+        bond.setSlashedAtEpoch(operator, windowStart);
+        assertGt(gov.getVotes(operator, tp), 0);
+    }
+
+    /// @notice #847 — an operator whose bytes are ONLY in the in-progress epoch
+    ///         (none in any elapsed epoch) reads exactly 0 weight and contributes
+    ///         0 to quorum. This is the standalone "in-progress excluded" case;
+    ///         `test_getVotes_immuneToCurrentEpochSettlement` proves the elapsed
+    ///         bucket is unaffected, this proves the in-progress bucket alone is
+    ///         not counted.
+    function test_getVotes_inProgressOnlyBytesReadZero() public {
+        vm.warp(BASE + 2);
+        bond.setFirstBondedAt(operator, uint64(BASE - 365 days));
+
+        // Bytes exist only in the current (in-progress) epoch — nothing elapsed.
+        uint64 currentEpoch = uint64(tp / EPOCH);
+        feeRouter.setBytes(operator, currentEpoch, 100_000);
+        feeRouter.setTotalBytes(currentEpoch, 1_000_000);
+
+        assertEq(gov.getVotes(operator, tp), 0);
+        assertEq(gov.quorum(tp), 0);
+    }
+
+    /// @notice #847 edge — exercises the `!hasElapsed` branch of
+    ///         `_slashedInWindow` specifically (a non-zero slash stamp that
+    ///         passes the `slashStamp == 0` guard but lands in epoch 0). A
+    ///         slashed operator still reads 0 weight, but via the empty-window
+    ///         byte leg (`_cappedServed → 0`), not the slash leg. Encodes the
+    ///         implicit coupling so a future refactor of `_cappedServed`'s
+    ///         epoch-0 behavior can't silently turn this into a slash bypass.
+    function test_getVotes_epoch0_slashedOperatorStillZero() public {
+        uint256 early = EPOCH - 1; // strictly inside epoch 0 → !hasElapsed.
+        bond.setFirstBondedAt(operator, 1);
+        feeRouter.setBytes(operator, 0, 100_000);
+        feeRouter.setTotalBytes(0, 1_000_000);
+        // Non-zero slash stamp (actualEpoch 0 → stamp 1): clears the
+        // `slashStamp == 0` guard so `_slashedInWindow` reaches `!hasElapsed`.
+        bond.setSlashedAtEpoch(operator, 1);
+
+        assertEq(gov.getVotes(operator, early), 0);
     }
 }
