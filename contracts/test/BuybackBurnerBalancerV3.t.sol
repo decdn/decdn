@@ -299,6 +299,14 @@ contract BuybackBurnerBalancerV3Test is Test {
         fresh.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
     }
 
+    function test_executeBuyback_revertsOnDegenerateSwapFee() public {
+        // A 100% pool fee would collapse the floor to 0 (fail-open); reject it.
+        vault.setSwapFee(1e18);
+        vm.prank(keeper);
+        vm.expectRevert(BuybackBurnerBalancerV3.PoolStateInvalid.selector);
+        bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
+    }
+
     function test_twapFloor_resistsSingleBlockSpotSpike() public {
         uint256 before = bb.twapPrice();
         // Halve the TOKEN leg in one block -> spot doubles instantaneously.

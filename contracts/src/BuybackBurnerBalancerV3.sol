@@ -430,7 +430,10 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         uint256 amountIn18 = amountIn * usdcTo18;
         uint256 expectedOut = Math.mulDiv(amountIn18, price, WAD);
         // Net the swap fee (1e18-scaled) before applying the slippage tolerance.
+        // A degenerate `feeE18 >= WAD` would collapse the floor to 0 (fail-open),
+        // so reject it (real Balancer pools cap the swap fee well below 100%).
         uint256 feeE18 = IBalancerV3Vault(balancerVault).getStaticSwapFeePercentage(balancerPool);
+        if (feeE18 >= WAD) revert PoolStateInvalid();
         uint256 afterFee = Math.mulDiv(expectedOut, WAD - feeE18, WAD);
         return Math.mulDiv(afterFee, BPS_DENOMINATOR - slippageBps, BPS_DENOMINATOR);
     }
