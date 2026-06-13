@@ -146,23 +146,34 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     // Vote source + quorum/threshold (ADR 036 § Formula)
     // -----------------------------------------------------------------
 
-    /// @notice Quorum = 4% of `totalBytesInWindow(epoch(t), windowEpochs)`.
+    /// @notice Quorum = 4% of `totalBytesInWindow(endEpoch, windowEpochs)`.
     ///         The denominator is the unramped, uncapped total — a conservative
     ///         upper bound on the true Σ vote weight; documented in
-    ///         ADR 036 § Behaviors that follow from the formula.
+    ///         ADR 036 § Behaviors that follow from the formula. The window ends
+    ///         at the last fully-elapsed epoch (`_endEpoch`, #847) so the read is
+    ///         immutable at the snapshot timepoint.
     function quorum(uint256 timepoint) public view override returns (uint256) {
-        uint64 endEpoch = uint64(timepoint / feeRouter.epochLength());
+        (uint64 endEpoch, bool hasElapsed) = _endEpoch(timepoint);
+        if (!hasElapsed) return 0;
         uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
         uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
         return (total * QUORUM_NUMERATOR) / QUORUM_DENOMINATOR;
     }
 
     /// @notice Proposal threshold = 0.1% of `totalBytesInWindow` at `clock() - 1`,
-    ///         consistent with the OZ Governor proposer-weight snapshot.
+    ///         consistent with the OZ Governor proposer-weight snapshot. Counts
+    ///         only fully-elapsed epochs (`_endEpoch`, #847).
     function proposalThreshold() public view override returns (uint256) {
         uint256 snapshot = uint256(clock()) - 1;
-        uint64 endEpoch = uint64(snapshot / feeRouter.epochLength());
-        uint64 n = feeRouter.windowEpochsAt(uint48(snapshot));
+        (uint64 endEpoch, bool hasElapsed) = _endEpoch(snapshot);
+        if (!hasElapsed) return 0;
+        // SafeCast (consistent with the `timepoint.toUint48()` reads in `quorum`
+        // / `_cappedServed`). For any reachable timepoint `clock() ≥ 1` (a live
+        // chain's `block.timestamp` is never 0), so `snapshot = clock() - 1 ∈
+        // [0, uint48.max - 1]` and the cast never reverts; the checked cast is
+        // the deliberate backstop if that ever fails (and keeps aderyn's
+        // unsafe-cast detector satisfied / the downcast intent explicit).
+        uint64 n = feeRouter.windowEpochsAt(snapshot.toUint48());
         uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
         return (total * PROPOSAL_THRESHOLD_NUMERATOR) / PROPOSAL_THRESHOLD_DENOMINATOR;
     }
@@ -191,22 +202,26 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     function _slashedInWindow(address account, uint256 timepoint) internal view returns (bool) {
         uint64 slashStamp = capacityBond.slashedAtEpoch(account);
         if (slashStamp == 0) return false;
+        (uint64 endEpoch, bool hasElapsed) = _endEpoch(timepoint);
+        // No fully-elapsed epoch yet ⇒ the byte window is empty, so there is
+        // nothing to zero. Keeps the slash window aligned with the byte window.
+        if (!hasElapsed) return false;
         // `slashedAtEpoch` returns `actualEpoch + 1` (or 0 if unslashed) so
         // an epoch-0 slash isn't collapsed with the unslashed sentinel.
         uint64 slashed = slashStamp - 1;
         uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
-        uint64 endEpoch = uint64(timepoint / feeRouter.epochLength());
         uint64 windowStart = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
-        // Upper-bound the slash epoch at `endEpoch`. A slash that happened
-        // AFTER the snapshot timepoint (e.g., between an old proposal's
-        // snapshot and "now") must NOT retroactively zero historical votes
-        // for that proposal.
+        // Upper-bound the slash epoch at `endEpoch` (the last fully-elapsed
+        // epoch). A slash that happened AFTER the snapshot timepoint — or in the
+        // in-progress epoch — must NOT retroactively zero historical votes for
+        // that proposal (#847: the slash window tracks the byte window).
         return slashed >= windowStart && slashed <= endEpoch;
     }
 
     function _cappedServed(address account, uint256 timepoint) internal view returns (uint256) {
+        (uint64 endEpoch, bool hasElapsed) = _endEpoch(timepoint);
+        if (!hasElapsed) return 0;
         uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
-        uint64 endEpoch = uint64(timepoint / feeRouter.epochLength());
         uint256 served = feeRouter.bytesInWindow(account, endEpoch, n);
         uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
         // Read the per-operator cap at the proposal snapshot, not live, so
@@ -214,6 +229,19 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         uint256 capBps = voteCapBpsAt(timepoint.toUint48());
         uint256 cap = (total * capBps) / BPS_DENOMINATOR;
         return served < cap ? served : cap;
+    }
+
+    /// @dev Last fully-elapsed epoch as of `timepoint`. Returns
+    ///      `hasElapsed = false` when no epoch has completed yet
+    ///      (`timepoint < epochLength`), so callers short-circuit to 0 / `false`
+    ///      instead of underflowing `uint64`. Counting only elapsed epochs makes
+    ///      the served-byte read immutable at the proposal snapshot, since
+    ///      `FeeRouter.routeSettlement` only ever writes the current epoch's
+    ///      bucket and never mutates an elapsed one (#847).
+    function _endEpoch(uint256 timepoint) private view returns (uint64 endEpoch, bool hasElapsed) {
+        uint64 cur = uint64(timepoint / feeRouter.epochLength());
+        if (cur == 0) return (0, false);
+        return (cur - 1, true);
     }
 
     /// @dev Linear ramp from 0 → 1e18 over `rampMonths × SECONDS_PER_MONTH`

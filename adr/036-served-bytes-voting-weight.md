@@ -3,6 +3,17 @@
 **Date:** 2026-05-27
 **Status:** Draft
 
+## Amendment (2026-06-13, #847): window ends at the last fully-elapsed epoch
+
+The vote window ends at the **last fully-elapsed epoch** as of the proposal-snapshot timepoint — `endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1` (the `∅` epoch-0 case ⇒ empty window ⇒ weight 0; see § Formula) — rather than at `epoch(t)`, the in-progress epoch. `FeeRouter.routeSettlement` only ever increments the *current* epoch's bucket, so an in-progress epoch's tally keeps changing after a proposal snapshot. Reading it in `_getVotes`/`quorum`/`proposalThreshold` violated the OpenZeppelin `Governor` snapshot invariant (weight must be immutable after the snapshot): an operator could settle bytes mid-vote and raise its own already-counted weight, and two voters casting at different times saw different totals/quorum. Counting only elapsed epochs — whose buckets are immutable forever — restores determinism with no change to `FeeRouter`.
+
+Consequences of the shift, both bounded by one epoch (≤ 1 week):
+
+- **Served-byte / quorum lag.** The current in-progress epoch's bytes are excluded from vote weight and from the quorum denominator until that epoch elapses. This is the direct cure for the defect, not an incidental cost.
+- **Slash-immediacy lag for same-epoch slashes.** A slash stamped in the in-progress epoch no longer zeroes a proposal snapshotted earlier in that same epoch; it takes effect once the epoch elapses (the slash window tracks the byte window — both end at `endEpoch(t)`). Slashes from prior epochs zero immediately as before.
+
+The formula, slashing-zero-out bound, and pseudocode below are written in their amended (`endEpoch(t)`) form.
+
 ## Context
 
 DAO voting weight could be keyed on declared capacity — `declared_capacity_Mbps × age_ramp(months_bonded)`, sourced from `CapacityBond.declaredMbps × age_ramp` — but declared capacity is operator-asserted at registration time and only loosely tied to actual delivery. A deeply-bonded but lightly-serving operator would then carry a vote weight that does not reflect their real contribution to the network.
@@ -23,17 +34,18 @@ vote_weight(op, t) = min(
     voteCapBps × total_bytes_window(t) / 10_000
 ) × age_ramp(op, t)
 
-served_bytes_window(op, t) = Σ_{e = epoch(t)-N+1 .. epoch(t)} FeeRouter.bytesPerEpoch[op][e]
+served_bytes_window(op, t) = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} FeeRouter.bytesPerEpoch[op][e]
 
-total_bytes_window(t)      = Σ_{e = epoch(t)-N+1 .. epoch(t)} FeeRouter.totalBytesPerEpoch[e]
+total_bytes_window(t)      = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} FeeRouter.totalBytesPerEpoch[e]
 
 age_ramp(op, t) = min(
     (t - CapacityBond.firstBondedAt[op]) / (age_ramp_months × seconds_per_month),
     1.0
 )
 
-epoch(t) = uint64(t / EPOCH_LENGTH)                     // EPOCH_LENGTH = 1 week, immutable
-N        = windowEpochs                                  // default 13 (~1 quarter)
+epoch(t)    = uint64(t / EPOCH_LENGTH)                  // EPOCH_LENGTH = 1 week, immutable
+endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1          // last fully-elapsed epoch (#847); ∅ ⇒ weight 0
+N           = windowEpochs                               // default 13 (~1 quarter)
 ```
 
 Where `t` is the OpenZeppelin Governor timepoint (timestamp clock per ERC-6372, consistent with [ADR 009 § Production](009-governance.md#production-operator-weighted-dao-governance)).
@@ -43,11 +55,11 @@ Where `t` is the OpenZeppelin Governor timepoint (timestamp clock per ERC-6372, 
 - **A registered operator with zero served bytes in the trailing window has zero vote.** The bond gates eligibility to vote; it does not directly grant weight.
 - **A fresh operator who serves heavily on day 1 still ramps in over `age_ramp_months`.** `age_ramp` is the tenure-buy-in defense; it stays defense-in-depth on top of bytes.
 - **Per-operator cap is computed against the bytes-weighted total at the same timepoint**, not against any historical or capacity-derived total. The cap clamp applies pre-multiplication by `age_ramp`.
-- **`quorum(t)` and `proposalThreshold(t)` use `FeeRouter.totalBytesInWindow(epoch(t), N)` as the denominator — an *upper-bound proxy* for `Σ_op vote_weight(op, t)`, not the exact sum.** The exact sum applies the per-operator cap and the `age_ramp` multiplier (both `≤ 1`), so `Σ_op vote_weight ≤ totalBytesInWindow` always. Calibrating quorum against the proxy is intentionally conservative — it makes quorum strictly harder to reach than against the true Σ — and avoids the gas of summing per-operator capped contributions on every `castVote`. The proxy is exact when no operator is above the cap and all operators are past `age_ramp_months` of tenure (the steady state).
+- **`quorum(t)` and `proposalThreshold(t)` use `FeeRouter.totalBytesInWindow(endEpoch(t), N)` as the denominator — an *upper-bound proxy* for `Σ_op vote_weight(op, t)`, not the exact sum.** The exact sum applies the per-operator cap and the `age_ramp` multiplier (both `≤ 1`), so `Σ_op vote_weight ≤ totalBytesInWindow` always. Calibrating quorum against the proxy is intentionally conservative — it makes quorum strictly harder to reach than against the true Σ — and avoids the gas of summing per-operator capped contributions on every `castVote`. The proxy is exact when no operator is above the cap and all operators are past `age_ramp_months` of tenure (the steady state).
 
 ### Slashing zero-out
 
-On any slash invocation (`CapacityBond.slash`), `CapacityBond` stamps `slashedAtEpoch[op] = epoch(block.timestamp)`. The Governor's `_getVotes(op, t)` returns zero whenever `slashedAtEpoch[op] >= epoch(t) - N + 1` — i.e., whenever the slash falls inside the current trailing window. Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
+On any slash invocation (`CapacityBond.slash`), `CapacityBond` stamps `slashedAtEpoch[op] = epoch(block.timestamp) + 1` (the `+1` reserves 0 for "unslashed" so an epoch-0 slash is not collapsed with the sentinel; the getter returns this raw, and `_getVotes` decodes `slashed = slashStamp - 1` before comparing). The Governor's `_getVotes(op, t)` returns zero whenever `endEpoch(t) - N + 1 <= slashed <= endEpoch(t)` — i.e., whenever the slash falls inside the trailing window of fully-elapsed epochs (#847). A slash in the in-progress epoch `epoch(t)` is above `endEpoch(t)` and so zeroes the vote only once that epoch elapses (it tracks the byte window). Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
 
 On a **granted** slash appeal via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `grantAppeal` path (the path that determines the operator was wrongly slashed), `SlashAppeal` calls `CapacityBond.settleAppealGranted`, which refunds the escrowed TOKEN and **recomputes** `slashedAtEpoch[op]` (the internal `_recomputeSlashedAtEpoch`), clearing it to zero only when no slash stands. An **upheld** appeal (`upholdAppeal` / `rejectAppeal`) leaves the field stamped — the slash stands.
 
@@ -78,10 +90,22 @@ The full Solidity surface is documented in [ADR 016 § Contract: FeeRouter](016-
 
 ```solidity
 function _getVotes(address op, uint256 timepoint, bytes memory) override returns (uint256) {
-    uint64 endEpoch = uint64(timepoint / EPOCH_LENGTH);
+    // endEpoch is the last fully-elapsed epoch; cur == 0 ⇒ no window yet (#847).
+    uint64 cur = uint64(timepoint / EPOCH_LENGTH);
+    if (cur == 0) return 0;
+    uint64 endEpoch = cur - 1;
     uint64 windowStart = endEpoch + 1 > windowEpochs ? endEpoch + 1 - windowEpochs : 0;
-    if (capacityBond.slashedAtEpoch(op) >= windowStart) {
-        return 0;
+    // `slashedAtEpoch` returns `actualEpoch + 1`, with 0 reserved for "unslashed"
+    // (so an epoch-0 slash isn't collapsed with the sentinel). Decode the +1
+    // before comparing. The decoded epoch is bounded above by `endEpoch` so a
+    // future / in-progress-epoch slash does not retroactively zero an earlier
+    // snapshot (#847: the slash window tracks the byte window).
+    uint64 slashStamp = capacityBond.slashedAtEpoch(op);
+    if (slashStamp != 0) {
+        uint64 slashed = slashStamp - 1;
+        if (slashed >= windowStart && slashed <= endEpoch) {
+            return 0;
+        }
     }
     uint256 served = feeRouter.bytesInWindow(op, endEpoch, windowEpochs);
     uint256 total  = feeRouter.totalBytesInWindow(endEpoch, windowEpochs);
@@ -92,7 +116,7 @@ function _getVotes(address op, uint256 timepoint, bytes memory) override returns
 }
 ```
 
-`quorum(t)` and `proposalThreshold(t)` use `feeRouter.totalBytesInWindow(epoch(t), windowEpochs)` × 4% / 0.1% respectively. The capped-and-ramped total weight (not raw bytes) is the strictly correct denominator, but is O(active_operators × N) to compute; the Governor uses the unramped, uncapped total bytes as a tractable upper bound and accepts the resulting quorum / threshold conservativeness.
+`quorum(t)` and `proposalThreshold(t)` use `feeRouter.totalBytesInWindow(endEpoch(t), windowEpochs)` × 4% / 0.1% respectively (both return 0 before the first epoch elapses). The capped-and-ramped total weight (not raw bytes) is the strictly correct denominator, but is O(active_operators × N) to compute; the Governor uses the unramped, uncapped total bytes as a tractable upper bound and accepts the resulting quorum / threshold conservativeness.
 
 The shipped `CapacityBond` exposes no `totalVotingWeightAt(ts)` aggregate getter. Under this ADR the Governor derives total voting weight from FeeRouter epoch accounting (`totalBytesInWindow`), not from a CapacityBond aggregate read.
 

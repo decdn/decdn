@@ -265,8 +265,9 @@ vote_weight(op, t) = min(
     voteCapBps × total_bytes_window(t) / 10_000
 ) × age_ramp(op, t)
 
-served_bytes_window(op, t) = Σ_{e = epoch(t)-N+1 .. epoch(t)} FeeRouter.bytesPerEpoch[op][e]
+served_bytes_window(op, t) = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} FeeRouter.bytesPerEpoch[op][e]
 age_ramp(op, t)            = min((t − CapacityBond.firstBondedAt[op]) / (age_ramp_months × seconds_per_month), 1.0)
+endEpoch(t)                = (t / EPOCH_LENGTH) == 0 ? ∅ : (t / EPOCH_LENGTH) − 1   // last fully-elapsed epoch (#847); ∅ ⇒ weight 0
 N                          = windowEpochs                                               // default 13 (~1 quarter)
 ```
 
