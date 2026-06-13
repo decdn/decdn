@@ -149,6 +149,13 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
 
     mapping(bytes32 channelId => Channel) internal channels;
 
+    /// @notice Channels whose provider settle leg was deferred because `FeeRouter`
+    ///         was paused when `settleChannel` ran. The client refund and close
+    ///         already happened; the un-withdrawn provider share stays in this
+    ///         contract until anyone calls `flushDeferredSettlement` post-unpause.
+    ///         The amount/bytes are recomputed from the (now `Closed`) `Channel`.
+    mapping(bytes32 channelId => bool) public settlementDeferred;
+
     // -----------------------------------------------------------------
     // Events (ADR 003 § Events)
     // -----------------------------------------------------------------
@@ -183,6 +190,12 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         uint256 clientRefund
     );
     event ChannelExpiredReclaimed(bytes32 indexed channelId, address indexed client, uint256 clientRefund);
+    event SettlementDeferred(
+        bytes32 indexed channelId, address indexed provider, uint256 settleBytes, uint256 settleAmount
+    );
+    event DeferredSettlementFlushed(
+        bytes32 indexed channelId, address indexed provider, uint256 settleBytes, uint256 settleAmount
+    );
     event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event MinDepositUpdated(uint256 oldValue, uint256 newValue);
     event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
@@ -200,6 +213,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     error NotChannelParty();
     error ChannelNotOpen();
     error ChannelNotClosing();
+    error NoDeferredSettlement();
     error ChannelExpired();
     error ChannelNotExpired();
     error DisputeWindowClosed();
@@ -474,9 +488,49 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         // `disputeChannel` reject a byte-only watermark advance via
         // `_requireBytesTrackPayment`, so routing only on a positive amount delta
         // never drops served-byte accounting (ADR 036 vote weight).
-        if (settleAmount != 0) _route(ch.provider, settleBytes, settleAmount);
+        //
+        // A paused `FeeRouter` must NOT freeze the exit: the client refund above
+        // already left, and reverting here would trap it (channel is `Closing`,
+        // so `reclaimExpired` cannot save it). Defer the provider leg — its USDC
+        // stays in this contract and `flushDeferredSettlement` routes it (and the
+        // served bytes) once the router is unpaused. Branch on the explicit
+        // `paused()` view, not a `try/catch`, so unexpected router reverts still
+        // propagate.
+        if (settleAmount != 0) {
+            // `paused()` is a staticcall to the trusted governance-set router under
+            // `nonReentrant`; the only state set afterward is a bookkeeping bool, no
+            // funds move (aderyn reentrancy-state-change FP).
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            if (IFeeRouterSettlement(feeRouter).paused()) {
+                settlementDeferred[channelId] = true;
+                emit SettlementDeferred(channelId, ch.provider, settleBytes, settleAmount);
+            } else {
+                _route(ch.provider, settleBytes, settleAmount);
+            }
+        }
 
         emit ChannelSettled(channelId, ch.provider, settleAmount, settleBytes, clientRefund);
+    }
+
+    /// @notice Any address: route the provider settle leg deferred by
+    ///         `settleChannel` when `FeeRouter` was paused. No-op-safe to retry —
+    ///         a still-paused router reverts the whole call, leaving the deferral
+    ///         flag set. The amount/bytes are recomputed from the closed channel,
+    ///         which `settleChannel` froze (no `withdraw` is possible once
+    ///         `Closed`), so they equal the provider share still held here.
+    function flushDeferredSettlement(bytes32 channelId) external nonReentrant {
+        if (!settlementDeferred[channelId]) revert NoDeferredSettlement();
+        Channel storage ch = channels[channelId];
+
+        uint256 settleAmount = ch.claimedAmount - ch.withdrawnAmount;
+        uint256 settleBytes = ch.claimedBytes - ch.withdrawnBytes;
+
+        // Clear before the external route (checks-effects-interactions): a paused
+        // router reverts the whole tx and restores the flag for a later retry.
+        settlementDeferred[channelId] = false;
+        _route(ch.provider, settleBytes, settleAmount);
+
+        emit DeferredSettlementFlushed(channelId, ch.provider, settleBytes, settleAmount);
     }
 
     /// @notice Client or provider: refund `deposit - withdrawnAmount` to the client
