@@ -191,10 +191,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     );
     event ChannelExpiredReclaimed(bytes32 indexed channelId, address indexed client, uint256 clientRefund);
     event SettlementDeferred(
-        bytes32 indexed channelId, address indexed provider, uint256 settleBytes, uint256 settleAmount
+        bytes32 indexed channelId, address indexed provider, uint256 settleAmount, uint256 settleBytes
     );
     event DeferredSettlementFlushed(
-        bytes32 indexed channelId, address indexed provider, uint256 settleBytes, uint256 settleAmount
+        bytes32 indexed channelId, address indexed provider, uint256 settleAmount, uint256 settleBytes
     );
     event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event MinDepositUpdated(uint256 oldValue, uint256 newValue);
@@ -214,6 +214,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     error ChannelNotOpen();
     error ChannelNotClosing();
     error NoDeferredSettlement();
+    error FeeRouterMissingPausedView(address feeRouter);
     error ChannelExpired();
     error ChannelNotExpired();
     error DisputeWindowClosed();
@@ -260,6 +261,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
             revert ZeroAddress();
         }
         if (feeRouter_.code.length == 0) revert FeeRouterHasNoCode(feeRouter_);
+        _requireRouterExposesPausedView(feeRouter_);
         if (disputeWindow_ < DISPUTE_WINDOW_FLOOR || disputeWindow_ > DISPUTE_WINDOW_CEILING) {
             revert ParamOutOfBounds(disputeWindow_, DISPUTE_WINDOW_FLOOR, DISPUTE_WINDOW_CEILING);
         }
@@ -503,7 +505,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
             // aderyn-ignore-next-line(reentrancy-state-change)
             if (IFeeRouterSettlement(feeRouter).paused()) {
                 settlementDeferred[channelId] = true;
-                emit SettlementDeferred(channelId, ch.provider, settleBytes, settleAmount);
+                emit SettlementDeferred(channelId, ch.provider, settleAmount, settleBytes);
             } else {
                 _route(ch.provider, settleBytes, settleAmount);
             }
@@ -530,7 +532,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         settlementDeferred[channelId] = false;
         _route(ch.provider, settleBytes, settleAmount);
 
-        emit DeferredSettlementFlushed(channelId, ch.provider, settleBytes, settleAmount);
+        emit DeferredSettlementFlushed(channelId, ch.provider, settleAmount, settleBytes);
     }
 
     /// @notice Client or provider: refund `deposit - withdrawnAmount` to the client
@@ -577,6 +579,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         // `_route` advance channel state while `routeSettlement` no-ops, desyncing
         // settlement accounting and stranding claimed USDC in the contract.
         if (newRouter.code.length == 0) revert FeeRouterHasNoCode(newRouter);
+        _requireRouterExposesPausedView(newRouter);
         if (newRouter == feeRouter) revert RouterUnchanged();
         address old = feeRouter;
         // Drop any standing allowance to the outgoing router so a re-point can
@@ -699,6 +702,19 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         );
         bytes32 digest = _hashTypedDataV4(structHash);
         if (!SignatureChecker.isValidSignatureNow(client, digest, signature)) revert InvalidVoucherSignature();
+    }
+
+    /// @dev `settleChannel` relies on `FeeRouter.paused()` to defer (not revert)
+    ///      the provider leg under pause, keeping the client refund unblocked.
+    ///      Probe the view once at config time so a router that does not expose it
+    ///      is rejected loudly here rather than bricking exits on every later
+    ///      settle. This is fail-fast (it re-reverts with a clear error) — not a
+    ///      hot-path silent catch, which would re-introduce the #849 fund-freeze.
+    function _requireRouterExposesPausedView(address router) internal view {
+        // Static-probe the selector: a router missing `paused()`, or one whose
+        // fallback returns no bool-sized value, fails the success/length check.
+        (bool ok, bytes memory ret) = router.staticcall(abi.encodeCall(IFeeRouterSettlement.paused, ()));
+        if (!ok || ret.length < 32) revert FeeRouterMissingPausedView(router);
     }
 
     /// @dev Approve then route a strictly-positive delta to `FeeRouter` in the

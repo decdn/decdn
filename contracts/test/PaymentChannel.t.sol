@@ -110,6 +110,14 @@ contract UnderPullRouter is IFeeRouterSettlement {
     }
 }
 
+/// @notice Router that implements `routeSettlement` but NOT `paused()`. Used to
+///         prove the config-time conformance probe rejects a non-conforming
+///         router loudly (constructor + setFeeRouter), rather than letting
+///         `settleChannel` brick on the missing pause view (#849 follow-up).
+contract NoPauseRouter {
+    function routeSettlement(address, uint256, uint256) external { }
+}
+
 /// @notice Minimal ERC-1271 smart-account wallet: validates a signature by
 ///         recovering it to a fixed owner EOA. Exercises the SignatureChecker
 ///         ERC-1271 branch of voucher verification (ADR 024 smart-account signers).
@@ -650,6 +658,24 @@ contract PaymentChannelTest is Test {
         channel.setFeeRouter(stranger);
     }
 
+    /// @dev A router with code that implements `routeSettlement` but not
+    ///      `paused()` is rejected at set time — settleChannel relies on that view.
+    function test_setFeeRouter_revertsOnRouterMissingPausedView() public {
+        NoPauseRouter bad = new NoPauseRouter();
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterMissingPausedView.selector, address(bad)));
+        channel.setFeeRouter(address(bad));
+    }
+
+    /// @dev The same conformance probe guards construction.
+    function test_constructor_revertsOnRouterMissingPausedView() public {
+        NoPauseRouter bad = new NoPauseRouter();
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterMissingPausedView.selector, address(bad)));
+        new PaymentChannel(
+            usdc, bond, address(bad), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin
+        );
+    }
+
     function test_setDisputeWindow_enforcesBounds() public {
         vm.prank(admin);
         vm.expectRevert(
@@ -821,7 +847,7 @@ contract PaymentChannelTest is Test {
         uint256 clientBefore = usdc.balanceOf(client);
 
         vm.expectEmit(true, true, false, true, address(channel));
-        emit PaymentChannel.SettlementDeferred(id, provider, bytesDelivered, amount);
+        emit PaymentChannel.SettlementDeferred(id, provider, amount, bytesDelivered);
         channel.settleChannel(id);
 
         // Client refunded and channel closed despite the paused router.
@@ -845,7 +871,7 @@ contract PaymentChannelTest is Test {
 
         router.setPaused(false);
         vm.expectEmit(true, true, false, true, address(channel));
-        emit PaymentChannel.DeferredSettlementFlushed(id, provider, bytesDelivered, amount);
+        emit PaymentChannel.DeferredSettlementFlushed(id, provider, amount, bytesDelivered);
         vm.prank(stranger); // permissionless
         channel.flushDeferredSettlement(id);
 
