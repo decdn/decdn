@@ -270,3 +270,120 @@ fn staged_commit_installs_the_staged_identity() {
 fn keystore_path_of(dir: &TempDir) -> PathBuf {
     dir.path().join("keystore.json")
 }
+
+/// The `*.bak.*` archive files currently in `dir`.
+fn bak_files(dir: &TempDir) -> Vec<PathBuf> {
+    fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(".bak."))
+        })
+        .collect()
+}
+
+/// Delete the single `*.tmp.*` staging file whose name starts with `prefix`,
+/// simulating the staged temp vanishing out from under a commit (so the install
+/// rename fails with `ENOENT` while the directory stays writable — exercising
+/// the fail-safe restore branch without an un-writable-dir trick that would also
+/// break the restore).
+fn delete_staged_temp(dir: &TempDir, prefix: &str) {
+    let temp = tmp_files(dir)
+        .into_iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(prefix))
+        })
+        .expect("a staged temp should exist");
+    fs::remove_file(&temp).unwrap();
+}
+
+/// Fail-safe commit (#844): if the install rename fails after `move_aside`
+/// archived the prior `node.secret`, `commit` restores the archive so the old
+/// key stays live — the canonical path is never left missing — and the error
+/// reports that the restore happened.
+#[test]
+fn commit_restores_prior_node_key_when_install_rename_fails() {
+    let tmp = TempDir::new().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let pw_file = write_password_file(&tmp);
+    key_gen(&make_args(&tmp, false, pw_file)).unwrap();
+
+    let node_path = tmp.path().join("node.secret");
+    let original_node = fs::read(&node_path).unwrap();
+
+    let staged_key = identity::stage_node_key(tmp.path()).unwrap();
+    // Make the install rename fail (ENOENT) without touching dir perms, so the
+    // best-effort restore can still succeed. `errno`-agnostic: the restore branch
+    // runs on any install-rename error, so this faithfully exercises it.
+    delete_staged_temp(&tmp, "node.secret.tmp.");
+
+    let err = staged_key.commit().unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("failed to rename"), "got: {msg}");
+    assert!(
+        msg.contains("stays live"),
+        "error should report the prior key was restored: {msg}"
+    );
+
+    // The prior key is back in place (NOT missing), byte-for-byte.
+    assert!(
+        node_path.exists(),
+        "node.secret must be restored, not missing"
+    );
+    assert_eq!(
+        fs::read(&node_path).unwrap(),
+        original_node,
+        "the prior node key must be restored byte-for-byte"
+    );
+    // The restoring rename consumed the archive; no temp or bak litter remains.
+    assert!(
+        bak_files(&tmp).is_empty(),
+        "restore must consume the .bak archive"
+    );
+    assert_eq!(tmp_file_count(&tmp), 0, "no staged temp should remain");
+}
+
+/// Fail-safe commit (#844), eth-keystore side: a failed install rename after the
+/// prior `keystore.json` was archived restores it in place rather than leaving
+/// the canonical path missing.
+#[test]
+fn commit_restores_prior_keystore_when_install_rename_fails() {
+    let tmp = TempDir::new().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let pw_file = write_password_file(&tmp);
+    key_gen(&make_args(&tmp, false, pw_file)).unwrap();
+
+    let keystore_path = keystore_path_of(&tmp);
+    let original_keystore = fs::read(&keystore_path).unwrap();
+
+    let staged_keystore = eth_identity::stage_keystore(tmp.path(), TEST_PASSWORD).unwrap();
+    delete_staged_temp(&tmp, "keystore.json.tmp.");
+
+    let err = staged_keystore.commit().unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("failed to rename"), "got: {msg}");
+    assert!(
+        msg.contains("stays live"),
+        "error should report the prior keystore was restored: {msg}"
+    );
+
+    assert!(
+        keystore_path.exists(),
+        "keystore.json must be restored, not missing"
+    );
+    assert_eq!(
+        fs::read(&keystore_path).unwrap(),
+        original_keystore,
+        "the prior keystore must be restored byte-for-byte"
+    );
+    assert!(
+        bak_files(&tmp).is_empty(),
+        "restore must consume the .bak archive"
+    );
+    assert_eq!(tmp_file_count(&tmp), 0, "no staged temp should remain");
+}

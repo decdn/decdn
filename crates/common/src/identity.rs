@@ -158,6 +158,61 @@ pub fn move_aside(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(bak)
 }
 
+/// Install the staged temp file `tmp` at `target`, archiving any existing
+/// `target` first. Shared commit primitive for the staged-key types
+/// ([`StagedNodeKey`] and `decdn_incentive`'s `StagedKeystore`) so their
+/// archive → rename → fail-safe-rollback logic stays in one place.
+///
+/// **Fail-safe.** If the install rename fails after the prior file was archived,
+/// the archive is restored (best-effort) so `target` keeps the prior file rather
+/// than going missing. The returned error distinguishes the two outcomes:
+/// - restore succeeded → the prior file is live at `target`, safe to retry;
+/// - restore also failed → `target` is now **missing**, and the error names the
+///   surviving `.bak` archive the operator must move back manually.
+///
+/// Does **not** remove `tmp` on failure — the caller's `Drop` owns temp cleanup,
+/// so the temp is reclaimed whether the caller `?`-propagates or not.
+///
+/// Returns the archive path if a prior file was moved aside, or `None` (fresh
+/// install).
+///
+/// # Errors
+///
+/// Returns an error if archiving the prior file fails, or if the install rename
+/// fails (with the best-effort restore outcome folded into the message).
+pub fn install_staged(tmp: &Path, target: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let bak = if target.exists() {
+        Some(move_aside(target)?)
+    } else {
+        None
+    };
+    let Err(rename_err) = fs::rename(tmp, target) else {
+        return Ok(bak);
+    };
+    let base = format!("failed to rename {} -> {}", tmp.display(), target.display());
+    // The install rename failed *after* any prior file was archived, which would
+    // otherwise leave `target` missing. Restore the archive (best-effort) so a
+    // failed rotation is fail-safe. The caller's `Drop` reclaims `tmp`.
+    let Some(bak_path) = &bak else {
+        // Fresh install: nothing was archived, so nothing to restore — `target`
+        // was already absent and stays absent. Clean failure.
+        return Err(anyhow::Error::new(rename_err).context(base));
+    };
+    match fs::rename(bak_path, target) {
+        Ok(()) => Err(anyhow::Error::new(rename_err).context(format!(
+            "{base}; the prior file was restored to {} and stays live (safe to retry)",
+            target.display()
+        ))),
+        Err(restore_err) => Err(anyhow::Error::new(rename_err).context(format!(
+            "{base}, AND restoring the archived prior file failed ({restore_err}): {} is now \
+             MISSING — its only surviving copy is the archive at {}. Move it back manually before \
+             starting the node (appendix-operator-key-rotation.md §5 rollback)",
+            target.display(),
+            bak_path.display()
+        ))),
+    }
+}
+
 /// A freshly-generated node key written to a temp file in `data_dir`, not yet
 /// committed to `node.secret`.
 ///
@@ -205,32 +260,13 @@ impl StagedNodeKey {
     /// # Errors
     ///
     /// Returns an error if archiving the prior key or the install rename fails.
-    /// The commit is **fail-safe**: if the install rename fails after the prior
-    /// key was archived, the archive is restored (best-effort) so the old key
-    /// stays live at the canonical path rather than leaving it missing. The
-    /// staged temp is removed by the `Drop` handler.
+    /// The commit is **fail-safe** via [`install_staged`]: if the install rename
+    /// fails after the prior key was archived, the archive is restored
+    /// (best-effort) so the old key stays live, and the error states whether the
+    /// restore succeeded or `node.secret` is now missing. On any error the staged
+    /// temp is removed by the `Drop` handler (`committed` stays `false`).
     pub fn commit(mut self) -> anyhow::Result<Option<PathBuf>> {
-        let bak = if self.final_path.exists() {
-            Some(move_aside(&self.final_path)?)
-        } else {
-            None
-        };
-        if let Err(e) = fs::rename(&self.tmp, &self.final_path) {
-            // The install rename failed *after* the prior key was archived, which
-            // would otherwise leave no `node.secret` at the canonical path. Restore
-            // the archive (best-effort) so a failed rotation is fail-safe — the old
-            // key stays live rather than the location going empty. If the restore
-            // also fails the archive is still on disk for manual recovery (runbook
-            // §5). The staged temp is cleaned up by `Drop` (committed stays false).
-            if let Some(bak_path) = &bak {
-                let _ = fs::rename(bak_path, &self.final_path);
-            }
-            return Err(anyhow::Error::new(e).context(format!(
-                "failed to rename {} -> {}",
-                self.tmp.display(),
-                self.final_path.display()
-            )));
-        }
+        let bak = install_staged(&self.tmp, &self.final_path)?;
         self.committed = true;
         Ok(bak)
     }

@@ -126,6 +126,10 @@ pub fn generate_and_persist(
 /// Dropping a [`StagedKeystore`] without committing removes the temp file, so an
 /// abandoned stage never litters `data_dir`.
 #[must_use = "a staged keystore must be committed (or it is discarded on drop)"]
+// `derive(Debug)` is safe only because every field is non-secret: the secret key
+// is already encrypted into the temp file and `key_bytes` is zeroed in
+// `stage_keystore`. If a secret field is ever added, hand-write `Debug` to omit
+// it (as `StagedNodeKey` does).
 #[derive(Debug)]
 pub struct StagedKeystore {
     tmp: PathBuf,
@@ -152,36 +156,18 @@ impl StagedKeystore {
     /// # Errors
     ///
     /// Returns an error if archiving the prior keystore or the install rename
-    /// fails. The commit is **fail-safe**: if the install rename fails after the
-    /// prior keystore was archived, the archive is restored (best-effort) so the
-    /// old keystore stays live at the canonical path rather than leaving it
-    /// missing. The staged temp is removed by the `Drop` handler.
+    /// fails. The commit is **fail-safe** via
+    /// [`decdn_common::identity::install_staged`]: if the install rename fails
+    /// after the prior keystore was archived, the archive is restored
+    /// (best-effort) so the old keystore stays live, and the error states whether
+    /// the restore succeeded or `keystore.json` is now missing. On any error the
+    /// staged temp is removed by the `Drop` handler (`committed` stays `false`).
     pub fn commit(mut self) -> anyhow::Result<Option<PathBuf>> {
-        let bak = if self.target.exists() {
-            // Archive the old keystore rather than destroying it: the operator
-            // key-rotation runbook (`appendix-operator-key-rotation.md` §5)
-            // relies on rollback to the prior key, and the offline-archive
-            // requirement applies symmetrically to the eth side.
-            Some(decdn_common::identity::move_aside(&self.target)?)
-        } else {
-            None
-        };
-        if let Err(e) = fs::rename(&self.tmp, &self.target) {
-            // The install rename failed *after* the prior keystore was archived,
-            // which would otherwise leave no `keystore.json` at the canonical path.
-            // Restore the archive (best-effort) so a failed rotation is fail-safe —
-            // the old keystore stays live rather than the location going empty. If
-            // the restore also fails the archive is still on disk for manual
-            // recovery (runbook §5). The staged temp is cleaned up by `Drop`.
-            if let Some(bak_path) = &bak {
-                let _ = fs::rename(bak_path, &self.target);
-            }
-            return Err(anyhow::Error::new(e).context(format!(
-                "failed to rename {} -> {}",
-                self.tmp.display(),
-                self.target.display()
-            )));
-        }
+        // Archiving (inside `install_staged`) keeps the prior ciphertext rather
+        // than destroying it: the operator key-rotation runbook
+        // (`appendix-operator-key-rotation.md` §5) relies on rollback to the prior
+        // key, and the offline-archive requirement applies symmetrically here.
+        let bak = decdn_common::identity::install_staged(&self.tmp, &self.target)?;
         self.committed = true;
         Ok(bak)
     }
