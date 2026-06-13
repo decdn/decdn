@@ -135,12 +135,17 @@ const CHANNEL_EXPIRY_WARP_SECS: u64 = 366 * 24 * 60 * 60;
 
 // Wall-clock bounds on the `forge` subprocesses (issue #785). `forge build`
 // compiles the contract set cold; the deploy normally finishes in ~1–5s but
-// `forge script --broadcast` intermittently stalls in receipt-wait under runner
-// CPU contention, so it is bounded per attempt and a *stall* (timeout) is
-// retried. A non-zero exit is treated as deterministic and fails fast.
+// `forge script --broadcast` intermittently fails under runner CPU contention in
+// two transient ways, both bounded per attempt and retried: a *stall* (timeout in
+// receipt-wait, #785) and a *broadcast-phase non-zero exit* (#883) where the
+// script body completed but tx submission hit a nonce/RPC/anvil hiccup. A
+// non-zero exit *before* the body completes (a genuine revert or script bug) is
+// deterministic and fails fast. `DEPLOY_ATTEMPTS` is 3 so a single run can absorb
+// one of each transient class (the #883 flake was stall-then-broadcast-hiccup)
+// and still get a clean attempt.
 const FORGE_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(45);
-const DEPLOY_ATTEMPTS: usize = 2;
+const DEPLOY_ATTEMPTS: usize = 3;
 // Overall ceiling on the single e2e flow, sized above the sum of the internal
 // `poll_until` budgets (~560s) + build + deploy so a slow-but-legitimate run
 // still surfaces its specific poll diagnostic, while a truly *unbounded* await
@@ -220,6 +225,41 @@ async fn forge_output(
             .with_context(|| format!("spawn `{what}` (is foundry installed?)")),
         Err(_) => Ok(Err(timeout)),
     }
+}
+
+/// Classifies a non-zero `forge script` exit (#883). Returns `true` when the
+/// script *body* completed — i.e. simulation succeeded and forge printed its
+/// `Script ran successfully` line — but the process still exited non-zero, which
+/// means the failure was in the later broadcast / tx-submission phase (a
+/// transient nonce/RPC/anvil hiccup under CPU contention, same root cause as the
+/// #785 stall; retryable). Returns `false` when that marker is absent, i.e. the
+/// script reverted or aborted before the body completed — a deterministic
+/// revert/script bug that should fail fast with full output rather than burn
+/// retries on a guaranteed-identical failure.
+fn forge_script_body_completed(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).contains("Script ran successfully")
+}
+
+#[test]
+fn broadcast_phase_failure_is_retryable() {
+    // Representative of the #883 attempt-2 stdout (line order condensed): the
+    // body ran (simulation + `Return` printed), then the process cut off in the
+    // broadcast/EVM-setup phase. Marker present ⇒ transient broadcast hiccup ⇒ retry.
+    let stdout = b"No files changed, compilation skipped\nScript ran successfully.\n\n== Return ==\nd: struct BaseProtocolDeploy.Deployment Deployment({ token: 0x959, paymentChannel: 0x4ed })\n\n## Setting up 1 EVM.";
+    assert!(forge_script_body_completed(stdout));
+}
+
+#[test]
+fn genuine_revert_fails_fast() {
+    // A revert/abort during simulation never prints the success marker, so the
+    // body did not complete ⇒ deterministic ⇒ fail fast (no retry).
+    let stdout = b"Error: Simulated execution failed.\nReason: revert: minDeposit not met\n";
+    assert!(!forge_script_body_completed(stdout));
+}
+
+#[test]
+fn empty_output_is_not_retryable() {
+    assert!(!forge_script_body_completed(b""));
 }
 
 // Bindings for the setup/write calls not exposed by the production
@@ -1407,15 +1447,17 @@ async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow
 /// from the anvil dev deployer. `INITIAL_TOKEN_HOLDER` is the node so it holds
 /// the staking TOKEN directly.
 ///
-/// `forge script --broadcast` can *stall* in its receipt-wait phase under runner
-/// CPU contention (issue #785), so each attempt is bounded by `DEPLOY_TIMEOUT`
-/// and a stall (timeout) is retried up to `DEPLOY_ATTEMPTS` times. Retry is safe:
-/// each run broadcasts from a fresh deployer nonce (new contract addresses) and
-/// `FORCE_OVERWRITE_MANIFEST` rewrites the manifest the test reads, so a
-/// completed retry fully supersedes a killed one. A *non-zero exit* (revert,
-/// script bug, RPC rejection) is almost always deterministic, so it fails fast
-/// with the full output rather than retrying a guaranteed-identical failure (and
-/// rather than logging a misleading "retrying" line for a hard error).
+/// `forge script --broadcast` fails transiently under runner CPU contention in
+/// two ways, both retried up to `DEPLOY_ATTEMPTS` times: a *stall* in receipt-wait
+/// (timeout, issue #785) and a *broadcast-phase non-zero exit* (#883) where the
+/// script body completed (`Script ran successfully` printed) but tx submission hit
+/// a nonce/RPC/anvil hiccup. Retry is safe: each run broadcasts from a fresh
+/// deployer nonce (new contract addresses) and `FORCE_OVERWRITE_MANIFEST` rewrites
+/// the manifest the test reads, so a completed retry fully supersedes a killed or
+/// half-broadcast one. A non-zero exit *before* the body completes (a genuine
+/// revert or script bug — no success marker) is deterministic and fails fast with
+/// the full output rather than retrying a guaranteed-identical failure. See
+/// `forge_script_body_completed` for the classification.
 async fn run_deploy_script(
     contracts: &Path,
     rpc_url: &str,
@@ -1445,10 +1487,26 @@ async fn run_deploy_script(
         // rather than masquerading as a stall and burning a retry.
         match forge_output(cmd, DEPLOY_TIMEOUT, "forge script DeployProtocol").await? {
             Ok(out) if out.status.success() => return Ok(()),
-            // Deterministic failure — surface the full output and stop.
+            // Non-zero exit *after* the script body completed (#883) — the failure
+            // was in the broadcast / tx-submission phase, a transient hiccup worth
+            // retrying like a stall. A non-zero exit *before* the body completed is
+            // a deterministic revert/script bug and fails fast with full output.
+            Ok(out) if forge_script_body_completed(&out.stdout) => {
+                if attempt == DEPLOY_ATTEMPTS {
+                    anyhow::bail!(
+                        "forge script DeployProtocol failed after {DEPLOY_ATTEMPTS} attempts; the final attempt completed the script body but exited non-zero during broadcast:\n{}\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                tracing::warn!(
+                    "forge script DeployProtocol attempt {attempt}/{DEPLOY_ATTEMPTS} completed the script body but exited non-zero during broadcast (transient nonce/RPC hiccup), retrying immediately"
+                );
+            }
+            // Deterministic failure (revert / script bug) — surface it and stop.
             Ok(out) => {
                 anyhow::bail!(
-                    "forge script DeployProtocol exited non-zero:\n{}\n{}",
+                    "forge script DeployProtocol exited non-zero before the script body completed (revert or script bug):\n{}\n{}",
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
                 )
@@ -1457,11 +1515,11 @@ async fn run_deploy_script(
             Err(timeout) => {
                 if attempt == DEPLOY_ATTEMPTS {
                     anyhow::bail!(
-                        "forge script DeployProtocol stalled on all {DEPLOY_ATTEMPTS} attempts (timed out after {timeout:?})"
+                        "forge script DeployProtocol failed after {DEPLOY_ATTEMPTS} attempts; the final attempt stalled (timed out after {timeout:?})"
                     );
                 }
                 tracing::warn!(
-                    "forge script DeployProtocol attempt {attempt}/{DEPLOY_ATTEMPTS} stalled, retrying after {timeout:?}"
+                    "forge script DeployProtocol attempt {attempt}/{DEPLOY_ATTEMPTS} stalled (killed after {timeout:?}), retrying immediately"
                 );
             }
         }
