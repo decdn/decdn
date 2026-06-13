@@ -119,6 +119,13 @@ impl LeechGovernor {
     ///
     /// Never gates serving a range already held — the caller only consults this
     /// for the speculative-pull branch.
+    ///
+    /// **Not side-effect-free despite the predicate-style name:** this `touch`es
+    /// the peer's LRU entry (inserting a fresh row for an unseen peer, evicting
+    /// the least-recently-touched victim if the table is full). That is
+    /// deliberate — an actively-pulling leecher must be touched on every
+    /// admission check so it is never the eviction victim — but a caller MUST NOT
+    /// treat `may_pull` as a pure read. `MAX_TRACKED_PEERS` bounds the growth.
     pub fn may_pull(&self, peer: &[u8; 32]) -> bool {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 

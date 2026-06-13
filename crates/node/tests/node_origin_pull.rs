@@ -2472,7 +2472,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x1F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -2509,6 +2509,16 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         "leaf received {} of {total_bytes} bytes",
         outcome.received
     );
+    // The headline #856 behavior: PAYLOAD_LEN (1.5 MiB) exceeds the default
+    // ~1 MiB window, so the pull MUST have paused at the window frontier and
+    // resumed as the leaf's vouchers cleared. Assert the pause actually fired —
+    // a regression that broke the resume could still pass the full-delivery
+    // checks above (the blob would simply never arrive), so pin the pause
+    // explicitly rather than only implicitly.
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_window_paused_total")? >= 1,
+        "the window pause/resume path must have engaged for a blob larger than the window"
+    );
     // B cached the (verified) blob — it is now a holder for future requests.
     anyhow::ensure!(
         cache_b.has(hash).await?,
@@ -2526,6 +2536,127 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
             )],
         "expected B's upstream watermark at the full blob, got {:?}",
         progress_log(&recorded)?
+    );
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+/// A resumed cache-miss request (`byte_offset > 0`) must NOT engage the fused
+/// window path: the incremental whole-blob BLAKE3 is only valid from offset 0,
+/// so the handler gates the fused serve on `req.byte_offset == 0` and falls a
+/// resumed miss back to the buffered path (`client.rs` §window-paced gate). With
+/// the window provider attached but no buffered origin on B's empty cache, the
+/// buffered fallback cleanly refuses. The regression this guards: dropping the
+/// offset-0 gate would route a resumed request into the fused path, which pulls
+/// and verifies from byte 0 and would mis-serve / mis-cache the blob (#856).
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()> {
+    use alloy::signers::SignerSync;
+
+    let payload = vec![0x7Eu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA7);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x7F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+
+    // Send a request resuming from one interval in (byte_offset > 0), with a
+    // valid ownership binding so authorization is NOT the reason for refusal —
+    // the offset gate must be.
+    let conn = leaf_ep
+        .connect(b_target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf open_bi: {e}"))?;
+    let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
+    let ext = StreamRequestExt {
+        voucher_interval_mb: None,
+        binding: Some(ClientBinding {
+            ethereum_address: leaf_eth.address().into(),
+            binding_signature,
+        }),
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: leaf_channel_id.into(),
+        byte_offset: MB_BYTES,
+        timestamp_us: 0x9007,
+    };
+    let payload_bytes =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame(&mut send, &payload_bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
+
+    let resp = match read_client(&mut recv).await? {
+        ClientMessage::StreamResponse(r) => r,
+        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
+    };
+    // The resumed miss is refused by the buffered fallback (no buffered origin),
+    // NOT served by the fused path.
+    anyhow::ensure!(
+        !resp.body.ok,
+        "resumed offset>0 miss must be refused, not served; error={:?}",
+        resp.error
+    );
+    conn.close(0u32.into(), b"done");
+
+    // The fused window path must never have run: no pause, no tee finalize, no
+    // upstream verify — and crucially B must have made NO upstream pull (empty
+    // progress log) and cached NOTHING. A regression that dropped the offset-0
+    // gate would trip at least the upstream pull (non-empty log) and likely the
+    // tee.
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_window_paused_total")? == 0,
+        "fused window pause must not fire for a resumed (offset>0) request"
+    );
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_tee_finalize_failed_total")? == 0,
+        "fused tee must not run for a resumed (offset>0) request"
+    );
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_upstream_verify_failed_total")? == 0,
+        "fused upstream verify must not run for a resumed (offset>0) request"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "B must not have pulled upstream for a resumed (offset>0) miss, got {:?}",
+        progress_log(&recorded)?
+    );
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "B must not have cached anything for a refused resumed request"
     );
 
     leaf_ep.close().await;
@@ -2602,7 +2733,7 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
     });
     let one_window = decdn_common::config::DEFAULT_PULL_AHEAD_BYTES;
     anyhow::ensure!(
-        upstream_bytes <= one_window + 4 * (CHUNK_SIZE as u64),
+        upstream_bytes <= one_window + 2 * (CHUNK_SIZE as u64),
         "B's upstream spend ({upstream_bytes}) must be bounded to ~one window ({one_window}), \
          not the whole {total_bytes}-byte blob"
     );
@@ -3053,7 +3184,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
         });
     let one_window = decdn_common::config::DEFAULT_PULL_AHEAD_BYTES;
     anyhow::ensure!(
-        upstream_bytes <= one_window + 4 * (CHUNK_SIZE as u64),
+        upstream_bytes <= one_window + 2 * (CHUNK_SIZE as u64),
         "B's upstream spend ({upstream_bytes}) must stay bounded to ~one window ({one_window})"
     );
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;

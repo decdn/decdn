@@ -543,7 +543,18 @@ impl ClientHandler {
     async fn await_coalesced_fill(&self, hash: Hash) -> bool {
         match self.pull_through.get().copied() {
             Some(timeout) => self.try_pull_through(hash, timeout).await,
-            None => self.cache.has(hash).await.unwrap_or(false),
+            // No pull-through configured: the coalesced fill either landed or it
+            // did not. A `has` *error* is a real store fault, not a clean miss —
+            // surface it (like `on_pull_through_timeout`) rather than silently
+            // reclassifying it as "blob absent" and reporting a clean `NotFound`.
+            None => match self.cache.has(hash).await {
+                Ok(present) => present,
+                Err(e) => {
+                    self.metrics.node_pull_through_error();
+                    tracing::warn!(%hash, error = %e, "coalesced-fill store lookup failed; treating as miss");
+                    false
+                }
+            },
         }
     }
 
@@ -1349,6 +1360,14 @@ impl ClientHandler {
             // `may_pull`.
             let made_pull_progress = pulled > pulled_at_iter_start;
             if !made_pull_progress && to_collect.is_none() && !done_pulling {
+                // A seed-leech cap is denying the pull with nothing to recoup. Drop
+                // the partial fill and reset the stream (no `StreamEnd`); the pause
+                // cause is already metered by `may_pull`. Log the partial progress
+                // so a throttled-but-not-dead serve is visible to an operator.
+                tracing::debug!(
+                    %hash, %channel_id, pulled, served_paid,
+                    "window pull-through throttled by seed-leech cap with nothing to recoup; dropping partial fill"
+                );
                 pull.abandon(None);
                 tee.abandon();
                 let _ = send.finish();
@@ -1372,19 +1391,49 @@ impl ClientHandler {
                     // node that is paying upstream egress but caching nothing is
                     // alertable, not just a debug-able log line.
                     self.metrics.node_pull_through_tee_finalize_failed();
-                    tracing::warn!(%hash, error = %e, "window pull-through tee finalize failed; blob served but not cached");
+                    match e {
+                        // The upstream pull verified clean (whole-blob BLAKE3 OK)
+                        // yet the teed bytes hash wrong: the forwarded stream and
+                        // the teed stream saw DIFFERENT bytes. That is an internal
+                        // divergence (a chunk-boundary/copy bug), not a routine
+                        // store hiccup — the client was handed bytes we did not
+                        // cache-verify. Surface it loudly.
+                        CacheError::HashMismatch { expected, actual } => {
+                            tracing::error!(
+                                %hash, %expected, %actual,
+                                "window pull-through tee/forward stream divergence: upstream verified but teed bytes hashed differently"
+                            );
+                        }
+                        other => {
+                            tracing::warn!(%hash, error = %other, "window pull-through tee finalize failed; blob served but not cached");
+                        }
+                    }
                 }
                 self.write_message(send, &ClientMessage::StreamEnd).await?;
-                let _ = send.finish();
+                // A failed `finish()` here means the clean `StreamEnd` may not have
+                // reached the wire even though we counted the bytes as served —
+                // log it rather than discard silently.
+                if let Err(e) = send.finish() {
+                    tracing::debug!(%hash, error = %e, "window pull-through send.finish failed after StreamEnd");
+                }
                 Ok(())
             }
             Err(e) => {
-                // Corrupt or short upstream: do NOT promote the blob. The
-                // downstream runs its own end-to-end hash check and rejects;
-                // close the send side cleanly so it observes the (short) end.
+                // Corrupt or short upstream: do NOT promote the blob. The protocol
+                // has no mid-stream delivery-fault code (only `VoucherRejected`
+                // rides mid-stream; the delivery-side `StreamError` codes are
+                // initial-`StreamResponse`-only — ADR 005 §domain split), so we do
+                // NOT emit a frame: closing the send side WITHOUT a `StreamEnd`
+                // sentinel is itself the signal, and the downstream's own
+                // end-to-end hash check rejects the bytes. Log the channel and
+                // byte counts so an operator can see the client was charged for
+                // bytes that failed final verification.
                 tee.abandon();
                 self.metrics.node_pull_through_upstream_verify_failed();
-                tracing::warn!(%hash, error = %e, "window pull-through upstream failed final verification; not caching");
+                tracing::warn!(
+                    %hash, %channel_id, served_paid, total_bytes, error = %e,
+                    "window pull-through upstream failed final verification; not caching, no StreamEnd sent"
+                );
                 let _ = send.finish();
                 Ok(())
             }
