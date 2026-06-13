@@ -822,14 +822,16 @@ enum CycleOutcome {
     /// An event filter ended cleanly (filter expiry / provider rotation).
     /// Resubscribe immediately with backoff reset.
     StreamEnded,
-    /// A live `ChannelOpened` for this node failed to persist; the checkpoint is
-    /// held below its block and `backfill_from` re-armed. We return early (rather
-    /// than draining on) so the outer loop resubscribes and the next cycle's
-    /// backfill re-covers the channel *without* waiting for an unrelated
-    /// stream-end or restart — otherwise a healthy never-resubscribing stream
-    /// would strand that client (vouchers rejected `WrongChannel`) indefinitely
-    /// (#751 MEDIUM-1). Resubscribe is paced by backoff so a *durable* store
-    /// failure backs off exponentially instead of hot-looping the backfill.
+    /// A live event handler re-armed the bring-up backfill and returned early so
+    /// the outer loop resubscribes and the next cycle's backfill re-covers the
+    /// gap *without* waiting for an unrelated stream-end or restart. Two triggers:
+    /// a `ChannelOpened` that failed to persist (the scan checkpoint is also held
+    /// below its block, else a healthy never-resubscribing stream would strand
+    /// that client with vouchers rejected `WrongChannel` indefinitely, #751
+    /// MEDIUM-1); or a `ChannelCloseInitiated` whose reconcile failed (#839, the
+    /// checkpoint is *not* held — it is open-tied — only `backfill_from` is
+    /// re-armed). Resubscribe is paced by backoff so a *durable* store/RPC failure
+    /// backs off exponentially instead of hot-looping the backfill.
     RecoveryPending,
 }
 
@@ -873,12 +875,13 @@ async fn watcher_loop<P: Provider + Clone>(
                 backoff = WATCHER_INITIAL_BACKOFF;
             }
             Ok(CycleOutcome::RecoveryPending) => {
-                // A live open failed to persist; `backfill_from` is re-armed.
-                // Resubscribe so the next cycle's backfill re-covers it, but pace
-                // it with backoff so a persistent store failure doesn't hot-loop.
+                // A live open-persist or close-reconcile failed; `backfill_from`
+                // is re-armed. Resubscribe so the next cycle's backfill re-covers
+                // it, but pace it with backoff so a persistent store/RPC failure
+                // doesn't hot-loop.
                 warn!(
                     backoff_secs = backoff.as_secs(),
-                    "watcher holding checkpoint after a failed open-persist; resubscribing to re-run the backfill"
+                    "watcher re-armed the bring-up backfill after a failed live persist/reconcile; resubscribing to re-run it"
                 );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(WATCHER_MAX_BACKOFF);
