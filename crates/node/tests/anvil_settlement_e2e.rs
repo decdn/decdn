@@ -1168,6 +1168,189 @@ async fn run_e2e() -> anyhow::Result<()> {
     );
     drop(service2);
 
+    // ============================================================
+    // CLOSING RECONCILIATION (#839) — two gaps the fix closes. First (boot scan):
+    // a channel this node provides is left `Closing` on-chain with NO local
+    // `PendingSettle` — the crash gap between a landed `closeChannel` and the
+    // durable `record_pending` write — produced here by closing directly via the
+    // contract while no settlement service is alive (service + service2 dropped).
+    // A fresh bootstrap's closing-reconciliation backfill must re-derive the
+    // `PendingSettle` (stamped with the on-chain `disputeDeadline`) so the settle
+    // sweep can finalize the channel (settle its claim and clear the obligation),
+    // and the live `ChannelSettled` arm must then drop the recovered entry.
+    // Second (live arm, below): a *client*-initiated close against the running
+    // service must be recorded by the live `ChannelCloseInitiated` arm. The
+    // channels here are never drawn, so settlement routes a zero remainder and
+    // refunds the deposit — the path under test is obligation recovery, not
+    // payout.
+    // ============================================================
+    // The downtime phase minted+approved 2×DEPOSIT and spent 1×DEPOSIT on
+    // `down_id`, so a 1×DEPOSIT allowance + balance remains for this open.
+    let close_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
+    let close_id = derive_channel_id(client_addr, node_addr, close_nonce.to::<u64>());
+    pc_client
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    // Close it directly via the contract (zero-voucher path: the channel was
+    // never drawn, so `claimedNonce == 0`). Sent from the node wallet (`pc_read`
+    // is node-provider-filled), matching the node's own crashed close: the
+    // channel is `Closing` on-chain but no service recorded a pending entry.
+    pc_read
+        .closeChannel(close_id, U256::ZERO, U256::ZERO, U256::ZERO, Bytes::new())
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let closed_ch = pc_read.getChannel(close_id).call().await?;
+    anyhow::ensure!(
+        matches!(closed_ch.status, PaymentChannel::Status::Closing),
+        "direct closeChannel did not move the reconciliation channel to Closing"
+    );
+    // No service was watching, so the obligation is absent before re-bootstrap —
+    // the very gap #839 recovers.
+    anyhow::ensure!(
+        concrete_store
+            .load_pending()?
+            .iter()
+            .all(|e| e.channel_id != close_id),
+        "a Closing channel closed while down must have no PendingSettle until re-bootstrap"
+    );
+
+    // Node comes back up against the same store: the bring-up closing-
+    // reconciliation backfill must record the obligation.
+    let service3 = PaymentChannelService::bootstrap(
+        node_provider.clone(),
+        payment_channel,
+        node_addr,
+        Arc::clone(&store),
+        concrete_store.clone(),
+        concrete_store.clone(),
+        Arc::clone(&handler),
+        U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        AutoSettleConfig::default(),
+        Arc::clone(&metrics),
+    )
+    .await?;
+    let recovered = poll_until(Duration::from_secs(60), || {
+        let pending = concrete_store.clone();
+        async move {
+            pending
+                .load_pending()
+                .ok()
+                .and_then(|entries| entries.into_iter().find(|e| e.channel_id == close_id))
+        }
+    })
+    .await
+    .ok_or_else(|| {
+        anyhow::anyhow!("closing-reconciliation backfill did not recover the PendingSettle (#839)")
+    })?;
+    anyhow::ensure!(
+        recovered.settle_after == closed_ch.disputeDeadline,
+        "recovered PendingSettle deadline {} must equal the on-chain disputeDeadline {}",
+        recovered.settle_after,
+        closed_ch.disputeDeadline
+    );
+
+    // The recovered entry is actionable end-to-end: warp past the dispute window,
+    // settle (callable by anyone), and the live ChannelSettled arm drops the
+    // recovered pending entry.
+    let _: serde_json::Value = node_provider
+        .raw_request("evm_increaseTime".into(), (DISPUTE_WINDOW_SECS + 600,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    pc_settle
+        .settleChannel(close_id)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let dropped = poll_until(Duration::from_secs(60), || {
+        let pending = concrete_store.clone();
+        async move {
+            pending
+                .load_pending()
+                .ok()
+                .filter(|entries| entries.iter().all(|e| e.channel_id != close_id))
+                .map(|_| ())
+        }
+    })
+    .await;
+    anyhow::ensure!(
+        dropped.is_some(),
+        "settled reconciliation channel's recovered PendingSettle was not dropped (#839)"
+    );
+
+    // --- Live arm + client-initiated close (#839, second gap) ---
+    // With service3 running, the CLIENT closes a channel this node provides. The
+    // node's own close path never fires, so only the live `ChannelCloseInitiated`
+    // arm can record the obligation. A full client-wallet binding is needed
+    // because `pc_client` (PaymentChannelOpen) exposes only `openChannel`.
+    let pc_client_full = PaymentChannel::new(payment_channel, client_provider.clone());
+    usdc_admin
+        .mint(client_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    usdc_client
+        .approve(payment_channel, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let live_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
+    let live_id = derive_channel_id(client_addr, node_addr, live_nonce.to::<u64>());
+    pc_client
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    // Let service3's watcher register the open first, so the subsequent close is
+    // an unambiguous live event against a known channel.
+    anyhow::ensure!(
+        poll_until(Duration::from_secs(60), || {
+            let store = Arc::clone(&store);
+            async move { store.get(live_id).ok().flatten() }
+        })
+        .await
+        .is_some(),
+        "watcher did not register the live-arm channel open"
+    );
+    // Client-initiated zero-voucher close (never drawn → claimedNonce == 0).
+    pc_client_full
+        .closeChannel(live_id, U256::ZERO, U256::ZERO, U256::ZERO, Bytes::new())
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let live_recovered = poll_until(Duration::from_secs(60), || {
+        let pending = concrete_store.clone();
+        async move {
+            pending
+                .load_pending()
+                .ok()
+                .and_then(|entries| entries.into_iter().find(|e| e.channel_id == live_id))
+        }
+    })
+    .await
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "live ChannelCloseInitiated arm did not record a PendingSettle for a client-initiated close (#839)"
+        )
+    })?;
+    let live_ch = pc_read.getChannel(live_id).call().await?;
+    anyhow::ensure!(
+        live_recovered.settle_after == live_ch.disputeDeadline,
+        "live-arm PendingSettle deadline {} must equal the on-chain disputeDeadline {}",
+        live_recovered.settle_after,
+        live_ch.disputeDeadline
+    );
+    drop(service3);
+
     client_ep.close().await;
     server_ep.close().await;
     let _ = server_task.await;
