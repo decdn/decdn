@@ -834,12 +834,14 @@ enum ReclaimEscalation {
 }
 
 /// Update the per-channel consecutive-failure tally for `channel_id` given this
-/// pass's `outcome`, and decide whether to escalate (#906). A `Resolved` outcome
-/// clears the tally (the deposit is recovered or the record is gone). A `Failed`
-/// outcome increments it and escalates once it reaches `threshold` — and on
-/// every subsequent failed sweep, so a *sustained* failure keeps surfacing an
-/// `error!`/metric rather than going quiet after the first crossing. Pure so the
-/// escalation policy is unit-testable without a live contract.
+/// pass's `outcome`, and decide whether to raise the per-channel `error!` (#906).
+/// A `Resolved` outcome clears the tally (the deposit is recovered or the record
+/// is gone). A `Failed` outcome increments it and escalates once it reaches
+/// `threshold` — and on every subsequent failed sweep, so a *sustained* failure
+/// keeps surfacing an `error!` rather than going quiet after the first crossing.
+/// This governs only the `error!`; the `buyer_reclaim_failures` metric is bumped
+/// by the caller on every `Failed` outcome, independent of this threshold. Pure
+/// so the escalation policy is unit-testable without a live contract.
 fn record_reclaim_outcome(
     failures: &mut HashMap<ChannelId, u32>,
     channel_id: ChannelId,
@@ -874,10 +876,11 @@ fn prune_reclaim_failures(failures: &mut HashMap<ChannelId, u32>, seen: &HashSet
 }
 
 /// One reclaim-sweep pass. Errors are logged per channel and never abort the
-/// sweep. Tracks consecutive per-channel failures in `failures` so a persistent
-/// reclaim failure escalates from a per-attempt `warn!` to an `error!` + the
-/// `buyer_reclaim_failures` metric (#906); the map is pruned each pass to the
-/// channels still expired so it cannot grow unbounded.
+/// sweep. Bumps the `buyer_reclaim_failures` metric on every failed attempt and
+/// tracks consecutive per-channel failures in `failures` so a *persistent*
+/// failure additionally escalates its per-attempt `warn!` to an `error!` once it
+/// crosses `RECLAIM_ESCALATION_THRESHOLD` (#906); the map is pruned each pass to
+/// the channels still expired so it cannot grow unbounded.
 async fn reclaim_once<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn BuyerChannelStore>,
@@ -968,16 +971,12 @@ async fn try_reclaim<P: Provider + Clone>(
             on_chain_client = %ch.client,
             "buyer reclaim: tracked channel's on-chain client is not this node; dropping bogus record"
         );
-        return outcome_after_forget(forget_reclaimed(store, st, "drop foreign/unknown record"));
+        return forget_reclaimed(store, st, "drop foreign/unknown record");
     }
     // If the upstream already closed/settled the channel, `reclaimExpired`
     // would revert — just drop our local record.
     if !matches!(ch.status, PaymentChannel::Status::Open) {
-        return outcome_after_forget(forget_reclaimed(
-            store,
-            st,
-            "expired channel already closed on-chain",
-        ));
+        return forget_reclaimed(store, st, "expired channel already closed on-chain");
     }
 
     let receipt = match contract.reclaimExpired(st.channel_id).send().await {
@@ -1001,29 +1000,26 @@ async fn try_reclaim<P: Provider + Clone>(
         );
         return ReclaimOutcome::Failed;
     }
-    outcome_after_forget(forget_reclaimed(
-        store,
-        st,
-        "reclaimed expired buyer channel deposit",
-    ))
+    forget_reclaimed(store, st, "reclaimed expired buyer channel deposit")
 }
 
 /// Compare-and-delete the buyer record for `st`'s channel after a reclaim (or a
-/// drop-bogus decision), logging the outcome. Uses `forget_if_channel` so a
-/// concurrent `open_or_reuse` that replaced this provider's channel between the
-/// sweep's `load_all` and here is NOT clobbered (lost-update guard).
+/// drop-bogus decision), logging the outcome and returning the resulting
+/// [`ReclaimOutcome`]. Uses `forget_if_channel` so a concurrent `open_or_reuse`
+/// that replaced this provider's channel between the sweep's `load_all` and here
+/// is NOT clobbered (lost-update guard).
 ///
-/// Returns `true` when the record is gone for our purposes — either we deleted
-/// it (`Ok(true)`) or a newer channel already superseded it (`Ok(false)`) — and
-/// `false` when the store write *errored*, so the stale record will be re-loaded
-/// and re-attempted next sweep. The caller folds that `false` into a `Failed`
-/// outcome so a persistent store-write failure escalates instead of being
-/// silently re-cleared every pass (#906 review).
+/// Resolves the sweep when the record is gone for our purposes — either we
+/// deleted it (`Ok(true)`) or a newer channel already superseded it
+/// (`Ok(false)`). A store write that *errored* (`Err`) leaves the stale record
+/// to be re-loaded and re-attempted next sweep, so it maps to `Failed`: a
+/// persistent store-write failure must escalate (and feed the metric) rather
+/// than being silently re-cleared every pass (#906 review).
 fn forget_reclaimed(
     store: &Arc<dyn BuyerChannelStore>,
     st: &BuyerChannelState,
     reason: &str,
-) -> bool {
+) -> ReclaimOutcome {
     match store.forget_if_channel(st.provider, st.channel_id) {
         Ok(true) => {
             info!(
@@ -1032,7 +1028,7 @@ fn forget_reclaimed(
                 reason,
                 "dropped buyer channel record"
             );
-            true
+            ReclaimOutcome::Resolved
         }
         Ok(false) => {
             debug!(
@@ -1041,7 +1037,7 @@ fn forget_reclaimed(
                 reason,
                 "buyer record already replaced by a newer channel; left in place"
             );
-            true
+            ReclaimOutcome::Resolved
         }
         Err(err) => {
             warn!(
@@ -1050,21 +1046,8 @@ fn forget_reclaimed(
                 reason,
                 "buyer reclaim: forget_if_channel failed"
             );
-            false
+            ReclaimOutcome::Failed
         }
-    }
-}
-
-/// Map a [`forget_reclaimed`] result to a [`ReclaimOutcome`]. A forget that
-/// succeeded (or found the record already superseded) resolves the sweep; a
-/// forget that errored leaves the record stranded and looping, so it counts as a
-/// failure toward escalation — a persistent store-write failure must not be
-/// silently re-cleared every sweep (#906 review).
-const fn outcome_after_forget(forgotten: bool) -> ReclaimOutcome {
-    if forgotten {
-        ReclaimOutcome::Resolved
-    } else {
-        ReclaimOutcome::Failed
     }
 }
 
@@ -1497,16 +1480,6 @@ mod tests {
             ReclaimEscalation::None,
         );
         assert!(failures.is_empty());
-    }
-
-    /// A forget that cleared the record (or found it already superseded) resolves
-    /// the sweep; a forget that errored leaves the record stranded, so it must
-    /// count as a failure toward escalation rather than silently re-clearing the
-    /// tally every pass (#906 review).
-    #[test]
-    fn forget_failure_maps_to_a_failed_outcome() {
-        assert_eq!(outcome_after_forget(true), ReclaimOutcome::Resolved);
-        assert_eq!(outcome_after_forget(false), ReclaimOutcome::Failed);
     }
 
     /// Tallies are independent per channel: one channel crossing the threshold
