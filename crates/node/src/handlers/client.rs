@@ -275,6 +275,11 @@ pub struct ClientHandler {
     /// speculative pull-through proceeds and credited from the voucher path.
     /// Unset (tests / feature off) leaves only the per-request window.
     leech_governor: OnceLock<Arc<LeechGovernor>>,
+    /// Speculative-prefetch engine (#820), attached post-construction via
+    /// [`ClientHandler::attach_prefetch_engine`]. `None` in tests / when prefetch
+    /// is off. When set, the serve path credits bytes served from
+    /// prefetch-acquired blobs to the demand-quality numerator.
+    prefetch_engine: OnceLock<Arc<crate::prefetch::PrefetchEngine>>,
     rate_per_mb: Arc<AtomicU64>,
     delivery_floor: u64,
     delivery_ceiling: u64,
@@ -354,6 +359,7 @@ impl ClientHandler {
             pull_through_origin: OnceLock::new(),
             pull_ahead_bytes: OnceLock::new(),
             leech_governor: OnceLock::new(),
+            prefetch_engine: OnceLock::new(),
             rate_per_mb,
             delivery_floor,
             delivery_ceiling,
@@ -386,6 +392,14 @@ impl ClientHandler {
     /// bytes against the paying peer's region.
     pub fn attach_region_accountant(&self, accountant: Arc<RegionAccountant>) {
         let _ = self.region_accountant.set(accountant);
+    }
+
+    /// Attach the speculative-prefetch engine (#820). Called once during runtime
+    /// wiring; a second call is ignored (the `OnceLock` keeps the first). After
+    /// this, each accepted voucher credits bytes served from prefetch-acquired
+    /// blobs to the engine's demand-quality numerator.
+    pub fn attach_prefetch_engine(&self, engine: Arc<crate::prefetch::PrefetchEngine>) {
+        let _ = self.prefetch_engine.set(engine);
     }
 
     /// Attach the node-to-node cache-miss pull-through deadline (#831). Called
@@ -1711,6 +1725,17 @@ impl ClientHandler {
                 // unattached (tests / feature off) just skips.
                 if let Some(gov) = self.leech_governor.get() {
                     gov.record_served(&client_node_id.0, delta_bytes);
+                }
+                // Demand-quality feedback (#820): if this blob was obtained by
+                // speculative prefetch, credit the served bytes to the policy's
+                // `served / acquired` ratio so the auto-throttle reflects whether
+                // prefetched content is actually being consumed.
+                if let Some(pf) = self.prefetch_engine.get() {
+                    pf.note_served_if_prefetched(
+                        *hash.as_bytes(),
+                        delta_bytes,
+                        crate::payment_settlement::unix_now(),
+                    );
                 }
                 // Nonce-gap signal (#747): the voucher was accepted, but its
                 // nonce skipped values past the prior `last_nonce + 1`. The

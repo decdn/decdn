@@ -1,0 +1,629 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import { Test } from "forge-std/Test.sol";
+
+import { BuybackBurner } from "../src/BuybackBurner.sol";
+import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
+import { Token } from "../src/Token.sol";
+import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
+
+import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+
+contract MockUSDC is ERC20 {
+    constructor() ERC20("USDC", "USDC") {
+        _mint(msg.sender, 1_000_000_000e6);
+    }
+
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
+}
+
+contract MockHighDecimalsToken is ERC20 {
+    constructor() ERC20("X", "X") { }
+
+    function decimals() public pure override returns (uint8) {
+        return 19;
+    }
+}
+
+/// @notice Minimal Balancer V3 Vault mock. Holds the pool's token set + their
+///         scaled-18 live balances, and exposes `pull` (the leg the Router
+///         drives) which uses the BuybackBurner's scoped allowance — mirroring
+///         "approve the Vault, call the Router".
+contract MockBalancerV3Vault {
+    IERC20[] internal tokens;
+    uint256[] internal balances18;
+    uint256 public swapFeePercentage = 1e16; // 1%, 1e18-scaled
+
+    function setPool(IERC20[] calldata tokens_, uint256[] calldata balances18_) external {
+        tokens = tokens_;
+        balances18 = balances18_;
+    }
+
+    /// @dev Mutate one leg's scaled-18 balance to simulate a spot move.
+    function setBalance(uint256 index, uint256 balance18) external {
+        balances18[index] = balance18;
+    }
+
+    function setSwapFee(uint256 feeE18) external {
+        swapFeePercentage = feeE18;
+    }
+
+    function getPoolTokens(address) external view returns (IERC20[] memory) {
+        return tokens;
+    }
+
+    function getCurrentLiveBalances(address) external view returns (uint256[] memory) {
+        return balances18;
+    }
+
+    function getStaticSwapFeePercentage(address) external view returns (uint256) {
+        return swapFeePercentage;
+    }
+
+    function pull(IERC20 token, address from, uint256 amount) external {
+        // slither-disable-next-line arbitrary-send-erc20
+        token.transferFrom(from, address(this), amount);
+    }
+}
+
+contract MockBalancerV3WeightedPool {
+    uint256[] internal weights;
+
+    constructor(uint256[] memory weights_) {
+        weights = weights_;
+    }
+
+    function getNormalizedWeights() external view returns (uint256[] memory) {
+        return weights;
+    }
+}
+
+/// @notice Minimal Balancer V3 Router mock. Records the caller's USDC allowance
+///         to the Vault in `observedAllowance` (the test asserts it equals
+///         `exactAmountIn`), drives the Vault pull, enforces `minAmountOut`, and
+///         pays `amountOut` TOKEN out of its own (pre-funded) balance.
+contract MockBalancerV3Router {
+    MockBalancerV3Vault internal vault;
+
+    uint256 public amountOut;
+    uint256 public observedAllowance;
+    address public lastPool;
+    uint256 public lastDeadline;
+    bool public lastWethIsEth;
+
+    error RouterMinOut(uint256 amountOut, uint256 minAmountOut);
+
+    constructor(MockBalancerV3Vault vault_) {
+        vault = vault_;
+    }
+
+    function setAmountOut(uint256 amountOut_) external {
+        amountOut = amountOut_;
+    }
+
+    function swapSingleTokenExactIn(
+        address pool,
+        IERC20 tokenIn,
+        IERC20 tokenOut_,
+        uint256 exactAmountIn,
+        uint256 minAmountOut,
+        uint256 deadline,
+        bool wethIsEth,
+        bytes calldata
+    ) external returns (uint256) {
+        observedAllowance = tokenIn.allowance(msg.sender, address(vault));
+        lastPool = pool;
+        lastDeadline = deadline;
+        lastWethIsEth = wethIsEth;
+
+        vault.pull(tokenIn, msg.sender, exactAmountIn);
+        if (amountOut < minAmountOut) revert RouterMinOut(amountOut, minAmountOut);
+        // slither-disable-next-line unchecked-transfer
+        tokenOut_.transfer(msg.sender, amountOut);
+        return amountOut;
+    }
+}
+
+/// @title BuybackBurnerBalancerV3 tests
+/// @notice Covers the live single-swap path, the TWAP `minOut` floor, the
+///         per-epoch USDC liquidity cap, the min/max buyback band, the scoped
+///         Vault approval lifecycle, and governance-setter access control.
+contract BuybackBurnerBalancerV3Test is Test {
+    MockUSDC internal usdc;
+    Token internal token;
+    MockBalancerV3Vault internal vault;
+    MockBalancerV3WeightedPool internal pool;
+    MockBalancerV3Router internal router;
+    BuybackBurnerBalancerV3 internal bb;
+
+    address internal admin = address(0xA11CE);
+    address internal keeper = address(0xCAFE);
+    address internal pauser = address(0xBAD);
+    address internal gov = address(0x60F);
+
+    // 80/20 TOKEN/USDC weighted pool seeded with 1,000,000 USDC + 100,000,000
+    // TOKEN. Marginal TOKEN-per-USDC spot = (wUsdc*balToken)/(balUsdc*wToken)
+    // = (0.2*1e26)/(1e24*0.8) scaled = 25e18 (25 TOKEN per USDC).
+    uint256 internal constant W_TOKEN = 0.8e18;
+    uint256 internal constant W_USDC = 0.2e18;
+    uint256 internal constant POOL_USDC_18 = 1e24; // 1,000,000 USDC scaled-18
+    uint256 internal constant POOL_TOKEN_18 = 1e26; // 100,000,000 TOKEN
+    uint256 internal constant SPOT = 25e18; // TOKEN per USDC, 1e18 fixed point
+
+    uint256 internal constant TWAP_WINDOW = 3600;
+    uint256 internal constant SLIPPAGE_BPS = 200;
+    uint256 internal constant MIN_BUYBACK = 100e6;
+    uint256 internal constant MAX_BUYBACK = 500_000e6;
+    uint256 internal constant CAP_FRACTION = 1000; // 10%
+
+    uint256 internal constant BUYBACK_USDC = 1000e6;
+    // expectedOut = 1000e6 * 1e12 * 25e18 / 1e18 = 25_000e18.
+    // floor = expectedOut * (1 - 1% fee) * (1 - 2% slippage)
+    //       = 25_000e18 * 0.99 * 0.98 = 24_255e18.
+    uint256 internal constant EXPECTED_OUT = 25_000e18;
+    uint256 internal constant FLOOR_OUT = 24_255e18;
+
+    function setUp() public {
+        usdc = new MockUSDC();
+        token = new Token(admin);
+
+        vault = new MockBalancerV3Vault();
+        uint256[] memory weights = new uint256[](2);
+        weights[0] = W_TOKEN;
+        weights[1] = W_USDC;
+        pool = new MockBalancerV3WeightedPool(weights);
+
+        IERC20[] memory tokens = new IERC20[](2);
+        tokens[0] = IERC20(address(token));
+        tokens[1] = IERC20(address(usdc));
+        uint256[] memory bals = new uint256[](2);
+        bals[0] = POOL_TOKEN_18;
+        bals[1] = POOL_USDC_18;
+        vault.setPool(tokens, bals);
+
+        router = new MockBalancerV3Router(vault);
+
+        bb = _deploy(CAP_FRACTION, MAX_BUYBACK);
+        router.setAmountOut(EXPECTED_OUT);
+
+        // Fund the Router with TOKEN to pay out, and the BuybackBurner with
+        // USDC (would arrive via FeeRouter.routeSettlement).
+        vm.prank(admin);
+        token.transfer(address(router), 500_000_000e18);
+        usdc.transfer(address(bb), 10_000_000e6);
+
+        _warmTwap(bb);
+    }
+
+    function _deploy(uint256 capFraction, uint256 maxBuyback) internal returns (BuybackBurnerBalancerV3 newBb) {
+        BuybackBurnerBalancerV3.Config memory cfg = BuybackBurnerBalancerV3.Config({
+            swapRouter_: IBalancerV3Router(address(router)),
+            pool_: address(pool),
+            vault_: address(vault),
+            subSwapCount_: 4,
+            subSwapMinBlockGap_: 10,
+            twapMinWindow_: TWAP_WINDOW,
+            maxBuybackAmount_: maxBuyback,
+            minBuybackAmount_: MIN_BUYBACK,
+            slippageBps_: SLIPPAGE_BPS,
+            epochLiquidityCapFraction_: capFraction
+        });
+        newBb = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+
+        vm.startPrank(admin);
+        newBb.grantRole(newBb.KEEPER_ROLE(), keeper);
+        newBb.grantRole(newBb.PAUSER_ROLE(), pauser);
+        newBb.grantRole(newBb.GOVERNANCE_ROLE(), gov);
+        vm.stopPrank();
+    }
+
+    /// @dev Establish a ready TWAP: an init poke, then a poke two windows later
+    ///      so the sliding window matures and `_twapPrice` is trusted.
+    function _warmTwap(BuybackBurnerBalancerV3 target) internal {
+        target.poke();
+        vm.warp(block.timestamp + 2 * TWAP_WINDOW);
+        target.poke();
+    }
+
+    // -----------------------------------------------------------------
+    // Happy path
+    // -----------------------------------------------------------------
+
+    function test_executeBuyback_happyPath_swapsBurnsEmits() public {
+        uint256 supplyBefore = token.totalSupply();
+
+        vm.expectEmit(false, false, false, true, address(bb));
+        emit BuybackBurner.BuybackExecuted(BUYBACK_USDC, EXPECTED_OUT);
+        vm.prank(keeper);
+        uint256 out = bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
+
+        assertEq(out, EXPECTED_OUT, "returned tokenOut");
+        assertEq(supplyBefore - token.totalSupply(), EXPECTED_OUT, "burned amount");
+        assertEq(router.lastPool(), address(pool), "router pool arg");
+        assertEq(router.lastWethIsEth(), false, "wethIsEth arg");
+        assertEq(bb.epochSwappedUsdc(), BUYBACK_USDC, "epoch accrual");
+    }
+
+    function test_twapPrice_reflectsStableSpot() public view {
+        // Clean power-of-ten pool state: the time-weighted average over a flat
+        // spot is exactly SPOT, no rounding.
+        assertEq(bb.twapPrice(), SPOT, "twap == spot exactly");
+    }
+
+    function test_twapFloor_accountsForSwapFee() public {
+        // Bump the pool fee to 5%; the floor must drop accordingly:
+        // 25_000e18 * 0.95 * 0.98 = 23_275e18. A keeper minOut between the old
+        // 1%-fee floor (24_255e18) and the new floor now passes.
+        vault.setSwapFee(5e16);
+        uint256 newFloor = 23_275e18;
+        vm.prank(keeper);
+        bb.executeBuyback(BUYBACK_USDC, newFloor);
+        // And one wei below the new floor reverts with the recomputed floor.
+        vm.prank(keeper);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.MinOutBelowTwapFloor.selector, newFloor - 1, newFloor)
+        );
+        bb.executeBuyback(BUYBACK_USDC, newFloor - 1);
+    }
+
+    // -----------------------------------------------------------------
+    // TWAP floor
+    // -----------------------------------------------------------------
+
+    function test_executeBuyback_minOutAtFloor_passes() public {
+        vm.prank(keeper);
+        bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
+        assertEq(bb.epochSwappedUsdc(), BUYBACK_USDC);
+    }
+
+    function test_executeBuyback_revertsWhenMinOutBelowTwapFloor() public {
+        vm.prank(keeper);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.MinOutBelowTwapFloor.selector, FLOOR_OUT - 1, FLOOR_OUT)
+        );
+        bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT - 1);
+    }
+
+    function test_executeBuyback_revertsTwapNotReady() public {
+        BuybackBurnerBalancerV3 fresh = _deploy(CAP_FRACTION, MAX_BUYBACK);
+        usdc.transfer(address(fresh), 10_000_000e6);
+        fresh.poke(); // initialize, but do not span the window
+        vm.prank(keeper);
+        vm.expectRevert(BuybackBurnerBalancerV3.TwapNotReady.selector);
+        fresh.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
+    }
+
+    function test_executeBuyback_revertsOnDegenerateSwapFee() public {
+        // A 100% pool fee would collapse the floor to 0 (fail-open); reject it.
+        vault.setSwapFee(1e18);
+        vm.prank(keeper);
+        vm.expectRevert(BuybackBurnerBalancerV3.PoolStateInvalid.selector);
+        bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
+    }
+
+    function test_twapFloor_resistsSingleBlockSpotSpike() public {
+        uint256 before = bb.twapPrice();
+        // Halve the TOKEN leg in one block -> spot doubles instantaneously.
+        vault.setBalance(0, POOL_TOKEN_18 / 2);
+        bb.poke(); // samples the spiked spot but with zero elapsed weight
+        uint256 afterSpike = bb.twapPrice();
+        assertApproxEqAbs(afterSpike, before, 1e15, "twap barely moves on a one-block spike");
+    }
+
+    // -----------------------------------------------------------------
+    // Min / max buyback band
+    // -----------------------------------------------------------------
+
+    function test_executeBuyback_revertsBelowMinBuyback() public {
+        // minOut large enough to clear the TWAP floor so the band check (which
+        // runs after the floor) is what reverts.
+        vm.prank(keeper);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.BelowMinBuyback.selector, MIN_BUYBACK - 1, MIN_BUYBACK)
+        );
+        bb.executeBuyback(MIN_BUYBACK - 1, 1e25);
+    }
+
+    function test_executeBuyback_revertsAboveMaxBuyback() public {
+        uint256 over = MAX_BUYBACK + 1;
+        // Floor for `over` USDC; keeper supplies a generous minOut so the band
+        // check (not the floor) is what reverts.
+        router.setAmountOut(type(uint256).max / 2);
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnerBalancerV3.AboveMaxBuyback.selector, over, MAX_BUYBACK));
+        bb.executeBuyback(over, type(uint256).max / 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Per-epoch liquidity cap
+    // -----------------------------------------------------------------
+
+    // 60,000 USDC buyback: floor = 60000e6 * 1e12 * 25e18 / 1e18 * 9800/10000.
+    uint256 internal constant BIG_BUYBACK = 60_000e6;
+    uint256 internal constant BIG_FLOOR = 1_470_000e18;
+    uint256 internal constant BIG_OUT = 1_500_000e18;
+
+    function test_epochCap_accruesAndBindsWithinEpoch() public {
+        // cap = 10% of 1,000,000 USDC = 100,000 USDC.
+        router.setAmountOut(BIG_OUT);
+        vm.startPrank(keeper);
+        bb.executeBuyback(BIG_BUYBACK, BIG_FLOOR); // 60k ok
+        assertEq(bb.epochSwappedUsdc(), BIG_BUYBACK);
+        uint256 cap = 100_000e6;
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.EpochCapExceeded.selector, BIG_BUYBACK + BIG_BUYBACK, cap)
+        );
+        bb.executeBuyback(BIG_BUYBACK, BIG_FLOOR); // 120k > 100k cap
+        vm.stopPrank();
+    }
+
+    function test_epochCap_resetsAcrossEpochs() public {
+        router.setAmountOut(BIG_OUT);
+        vm.prank(keeper);
+        bb.executeBuyback(BIG_BUYBACK, BIG_FLOOR);
+        assertEq(bb.epochSwappedUsdc(), BIG_BUYBACK);
+
+        vm.warp(block.timestamp + 7 days);
+        vm.expectEmit(true, false, false, false, address(bb));
+        emit BuybackBurnerBalancerV3.EpochRolled(uint64(block.timestamp / 7 days), 0);
+        vm.prank(keeper);
+        bb.executeBuyback(BIG_BUYBACK, BIG_FLOOR);
+        assertEq(bb.epochSwappedUsdc(), BIG_BUYBACK, "epoch accrual reset then re-accrued");
+    }
+
+    // -----------------------------------------------------------------
+    // Scoped Vault approval
+    // -----------------------------------------------------------------
+
+    function test_scopedApproval_setToAmountInThenResetToZero() public {
+        vm.prank(keeper);
+        bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
+        assertEq(router.observedAllowance(), BUYBACK_USDC, "allowance scoped to amountIn at swap time");
+        assertEq(usdc.allowance(address(bb), address(vault)), 0, "allowance reset after swap");
+    }
+
+    // -----------------------------------------------------------------
+    // Governance setters
+    // -----------------------------------------------------------------
+
+    function test_setSwapRouter_updatesAndGuards() public {
+        vm.prank(gov);
+        bb.setSwapRouter(address(0xABCD));
+        assertEq(address(bb.swapRouter()), address(0xABCD));
+
+        vm.prank(gov);
+        vm.expectRevert(BuybackBurner.ZeroAddress.selector);
+        bb.setSwapRouter(address(0));
+
+        vm.expectRevert();
+        bb.setSwapRouter(address(0x1234)); // no GOVERNANCE_ROLE
+    }
+
+    function test_setKeeper_rotatesRole() public {
+        address newKeeper = address(0x5EE);
+        vm.prank(gov);
+        bb.setKeeper(newKeeper);
+        assertTrue(bb.hasRole(bb.KEEPER_ROLE(), newKeeper));
+        assertEq(bb.keeper(), newKeeper);
+
+        vm.prank(gov);
+        bb.setKeeper(keeper);
+        assertFalse(bb.hasRole(bb.KEEPER_ROLE(), newKeeper), "old keeper role revoked");
+    }
+
+    function test_setSlippageTolerance_boundsAndGuards() public {
+        vm.prank(gov);
+        bb.setSlippageTolerance(500);
+        assertEq(bb.slippageBps(), 500);
+
+        vm.prank(gov);
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnerBalancerV3.SlippageOutOfBounds.selector, 10_000, 10_000));
+        bb.setSlippageTolerance(10_000);
+    }
+
+    function test_setEpochLiquidityCapFraction_boundsAndGuards() public {
+        vm.prank(gov);
+        bb.setEpochLiquidityCapFraction(3000);
+        assertEq(bb.epochLiquidityCapFraction(), 3000);
+
+        vm.prank(gov);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.CapFractionOutOfBounds.selector, 3001, 100, 3000)
+        );
+        bb.setEpochLiquidityCapFraction(3001);
+    }
+
+    function test_setters_requireGovernanceRole() public {
+        vm.expectRevert();
+        bb.setMinBuybackAmount(1);
+        vm.expectRevert();
+        bb.setMaxBuybackAmount(1);
+        vm.expectRevert();
+        bb.setEpochLiquidityCapFraction(1000);
+    }
+
+    // -----------------------------------------------------------------
+    // Pause + constructor + accumulated fees
+    // -----------------------------------------------------------------
+
+    function test_pause_blocksExecuteBuyback() public {
+        vm.prank(pauser);
+        bb.pause();
+        vm.prank(keeper);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
+    }
+
+    function test_constructor_revertsOnZeroRouter() public {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.swapRouter_ = IBalancerV3Router(address(0));
+        vm.expectRevert(BuybackBurner.ZeroAddress.selector);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_constructor_revertsOnCapFractionOutOfBounds() public {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.epochLiquidityCapFraction_ = 3001;
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.CapFractionOutOfBounds.selector, 3001, 100, 3000)
+        );
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_constructor_revertsOnTwapWindowTooShort() public {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.twapMinWindow_ = 30 minutes - 1;
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.TwapWindowTooShort.selector, 30 minutes - 1, 30 minutes)
+        );
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_constructor_revertsOnInvertedBand() public {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.minBuybackAmount_ = MAX_BUYBACK + 1;
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.BuybackBandInverted.selector, MAX_BUYBACK + 1, MAX_BUYBACK)
+        );
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_setMaxBuybackAmount_revertsBelowMin() public {
+        vm.prank(gov);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.BuybackBandInverted.selector, MIN_BUYBACK, MIN_BUYBACK - 1)
+        );
+        bb.setMaxBuybackAmount(MIN_BUYBACK - 1);
+    }
+
+    function test_constructor_revertsOnUsdcDecimalsAbove18() public {
+        MockHighDecimalsToken bad = new MockHighDecimalsToken();
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnerBalancerV3.UnsupportedTokenDecimals.selector, uint8(19)));
+        new BuybackBurnerBalancerV3(IERC20(address(bad)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_poke_revertsWhenPoolUnwired() public {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.pool_ = address(0);
+        cfg.vault_ = address(0);
+        BuybackBurnerBalancerV3 bb2 =
+            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        vm.expectRevert(BuybackBurner.PoolNotWired.selector);
+        bb2.poke();
+    }
+
+    function test_getAccumulatedFees_reportsUsdcBalance() public view {
+        assertEq(bb.getAccumulatedFees(), usdc.balanceOf(address(bb)));
+    }
+
+    // -----------------------------------------------------------------
+    // Pool-state read robustness (address-matching, not index-based)
+    // -----------------------------------------------------------------
+
+    function test_poolState_reversedTokenOrdering() public {
+        // USDC at index 0, TOKEN at index 1 (opposite of setUp). The spot must
+        // still resolve to SPOT because legs are matched by address, not index.
+        BuybackBurnerBalancerV3 bb2 =
+            _deployAgainstPool(_orderedTokens(true), _orderedWeights(true), _orderedBals(true));
+        _warmTwap(bb2);
+        assertEq(bb2.twapPrice(), SPOT, "spot correct under reversed token ordering");
+    }
+
+    function test_poolState_ignoresDecoyLegInThreeTokenPool() public {
+        // 3-token pool (TOKEN, decoy, USDC) — the decoy leg must be ignored.
+        IERC20[] memory t = new IERC20[](3);
+        t[0] = IERC20(address(token));
+        t[1] = IERC20(address(0xBEEF));
+        t[2] = IERC20(address(usdc));
+        uint256[] memory w = new uint256[](3);
+        w[0] = W_TOKEN;
+        w[1] = 0.1e18;
+        w[2] = W_USDC;
+        uint256[] memory b = new uint256[](3);
+        b[0] = POOL_TOKEN_18;
+        b[1] = 12_345e18;
+        b[2] = POOL_USDC_18;
+        BuybackBurnerBalancerV3 bb2 = _deployAgainstPool(t, w, b);
+        _warmTwap(bb2);
+        assertEq(bb2.twapPrice(), SPOT, "decoy leg ignored in 3-token pool");
+    }
+
+    function test_poolState_revertsOnMissingTokenLeg() public {
+        // Pool has USDC + a decoy but no TOKEN leg -> PoolStateInvalid.
+        IERC20[] memory t = new IERC20[](2);
+        t[0] = IERC20(address(usdc));
+        t[1] = IERC20(address(0xDEAD));
+        BuybackBurnerBalancerV3 bb2 = _deployAgainstPool(t, _orderedWeights(true), _orderedBals(true));
+        vm.expectRevert(BuybackBurnerBalancerV3.PoolStateInvalid.selector);
+        bb2.poke(); // poke -> _updateTwapAccumulator -> _spotPrice -> _poolState
+    }
+
+    function test_twap_tracksRecentSpotAcrossMultipleWindows() public {
+        // Roll several windows at SPOT, then double the TOKEN leg (spot -> 50e18)
+        // and roll several more. The sliding anchor must discard the stale 25e18
+        // region; twapPrice converges to the recent spot, not a lifetime average.
+        for (uint256 i = 0; i < 4; ++i) {
+            vm.warp(block.timestamp + 2 * TWAP_WINDOW);
+            bb.poke();
+        }
+        vault.setBalance(0, POOL_TOKEN_18 * 2); // index 0 == TOKEN -> spot doubles
+        for (uint256 i = 0; i < 4; ++i) {
+            vm.warp(block.timestamp + 2 * TWAP_WINDOW);
+            bb.poke();
+        }
+        assertApproxEqAbs(bb.twapPrice(), 50e18, 1e18, "twap tracks recent spot across rolls");
+    }
+
+    function _deployAgainstPool(IERC20[] memory t, uint256[] memory w, uint256[] memory b)
+        internal
+        returns (BuybackBurnerBalancerV3 bb2)
+    {
+        MockBalancerV3Vault v2 = new MockBalancerV3Vault();
+        v2.setPool(t, b);
+        MockBalancerV3WeightedPool p2 = new MockBalancerV3WeightedPool(w);
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.vault_ = address(v2);
+        cfg.pool_ = address(p2);
+        bb2 = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function _orderedTokens(bool usdcFirst) internal view returns (IERC20[] memory t) {
+        t = new IERC20[](2);
+        t[0] = IERC20(address(usdcFirst ? address(usdc) : address(token)));
+        t[1] = IERC20(address(usdcFirst ? address(token) : address(usdc)));
+    }
+
+    function _orderedWeights(bool usdcFirst) internal pure returns (uint256[] memory w) {
+        w = new uint256[](2);
+        w[0] = usdcFirst ? W_USDC : W_TOKEN;
+        w[1] = usdcFirst ? W_TOKEN : W_USDC;
+    }
+
+    function _orderedBals(bool usdcFirst) internal pure returns (uint256[] memory b) {
+        b = new uint256[](2);
+        b[0] = usdcFirst ? POOL_USDC_18 : POOL_TOKEN_18;
+        b[1] = usdcFirst ? POOL_TOKEN_18 : POOL_USDC_18;
+    }
+
+    function _defaultCfg() internal view returns (BuybackBurnerBalancerV3.Config memory cfg) {
+        cfg = BuybackBurnerBalancerV3.Config({
+            swapRouter_: IBalancerV3Router(address(router)),
+            pool_: address(pool),
+            vault_: address(vault),
+            subSwapCount_: 4,
+            subSwapMinBlockGap_: 10,
+            twapMinWindow_: TWAP_WINDOW,
+            maxBuybackAmount_: MAX_BUYBACK,
+            minBuybackAmount_: MIN_BUYBACK,
+            slippageBps_: SLIPPAGE_BPS,
+            epochLiquidityCapFraction_: CAP_FRACTION
+        });
+    }
+}

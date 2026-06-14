@@ -651,8 +651,8 @@ impl DhtHandler {
     fn handle_find_value(&self, req: wire::FindValueRequest) -> wire::FindValueResponse {
         let now_us = now_us();
         // Feed the inbound demand signal to the prefetch engine before building
-        // the response (ADR 022 §Prefetch Demand Signal). Decide-and-meter only;
-        // the live acquisition is the #650 follow-up.
+        // the response (ADR 022 §Prefetch Demand Signal). On a threshold-cross
+        // this may fire a live, non-blocking speculative acquisition (#820).
         if let Some(engine) = &self.prefetch {
             self.run_prefetch(engine, req.hash.as_bytes(), now_us / 1_000_000);
         }
@@ -672,9 +672,9 @@ impl DhtHandler {
         }
     }
 
-    /// Feed the `FIND_VALUE` demand signal to the prefetch engine and translate
-    /// the decision into metrics. Decides and meters only — the live
-    /// acquisition is the #650 follow-up.
+    /// Feed the `FIND_VALUE` demand signal to the prefetch engine, translate the
+    /// decision into metrics, and — on an `Acquire` — fire a live, bounded,
+    /// non-blocking background acquisition (#820).
     fn run_prefetch(
         &self,
         engine: &Arc<crate::prefetch::PrefetchEngine>,
@@ -696,9 +696,10 @@ impl DhtHandler {
         if let PrefetchDecision::Acquire = decision {
             self.metrics
                 .record_prefetch_acquire(engine.policy_requires_origin());
-            tracing::debug!(
-                "prefetch: demand threshold crossed; acquisition deferred to #650 follow-up"
-            );
+            // Fire the live, bounded background acquisition (#820). Non-blocking:
+            // `try_acquire` spawns the pull and returns immediately, so the DHT
+            // serve loop is never stalled by a speculative fetch.
+            engine.try_acquire(*hash_bytes);
         }
         self.metrics.set_prefetch_quality(
             engine.policy().demand_quality_ratio(now_secs),

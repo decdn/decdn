@@ -85,7 +85,7 @@ use decdn_incentive::{
     voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerChannelService;
-use decdn_node::channel_store::PersistentChannelStateStore;
+use decdn_node::channel_store::{BuyerChannelStoreHandle, PersistentChannelStateStore};
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::{AutoSettleConfig, PaymentChannelService};
@@ -135,12 +135,17 @@ const CHANNEL_EXPIRY_WARP_SECS: u64 = 366 * 24 * 60 * 60;
 
 // Wall-clock bounds on the `forge` subprocesses (issue #785). `forge build`
 // compiles the contract set cold; the deploy normally finishes in ~1–5s but
-// `forge script --broadcast` intermittently stalls in receipt-wait under runner
-// CPU contention, so it is bounded per attempt and a *stall* (timeout) is
-// retried. A non-zero exit is treated as deterministic and fails fast.
+// `forge script --broadcast` intermittently fails under runner CPU contention in
+// two transient ways, both bounded per attempt and retried: a *stall* (timeout in
+// receipt-wait, #785) and a *broadcast-phase non-zero exit* (#883) where the
+// script body completed but tx submission hit a nonce/RPC/anvil hiccup. A
+// non-zero exit *before* the body completes (a genuine revert or script bug) is
+// deterministic and fails fast. `DEPLOY_ATTEMPTS` is 3 so a single run can absorb
+// one of each transient class (the #883 flake was stall-then-broadcast-hiccup)
+// and still get a clean attempt.
 const FORGE_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(45);
-const DEPLOY_ATTEMPTS: usize = 2;
+const DEPLOY_ATTEMPTS: usize = 3;
 // Overall ceiling on the single e2e flow, sized above the sum of the internal
 // `poll_until` budgets (~560s) + build + deploy so a slow-but-legitimate run
 // still surfaces its specific poll diagnostic, while a truly *unbounded* await
@@ -220,6 +225,41 @@ async fn forge_output(
             .with_context(|| format!("spawn `{what}` (is foundry installed?)")),
         Err(_) => Ok(Err(timeout)),
     }
+}
+
+/// Classifies a non-zero `forge script` exit (#883). Returns `true` when the
+/// script *body* completed — i.e. simulation succeeded and forge printed its
+/// `Script ran successfully` line — but the process still exited non-zero, which
+/// means the failure was in the later broadcast / tx-submission phase (a
+/// transient nonce/RPC/anvil hiccup under CPU contention, same root cause as the
+/// #785 stall; retryable). Returns `false` when that marker is absent, i.e. the
+/// script reverted or aborted before the body completed — a deterministic
+/// revert/script bug that should fail fast with full output rather than burn
+/// retries on a guaranteed-identical failure.
+fn forge_script_body_completed(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).contains("Script ran successfully")
+}
+
+#[test]
+fn broadcast_phase_failure_is_retryable() {
+    // Representative of the #883 attempt-2 stdout (line order condensed): the
+    // body ran (simulation + `Return` printed), then the process cut off in the
+    // broadcast/EVM-setup phase. Marker present ⇒ transient broadcast hiccup ⇒ retry.
+    let stdout = b"No files changed, compilation skipped\nScript ran successfully.\n\n== Return ==\nd: struct BaseProtocolDeploy.Deployment Deployment({ token: 0x959, paymentChannel: 0x4ed })\n\n## Setting up 1 EVM.";
+    assert!(forge_script_body_completed(stdout));
+}
+
+#[test]
+fn genuine_revert_fails_fast() {
+    // A revert/abort during simulation never prints the success marker, so the
+    // body did not complete ⇒ deterministic ⇒ fail fast (no retry).
+    let stdout = b"Error: Simulated execution failed.\nReason: revert: minDeposit not met\n";
+    assert!(!forge_script_body_completed(stdout));
+}
+
+#[test]
+fn empty_output_is_not_retryable() {
+    assert!(!forge_script_body_completed(b""));
 }
 
 // Bindings for the setup/write calls not exposed by the production
@@ -748,29 +788,63 @@ async fn run_e2e() -> anyhow::Result<()> {
     // bindings (`openChannel`, `clientChannelNonce`, `reclaimExpired`) and the
     // service end-to-end on a live deployment.
     // ============================================================
+    // The buyer service runs under its OWN eth identity, distinct from the
+    // `client_addr` that drove the seller-path channels above. This is what makes
+    // the bootstrap reconciliation scan (#763) deterministic here: reconcile
+    // re-hydrates `ChannelOpened(client == self)` orphans, and a fresh buyer
+    // address owns no prior channels, so the scan finds nothing to race against
+    // the lazy open below. (Reusing `client_addr` would let reconcile re-hydrate
+    // the still-Open, already-withdrawn `id1` and the open would reuse it.)
+    let buyer_signer = Arc::new(PrivateKeySigner::random());
+    let buyer_addr = buyer_signer.address();
+    let _: serde_json::Value = admin
+        .raw_request(
+            "anvil_setBalance".into(),
+            (
+                buyer_addr,
+                U256::from(100u64) * U256::from(10u64).pow(U256::from(18)),
+            ),
+        )
+        .await?;
+    let buyer_provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from((*buyer_signer).clone()))
+        .connect_http(url.clone());
+    let usdc_buyer = Erc20::new(usdc_addr, buyer_provider.clone());
+    // Fund the buyer generously: the existing path opens 1 channel + a top-up,
+    // and the #763 scenarios appended at the end open several more.
+    usdc_admin
+        .mint(
+            buyer_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(12u64),
+        )
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
     let buyer_store = Arc::new(MemoryBuyerChannelStore::new());
     let buyer_store_dyn: Arc<dyn BuyerChannelStore> = buyer_store.clone();
     let buyer_service = BuyerChannelService::bootstrap(
-        client_provider.clone(),
+        buyer_provider.clone(),
         payment_channel,
-        client_addr,
+        buyer_addr,
         buyer_store_dyn,
-        Arc::clone(&client_signer),
+        Arc::clone(&buyer_signer),
         voucher_domain(CHAIN_ID, payment_channel),
         U256::from(DEPOSIT_MICRO_USDC),
-        false, // USDC already approved above; don't issue a second approval
+        true, // fresh buyer identity → issue the one-time max USDC approval
     )
     .await?;
 
-    // Lazy open against the provider → a fresh on-chain channel (the client's
-    // 3rd, nonce 2) + a persisted buyer record.
+    // Lazy open against the provider → a fresh on-chain channel (the buyer's
+    // first, nonce 0) + a persisted buyer record.
     let buyer_ctx = buyer_service
         .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
         .await?;
     let buyer_id = buyer_ctx.channel_id;
     let on_chain = pc_read.getChannel(buyer_id).call().await?;
     anyhow::ensure!(
-        on_chain.client == client_addr && on_chain.provider == node_addr,
+        on_chain.client == buyer_addr && on_chain.provider == node_addr,
         "buyer channel opened with wrong client/provider"
     );
     anyhow::ensure!(
@@ -863,7 +937,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("buyer channel vanished before reclaim"))?;
     expired.expires_at = 1; // far in the past vs the system clock → sweep treats as expired
     buyer_store.record(&expired)?;
-    let balance_before = usdc_client.balanceOf(client_addr).call().await?;
+    let balance_before = usdc_buyer.balanceOf(buyer_addr).call().await?;
     let _: serde_json::Value = node_provider
         .raw_request("evm_increaseTime".into(), (CHANNEL_EXPIRY_WARP_SECS,))
         .await?;
@@ -875,7 +949,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         buyer_store.get_by_provider(node_addr)?.is_none(),
         "reclaimed buyer channel record must be dropped"
     );
-    let balance_after = usdc_client.balanceOf(client_addr).call().await?;
+    let balance_after = usdc_buyer.balanceOf(buyer_addr).call().await?;
     anyhow::ensure!(
         balance_after.saturating_sub(balance_before) == topped_deposit,
         "reclaimExpired must refund the full deposit ({topped_deposit} µUSDC); \
@@ -1366,6 +1440,205 @@ async fn run_e2e() -> anyhow::Result<()> {
     );
     drop(service3);
 
+    // ============================================================
+    // #763 BUYER ROBUSTNESS — concurrency, expired rotation, and bootstrap
+    // reconciliation, all under the dedicated `buyer_addr` identity so the
+    // reconcile scan only ever sees the buyer's own channels. No seller
+    // settlement service is alive here; these scenarios are purely on-chain
+    // (open / reclaim) + the chain-log reconciliation scan, so none is needed.
+    // ============================================================
+
+    // --- A. Concurrent same-provider opens escrow exactly one deposit (#753). ---
+    // Two racing open_or_reuse for one provider: the InFlightOpenGuard lets one
+    // escrow a channel and makes the other bail-for-retry (or reuse the winner),
+    // so the on-chain client nonce advances by EXACTLY one and only one channel
+    // is ever tracked — never two deposits.
+    anyhow::ensure!(
+        buyer_store.get_by_provider(node_addr)?.is_none(),
+        "precondition: no buyer channel tracked for the provider after the reclaim above"
+    );
+    let nonce_before = pc_read.clientChannelNonce(buyer_addr).call().await?;
+    let (r1, r2) = tokio::join!(
+        buyer_service.open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC)),
+        buyer_service.open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC)),
+    );
+    let nonce_after = pc_read.clientChannelNonce(buyer_addr).call().await?;
+    anyhow::ensure!(
+        nonce_after == nonce_before + U256::from(1u64),
+        "concurrent opens must escrow exactly one channel (nonce {nonce_before} → {nonce_after})"
+    );
+    anyhow::ensure!(
+        buyer_store.len() == 1,
+        "concurrent opens must leave exactly one tracked channel"
+    );
+    let opened_ids: Vec<_> = [&r1, &r2]
+        .into_iter()
+        .filter_map(|r| r.as_ref().ok().map(|ctx| ctx.channel_id))
+        .collect();
+    let win_id = opened_ids
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("at least one concurrent open must succeed"))?;
+    anyhow::ensure!(
+        opened_ids.iter().all(|id| *id == win_id),
+        "concurrent opens must never surface two distinct channels"
+    );
+    let reuse_ctx = buyer_service
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .await?;
+    anyhow::ensure!(
+        reuse_ctx.channel_id == win_id && buyer_store.len() == 1,
+        "a retry after the concurrent race reuses the one channel"
+    );
+
+    // --- B. Expired-channel rotation reached THROUGH open_or_reuse_channel. ---
+    // Mark the tracked channel expired and warp past its on-chain expiry, then a
+    // fresh open_or_reuse must reclaim it FIRST (reclaim-before-reopen, dropping
+    // the old record) and open a new channel — the rotation path previously only
+    // reachable via sweep_expired_once directly, not through open_or_reuse.
+    let mut row = buyer_store
+        .get_by_provider(node_addr)?
+        .ok_or_else(|| anyhow::anyhow!("buyer channel vanished before rotation test"))?;
+    row.expires_at = 1; // expired vs host clock → reclaim candidate
+    buyer_store.record(&row)?;
+    let _: serde_json::Value = node_provider
+        .raw_request("evm_increaseTime".into(), (CHANNEL_EXPIRY_WARP_SECS,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    let rotated = buyer_service
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .await?;
+    anyhow::ensure!(
+        rotated.channel_id != win_id && buyer_store.len() == 1,
+        "rotation must reclaim the expired channel and open a new one"
+    );
+    anyhow::ensure!(
+        matches!(
+            pc_read.getChannel(win_id).call().await?.status,
+            PaymentChannel::Status::Closed
+        ),
+        "the rotated-away channel must be reclaimed (Closed) on-chain"
+    );
+
+    // --- C. Bootstrap reconciliation re-hydrates an orphaned on-chain channel. ---
+    // Open a channel directly via the buyer wallet so no service tracks it, then
+    // bring up a fresh BuyerChannelService (empty store) under the same identity:
+    // its bootstrap reconciliation scan must discover the on-chain orphan and
+    // re-hydrate it so the reclaim sweep can recover the deposit.
+    let pc_buyer = PaymentChannelOpen::new(payment_channel, buyer_provider.clone());
+    pc_buyer
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let recon_store = Arc::new(MemoryBuyerChannelStore::new());
+    let recon_store_dyn: Arc<dyn BuyerChannelStore> = recon_store.clone();
+    let recon_service = BuyerChannelService::bootstrap(
+        buyer_provider.clone(),
+        payment_channel,
+        buyer_addr,
+        recon_store_dyn,
+        Arc::clone(&buyer_signer),
+        voucher_domain(CHAIN_ID, payment_channel),
+        U256::from(DEPOSIT_MICRO_USDC),
+        false,
+    )
+    .await?;
+    let rehydrated = poll_until(Duration::from_secs(60), || {
+        let recon_store = Arc::clone(&recon_store);
+        async move { recon_store.get_by_provider(node_addr).ok().flatten() }
+    })
+    .await
+    .ok_or_else(|| {
+        anyhow::anyhow!("bootstrap reconciliation did not re-hydrate any orphaned buyer channel")
+    })?;
+    let recon_view = pc_read.getChannel(rehydrated.channel_id).call().await?;
+    anyhow::ensure!(
+        recon_view.client == buyer_addr
+            && recon_view.provider == node_addr
+            && matches!(recon_view.status, PaymentChannel::Status::Open),
+        "re-hydrated channel must be an Open channel we own"
+    );
+    anyhow::ensure!(
+        rehydrated.deposit == recon_view.deposit && rehydrated.expires_at == recon_view.expiresAt,
+        "re-hydrated state must mirror the on-chain deposit/expiry"
+    );
+    drop(recon_service);
+
+    // --- D. Reconciliation repairs an undecodable (post-downgrade) row, and a
+    // corrupt sibling never blocks the reclaim sweep (#753 / #763). ---
+    let pstore_dir = tempfile::tempdir()?;
+    // `PersistentChannelStateStore::open` enforces a `0o700` data_dir; a CI umask
+    // of 002 leaves the tempdir at 0o755, so tighten it (mirrors the seller store
+    // setup above).
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        pstore_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
+    let pconcrete = Arc::new(PersistentChannelStateStore::open(pstore_dir.path())?);
+    // A real on-chain channel whose local row got corrupted by a downgrade.
+    pc_buyer
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    // Seed an undecodable value under the provider key (its channel_id is
+    // unrecoverable from disk — exactly what reconcile rebuilds from chain).
+    pconcrete.insert_raw_buyer_record(node_addr, &[0u8; 8])?;
+    let pstore_dyn: Arc<dyn BuyerChannelStore> =
+        Arc::new(BuyerChannelStoreHandle::new(Arc::clone(&pconcrete)));
+    let persist_service = BuyerChannelService::bootstrap(
+        buyer_provider.clone(),
+        payment_channel,
+        buyer_addr,
+        Arc::clone(&pstore_dyn),
+        Arc::clone(&buyer_signer),
+        voucher_domain(CHAIN_ID, payment_channel),
+        U256::from(DEPOSIT_MICRO_USDC),
+        false,
+    )
+    .await?;
+    let repaired = poll_until(Duration::from_secs(60), || {
+        let s = Arc::clone(&pstore_dyn);
+        async move { s.get_by_provider(node_addr).ok().flatten() }
+    })
+    .await
+    .ok_or_else(|| anyhow::anyhow!("reconcile did not repair the undecodable buyer row"))?;
+    anyhow::ensure!(
+        matches!(
+            pc_read.getChannel(repaired.channel_id).call().await?.status,
+            PaymentChannel::Status::Open
+        ),
+        "the repaired row must point at an Open on-chain channel"
+    );
+    // D2 (mixed reclaim): seed an undecodable row under an unrelated provider key
+    // alongside the healthy (now-expired) repaired row, then sweep — the corrupt
+    // sibling is skipped by load_all and the healthy channel is still reclaimed.
+    let corrupt_provider = Address::from([0xCDu8; 20]);
+    pconcrete.insert_raw_buyer_record(corrupt_provider, &[0u8; 8])?;
+    let mut healthy = pstore_dyn
+        .get_by_provider(node_addr)?
+        .ok_or_else(|| anyhow::anyhow!("repaired row vanished before mixed-reclaim test"))?;
+    healthy.expires_at = 1;
+    pstore_dyn.record(&healthy)?;
+    let _: serde_json::Value = node_provider
+        .raw_request("evm_increaseTime".into(), (CHANNEL_EXPIRY_WARP_SECS,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    persist_service.sweep_expired_once().await;
+    anyhow::ensure!(
+        pstore_dyn.get_by_provider(node_addr)?.is_none(),
+        "the healthy expired channel must be reclaimed despite the corrupt sibling"
+    );
+    anyhow::ensure!(
+        pstore_dyn.get_by_provider(corrupt_provider).is_err(),
+        "the corrupt sibling row remains (skipped, not reclaimed)"
+    );
+    drop(persist_service);
+
     client_ep.close().await;
     server_ep.close().await;
     let _ = server_task.await;
@@ -1407,15 +1680,17 @@ async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow
 /// from the anvil dev deployer. `INITIAL_TOKEN_HOLDER` is the node so it holds
 /// the staking TOKEN directly.
 ///
-/// `forge script --broadcast` can *stall* in its receipt-wait phase under runner
-/// CPU contention (issue #785), so each attempt is bounded by `DEPLOY_TIMEOUT`
-/// and a stall (timeout) is retried up to `DEPLOY_ATTEMPTS` times. Retry is safe:
-/// each run broadcasts from a fresh deployer nonce (new contract addresses) and
-/// `FORCE_OVERWRITE_MANIFEST` rewrites the manifest the test reads, so a
-/// completed retry fully supersedes a killed one. A *non-zero exit* (revert,
-/// script bug, RPC rejection) is almost always deterministic, so it fails fast
-/// with the full output rather than retrying a guaranteed-identical failure (and
-/// rather than logging a misleading "retrying" line for a hard error).
+/// `forge script --broadcast` fails transiently under runner CPU contention in
+/// two ways, both retried up to `DEPLOY_ATTEMPTS` times: a *stall* in receipt-wait
+/// (timeout, issue #785) and a *broadcast-phase non-zero exit* (#883) where the
+/// script body completed (`Script ran successfully` printed) but tx submission hit
+/// a nonce/RPC/anvil hiccup. Retry is safe: each run broadcasts from a fresh
+/// deployer nonce (new contract addresses) and `FORCE_OVERWRITE_MANIFEST` rewrites
+/// the manifest the test reads, so a completed retry fully supersedes a killed or
+/// half-broadcast one. A non-zero exit *before* the body completes (a genuine
+/// revert or script bug — no success marker) is deterministic and fails fast with
+/// the full output rather than retrying a guaranteed-identical failure. See
+/// `forge_script_body_completed` for the classification.
 async fn run_deploy_script(
     contracts: &Path,
     rpc_url: &str,
@@ -1445,10 +1720,26 @@ async fn run_deploy_script(
         // rather than masquerading as a stall and burning a retry.
         match forge_output(cmd, DEPLOY_TIMEOUT, "forge script DeployProtocol").await? {
             Ok(out) if out.status.success() => return Ok(()),
-            // Deterministic failure — surface the full output and stop.
+            // Non-zero exit *after* the script body completed (#883) — the failure
+            // was in the broadcast / tx-submission phase, a transient hiccup worth
+            // retrying like a stall. A non-zero exit *before* the body completed is
+            // a deterministic revert/script bug and fails fast with full output.
+            Ok(out) if forge_script_body_completed(&out.stdout) => {
+                if attempt == DEPLOY_ATTEMPTS {
+                    anyhow::bail!(
+                        "forge script DeployProtocol failed after {DEPLOY_ATTEMPTS} attempts; the final attempt completed the script body but exited non-zero during broadcast:\n{}\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                tracing::warn!(
+                    "forge script DeployProtocol attempt {attempt}/{DEPLOY_ATTEMPTS} completed the script body but exited non-zero during broadcast (transient nonce/RPC hiccup), retrying immediately"
+                );
+            }
+            // Deterministic failure (revert / script bug) — surface it and stop.
             Ok(out) => {
                 anyhow::bail!(
-                    "forge script DeployProtocol exited non-zero:\n{}\n{}",
+                    "forge script DeployProtocol exited non-zero before the script body completed (revert or script bug):\n{}\n{}",
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
                 )
@@ -1457,11 +1748,11 @@ async fn run_deploy_script(
             Err(timeout) => {
                 if attempt == DEPLOY_ATTEMPTS {
                     anyhow::bail!(
-                        "forge script DeployProtocol stalled on all {DEPLOY_ATTEMPTS} attempts (timed out after {timeout:?})"
+                        "forge script DeployProtocol failed after {DEPLOY_ATTEMPTS} attempts; the final attempt stalled (timed out after {timeout:?})"
                     );
                 }
                 tracing::warn!(
-                    "forge script DeployProtocol attempt {attempt}/{DEPLOY_ATTEMPTS} stalled, retrying after {timeout:?}"
+                    "forge script DeployProtocol attempt {attempt}/{DEPLOY_ATTEMPTS} stalled (killed after {timeout:?}), retrying immediately"
                 );
             }
         }

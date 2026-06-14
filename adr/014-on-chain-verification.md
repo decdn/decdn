@@ -77,7 +77,7 @@ When constructing a `ProbeResponse` or `StreamResponse`, the node signs the secu
 
 ### SlashJudge Contract
 
-A unified contract that adjudicates the three signature-dependent offenses (phantom announcement, rate manipulation, blacklist violation). All resolve synchronously at submit time — see § Bond Handling. The contract holds challenge bonds, verifies evidence, and calls `CapacityBond.slash()` on each successful submission.
+A unified contract that adjudicates the three signature-dependent offenses (phantom announcement, rate manipulation, blacklist violation). Challenging is a two-phase **commit–reveal** flow (see [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal)): a `commitChallenge` registers an opaque commitment, and the `submit*Challenge` reveal resolves synchronously once the commitment matures — there is still no counter-evidence window (see § Bond Handling). The contract holds challenge bonds, verifies evidence, and calls `CapacityBond.slash()` on each successful reveal.
 
 #### Interface
 
@@ -105,43 +105,53 @@ interface ISlashJudge {
         bytes32 evidenceHash
     );
 
+    /// Phase 1 of every challenge: register an opaque commitment
+    /// `keccak256(abi.encode(evidenceHash, salt, msg.sender))`. Hides the evidence
+    /// and binds the challenger so a mempool copy of the reveal cannot steal the
+    /// reward (see § Challenge front-running mitigation). Reverts on a duplicate.
+    function commitChallenge(bytes32 commitment) external;
+
     /// Phantom announcement: node signed has_blob=true then ok=false within 30s.
-    /// Emits `Slashed` synchronously on successful verification (no counter-evidence window).
+    /// Reveals a prior `commitChallenge` (`salt` reconstructs it); emits `Slashed`
+    /// synchronously once the commitment matures (no counter-evidence window).
     function submitPhantomChallenge(
         address challengedNode,              // Ethereum address or Safe address of the challenged node
         bytes32 nodeId,
         bytes calldata probeResponseData,   // serialized {hash, has_blob, rate_per_mb, timestamp_us}
         bytes calldata probeSlashSig,        // EIP-712 signature (EOA or ERC-1271)
         bytes calldata streamResponseData,  // serialized {hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}
-        bytes calldata streamSlashSig        // EIP-712 signature (EOA or ERC-1271)
+        bytes calldata streamSlashSig,       // EIP-712 signature (EOA or ERC-1271)
+        bytes32 salt                         // reveals the commitChallenge commitment
     ) external;
 
-    /// Rate manipulation: stream rate > probe rate within 30s window (immediate).
-    /// Emits `Slashed` synchronously on successful verification.
+    /// Rate manipulation: stream rate > probe rate within 30s window.
+    /// Reveals a prior `commitChallenge`; emits `Slashed` synchronously on success.
     function submitRateChallenge(
         address challengedNode,
         bytes32 nodeId,
         bytes calldata probeResponseData,
         bytes calldata probeSlashSig,
         bytes calldata streamResponseData,
-        bytes calldata streamSlashSig
+        bytes calldata streamSlashSig,
+        bytes32 salt
     ) external;
 
     /// Blacklist violation: serving a blacklisted hash after compliance window.
-    /// Emits `Slashed` synchronously on successful verification.
+    /// Reveals a prior `commitChallenge`; emits `Slashed` synchronously on success.
     function submitBlacklistChallenge(
         address challengedNode,
         bytes32 nodeId,
         bytes32 blobHash,
         bytes calldata responseData,   // ProbeResponse (has_blob=true) or StreamResponse (ok=true)
         bytes calldata slashSig,
-        bool isStreamResponse          // false = ProbeResponse evidence, true = StreamResponse evidence
+        bool isStreamResponse,         // false = ProbeResponse evidence, true = StreamResponse evidence
+        bytes32 salt                   // reveals the commitChallenge commitment
     ) external;
 
-    // All three offense types (Phantom, RateManipulation, Blacklist) resolve
-    // synchronously at submit time. There is no counter-evidence window —
-    // `Slashed` is emitted atomically with `CapacityBond.slash()` inside
-    // each `submit*Challenge` call.
+    // After a matured commitment, all three offense types (Phantom,
+    // RateManipulation, Blacklist) resolve synchronously at reveal time. There is
+    // no counter-evidence window — `Slashed` is emitted atomically with
+    // `CapacityBond.slash()` inside each `submit*Challenge` reveal.
 }
 ```
 
@@ -189,10 +199,25 @@ The check applies at initialization too — neither contract may be deployed wit
 
 #### Bond Handling
 
-- Challengers must `TOKEN.approve(slashJudge, bondAmount)` before calling any `submit*Challenge()` function. The contract transfers the bond on submission.
+- Challengers must `TOKEN.approve(slashJudge, bondAmount)` before calling any `submit*Challenge()` reveal. The contract transfers the bond on the reveal (not on `commitChallenge`, which moves no funds — see [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal)).
 - **Successful challenge:** bond returned to challenger; node slashed via `CapacityBond.slash()`.
-- **All three offenses** (phantom, rate manipulation, blacklist): if on-chain verification passes, the slash executes synchronously at submit time — no counter-evidence window. Each offense's evidence is cryptographically dispositive: phantom and rate manipulation rely on two contradictory signed messages from the same node within 30 s; blacklist relies on a signed response for an already-blacklisted hash. The node's recourse is to not commit the offense; for rate changes, honor the last probe-quoted rate for the 30-second slashing window before serving streams at a new rate.
+- **All three offenses** (phantom, rate manipulation, blacklist): if on-chain verification passes, the slash executes synchronously at reveal time (inside the `submit*Challenge` call, after a prior `commitChallenge`) — no counter-evidence window. Each offense's evidence is cryptographically dispositive: phantom and rate manipulation rely on two contradictory signed messages from the same node within 30 s; blacklist relies on a signed response for an already-blacklisted hash. The node's recourse is to not commit the offense; for rate changes, honor the last probe-quoted rate for the 30-second slashing window before serving streams at a new rate.
 - **Frivolous-challenge bond loss.** A `submit*Challenge` that fails on-chain verification (signature mismatch, timestamp out of window, hash mismatch, etc.) reverts and the challenger pays only gas; the bond is not transferred for failed verifications. A challenge that *passes* verification always slashes the node — there is no second-stage dispute that could forfeit the bond after-the-fact.
+
+#### Challenge front-running mitigation (commit–reveal)
+
+**Vector (#854).** Each `submit*Challenge` discloses the full slashable evidence (`probeResponseData`, `streamResponseData`, the operator's `slash_sig`s) in its calldata. If that were the only step, a mempool watcher could copy a pending honest challenge, resubmit it with their own address as `msg.sender`, and become the recorded challenger — capturing the 50% finality reward ([§ Integration](#integration-with-existing-contracts); distributed by `finalizeUnappealedSlash` per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)). The challenge bond round-trips, so only the *reward* is at risk, but that reward is the entire incentive for off-path witnesses, so leaving it MEV-extractable hollows out the enforcement layer. `usedEvidenceHash` only prevents a double-slash; the reward slot is otherwise strict first-lander.
+
+**Mechanism.** Every challenge is a two-phase commit–reveal:
+
+1. **Commit** — `commitChallenge(commitment)` stores `commitment = keccak256(abi.encode(evidenceHash, salt, msg.sender))` against `block.timestamp`. The commitment is opaque (reveals neither the target nor the evidence) and **binds the challenger's address**. It moves no funds and reverts on a duplicate.
+2. **Reveal** — `submit*Challenge(…, salt)` runs the existing verification, recomputes `evidenceHash`, reconstructs `keccak256(abi.encode(evidenceHash, salt, msg.sender))`, and requires a stored commitment that has aged ≥ `MIN_REVEAL_DELAY` and not expired past `REVEAL_WINDOW`. The commitment is deleted on success, then the slash proceeds as before.
+
+**Why it closes the vector.** Front-running the commit reveals nothing (it is a blind hash). At reveal the evidence becomes public, but the commitment binds `msg.sender`, so a copycat must submit under their own address — for which no commitment exists (`NoCommitment`). They cannot create one in time: `evidenceHash` is unknown until the reveal, and a fresh commit cannot be revealed until `MIN_REVEAL_DELAY` has elapsed, by which point the honest reveal has already landed (the sequencer orders it first) and consumed the evidence — so the copycat's later reveal hits `EvidenceAlreadyUsed`. The challenger binding plus the maturation delay are what close the vector; `usedEvidenceHash` is the double-slash backstop, not the primary defense. Two *independent* honest witnesses who each blind-committed still race fairly at reveal — first reveal wins the reward, the second hits `EvidenceAlreadyUsed` — which is the intended discovery race, not theft.
+
+**L2 context and residuals.** The initial deployment targets Arbitrum, whose centralized first-come-first-served sequencer with no public mempool already blunts classical gas-priority front-running; commit–reveal additionally hardens the reward against Timeboost express-lane ordering, sequencer collusion, and any future move to decentralized sequencing, so the enforcement incentive does not rest on a sequencer-trust assumption. Accepted residuals: `commitChallenge` is permissionless and unbonded, so commit spam is possible but self-limiting (each commit costs the spammer one SSTORE and locks no protocol funds); and an honest challenge now costs two transactions plus a short maturation delay.
+
+**Parameters.** `MIN_REVEAL_DELAY` (1 minute) and `REVEAL_WINDOW` (1 day) are fixed, not governable — matching the `MAX_FUTURE_SKEW_US` precedent. The 1-minute maturation is negligible against the ≥ 1-day evidence-age window, so it never stales otherwise-fresh evidence; `REVEAL_WINDOW` only bounds how long a single commitment stays valid, and an expired commitment can simply be re-committed (`commitChallenge` overwrites a slot older than `REVEAL_WINDOW`), so a stalled or pause-interrupted challenger is never permanently wedged on a `(salt, evidence)` pair. Promotion to governable is deferred unless operational experience demands it.
 
 #### `Slashed` event and `slashId` allocation
 
@@ -226,6 +251,8 @@ Using secp256k1 EIP-712 for `slash_sig` keeps per-signature verification at ~3k 
 | --- | --- | --- | --- | --- | --- |
 | `MAX_EVIDENCE_AGE_US` | `SlashJudge` | 5 days | 1 day | 30 days | `< CapacityBond.unbondingPeriod` (paired) |
 | `MAX_FUTURE_SKEW_US` | `SlashJudge` | 60 s | (fixed) | (fixed) | — |
+| `MIN_REVEAL_DELAY` | `SlashJudge` | 60 s | (fixed) | (fixed) | commit–reveal maturation (#854) |
+| `REVEAL_WINDOW` | `SlashJudge` | 1 day | (fixed) | (fixed) | commit–reveal expiry (#854) |
 | Challenge bond | `SlashJudge` | (per [ADR 009](009-governance.md#governable-parameters-with-safety-bounds)) | 1 TOKEN | 1,000 TOKEN | — |
 
 The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contracts. Setter paths on both `SlashJudge` and `CapacityBond` enforce the post-update inequality at the contract layer (see [Interaction with unbonding period](#interaction-with-unbonding-period) for the exact revert conditions); violating updates revert atomically with the setter call. `MAX_FUTURE_SKEW_US` is fixed at 60 seconds at deployment and not governable — it absorbs NTP drift between challenger and evidence-signing node and has no economic surface that varies by network conditions. Challenge bond bounds are canonical in [ADR 009](009-governance.md#governable-parameters-with-safety-bounds); listed here for completeness.
@@ -254,6 +281,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - `slash_sig` reuses the existing NodeId-to-Ethereum-address binding in `CapacityBond` — no new on-chain registration step.
 - `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Universal on-chain accountability is the protocol's single stance — there is no opt-out and no validation-mode difference between PoC and production for this field.
 - The unified `SlashJudge` contract provides a single audit surface for all slashing logic.
+- The [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal) commit–reveal makes the 50% challenger reward un-front-runnable: the incentive for off-path witnesses survives independently of any transaction-ordering trust assumption (Arbitrum's sequencer today, decentralized sequencing or Timeboost later).
 
 ### Negative
 
@@ -262,3 +290,4 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - Off-chain verifiers (clients, requesting nodes, third-party fraud detectors) must `ecrecover` and look up `CapacityBond.nodeIdOf(recovered)` to attribute a message to a NodeId, rather than verifying directly against the iroh key. These parties already maintain the binding cache for voucher attribution, so the marginal cost is one extra map lookup per verification.
 - Cross-contract replay is prevented by per-contract EIP-712 domains, but implementers must configure domain separators correctly at deployment.
 - The [§ SlashJudge Contract](#slashjudge-contract) `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface — small but real: every slash path emits the event atomically with `CapacityBond.slash()`, and the `OffenseType` ordering is contract-canonical (any reordering requires coordinated migration of `SlashAppeal` per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)).
+- The [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal) commit–reveal makes every honest challenge two transactions (`commitChallenge` then `submit*Challenge`) separated by `MIN_REVEAL_DELAY`, adds a `commitments` mapping to `SlashJudge`'s storage and audit surface, and introduces an unbonded permissionless commit whose only abuse is gas-bounded storage spam. This is the accepted cost of removing the reward-MEV surface; the slash semantics, evidence checks, and `Slashed` record are unchanged.

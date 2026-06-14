@@ -18,14 +18,20 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 /// @title SlashJudge
 /// @notice On-chain adjudicator for the three signature-dependent slashable
 ///         offenses (ADR 014): phantom announcement, rate manipulation, and
-///         blacklist violation. Each `submit*Challenge` verifies secp256k1
-///         EIP-712 `slash_sig` evidence with `SignatureChecker` (EOA + ERC-1271),
-///         confirms the challenged address is a registered operator, enforces the
-///         evidence-age window, then calls `CapacityBond.slash` and emits the
-///         canonical `Slashed` event — all synchronously, with no counter-evidence
-///         window. The challenger is recorded by `slash` for the 50% finality
-///         reward (escrow-on-slash, ADR 026 / ADR 028); `SlashJudge` itself only
-///         round-trips the challenge bond.
+///         blacklist violation. Challenging is a two-phase commit–reveal flow
+///         (ADR 014 § Challenge front-running mitigation, #854): the challenger
+///         first `commitChallenge`s an opaque
+///         `keccak256(abi.encode(evidenceHash, salt, challenger))`, then reveals via a
+///         `submit*Challenge` once the commitment has matured. Each reveal
+///         verifies secp256k1 EIP-712 `slash_sig` evidence with `SignatureChecker`
+///         (EOA + ERC-1271), confirms the challenged address is a registered
+///         operator, enforces the evidence-age window, then calls
+///         `CapacityBond.slash` and emits the canonical `Slashed` event with no
+///         counter-evidence window. The challenger is recorded by `slash` for the
+///         50% finality reward (escrow-on-slash, ADR 026 / ADR 028); binding the
+///         challenger into the commitment stops a mempool copy of the reveal from
+///         stealing that reward. `SlashJudge` itself only round-trips the
+///         challenge bond.
 /// @dev    `MAX_EVIDENCE_AGE_US < CapacityBond.unbondingPeriod * 1e6` is enforced on
 ///         this side (constructor + `setMaxEvidenceAge`). The mirror check on
 ///         `CapacityBond.setUnbondingPeriod` is enforced via CapacityBond's
@@ -74,6 +80,17 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     ///      § Region-stability window) — see `_checkBlacklistedBefore`.
     bytes32 internal constant GLOBAL_REGION = bytes32("GLOBAL");
 
+    /// @dev Commit–reveal anti-front-running bounds (ADR 014 § Challenge
+    ///      front-running mitigation, #854). A reveal (`submit*Challenge`) is
+    ///      valid only once its commitment has aged `MIN_REVEAL_DELAY` and before
+    ///      it expires at `REVEAL_WINDOW`. The 1-minute maturation is negligible
+    ///      against the ≥1-day evidence-age window, so it never stales otherwise
+    ///      fresh evidence; `REVEAL_WINDOW` bounds how long a commitment stays
+    ///      valid (the normal path reveals well within it). Both are fixed (not
+    ///      governable), matching the `MAX_FUTURE_SKEW_US` precedent.
+    uint256 internal constant MIN_REVEAL_DELAY = 1 minutes;
+    uint256 internal constant REVEAL_WINDOW = 1 days;
+
     // -----------------------------------------------------------------
     // Immutables + governable state
     // -----------------------------------------------------------------
@@ -102,6 +119,15 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     ///         dedup, so this guard lives here.
     mapping(bytes32 => bool) public usedEvidenceHash;
 
+    /// @notice Commit timestamp (unix seconds) for each commit–reveal commitment
+    ///         `keccak256(abi.encode(evidenceHash, salt, challenger))`, set by
+    ///         `commitChallenge` and cleared on the matching reveal. `0` means "no
+    ///         commitment"; a non-zero value older than `REVEAL_WINDOW` is an
+    ///         expired commitment that `commitChallenge` may overwrite. Binding the
+    ///         challenger into the preimage is what makes the reward un-stealable by
+    ///         a mempool copy of the reveal (#854).
+    mapping(bytes32 => uint64) public commitments;
+
     // -----------------------------------------------------------------
     // Decoded evidence structs (ABI layout of the `*ResponseData` args)
     // -----------------------------------------------------------------
@@ -129,6 +155,9 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
 
     event ChallengeBondUpdated(uint256 oldValue, uint256 newValue);
     event MaxEvidenceAgeUpdated(uint256 oldValueUs, uint256 newValueUs);
+    /// @notice A commit–reveal commitment was registered (#854). The preimage
+    ///         (evidence, salt, challenger) is intentionally not revealed here.
+    event ChallengeCommitted(bytes32 indexed commitment);
 
     error ZeroAddress();
     error NodeNotRegistered(address challengedNode);
@@ -146,6 +175,10 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     error HashNotBlacklisted(bytes32 hash);
     error BlacklistAfterResponse(uint256 addedAtUs, uint64 responseTsUs);
     error EvidenceAlreadyUsed(bytes32 evidenceHash);
+    error CommitmentExists();
+    error NoCommitment();
+    error RevealTooEarly(uint256 readyAt);
+    error CommitmentExpired(uint256 expiredAt);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error EvidenceAgeExceedsUnbonding(uint256 maxEvidenceAgeUs, uint256 unbondingUs);
 
@@ -199,22 +232,42 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     // -----------------------------------------------------------------
 
     /// @inheritdoc ISlashJudge
+    function commitChallenge(bytes32 commitment) external override whenNotPaused {
+        uint64 existing = commitments[commitment];
+        // A still-live commitment may not be overwritten; an expired one (or an
+        // empty slot, `existing == 0`) may be (re)committed. This keeps a
+        // challenger who went offline or lost a blind race from being permanently
+        // wedged on a `(salt, evidence)` pair — including across a pause longer
+        // than `REVEAL_WINDOW` — since they can re-commit the same salt once it
+        // expires (#854). `uint64(block.timestamp)` is safe past year ~2554.
+        // Permissionless and unbonded by design: the slot is keyed by the opaque
+        // commitment, not by `msg.sender` (authority lives in the preimage and is
+        // checked at reveal), so overwriting a third party's *expired* slot only
+        // resets a timer bound to their own address — it cannot redirect the
+        // reward. The bond is pulled at reveal in `_resolve`, never here.
+        if (existing != 0) {
+            // forge-lint: disable-next-line(block-timestamp)
+            if (block.timestamp <= uint256(existing) + REVEAL_WINDOW) revert CommitmentExists();
+        }
+        commitments[commitment] = uint64(block.timestamp);
+        emit ChallengeCommitted(commitment);
+    }
+
+    /// @inheritdoc ISlashJudge
     function submitPhantomChallenge(
         address challengedNode,
         bytes32 nodeId,
         bytes calldata probeResponseData,
         bytes calldata probeSlashSig,
         bytes calldata streamResponseData,
-        bytes calldata streamSlashSig
+        bytes calldata streamSlashSig,
+        bytes32 salt
     ) external override nonReentrant whenNotPaused {
-        (ProbeMsg memory p, StreamMsg memory s, bytes32 probeHash, bytes32 streamHash) =
-            _verifyPair(challengedNode, nodeId, probeResponseData, probeSlashSig, streamResponseData, streamSlashSig);
-
-        // Phantom = announced the blob then failed to deliver it.
-        if (!p.hasBlob || s.ok) revert NotPhantom();
-
-        bytes32 evidenceHash = keccak256(abi.encode(uint8(OffenseType.Phantom), probeHash, streamHash));
-        _resolve(challengedNode, OffenseType.Phantom, evidenceHash);
+        _checkRegistered(challengedNode, nodeId);
+        bytes32 evidenceHash = _verifyPair(
+            challengedNode, probeResponseData, probeSlashSig, streamResponseData, streamSlashSig, OffenseType.Phantom
+        );
+        _resolve(challengedNode, OffenseType.Phantom, evidenceHash, salt);
     }
 
     /// @inheritdoc ISlashJudge
@@ -224,16 +277,19 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         bytes calldata probeResponseData,
         bytes calldata probeSlashSig,
         bytes calldata streamResponseData,
-        bytes calldata streamSlashSig
+        bytes calldata streamSlashSig,
+        bytes32 salt
     ) external override nonReentrant whenNotPaused {
-        (ProbeMsg memory p, StreamMsg memory s, bytes32 probeHash, bytes32 streamHash) =
-            _verifyPair(challengedNode, nodeId, probeResponseData, probeSlashSig, streamResponseData, streamSlashSig);
-
-        // Rate manipulation = charged a higher stream rate than was probe-quoted.
-        if (s.ratePerMb <= p.ratePerMb) revert NotRateManipulation();
-
-        bytes32 evidenceHash = keccak256(abi.encode(uint8(OffenseType.RateManipulation), probeHash, streamHash));
-        _resolve(challengedNode, OffenseType.RateManipulation, evidenceHash);
+        _checkRegistered(challengedNode, nodeId);
+        bytes32 evidenceHash = _verifyPair(
+            challengedNode,
+            probeResponseData,
+            probeSlashSig,
+            streamResponseData,
+            streamSlashSig,
+            OffenseType.RateManipulation
+        );
+        _resolve(challengedNode, OffenseType.RateManipulation, evidenceHash, salt);
     }
 
     /// @inheritdoc ISlashJudge
@@ -243,7 +299,8 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         bytes32 blobHash,
         bytes calldata responseData,
         bytes calldata slashSig,
-        bool isStreamResponse
+        bool isStreamResponse,
+        bytes32 salt
     ) external override nonReentrant whenNotPaused {
         _checkRegistered(challengedNode, nodeId);
 
@@ -274,7 +331,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         _checkBlacklistedBefore(challengedNode, blobHash, responseTsUs);
 
         bytes32 evidenceHash = keccak256(abi.encode(uint8(OffenseType.Blacklist), structHash, isStreamResponse));
-        _resolve(challengedNode, OffenseType.Blacklist, evidenceHash);
+        _resolve(challengedNode, OffenseType.Blacklist, evidenceHash, salt);
     }
 
     // -----------------------------------------------------------------
@@ -316,23 +373,24 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     // -----------------------------------------------------------------
 
     /// @dev Shared phantom/rate path: decode + verify both signatures, confirm
-    ///      registration, same-hash, the 30s window, and evidence freshness.
-    ///      Returns the decoded messages and their EIP-712 struct hashes (used by
-    ///      the caller for the offense-specific predicate + `evidenceHash`).
+    ///      same-hash, the 30s window, and evidence freshness, then apply the
+    ///      offense-specific predicate and return the `evidenceHash`. Registration
+    ///      is checked by the caller; the predicate and hashing fold in here
+    ///      (rather than returning the decoded messages) so the reveal entry
+    ///      points stay within the stack limit once `salt` rides along (via_ir is
+    ///      off).
     function _verifyPair(
         address challengedNode,
-        bytes32 nodeId,
         bytes calldata probeData,
         bytes calldata probeSig,
         bytes calldata streamData,
-        bytes calldata streamSig
-    ) internal view returns (ProbeMsg memory p, StreamMsg memory s, bytes32 probeHash, bytes32 streamHash) {
-        _checkRegistered(challengedNode, nodeId);
-
-        p = abi.decode(probeData, (ProbeMsg));
-        s = abi.decode(streamData, (StreamMsg));
-        probeHash = _probeStructHash(p);
-        streamHash = _streamStructHash(s);
+        bytes calldata streamSig,
+        OffenseType offense
+    ) internal view returns (bytes32 evidenceHash) {
+        ProbeMsg memory p = abi.decode(probeData, (ProbeMsg));
+        StreamMsg memory s = abi.decode(streamData, (StreamMsg));
+        bytes32 probeHash = _probeStructHash(p);
+        bytes32 streamHash = _streamStructHash(s);
 
         if (!SignatureChecker.isValidSignatureNow(challengedNode, _hashTypedDataV4(probeHash), probeSig)) {
             revert InvalidProbeSignature();
@@ -347,6 +405,16 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
             revert TimestampWindowViolated(p.timestampUs, s.timestampUs);
         }
         _checkStaleness(p.timestampUs);
+
+        if (offense == OffenseType.Phantom) {
+            // Phantom = announced the blob then failed to deliver it.
+            if (!p.hasBlob || s.ok) revert NotPhantom();
+        } else {
+            // Rate manipulation = charged a higher stream rate than was probe-quoted.
+            if (s.ratePerMb <= p.ratePerMb) revert NotRateManipulation();
+        }
+
+        evidenceHash = keccak256(abi.encode(uint8(offense), probeHash, streamHash));
     }
 
     function _probeStructHash(ProbeMsg memory p) internal pure returns (bytes32) {
@@ -449,10 +517,28 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         if (ageUs >= maxEvidenceAgeUs) revert EvidenceTooOld(ageUs, maxEvidenceAgeUs);
     }
 
-    /// @dev Consume the evidence (replay guard), pull the challenge bond, slash
-    ///      (records `msg.sender` as the challenger for the 50% finality leg),
-    ///      return the bond, and emit `Slashed`.
-    function _resolve(address operator, OffenseType offenseType, bytes32 evidenceHash) internal {
+    /// @dev Reveal: reconstruct the caller's commitment, enforce the reveal
+    ///      window, then consume the evidence (replay guard), pull the challenge
+    ///      bond, slash (records `msg.sender` as the challenger for the 50%
+    ///      finality leg), return the bond, and emit `Slashed`. The commitment
+    ///      `keccak256(abi.encode(evidenceHash, salt, msg.sender))` binds the challenger, so a
+    ///      mempool copy of this reveal (different `msg.sender`) finds no
+    ///      commitment and cannot claim the reward (#854). A mismatched `salt` or
+    ///      evidence likewise reconstructs an unknown commitment → `NoCommitment`.
+    function _resolve(address operator, OffenseType offenseType, bytes32 evidenceHash, bytes32 salt) internal {
+        bytes32 commitment = keccak256(abi.encode(evidenceHash, salt, msg.sender));
+        uint64 committedAt = commitments[commitment];
+        // `0` is the unset sentinel for `commitments`; strict equality is correct.
+        // slither-disable-next-line incorrect-equality
+        if (committedAt == 0) revert NoCommitment();
+        uint256 readyAt = uint256(committedAt) + MIN_REVEAL_DELAY;
+        uint256 expiresAt = uint256(committedAt) + REVEAL_WINDOW;
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp < readyAt) revert RevealTooEarly(readyAt);
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > expiresAt) revert CommitmentExpired(expiresAt);
+        delete commitments[commitment];
+
         if (usedEvidenceHash[evidenceHash]) revert EvidenceAlreadyUsed(evidenceHash);
         usedEvidenceHash[evidenceHash] = true;
 

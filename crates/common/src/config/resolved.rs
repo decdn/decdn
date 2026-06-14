@@ -505,6 +505,10 @@ pub struct ResolvedPrefetch {
     pub threshold_window_secs: u64,
     pub demand_quality_min_ratio: f64,
     pub demand_quality_window_secs: u64,
+    /// Max prefetch acquisitions running concurrently (#820). `> 0`.
+    pub max_concurrent_acquisitions: u32,
+    /// Per-acquisition pull-through deadline in seconds (#820). `> 0`.
+    pub acquisition_timeout_secs: u64,
 }
 
 impl Default for ResolvedPrefetch {
@@ -517,6 +521,8 @@ impl Default for ResolvedPrefetch {
             threshold_window_secs: super::DEFAULT_PREFETCH_THRESHOLD_WINDOW_SECS,
             demand_quality_min_ratio: super::DEFAULT_PREFETCH_DEMAND_QUALITY_MIN_RATIO,
             demand_quality_window_secs: super::DEFAULT_PREFETCH_DEMAND_QUALITY_WINDOW_SECS,
+            max_concurrent_acquisitions: super::DEFAULT_PREFETCH_MAX_CONCURRENT_ACQUISITIONS,
+            acquisition_timeout_secs: super::DEFAULT_PREFETCH_ACQUISITION_TIMEOUT_SECS,
         }
     }
 }

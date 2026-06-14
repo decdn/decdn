@@ -25,8 +25,8 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::BytesMut;
-use decdn_cache::Hash;
 use decdn_cache::origin::{Origin, OriginFetch};
+use decdn_cache::{CacheEngine, Hash};
 use decdn_common::admin::RegionBytes;
 use decdn_incentive::{
     ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore,
@@ -519,6 +519,7 @@ fn build_origin_with_timeout(
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
         },
+        acquisition_observer: None,
     });
     origin
 }
@@ -542,23 +543,6 @@ fn progress_log(recorded: &Arc<Mutex<Vec<ProgressEntry>>>) -> Result<Vec<Progres
     Ok(log.clone())
 }
 
-/// Read the value of a `decdn_<name>` counter from the metrics text.
-fn counter_value(metrics: &Arc<Metrics>, name: &str) -> Result<u64> {
-    let text = metrics
-        .encode()
-        .map_err(|e| anyhow::anyhow!("encode metrics: {e}"))?;
-    let prefix = format!("decdn_{name} ");
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix(&prefix) {
-            return v
-                .trim()
-                .parse::<u64>()
-                .map_err(|e| anyhow::anyhow!("parse counter {name}: {e}"));
-        }
-    }
-    anyhow::bail!("counter {name} not found in:\n{text}")
-}
-
 /// Assert a `decdn_<name> <value>` counter line is present in the metrics text.
 fn assert_counter(metrics: &Arc<Metrics>, name: &str, value: u64) -> Result<()> {
     let text = metrics
@@ -569,6 +553,239 @@ fn assert_counter(metrics: &Arc<Metrics>, name: &str, value: u64) -> Result<()> 
         text.lines().any(|l| l == want),
         "expected metric line `{want}`; got:\n{text}"
     );
+    Ok(())
+}
+
+/// Read a `decdn_<name>` counter's value from the metrics scrape, or `0` if the
+/// line is absent.
+fn counter_value(metrics: &Arc<Metrics>, name: &str) -> Result<u64> {
+    let text = metrics
+        .encode()
+        .map_err(|e| anyhow::anyhow!("encode metrics: {e}"))?;
+    let prefix = format!("decdn_{name} ");
+    let val = text
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    Ok(val)
+}
+
+/// #820 end-to-end: a node with prefetch enabled, observing enough `FIND_VALUE`
+/// demand for a hash it does not hold, speculatively acquires it via the cache
+/// pull-through (DHT/origin discovery → probe → paid pull from an upstream),
+/// records the spend into the prefetch ledger, and tags the blob so the serve
+/// path can later credit it. Closes AC 7 of #650.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
+    let payload = vec![0xCDu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: holds the blob; serves probe + client. -----------------------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xC1);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics_a = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics_a);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics_a,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: prefetch-enabled, hosts the NodeOrigin in its cache chain. ----
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    // Prime B's iroh address cache with A's address (NodeId-only dialing).
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+
+    // Prefetch engine (enabled), authorized-origin directory maps the hash to A.
+    let prefetch_cfg = decdn_common::config::ResolvedPrefetch {
+        enabled: true,
+        require_authorized_origin: true,
+        budget_usdc_per_hour: 1_000_000,
+        find_value_threshold: 2,
+        ..Default::default()
+    };
+    let authorized_dir: Arc<dyn OriginDirectory> =
+        Arc::new(ConfigOriginDirectory::new(HashMap::from([(
+            DhtHash::from_bytes(*hash.as_bytes()),
+            vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
+        )])));
+    let engine = Arc::new(decdn_node::prefetch::PrefetchEngine::new(
+        prefetch_cfg,
+        authorized_dir,
+    ));
+    let observer = Arc::new(decdn_node::prefetch::PrefetchAcquisitionObserver::new(
+        Arc::clone(&engine),
+        Arc::clone(&b_metrics),
+    )) as Arc<dyn decdn_node::node_origin::AcquisitionObserver>;
+
+    // B's NodeOrigin, provisioned with the prefetch acquisition observer.
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = NodeOrigin::new();
+    origin.provision(NodeOriginDeps {
+        endpoint: ep_b.clone(),
+        routing_table: Arc::new(Mutex::new(RoutingTable::new(DhtNodeId::from_bytes(
+            *b_id.as_bytes(),
+        )))),
+        staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
+        origin_directory: Arc::new(ConfigOriginDirectory::new(HashMap::from([(
+            DhtHash::from_bytes(*hash.as_bytes()),
+            providers,
+        )]))) as Arc<dyn OriginDirectory>,
+        addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
+            as Arc<dyn NodeAddressResolver>,
+        buyer,
+        self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
+        slash_domain: slash_domain(),
+        local_rep: Arc::clone(&local_rep),
+        obs_buffer: Arc::clone(&obs_buffer),
+        network_rep: Arc::new(
+            NetworkReputation::new(NetworkReputationConfig::default())
+                .expect("network reputation config"),
+        ),
+        rep_cfg: NetworkReputationConfig::default(),
+        negative_cache: NegativeProbeCache::new(),
+        metrics: Arc::clone(&b_metrics),
+        region_accountant: empty_region_accountant(),
+        config: NodeOriginConfig {
+            probe_fanout: 5,
+            pull_timeout: Duration::from_secs(20),
+            max_blob_size_bytes: 0,
+            enable_0rtt: false,
+            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
+            lookup: decdn_node::dht::LookupConfig::default(),
+        },
+        acquisition_observer: Some(observer),
+    });
+
+    // B's cache with the NodeOrigin last in the chain — exactly how the runtime
+    // wires pull-through. `populate` will drive a network pull on a miss.
+    let cache_dir_b = tempfile::tempdir()?;
+    let cache_b = CacheEngine::open(
+        cache_dir_b.path(),
+        vec![Arc::new(origin.clone()) as Arc<dyn Origin>],
+        16,
+    )
+    .await?;
+    anyhow::ensure!(!cache_b.has(hash).await?, "B should start without the blob");
+
+    engine.provision_acquirer(
+        cache_b.clone(),
+        Arc::clone(&b_metrics),
+        tokio_util::sync::CancellationToken::new(),
+    );
+
+    // Drive FIND_VALUE demand to cross the trigger threshold (the gates run in
+    // `decide`), then fire the acquisition exactly as the DHT handler does.
+    let hash_bytes = *hash.as_bytes();
+    assert_eq!(
+        engine.on_find_value(&hash_bytes, 0),
+        decdn_node::prefetch::PrefetchOutcome::BelowThreshold
+    );
+    assert_eq!(
+        engine.on_find_value(&hash_bytes, 1),
+        decdn_node::prefetch::PrefetchOutcome::Decided(
+            decdn_node::prefetch::decision::PrefetchDecision::Acquire
+        )
+    );
+    engine.try_acquire(hash_bytes);
+
+    // Await the background acquisition (bounded): the blob lands in B's cache.
+    // The poll budget (35s) deliberately exceeds the acquirer's configured
+    // deadline (`acquisition_timeout_secs`, default 30s) so a slow-but-correct
+    // pull on loaded CI is not declared a failure before the acquirer itself
+    // would give up. The happy path breaks in well under 1s, so this budget is
+    // only ever spent on a genuine hang.
+    let mut cached = false;
+    for _ in 0..350 {
+        if cache_b.has(hash).await? {
+            cached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::ensure!(
+        cached,
+        "prefetch acquisition did not cache the blob in time"
+    );
+
+    // The paid pull recorded non-zero spend into the prefetch ledger + metric.
+    let spend = counter_value(&b_metrics, "prefetch_spend_usdc_total")?;
+    anyhow::ensure!(spend > 0, "expected non-zero prefetch spend, got {spend}");
+    anyhow::ensure!(
+        counter_value(&b_metrics, "prefetch_acquire_succeeded_total")? == 1,
+        "expected one successful prefetch acquisition"
+    );
+    // The blob is tagged as prefetch content for the serve path's record_served.
+    anyhow::ensure!(
+        engine.acquired().contains(&hash_bytes, 2),
+        "acquired blob should be tagged as prefetch content"
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.abort();
     Ok(())
 }
 

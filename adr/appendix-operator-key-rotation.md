@@ -79,7 +79,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
    - `decdn_node_uptime_seconds` advancing
    - Outgoing `NodeAnnounce` carries the new NodeId (visible in peers' gossip logs)
 8. **Un-drain** — accept inbound connections again.
-9. **Archive** the old iroh keystore offline; retain at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) [§ SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract) Evidence Verification Per Offense Type) — the staleness ceiling beyond which old-key slash evidence cannot be submitted. Retention is forensic-only: `bindNodeId` does not initiate unbonding, all `SlashJudge` offenses (phantom, rate, blacklist) resolve synchronously at submit time per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling), and no key-bound counter-evidence flow exists for the old iroh key. Holding longer is harmless.
+9. **Archive** the old iroh keystore offline; retain at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) [§ SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract) Evidence Verification Per Offense Type) — the staleness ceiling beyond which old-key slash evidence cannot be submitted. Retention is forensic-only: `bindNodeId` does not initiate unbonding, all `SlashJudge` offenses (phantom, rate, blacklist) resolve at reveal time per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling), and no key-bound counter-evidence flow exists for the old iroh key. Holding longer is harmless.
 
 ### Failure modes
 

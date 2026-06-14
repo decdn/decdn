@@ -809,7 +809,7 @@ pub async fn run(
             Arc::clone(&staker_set),
             Arc::clone(&record_store),
         )
-        .with_prefetch(prefetch_engine),
+        .with_prefetch(Arc::clone(&prefetch_engine)),
     );
 
     // The DHT handler builds its own routing table internally; grab a
@@ -922,6 +922,13 @@ pub async fn run(
     let voucher_activity = Arc::new(decdn_incentive::VoucherActivity::new());
     client_handler.attach_voucher_activity(Arc::clone(&voucher_activity));
     client_handler.attach_region_accountant(Arc::clone(&region_accountant));
+    // Let the serve path credit bytes served from prefetch-acquired blobs to the
+    // demand-quality numerator (#820). Harmless when prefetch is off — the
+    // acquired-set is never populated, so the lookup always misses.
+    client_handler.attach_prefetch_engine(Arc::clone(&prefetch_engine));
+    // Cancels in-flight prefetch acquisitions on shutdown; cancelled below
+    // alongside `pull_through_bg_shutdown`.
+    let prefetch_shutdown = CancellationToken::new();
     // Arm the cache-miss pull-through hook (#831) when the feature is enabled.
     // The outer deadline bounds how long a miss blocks the delivery path before
     // falling back to `NotFound`. It is *derived* from the per-candidate budget
@@ -1343,6 +1350,14 @@ pub async fn run(
                     deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
                     lookup: crate::dht::LookupConfig::default(),
                 },
+                // Feed the prefetch ledger when prefetch is enabled (#820); the
+                // observer records only prefetch-initiated pulls.
+                acquisition_observer: cfg.prefetch.enabled.then(|| {
+                    Arc::new(crate::prefetch::PrefetchAcquisitionObserver::new(
+                        Arc::clone(&prefetch_engine),
+                        Arc::clone(&node_metrics),
+                    )) as Arc<dyn crate::node_origin::AcquisitionObserver>
+                }),
             });
             tracing::info!("node-to-node cache-miss pull-through provisioned and enabled (#831)");
         } else {
@@ -1352,6 +1367,24 @@ pub async fn run(
                  process (restart to retry)"
             );
         }
+    }
+
+    // Provision the live prefetch acquirer (#820) once the cache exists. Gated on
+    // `prefetch.enabled` — a disabled engine never reaches `try_acquire`, so an
+    // unprovisioned acquirer is the inert default. Acquisitions drive
+    // `cache.populate`, which uses the node-origin pull path provisioned above;
+    // with pull-through off the populate just misses (no network spend).
+    if cfg.prefetch.enabled {
+        prefetch_engine.provision_acquirer(
+            cache.clone(),
+            Arc::clone(&node_metrics),
+            prefetch_shutdown.clone(),
+        );
+        tracing::info!(
+            max_concurrent = cfg.prefetch.max_concurrent_acquisitions,
+            timeout_secs = cfg.prefetch.acquisition_timeout_secs,
+            "speculative-prefetch acquisition provisioned and enabled (#820)"
+        );
     }
 
     // GossipService owns its own shutdown via this token (#805): cancelling
@@ -1648,6 +1681,10 @@ pub async fn run(
     // already drained above), so a late warm write either lands intact or is
     // dropped, never corrupting the store.
     pull_through_bg_shutdown.cancel();
+    // Cancel any in-flight speculative prefetch acquisitions (#820): the router
+    // has drained, so warming the cache speculatively is moot. Advisory, like the
+    // background cache-fill tasks above — observed at the next await, not joined.
+    prefetch_shutdown.cancel();
     // The router has drained, so no further vouchers — and therefore no further
     // receipts — will be produced. Signal the receipt writer to flush whatever
     // is already enqueued and exit; it is awaited in the drain phase below so
