@@ -539,11 +539,14 @@ For how nodes validate `rate_per_mb` against cached bounds before signing protoc
 | Function | Purpose |
 | --- | --- |
 | `executeBuyback(amount, minTokenOut)` | Governance multisig or `keeper`: swap `amount` of USDC for ≥ `minTokenOut` TOKEN and burn the proceeds. |
-| `setKeeper(addr)` / `setSwapRouter(addr)` / `setPool(addr)` | Governance: rotate the authorized keeper, swap router, or pool. |
+| `setKeeper(addr)` / `setSwapRouter(addr)` | Governance: rotate the authorized keeper or swap router. |
 | `setSlippageTolerance(bps)` / `setMinBuybackAmount(n)` / `setMaxBuybackAmount(n)` | Governance: per-call execution guards. |
+| `setEpochLiquidityCapFraction(bps)` | Governance: per-epoch USDC liquidity cap as a fraction of epoch-start pool depth (bounded `[1%, 30%]`, [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)). |
+| `setVault(addr)` / `setPool(addr)` | Governance: wire/rotate the Balancer V3 Vault (approval target) and pool. |
+| `poke()` | Permissionless: advance the on-chain TWAP price accumulator that backs the `minOut` floor. |
 | `keeper() → address` / `getAccumulatedFees() → uint256` | Views: current keeper and accumulated buyback inflow (USDC). |
 
-This is the canonical `BuybackBurner` interface. [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) defines the economic parameters and the 30% router-fed inflow source. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but `BuybackBurner` MUST self-approve the Balancer V3 **Vault** address (a separate contract) during initialization — the Vault pulls input tokens from the `msg.sender` of the Router call. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
+This is the canonical `BuybackBurner` interface. [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) defines the economic parameters and the 30% router-fed inflow source. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but `BuybackBurner` approves the Balancer V3 **Vault** address (a separate contract) — the Vault pulls input tokens from the `msg.sender` of the Router call. The concrete `BuybackBurnerBalancerV3` ([#686](https://github.com/decdn/decdn/issues/686)) issues a **scoped per-swap** `forceApprove(vault, amountIn)` reset to `0` after each swap (no standing allowance), rather than a max approval at initialization. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
 
 All `set*` functions are governance-only behind a timelock.
 
