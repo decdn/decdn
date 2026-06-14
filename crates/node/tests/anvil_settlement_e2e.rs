@@ -418,10 +418,14 @@ async fn run_e2e() -> anyhow::Result<()> {
         read_manifest(&manifest)?;
 
     // Build the per-role providers + contract handles.
+    // Simple nonce management mirrors production (`runtime::mod`, #904): a send
+    // whose gas-estimate reverts must not leak a cached nonce and gap the lane.
     let node_provider = ProviderBuilder::new()
+        .with_simple_nonce_management()
         .wallet(EthereumWallet::from(node_signer.clone()))
         .connect_http(url.clone());
     let client_provider = ProviderBuilder::new()
+        .with_simple_nonce_management()
         .wallet(EthereumWallet::from((*client_signer).clone()))
         .connect_http(url.clone());
 
@@ -806,7 +810,10 @@ async fn run_e2e() -> anyhow::Result<()> {
             ),
         )
         .await?;
+    // Simple nonce management mirrors the buyer wallet provider in production
+    // (#904) — the reverting-reclaim regression scenario below depends on it.
     let buyer_provider = ProviderBuilder::new()
+        .with_simple_nonce_management()
         .wallet(EthereumWallet::from((*buyer_signer).clone()))
         .connect_http(url.clone());
     let usdc_buyer = Erc20::new(usdc_addr, buyer_provider.clone());
@@ -1638,6 +1645,71 @@ async fn run_e2e() -> anyhow::Result<()> {
         "the corrupt sibling row remains (skipped, not reclaimed)"
     );
     drop(persist_service);
+
+    // --- E. A reverting reclaimExpired must NOT wedge the buyer tx lane (#904). ---
+    // `reclaimExpired` is *expected* to revert under host-clock-vs-chain skew and
+    // be retried. With alloy's default CachedNonceManager the nonce is advanced
+    // when the tx is prepared; a send that then fails (its gas-estimate reverts)
+    // never lands but leaves the cached nonce advanced, gapping every later tx
+    // from this wallet. `get_receipt` has no default timeout, so the original
+    // repro hung until the harness `OVERALL_TIMEOUT` killed the run. The buyer
+    // provider uses `with_simple_nonce_management`, so the lane stays live.
+    //
+    // Driven at the contract layer (not the sweep) so the reclaim target is a
+    // channel we just opened against the registered node — `openChannel` rejects
+    // unregistered providers, and a freshly opened channel is genuinely not-yet-
+    // expired (every prior scenario warped chain time past the max lifetime).
+    let pc_buyer_full = PaymentChannel::new(payment_channel, buyer_provider.clone());
+    let open_receipt = pc_buyer
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let regress_id = open_receipt
+        .inner
+        .logs()
+        .iter()
+        .filter_map(|log| log.log_decode::<PaymentChannel::ChannelOpened>().ok())
+        .map(|decoded| decoded.inner.data)
+        .find(|ev| ev.client == buyer_addr && ev.provider == node_addr)
+        .map(|ev| ev.channelId)
+        .ok_or_else(|| anyhow::anyhow!("ChannelOpened event missing from openChannel receipt"))?;
+    // A not-yet-expired channel: reclaimExpired's gas estimate reverts, so the
+    // send fails after the cached nonce was already advanced (the leak path).
+    let reclaim_err = match pc_buyer_full.reclaimExpired(regress_id).send().await {
+        Ok(_) => anyhow::bail!(
+            "reclaimExpired on a not-yet-expired channel must revert (precondition for the regression)"
+        ),
+        Err(e) => format!("{e:?}").to_lowercase(),
+    };
+    // Assert it failed *because the call reverted*, not via an unrelated RPC or
+    // signing error that would let the scenario pass without exercising the
+    // gas-estimate-revert path that leaks the cached nonce.
+    anyhow::ensure!(
+        reclaim_err.contains("revert"),
+        "reclaimExpired must fail with an on-chain revert, not an unrelated error: {reclaim_err}"
+    );
+    // The next buyer tx must land promptly. A leaked/gapped nonce would leave it
+    // unmined indefinitely (under anvil automine nothing fills the gap), so a
+    // tight bound turns the regression into a fast, named failure.
+    let followup = tokio::time::timeout(Duration::from_secs(20), async {
+        let receipt = pc_buyer
+            .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        anyhow::Ok(receipt)
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("buyer tx after a reverting reclaim hung — nonce lane wedged (#904)")
+    })??;
+    anyhow::ensure!(
+        followup.status(),
+        "the follow-up buyer openChannel must land on-chain after the reverting reclaim"
+    );
 
     client_ep.close().await;
     server_ep.close().await;

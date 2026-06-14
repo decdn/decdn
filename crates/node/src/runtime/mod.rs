@@ -889,7 +889,17 @@ pub async fn run(
     // channels opened against this node so the handler accepts their vouchers,
     // and forgets settled ones. The redeem hint lets the handler nudge the
     // service when an accrued claim may have crossed the threshold.
+    // Simple (re-fetch-each-send) nonce management, not alloy's default cached
+    // manager (#904). The cached manager advances its in-memory nonce when it
+    // *prepares* a tx; if that send then fails (e.g. its `eth_estimateGas`
+    // reverts on an always-reverting settlement under contention), the tx never
+    // lands but the cached nonce stays advanced, so every subsequent tx from
+    // this wallet carries a gapped nonce, sits unmined, and wedges the lane
+    // until restart. `SimpleNonceManager` stores nothing — each send re-reads
+    // the pending nonce — so a failed send can't gap the lane. The buyer
+    // provider below relies on this same property for the retried `reclaimExpired`.
     let wallet_provider = ProviderBuilder::new()
+        .with_simple_nonce_management()
         .wallet(EthereumWallet::from((*eth_signer).clone()))
         .connect_http(rpc_url.clone());
     let payment_service = PaymentChannelService::bootstrap(
@@ -996,7 +1006,17 @@ pub async fn run(
     // is opportunistic cost-recovery, so a failed startup `approve` tx (e.g.
     // insufficient gas) must not block the node's core seller function. Log and
     // continue with the buyer path disabled (and thus pull-through disabled).
+    // Simple nonce management, for the reason given on the seller
+    // `wallet_provider` above (#904). It matters most here: `reclaimExpired` is
+    // *expected* to revert under host-clock-vs-chain skew and be retried, so a
+    // reverting send must not leak a cached nonce and wedge the buyer lane. This
+    // provider is shared across `approve`/`openChannel`/`topUp`/`reclaimExpired`
+    // and the reclaim sweep runs concurrently with opens, so correctness relies
+    // on `SimpleNonceManager` re-reading the pending nonce each send (a transient
+    // racing collision just gets a fresh nonce on the next attempt), not on the
+    // sends being strictly serialized.
     let buyer_wallet_provider = ProviderBuilder::new()
+        .with_simple_nonce_management()
         .wallet(EthereumWallet::from((*eth_signer).clone()))
         .connect_http(rpc_url);
     let buyer_channel_store: Arc<dyn decdn_incentive::BuyerChannelStore> = Arc::new(
