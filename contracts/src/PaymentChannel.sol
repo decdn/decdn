@@ -154,6 +154,12 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///         already happened; the un-withdrawn provider share stays in this
     ///         contract until anyone calls `flushDeferredSettlement` post-unpause.
     ///         The amount/bytes are recomputed from the (now `Closed`) `Channel`.
+    /// @dev    There is no on-chain enumeration of deferred ids: a pending flush is
+    ///         discoverable only via the indexed `SettlementDeferred` event (the
+    ///         flag itself is readable but only if the id is already known).
+    ///         Driving the eventual `flushDeferredSettlement` is therefore an
+    ///         off-chain-indexer responsibility; the funds remain safe and
+    ///         permissionlessly flushable in the meantime.
     mapping(bytes32 channelId => bool) public settlementDeferred;
 
     // -----------------------------------------------------------------
@@ -492,8 +498,9 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         // never drops served-byte accounting (ADR 036 vote weight).
         //
         // A paused `FeeRouter` must NOT freeze the exit: the client refund above
-        // already left, and reverting here would trap it (channel is `Closing`,
-        // so `reclaimExpired` cannot save it). Defer the provider leg — its USDC
+        // already left, and reverting here would trap it — the revert rolls back
+        // the `Status.Closed` write above to `Closing`, where `reclaimExpired`
+        // (which needs `Open`) cannot save it. Defer the provider leg — its USDC
         // stays in this contract and `flushDeferredSettlement` routes it (and the
         // served bytes) once the router is unpaused. Branch on the explicit
         // `paused()` view, not a `try/catch`, so unexpected router reverts still
@@ -515,11 +522,12 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     }
 
     /// @notice Any address: route the provider settle leg deferred by
-    ///         `settleChannel` when `FeeRouter` was paused. No-op-safe to retry —
-    ///         a still-paused router reverts the whole call, leaving the deferral
-    ///         flag set. The amount/bytes are recomputed from the closed channel,
-    ///         which `settleChannel` froze (no `withdraw` is possible once
-    ///         `Closed`), so they equal the provider share still held here.
+    ///         `settleChannel` when `FeeRouter` was paused. Safe to retry — a
+    ///         still-paused router reverts the whole call, leaving the deferral
+    ///         flag set; once routed, a re-call reverts `NoDeferredSettlement`. The
+    ///         amount/bytes are recomputed from the closed channel, which
+    ///         `settleChannel` froze (no `withdraw` is possible once `Closed`), so
+    ///         they equal the provider share still held here.
     function flushDeferredSettlement(bytes32 channelId) external nonReentrant {
         if (!settlementDeferred[channelId]) revert NoDeferredSettlement();
         Channel storage ch = channels[channelId];
@@ -573,6 +581,11 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     /// @notice Re-point the settlement router. Open channels keep their vouchers
     ///         valid — the EIP-712 domain hashes this contract, not the router
     ///         (ADR 003 § Governance setter: setFeeRouter).
+    /// @dev    Any settlement deferred before this re-point (see `settlementDeferred`)
+    ///         routes through the NEW router on `flushDeferredSettlement` — its
+    ///         `_route` reads `feeRouter` live — crediting the new router's epoch
+    ///         for ADR-036 weight. Intentional: a re-point is the recovery path out
+    ///         of a paused/broken router, and the new one is conformance-probed here.
     function setFeeRouter(address newRouter) external onlyRole(GOVERNANCE_ROLE) {
         if (newRouter == address(0)) revert ZeroAddress();
         // Same invariant the constructor enforces: routing to an EOA would let

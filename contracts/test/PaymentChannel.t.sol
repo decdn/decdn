@@ -906,6 +906,79 @@ contract PaymentChannelTest is Test {
         channel.flushDeferredSettlement(id);
     }
 
+    /// @dev The load-bearing case: with a prior `withdraw`, the deferred and
+    ///      flushed share must be the remainder (`claimed − withdrawn`), not the
+    ///      full claim — proving `flushDeferredSettlement` recomputes the delta and
+    ///      cannot double-route already-withdrawn amount/bytes.
+    function test_flushDeferredSettlement_partialWithdraw_routesRemainderOnly() public {
+        bytes32 id = _open();
+        // Provider withdraws part while Open (router unpaused → routes 300e6 now).
+        vm.prank(provider);
+        channel.withdraw(id, 300e6, 1, 30_000_000, _sign(id, 300e6, 1, 30_000_000));
+        // Close at a higher watermark, then warp past the dispute window.
+        vm.prank(provider);
+        channel.closeChannel(id, 700e6, 2, 70_000_000, _sign(id, 700e6, 2, 70_000_000));
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        router.setPaused(true);
+        uint256 clientBefore = usdc.balanceOf(client);
+
+        // Deferred share is the remainder (700−300 / 70M−30M), not the full claim.
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.SettlementDeferred(id, provider, 400e6, 40_000_000);
+        channel.settleChannel(id);
+
+        assertEq(usdc.balanceOf(client) - clientBefore, DEPOSIT - 700e6); // 300e6 refund
+        assertEq(usdc.balanceOf(address(channel)), 400e6); // only the un-withdrawn share held
+        assertTrue(channel.settlementDeferred(id));
+
+        router.setPaused(false);
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.DeferredSettlementFlushed(id, provider, 400e6, 40_000_000);
+        channel.flushDeferredSettlement(id);
+
+        // Conservation over the whole run: 300 (withdraw) + 400 (flush) == 700 claimed.
+        assertEq(router.totalRouted(), 700e6);
+        assertEq(router.totalBytes(), 70_000_000);
+        assertEq(usdc.balanceOf(address(channel)), 0);
+        assertFalse(channel.settlementDeferred(id));
+    }
+
+    /// @dev A deferred settle still closes the channel: the exit is final, so the
+    ///      provider leg can only route via flush — never a second settle/dispute.
+    function test_settle_deferred_channelIsClosed_cannotResettleOrDispute() public {
+        bytes32 id = _openCloseWarp(700e6, 70_000_000);
+        router.setPaused(true);
+        channel.settleChannel(id); // deferred; status now Closed
+
+        vm.expectRevert(PaymentChannel.ChannelNotClosing.selector);
+        channel.settleChannel(id);
+
+        vm.expectRevert(PaymentChannel.ChannelNotClosing.selector);
+        channel.disputeChannel(id, 800e6, 2, 80_000_000, _sign(id, 800e6, 2, 80_000_000));
+    }
+
+    /// @dev Governance re-pointing the router between defer and flush routes the
+    ///      held share through the NEW router (`_route` reads `feeRouter` live) —
+    ///      the documented incident-recovery path out of a paused router.
+    function test_flushDeferredSettlement_afterRouterRepoint_routesToNewRouter() public {
+        bytes32 id = _openCloseWarp(700e6, 70_000_000);
+        router.setPaused(true);
+        channel.settleChannel(id); // deferred against the paused setUp router
+
+        MockSettlementRouter router2 = new MockSettlementRouter(usdc); // fresh, unpaused, conforming
+        vm.prank(admin);
+        channel.setFeeRouter(address(router2));
+
+        channel.flushDeferredSettlement(id);
+
+        assertEq(router2.totalRouted(), 700e6); // new router receives the deferred share
+        assertEq(router2.totalBytes(), 70_000_000);
+        assertEq(router.totalRouted(), 0); // old (paused) router got nothing for the settle
+        assertEq(usdc.balanceOf(address(channel)), 0);
+        assertFalse(channel.settlementDeferred(id));
+    }
+
     /// @dev Flushing while the router is still paused reverts and leaves the
     ///      deferral flag set, so it stays retryable after a later unpause.
     function test_flushDeferredSettlement_stillPaused_revertsAndStaysDeferred() public {
@@ -913,7 +986,7 @@ contract PaymentChannelTest is Test {
         router.setPaused(true);
         channel.settleChannel(id);
 
-        vm.expectRevert(); // router's whenNotPaused guard
+        vm.expectRevert(bytes("MockSettlementRouter: paused")); // mirrors router's whenNotPaused guard
         channel.flushDeferredSettlement(id);
         assertTrue(channel.settlementDeferred(id));
 
