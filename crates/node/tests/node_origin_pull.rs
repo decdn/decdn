@@ -25,7 +25,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::BytesMut;
-use decdn_cache::origin::{Origin, OriginFetch};
+use decdn_cache::origin::{FilesystemOrigin, Origin, OriginFetch};
 use decdn_cache::{CacheEngine, Hash};
 use decdn_common::admin::RegionBytes;
 use decdn_incentive::{
@@ -34,7 +34,7 @@ use decdn_incentive::{
     signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::ChannelOpener;
-use decdn_node::client_requester::ChannelContext;
+use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::dht::negative_cache::Hash as DhtHash;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
@@ -785,6 +785,402 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
 
     ep_b.close().await;
     ep_a.close().await;
+    task_a.abort();
+    Ok(())
+}
+
+/// Build a cache pre-seeded with every payload in `payloads`: a one-shard
+/// filesystem origin holds them, the cache pulls each into its local store, then
+/// the origin is dropped. A multi-blob sibling of `support::cache_with_blob`,
+/// used by #900's negative control where node A must hold a second, *non*-
+/// prefetched blob.
+async fn cache_with_blobs(payloads: &[&[u8]]) -> Result<(CacheEngine, tempfile::TempDir)> {
+    let origin_dir = tempfile::tempdir()?;
+    for payload in payloads {
+        let hex = Hash::new(payload).to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let dir = origin_dir.path().join(shard);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(hex.as_str()), payload)?;
+    }
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+    for payload in payloads {
+        let _ = cache.get(Hash::new(payload)).await?; // populate the local store
+    }
+    drop(origin_dir);
+    Ok((cache, cache_dir))
+}
+
+/// #900: the demand-quality numerator must be fed through the *live* serve loop.
+/// After node B speculatively prefetch-acquires a blob (tagging it as prefetch
+/// content), a real paid `cdn/client/v1` pull of that blob *from B* drives
+/// `PrefetchEngine::note_served_if_prefetched` from inside `collect_voucher`,
+/// moving the `served / acquired` demand-quality ratio off zero. The two halves
+/// (tag-on-acquire and the `note_served_credits_only_prefetched_hashes` unit
+/// test for tag→credit) are tested in isolation elsewhere; this pins the wiring
+/// through the real `ClientHandler` serve path.
+///
+/// A negative control then serves an *untagged* blob (one B reactively pulled on
+/// a cache miss, never prefetch-acquired) through the same live handler and
+/// asserts the ratio is unchanged — pinning the `acquired.contains` gate, not
+/// just that *some* credit fires.
+#[tokio::test(flavor = "multi_thread")]
+// test setup; failures should panic loudly. `similar_names`: the hash/hash2 and
+// c_buyer/c2_buyer pairs are the positive vs negative-control fixtures.
+#[allow(clippy::expect_used, clippy::too_many_lines, clippy::similar_names)]
+async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()> {
+    let payload = vec![0xCDu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let hash_bytes = *hash.as_bytes();
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // A second, same-sized blob node A also holds. It is never prefetch-acquired;
+    // the negative control serves it through B's live handler to prove an
+    // untagged blob does not move the demand-quality ratio. Same length as the
+    // first so the hand-rolled probe responder's fixed `total_bytes` fits both.
+    let payload2 = vec![0xEEu8; PAYLOAD_LEN];
+    let hash2 = Hash::new(&payload2);
+    let hash2_bytes = *hash2.as_bytes();
+
+    // --- Node A: holds both blobs; serves probe + client (the prefetch upstream).
+    let (cache_a, _tmp_a) = cache_with_blobs(&[payload.as_slice(), payload2.as_slice()]).await?;
+    anyhow::ensure!(
+        cache_a.has(hash).await? && cache_a.has(hash2).await?,
+        "node A must hold both fixture blobs"
+    );
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let ab_channel_id = B256::repeat_byte(0xC1);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        ab_channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics_a = Arc::new(Metrics::new());
+    let limiter_a = permissive_limiter(&metrics_a);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics_a,
+        limiter_a,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: prefetch-enabled NodeOrigin AND a live ClientHandler server. ---
+    // Its endpoint carries `ALPN_CLIENT` so the same NodeId can both dial A for
+    // the speculative pull and later accept client C's paid serve request.
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    // Prime B's iroh address cache with A's address (NodeId-only dialing).
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        hash_bytes,
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+
+    let prefetch_cfg = decdn_common::config::ResolvedPrefetch {
+        enabled: true,
+        require_authorized_origin: true,
+        budget_usdc_per_hour: 1_000_000,
+        find_value_threshold: 2,
+        ..Default::default()
+    };
+    let authorized_dir: Arc<dyn OriginDirectory> =
+        Arc::new(ConfigOriginDirectory::new(HashMap::from([(
+            DhtHash::from_bytes(hash_bytes),
+            vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
+        )])));
+    let engine = Arc::new(decdn_node::prefetch::PrefetchEngine::new(
+        prefetch_cfg,
+        authorized_dir,
+    ));
+    let observer = Arc::new(decdn_node::prefetch::PrefetchAcquisitionObserver::new(
+        Arc::clone(&engine),
+        Arc::clone(&b_metrics),
+    )) as Arc<dyn decdn_node::node_origin::AcquisitionObserver>;
+
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        channel_id: ab_channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = NodeOrigin::new();
+    origin.provision(NodeOriginDeps {
+        endpoint: ep_b.clone(),
+        routing_table: Arc::new(Mutex::new(RoutingTable::new(DhtNodeId::from_bytes(
+            *b_id.as_bytes(),
+        )))),
+        staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
+        origin_directory: Arc::new(ConfigOriginDirectory::new(HashMap::from([
+            (DhtHash::from_bytes(hash_bytes), providers.clone()),
+            // blob2 is discoverable on A too, for the negative control's
+            // reactive (non-prefetch) pull-through.
+            (DhtHash::from_bytes(hash2_bytes), providers),
+        ]))) as Arc<dyn OriginDirectory>,
+        addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
+            as Arc<dyn NodeAddressResolver>,
+        buyer,
+        self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
+        slash_domain: slash_domain(),
+        local_rep: Arc::clone(&local_rep),
+        obs_buffer: Arc::clone(&obs_buffer),
+        network_rep: Arc::new(
+            NetworkReputation::new(NetworkReputationConfig::default())
+                .expect("network reputation config"),
+        ),
+        rep_cfg: NetworkReputationConfig::default(),
+        negative_cache: NegativeProbeCache::new(),
+        metrics: Arc::clone(&b_metrics),
+        region_accountant: empty_region_accountant(),
+        config: NodeOriginConfig {
+            probe_fanout: 5,
+            pull_timeout: Duration::from_secs(20),
+            max_blob_size_bytes: 0,
+            enable_0rtt: false,
+            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
+            lookup: decdn_node::dht::LookupConfig::default(),
+        },
+        acquisition_observer: Some(observer),
+    });
+
+    let cache_dir_b = tempfile::tempdir()?;
+    let cache_b = CacheEngine::open(
+        cache_dir_b.path(),
+        vec![Arc::new(origin.clone()) as Arc<dyn Origin>],
+        16,
+    )
+    .await?;
+    anyhow::ensure!(!cache_b.has(hash).await?, "B should start without the blob");
+
+    engine.provision_acquirer(
+        cache_b.clone(),
+        Arc::clone(&b_metrics),
+        tokio_util::sync::CancellationToken::new(),
+    );
+
+    // --- Prefetch-acquire the blob into B (tags it as prefetch content). -------
+    assert_eq!(
+        engine.on_find_value(&hash_bytes, 0),
+        decdn_node::prefetch::PrefetchOutcome::BelowThreshold
+    );
+    assert_eq!(
+        engine.on_find_value(&hash_bytes, 1),
+        decdn_node::prefetch::PrefetchOutcome::Decided(
+            decdn_node::prefetch::decision::PrefetchDecision::Acquire
+        )
+    );
+    engine.try_acquire(hash_bytes);
+
+    let mut cached = false;
+    for _ in 0..350 {
+        if cache_b.has(hash).await? {
+            cached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::ensure!(
+        cached,
+        "prefetch acquisition did not cache the blob in time"
+    );
+    anyhow::ensure!(
+        engine.acquired().contains(&hash_bytes, 2),
+        "acquired blob should be tagged as prefetch content"
+    );
+
+    // Baseline: the acquisition seeded the demand-quality *denominator*, but
+    // nothing has been served yet, so the ratio sits at zero. (`now = 0`: the
+    // ledger's real-time records are never pruned by a tiny query clock —
+    // `saturating_sub` floors the age at 0, always inside the window. This
+    // relies on the positive default `demand_quality_window_secs`; a zero window
+    // would make `0 >= 0` prune everything.)
+    let initial_ratio = engine.policy().demand_quality_ratio(0);
+    anyhow::ensure!(
+        initial_ratio.abs() < f64::EPSILON,
+        "expected a zero served/acquired baseline, got {initial_ratio}"
+    );
+
+    // --- Node B as a serving node: a real paid client pull of the tagged blob. -
+    // Two client channels are registered up front: C1 pulls the tagged blob
+    // (positive), C2 pulls the untagged blob2 (negative control).
+    let b_eth = Arc::new(PrivateKeySigner::random());
+    let c_buyer = Arc::new(PrivateKeySigner::random());
+    let c2_buyer = Arc::new(PrivateKeySigner::random());
+    let bc_channel_id = B256::repeat_byte(0xC2);
+    let bc_channel_id2 = B256::repeat_byte(0xC3);
+    let store_b = Arc::new(MemoryChannelStateStore::new());
+    store_b.record(&ChannelState::new(
+        bc_channel_id,
+        c_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    store_b.record(&ChannelState::new(
+        bc_channel_id2,
+        c2_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let limiter_b = permissive_limiter(&b_metrics);
+    let handler_b = build_handler_full(
+        b_id,
+        &b_eth,
+        &b_metrics,
+        limiter_b,
+        cache_b.clone(),
+        store_b as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    handler_b.attach_prefetch_engine(Arc::clone(&engine));
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let (ep_c, _addr_c) = local_endpoint(fresh_key(), vec![]).await?;
+    let c_ctx = ChannelContext {
+        channel_id: bc_channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        client_signer: Arc::clone(&c_buyer),
+        voucher_domain: voucher_dom(),
+        prior_nonce: U256::ZERO,
+        prior_bytes_delivered: U256::ZERO,
+        prior_amount: U256::ZERO,
+    };
+    let got = stream_fetch(
+        &ep_c,
+        EndpointAddr::new(b_id).with_ip_addr(addr_b),
+        &c_ctx,
+        &slash_domain(),
+        b_eth.address(),
+        hash_bytes,
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+
+    // The live serve loop credited the served bytes: the ratio moved off zero.
+    let final_ratio = engine.policy().demand_quality_ratio(0);
+    anyhow::ensure!(
+        final_ratio > initial_ratio,
+        "serving a prefetch-acquired blob must raise the demand-quality ratio \
+         ({initial_ratio} -> {final_ratio})"
+    );
+    // The whole blob was acquired (denominator) and the whole blob was served
+    // back through the live handler (numerator: summed over both voucher
+    // intervals), so served/acquired is exactly 1.0. Asserting the precise value
+    // — not merely `> 0` — catches a partial credit, e.g. crediting only the
+    // first 1 MiB voucher interval would leave the ratio at ~0.67 and pass a
+    // `> 0` check.
+    anyhow::ensure!(
+        (final_ratio - 1.0).abs() < 1e-9,
+        "expected served/acquired == 1.0 after a fully-served prefetch blob, got {final_ratio}"
+    );
+
+    // --- Negative control: an *untagged* blob served through the same live
+    // handler must NOT move the ratio. B reactively pulls blob2 from A via a
+    // plain cache-miss `populate` (the demand path, which never tags the blob as
+    // prefetch content), so serving it credits nothing.
+    cache_b.populate(hash2).await?;
+    anyhow::ensure!(
+        cache_b.has(hash2).await?,
+        "B should hold the reactively-pulled blob2"
+    );
+    anyhow::ensure!(
+        !engine.acquired().contains(&hash2_bytes, 2),
+        "a reactively-pulled blob must not be tagged as prefetch content"
+    );
+
+    let c2_ctx = ChannelContext {
+        channel_id: bc_channel_id2,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        client_signer: Arc::clone(&c2_buyer),
+        voucher_domain: voucher_dom(),
+        prior_nonce: U256::ZERO,
+        prior_bytes_delivered: U256::ZERO,
+        prior_amount: U256::ZERO,
+    };
+    let got2 = stream_fetch(
+        &ep_c,
+        EndpointAddr::new(b_id).with_ip_addr(addr_b),
+        &c2_ctx,
+        &slash_domain(),
+        b_eth.address(),
+        hash2_bytes,
+        0,
+        0x00c0_fffe,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got2.as_ref() == payload2.as_slice(),
+        "negative-control delivered bytes mismatch"
+    );
+
+    // The untagged serve fired `note_served_if_prefetched` (the live wiring) but
+    // the `acquired.contains` gate rejected the credit, so the ratio holds at 1.0.
+    let ratio_after_untagged = engine.policy().demand_quality_ratio(0);
+    anyhow::ensure!(
+        (ratio_after_untagged - 1.0).abs() < 1e-9,
+        "serving an untagged blob must leave served/acquired unchanged at 1.0, \
+         got {ratio_after_untagged}"
+    );
+
+    ep_c.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_b.abort();
     task_a.abort();
     Ok(())
 }
