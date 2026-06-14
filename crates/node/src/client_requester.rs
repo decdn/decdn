@@ -548,10 +548,18 @@ pub struct UpstreamPullHeader {
 ///
 /// Unlike `stream_fetch_tracked`, the acked voucher watermark is OWNED here (not
 /// threaded as a `&mut` out-param) and read back via [`Self::progress`] /
-/// returned by `finish`/`abort` — the caller (`node_origin`) persists it. The
-/// caller must bound `next_chunk`/`finish` with its own deadline and, on any
-/// exit, call `progress`/`finish`/`abort` to recover the watermark for
-/// `record_progress` (#852).
+/// returned by `finish`/`abort` — the caller (`node_origin`) persists it. On any
+/// exit, the caller MUST call `progress`/`finish`/`abort` to recover the
+/// watermark for `record_progress` (#852); a [`Drop`] guard closes the
+/// connection if none ran, but cannot return the watermark, so the obligation
+/// stands.
+///
+/// **Deadlines.** The serve loop bounds only the *open* (handshake) phase with
+/// the pull-through deadline. The streaming `next_chunk`/`finish` reads here are
+/// NOT each deadline-bounded: a stalled upstream mid-stream is bounded by the
+/// QUIC idle timeout and by the loop's own pacing — it stops pulling and recoups
+/// a downstream voucher every window, so it cannot run unboundedly ahead of
+/// (unpaid) downstream demand — rather than by a per-read timeout in this type.
 pub struct UpstreamPull {
     conn: iroh::endpoint::Connection,
     send: SendStream,
@@ -826,6 +834,21 @@ impl UpstreamPull {
     pub fn abort(self) -> VoucherProgress {
         self.conn.close(0u32.into(), b"client-abandoned");
         self.progress
+    }
+}
+
+impl Drop for UpstreamPull {
+    /// Safety net for the "call a terminal method on every exit" contract: if a
+    /// caller returns or panics without `finish`/`abort`, still close the upstream
+    /// connection so the QUIC stream and the upstream's server-side serve task
+    /// don't linger and keep that paid stream half-open. `Connection::close` is
+    /// first-wins and idempotent, so an explicit close in `finish`/`abort` keeps
+    /// its richer reason and this is a no-op when one of them ran; it only takes
+    /// effect on a dropped-without-finalize path. The acked watermark cannot be
+    /// recovered from `drop` (it can't be returned), so this bounds only the
+    /// connection leak, not the #852 watermark loss the doc contract guards.
+    fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"upstream-pull-dropped");
     }
 }
 

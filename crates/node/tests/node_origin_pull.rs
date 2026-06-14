@@ -3084,11 +3084,7 @@ async fn window_pull_through_leech_stall_refuses_without_spinning() -> Result<()
     )
     .await?;
     handler_b.attach_leech_governor(Arc::new(LeechGovernor::new(
-        LeechCaps {
-            max_unrecouped_leech_bytes: 0,
-            initial_allowance_bytes: CHUNK_SIZE as u64,
-            share_ratio_percent: 0,
-        },
+        LeechCaps::new_unchecked(0, CHUNK_SIZE as u64, 0),
         Arc::clone(&b_metrics),
     )));
     let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -3444,11 +3440,14 @@ async fn window_pull_through_global_budget_exhausted_refuses_admission() -> Resu
     )
     .await?;
     let gov = Arc::new(LeechGovernor::new(
-        LeechCaps {
-            max_unrecouped_leech_bytes: CHUNK_SIZE as u64,
-            initial_allowance_bytes: decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
-            share_ratio_percent: 100,
-        },
+        // `new_unchecked`: a tiny global budget below the opening window, so the
+        // global circuit breaker binds on the first admission (the scenario under
+        // test). `LeechCaps::new` rejects this pairing by design.
+        LeechCaps::new_unchecked(
+            CHUNK_SIZE as u64,
+            decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
+            100,
+        ),
         Arc::clone(&b_metrics),
     ));
     // Pre-exhaust the global budget through an unrelated peer.
@@ -3488,6 +3487,188 @@ async fn window_pull_through_global_budget_exhausted_refuses_admission() -> Resu
         "a budget-refused request must not fill B's cache"
     );
     assert_counter(&b_metrics, "node_pull_through_leech_budget_paused_total", 1)?;
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Result<()> {
+    // #856 step (4): the fused serve opens the upstream pull, reads `total_bytes`
+    // from the signed header, and — if it exceeds this node's `max_blob_size_bytes`
+    // — signs `BlobTooLarge` (wire `NotFound`), abandons BOTH the upstream pull and
+    // the cache tee, and forwards nothing. The regression this guards: a dropped
+    // size gate would fuse-serve an over-ceiling blob; a forgotten `tee.abandon()`
+    // on this arm would strand the in-flight tee claim for the hash. We assert the
+    // refusal, the `blob_too_large` metric, that no voucher was paid upstream
+    // (channel opened, zero bytes pulled), and that nothing was cached.
+    let payload = vec![0xB1u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA6);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x6F);
+    // 1 MiB ceiling, below the 1.5 MiB blob, so the SIZE gate trips — but the
+    // deposit guard (ceiling = min_payment(1 MiB, RATE) = 10 µUSDC) passes against
+    // the funded leaf, so we exercise step (4), not the step (1) deposit guard.
+    let max_blob_size_bytes = 1024 * 1024;
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        max_blob_size_bytes,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let refused = leaf_paced_pull(
+        &leaf_ep,
+        b_target.clone(),
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await
+    .is_err();
+    anyhow::ensure!(
+        refused,
+        "an upstream blob over the size ceiling must be refused (signed NotFound), not fused-served"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "the size gate must abort before any voucher is paid upstream, got {:?}",
+        progress_log(&recorded)?
+    );
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "an oversized-upstream refusal must not promote the blob into B's cache"
+    );
+    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 1)?;
+    // The tee claim was released on the abort arm: a second request for the SAME
+    // hash is not wedged on a stranded in-flight entry — it reaches the size gate
+    // again and is refused identically (a leaked tee would instead hang/coalesce).
+    let retry_sk = fresh_key();
+    let retry_node_id = B256::from(*retry_sk.public().as_bytes());
+    let (retry_ep, _) = local_endpoint(retry_sk, vec![]).await?;
+    let refused_again = leaf_paced_pull(
+        &retry_ep,
+        b_target,
+        retry_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await
+    .is_err();
+    anyhow::ensure!(
+        refused_again,
+        "a repeat request for the same hash must be refused again, not wedged on a stranded tee claim"
+    );
+    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 2)?;
+
+    retry_ep.close().await;
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
+    // #856 step (2): the per-peer share ratio can deny a speculative pull at
+    // *admission*, before any upstream byte is pulled — distinct from the
+    // mid-stream stall (`window_pull_through_leech_stall_*`) and the global-budget
+    // admission refusal (`..._global_budget_exhausted_*`). A peer with zero opening
+    // allowance and a 0% share ratio (and no prior service) is over its ceiling on
+    // the very first check, so the serve signs `CacheMiss` (wire `NotFound`) and
+    // the share-ratio pause fires once, with no upstream spend and nothing cached.
+    let payload = vec![0xC2u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA8);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x8F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    // No opening allowance, no share-ratio growth, global budget off: the peer is
+    // immediately over its (zero) ceiling at the first admission poll. These caps
+    // satisfy `LeechCaps::new` (a `0` global budget disables the window≤budget
+    // cross-check), so the validated constructor is used here.
+    let gov = Arc::new(LeechGovernor::new(
+        LeechCaps::new(0, 0, 0).map_err(|e| anyhow::anyhow!("invalid caps: {e}"))?,
+        Arc::clone(&b_metrics),
+    ));
+    handler_b.attach_leech_governor(gov);
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let refused = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await
+    .is_err();
+    anyhow::ensure!(
+        refused,
+        "a peer over its per-peer share ratio must be refused at admission (signed NotFound)"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "the share-ratio admission refusal must precede any upstream spend, got {:?}",
+        progress_log(&recorded)?
+    );
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "a share-ratio-refused request must not fill B's cache"
+    );
+    assert_counter(&b_metrics, "node_pull_through_share_ratio_paused_total", 1)?;
 
     leaf_ep.close().await;
     ep_b.close().await;

@@ -573,9 +573,13 @@ impl ClientHandler {
     }
 
     /// Whether a speculative pull may proceed for `peer` under the seed-leech caps
-    /// (#856). Always `true` when no governor is attached.
-    fn leech_may_pull(&self, peer: &[u8; 32]) -> bool {
-        self.leech_governor.get().is_none_or(|g| g.may_pull(peer))
+    /// (#856). Always `true` when no governor is attached. Like
+    /// [`LeechGovernor::poll_admission`] this is a stateful, advisory poll (it
+    /// touches the peer's LRU entry and does not reserve budget), not a pure read.
+    fn leech_admit(&self, peer: &[u8; 32]) -> bool {
+        self.leech_governor
+            .get()
+            .is_none_or(|g| g.poll_admission(peer))
     }
 
     /// Account `bytes` speculatively pulled for `peer` under the seed-leech caps
@@ -1112,7 +1116,7 @@ impl ClientHandler {
         // (2) Seed-leech admission: global unrecouped budget + per-peer share
         // ratio. `may_pull` bumps its own pause metric on refusal.
         let peer = client_node_id.0;
-        if !self.leech_may_pull(&peer) {
+        if !self.leech_admit(&peer) {
             tee.abandon();
             return self
                 .respond_error(&mut send, req, ServeRejectReason::CacheMiss)
@@ -1202,7 +1206,7 @@ impl ClientHandler {
     ///
     /// Precise bound: the window is checked at the top of the pull phase, *before*
     /// fetching the next chunk, so the realized frontier can overshoot by up to one
-    /// `pull_chunk_bytes` chunk (the chunk that crosses the threshold). The
+    /// upstream `CHUNK_SIZE` payload (the chunk that crosses the threshold). The
     /// documented `pull_ahead_bytes` exposure is therefore exact only to within one
     /// chunk — negligible at the default ~1 MiB window vs `CHUNK_SIZE`, but the
     /// "≤ one window" claims elsewhere mean "≤ window + one chunk".
@@ -1260,7 +1264,7 @@ impl ClientHandler {
                     window_hit = true;
                     break;
                 }
-                if !self.leech_may_pull(&peer) {
+                if !self.leech_admit(&peer) {
                     break;
                 }
                 match pull.next_chunk().await {
@@ -1276,8 +1280,15 @@ impl ClientHandler {
                         pulled = pulled.saturating_add(len);
                         self.leech_record_pulled(&peer, len);
                         if let Err(e) = tee.write(&chunk).await {
+                            // A LOCAL store fault on already-paid bytes — distinct
+                            // from a downstream client drop (which goes through
+                            // `abandon_window_serve`). Meter it separately so an
+                            // operator can tell a failing `data_dir` from flaky
+                            // peers. `abandon` still persists the buyer watermark
+                            // (#852) for what we paid upstream.
                             pull.abandon(None);
                             tee.abandon();
+                            self.metrics.node_pull_through_local_tee_failed();
                             return Err(anyhow::anyhow!("cache tee write failed: {e}"));
                         }
                         if let Err(e) = self
@@ -1456,8 +1467,16 @@ impl ClientHandler {
 
     /// The #856 abandonment path: the downstream client underpaid or dropped
     /// mid-pull. Stop the upstream spend immediately (exposure ≤ one window),
-    /// drop the partial fill, and meter it. The rejection was already written to
-    /// the client by `collect_voucher`, so the caller just returns `Ok(())`.
+    /// drop the partial fill (persisting the buyer watermark via `pull.abandon`,
+    /// #852), and meter it as a client-abandon.
+    ///
+    /// This helper only does the teardown + metering; it neither writes a wire
+    /// frame nor decides the caller's return value. Its three call sites differ:
+    /// the voucher-rejected arm returns `Ok(())` after `collect_voucher` already
+    /// wrote the rejection; the `collect_voucher` `Err` arm and the downstream
+    /// `write_message` failure both propagate `Err` and may not have written any
+    /// frame (an underpayment `bail!` has no wire reject code). Do not read this
+    /// as "a rejection was always sent."
     fn abandon_window_serve(&self, pull: NodeProgressivePull, tee: TeeSink) {
         pull.abandon(None);
         tee.abandon();

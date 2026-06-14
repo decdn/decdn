@@ -277,6 +277,9 @@ impl NodeOrigin {
                     started: Instant::now(),
                     delivered: 0,
                     node_id: candidate.node_id,
+                    hash_bytes,
+                    prior_amount: ctx.prior_amount,
+                    prior_bytes_delivered: ctx.prior_bytes_delivered,
                 },
             )),
             Err(err) => {
@@ -306,6 +309,12 @@ pub struct NodeProgressivePull {
     delivered: u64,
     /// Candidate node id, for region accounting.
     node_id: [u8; 32],
+    /// Blob hash, for the prefetch acquisition-ledger feed (#820).
+    hash_bytes: [u8; 32],
+    /// Channel cumulative amount/bytes BEFORE this pull, so the finalize path can
+    /// compute this pull's spend/byte delta for the prefetch ledger (#820).
+    prior_amount: U256,
+    prior_bytes_delivered: U256,
 }
 
 impl NodeProgressivePull {
@@ -343,6 +352,9 @@ impl NodeProgressivePull {
             started,
             delivered,
             node_id,
+            hash_bytes,
+            prior_amount,
+            prior_bytes_delivered,
         } = self;
         // Capture the acked watermark before `finish` consumes the pull so a
         // paid-but-corrupt delivery is still persisted (#852).
@@ -355,6 +367,16 @@ impl NodeProgressivePull {
             return verify.map(|_| ());
         };
         persist_buyer_progress(deps, provider_addr, channel_id, &watermark);
+        // Feed the prefetch ledger (#820) on both Ok and Err — see the buffered
+        // path; the window path is demand-miss today, so the observer no-ops, but
+        // wiring it keeps the ledger correct if a prefetch pull is ever routed here.
+        feed_acquisition_observer(
+            deps,
+            hash_bytes,
+            &watermark,
+            prior_amount,
+            prior_bytes_delivered,
+        );
         match verify {
             Ok(_) => {
                 record_outcome(
@@ -388,6 +410,9 @@ impl NodeProgressivePull {
             pk,
             provider_addr,
             channel_id,
+            hash_bytes,
+            prior_amount,
+            prior_bytes_delivered,
             ..
         } = self;
         let watermark = pull.abort();
@@ -395,6 +420,16 @@ impl NodeProgressivePull {
             return;
         };
         persist_buyer_progress(deps, provider_addr, channel_id, &watermark);
+        // A paid-but-abandoned pull still advanced the watermark (#852); feed its
+        // spend to the prefetch ledger (#820) for the same reason as the buffered
+        // path's Err arm — see `feed_acquisition_observer`.
+        feed_acquisition_observer(
+            deps,
+            hash_bytes,
+            &watermark,
+            prior_amount,
+            prior_bytes_delivered,
+        );
         if let Some(err) = cause {
             classify_pull_failure(deps, pk, provider_addr, err);
         }
@@ -642,26 +677,15 @@ async fn pull_from_candidate(
     // pull.
     let elapsed = started.elapsed();
     persist_buyer_progress(deps, provider_addr, ctx.channel_id, &progress);
-    // Surface this pull's cost to the prefetch ledger (#820) for BOTH a
-    // successful and a paid-but-failed delivery: the voucher watermark — and
-    // thus real spend — can advance even on a mid-stream failure (#852), and the
-    // rolling-1h prefetch budget must account for every micro-USDC spent, not
-    // just the successes (else the budget gate silently under-counts and can be
-    // overspent by repeated failing pulls). Per-pull spend/bytes are the
-    // channel-cumulative watermark minus the channel's prior cumulative
-    // (`progress` is seeded from `ctx.prior_*` inside `stream_fetch_tracked`),
-    // i.e. the delta for THIS pull, not the running total. The observer itself
-    // filters to prefetch-initiated pulls; demand-miss pulls are ignored there.
-    if let Some(obs) = &deps.acquisition_observer
-        && let Some((_, bytes_delivered, amount)) = progress.acked()
-    {
-        let spent = narrow_pull_delta(amount.saturating_sub(ctx.prior_amount), "spend");
-        let acquired = narrow_pull_delta(
-            bytes_delivered.saturating_sub(ctx.prior_bytes_delivered),
-            "bytes",
-        );
-        obs.on_pull(hash_bytes, spent, acquired);
-    }
+    // Surface this pull's cost to the prefetch ledger (#820); see the helper for
+    // why this fires on both success and a paid-but-failed delivery.
+    feed_acquisition_observer(
+        deps,
+        hash_bytes,
+        &progress,
+        ctx.prior_amount,
+        ctx.prior_bytes_delivered,
+    );
     match result {
         Ok(bytes) => {
             record_outcome(
@@ -784,14 +808,50 @@ fn combined_reputation(deps: &NodeOriginDeps, pk: PublicKey, now_secs: u64) -> f
     combined_score(Some(local), network, &deps.rep_cfg) as f32
 }
 
+/// Feed the prefetch acquisition ledger (#820) with THIS pull's spend/byte
+/// deltas, for BOTH a successful and a paid-but-failed delivery (the watermark —
+/// and thus real spend — can advance even on a mid-stream failure #852, and the
+/// rolling-1h budget must account for every micro-USDC spent, not just the
+/// successes, or the gate silently under-counts and can be overspent). Deltas are
+/// the acked watermark minus the channel's prior cumulative (the delta for THIS
+/// pull, not the running total). No-op when no observer is attached or nothing
+/// was acked.
+///
+/// Fires for ALL pull paths — the buffered `pull_from_candidate` AND the
+/// window-paced `NodeProgressivePull` finalize — so the ledger never silently
+/// misses spend that a future routing change pushes onto the window path. The
+/// observer itself filters to prefetch-initiated pulls; a demand-miss pull (the
+/// entire window-paced serve path today) is a harmless no-op inside `on_pull`.
+fn feed_acquisition_observer(
+    deps: &NodeOriginDeps,
+    hash_bytes: [u8; 32],
+    progress: &VoucherProgress,
+    prior_amount: U256,
+    prior_bytes_delivered: U256,
+) {
+    if let Some(obs) = &deps.acquisition_observer
+        && let Some((_, bytes_delivered, amount)) = progress.acked()
+    {
+        let spent = narrow_pull_delta(amount.saturating_sub(prior_amount), "spend", &deps.metrics);
+        let acquired = narrow_pull_delta(
+            bytes_delivered.saturating_sub(prior_bytes_delivered),
+            "bytes",
+            &deps.metrics,
+        );
+        obs.on_pull(hash_bytes, spent, acquired);
+    }
+}
+
 /// Narrow a per-pull `U256` micro-USDC / byte delta to `u64` for the prefetch
 /// ledger (#820). A real per-pull delta never approaches `u64::MAX`; an overflow
-/// signals upstream voucher-accounting corruption, so log it loudly and fall
-/// back to `0` — the same under-count-not-over-count direction the rest of the
-/// prefetch ledger uses. Clamping HIGH (`u64::MAX`) would instead poison the
+/// signals upstream voucher-accounting corruption, so log it loudly, bump
+/// `node_pull_delta_overflow` so it is alertable (not just log-grep-able), and
+/// fall back to `0` — the same under-count-not-over-count direction the rest of
+/// the prefetch ledger uses. Clamping HIGH (`u64::MAX`) would instead poison the
 /// rolling budget sum and silently pin the gate to permanent exhaustion.
-fn narrow_pull_delta(value: U256, field: &str) -> u64 {
+fn narrow_pull_delta(value: U256, field: &str, metrics: &Metrics) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| {
+        metrics.node_pull_delta_overflow();
         warn!(%value, field, "node-origin: per-pull prefetch {field} delta exceeds u64; recording 0");
         0
     })

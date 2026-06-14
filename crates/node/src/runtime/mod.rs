@@ -964,11 +964,16 @@ pub async fn run(
         if let Some(origin) = &pull_through_origin {
             client_handler
                 .attach_window_pull_through(Arc::clone(origin), cfg.cache.pull_ahead_bytes);
-            let leech_caps = crate::leech_governor::LeechCaps {
-                max_unrecouped_leech_bytes: cfg.cache.max_unrecouped_leech_bytes,
-                initial_allowance_bytes: cfg.cache.pull_ahead_bytes,
-                share_ratio_percent: cfg.cache.pull_share_ratio_percent,
-            };
+            // The resolver already enforces `pull_ahead_bytes <=
+            // max_unrecouped_leech_bytes` (with the `0`-disables carve-out), so
+            // this validated build is belt-and-suspenders — a self-contradicting
+            // pairing is a bring-up error, not a silently-degraded governor.
+            let leech_caps = crate::leech_governor::LeechCaps::new(
+                cfg.cache.max_unrecouped_leech_bytes,
+                cfg.cache.pull_ahead_bytes,
+                cfg.cache.pull_share_ratio_percent,
+            )
+            .context("invalid seed-leech caps: opening window exceeds the global budget")?;
             client_handler.attach_leech_governor(Arc::new(
                 crate::leech_governor::LeechGovernor::new(leech_caps, Arc::clone(&node_metrics)),
             ));

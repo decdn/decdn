@@ -571,6 +571,23 @@ pub struct DecdnMetrics {
     /// corrupt-upstream bytes through this node. Field has no `_total` suffix
     /// because the `OpenMetrics` encoder appends it.
     pub node_pull_through_upstream_verify_failed: Counter,
+    /// `decdn_node_pull_through_local_tee_failed_total` (#856): a window-paced
+    /// serve aborted mid-pull because writing an already-paid upstream chunk into
+    /// the local cache tee failed (a store/`data_dir` fault) — distinct from
+    /// `node_pull_through_client_abandoned`, which counts the downstream client
+    /// dropping or underpaying. Splitting the two lets an operator tell a failing
+    /// local store from flaky/abusive downstreams: a sustained rate here points at
+    /// disk, not peers. Field has no `_total` suffix because the `OpenMetrics`
+    /// encoder appends it.
+    pub node_pull_through_local_tee_failed: Counter,
+    /// `decdn_node_pull_delta_overflow_total` (#820): per-pull prefetch-ledger
+    /// spend/byte deltas that exceeded `u64` when narrowed from `U256` and were
+    /// clamped to `0` (the conservative under-count direction). A real per-pull
+    /// delta never approaches `u64::MAX`, so any nonzero value signals upstream
+    /// voucher-accounting corruption — otherwise visible only by log-grep of the
+    /// `narrow_pull_delta` warning. Field has no `_total` suffix because the
+    /// `OpenMetrics` encoder appends it.
+    pub node_pull_delta_overflow: Counter,
     /// `decdn_node_address_watcher_restarts_total` (#831): distinct drift windows
     /// of the `NodeId → address` resolver's event watcher (mirrors the staker-set
     /// watcher, #788). Edge-triggered once per outage, not per backoff iteration.
@@ -1259,6 +1276,19 @@ impl Metrics {
     /// hash check at finalization (#856).
     pub fn node_pull_through_upstream_verify_failed(&self) {
         self.decdn.node_pull_through_upstream_verify_failed.inc();
+    }
+
+    /// A window-paced serve aborted because a local cache-tee write of an
+    /// already-paid upstream chunk failed (#856) — a store fault, not a downstream
+    /// client drop.
+    pub fn node_pull_through_local_tee_failed(&self) {
+        self.decdn.node_pull_through_local_tee_failed.inc();
+    }
+
+    /// A per-pull prefetch-ledger delta overflowed `u64` and was clamped to `0`
+    /// (#820) — a signal of upstream voucher-accounting corruption.
+    pub fn node_pull_delta_overflow(&self) {
+        self.decdn.node_pull_delta_overflow.inc();
     }
 
     /// A buyer→upstream pull hit this node's own `pull_timeout` deadline (#857).
