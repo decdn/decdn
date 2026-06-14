@@ -73,6 +73,19 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, rank_candidates};
 /// than burning the caller's miss-latency budget on it.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Post-pull cost observer (#820). Invoked once per pull that acked any voucher
+/// — a successful delivery OR a paid-but-failed one (whose watermark still
+/// advanced, #852) — so the prefetch budget accounts for all spend, not just
+/// successes. It fires for ALL pulls (demand-miss and prefetch alike), so the
+/// observer itself filters to the pulls it cares about. `[u8; 32]` keeps this
+/// trait free of any cache/DHT hash type.
+pub trait AcquisitionObserver: Send + Sync + std::fmt::Debug {
+    /// `micro_usdc` and `bytes` are the deltas for *this* pull (the channel
+    /// watermark minus its prior cumulative), not the channel running totals.
+    /// One pull is one blob/stream, so `bytes` is this pull's delivered length.
+    fn on_pull(&self, hash: [u8; 32], micro_usdc: u64, bytes: u64);
+}
+
 /// Tuning knobs for the node-to-node pull, resolved from `[cache]` config.
 #[derive(Debug, Clone)]
 pub struct NodeOriginConfig {
@@ -130,6 +143,9 @@ pub struct NodeOriginDeps {
     pub region_accountant: Arc<crate::region_accounting::RegionAccountant>,
     /// Resolved pull tuning.
     pub config: NodeOriginConfig,
+    /// Optional post-pull cost observer (#820). `None` on a node without
+    /// prefetch; `Some` feeds the prefetch acquisition ledger.
+    pub acquisition_observer: Option<Arc<dyn AcquisitionObserver>>,
 }
 
 impl std::fmt::Debug for NodeOriginDeps {
@@ -353,10 +369,10 @@ async fn try_pull(
 /// open/reuse a buyer channel, `stream_fetch`, and record the reputation
 /// outcome. Returns the bytes on success, `None` (try the next) otherwise.
 // Sequential resolve → open → fetch → classify pipeline; the tracing macros and
-// the success/failure classification inflate the cognitive-complexity metric
-// past threshold (same inflation noted in `chain_staker_set`). Splitting it
-// would scatter a single linear flow across helpers.
-#[allow(clippy::cognitive_complexity)]
+// the success/failure classification inflate the cognitive-complexity + line
+// metrics past threshold (same inflation noted in `chain_staker_set`). Splitting
+// it would scatter a single linear flow across helpers.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn pull_from_candidate(
     deps: &NodeOriginDeps,
     candidate: &Candidate,
@@ -426,6 +442,26 @@ async fn pull_from_candidate(
     {
         deps.metrics.node_pull_progress_persist_failure();
         warn!(%provider_addr, %err, "node-origin: failed to persist buyer voucher progress");
+    }
+    // Surface this pull's cost to the prefetch ledger (#820) for BOTH a
+    // successful and a paid-but-failed delivery: the voucher watermark — and
+    // thus real spend — can advance even on a mid-stream failure (#852), and the
+    // rolling-1h prefetch budget must account for every micro-USDC spent, not
+    // just the successes (else the budget gate silently under-counts and can be
+    // overspent by repeated failing pulls). Per-pull spend/bytes are the
+    // channel-cumulative watermark minus the channel's prior cumulative
+    // (`progress` is seeded from `ctx.prior_*` inside `stream_fetch_tracked`),
+    // i.e. the delta for THIS pull, not the running total. The observer itself
+    // filters to prefetch-initiated pulls; demand-miss pulls are ignored there.
+    if let Some(obs) = &deps.acquisition_observer
+        && let Some((_, bytes_delivered, amount)) = progress.acked()
+    {
+        let spent = narrow_pull_delta(amount.saturating_sub(ctx.prior_amount), "spend");
+        let acquired = narrow_pull_delta(
+            bytes_delivered.saturating_sub(ctx.prior_bytes_delivered),
+            "bytes",
+        );
+        obs.on_pull(hash_bytes, spent, acquired);
     }
     match result {
         Ok(bytes) => {
@@ -514,6 +550,19 @@ fn combined_reputation(deps: &NodeOriginDeps, pk: PublicKey, now_secs: u64) -> f
     let local = deps.local_rep.score(pk);
     let network = deps.network_rep.score(pk, now_secs);
     combined_score(Some(local), network, &deps.rep_cfg) as f32
+}
+
+/// Narrow a per-pull `U256` micro-USDC / byte delta to `u64` for the prefetch
+/// ledger (#820). A real per-pull delta never approaches `u64::MAX`; an overflow
+/// signals upstream voucher-accounting corruption, so log it loudly and fall
+/// back to `0` — the same under-count-not-over-count direction the rest of the
+/// prefetch ledger uses. Clamping HIGH (`u64::MAX`) would instead poison the
+/// rolling budget sum and silently pin the gate to permanent exhaustion.
+fn narrow_pull_delta(value: U256, field: &str) -> u64 {
+    u64::try_from(value).unwrap_or_else(|_| {
+        warn!(%value, field, "node-origin: per-pull prefetch {field} delta exceeds u64; recording 0");
+        0
+    })
 }
 
 /// Fold a pull/probe outcome into BOTH the local EWMA score and the outbound

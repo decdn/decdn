@@ -100,6 +100,10 @@ The metrics backend (`iroh_metrics`) carries no label dimension, so the per-`gat
 | `decdn_prefetch_origin_gate_rejections_total` | Counter | R | — | Acquisitions skipped because no candidate in the DHT FIND_VALUE result set was authorized as origin under the relevant `OriginAssignment` lookup. Identical-by-construction to `decdn_prefetch_acquisitions_unauthorized_total`; surfaced as a standalone counter for alerting convenience. |
 | `decdn_prefetch_demand_quality_ratio_milli` | Gauge | R | — | Current rolling-window `served_bytes / acquired_bytes` for prefetched content, scaled ×1000 (the gauge backend is integer-valued). Below `prefetch.demand_quality_min_ratio` triggers the auto-throttle described in [ADR 022 § Prefetch Decision](022-content-discovery.md#prefetch-decision). |
 | `decdn_prefetch_throttle_active` | Gauge | R | — | `1` while the demand-quality auto-throttle is suppressing prefetch; `0` otherwise. |
+| `decdn_prefetch_acquire_succeeded_total` | Counter | R | — | Speculative acquisitions whose pull-through completed and cached the blob. Pairs with `decdn_prefetch_spend_usdc_total` to derive average spend per successful acquisition. |
+| `decdn_prefetch_acquire_failed_total` | Counter | R | — | Speculative acquisitions whose pull-through found no source or errored. A sustained non-zero rate suggests demand signals for content with no reachable authorized origin. |
+| `decdn_prefetch_acquire_timeout_total` | Counter | R | — | Speculative acquisitions that hit `prefetch.acquisition_timeout_secs` before completing. |
+| `decdn_prefetch_acquire_dropped_saturated_total` | Counter | R | — | Speculative acquisitions dropped because `prefetch.max_concurrent_acquisitions` were already in flight. Non-zero values indicate the operator should raise the cap or that demand is bursting faster than the node can pull. |
 
 #### Probe Metrics (`cdn/probe/v1`)
 

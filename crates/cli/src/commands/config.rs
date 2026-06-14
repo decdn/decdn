@@ -315,6 +315,11 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  prefetch_enabled:         {}",
         resolved.prefetch.enabled
     )?;
+    writeln!(
+        w,
+        "  prefetch_acquisitions:    max {} concurrent, {}s timeout",
+        resolved.prefetch.max_concurrent_acquisitions, resolved.prefetch.acquisition_timeout_secs
+    )?;
     Ok(())
 }
 
@@ -460,11 +465,11 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # retained_files = 4                        # rotated backup receipt files retained (#802); 0 keeps none
 
 [prefetch]
-# ADR 022 speculative-prefetch operator policy. Disabled by default.
-# NOTE: this slice only *meters* — it records demand, runs the decision gates,
-# and exports metrics, but does not yet acquire content (the live acquisition
-# is the #650 follow-up). Setting enabled = true before then exercises the
-# decision/metrics path only; no prefetch bytes are fetched and no USDC spent.
+# ADR 022 speculative-prefetch operator policy. Disabled by default. When
+# enabled, a node observing enough FIND_VALUE demand for a hash speculatively
+# acquires it (DHT lookup → probe → paid pull-through), subject to the
+# authorized-origin gate, the rolling-1h budget, and the demand-quality
+# auto-throttle. Leave disabled unless you understand the spend implications.
 # enabled = false
 # require_authorized_origin = true          # require an authorized origin in the FIND_VALUE candidate set
 # budget_usdc_per_hour = 0                  # micro-USDC rolling-1h spend cap; 0 = never prefetch
@@ -472,6 +477,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # threshold_window_secs = 300               # rolling-window length for the trigger
 # demand_quality_min_ratio = 0.1            # served/acquired auto-throttle floor
 # demand_quality_window_secs = 3600         # rolling-window length for the demand-quality predicate
+# max_concurrent_acquisitions = 4           # cap on background speculative pulls in flight
+# acquisition_timeout_secs = 30             # per-acquisition pull-through deadline
 "#;
 
 #[cfg(test)]
