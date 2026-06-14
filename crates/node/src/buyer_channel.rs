@@ -27,7 +27,7 @@
 //! Structurally this mirrors [`crate::payment_settlement::PaymentChannelService`]:
 //! a generic-over-`Provider` struct owning an `AbortOnDrop` background task.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,6 +45,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::client_requester::ChannelContext;
+use crate::metrics::Metrics;
 use crate::payment_settlement::{
     MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range, unix_now,
 };
@@ -53,6 +54,21 @@ use crate::payment_settlement::{
 /// Channel lifetimes are long (default 90 days), so an hourly scan is ample —
 /// matches the seller expiry sweep cadence.
 const RECLAIM_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
+
+/// How many consecutive failed sweeps a single channel's reclaim must rack up
+/// before the per-attempt `warn!` escalates to an `error!` + alertable metric
+/// (#906). A one-off failure is the expected transient case (host-clock-vs-chain
+/// skew: not yet expired on-chain, retry next tick), so we tolerate a few
+/// sweeps; ~6 hours (6 × `RECLAIM_SWEEP_INTERVAL`) of sustained failure is well
+/// past any plausible skew and means a refundable deposit is genuinely stranded
+/// (dead gas wallet, a never-clearing contract condition) and warrants operator
+/// attention. Contrast the seller path's
+/// `payment_settlement::record_pending_after_close`, which `error!`s on
+/// the *first* failure: there a missed write means a fully-drawn channel never
+/// auto-settles, so there is no benign-transient case to tolerate. A buyer
+/// reclaim failure usually *is* benign (chain-clock skew), so we wait out a few
+/// sweeps before treating it as a genuine stranded deposit.
+const RECLAIM_ESCALATION_THRESHOLD: u32 = 6;
 
 /// How many blocks back from head the one-shot bootstrap reconciliation scan
 /// looks for orphaned `ChannelOpened(client == self)` events (#763). The buyer
@@ -154,6 +170,16 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     /// contends, so many concurrent pulls to an already-open provider proceed
     /// freely.
     opens_in_flight: Arc<Mutex<HashSet<Address>>>,
+    /// Per-channel consecutive `try_reclaim`-failure tally (#906), shared between
+    /// the background reclaim loop and [`Self::sweep_expired_once`]. In-memory
+    /// only: a restart resets it, so a persistent failure re-escalates after
+    /// `RECLAIM_ESCALATION_THRESHOLD` post-restart sweeps (escalation is
+    /// observability-only, so this is acceptable). Pruned each pass down to the
+    /// channels still expired, so it cannot grow unbounded.
+    reclaim_failures: Arc<Mutex<HashMap<ChannelId, u32>>>,
+    /// Metrics sink for the reclaim sweep (#906): `buyer_reclaim_failure` on a
+    /// failed attempt, paired with the threshold `error!` escalation.
+    metrics: Arc<Metrics>,
     _reclaimer: AbortOnDrop,
     /// Aborts the one-shot bootstrap reconciliation scan (#763) if the service is
     /// dropped (a fast restart) before the scan finishes, so a long backfill
@@ -186,6 +212,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         voucher_domain: Eip712Domain,
         default_deposit: U256,
         ensure_max_approval: bool,
+        metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let contract = PaymentChannel::new(payment_channel_addr, provider.clone());
 
@@ -215,10 +242,13 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             "BuyerChannelService bootstrap complete"
         );
 
+        let reclaim_failures = Arc::new(Mutex::new(HashMap::new()));
         let reclaimer = tokio::spawn(reclaim_loop(
             contract.clone(),
             Arc::clone(&store),
             self_address,
+            Arc::clone(&reclaim_failures),
+            Arc::clone(&metrics),
         ));
 
         // Shared per-provider in-flight-open set: the reconciler claims the same
@@ -250,6 +280,8 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             min_deposit,
             default_deposit,
             opens_in_flight,
+            reclaim_failures,
+            metrics,
             _reclaimer: AbortOnDrop(reclaimer),
             _reconciler: AbortOnDrop(reconciler),
         })
@@ -355,7 +387,11 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                 channel_id = %existing.channel_id,
                 "tracked buyer channel expired; reclaiming before opening a replacement"
             );
-            try_reclaim(&self.contract, &self.store, self.self_address, &existing).await;
+            // Outcome intentionally ignored here: a persistent failure on this
+            // one-off open-path reclaim is already surfaced to the caller as a
+            // retryable error below — the consecutive-failure escalation (#906)
+            // is the background sweep's job, not this synchronous open.
+            let _ = try_reclaim(&self.contract, &self.store, self.self_address, &existing).await;
             // If the expired record is still present (reclaim hit an RPC error,
             // or the chain clock has not yet reached expiry under host-clock
             // skew), do NOT open a replacement that would overwrite and orphan
@@ -543,7 +579,14 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// it is also exposed so the runtime (or a test) can trigger an immediate
     /// pass. Best-effort — per-channel errors are logged, never propagated.
     pub async fn sweep_expired_once(&self) {
-        reclaim_once(&self.contract, &self.store, self.self_address).await;
+        reclaim_once(
+            &self.contract,
+            &self.store,
+            self.self_address,
+            &self.reclaim_failures,
+            &self.metrics,
+        )
+        .await;
     }
 
     /// Add `additional` USDC to the channel tracked for `provider_addr`.
@@ -756,6 +799,8 @@ async fn reclaim_loop<P: Provider + Clone>(
     contract: PaymentChannel::PaymentChannelInstance<P>,
     store: Arc<dyn BuyerChannelStore>,
     self_address: Address,
+    failures: Arc<Mutex<HashMap<ChannelId, u32>>>,
+    metrics: Arc<Metrics>,
 ) {
     let mut ticker = tokio::time::interval(RECLAIM_SWEEP_INTERVAL);
     // Skip the immediate first tick — bootstrap just ran and nothing is near
@@ -763,16 +808,79 @@ async fn reclaim_loop<P: Provider + Clone>(
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        reclaim_once(&contract, &store, self_address).await;
+        reclaim_once(&contract, &store, self_address, &failures, &metrics).await;
     }
 }
 
+/// Outcome of one [`try_reclaim`] attempt, consumed by [`record_reclaim_outcome`]
+/// to drive the consecutive-failure escalation (#906).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReclaimOutcome {
+    /// The local record was forgotten this pass — the deposit was reclaimed, or
+    /// the record was dropped as bogus / already-closed. Nothing left to escalate.
+    Resolved,
+    /// The reclaim attempt failed; the record was left in place for a later sweep.
+    Failed,
+}
+
+/// Whether a reclaim failure has crossed the escalation threshold this pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReclaimEscalation {
+    None,
+    Escalate { consecutive: u32 },
+}
+
+/// Update the per-channel consecutive-failure tally for `channel_id` given this
+/// pass's `outcome`, and decide whether to escalate (#906). A `Resolved` outcome
+/// clears the tally (the deposit is recovered or the record is gone). A `Failed`
+/// outcome increments it and escalates once it reaches `threshold` — and on
+/// every subsequent failed sweep, so a *sustained* failure keeps surfacing an
+/// `error!`/metric rather than going quiet after the first crossing. Pure so the
+/// escalation policy is unit-testable without a live contract.
+fn record_reclaim_outcome(
+    failures: &mut HashMap<ChannelId, u32>,
+    channel_id: ChannelId,
+    outcome: ReclaimOutcome,
+    threshold: u32,
+) -> ReclaimEscalation {
+    match outcome {
+        ReclaimOutcome::Resolved => {
+            failures.remove(&channel_id);
+            ReclaimEscalation::None
+        }
+        ReclaimOutcome::Failed => {
+            let consecutive = failures.entry(channel_id).or_insert(0);
+            *consecutive = consecutive.saturating_add(1);
+            if *consecutive >= threshold {
+                ReclaimEscalation::Escalate {
+                    consecutive: *consecutive,
+                }
+            } else {
+                ReclaimEscalation::None
+            }
+        }
+    }
+}
+
+/// Drop failure tallies for channels not attempted in the latest sweep — they
+/// were reclaimed, replaced by a newer open, or are no longer past expiry — so
+/// the map tracks only currently-failing channels and cannot grow unbounded
+/// (#906). `seen` is the set of channel ids this pass attempted.
+fn prune_reclaim_failures(failures: &mut HashMap<ChannelId, u32>, seen: &HashSet<ChannelId>) {
+    failures.retain(|id, _| seen.contains(id));
+}
+
 /// One reclaim-sweep pass. Errors are logged per channel and never abort the
-/// sweep.
+/// sweep. Tracks consecutive per-channel failures in `failures` so a persistent
+/// reclaim failure escalates from a per-attempt `warn!` to an `error!` + the
+/// `buyer_reclaim_failures` metric (#906); the map is pruned each pass to the
+/// channels still expired so it cannot grow unbounded.
 async fn reclaim_once<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn BuyerChannelStore>,
     self_address: Address,
+    failures: &Arc<Mutex<HashMap<ChannelId, u32>>>,
+    metrics: &Arc<Metrics>,
 ) {
     let states = match store.load_all() {
         Ok(s) => s,
@@ -782,12 +890,49 @@ async fn reclaim_once<P: Provider + Clone>(
         }
     };
     let now = unix_now();
-    for st in states {
+    let mut seen: HashSet<ChannelId> = HashSet::new();
+    for st in &states {
         if !st.is_expired_at(now) {
             continue;
         }
-        try_reclaim(contract, store, self_address, &st).await;
+        seen.insert(st.channel_id);
+        let outcome = try_reclaim(contract, store, self_address, st).await;
+        if outcome == ReclaimOutcome::Failed {
+            metrics.buyer_reclaim_failure();
+        }
+        // Lock scoped to the synchronous tally update only: the guard's block
+        // contains no `.await`, so it is never held across a suspension point
+        // (clippy `await_holding_lock`). A poisoned lock is recovered rather than
+        // propagated — the map carries no cross-element invariant — mirroring
+        // `InFlightOpenGuard`'s `Drop` (its `claim` deliberately does the opposite).
+        let escalation = {
+            let mut guard = failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            record_reclaim_outcome(
+                &mut guard,
+                st.channel_id,
+                outcome,
+                RECLAIM_ESCALATION_THRESHOLD,
+            )
+        };
+        if let ReclaimEscalation::Escalate { consecutive } = escalation {
+            error!(
+                channel_id = %st.channel_id,
+                provider = %st.provider,
+                deposit = %st.deposit,
+                consecutive,
+                "buyer reclaim has failed {consecutive} consecutive sweeps for this channel; \
+                 the refundable deposit may be unrecovered (check this node's gas balance and \
+                 RPC) or the local channel record could not be cleared (check the channel \
+                 store) — reconcile manually"
+            );
+        }
     }
+    let mut guard = failures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    prune_reclaim_failures(&mut guard, &seen);
 }
 
 /// Reclaim one expired channel's deposit (or drop the record if the upstream
@@ -800,12 +945,12 @@ async fn try_reclaim<P: Provider + Clone>(
     store: &Arc<dyn BuyerChannelStore>,
     self_address: Address,
     st: &BuyerChannelState,
-) {
+) -> ReclaimOutcome {
     let ch = match contract.getChannel(st.channel_id).call().await {
         Ok(ch) => ch,
         Err(err) => {
             warn!(%err, channel_id = %st.channel_id, "buyer reclaim: getChannel failed");
-            return;
+            return ReclaimOutcome::Failed;
         }
     };
     // Ownership guard: `reclaimExpired` always refunds `channel.client`, never
@@ -820,14 +965,16 @@ async fn try_reclaim<P: Provider + Clone>(
             on_chain_client = %ch.client,
             "buyer reclaim: tracked channel's on-chain client is not this node; dropping bogus record"
         );
-        forget_reclaimed(store, st, "drop foreign/unknown record");
-        return;
+        return outcome_after_forget(forget_reclaimed(store, st, "drop foreign/unknown record"));
     }
     // If the upstream already closed/settled the channel, `reclaimExpired`
     // would revert — just drop our local record.
     if !matches!(ch.status, PaymentChannel::Status::Open) {
-        forget_reclaimed(store, st, "expired channel already closed on-chain");
-        return;
+        return outcome_after_forget(forget_reclaimed(
+            store,
+            st,
+            "expired channel already closed on-chain",
+        ));
     }
 
     let receipt = match contract.reclaimExpired(st.channel_id).send().await {
@@ -835,12 +982,12 @@ async fn try_reclaim<P: Provider + Clone>(
             Ok(r) => r,
             Err(err) => {
                 warn!(%err, channel_id = %st.channel_id, "buyer reclaim: receipt failed");
-                return;
+                return ReclaimOutcome::Failed;
             }
         },
         Err(err) => {
             warn!(%err, channel_id = %st.channel_id, "buyer reclaim: send failed");
-            return;
+            return ReclaimOutcome::Failed;
         }
     };
     if !receipt.status() {
@@ -849,35 +996,72 @@ async fn try_reclaim<P: Provider + Clone>(
             tx = %receipt.transaction_hash,
             "reclaimExpired reverted on-chain; leaving record for retry"
         );
-        return;
+        return ReclaimOutcome::Failed;
     }
-    forget_reclaimed(store, st, "reclaimed expired buyer channel deposit");
+    outcome_after_forget(forget_reclaimed(
+        store,
+        st,
+        "reclaimed expired buyer channel deposit",
+    ))
 }
 
 /// Compare-and-delete the buyer record for `st`'s channel after a reclaim (or a
 /// drop-bogus decision), logging the outcome. Uses `forget_if_channel` so a
 /// concurrent `open_or_reuse` that replaced this provider's channel between the
 /// sweep's `load_all` and here is NOT clobbered (lost-update guard).
-fn forget_reclaimed(store: &Arc<dyn BuyerChannelStore>, st: &BuyerChannelState, reason: &str) {
+///
+/// Returns `true` when the record is gone for our purposes — either we deleted
+/// it (`Ok(true)`) or a newer channel already superseded it (`Ok(false)`) — and
+/// `false` when the store write *errored*, so the stale record will be re-loaded
+/// and re-attempted next sweep. The caller folds that `false` into a `Failed`
+/// outcome so a persistent store-write failure escalates instead of being
+/// silently re-cleared every pass (#906 review).
+fn forget_reclaimed(
+    store: &Arc<dyn BuyerChannelStore>,
+    st: &BuyerChannelState,
+    reason: &str,
+) -> bool {
     match store.forget_if_channel(st.provider, st.channel_id) {
-        Ok(true) => info!(
-            channel_id = %st.channel_id,
-            provider = %st.provider,
-            reason,
-            "dropped buyer channel record"
-        ),
-        Ok(false) => debug!(
-            channel_id = %st.channel_id,
-            provider = %st.provider,
-            reason,
-            "buyer record already replaced by a newer channel; left in place"
-        ),
-        Err(err) => warn!(
-            %err,
-            provider = %st.provider,
-            reason,
-            "buyer reclaim: forget_if_channel failed"
-        ),
+        Ok(true) => {
+            info!(
+                channel_id = %st.channel_id,
+                provider = %st.provider,
+                reason,
+                "dropped buyer channel record"
+            );
+            true
+        }
+        Ok(false) => {
+            debug!(
+                channel_id = %st.channel_id,
+                provider = %st.provider,
+                reason,
+                "buyer record already replaced by a newer channel; left in place"
+            );
+            true
+        }
+        Err(err) => {
+            warn!(
+                %err,
+                provider = %st.provider,
+                reason,
+                "buyer reclaim: forget_if_channel failed"
+            );
+            false
+        }
+    }
+}
+
+/// Map a [`forget_reclaimed`] result to a [`ReclaimOutcome`]. A forget that
+/// succeeded (or found the record already superseded) resolves the sweep; a
+/// forget that errored leaves the record stranded and looping, so it counts as a
+/// failure toward escalation — a persistent store-write failure must not be
+/// silently re-cleared every sweep (#906 review).
+const fn outcome_after_forget(forgotten: bool) -> ReclaimOutcome {
+    if forgotten {
+        ReclaimOutcome::Resolved
+    } else {
+        ReclaimOutcome::Failed
     }
 }
 
@@ -1243,6 +1427,116 @@ mod tests {
         assert_eq!(ctx.prior_nonce, U256::from(3u64));
         assert_eq!(ctx.prior_bytes_delivered, U256::from(3_000u64));
         assert_eq!(ctx.prior_amount, U256::from(30u64));
+    }
+
+    /// A persistent reclaim failure stays silent for the first few sweeps (the
+    /// expected transient case) and escalates once it reaches the threshold —
+    /// then keeps escalating on every subsequent failed sweep so a sustained
+    /// stranded deposit keeps surfacing rather than going quiet after the first
+    /// crossing (#906).
+    #[test]
+    fn reclaim_failures_escalate_at_threshold_and_stay_escalated() {
+        let mut failures: HashMap<ChannelId, u32> = HashMap::new();
+        let ch = B256::repeat_byte(0x11);
+        let note = |f: &mut HashMap<ChannelId, u32>| {
+            record_reclaim_outcome(f, ch, ReclaimOutcome::Failed, RECLAIM_ESCALATION_THRESHOLD)
+        };
+        for _ in 1..RECLAIM_ESCALATION_THRESHOLD {
+            assert_eq!(note(&mut failures), ReclaimEscalation::None);
+        }
+        assert_eq!(
+            note(&mut failures),
+            ReclaimEscalation::Escalate {
+                consecutive: RECLAIM_ESCALATION_THRESHOLD
+            },
+        );
+        assert_eq!(
+            note(&mut failures),
+            ReclaimEscalation::Escalate {
+                consecutive: RECLAIM_ESCALATION_THRESHOLD + 1
+            },
+        );
+    }
+
+    /// A resolved pass (deposit reclaimed, or record dropped as bogus/closed)
+    /// clears the tally, so a later failure restarts the count from one (#906).
+    #[test]
+    fn reclaim_resolved_clears_the_failure_tally() {
+        let mut failures: HashMap<ChannelId, u32> = HashMap::new();
+        let ch = B256::repeat_byte(0x22);
+        let threshold = 3;
+        record_reclaim_outcome(&mut failures, ch, ReclaimOutcome::Failed, threshold);
+        record_reclaim_outcome(&mut failures, ch, ReclaimOutcome::Failed, threshold);
+        assert_eq!(
+            record_reclaim_outcome(&mut failures, ch, ReclaimOutcome::Resolved, threshold),
+            ReclaimEscalation::None,
+        );
+        assert!(!failures.contains_key(&ch), "Resolved forgets the channel");
+        assert_eq!(
+            record_reclaim_outcome(&mut failures, ch, ReclaimOutcome::Failed, threshold),
+            ReclaimEscalation::None,
+        );
+        assert_eq!(failures.get(&ch), Some(&1), "count restarts from one");
+    }
+
+    /// A resolved outcome for a channel with no prior failures is a no-op (the
+    /// common steady-state case: most sweeps reclaim cleanly first try).
+    #[test]
+    fn reclaim_resolved_on_untracked_channel_is_a_noop() {
+        let mut failures: HashMap<ChannelId, u32> = HashMap::new();
+        assert_eq!(
+            record_reclaim_outcome(
+                &mut failures,
+                B256::repeat_byte(0x33),
+                ReclaimOutcome::Resolved,
+                3
+            ),
+            ReclaimEscalation::None,
+        );
+        assert!(failures.is_empty());
+    }
+
+    /// A forget that cleared the record (or found it already superseded) resolves
+    /// the sweep; a forget that errored leaves the record stranded, so it must
+    /// count as a failure toward escalation rather than silently re-clearing the
+    /// tally every pass (#906 review).
+    #[test]
+    fn forget_failure_maps_to_a_failed_outcome() {
+        assert_eq!(outcome_after_forget(true), ReclaimOutcome::Resolved);
+        assert_eq!(outcome_after_forget(false), ReclaimOutcome::Failed);
+    }
+
+    /// Tallies are independent per channel: one channel crossing the threshold
+    /// does not escalate an unrelated channel still on its first failure (#906).
+    #[test]
+    fn reclaim_failure_tallies_are_per_channel() {
+        let mut failures: HashMap<ChannelId, u32> = HashMap::new();
+        let (a, b) = (B256::repeat_byte(0x44), B256::repeat_byte(0x55));
+        let threshold = 2;
+        record_reclaim_outcome(&mut failures, a, ReclaimOutcome::Failed, threshold);
+        assert_eq!(
+            record_reclaim_outcome(&mut failures, a, ReclaimOutcome::Failed, threshold),
+            ReclaimEscalation::Escalate { consecutive: 2 },
+        );
+        assert_eq!(
+            record_reclaim_outcome(&mut failures, b, ReclaimOutcome::Failed, threshold),
+            ReclaimEscalation::None,
+        );
+    }
+
+    /// The end-of-pass prune drops tallies for channels the sweep did not attempt
+    /// (reclaimed, replaced, or no longer expired) and keeps the still-failing
+    /// ones, so the map cannot grow unbounded (#906).
+    #[test]
+    fn reclaim_prune_keeps_only_attempted_channels() {
+        let mut failures: HashMap<ChannelId, u32> = HashMap::new();
+        let (still_failing, gone) = (B256::repeat_byte(0x66), B256::repeat_byte(0x77));
+        failures.insert(still_failing, 4);
+        failures.insert(gone, 2);
+        let seen: HashSet<ChannelId> = HashSet::from([still_failing]);
+        prune_reclaim_failures(&mut failures, &seen);
+        assert_eq!(failures.get(&still_failing), Some(&4));
+        assert!(!failures.contains_key(&gone), "untracked channel is pruned");
     }
 
     /// The per-provider in-flight-open slot refuses a second concurrent claim

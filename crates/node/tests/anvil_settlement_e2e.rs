@@ -840,6 +840,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher_domain(CHAIN_ID, payment_channel),
         U256::from(DEPOSIT_MICRO_USDC),
         true, // fresh buyer identity → issue the one-time max USDC approval
+        Arc::new(Metrics::new()),
     )
     .await?;
 
@@ -1550,6 +1551,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher_domain(CHAIN_ID, payment_channel),
         U256::from(DEPOSIT_MICRO_USDC),
         false,
+        Arc::new(Metrics::new()),
     )
     .await?;
     let rehydrated = poll_until(Duration::from_secs(60), || {
@@ -1606,6 +1608,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher_domain(CHAIN_ID, payment_channel),
         U256::from(DEPOSIT_MICRO_USDC),
         false,
+        Arc::new(Metrics::new()),
     )
     .await?;
     let repaired = poll_until(Duration::from_secs(60), || {
