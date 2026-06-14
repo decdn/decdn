@@ -85,7 +85,7 @@ use decdn_incentive::{
     voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerChannelService;
-use decdn_node::channel_store::PersistentChannelStateStore;
+use decdn_node::channel_store::{BuyerChannelStoreHandle, PersistentChannelStateStore};
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::{AutoSettleConfig, PaymentChannelService};
@@ -788,29 +788,63 @@ async fn run_e2e() -> anyhow::Result<()> {
     // bindings (`openChannel`, `clientChannelNonce`, `reclaimExpired`) and the
     // service end-to-end on a live deployment.
     // ============================================================
+    // The buyer service runs under its OWN eth identity, distinct from the
+    // `client_addr` that drove the seller-path channels above. This is what makes
+    // the bootstrap reconciliation scan (#763) deterministic here: reconcile
+    // re-hydrates `ChannelOpened(client == self)` orphans, and a fresh buyer
+    // address owns no prior channels, so the scan finds nothing to race against
+    // the lazy open below. (Reusing `client_addr` would let reconcile re-hydrate
+    // the still-Open, already-withdrawn `id1` and the open would reuse it.)
+    let buyer_signer = Arc::new(PrivateKeySigner::random());
+    let buyer_addr = buyer_signer.address();
+    let _: serde_json::Value = admin
+        .raw_request(
+            "anvil_setBalance".into(),
+            (
+                buyer_addr,
+                U256::from(100u64) * U256::from(10u64).pow(U256::from(18)),
+            ),
+        )
+        .await?;
+    let buyer_provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from((*buyer_signer).clone()))
+        .connect_http(url.clone());
+    let usdc_buyer = Erc20::new(usdc_addr, buyer_provider.clone());
+    // Fund the buyer generously: the existing path opens 1 channel + a top-up,
+    // and the #763 scenarios appended at the end open several more.
+    usdc_admin
+        .mint(
+            buyer_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(12u64),
+        )
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
     let buyer_store = Arc::new(MemoryBuyerChannelStore::new());
     let buyer_store_dyn: Arc<dyn BuyerChannelStore> = buyer_store.clone();
     let buyer_service = BuyerChannelService::bootstrap(
-        client_provider.clone(),
+        buyer_provider.clone(),
         payment_channel,
-        client_addr,
+        buyer_addr,
         buyer_store_dyn,
-        Arc::clone(&client_signer),
+        Arc::clone(&buyer_signer),
         voucher_domain(CHAIN_ID, payment_channel),
         U256::from(DEPOSIT_MICRO_USDC),
-        false, // USDC already approved above; don't issue a second approval
+        true, // fresh buyer identity → issue the one-time max USDC approval
     )
     .await?;
 
-    // Lazy open against the provider → a fresh on-chain channel (the client's
-    // 3rd, nonce 2) + a persisted buyer record.
+    // Lazy open against the provider → a fresh on-chain channel (the buyer's
+    // first, nonce 0) + a persisted buyer record.
     let buyer_ctx = buyer_service
         .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
         .await?;
     let buyer_id = buyer_ctx.channel_id;
     let on_chain = pc_read.getChannel(buyer_id).call().await?;
     anyhow::ensure!(
-        on_chain.client == client_addr && on_chain.provider == node_addr,
+        on_chain.client == buyer_addr && on_chain.provider == node_addr,
         "buyer channel opened with wrong client/provider"
     );
     anyhow::ensure!(
@@ -903,7 +937,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("buyer channel vanished before reclaim"))?;
     expired.expires_at = 1; // far in the past vs the system clock → sweep treats as expired
     buyer_store.record(&expired)?;
-    let balance_before = usdc_client.balanceOf(client_addr).call().await?;
+    let balance_before = usdc_buyer.balanceOf(buyer_addr).call().await?;
     let _: serde_json::Value = node_provider
         .raw_request("evm_increaseTime".into(), (CHANNEL_EXPIRY_WARP_SECS,))
         .await?;
@@ -915,7 +949,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         buyer_store.get_by_provider(node_addr)?.is_none(),
         "reclaimed buyer channel record must be dropped"
     );
-    let balance_after = usdc_client.balanceOf(client_addr).call().await?;
+    let balance_after = usdc_buyer.balanceOf(buyer_addr).call().await?;
     anyhow::ensure!(
         balance_after.saturating_sub(balance_before) == topped_deposit,
         "reclaimExpired must refund the full deposit ({topped_deposit} µUSDC); \
@@ -1405,6 +1439,197 @@ async fn run_e2e() -> anyhow::Result<()> {
         "live-arm recovery must use the clean reconcile path (no watcher persist failures):\n{watcher_metrics}"
     );
     drop(service3);
+
+    // ============================================================
+    // #763 BUYER ROBUSTNESS — concurrency, expired rotation, and bootstrap
+    // reconciliation, all under the dedicated `buyer_addr` identity so the
+    // reconcile scan only ever sees the buyer's own channels. No seller
+    // settlement service is alive here; these scenarios are purely on-chain
+    // (open / reclaim) + the chain-log reconciliation scan, so none is needed.
+    // ============================================================
+
+    // --- A. Concurrent same-provider opens escrow exactly one deposit (#753). ---
+    // Two racing open_or_reuse for one provider: the InFlightOpenGuard lets one
+    // escrow a channel and makes the other bail-for-retry (or reuse the winner),
+    // so the on-chain client nonce advances by EXACTLY one and only one channel
+    // is ever tracked — never two deposits.
+    anyhow::ensure!(
+        buyer_store.get_by_provider(node_addr)?.is_none(),
+        "precondition: no buyer channel tracked for the provider after the reclaim above"
+    );
+    let nonce_before = pc_read.clientChannelNonce(buyer_addr).call().await?;
+    let (r1, r2) = tokio::join!(
+        buyer_service.open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC)),
+        buyer_service.open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC)),
+    );
+    let nonce_after = pc_read.clientChannelNonce(buyer_addr).call().await?;
+    anyhow::ensure!(
+        nonce_after == nonce_before + U256::from(1u64),
+        "concurrent opens must escrow exactly one channel (nonce {nonce_before} → {nonce_after})"
+    );
+    anyhow::ensure!(
+        buyer_store.len() == 1,
+        "concurrent opens must leave exactly one tracked channel"
+    );
+    let opened_ids: Vec<_> = [&r1, &r2]
+        .into_iter()
+        .filter_map(|r| r.as_ref().ok().map(|ctx| ctx.channel_id))
+        .collect();
+    let win_id = opened_ids
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("at least one concurrent open must succeed"))?;
+    anyhow::ensure!(
+        opened_ids.iter().all(|id| *id == win_id),
+        "concurrent opens must never surface two distinct channels"
+    );
+    let reuse_ctx = buyer_service
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .await?;
+    anyhow::ensure!(
+        reuse_ctx.channel_id == win_id && buyer_store.len() == 1,
+        "a retry after the concurrent race reuses the one channel"
+    );
+
+    // --- B. Expired-channel rotation reached THROUGH open_or_reuse_channel. ---
+    // Mark the tracked channel expired and warp past its on-chain expiry, then a
+    // fresh open_or_reuse must reclaim it FIRST (reclaim-before-reopen, dropping
+    // the old record) and open a new channel — the rotation path previously only
+    // reachable via sweep_expired_once directly, not through open_or_reuse.
+    let mut row = buyer_store
+        .get_by_provider(node_addr)?
+        .ok_or_else(|| anyhow::anyhow!("buyer channel vanished before rotation test"))?;
+    row.expires_at = 1; // expired vs host clock → reclaim candidate
+    buyer_store.record(&row)?;
+    let _: serde_json::Value = node_provider
+        .raw_request("evm_increaseTime".into(), (CHANNEL_EXPIRY_WARP_SECS,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    let rotated = buyer_service
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .await?;
+    anyhow::ensure!(
+        rotated.channel_id != win_id && buyer_store.len() == 1,
+        "rotation must reclaim the expired channel and open a new one"
+    );
+    anyhow::ensure!(
+        matches!(
+            pc_read.getChannel(win_id).call().await?.status,
+            PaymentChannel::Status::Closed
+        ),
+        "the rotated-away channel must be reclaimed (Closed) on-chain"
+    );
+
+    // --- C. Bootstrap reconciliation re-hydrates an orphaned on-chain channel. ---
+    // Open a channel directly via the buyer wallet so no service tracks it, then
+    // bring up a fresh BuyerChannelService (empty store) under the same identity:
+    // its bootstrap reconciliation scan must discover the on-chain orphan and
+    // re-hydrate it so the reclaim sweep can recover the deposit.
+    let pc_buyer = PaymentChannelOpen::new(payment_channel, buyer_provider.clone());
+    pc_buyer
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let recon_store = Arc::new(MemoryBuyerChannelStore::new());
+    let recon_store_dyn: Arc<dyn BuyerChannelStore> = recon_store.clone();
+    let recon_service = BuyerChannelService::bootstrap(
+        buyer_provider.clone(),
+        payment_channel,
+        buyer_addr,
+        recon_store_dyn,
+        Arc::clone(&buyer_signer),
+        voucher_domain(CHAIN_ID, payment_channel),
+        U256::from(DEPOSIT_MICRO_USDC),
+        false,
+    )
+    .await?;
+    let rehydrated = poll_until(Duration::from_secs(60), || {
+        let recon_store = Arc::clone(&recon_store);
+        async move { recon_store.get_by_provider(node_addr).ok().flatten() }
+    })
+    .await
+    .ok_or_else(|| {
+        anyhow::anyhow!("bootstrap reconciliation did not re-hydrate any orphaned buyer channel")
+    })?;
+    let recon_view = pc_read.getChannel(rehydrated.channel_id).call().await?;
+    anyhow::ensure!(
+        recon_view.client == buyer_addr
+            && recon_view.provider == node_addr
+            && matches!(recon_view.status, PaymentChannel::Status::Open),
+        "re-hydrated channel must be an Open channel we own"
+    );
+    anyhow::ensure!(
+        rehydrated.deposit == recon_view.deposit && rehydrated.expires_at == recon_view.expiresAt,
+        "re-hydrated state must mirror the on-chain deposit/expiry"
+    );
+    drop(recon_service);
+
+    // --- D. Reconciliation repairs an undecodable (post-downgrade) row, and a
+    // corrupt sibling never blocks the reclaim sweep (#753 / #763). ---
+    let pstore_dir = tempfile::tempdir()?;
+    let pconcrete = Arc::new(PersistentChannelStateStore::open(pstore_dir.path())?);
+    // A real on-chain channel whose local row got corrupted by a downgrade.
+    pc_buyer
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    // Seed an undecodable value under the provider key (its channel_id is
+    // unrecoverable from disk — exactly what reconcile rebuilds from chain).
+    pconcrete.insert_raw_buyer_record(node_addr, &[0u8; 8])?;
+    let pstore_dyn: Arc<dyn BuyerChannelStore> =
+        Arc::new(BuyerChannelStoreHandle::new(Arc::clone(&pconcrete)));
+    let persist_service = BuyerChannelService::bootstrap(
+        buyer_provider.clone(),
+        payment_channel,
+        buyer_addr,
+        Arc::clone(&pstore_dyn),
+        Arc::clone(&buyer_signer),
+        voucher_domain(CHAIN_ID, payment_channel),
+        U256::from(DEPOSIT_MICRO_USDC),
+        false,
+    )
+    .await?;
+    let repaired = poll_until(Duration::from_secs(60), || {
+        let s = Arc::clone(&pstore_dyn);
+        async move { s.get_by_provider(node_addr).ok().flatten() }
+    })
+    .await
+    .ok_or_else(|| anyhow::anyhow!("reconcile did not repair the undecodable buyer row"))?;
+    anyhow::ensure!(
+        matches!(
+            pc_read.getChannel(repaired.channel_id).call().await?.status,
+            PaymentChannel::Status::Open
+        ),
+        "the repaired row must point at an Open on-chain channel"
+    );
+    // D2 (mixed reclaim): seed an undecodable row under an unrelated provider key
+    // alongside the healthy (now-expired) repaired row, then sweep — the corrupt
+    // sibling is skipped by load_all and the healthy channel is still reclaimed.
+    let corrupt_provider = Address::from([0xCDu8; 20]);
+    pconcrete.insert_raw_buyer_record(corrupt_provider, &[0u8; 8])?;
+    let mut healthy = pstore_dyn
+        .get_by_provider(node_addr)?
+        .ok_or_else(|| anyhow::anyhow!("repaired row vanished before mixed-reclaim test"))?;
+    healthy.expires_at = 1;
+    pstore_dyn.record(&healthy)?;
+    let _: serde_json::Value = node_provider
+        .raw_request("evm_increaseTime".into(), (CHANNEL_EXPIRY_WARP_SECS,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    persist_service.sweep_expired_once().await;
+    anyhow::ensure!(
+        pstore_dyn.get_by_provider(node_addr)?.is_none(),
+        "the healthy expired channel must be reclaimed despite the corrupt sibling"
+    );
+    anyhow::ensure!(
+        pstore_dyn.get_by_provider(corrupt_provider).is_err(),
+        "the corrupt sibling row remains (skipped, not reclaimed)"
+    );
+    drop(persist_service);
 
     client_ep.close().await;
     server_ep.close().await;

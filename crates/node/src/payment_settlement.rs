@@ -193,7 +193,10 @@ const REORG_MARGIN_BLOCKS: u64 = 128;
 /// limit. 10k is a conservative default that clears the common range caps; tie it
 /// to the deployment provider's documented `eth_getLogs` limit (and make it
 /// configurable) if a target RPC enforces a tighter or result-count-based cap.
-const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
+///
+/// `pub(crate)` so the buyer-side bootstrap reconciliation scan
+/// ([`crate::buyer_channel`], #763) can reuse the same window cap.
+pub(crate) const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
 
 /// Debounce thresholds for the watcher scan checkpoint (#784). The persisted
 /// checkpoint is only a *floor* for the resume backfill: `resolve_backfill_start`
@@ -245,7 +248,10 @@ const fn resolve_backfill_start(last_seen: Option<u64>, head: u64, margin: u64) 
 /// `eth_getLogs` calls. Pure and allocation-light (one entry per window); a
 /// `from > to` range yields no windows (the caller validates that separately via
 /// [`check_backfill_range`]). Unit-tested for the window math.
-fn backfill_windows(from: u64, to: u64, span: u64) -> Vec<(u64, u64)> {
+///
+/// `pub(crate)` so the buyer-side bootstrap reconciliation scan
+/// ([`crate::buyer_channel`], #763) reuses the same windowing rather than forking it.
+pub(crate) fn backfill_windows(from: u64, to: u64, span: u64) -> Vec<(u64, u64)> {
     let mut windows = Vec::new();
     if from > to || span == 0 {
         return windows;
@@ -270,7 +276,10 @@ fn backfill_windows(from: u64, to: u64, span: u64) -> Vec<(u64, u64)> {
 /// an `Err` so the caller retries via the watcher backoff rather than skipping
 /// the backfill (which would permanently reopen the race once the lagging node
 /// catches up).
-fn check_backfill_range(from: u64, to: u64) -> Result<()> {
+///
+/// `pub(crate)` so the buyer-side bootstrap reconciliation scan
+/// ([`crate::buyer_channel`], #763) shares the same range validation.
+pub(crate) fn check_backfill_range(from: u64, to: u64) -> Result<()> {
     if from > to {
         anyhow::bail!(
             "backfill range invalid: from_block ({from}) > to_block ({to}); \

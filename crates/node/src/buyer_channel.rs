@@ -39,18 +39,33 @@ use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, DepositOutcome,
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, DepositOutcome, StoreError,
 };
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::client_requester::ChannelContext;
-use crate::payment_settlement::unix_now;
+use crate::payment_settlement::{
+    MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range, unix_now,
+};
 
 /// How often the reclaim sweep scans tracked buyer channels for expiry.
 /// Channel lifetimes are long (default 90 days), so an hourly scan is ample —
 /// matches the seller expiry sweep cadence.
 const RECLAIM_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
+
+/// How many blocks back from head the one-shot bootstrap reconciliation scan
+/// looks for orphaned `ChannelOpened(client == self)` events (#763). The buyer
+/// has no scan checkpoint (unlike the seller watcher): orphans only arise from
+/// the two rare post-escrow failure legs in [`BuyerChannelService::open_and_persist`]
+/// (event-decode or `store.record` failing *after* the on-chain escrow) or a
+/// postcard-undecodable row after a binary downgrade — all of which strand a
+/// deposit seconds before the next restart. A modest fixed lookback (~1–2 days
+/// of an Arbitrum-Sepolia-class ~0.25 s/block L2) recovers those realistic cases
+/// cheaply without re-scanning the full chain every boot. An orphan older than
+/// this window is missed (it is reclaim-able only after its long expiry anyway);
+/// promote to config if operators need a full-lifetime scan.
+const BUYER_RECONCILE_LOOKBACK_BLOCKS: u64 = 700_000;
 
 /// Re-approve the `PaymentChannel` spender when the standing USDC allowance has
 /// fallen below this floor. Set to half of `U256::MAX` so a single max approval
@@ -140,6 +155,10 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     /// freely.
     opens_in_flight: Arc<Mutex<HashSet<Address>>>,
     _reclaimer: AbortOnDrop,
+    /// Aborts the one-shot bootstrap reconciliation scan (#763) if the service is
+    /// dropped (a fast restart) before the scan finishes, so a long backfill
+    /// never outlives the service. Held only for its `Drop`.
+    _reconciler: AbortOnDrop,
 }
 
 impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
@@ -202,6 +221,25 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             self_address,
         ));
 
+        // Shared per-provider in-flight-open set: the reconciler claims the same
+        // slots the live open path uses, so its re-hydration can never overwrite a
+        // channel a concurrent cache-miss open just recorded.
+        let opens_in_flight = Arc::new(Mutex::new(HashSet::new()));
+
+        // One-shot bootstrap reconciliation (#763): re-hydrate any on-chain
+        // channel this node opened but lost track of (record/decode failed
+        // post-escrow, or a downgrade made the row undecodable). Best-effort and
+        // non-blocking — matches the non-fatal buyer-bootstrap posture; the
+        // already-spawned reclaim loop reclaims any re-hydrated expired channel
+        // on its next tick. Runs in the background so a transient RPC failure on
+        // the head read does not fail bring-up.
+        let reconciler = tokio::spawn(reconcile_orphans_once(
+            contract.clone(),
+            Arc::clone(&store),
+            self_address,
+            Arc::clone(&opens_in_flight),
+        ));
+
         Ok(Self {
             contract,
             store,
@@ -211,8 +249,9 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             self_address,
             min_deposit,
             default_deposit,
-            opens_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            opens_in_flight,
             _reclaimer: AbortOnDrop(reclaimer),
+            _reconciler: AbortOnDrop(reconciler),
         })
     }
 
@@ -842,6 +881,280 @@ fn forget_reclaimed(store: &Arc<dyn BuyerChannelStore>, st: &BuyerChannelState, 
     }
 }
 
+/// Authoritative on-chain view of one `ChannelOpened` open, distilled from the
+/// event + a `getChannel` read into just the fields the reconciliation decision
+/// needs. Keeping it scalar (rather than the alloy `Channel` binding) lets
+/// [`reconcile_decision`] be unit-tested without constructing contract types.
+#[derive(Debug, Clone)]
+struct OnChainOpen {
+    channel_id: ChannelId,
+    /// On-chain `channel.client` (read back via `getChannel`, not the event) so
+    /// a zeroed struct from an unknown id can be rejected.
+    client: Address,
+    provider: Address,
+    token: Address,
+    deposit: U256,
+    expires_at: u64,
+    claimed_nonce: U256,
+    claimed_bytes: U256,
+    claimed_amount: U256,
+    is_open: bool,
+}
+
+/// Decide whether a re-hydrated [`BuyerChannelState`] must be persisted for an
+/// on-chain open, and build it. Pure (no I/O) so the policy is unit-testable.
+///
+/// Returns `Some(state)` only when the channel is genuinely orphaned: still
+/// `Open` on-chain, owned by this node, and with **no decodable local row**
+/// (`existing` is `None` — the caller maps a corrupt/undecodable row to `None`
+/// so it is repaired by the overwrite). A present healthy row — for any
+/// `channel_id` — is never clobbered: the running node's own record is
+/// authoritative for which channel is live for that provider. A second still-Open
+/// channel for the same provider (only possible after a prior orphan) is left for
+/// a later boot to recover once the live row is gone; this is the documented
+/// residual of the one-row-per-provider store keying.
+fn reconcile_decision(
+    view: &OnChainOpen,
+    self_address: Address,
+    existing: Option<&BuyerChannelState>,
+) -> Option<BuyerChannelState> {
+    // `getChannel` on an unknown id returns a zeroed struct (client == 0); a
+    // mined `ChannelOpened` cannot have client == 0, so a mismatch here means we
+    // somehow read a foreign/empty channel — never reclaim it for someone else.
+    if view.client != self_address {
+        return None;
+    }
+    // Closing/Closed channels need no buyer reclaim (`reclaimExpired` reverts);
+    // mirrors the reclaim sweep's status guard in `try_reclaim`.
+    if !view.is_open {
+        return None;
+    }
+    // A decodable local row already covers this provider — leave it untouched.
+    if existing.is_some() {
+        return None;
+    }
+    let mut state = BuyerChannelState::new(
+        view.channel_id,
+        view.provider,
+        view.token,
+        view.deposit,
+        view.expires_at,
+    );
+    // Hydrate the cumulative watermark from the authoritative on-chain claimed
+    // totals so a re-hydrated channel that already saw deliveries resumes at the
+    // right nonce instead of re-signing from zero (which the provider would
+    // reject). `new()` zeroes `last_*` and on-chain claimed totals are `>= 0`, so
+    // `advance` cannot regress here; on the impossible error keep the un-advanced
+    // (zeroed-watermark) state rather than panic.
+    if let Err(err) = state.advance(view.claimed_nonce, view.claimed_bytes, view.claimed_amount) {
+        warn!(
+            channel_id = %view.channel_id,
+            provider = %view.provider,
+            %err,
+            "buyer reconcile: on-chain claimed totals could not seed the watermark; \
+             hydrating with a zero watermark"
+        );
+    }
+    Some(state)
+}
+
+/// Reconcile one `ChannelOpened` event: confirm it is ours, read authoritative
+/// on-chain state, and re-hydrate the local store if the channel is an orphan.
+/// Returns `Ok(true)` when a row was (re)hydrated, `Ok(false)` when skipped, and
+/// `Err` only on a per-event fault (a `getChannel` RPC error) the caller logs
+/// and steps past.
+// Linear guard sequence (ownership filter → getChannel → per-provider slot →
+// store-read with fault/corrupt split → decide → record); splitting would
+// scatter the atomicity reasoning.
+#[allow(clippy::cognitive_complexity)]
+async fn reconcile_one_opened<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    store: &Arc<dyn BuyerChannelStore>,
+    self_address: Address,
+    opens_in_flight: &Arc<Mutex<HashSet<Address>>>,
+    event: &PaymentChannel::ChannelOpened,
+) -> Result<bool> {
+    // The filter is by event signature, not topic, so `query` returns every
+    // open in the range; keep only our own (mirrors the seller's client/provider
+    // self-filter).
+    if event.client != self_address {
+        return Ok(false);
+    }
+    let ch = contract
+        .getChannel(event.channelId)
+        .call()
+        .await
+        .with_context(|| format!("reconcile getChannel for {}", event.channelId))?;
+
+    // Serialize against the live open path for this provider. The reconciler is a
+    // second writer to the provider-keyed store, racing concurrent cache-miss
+    // opens the moment bootstrap returns; without this guard our re-hydration
+    // could overwrite (orphan) a channel a live open just escrowed and recorded.
+    // Claiming the same per-provider slot the live path uses makes the read +
+    // record below atomic with respect to opens: a live open in flight → we skip
+    // (it persists the real channel); otherwise the slot is ours until drop.
+    let Some(_open_guard) = InFlightOpenGuard::claim(opens_in_flight, ch.provider)? else {
+        debug!(
+            provider = %ch.provider,
+            channel_id = %event.channelId,
+            "buyer reconcile: a live open is in flight for this provider; skipping (it persists the real channel)"
+        );
+        return Ok(false);
+    };
+
+    // Read the local row UNDER the slot so the decision + record are atomic wrt
+    // live opens. Distinguish an *unreadable* row (corrupt bytes / a future
+    // schema after a downgrade) — whose channel_id is unrecoverable from disk, so
+    // re-hydrating from chain is the repair — from a *backend/IO fault*, where the
+    // row may be perfectly healthy and overwriting it would clobber a live
+    // channel. Repair the former (treat as "no row"); skip the latter.
+    let existing = match store.get_by_provider(ch.provider) {
+        Ok(row) => row,
+        Err(
+            err @ (StoreError::Corrupt { .. }
+            | StoreError::UnsupportedSchema { .. }
+            | StoreError::Codec(_)),
+        ) => {
+            warn!(
+                provider = %ch.provider,
+                channel_id = %event.channelId,
+                %err,
+                "buyer reconcile: local row unreadable (corrupt/downgraded); re-hydrating from chain"
+            );
+            None
+        }
+        Err(err) => {
+            warn!(
+                provider = %ch.provider,
+                channel_id = %event.channelId,
+                %err,
+                "buyer reconcile: store read failed (backend/IO); skipping to avoid clobbering a possibly-healthy row"
+            );
+            return Ok(false);
+        }
+    };
+    let view = OnChainOpen {
+        channel_id: event.channelId,
+        client: ch.client,
+        provider: ch.provider,
+        token: ch.token,
+        // `Channel.expiresAt` is `uint64` in the binding — no clamp needed.
+        expires_at: ch.expiresAt,
+        deposit: ch.deposit,
+        claimed_nonce: ch.claimedNonce,
+        claimed_bytes: ch.claimedBytes,
+        claimed_amount: ch.claimedAmount,
+        is_open: matches!(ch.status, PaymentChannel::Status::Open),
+    };
+    let Some(state) = reconcile_decision(&view, self_address, existing.as_ref()) else {
+        // Surface the one orphan the scan deliberately cannot auto-recover: a
+        // second still-Open channel we own whose provider is already covered by a
+        // live local row (the documented one-row-per-provider residual). Its
+        // deposit is reclaimable only after the live row clears on a later boot,
+        // so log it rather than skip silently.
+        if view.is_open
+            && view.client == self_address
+            && existing.is_some_and(|s| s.channel_id != view.channel_id)
+        {
+            warn!(
+                provider = %view.provider,
+                orphan_channel_id = %view.channel_id,
+                deposit = %view.deposit,
+                "buyer reconcile: a second still-open channel for this provider is already covered by a \
+                 live row; its deposit is deferred to a later boot once the live row clears"
+            );
+        }
+        return Ok(false);
+    };
+    store
+        .record(&state)
+        .context("persist re-hydrated buyer channel")?;
+    info!(
+        provider = %state.provider,
+        channel_id = %state.channel_id,
+        deposit = %state.deposit,
+        expires_at = state.expires_at,
+        "buyer reconcile: re-hydrated orphaned channel; reclaim sweep will recover the deposit"
+    );
+    Ok(true)
+}
+
+/// One-shot bootstrap reconciliation scan (#763): enumerate
+/// `ChannelOpened(client == self)` over the last [`BUYER_RECONCILE_LOOKBACK_BLOCKS`]
+/// blocks and re-hydrate any still-`Open` channel missing or undecodable in the
+/// local store, so the reclaim sweep can recover its deposit. Best-effort: a
+/// head-read failure `warn!`s and returns; a single window's `query()` failure is
+/// logged and skipped so the *other* windows still reconcile (unlike the seller,
+/// the buyer keeps no checkpoint, so the lost window is only re-covered on a
+/// later restart); per-event faults are logged and skipped. The completion log
+/// reports the failed-window count so a partial scan is observable. Mirrors the
+/// seller backfill in [`crate::payment_settlement`], reusing its window helpers.
+// Linear scan (head → windows → query → per-event) with inline best-effort
+// guards; splitting would obscure the control flow.
+#[allow(clippy::cognitive_complexity)]
+async fn reconcile_orphans_once<P: Provider + Clone>(
+    contract: PaymentChannel::PaymentChannelInstance<P>,
+    store: Arc<dyn BuyerChannelStore>,
+    self_address: Address,
+    opens_in_flight: Arc<Mutex<HashSet<Address>>>,
+) {
+    let head = match contract.provider().get_block_number().await {
+        Ok(h) => h,
+        Err(err) => {
+            warn!(%err, "buyer reconcile: head block read failed; skipping scan this boot");
+            return;
+        }
+    };
+    let start = head.saturating_sub(BUYER_RECONCILE_LOOKBACK_BLOCKS);
+    if let Err(err) = check_backfill_range(start, head) {
+        warn!(%err, start, head, "buyer reconcile: invalid scan range; skipping");
+        return;
+    }
+    let mut rehydrated: u64 = 0;
+    let mut failed_windows: u64 = 0;
+    for (from, to) in backfill_windows(start, head, MAX_BACKFILL_BLOCK_SPAN) {
+        let logs = match contract
+            .ChannelOpened_filter()
+            .from_block(from)
+            .to_block(to)
+            .query()
+            .await
+        {
+            Ok(logs) => logs,
+            Err(err) => {
+                // Skip just this window, not the whole scan: the windows are
+                // independent, so a transient `eth_getLogs` failure on one should
+                // not strand orphans in later windows until the next restart.
+                warn!(
+                    %err,
+                    from,
+                    to,
+                    "buyer reconcile: ChannelOpened query failed for this window; skipping it"
+                );
+                failed_windows = failed_windows.saturating_add(1);
+                continue;
+            }
+        };
+        for (event, _log) in logs {
+            match reconcile_one_opened(&contract, &store, self_address, &opens_in_flight, &event)
+                .await
+            {
+                Ok(true) => rehydrated = rehydrated.saturating_add(1),
+                Ok(false) => {}
+                Err(err) => warn!(
+                    %err,
+                    channel_id = %event.channelId,
+                    "buyer reconcile: skipping event after a per-event fault"
+                ),
+            }
+        }
+    }
+    info!(
+        start,
+        head, rehydrated, failed_windows, "buyer reconcile: bootstrap scan complete"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +1230,92 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty(),
             "dropping the guard releases the slot",
+        );
+    }
+
+    fn self_addr() -> Address {
+        address!("00000000000000000000000000000000000000aa")
+    }
+
+    /// Build an on-chain view owned by `self_addr()` for the channel/provider
+    /// keyed off `byte`, with the given liveness and on-chain claimed totals.
+    fn view(byte: u8, is_open: bool, claimed: (u64, u64, u64)) -> OnChainOpen {
+        let mut prov = [0u8; 20];
+        prov[19] = byte;
+        OnChainOpen {
+            channel_id: B256::repeat_byte(byte),
+            client: self_addr(),
+            provider: Address::from(prov),
+            token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            deposit: U256::from(12_000_000u64),
+            expires_at: 1_900_000_000,
+            claimed_nonce: U256::from(claimed.0),
+            claimed_bytes: U256::from(claimed.1),
+            claimed_amount: U256::from(claimed.2),
+            is_open,
+        }
+    }
+
+    #[test]
+    fn reconcile_orphan_with_no_local_row_rehydrates_from_chain() {
+        // An Open channel we own with no local row re-hydrates straight from the
+        // on-chain `getChannel` fields (deposit/expiry), zero watermark.
+        let v = view(5, true, (0, 0, 0));
+        let expected =
+            BuyerChannelState::new(v.channel_id, v.provider, v.token, v.deposit, v.expires_at);
+        assert_eq!(reconcile_decision(&v, self_addr(), None), Some(expected));
+    }
+
+    #[test]
+    fn reconcile_hydrates_watermark_from_onchain_claimed_totals() {
+        // A re-hydrated channel that already saw deliveries must resume at the
+        // on-chain claimed totals, not zero (else the provider rejects re-signed
+        // vouchers).
+        let v = view(6, true, (4, 4_096, 41));
+        let mut expected =
+            BuyerChannelState::new(v.channel_id, v.provider, v.token, v.deposit, v.expires_at);
+        expected.last_nonce = U256::from(4u64);
+        expected.last_bytes_delivered = U256::from(4_096u64);
+        expected.last_amount = U256::from(41u64);
+        assert_eq!(reconcile_decision(&v, self_addr(), None), Some(expected));
+    }
+
+    #[test]
+    fn reconcile_skips_when_a_healthy_local_row_exists() {
+        // Same channel_id: clearly nothing to do.
+        let v = view(7, true, (0, 0, 0));
+        let mut existing = sample(7);
+        existing.channel_id = v.channel_id;
+        assert!(
+            reconcile_decision(&v, self_addr(), Some(&existing)).is_none(),
+            "a healthy local row for the same channel is left untouched"
+        );
+        // Different channel_id for the same provider: the live local row is still
+        // authoritative and must NOT be clobbered by an older orphan.
+        let mut differing = sample(7);
+        differing.channel_id = B256::repeat_byte(0x99);
+        assert!(
+            reconcile_decision(&v, self_addr(), Some(&differing)).is_none(),
+            "a present local row is never overwritten, even for a different channel_id"
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_non_open_channels() {
+        let v = view(8, false, (0, 0, 0));
+        assert!(
+            reconcile_decision(&v, self_addr(), None).is_none(),
+            "a Closing/Closed channel needs no buyer reclaim"
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_channels_not_owned_by_self() {
+        let mut v = view(9, true, (0, 0, 0));
+        v.client = address!("00000000000000000000000000000000000000bb");
+        assert!(
+            reconcile_decision(&v, self_addr(), None).is_none(),
+            "a channel whose on-chain client is not us is never reclaimed for someone else"
         );
     }
 }

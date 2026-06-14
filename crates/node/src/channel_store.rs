@@ -878,6 +878,39 @@ impl PersistentChannelStateStore {
         Ok(())
     }
 
+    /// Test/e2e-only: write raw value bytes under a buyer provider key, bypassing
+    /// the postcard encoder, to simulate a row left undecodable by a binary
+    /// downgrade. The buyer reconciliation + mixed-reclaim e2e (#763) lives in a
+    /// separate integration-test file and cannot reach the private buyer table;
+    /// this is the seam it uses to seed corruption against a live store.
+    #[cfg(any(test, feature = "anvil-e2e"))]
+    pub fn insert_raw_buyer_record(
+        &self,
+        provider: Address,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let key: [u8; 20] = provider.into();
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(BUYER_CHANNEL_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            table
+                .insert(&key, bytes)
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+
     fn buyer_forget(&self, provider: Address) -> Result<(), StoreError> {
         let key: [u8; 20] = provider.into();
 
