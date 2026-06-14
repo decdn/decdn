@@ -135,6 +135,7 @@ contract SlashJudgeTest is Test {
     uint256 internal constant NODE_PK = 0x4E0DE;
     address internal node;
     address internal challenger = address(0xC4A11E);
+    address internal challenger2 = address(0xC0FFEE);
     address internal admin = address(0xA11CE);
     address internal pauser = address(0xDEAD);
     address internal stranger = address(0x5747A);
@@ -145,6 +146,13 @@ contract SlashJudgeTest is Test {
     uint256 internal constant CHALLENGE_BOND = 100e18;
     uint256 internal constant MAX_EVIDENCE_AGE_US = 5 days * 1_000_000;
     uint256 internal constant UNBONDING = 14 days;
+
+    // Mirror of the contract's fixed commit–reveal bounds (#854). Kept in the
+    // test as literals because the contract exposes them only as internal
+    // constants; a divergence would surface as a RevealTooEarly/Expired failure.
+    uint256 internal constant REVEAL_DELAY = 1 minutes;
+    uint256 internal constant REVEAL_WINDOW = 1 days;
+    bytes32 internal constant SALT = bytes32(uint256(0x5A17));
 
     bytes32 internal constant GLOBAL_REGION = bytes32("GLOBAL");
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
@@ -205,6 +213,16 @@ contract SlashJudgeTest is Test {
         });
     }
 
+    function _probeStructHash(SlashJudge.ProbeMsg memory p) internal pure returns (bytes32) {
+        return keccak256(abi.encode(PROBE_TYPEHASH, p.hash, p.hasBlob, p.ratePerMb, p.timestampUs));
+    }
+
+    function _streamStructHash(SlashJudge.StreamMsg memory s) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(STREAM_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.channelId, s.timestampUs, s.redirect)
+        );
+    }
+
     function _digest(bytes32 structHash) internal view returns (bytes32) {
         bytes32 ds = keccak256(
             abi.encode(
@@ -219,19 +237,42 @@ contract SlashJudgeTest is Test {
     }
 
     function _signProbe(SlashJudge.ProbeMsg memory p) internal view returns (bytes memory) {
-        bytes32 sh = keccak256(abi.encode(PROBE_TYPEHASH, p.hash, p.hasBlob, p.ratePerMb, p.timestampUs));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(NODE_PK, _digest(sh));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(NODE_PK, _digest(_probeStructHash(p)));
         return abi.encodePacked(r, s, v);
     }
 
     function _signStream(SlashJudge.StreamMsg memory st) internal view returns (bytes memory) {
-        bytes32 sh = keccak256(
-            abi.encode(
-                STREAM_TYPEHASH, st.hash, st.ok, st.ratePerMb, st.totalBytes, st.channelId, st.timestampUs, st.redirect
-            )
-        );
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(NODE_PK, _digest(sh));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(NODE_PK, _digest(_streamStructHash(st)));
         return abi.encodePacked(r, s, v);
+    }
+
+    // -----------------------------------------------------------------
+    // Commit–reveal helpers (#854)
+    // -----------------------------------------------------------------
+
+    function _pairHash(SlashJudge.ProbeMsg memory p, SlashJudge.StreamMsg memory s, ISlashJudge.OffenseType offense)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(uint8(offense), _probeStructHash(p), _streamStructHash(s)));
+    }
+
+    function _blacklistHash(bytes32 structHash, bool isStream) internal pure returns (bytes32) {
+        return keccak256(abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), structHash, isStream));
+    }
+
+    /// @dev Commit `evidenceHash` as `who` (salt `SALT`) without advancing time.
+    function _commitAs(address who, bytes32 evidenceHash) internal {
+        vm.prank(who);
+        judge.commitChallenge(keccak256(abi.encode(evidenceHash, SALT, who)));
+    }
+
+    /// @dev Commit as `challenger` and warp past `MIN_REVEAL_DELAY` so the next
+    ///      `submit*Challenge` reveal is valid.
+    function _commitAndMature(bytes32 evidenceHash) internal {
+        _commitAs(challenger, evidenceHash);
+        vm.warp(block.timestamp + REVEAL_DELAY + 1);
     }
 
     // -----------------------------------------------------------------
@@ -243,8 +284,9 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
 
         uint256 balBefore = token.balanceOf(challenger);
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.Phantom));
         vm.prank(challenger);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
 
         assertEq(slasher.slashCount(), 1);
         assertEq(slasher.lastOperator(), node);
@@ -258,7 +300,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs); // ok=true → not phantom
         vm.prank(challenger);
         vm.expectRevert(SlashJudge.NotPhantom.selector);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_phantom_revertsOnUnregisteredNode() public {
@@ -267,7 +309,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.NodeNotRegistered.selector, node));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_phantom_revertsOnNodeIdMismatch() public {
@@ -276,7 +318,7 @@ contract SlashJudgeTest is Test {
         bytes32 wrongId = bytes32(uint256(0xBAD));
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.NodeIdMismatch.selector, wrongId, NODE_ID));
-        judge.submitPhantomChallenge(node, wrongId, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, wrongId, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_phantom_revertsOnBadProbeSignature() public {
@@ -285,7 +327,7 @@ contract SlashJudgeTest is Test {
         bytes memory probeSig = _signProbe(_probe(true, 99, probeTs)); // signed different rate
         vm.prank(challenger);
         vm.expectRevert(SlashJudge.InvalidProbeSignature.selector);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), probeSig, abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), probeSig, abi.encode(s), _signStream(s), SALT);
     }
 
     function test_phantom_revertsOutsideTimestampWindow() public {
@@ -294,7 +336,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(false, 10, farStream);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.TimestampWindowViolated.selector, probeTs, farStream));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_phantom_revertsOnStaleEvidence() public {
@@ -307,7 +349,7 @@ contract SlashJudgeTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(SlashJudge.EvidenceTooOld.selector, uint256(6 days * 1_000_000), MAX_EVIDENCE_AGE_US)
         );
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_phantom_revertsOnFutureEvidence() public {
@@ -318,26 +360,24 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(false, 10, futureStream);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceInFuture.selector, futureProbe));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_phantom_revertsOnEvidenceReplay() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
         SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
 
+        _commitAndMature(evidenceHash);
         vm.prank(challenger);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
 
-        bytes32 probeHash = keccak256(abi.encode(PROBE_TYPEHASH, p.hash, p.hasBlob, p.ratePerMb, p.timestampUs));
-        bytes32 streamHash = keccak256(
-            abi.encode(STREAM_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.channelId, s.timestampUs, s.redirect)
-        );
-        bytes32 evidenceHash = keccak256(abi.encode(uint8(ISlashJudge.OffenseType.Phantom), probeHash, streamHash));
-
-        // Resubmitting the exact same signed proof must not ratchet the offense count.
+        // Re-commit the same proof: the commitment check now passes but the
+        // evidence replay guard must still reject it (no offense-count ratchet).
+        _commitAndMature(evidenceHash);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceAlreadyUsed.selector, evidenceHash));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
 
         assertEq(slasher.slashCount(), 1);
         assertTrue(judge.usedEvidenceHash(evidenceHash));
@@ -350,8 +390,9 @@ contract SlashJudgeTest is Test {
     function test_rate_slashesWhenStreamRateHigher() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
         SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs); // 25 > 10
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
         vm.prank(challenger);
-        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
         assertEq(slasher.lastOffense(), uint8(ISlashJudge.OffenseType.RateManipulation));
     }
 
@@ -360,7 +401,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs); // equal → not manipulation
         vm.prank(challenger);
         vm.expectRevert(SlashJudge.NotRateManipulation.selector);
-        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     // -----------------------------------------------------------------
@@ -370,16 +411,18 @@ contract SlashJudgeTest is Test {
     function test_blacklist_slashesOnStreamResponse() public {
         blacklist.setEntry(GLOBAL_REGION, BLOB, uint64(block.timestamp - 1000));
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
         vm.prank(challenger);
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
         assertEq(slasher.lastOffense(), uint8(ISlashJudge.OffenseType.Blacklist));
     }
 
     function test_blacklist_slashesOnProbeResponse() public {
         blacklist.setEntry(GLOBAL_REGION, BLOB, uint64(block.timestamp - 1000));
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        _commitAndMature(_blacklistHash(_probeStructHash(p), false));
         vm.prank(challenger);
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(p), _signProbe(p), false);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(p), _signProbe(p), false, SALT);
         assertEq(slasher.slashCount(), 1);
     }
 
@@ -387,7 +430,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 
     function test_blacklist_revertsWhenBlacklistedAfterResponse() public {
@@ -399,7 +442,7 @@ contract SlashJudgeTest is Test {
                 SlashJudge.BlacklistAfterResponse.selector, uint256(block.timestamp + 1000) * 1_000_000, streamTs
             )
         );
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 
     function test_blacklist_revertsWhenSuspended() public {
@@ -408,7 +451,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 
     function test_blacklist_revertsOnHashMismatch() public {
@@ -417,7 +460,7 @@ contract SlashJudgeTest is Test {
         bytes32 otherHash = bytes32(uint256(0xC0FFEE));
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashMismatch.selector, otherHash, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, otherHash, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, otherHash, abi.encode(s), _signStream(s), true, SALT);
     }
 
     // --- ADR 030 regional + ripening slash-eligibility ----------------------
@@ -427,8 +470,9 @@ contract SlashJudgeTest is Test {
         slasher.setRegion(node, "us-east", "", 0);
         blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
         vm.prank(challenger);
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
         assertEq(slasher.lastOffense(), uint8(ISlashJudge.OffenseType.Blacklist));
     }
 
@@ -438,8 +482,9 @@ contract SlashJudgeTest is Test {
         slasher.setRegion(node, "eu-west", "us-east", uint64(block.timestamp - 1 days));
         blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
         vm.prank(challenger);
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
         assertEq(slasher.slashCount(), 1);
     }
 
@@ -451,7 +496,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 
     function test_blacklist_revertsRegionalEntryAfterResponse() public {
@@ -464,7 +509,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 
     function test_blacklist_unrelatedRegionEntryDoesNotSlash() public {
@@ -474,7 +519,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 
     function test_blacklist_globalAfterResponse_rescuedByRegionalLeg() public {
@@ -485,8 +530,9 @@ contract SlashJudgeTest is Test {
         blacklist.setEntry(GLOBAL_REGION, BLOB, uint64(block.timestamp + 1000)); // after response
         blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000)); // before response
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
         vm.prank(challenger);
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
         assertEq(slasher.slashCount(), 1);
     }
 
@@ -503,7 +549,7 @@ contract SlashJudgeTest is Test {
                 SlashJudge.BlacklistAfterResponse.selector, uint256(block.timestamp + 1000) * 1_000_000, streamTs
             )
         );
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 
     function test_blacklist_suspendedRegionalEntryDoesNotSlash() public {
@@ -514,7 +560,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 
     function test_blacklist_neverChangedFallback_ripensFromMaxBondGate() public {
@@ -530,8 +576,9 @@ contract SlashJudgeTest is Test {
         slasher.setGate(uint64(block.timestamp - 1 days), 7 days);
         blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
         vm.prank(challenger);
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
         assertEq(slasher.slashCount(), 1);
     }
 
@@ -549,7 +596,196 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
+    }
+
+    // -----------------------------------------------------------------
+    // Commit–reveal front-running mitigation (#854)
+    // -----------------------------------------------------------------
+
+    function test_commit_revertsOnDuplicate() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        bytes32 commitment = keccak256(abi.encode(_pairHash(p, s, ISlashJudge.OffenseType.Phantom), SALT, challenger));
+
+        vm.prank(challenger);
+        judge.commitChallenge(commitment);
+        vm.prank(challenger);
+        vm.expectRevert(SlashJudge.CommitmentExists.selector);
+        judge.commitChallenge(commitment);
+    }
+
+    function test_commit_blockedWhilePaused() public {
+        vm.prank(pauser);
+        judge.pause();
+        vm.prank(challenger);
+        vm.expectRevert();
+        judge.commitChallenge(bytes32(uint256(0x1234)));
+    }
+
+    function test_reveal_revertsWithoutCommit() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(SlashJudge.NoCommitment.selector);
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_reveal_revertsBeforeDelay() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
+
+        _commitAs(challenger, evidenceHash);
+        uint256 readyAt = block.timestamp + REVEAL_DELAY;
+        // Still inside the maturation delay (warp less than MIN_REVEAL_DELAY).
+        vm.warp(block.timestamp + REVEAL_DELAY - 1);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.RevealTooEarly.selector, readyAt));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_reveal_revertsAfterWindow() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
+
+        _commitAs(challenger, evidenceHash);
+        uint256 expiresAt = block.timestamp + REVEAL_WINDOW;
+        // Past the reveal window. Evidence (≈5s old) is still inside the 5-day
+        // staleness ceiling after a 1-day warp, so the expiry is the live revert.
+        vm.warp(block.timestamp + REVEAL_WINDOW + 1);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.CommitmentExpired.selector, expiresAt));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_reveal_revertsForWrongChallenger() public {
+        // A mempool copy of the reveal: the same evidence + salt submitted by a
+        // different `msg.sender` reconstructs a different commitment, which was
+        // never registered → NoCommitment. This is the front-running fix.
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.Phantom));
+
+        vm.prank(stranger);
+        vm.expectRevert(SlashJudge.NoCommitment.selector);
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_reveal_consumesCommitment() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.Phantom));
+
+        vm.prank(challenger);
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+
+        // The commitment was deleted on the successful reveal, so a naive resubmit
+        // (no fresh commit) fails the commitment check before the replay guard.
+        vm.prank(challenger);
+        vm.expectRevert(SlashJudge.NoCommitment.selector);
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_commit_emitsEvent() public {
+        bytes32 commitment = keccak256(abi.encode(bytes32(uint256(0xABCD)), SALT, challenger));
+        vm.expectEmit(true, false, false, false, address(judge));
+        emit SlashJudge.ChallengeCommitted(commitment);
+        vm.prank(challenger);
+        judge.commitChallenge(commitment);
+    }
+
+    function test_reveal_succeedsAtExactReadyBoundary() public {
+        // block.timestamp == committedAt + MIN_REVEAL_DELAY is valid (`<` not `<=`).
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        _commitAs(challenger, _pairHash(p, s, ISlashJudge.OffenseType.Phantom));
+        vm.warp(block.timestamp + REVEAL_DELAY); // exactly at readyAt
+        vm.prank(challenger);
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    function test_reveal_succeedsAtExactExpiryBoundary() public {
+        // block.timestamp == committedAt + REVEAL_WINDOW is still valid (`>` not `>=`).
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        _commitAs(challenger, _pairHash(p, s, ISlashJudge.OffenseType.Phantom));
+        vm.warp(block.timestamp + REVEAL_WINDOW); // exactly at expiry
+        vm.prank(challenger);
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    function test_reveal_revertsForDifferentSalt() public {
+        // The commitment binds the salt: revealing the same evidence under a
+        // different salt reconstructs a commitment that was never stored.
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.Phantom)); // commits with SALT
+        bytes32 otherSalt = bytes32(uint256(0xBEEF));
+        vm.prank(challenger);
+        vm.expectRevert(SlashJudge.NoCommitment.selector);
+        judge.submitPhantomChallenge(
+            node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), otherSalt
+        );
+    }
+
+    function test_commit_overwritesExpiredCommitment() public {
+        // A challenger who let a commitment expire (or lost a blind race) can
+        // re-commit the SAME (evidence, salt) once it lapses past REVEAL_WINDOW,
+        // then reveal — proving they are not permanently wedged on that salt.
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
+
+        _commitAs(challenger, evidenceHash);
+        vm.warp(block.timestamp + REVEAL_WINDOW + 1); // first commitment expires
+
+        // Re-commit the identical triple: allowed because the prior one expired.
+        _commitAs(challenger, evidenceHash);
+        vm.warp(block.timestamp + REVEAL_DELAY + 1); // mature the fresh commitment
+        vm.prank(challenger);
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    function test_commit_revertsOnDuplicateWhileLive() public {
+        // While a commitment is still inside REVEAL_WINDOW, a re-commit reverts
+        // (complements test_commit_overwritesExpiredCommitment for the live case).
+        bytes32 commitment = keccak256(abi.encode(bytes32(uint256(0xDEAD)), SALT, challenger));
+        vm.prank(challenger);
+        judge.commitChallenge(commitment);
+        vm.warp(block.timestamp + REVEAL_WINDOW); // still live (boundary is inclusive)
+        vm.prank(challenger);
+        vm.expectRevert(SlashJudge.CommitmentExists.selector);
+        judge.commitChallenge(commitment);
+    }
+
+    function test_reveal_blindRaceFirstRevealWins() public {
+        // Two honest witnesses independently commit the same evidence (blind, so
+        // neither can be front-run). The first to reveal is recorded as the
+        // challenger and wins the reward; the loser's reveal — despite a valid
+        // commitment — hits the evidence replay guard. The reward is decided by
+        // reveal order, never by copying calldata.
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
+
+        _commitAs(challenger, evidenceHash);
+        _commitAs(challenger2, evidenceHash);
+        vm.warp(block.timestamp + REVEAL_DELAY + 1);
+
+        vm.prank(challenger);
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        assertEq(slasher.lastChallenger(), challenger);
+
+        vm.prank(challenger2);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceAlreadyUsed.selector, evidenceHash));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+
+        assertEq(slasher.slashCount(), 1);
     }
 
     // -----------------------------------------------------------------
@@ -611,7 +847,7 @@ contract SlashJudgeTest is Test {
         SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
         vm.prank(challenger);
         vm.expectRevert();
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s));
+        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_constructor_revertsWhenEvidenceAgeExceedsUnbonding() public {
