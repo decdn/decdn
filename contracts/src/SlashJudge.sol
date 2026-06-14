@@ -21,7 +21,7 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         blacklist violation. Challenging is a two-phase commit–reveal flow
 ///         (ADR 014 § Challenge front-running mitigation, #854): the challenger
 ///         first `commitChallenge`s an opaque
-///         `keccak256(evidenceHash, salt, challenger)`, then reveals via a
+///         `keccak256(abi.encode(evidenceHash, salt, challenger))`, then reveals via a
 ///         `submit*Challenge` once the commitment has matured. Each reveal
 ///         verifies secp256k1 EIP-712 `slash_sig` evidence with `SignatureChecker`
 ///         (EOA + ERC-1271), confirms the challenged address is a registered
@@ -516,7 +516,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     ///      window, then consume the evidence (replay guard), pull the challenge
     ///      bond, slash (records `msg.sender` as the challenger for the 50%
     ///      finality leg), return the bond, and emit `Slashed`. The commitment
-    ///      `keccak256(evidenceHash, salt, msg.sender)` binds the challenger, so a
+    ///      `keccak256(abi.encode(evidenceHash, salt, msg.sender))` binds the challenger, so a
     ///      mempool copy of this reveal (different `msg.sender`) finds no
     ///      commitment and cannot claim the reward (#854).
     function _resolve(address operator, OffenseType offenseType, bytes32 evidenceHash, bytes32 salt) internal {
