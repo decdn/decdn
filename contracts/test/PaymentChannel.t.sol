@@ -1353,6 +1353,41 @@ contract PaymentChannelTest is Test {
         assertEq(channel.deferredSettlements(0, 3).length, 3); // full page
     }
 
+    /// @dev Fuzz the pagination invariant over the full `(offset, limit)` domain
+    ///      (including `type(uint256).max` extremes): the returned page must equal
+    ///      the matching slice of the canonical full enumeration. This pins, in one
+    ///      property, the overflow-safe length clamp (no `offset + limit` revert),
+    ///      the `at(offset + i)` indexing, and the absence of duplicates/gaps —
+    ///      the page is exactly `full[offset .. offset + size]`.
+    function testFuzz_deferredSettlements_pageMatchesFullEnumerationSlice(uint256 offset, uint256 limit) public {
+        uint256 count = 6;
+        router.setPaused(true);
+        for (uint256 i = 0; i < count; i++) {
+            bytes32 id = _openCloseWarp(100e6, 10_000_000);
+            channel.settleChannel(id);
+        }
+        assertEq(channel.deferredSettlementCount(), count);
+
+        // Canonical ordering, taken once with no interleaving mutation.
+        bytes32[] memory full = channel.deferredSettlements(0, count);
+        assertEq(full.length, count);
+
+        // Expected page length, computed with the same overflow-safe clamp the
+        // contract uses (never forming `offset + limit`).
+        uint256 expectedSize;
+        if (offset < count && limit != 0) {
+            uint256 remaining = count - offset;
+            expectedSize = limit < remaining ? limit : remaining;
+        }
+
+        bytes32[] memory page = channel.deferredSettlements(offset, limit);
+        assertEq(page.length, expectedSize);
+        for (uint256 i = 0; i < expectedSize; i++) {
+            // `offset + i < count`, so this reference read cannot overflow.
+            assertEq(page[i], full[offset + i]);
+        }
+    }
+
     /// @dev A zero provider-amount settle never defers, so the enumeration stays empty.
     function test_deferredSettlementCount_unchangedOnZeroAmountSettle() public {
         bytes32 id = _open();
