@@ -1033,6 +1033,14 @@ contract PaymentChannelTest is Test {
         vm.warp(block.timestamp + DISPUTE_WINDOW);
     }
 
+    /// @dev Membership test over a `deferredSettlements` page (order is unstable).
+    function _contains(bytes32[] memory page, bytes32 target) internal pure returns (bool) {
+        for (uint256 i = 0; i < page.length; i++) {
+            if (page[i] == target) return true;
+        }
+        return false;
+    }
+
     /// @dev A paused router must NOT freeze the exit: the client refund still
     ///      lands and the channel closes; only the provider leg is deferred.
     function test_settle_routerPaused_refundsClientAndDefersProviderLeg() public {
@@ -1198,6 +1206,141 @@ contract PaymentChannelTest is Test {
         assertEq(usdc.balanceOf(client) - clientBefore, DEPOSIT);
         assertFalse(channel.settlementDeferred(id));
         assertEq(router.callCount(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Deferred-settlement enumeration (#902 — keeper drain without log replay)
+    // -----------------------------------------------------------------
+
+    /// @dev A deferral is enumerable on-chain: count + paginated view surface the
+    ///      pending id without replaying the `SettlementDeferred` event.
+    function test_deferredSettlements_enumeratesPendingId() public {
+        bytes32 id = _openCloseWarp(700e6, 70_000_000);
+        router.setPaused(true);
+        channel.settleChannel(id);
+
+        assertEq(channel.deferredSettlementCount(), 1);
+        bytes32[] memory page = channel.deferredSettlements(0, 10);
+        assertEq(page.length, 1);
+        assertEq(page[0], id);
+    }
+
+    /// @dev Flushing removes the id from the enumeration, not just the per-id flag.
+    function test_deferredSettlements_clearedAfterFlush() public {
+        bytes32 id = _openCloseWarp(700e6, 70_000_000);
+        router.setPaused(true);
+        channel.settleChannel(id);
+        assertEq(channel.deferredSettlementCount(), 1);
+
+        router.setPaused(false);
+        channel.flushDeferredSettlement(id);
+
+        assertEq(channel.deferredSettlementCount(), 0);
+        assertEq(channel.deferredSettlements(0, 10).length, 0);
+    }
+
+    /// @dev Several concurrent deferrals all enumerate; flushing one removes only
+    ///      that id (set membership, not position), leaving the rest drainable.
+    function test_deferredSettlements_multipleDeferrals_selectiveFlush() public {
+        router.setPaused(true);
+        bytes32 id1 = _openCloseWarp(700e6, 70_000_000);
+        channel.settleChannel(id1);
+        bytes32 id2 = _openCloseWarp(500e6, 50_000_000);
+        channel.settleChannel(id2);
+        bytes32 id3 = _openCloseWarp(300e6, 30_000_000);
+        channel.settleChannel(id3);
+
+        assertEq(channel.deferredSettlementCount(), 3);
+        bytes32[] memory all = channel.deferredSettlements(0, 10);
+        assertTrue(_contains(all, id1));
+        assertTrue(_contains(all, id2));
+        assertTrue(_contains(all, id3));
+
+        router.setPaused(false); // must be unpaused to route the flushed leg
+        channel.flushDeferredSettlement(id2);
+
+        assertEq(channel.deferredSettlementCount(), 2);
+        assertFalse(channel.settlementDeferred(id2));
+        // Both views agree, in both directions: the page and the per-id view.
+        assertTrue(channel.settlementDeferred(id1));
+        assertTrue(channel.settlementDeferred(id3));
+        bytes32[] memory rest = channel.deferredSettlements(0, 10);
+        assertFalse(_contains(rest, id2));
+        assertTrue(_contains(rest, id1));
+        assertTrue(_contains(rest, id3));
+    }
+
+    /// @dev Pages must return the actual ids (proving `at(offset + i)` indexing,
+    ///      not just a correctly-sized array): walk the set one id per page across
+    ///      every offset and assert the pages partition the set — distinct ids, no
+    ///      gaps, each member seen exactly once.
+    function test_deferredSettlements_pageContentsPartitionTheSetAcrossOffsets() public {
+        router.setPaused(true);
+        bytes32 id1 = _openCloseWarp(700e6, 70_000_000);
+        channel.settleChannel(id1);
+        bytes32 id2 = _openCloseWarp(500e6, 50_000_000);
+        channel.settleChannel(id2);
+        bytes32 id3 = _openCloseWarp(300e6, 30_000_000);
+        channel.settleChannel(id3);
+
+        bytes32 p0 = channel.deferredSettlements(0, 1)[0];
+        bytes32 p1 = channel.deferredSettlements(1, 1)[0];
+        bytes32 p2 = channel.deferredSettlements(2, 1)[0];
+
+        // Distinct: no offset returned the same element as another (no overlap/gap).
+        assertTrue(p0 != p1 && p1 != p2 && p0 != p2);
+        // Union equals the set: every deferred id appears in exactly one page.
+        bytes32[] memory pages = new bytes32[](3);
+        pages[0] = p0;
+        pages[1] = p1;
+        pages[2] = p2;
+        assertTrue(_contains(pages, id1));
+        assertTrue(_contains(pages, id2));
+        assertTrue(_contains(pages, id3));
+    }
+
+    /// @dev `limit == type(uint256).max` from offset 0 is the "drain everything"
+    ///      sentinel: it clamps to the set length without overflowing `offset + limit`.
+    function test_deferredSettlements_maxLimitFromZeroReturnsFullSet() public {
+        router.setPaused(true);
+        bytes32 id = _openCloseWarp(700e6, 70_000_000);
+        channel.settleChannel(id);
+
+        bytes32[] memory page = channel.deferredSettlements(0, type(uint256).max);
+        assertEq(page.length, 1);
+        assertEq(page[0], id);
+    }
+
+    /// @dev Pagination guards: out-of-range offset and zero limit yield an empty
+    ///      page; a limit past the end clamps to the remaining tail.
+    function test_deferredSettlements_paginationBoundaries() public {
+        router.setPaused(true);
+        bytes32 id1 = _openCloseWarp(700e6, 70_000_000);
+        channel.settleChannel(id1);
+        bytes32 id2 = _openCloseWarp(500e6, 50_000_000);
+        channel.settleChannel(id2);
+        bytes32 id3 = _openCloseWarp(300e6, 30_000_000);
+        channel.settleChannel(id3);
+
+        assertEq(channel.deferredSettlements(3, 10).length, 0); // offset == len → empty
+        assertEq(channel.deferredSettlements(9, 10).length, 0); // offset > len  → empty
+        assertEq(channel.deferredSettlements(0, 0).length, 0); // limit 0       → empty
+        assertEq(channel.deferredSettlements(2, 10).length, 1); // clamp to tail
+        assertEq(channel.deferredSettlements(1, 1).length, 1); // window inside set
+        assertEq(channel.deferredSettlements(0, 3).length, 3); // full page
+    }
+
+    /// @dev A zero provider-amount settle never defers, so the enumeration stays empty.
+    function test_deferredSettlementCount_unchangedOnZeroAmountSettle() public {
+        bytes32 id = _open();
+        vm.prank(client);
+        channel.closeChannel(id, 0, 0, 0, "");
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        router.setPaused(true);
+        channel.settleChannel(id);
+
+        assertEq(channel.deferredSettlementCount(), 0);
     }
 
     // -----------------------------------------------------------------
