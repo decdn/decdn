@@ -18,4 +18,10 @@ interface IFeeRouterSettlement {
     ///         `bytesDelivered` into the current epoch. Caller must hold
     ///         `ROUTER_CALLER_ROLE` on the router and have approved `amount`.
     function routeSettlement(address operator, uint256 bytesDelivered, uint256 amount) external;
+
+    /// @notice True when the router is paused and `routeSettlement` would revert.
+    /// @dev    `PaymentChannel.settleChannel` reads this to defer the provider
+    ///         settle leg (keeping the client refund unblocked) instead of
+    ///         reverting the whole exit while the router is paused.
+    function paused() external view returns (bool);
 }

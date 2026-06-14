@@ -49,11 +49,24 @@ contract MockSettlementRouter is IFeeRouterSettlement {
 
     RouteCall[] public calls;
 
+    /// @dev Mirrors the real `FeeRouter`'s `whenNotPaused` guard on
+    ///      `routeSettlement` so the channel's pause-deferral path is exercised.
+    bool internal _paused;
+
     constructor(IERC20 usdc_) {
         usdc = usdc_;
     }
 
+    function setPaused(bool p) external {
+        _paused = p;
+    }
+
+    function paused() external view override returns (bool) {
+        return _paused;
+    }
+
     function routeSettlement(address operator, uint256 bytesDelivered, uint256 amount) external override {
+        require(!_paused, "MockSettlementRouter: paused");
         require(amount != 0, "MockSettlementRouter: zero amount");
         usdc.transferFrom(msg.sender, address(this), amount);
         calls.push(RouteCall(operator, bytesDelivered, amount));
@@ -90,6 +103,29 @@ contract UnderPullRouter is IFeeRouterSettlement {
     function routeSettlement(address, uint256, uint256 amount) external override {
         require(amount != 0, "UnderPullRouter: zero amount");
         usdc.transferFrom(msg.sender, address(this), amount - 1);
+    }
+
+    function paused() external pure override returns (bool) {
+        return false;
+    }
+}
+
+/// @notice Router that implements `routeSettlement` but NOT `paused()`. Used to
+///         prove the config-time conformance probe rejects a non-conforming
+///         router loudly (constructor + setFeeRouter), rather than letting
+///         `settleChannel` brick on the missing pause view (#849 follow-up).
+contract NoPauseRouter {
+    function routeSettlement(address, uint256, uint256) external { }
+}
+
+/// @notice Router whose `paused()` shares the selector but returns a non-canonical
+///         bool word (2). Proves the conformance probe rejects a return the
+///         high-level `paused()` call would strict-decode-revert on.
+contract NonBoolPauseRouter {
+    function routeSettlement(address, uint256, uint256) external { }
+
+    function paused() external pure returns (uint256) {
+        return 2;
     }
 }
 
@@ -634,6 +670,34 @@ contract PaymentChannelTest is Test {
         channel.setFeeRouter(stranger);
     }
 
+    /// @dev A router with code that implements `routeSettlement` but not
+    ///      `paused()` is rejected at set time — settleChannel relies on that view.
+    function test_setFeeRouter_revertsOnRouterMissingPausedView() public {
+        NoPauseRouter bad = new NoPauseRouter();
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterMissingPausedView.selector, address(bad)));
+        channel.setFeeRouter(address(bad));
+    }
+
+    /// @dev A router whose `paused()` returns a non-canonical bool word (> 1) is
+    ///      rejected — the high-level call in `settleChannel` would otherwise
+    ///      strict-decode-revert and re-trap the refund.
+    function test_setFeeRouter_revertsOnNonBooleanPausedReturn() public {
+        NonBoolPauseRouter bad = new NonBoolPauseRouter();
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterMissingPausedView.selector, address(bad)));
+        channel.setFeeRouter(address(bad));
+    }
+
+    /// @dev The same conformance probe guards construction.
+    function test_constructor_revertsOnRouterMissingPausedView() public {
+        NoPauseRouter bad = new NoPauseRouter();
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterMissingPausedView.selector, address(bad)));
+        new PaymentChannel(
+            usdc, bond, address(bad), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin
+        );
+    }
+
     function test_setDisputeWindow_enforcesBounds() public {
         vm.prank(admin);
         vm.expectRevert(
@@ -954,6 +1018,186 @@ contract PaymentChannelTest is Test {
         channel.settleChannel(id);
         assertEq(router.totalRouted(), DEPOSIT);
         assertEq(usdc.balanceOf(client) - clientBefore, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // settleChannel pause deferral (#849 — exits always open)
+    // -----------------------------------------------------------------
+
+    /// @dev Helper: open, close at `amount`/`bytesDelivered`, warp past the
+    ///      dispute window. Returns the channel id ready to settle.
+    function _openCloseWarp(uint256 amount, uint256 bytesDelivered) internal returns (bytes32 id) {
+        id = _open();
+        vm.prank(provider);
+        channel.closeChannel(id, amount, 1, bytesDelivered, _sign(id, amount, 1, bytesDelivered));
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+    }
+
+    /// @dev A paused router must NOT freeze the exit: the client refund still
+    ///      lands and the channel closes; only the provider leg is deferred.
+    function test_settle_routerPaused_refundsClientAndDefersProviderLeg() public {
+        uint256 amount = 700e6;
+        uint256 bytesDelivered = 70_000_000;
+        bytes32 id = _openCloseWarp(amount, bytesDelivered);
+
+        router.setPaused(true);
+        uint256 clientBefore = usdc.balanceOf(client);
+
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.SettlementDeferred(id, provider, amount, bytesDelivered);
+        channel.settleChannel(id);
+
+        // Client refunded and channel closed despite the paused router.
+        assertEq(usdc.balanceOf(client) - clientBefore, DEPOSIT - amount);
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closed));
+        // Provider leg deferred: nothing routed, flag set, USDC held by the channel.
+        assertTrue(channel.settlementDeferred(id));
+        assertEq(router.callCount(), 0);
+        assertEq(usdc.balanceOf(address(channel)), amount);
+    }
+
+    /// @dev After unpause, anyone can flush the deferred provider leg — routing
+    ///      the exact share and bytes once — and a second flush reverts.
+    function test_flushDeferredSettlement_routesAfterUnpause() public {
+        uint256 amount = 700e6;
+        uint256 bytesDelivered = 70_000_000;
+        bytes32 id = _openCloseWarp(amount, bytesDelivered);
+
+        router.setPaused(true);
+        channel.settleChannel(id);
+
+        router.setPaused(false);
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.DeferredSettlementFlushed(id, provider, amount, bytesDelivered);
+        vm.prank(stranger); // permissionless
+        channel.flushDeferredSettlement(id);
+
+        assertEq(router.totalRouted(), amount);
+        assertEq(router.totalBytes(), bytesDelivered);
+        assertEq(usdc.balanceOf(address(channel)), 0);
+        assertFalse(channel.settlementDeferred(id));
+
+        // Idempotent: a second flush has nothing left to route.
+        vm.expectRevert(PaymentChannel.NoDeferredSettlement.selector);
+        channel.flushDeferredSettlement(id);
+    }
+
+    /// @dev The load-bearing case: with a prior `withdraw`, the deferred and
+    ///      flushed share must be the remainder (`claimed − withdrawn`), not the
+    ///      full claim — proving `flushDeferredSettlement` recomputes the delta and
+    ///      cannot double-route already-withdrawn amount/bytes.
+    function test_flushDeferredSettlement_partialWithdraw_routesRemainderOnly() public {
+        bytes32 id = _open();
+        // Provider withdraws part while Open (router unpaused → routes 300e6 now).
+        vm.prank(provider);
+        channel.withdraw(id, 300e6, 1, 30_000_000, _sign(id, 300e6, 1, 30_000_000));
+        // Close at a higher watermark, then warp past the dispute window.
+        vm.prank(provider);
+        channel.closeChannel(id, 700e6, 2, 70_000_000, _sign(id, 700e6, 2, 70_000_000));
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        router.setPaused(true);
+        uint256 clientBefore = usdc.balanceOf(client);
+
+        // Deferred share is the remainder (700−300 / 70M−30M), not the full claim.
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.SettlementDeferred(id, provider, 400e6, 40_000_000);
+        channel.settleChannel(id);
+
+        assertEq(usdc.balanceOf(client) - clientBefore, DEPOSIT - 700e6); // 300e6 refund
+        assertEq(usdc.balanceOf(address(channel)), 400e6); // only the un-withdrawn share held
+        assertTrue(channel.settlementDeferred(id));
+
+        router.setPaused(false);
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.DeferredSettlementFlushed(id, provider, 400e6, 40_000_000);
+        channel.flushDeferredSettlement(id);
+
+        // Conservation over the whole run: 300 (withdraw) + 400 (flush) == 700 claimed.
+        assertEq(router.totalRouted(), 700e6);
+        assertEq(router.totalBytes(), 70_000_000);
+        assertEq(usdc.balanceOf(address(channel)), 0);
+        assertFalse(channel.settlementDeferred(id));
+    }
+
+    /// @dev A deferred settle still closes the channel: the exit is final, so the
+    ///      provider leg can only route via flush — never a second settle/dispute.
+    function test_settle_deferred_channelIsClosed_cannotResettleOrDispute() public {
+        bytes32 id = _openCloseWarp(700e6, 70_000_000);
+        router.setPaused(true);
+        channel.settleChannel(id); // deferred; status now Closed
+
+        vm.expectRevert(PaymentChannel.ChannelNotClosing.selector);
+        channel.settleChannel(id);
+
+        vm.expectRevert(PaymentChannel.ChannelNotClosing.selector);
+        channel.disputeChannel(id, 800e6, 2, 80_000_000, _sign(id, 800e6, 2, 80_000_000));
+    }
+
+    /// @dev Governance re-pointing the router between defer and flush routes the
+    ///      held share through the NEW router (`_route` reads `feeRouter` live) —
+    ///      the documented incident-recovery path out of a paused router.
+    function test_flushDeferredSettlement_afterRouterRepoint_routesToNewRouter() public {
+        bytes32 id = _openCloseWarp(700e6, 70_000_000);
+        router.setPaused(true);
+        channel.settleChannel(id); // deferred against the paused setUp router
+
+        MockSettlementRouter router2 = new MockSettlementRouter(usdc); // fresh, unpaused, conforming
+        vm.prank(admin);
+        channel.setFeeRouter(address(router2));
+
+        channel.flushDeferredSettlement(id);
+
+        assertEq(router2.totalRouted(), 700e6); // new router receives the deferred share
+        assertEq(router2.totalBytes(), 70_000_000);
+        assertEq(router.totalRouted(), 0); // old (paused) router got nothing for the settle
+        assertEq(usdc.balanceOf(address(channel)), 0);
+        assertFalse(channel.settlementDeferred(id));
+    }
+
+    /// @dev Flushing while the router is still paused reverts and leaves the
+    ///      deferral flag set, so it stays retryable after a later unpause.
+    function test_flushDeferredSettlement_stillPaused_revertsAndStaysDeferred() public {
+        bytes32 id = _openCloseWarp(700e6, 70_000_000);
+        router.setPaused(true);
+        channel.settleChannel(id);
+
+        vm.expectRevert(bytes("MockSettlementRouter: paused")); // mirrors router's whenNotPaused guard
+        channel.flushDeferredSettlement(id);
+        assertTrue(channel.settlementDeferred(id));
+
+        // Unpause and retry succeeds.
+        router.setPaused(false);
+        channel.flushDeferredSettlement(id);
+        assertEq(router.totalRouted(), 700e6);
+        assertFalse(channel.settlementDeferred(id));
+    }
+
+    /// @dev A channel that never deferred cannot be flushed.
+    function test_flushDeferredSettlement_notDeferred_reverts() public {
+        bytes32 id = _openCloseWarp(700e6, 70_000_000);
+        channel.settleChannel(id); // router not paused → routed inline
+
+        assertFalse(channel.settlementDeferred(id));
+        vm.expectRevert(PaymentChannel.NoDeferredSettlement.selector);
+        channel.flushDeferredSettlement(id);
+    }
+
+    /// @dev A fully-refunded channel (zero provider amount) needs no router call,
+    ///      so a paused router never triggers a deferral.
+    function test_settle_routerPaused_zeroProviderAmount_noDeferral() public {
+        bytes32 id = _open();
+        vm.prank(client);
+        channel.closeChannel(id, 0, 0, 0, "");
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        router.setPaused(true);
+        uint256 clientBefore = usdc.balanceOf(client);
+        channel.settleChannel(id);
+
+        assertEq(usdc.balanceOf(client) - clientBefore, DEPOSIT);
+        assertFalse(channel.settlementDeferred(id));
+        assertEq(router.callCount(), 0);
     }
 
     // -----------------------------------------------------------------
