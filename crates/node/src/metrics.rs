@@ -609,7 +609,9 @@ pub struct DecdnMetrics {
     /// Visible name: `decdn_prefetch_acquisitions_bypassed_total`.
     pub prefetch_acquisitions_bypassed: Counter,
     /// Cumulative micro-USDC paid for prefetch acquisitions (#820). Incremented
-    /// on each successful speculative paid pull. Visible name:
+    /// on each prefetch-initiated paid pull that acked vouchers — a success OR a
+    /// paid-but-failed delivery (whose voucher watermark advanced) — so it tracks
+    /// all speculative spend, not just successes. Visible name:
     /// `decdn_prefetch_spend_usdc_total`.
     pub prefetch_spend_usdc: Counter,
     /// Times the rolling-1h prefetch budget was hit, blocking acquisitions
@@ -873,7 +875,8 @@ impl Metrics {
     }
 
     /// Add `micro_usdc` to the cumulative prefetch spend (#820). Called from the
-    /// acquisition observer on each successful speculative paid pull.
+    /// acquisition observer on each prefetch-initiated paid pull that acked
+    /// vouchers, whether it ultimately succeeded or failed after paying.
     pub fn add_prefetch_spend(&self, micro_usdc: u64) {
         self.decdn.prefetch_spend_usdc.inc_by(micro_usdc);
     }

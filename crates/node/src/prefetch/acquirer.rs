@@ -52,7 +52,13 @@ impl InflightSet {
     /// Mark `hash` in flight, returning a guard that clears it on drop, or
     /// `None` if it is already in flight (caller should skip — dedupe).
     fn arm(self: &Arc<Self>, hash: [u8; 32]) -> Option<InflightGuard> {
-        let mut set = self.inner.lock().ok()?;
+        let Ok(mut set) = self.inner.lock() else {
+            // Match the logging the other prefetch locks do on poison
+            // (`PrefetchAcquiredSet::insert`) so a dropped acquisition is
+            // diagnosable; behaviour is unchanged (skip — no new acquisition).
+            tracing::error!("prefetch in-flight set arm: mutex poisoned");
+            return None;
+        };
         if !set.insert(hash) {
             return None;
         }
@@ -86,9 +92,16 @@ struct InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        if let Ok(mut set) = self.set.inner.lock() {
-            set.remove(&self.hash);
-        }
+        // Recover a poisoned lock so the RAII cleanup ALWAYS runs: leaving the
+        // hash armed would permanently wedge dedupe (and the observer gate) for
+        // it. The map is internally consistent regardless of the prior panic, so
+        // taking the poisoned guard is safe here.
+        let mut set = self
+            .set
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.remove(&self.hash);
     }
 }
 

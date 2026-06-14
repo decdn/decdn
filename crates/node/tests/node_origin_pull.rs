@@ -748,8 +748,13 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
     engine.try_acquire(hash_bytes);
 
     // Await the background acquisition (bounded): the blob lands in B's cache.
+    // The poll budget (35s) deliberately exceeds the acquirer's configured
+    // deadline (`acquisition_timeout_secs`, default 30s) so a slow-but-correct
+    // pull on loaded CI is not declared a failure before the acquirer itself
+    // would give up. The happy path breaks in well under 1s, so this budget is
+    // only ever spent on a genuine hang.
     let mut cached = false;
-    for _ in 0..100 {
+    for _ in 0..350 {
         if cache_b.has(hash).await? {
             cached = true;
             break;
