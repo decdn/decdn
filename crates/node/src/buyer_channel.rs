@@ -974,9 +974,9 @@ async fn reconcile_one_opened<P: Provider + Clone>(
     opens_in_flight: &Arc<Mutex<HashSet<Address>>>,
     event: &PaymentChannel::ChannelOpened,
 ) -> Result<bool> {
-    // The filter is by event signature, not topic, so `query` returns every
-    // open in the range; keep only our own (mirrors the seller's client/provider
-    // self-filter).
+    // The query already topic-filters on `client == self_address` (the indexed
+    // `client` topic), so in practice every event here is ours; this is a
+    // defense-in-depth check against a misbehaving RPC that ignores the topic.
     if event.client != self_address {
         return Ok(false);
     }
@@ -1115,6 +1115,10 @@ async fn reconcile_orphans_once<P: Provider + Clone>(
     for (from, to) in backfill_windows(start, head, MAX_BACKFILL_BLOCK_SPAN) {
         let logs = match contract
             .ChannelOpened_filter()
+            // RPC-level filter on the indexed `client` topic so `eth_getLogs`
+            // returns only this node's own opens — bounds result-count/latency on
+            // busy deployments instead of fetching every open in the window.
+            .topic2(self_address)
             .from_block(from)
             .to_block(to)
             .query()

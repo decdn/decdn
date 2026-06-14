@@ -1569,6 +1569,14 @@ async fn run_e2e() -> anyhow::Result<()> {
     // --- D. Reconciliation repairs an undecodable (post-downgrade) row, and a
     // corrupt sibling never blocks the reclaim sweep (#753 / #763). ---
     let pstore_dir = tempfile::tempdir()?;
+    // `PersistentChannelStateStore::open` enforces a `0o700` data_dir; a CI umask
+    // of 002 leaves the tempdir at 0o755, so tighten it (mirrors the seller store
+    // setup above).
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        pstore_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
     let pconcrete = Arc::new(PersistentChannelStateStore::open(pstore_dir.path())?);
     // A real on-chain channel whose local row got corrupted by a downgrade.
     pc_buyer
