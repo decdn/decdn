@@ -715,6 +715,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         // fallback returns no bool-sized value, fails the success/length check.
         (bool ok, bytes memory ret) = router.staticcall(abi.encodeCall(IFeeRouterSettlement.paused, ()));
         if (!ok || ret.length < 32) revert FeeRouterMissingPausedView(router);
+        // The high-level paused() call in settleChannel strict-decodes a bool,
+        // which reverts on a word > 1; reject such a router here so the probe
+        // truly mirrors it (excess returndata is tolerated, matching that decode).
+        if (abi.decode(ret, (uint256)) > 1) revert FeeRouterMissingPausedView(router);
     }
 
     /// @dev Approve then route a strictly-positive delta to `FeeRouter` in the

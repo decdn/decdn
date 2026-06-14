@@ -118,6 +118,17 @@ contract NoPauseRouter {
     function routeSettlement(address, uint256, uint256) external { }
 }
 
+/// @notice Router whose `paused()` shares the selector but returns a non-canonical
+///         bool word (2). Proves the conformance probe rejects a return the
+///         high-level `paused()` call would strict-decode-revert on.
+contract NonBoolPauseRouter {
+    function routeSettlement(address, uint256, uint256) external { }
+
+    function paused() external pure returns (uint256) {
+        return 2;
+    }
+}
+
 /// @notice Minimal ERC-1271 smart-account wallet: validates a signature by
 ///         recovering it to a fixed owner EOA. Exercises the SignatureChecker
 ///         ERC-1271 branch of voucher verification (ADR 024 smart-account signers).
@@ -662,6 +673,16 @@ contract PaymentChannelTest is Test {
     ///      `paused()` is rejected at set time — settleChannel relies on that view.
     function test_setFeeRouter_revertsOnRouterMissingPausedView() public {
         NoPauseRouter bad = new NoPauseRouter();
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterMissingPausedView.selector, address(bad)));
+        channel.setFeeRouter(address(bad));
+    }
+
+    /// @dev A router whose `paused()` returns a non-canonical bool word (> 1) is
+    ///      rejected — the high-level call in `settleChannel` would otherwise
+    ///      strict-decode-revert and re-trap the refund.
+    function test_setFeeRouter_revertsOnNonBooleanPausedReturn() public {
+        NonBoolPauseRouter bad = new NonBoolPauseRouter();
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterMissingPausedView.selector, address(bad)));
         channel.setFeeRouter(address(bad));
