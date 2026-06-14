@@ -7,6 +7,7 @@ import { CapacityBond } from "../src/CapacityBond.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
+import { ISlashJudge } from "../src/interfaces/ISlashJudge.sol";
 import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol";
 import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -44,6 +45,11 @@ contract CapacityBondRegionE2ETest is Test {
     address internal challenger = address(0xC4A11E);
     bytes32 internal constant BLOB = bytes32(uint256(0xB10B));
     bytes32 internal constant US_EAST = bytes32("us-east");
+
+    // Commit–reveal (#854): mirror of SlashJudge's fixed MIN_REVEAL_DELAY and a
+    // fixed salt for the challenger's blind commitment.
+    uint256 internal constant REVEAL_DELAY = 1 minutes;
+    bytes32 internal constant SALT = bytes32(uint256(0x5A17));
 
     // ===================================================================
     // AUTO-GENERATED — do not edit by hand.
@@ -300,9 +306,11 @@ contract CapacityBondRegionE2ETest is Test {
         uint64 ts = uint64(block.timestamp * 1_000_000 - 5_000_000);
         SlashJudge.StreamMsg memory s = _stream(ts);
         bytes memory sig = _signStream(judge, s); // sign before prank (see _submitBlacklistSlash)
+        // Reverts in `_checkBlacklistedBefore`, before the commit–reveal check, so
+        // no commitment is needed; `salt` is still a required argument (#854).
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, true);
+        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, true, SALT);
         assertEq(bond.lifetimeOffenseCount(REG_OPERATOR), 0);
     }
 
@@ -340,14 +348,23 @@ contract CapacityBondRegionE2ETest is Test {
     }
 
     /// @dev Submit a blacklist challenge with a node-signed stream response at
-    ///      `tsUs`; expects a successful slash.
+    ///      `tsUs`; expects a successful slash. Commit–reveal (#854): commit the
+    ///      evidence hash, mature past `MIN_REVEAL_DELAY`, then reveal.
     function _submitBlacklistSlash(SlashJudge judge, uint64 tsUs) internal {
         SlashJudge.StreamMsg memory s = _stream(tsUs);
         // Sign BEFORE pranking: `_signStream` makes an external view call that
         // would otherwise consume the prank, leaving `msg.sender` as the test.
         bytes memory sig = _signStream(judge, s);
+
+        bytes32 evidenceHash =
+            keccak256(abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), _streamStructHash(judge, s), true));
         vm.prank(challenger);
-        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, true);
+        judge.commitChallenge(keccak256(abi.encode(evidenceHash, SALT, challenger)));
+        // A 1-minute maturation is negligible against the 5-day evidence window.
+        vm.warp(block.timestamp + REVEAL_DELAY + 1);
+
+        vm.prank(challenger);
+        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, true, SALT);
     }
 
     function _stream(uint64 tsUs) internal pure returns (SlashJudge.StreamMsg memory) {
@@ -362,10 +379,10 @@ contract CapacityBondRegionE2ETest is Test {
         });
     }
 
-    /// @dev EIP-712 sign a `StreamResponse` with the operator's secp256k1 key over
-    ///      `SlashJudge`'s domain (`"deCDN SlashJudge"` / `"1"`).
-    function _signStream(SlashJudge judge, SlashJudge.StreamMsg memory s) internal view returns (bytes memory) {
-        bytes32 structHash = keccak256(
+    /// @dev The EIP-712 `StreamResponse` struct hash (the blacklist evidence
+    ///      preimage component) over `SlashJudge`'s typehash.
+    function _streamStructHash(SlashJudge judge, SlashJudge.StreamMsg memory s) internal view returns (bytes32) {
+        return keccak256(
             abi.encode(
                 judge.STREAM_RESPONSE_TYPEHASH(),
                 s.hash,
@@ -377,6 +394,12 @@ contract CapacityBondRegionE2ETest is Test {
                 s.redirect
             )
         );
+    }
+
+    /// @dev EIP-712 sign a `StreamResponse` with the operator's secp256k1 key over
+    ///      `SlashJudge`'s domain (`"deCDN SlashJudge"` / `"1"`).
+    function _signStream(SlashJudge judge, SlashJudge.StreamMsg memory s) internal view returns (bytes memory) {
+        bytes32 structHash = _streamStructHash(judge, s);
         bytes32 domainSeparator = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
