@@ -542,11 +542,12 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
 
     /// @notice Any address: route the provider settle leg deferred by
     ///         `settleChannel` when `FeeRouter` was paused. Safe to retry — a
-    ///         still-paused router reverts the whole call, leaving the deferral
-    ///         entry enumerated; once routed, a re-call reverts `NoDeferredSettlement`. The
-    ///         amount/bytes are recomputed from the closed channel, which
-    ///         `settleChannel` froze (no `withdraw` is possible once `Closed`), so
-    ///         they equal the provider share still held here.
+    ///         still-paused router reverts the whole call and the channel stays in
+    ///         the deferred set; a successful flush removes it, so any later call
+    ///         reverts `NoDeferredSettlement`. The amount/bytes are recomputed from
+    ///         the closed channel, which `settleChannel` froze (no `withdraw` is
+    ///         possible once `Closed`), so they equal the provider share still held
+    ///         here.
     function flushDeferredSettlement(bytes32 channelId) external nonReentrant {
         // `remove` clears the id and reports presence in one step (checks-effects):
         // false means it was never deferred (or already flushed). Removing before
@@ -589,9 +590,13 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         if (offset >= len || limit == 0) {
             return new bytes32[](0);
         }
-        uint256 end = offset + limit;
-        if (end > len) end = len;
-        uint256 size = end - offset;
+        // `remaining > 0` given the `offset >= len` guard above. Take `size` as the
+        // smaller of `limit` and `remaining` directly — never forming `offset +
+        // limit`, so a defensive `limit == type(uint256).max` clamps instead of
+        // reverting on overflow. `offset + i < offset + size <= len`, so every
+        // `at(offset + i)` is in bounds.
+        uint256 remaining = len - offset;
+        uint256 size = limit < remaining ? limit : remaining;
         page = new bytes32[](size);
         for (uint256 i = 0; i < size; i++) {
             page[i] = _deferredSettlements.at(offset + i);

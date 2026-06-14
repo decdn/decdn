@@ -1311,6 +1311,29 @@ contract PaymentChannelTest is Test {
         assertEq(page[0], id);
     }
 
+    /// @dev A max `limit` at a non-zero `offset` must clamp to the remaining tail,
+    ///      not revert on `offset + limit` overflow — keepers may pass max limit
+    ///      defensively from any offset.
+    function test_deferredSettlements_maxLimitFromNonZeroOffsetClampsNoOverflow() public {
+        router.setPaused(true);
+        bytes32 id1 = _openCloseWarp(700e6, 70_000_000);
+        channel.settleChannel(id1);
+        bytes32 id2 = _openCloseWarp(500e6, 50_000_000);
+        channel.settleChannel(id2);
+        bytes32 id3 = _openCloseWarp(300e6, 30_000_000);
+        channel.settleChannel(id3);
+
+        // offset 1 + max limit → the 2-element tail, no overflow revert.
+        bytes32[] memory tail = channel.deferredSettlements(1, type(uint256).max);
+        assertEq(tail.length, 2);
+        // The two returned ids are the set minus whichever id sits at index 0.
+        bytes32 head = channel.deferredSettlements(0, 1)[0];
+        assertFalse(_contains(tail, head));
+        assertTrue(channel.settlementDeferred(tail[0]));
+        assertTrue(channel.settlementDeferred(tail[1]));
+        assertTrue(tail[0] != tail[1]);
+    }
+
     /// @dev Pagination guards: out-of-range offset and zero limit yield an empty
     ///      page; a limit past the end clamps to the remaining tail.
     function test_deferredSettlements_paginationBoundaries() public {
