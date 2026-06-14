@@ -56,8 +56,11 @@ use crate::payment_settlement::{
 const RECLAIM_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 
 /// How many consecutive failed sweeps a single channel's reclaim must rack up
-/// before the per-attempt `warn!` escalates to an `error!` + alertable metric
-/// (#906). A one-off failure is the expected transient case (host-clock-vs-chain
+/// before the per-attempt `warn!` escalates to a per-channel `error!` (#906).
+/// The `buyer_reclaim_failures` metric increments on *every* failed attempt, so
+/// the alertable signal exists from the first failure — this threshold gates
+/// only the louder, per-channel `error!`.
+/// A one-off failure is the expected transient case (host-clock-vs-chain
 /// skew: not yet expired on-chain, retry next tick), so we tolerate a few
 /// sweeps; ~6 hours (6 × `RECLAIM_SWEEP_INTERVAL`) of sustained failure is well
 /// past any plausible skew and means a refundable deposit is genuinely stranded
