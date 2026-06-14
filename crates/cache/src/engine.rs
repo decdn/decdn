@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -1398,6 +1399,66 @@ impl CacheEngine {
         Ok(())
     }
 
+    /// Begin a node-driven *tee* fill of `hash` (#856): the caller pushes blob
+    /// chunks (received from an upstream node→node pull) via [`TeeSink::write`]
+    /// while the engine streams them into the store, and [`TeeSink::finish`]
+    /// verifies the whole-blob hash and promotes the blob on match. This lets the
+    /// node's `cdn/client/v1` handler fuse the upstream pull with downstream
+    /// delivery — forwarding each chunk to the paying client as it arrives —
+    /// rather than buffering the whole blob via [`Self::populate`] before serving
+    /// (the prepay-the-whole-blob exposure of #856).
+    ///
+    /// Coalescing (#305): the tee participates in the SAME in-flight map as
+    /// [`Self::populate`] / [`Self::get`]. If another fill for `hash` is already
+    /// in progress this returns [`TeeOpen::InFlight`] and the caller MUST NOT open
+    /// a second upstream pull (no double spend) — it can instead wait on the
+    /// existing fill via `populate` and serve from the store. The returned
+    /// [`TeeSink`] holds the in-flight claim for `hash`; dropping it (via
+    /// `finish` / `abandon`, or an early return on the error path) releases the
+    /// claim and wakes waiters.
+    ///
+    /// Unlike `populate`, this does NOT itself check `is_evicted` or `has`: the
+    /// `cdn/client/v1` miss path that calls it has already gated on both. The
+    /// caller owns the upstream pull, so the engine stays payment-agnostic.
+    #[must_use]
+    pub fn open_tee_sink(&self, hash: Hash) -> TeeOpen {
+        let mut guard = self
+            .inner
+            .inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if guard.contains_key(&hash) {
+            return TeeOpen::InFlight;
+        }
+        let notify = Arc::new(Notify::new());
+        guard.insert(hash, Arc::clone(&notify));
+        drop(guard);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(TEE_SINK_CHANNEL_CAP);
+        // Adapt the receiver into the `io::Result<Bytes>` stream the engine's
+        // commit path consumes. The channel closing (all senders dropped) ends
+        // the stream — that is how `finish` / `abandon` signal end-of-blob.
+        let source: Pin<
+            Box<dyn futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync>,
+        > = Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (Ok(chunk), rx))
+        }));
+        let engine = self.clone();
+        let max_blob_bytes = self.inner.max_blob_bytes;
+        let import = tokio::spawn(async move {
+            engine
+                .import_and_verify_stream(hash, source, max_blob_bytes)
+                .await
+        });
+        TeeOpen::Owner(TeeSink {
+            engine: self.clone(),
+            hash,
+            notify,
+            tx: Some(tx),
+            import: Some(import),
+        })
+    }
+
     /// Flush ephemeral state to disk. The iroh-blobs store does its own
     /// cleanup on drop, but only an explicit
     /// [`iroh_blobs::store::fs::FsStore`] shutdown guarantees that in-flight
@@ -1828,15 +1889,67 @@ impl CacheEngine {
             return self.commit_buffered_bytes(hash, bytes).await;
         }
 
-        // Streaming path: hand the stream to `iroh-blobs::add_stream`
-        // and capture mid-stream errors via the side channel.
-        // `iroh-blobs::add_stream` swallows the upstream `io::Error`
-        // (it `?`-propagates inside an async block whose error is
-        // discarded), so without this capture the engine sees only
-        // "unexpected end of stream" and operators lose the
-        // actionable upstream message. Failed attempts strand a
-        // partial `TempTag` worth of bytes; iroh-blobs GC reclaims
-        // them at `cache.gc_interval_sec` cadence.
+        // Streaming path: drive the origin stream into the store, verify the
+        // hash, and promote — shared verbatim with the node-driven tee sink
+        // (#856) via `import_and_verify_stream`. On a committed blob the engine's
+        // existing `get()` callers (admin RPC, metrics tests) want the full
+        // payload as `Bytes`, so re-read it from the local store (one mmap'd read
+        // with `fs-store`, no extra origin egress).
+        match self
+            .import_and_verify_stream(hash, stream, max_blob_bytes)
+            .await?
+        {
+            StreamCommitOutcome::Committed => match self.read_local(hash).await {
+                Ok(bytes) => Ok(PullThroughOutcome::Bytes(bytes)),
+                Err(CacheError::Store(err)) => Ok(PullThroughOutcome::Store(err)),
+                Err(other) => {
+                    // `read_local` only surfaces `Store`; any other variant is a
+                    // logic regression. Map to `Store` so the outer
+                    // `pull_through` still surfaces a coherent error; the inner
+                    // anyhow chain preserves the cause.
+                    Ok(PullThroughOutcome::Store(anyhow::Error::msg(format!(
+                        "read_local returned unexpected variant after successful commit: {other}"
+                    ))))
+                }
+            },
+            StreamCommitOutcome::HashMismatch { actual } => {
+                Ok(PullThroughOutcome::HashMismatch { actual })
+            }
+            StreamCommitOutcome::BlobTooLarge => Ok(PullThroughOutcome::BlobTooLarge),
+            StreamCommitOutcome::Store(err) => Ok(PullThroughOutcome::Store(err)),
+        }
+    }
+
+    /// Drive a chunk stream into the iroh-blobs store, capturing mid-stream
+    /// errors via the side channel, verify the committed hash against `hash`,
+    /// and on match promote the temp tag to a named tag. This is the shared
+    /// commit-and-verify tail used by both the origin pull-through
+    /// ([`Self::pull_through_attempt`]) and the node-driven tee sink
+    /// ([`Self::open_tee_sink`], #856) — the only difference between the two is
+    /// the source of `stream` (an `Origin::fetch` stream vs. a caller-fed
+    /// channel). It does NOT broadcast the insert or read the bytes back; the
+    /// caller owns those (the tee broadcasts on `finish`, the pull-through
+    /// re-reads for its `Bytes` return).
+    ///
+    /// `count_and_cap_stream` enforces `max_blob_bytes` and bumps the
+    /// origin-egress metric per chunk, so a tee fill is metered as the upstream
+    /// egress it genuinely is (those bytes left an origin) without touching the
+    /// `get`-caller hit/returned counters.
+    async fn import_and_verify_stream<S>(
+        &self,
+        hash: Hash,
+        stream: S,
+        max_blob_bytes: u64,
+    ) -> Result<StreamCommitOutcome, OriginPullError>
+    where
+        S: futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
+    {
+        // `iroh-blobs::add_stream` swallows the upstream `io::Error` (it
+        // `?`-propagates inside an async block whose error is discarded), so
+        // without this side-channel capture the engine sees only "unexpected end
+        // of stream" and operators lose the actionable upstream message. Failed
+        // attempts strand a partial `TempTag` worth of bytes; iroh-blobs GC
+        // reclaims them at `cache.gc_interval_sec` cadence.
         let captured_err: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
         let counted = count_and_cap_stream(
             stream,
@@ -1847,46 +1960,39 @@ impl CacheEngine {
         let progress = self.inner.store.blobs().add_stream(counted).await;
         let temp_tag_result = progress.temp_tag().await;
 
-        // Side-channel-recorded error wins over both the iroh-blobs
-        // Err arm AND a "successful" partial import, because the
-        // latter's hash is deterministically wrong and we'd rather
-        // surface the real cause ("body read stalled", "decompression
-        // failed") than a confusing `HashMismatch`. Drop the temp tag
-        // (regardless of inner Ok/Err) so iroh-blobs GC reclaims the
-        // partial bytes.
+        // Side-channel-recorded error wins over both the iroh-blobs Err arm AND a
+        // "successful" partial import, because the latter's hash is
+        // deterministically wrong and we'd rather surface the real cause than a
+        // confusing `HashMismatch`. Drop the temp tag (regardless of inner
+        // Ok/Err) so iroh-blobs GC reclaims the partial bytes.
         let captured = captured_err
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(upstream) = captured {
             drop(temp_tag_result);
-            // Cap-breach mid-stream: typed `BlobTooLargeMarker` is the
-            // documented escape hatch — surface as the typed
-            // `BlobTooLarge` outcome rather than routing through
-            // `classify_io_error` which would collapse it to a
-            // generic `OriginError`.
+            // Cap-breach mid-stream: typed `BlobTooLargeMarker` is the documented
+            // escape hatch — surface as the typed `BlobTooLarge` outcome rather
+            // than routing through `classify_io_error` which would collapse it to
+            // a generic `OriginError`.
             if is_blob_too_large_marker(&upstream) {
-                return Ok(PullThroughOutcome::BlobTooLarge);
+                return Ok(StreamCommitOutcome::BlobTooLarge);
             }
-            // Otherwise classify via the shared body-phase
-            // classifier: typed `OriginError::*` inners surface as
-            // Permanent (decompression failures, etc.);
-            // `io::ErrorKind`-Transient kinds (ConnectionReset,
-            // TimedOut, …) surface as Transient and re-enter the
-            // retry loop for abort+restart.
+            // Otherwise classify via the shared body-phase classifier: typed
+            // `OriginError::*` inners surface as Permanent (decompression
+            // failures, etc.); `io::ErrorKind`-Transient kinds (ConnectionReset,
+            // TimedOut, …) surface as Transient and re-enter the retry loop.
             return Err(classify_io_error(upstream));
         }
 
         let temp_tag = match temp_tag_result {
             Ok(tt) => tt,
             Err(err) => {
-                // No upstream-captured error: the failure is on
-                // iroh-blobs' side (disk write, actor crash,
-                // serialization-task panic, etc.). Surface as
-                // `Store` so operators routing on origin-vs-store
-                // don't misclassify a local store problem as a
-                // remote origin one. Not retry-class.
-                return Ok(PullThroughOutcome::Store(
+                // No upstream-captured error: the failure is on iroh-blobs' side
+                // (disk write, actor crash, serialization-task panic, etc.).
+                // Surface as `Store` so operators routing on origin-vs-store
+                // don't misclassify a local store problem as a remote origin one.
+                return Ok(StreamCommitOutcome::Store(
                     anyhow::Error::from(err)
                         .context("iroh-blobs add_stream failed during pull-through"),
                 ));
@@ -1897,55 +2003,33 @@ impl CacheEngine {
         if actual != hash {
             // Drop the temp tag without promotion → the wrong-hash bytes are
             // never tagged, so they are GC-eligible inside iroh-blobs and the
-            // next sweep reclaims them. Deterministic protocol violation: a
-            // clean stream that hashed wrong is not a transport failure —
-            // retry won't help.
+            // next sweep reclaims them. Deterministic protocol violation: a clean
+            // stream that hashed wrong is not a transport failure — retry won't
+            // help.
             //
             // We deliberately do NOT logically evict `actual`. The persisted
             // evicted set is reserved for operator DMCA/corruption takedowns
-            // (#279); reusing it here would durably censor `actual` — and
-            // since content is BLAKE3-addressed, bytes whose hash is `actual`
-            // *are* the authorized content for `actual`. A malicious upstream
-            // that answers a pull for `hash` with a victim blob's bytes could
-            // otherwise make us permanently blacklist that legitimate blob
-            // (#853). The requested hash `hash` is correctly never committed;
-            // a later request for `actual` itself is served only if its bytes
-            // genuinely hash to `actual`, which is exactly correct.
+            // (#279); reusing it here would durably censor `actual` — and since
+            // content is BLAKE3-addressed, bytes whose hash is `actual` *are* the
+            // authorized content for `actual`. A malicious upstream that answers
+            // a pull for `hash` with a victim blob's bytes could otherwise make
+            // us permanently blacklist that legitimate blob (#853). The requested
+            // hash `hash` is correctly never committed.
             drop(temp_tag);
-            return Ok(PullThroughOutcome::HashMismatch { actual });
+            return Ok(StreamCommitOutcome::HashMismatch { actual });
         }
 
         // Promote the temp tag to a named tag — same effect as
-        // `add_bytes(...).await`, which goes through `with_tag()` (
-        // iroh-blobs `blobs.rs:624-632`). The name is opaque; the
-        // store auto-assigns it. Tag-create failure is store-side, not
-        // origin-side: surface as `Store` so retry-class taxonomy
-        // doesn't pick it up.
+        // `add_bytes(...).await`, which goes through `with_tag()` (iroh-blobs
+        // `blobs.rs:624-632`). The name is opaque; the store auto-assigns it.
+        // Tag-create failure is store-side, not origin-side: surface as `Store`
+        // so retry-class taxonomy doesn't pick it up.
         let haf = temp_tag.hash_and_format();
         if let Err(err) = self.inner.store.tags().create(haf).await {
-            return Ok(PullThroughOutcome::Store(anyhow::Error::from(err)));
+            return Ok(StreamCommitOutcome::Store(anyhow::Error::from(err)));
         }
         drop(temp_tag);
-
-        // The engine's existing `get()` callers (admin RPC, metrics
-        // tests) want the full payload as `Bytes`. Re-read it from
-        // the local store: with iroh-blobs' `fs-store` this is one
-        // mmap'd read with no extra origin egress. Stream-shaped
-        // `get()` is in scope for #317 (cdn/client/v1 paid delivery),
-        // not this issue.
-        match self.read_local(hash).await {
-            Ok(bytes) => Ok(PullThroughOutcome::Bytes(bytes)),
-            Err(CacheError::Store(err)) => Ok(PullThroughOutcome::Store(err)),
-            Err(other) => {
-                // `read_local` only surfaces `Store`; any other
-                // variant is a logic regression. Map to `Store` so
-                // the outer `pull_through` still surfaces a coherent
-                // error; the inner anyhow chain preserves the cause.
-                Ok(PullThroughOutcome::Store(anyhow::Error::msg(format!(
-                    "read_local returned unexpected variant after successful commit: {other}"
-                ))))
-            }
-        }
+        Ok(StreamCommitOutcome::Committed)
     }
 
     /// Commit a fully-buffered payload from the drain path. Drains do
@@ -2014,6 +2098,160 @@ enum PullThroughOutcome {
     BlobTooLarge,
     HashMismatch { actual: Hash },
     Store(anyhow::Error),
+}
+
+/// Outcome of [`CacheEngine::import_and_verify_stream`] — the commit-and-verify
+/// tail shared by origin pull-through and the tee sink (#856). Mirrors
+/// [`PullThroughOutcome`] minus the `Bytes`/`NotFound` arms: a stream import
+/// either commits, hashes wrong, overruns the cap, or hits a store fault.
+#[derive(Debug)]
+enum StreamCommitOutcome {
+    Committed,
+    BlobTooLarge,
+    HashMismatch { actual: Hash },
+    Store(anyhow::Error),
+}
+
+/// Backpressure bound on the [`TeeSink`] feeder channel: at most this many
+/// caller-pushed chunks may be in flight to the store-import task before
+/// [`TeeSink::write`] awaits. Small enough to cap resident memory (a handful of
+/// `cdn/client/v1` chunks), large enough that the store import and the network
+/// forward overlap rather than ping-ponging one chunk at a time.
+const TEE_SINK_CHANNEL_CAP: usize = 8;
+
+/// Result of [`CacheEngine::open_tee_sink`] (#856).
+#[derive(Debug)]
+pub enum TeeOpen {
+    /// This caller owns the fill: drive it via the [`TeeSink`].
+    Owner(TeeSink),
+    /// Another task is already filling this hash (coalescing, #305). The caller
+    /// MUST NOT open a competing upstream pull — wait on the existing fill via
+    /// [`CacheEngine::populate`] / [`CacheEngine::get`] and serve from the store.
+    InFlight,
+}
+
+/// A caller-driven tee fill of one blob into the cache (#856). The owner pushes
+/// chunks via [`Self::write`] as they arrive from an upstream node→node pull;
+/// the engine streams them into the store concurrently. [`Self::finish`]
+/// verifies the whole-blob hash and promotes the blob (making it a discoverable
+/// holder); [`Self::abandon`] drops a partial fill (e.g. the downstream client
+/// disconnected). Either way — or on an early drop from any error path — the
+/// in-flight claim for the hash is released and waiters are woken.
+#[derive(Debug)]
+pub struct TeeSink {
+    engine: CacheEngine,
+    hash: Hash,
+    /// The per-hash in-flight notifier (shared with [`CacheEngine::populate`]
+    /// waiters); woken on drop so a coalesced waiter re-checks presence.
+    notify: Arc<Notify>,
+    /// Feeder into the store-import task. `take`n / set to `None` by
+    /// `finish`/`abandon` to end the stream; dropping it closes the channel.
+    tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
+    /// The spawned store-import task; `take`n by `finish` (awaited) or
+    /// `abandon`/`Drop` (aborted).
+    import: Option<tokio::task::JoinHandle<Result<StreamCommitOutcome, OriginPullError>>>,
+}
+
+impl TeeSink {
+    /// Push one chunk into the fill. Awaits if the bounded feeder channel is
+    /// full (store backpressure, which also paces the caller's downstream
+    /// forward). Errors if the import task has already ended — the caller should
+    /// then [`Self::abandon`].
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] if the sink is already finished or the import task
+    /// dropped the receiver before this write landed.
+    pub async fn write(&mut self, chunk: &[u8]) -> CacheResult<()> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(CacheError::Store(anyhow::anyhow!(
+                "tee sink write after finish/abandon"
+            )));
+        };
+        tx.send(Bytes::copy_from_slice(chunk)).await.map_err(|_| {
+            CacheError::Store(anyhow::anyhow!(
+                "tee sink import task ended before write completed"
+            ))
+        })
+    }
+
+    /// Close the stream and finalize: verify the committed hash and, on match,
+    /// promote the blob and announce the insert (ADR 022 §STORE Flow), so the
+    /// node becomes a discoverable holder for future requests.
+    ///
+    /// # Errors
+    ///
+    /// - [`CacheError::HashMismatch`] — the assembled bytes did not hash to
+    ///   `hash` (corrupt upstream); the blob is NOT promoted.
+    /// - [`CacheError::BlobTooLarge`] — the fill exceeded `max_blob_bytes`.
+    /// - [`CacheError::Store`] — store-write or import-task-join fault.
+    /// - [`CacheError::OriginError`] — a mid-stream transport error was captured.
+    pub async fn finish(mut self) -> CacheResult<()> {
+        // Drop the sender → the import stream ends → the task finalizes.
+        self.tx = None;
+        let Some(import) = self.import.take() else {
+            return Err(CacheError::Store(anyhow::anyhow!(
+                "tee sink finished twice"
+            )));
+        };
+        let outcome = import.await.map_err(|e| {
+            CacheError::Store(anyhow::anyhow!("tee sink import task join failed: {e}"))
+        })?;
+        match outcome {
+            Ok(StreamCommitOutcome::Committed) => {
+                // Announce the fresh commit to DHT-republish subscribers
+                // (ADR 022 §STORE Flow), mirroring the origin pull-through path.
+                // No active subscriber → `SendError`, the normal state; ignore.
+                let _ = self.engine.inner.inserts_tx.send(self.hash);
+                self.engine.touch(self.hash);
+                Ok(())
+            }
+            Ok(StreamCommitOutcome::HashMismatch { actual }) => Err(CacheError::HashMismatch {
+                expected: self.hash,
+                actual,
+            }),
+            Ok(StreamCommitOutcome::BlobTooLarge) => Err(CacheError::BlobTooLarge {
+                hash: self.hash,
+                limit_bytes: self.engine.inner.max_blob_bytes,
+            }),
+            Ok(StreamCommitOutcome::Store(err)) => Err(CacheError::Store(err)),
+            Err(e) => Err(CacheError::OriginError {
+                hash: self.hash,
+                source: e.into_inner(),
+            }),
+        }
+        // `self` drops here → the in-flight claim is released AFTER the commit,
+        // so a coalesced waiter that wakes sees the blob present.
+    }
+
+    /// Drop a partial fill without promoting it (e.g. the downstream client
+    /// disconnected, so we stop pulling). The partial temp tag is reclaimed by
+    /// iroh-blobs GC; the in-flight claim releases on drop.
+    pub fn abandon(mut self) {
+        self.tx = None;
+        if let Some(import) = self.import.take() {
+            import.abort();
+        }
+    }
+}
+
+impl Drop for TeeSink {
+    fn drop(&mut self) {
+        // Release the in-flight claim and wake waiters (#305) on EVERY exit —
+        // `finish`, `abandon`, or an early drop on the caller's error path. If
+        // the import task is still live (dropped without finish/abandon), abort
+        // it so its partial temp tag becomes GC-eligible.
+        if let Some(import) = self.import.take() {
+            import.abort();
+        }
+        self.engine
+            .inner
+            .inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.hash);
+        self.notify.notify_waiters();
+    }
 }
 
 /// True when the body-phase `io::Error` wraps a typed
@@ -2327,6 +2565,106 @@ mod tests {
         anyhow::ensure!(
             r.is_err(),
             "cache hit must not emit on subscribe_inserts; got {r:?}"
+        );
+        Ok(())
+    }
+
+    /// Unwrap a [`TeeOpen::Owner`], failing the test on `InFlight`.
+    fn owner(open: TeeOpen) -> anyhow::Result<TeeSink> {
+        match open {
+            TeeOpen::Owner(sink) => Ok(sink),
+            TeeOpen::InFlight => Err(anyhow::anyhow!("expected Owner, got InFlight")),
+        }
+    }
+
+    #[tokio::test]
+    async fn tee_sink_commits_promotes_and_announces() -> anyhow::Result<()> {
+        // A teed fill (#856) must end up cached, hash-verified, and announced to
+        // DHT-republish subscribers exactly like an origin pull-through.
+        let tmp = tempfile::tempdir()?;
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|i| u8::try_from(i % 256).unwrap_or(0))
+            .collect();
+        let hash = Hash::new(&payload);
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+        let mut rx = engine.subscribe_inserts();
+
+        let mut sink = owner(engine.open_tee_sink(hash))?;
+        for chunk in payload.chunks(64 * 1024) {
+            sink.write(chunk).await?;
+        }
+        sink.finish().await?;
+
+        anyhow::ensure!(engine.has(hash).await?, "blob must be present after finish");
+        let got = engine.get(hash).await?;
+        anyhow::ensure!(
+            got.as_ref() == payload.as_slice(),
+            "served bytes must match"
+        );
+
+        let announced = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for tee insert announce"))?
+            .map_err(|e| anyhow::anyhow!("recv: {e}"))?;
+        anyhow::ensure!(
+            announced == hash,
+            "announced hash must equal committed hash"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tee_sink_hash_mismatch_does_not_promote() -> anyhow::Result<()> {
+        // Corrupt upstream: bytes that do not hash to the requested hash must
+        // NOT be promoted, and `finish` surfaces `HashMismatch` (#853 semantics).
+        let tmp = tempfile::tempdir()?;
+        let wanted = Hash::new(b"the genuine content");
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+
+        let mut sink = owner(engine.open_tee_sink(wanted))?;
+        sink.write(b"not the genuine content at all").await?;
+        let err = sink
+            .finish()
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected HashMismatch, got Ok"))?;
+        anyhow::ensure!(
+            matches!(err, CacheError::HashMismatch { expected, .. } if expected == wanted),
+            "expected HashMismatch for {wanted}, got {err:?}"
+        );
+        anyhow::ensure!(
+            !engine.has(wanted).await?,
+            "mismatched bytes must not be promoted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tee_sink_coalesces_concurrent_fills() -> anyhow::Result<()> {
+        // Two concurrent fills for the same hash: the first owns it, the second
+        // is told it is in flight (no double upstream pull, #305). Releasing the
+        // owner lets a later caller own it again.
+        let tmp = tempfile::tempdir()?;
+        let hash = Hash::new(b"coalesce me");
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+
+        let first = owner(engine.open_tee_sink(hash))?;
+        anyhow::ensure!(
+            matches!(engine.open_tee_sink(hash), TeeOpen::InFlight),
+            "second concurrent fill must report InFlight"
+        );
+
+        // Abandon the owner (e.g. downstream client dropped) → claim released.
+        first.abandon();
+        // Drop runs synchronously on `abandon`'s move; the claim is now free.
+        anyhow::ensure!(
+            matches!(engine.open_tee_sink(hash), TeeOpen::Owner(_)),
+            "after abandon, a new fill must be able to own the hash"
+        );
+        anyhow::ensure!(
+            !engine.has(hash).await?,
+            "an abandoned fill must not have committed the blob"
         );
         Ok(())
     }

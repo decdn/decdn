@@ -60,7 +60,7 @@ pub use probe_sig::{
     ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION,
     slash_judge_domain,
 };
-pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, verify_rate};
+pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 pub use store::{
     ChannelStateStore, MemoryChannelStateStore, MemoryPendingSettleStore, PendingSettle,
     PendingSettleStore, StoreError, WatcherCheckpointStore,

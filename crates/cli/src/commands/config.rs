@@ -207,6 +207,13 @@ pub fn write_validate_summary<W: std::io::Write>(
             "  node_to_node_pull:        enabled (probe_fanout={}, pull_timeout_sec={})",
             resolved.cache.node_pull_probe_fanout, resolved.cache.node_pull_timeout_sec
         )?;
+        writeln!(
+            w,
+            "  pull_through_caps:        pull_ahead_bytes={}, max_unrecouped_leech_bytes={}, share_ratio_percent={}",
+            resolved.cache.pull_ahead_bytes,
+            resolved.cache.max_unrecouped_leech_bytes,
+            resolved.cache.pull_share_ratio_percent
+        )?;
     } else {
         writeln!(w, "  node_to_node_pull:        disabled")?;
     }
@@ -418,6 +425,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
 # node_pull_timeout_sec = 20               # per-upstream pull timeout on a node-to-node miss; the overall pull-through deadline is derived to allow trying every ranked upstream before falling back (#831, #859)
+# pull_ahead_bytes = 1048576               # window-paced pull-through pipeline window (#856, ADR 037); per-request speculative loss is bounded to this many bytes
+# max_unrecouped_leech_bytes = 268435456   # node-wide unrecouped-leech budget in bytes (#856, ADR 037); aggregate speculative spend above this pauses until served bytes recoup it; 0 disables
+# pull_share_ratio_percent = 400           # per-peer pull ceiling as a percent of bytes served to that peer (#856, ADR 037); 100 == 1.0x, plus an opening pull_ahead_bytes allowance
 
 [payment]
 # rate_per_mb = 10

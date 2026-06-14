@@ -516,6 +516,342 @@ async fn fetch_inner(
     Ok(blob)
 }
 
+/// Header fields from the upstream `StreamResponse`, surfaced by
+/// [`open_progressive_pull`] before the first chunk so the fused serve path
+/// (#856) knows `total_bytes` up front — it must sign its OWN downstream
+/// `StreamResponse` (which commits to a `total_bytes`) before forwarding a byte.
+#[derive(Debug, Clone, Copy)]
+pub struct UpstreamPullHeader {
+    /// Whole-blob size the upstream promised (echoed into our downstream
+    /// `StreamResponse`).
+    pub total_bytes: u64,
+    /// Upstream rate; informational for the caller (the buyer pays it inside
+    /// [`UpstreamPull::next_chunk`]).
+    pub rate_per_mb: u64,
+    /// Upstream voucher cadence in bytes (the buyer pays one voucher per
+    /// interval as chunks arrive).
+    pub interval_bytes: u64,
+}
+
+/// A live, progressive `cdn/client/v1` pull (#856), the streaming counterpart of
+/// the buffered [`stream_fetch`]. Opened by [`open_progressive_pull`] (which has
+/// already done the handshake and verified the response), driven chunk-by-chunk
+/// via [`Self::next_chunk`], and closed by [`Self::finish`] (completeness +
+/// whole-blob hash) or [`Self::abort`].
+///
+/// It pays the upstream per voucher interval *inside* `next_chunk` — identical
+/// pacing to `stream_fetch` — but yields each chunk to the caller (which
+/// forwards it to the paying downstream client and tees it into the cache)
+/// instead of buffering the whole blob. This is what lets the serving node cap
+/// its speculative exposure to a bounded window rather than fronting the entire
+/// upstream cost before any downstream voucher arrives.
+///
+/// Unlike `stream_fetch_tracked`, the acked voucher watermark is OWNED here (not
+/// threaded as a `&mut` out-param) and read back via [`Self::progress`] /
+/// returned by `finish`/`abort` — the caller (`node_origin`) persists it. On any
+/// exit, the caller MUST call `progress`/`finish`/`abort` to recover the
+/// watermark for `record_progress` (#852); a [`Drop`] guard closes the
+/// connection if none ran, but cannot return the watermark, so the obligation
+/// stands.
+///
+/// **Deadlines.** The serve loop bounds only the *open* (handshake) phase with
+/// the pull-through deadline. The streaming `next_chunk`/`finish` reads here are
+/// NOT each deadline-bounded: a stalled upstream mid-stream is bounded by the
+/// QUIC idle timeout and by the loop's own pacing — it stops pulling and recoups
+/// a downstream voucher every window, so it cannot run unboundedly ahead of
+/// (unpaid) downstream demand — rather than by a per-read timeout in this type.
+pub struct UpstreamPull {
+    conn: iroh::endpoint::Connection,
+    send: SendStream,
+    recv: RecvStream,
+    ctx: ChannelContext,
+    progress: VoucherProgress,
+    hash: [u8; 32],
+    byte_offset: u64,
+    rate_per_mb: u64,
+    interval_bytes: u64,
+    /// Promised remaining bytes (`total_bytes - byte_offset`).
+    expected: u64,
+    /// Bytes received so far on this stream.
+    cumulative: u64,
+    /// Bytes received since the last voucher.
+    unvouchered: u64,
+    /// Incremental whole-blob BLAKE3 (only fed/checked for a full fetch,
+    /// `byte_offset == 0`) — hashes chunks as they stream so we never buffer the
+    /// blob just to verify it.
+    hasher: blake3::Hasher,
+    /// `StreamEnd` seen — `next_chunk` returns `None` and `finish` skips the
+    /// drain.
+    ended: bool,
+}
+
+impl std::fmt::Debug for UpstreamPull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamPull")
+            .field("hash", &Hash::from_bytes(self.hash))
+            .field("expected", &self.expected)
+            .field("cumulative", &self.cumulative)
+            .field("ended", &self.ended)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Open a progressive `cdn/client/v1` pull (#856): connect, send the
+/// [`StreamRequest`], read and verify the signed [`StreamResponse`] (so
+/// `total_bytes` is known up front), and return its header plus a live
+/// [`UpstreamPull`] to drive. The same response-validation rules as
+/// [`stream_fetch`] apply — zero-rate rejection, `slash_sig` recovery, echoed
+/// field checks, the [`BlobTooLargeClaim`] ceiling, and the
+/// `total_bytes >= byte_offset` floor — all enforced BEFORE the first chunk.
+///
+/// # Errors
+///
+/// Same set as [`stream_fetch`] for the handshake/response phase (connect /
+/// transport, refused or zero-rate response, bad `slash_sig`, mismatched echoed
+/// field, oversized `total_bytes`).
+#[allow(clippy::too_many_arguments)]
+pub async fn open_progressive_pull(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &ChannelContext,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    max_blob_size_bytes: u64,
+) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+    // Full handshake — no 0-RTT on cdn/client/v1 (ADR 015).
+    let conn = endpoint
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
+
+    let req = StreamRequest {
+        hash,
+        channel_id: ctx.channel_id.into(),
+        byte_offset,
+        timestamp_us,
+    };
+    let payload = decdn_protocol::encode_stream_request(&req, None)
+        .map_err(|e| anyhow::anyhow!("encode stream request: {e}"))?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write stream request: {e}"))?;
+
+    let resp = match read_client_message(&mut recv).await? {
+        ClientMessage::StreamResponse(r) => r,
+        other => anyhow::bail!("expected StreamResponse, got {}", variant_name(&other)),
+    };
+    verify_response(
+        &resp,
+        slash_domain,
+        expected_signer,
+        hash,
+        ctx.channel_id,
+        timestamp_us,
+    )?;
+    if !resp.body.ok {
+        anyhow::bail!("delivery refused: {:?}", resp.error);
+    }
+    if resp.body.redirect.is_some() {
+        anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
+    }
+    // Same buyer-side ceiling as `fetch_inner`: reject an inflated `total_bytes`
+    // before forwarding/allocating anything (#840). Typed sentinel so the pull
+    // orchestrator classifies it as a buyer policy rejection, not provider fault.
+    if max_blob_size_bytes > 0 && resp.body.total_bytes > max_blob_size_bytes {
+        return Err(anyhow::Error::new(BlobTooLargeClaim {
+            claimed: resp.body.total_bytes,
+            ceiling: max_blob_size_bytes,
+        }));
+    }
+    if resp.body.total_bytes < byte_offset {
+        anyhow::bail!(
+            "server claimed total_bytes ({}) below the requested byte_offset ({})",
+            resp.body.total_bytes,
+            byte_offset
+        );
+    }
+
+    let rate_per_mb = resp.body.rate_per_mb;
+    let interval_bytes = resp
+        .voucher_interval_mb
+        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
+        .saturating_mul(MB_BYTES);
+    let expected = resp.body.total_bytes.saturating_sub(byte_offset);
+    let header = UpstreamPullHeader {
+        total_bytes: resp.body.total_bytes,
+        rate_per_mb,
+        interval_bytes,
+    };
+    let pull = UpstreamPull {
+        conn,
+        send,
+        recv,
+        ctx: ctx.clone(),
+        progress: VoucherProgress::seed(ctx),
+        hash,
+        byte_offset,
+        rate_per_mb,
+        interval_bytes,
+        expected,
+        cumulative: 0,
+        unvouchered: 0,
+        hasher: blake3::Hasher::new(),
+        ended: false,
+    };
+    Ok((header, pull))
+}
+
+impl UpstreamPull {
+    /// Bytes this stream will deliver: the upstream's promised `total_bytes`
+    /// minus the requested `byte_offset` (the full `total_bytes` for a fresh
+    /// fetch, the remaining suffix for a resumed one).
+    #[must_use]
+    pub const fn expected(&self) -> u64 {
+        self.expected
+    }
+
+    /// The current acked voucher watermark — read it on any exit (including an
+    /// error from `next_chunk`) to persist what was paid (#852).
+    #[must_use]
+    pub const fn progress(&self) -> VoucherProgress {
+        self.progress
+    }
+
+    /// Read the next `ChunkData`, paying the upstream at each voucher-interval
+    /// boundary (and a closing voucher once all promised bytes have arrived),
+    /// and return the chunk for the caller to forward downstream + tee to cache.
+    /// Returns `Ok(None)` on `StreamEnd`.
+    ///
+    /// # Errors
+    ///
+    /// An over-`CHUNK_SIZE` chunk, more bytes than promised, a mid-stream
+    /// `StreamError`, an unexpected message, or a [`UpstreamVoucherRejected`] /
+    /// transport error while paying.
+    pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
+        if self.ended {
+            return Ok(None);
+        }
+        match read_client_message(&mut self.recv).await? {
+            ClientMessage::ChunkData(chunk) => {
+                if chunk.bytes.len() > decdn_protocol::CHUNK_SIZE {
+                    anyhow::bail!("chunk of {} bytes exceeds CHUNK_SIZE", chunk.bytes.len());
+                }
+                self.cumulative = self.cumulative.saturating_add(chunk.bytes.len() as u64);
+                if self.cumulative > self.expected {
+                    anyhow::bail!(
+                        "server sent {} bytes, more than the {} promised",
+                        self.cumulative,
+                        self.expected
+                    );
+                }
+                // Feed the incremental hash only for a full fetch — a resumed
+                // fetch cannot recompute the whole-blob hash from a suffix.
+                if self.byte_offset == 0 {
+                    self.hasher.update(&chunk.bytes);
+                }
+                self.unvouchered = self.unvouchered.saturating_add(chunk.bytes.len() as u64);
+                let boundary = self.unvouchered >= self.interval_bytes && self.interval_bytes > 0;
+                let closing = self.cumulative >= self.expected && self.unvouchered > 0;
+                if boundary || closing {
+                    self_pay(
+                        &mut self.send,
+                        &mut self.recv,
+                        &self.ctx,
+                        self.rate_per_mb,
+                        self.cumulative,
+                        &mut self.progress,
+                    )
+                    .await?;
+                    self.unvouchered = 0;
+                }
+                Ok(Some(Bytes::from(chunk.bytes)))
+            }
+            ClientMessage::StreamEnd => {
+                self.ended = true;
+                Ok(None)
+            }
+            ClientMessage::StreamError(e) => anyhow::bail!("stream failed: {e:?}"),
+            other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
+        }
+    }
+
+    /// Finalize a completed pull: drain to `StreamEnd` if needed, enforce the
+    /// completeness check (resumes) and whole-blob hash (full fetches), close the
+    /// connection cleanly, and return the final acked watermark to persist.
+    ///
+    /// # Errors
+    ///
+    /// [`HashMismatch`] on a corrupt full-fetch delivery, or a short/over-long
+    /// delivery, mirroring [`stream_fetch`]'s completeness rules.
+    pub async fn finish(mut self) -> anyhow::Result<VoucherProgress> {
+        while !self.ended {
+            match read_client_message(&mut self.recv).await? {
+                ClientMessage::StreamEnd => self.ended = true,
+                ClientMessage::ChunkData(_) => {
+                    anyhow::bail!("server sent ChunkData after the promised total")
+                }
+                ClientMessage::StreamError(e) => anyhow::bail!("stream failed: {e:?}"),
+                other => {
+                    anyhow::bail!("unexpected message at stream end: {}", variant_name(&other))
+                }
+            }
+        }
+        // Resume completeness (see `fetch_inner` for the rationale): a resumed
+        // fetch has no whole-blob hash, so the promised remainder is the only
+        // completeness signal.
+        if self.byte_offset > 0 && self.cumulative < self.expected {
+            self.conn.close(0u32.into(), b"short-delivery");
+            anyhow::bail!(
+                "server sent {} of {} promised bytes before StreamEnd",
+                self.cumulative,
+                self.expected
+            );
+        }
+        // Whole-blob integrity on a full fetch — the incremental hash over the
+        // forwarded chunks must equal the requested content hash.
+        if self.byte_offset == 0 {
+            let digest = Hash::from_bytes(*self.hasher.finalize().as_bytes());
+            if digest != Hash::from_bytes(self.hash) {
+                self.conn.close(0u32.into(), b"hash-mismatch");
+                return Err(anyhow::Error::new(HashMismatch));
+            }
+        }
+        self.conn.close(0u32.into(), b"done");
+        Ok(self.progress)
+    }
+
+    /// Abandon the pull (e.g. the downstream client dropped, so we stop pulling
+    /// and paying). Closes the connection and returns the acked watermark so the
+    /// caller can still persist what it paid (#852).
+    #[must_use]
+    pub fn abort(self) -> VoucherProgress {
+        self.conn.close(0u32.into(), b"client-abandoned");
+        self.progress
+    }
+}
+
+impl Drop for UpstreamPull {
+    /// Safety net for the "call a terminal method on every exit" contract: if a
+    /// caller returns or panics without `finish`/`abort`, still close the upstream
+    /// connection so the QUIC stream and the upstream's server-side serve task
+    /// don't linger and keep that paid stream half-open. `Connection::close` is
+    /// first-wins and idempotent, so an explicit close in `finish`/`abort` keeps
+    /// its richer reason and this is a no-op when one of them ran; it only takes
+    /// effect on a dropped-without-finalize path. The acked watermark cannot be
+    /// recovered from `drop` (it can't be returned), so this bounds only the
+    /// connection leak, not the #852 watermark loss the doc contract guards.
+    fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"upstream-pull-dropped");
+    }
+}
+
 /// Sign and send a cumulative voucher for the channel-wide bytes delivered so
 /// far (prior state + `stream_bytes` of this stream), then await `VoucherAck`.
 ///
@@ -639,5 +975,35 @@ const fn variant_name(msg: &ClientMessage) -> &'static str {
         ClientMessage::VoucherAck => "VoucherAck",
         ClientMessage::StreamEnd => "StreamEnd",
         ClientMessage::StreamError(_) => "StreamError",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The progressive pull verifies integrity with an INCREMENTAL BLAKE3 over
+    /// the forwarded chunks (`UpstreamPull::finish`) instead of `Hash::new` over
+    /// a buffered blob (`fetch_inner`). This pins the equivalence the swap relies
+    /// on: feeding a hasher chunk-by-chunk yields the same content hash
+    /// iroh-blobs addresses with, for any chunk split.
+    #[test]
+    fn incremental_blake3_matches_whole_blob_hash() {
+        let payload: Vec<u8> = (0..300_000u32)
+            .map(|i| u8::try_from(i % 256).unwrap_or(0))
+            .collect();
+        let whole = Hash::new(&payload);
+
+        for chunk_len in [1usize, 7, 1024, 65_536, payload.len()] {
+            let mut hasher = blake3::Hasher::new();
+            for chunk in payload.chunks(chunk_len) {
+                hasher.update(chunk);
+            }
+            let incremental = Hash::from_bytes(*hasher.finalize().as_bytes());
+            assert_eq!(
+                incremental, whole,
+                "incremental hash with chunk_len={chunk_len} must equal Hash::new"
+            );
+        }
     }
 }

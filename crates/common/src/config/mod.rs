@@ -166,6 +166,22 @@ pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
 /// serving path gives up (#859).
 pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 
+/// Default window-paced pull-through pipeline window (#856, ADR 037
+/// `pull_ahead_bytes`): 1 MiB ≈ one voucher interval. The serving node pulls at
+/// most this many bytes ahead of the requesting client's cleared payment, so an
+/// abandoned request costs at most this window of upstream spend, not the whole
+/// blob.
+pub const DEFAULT_PULL_AHEAD_BYTES: u64 = 1_048_576;
+/// Default node-wide unrecouped-leech budget (#856, ADR 037
+/// `max_unrecouped_leech_bytes`): 256 MiB. Aggregate speculative pull-through
+/// spend above this pauses until the node serves and recoups. Finite by ADR
+/// commitment; operator-tunable and modeled before locking.
+pub const DEFAULT_MAX_UNRECOUPED_LEECH_BYTES: u64 = 256 * 1024 * 1024;
+/// Default per-peer share ratio (#856, ADR 037 `share_ratio`): 400 == 4.0×. A
+/// peer may be pulled for up to 4× the bytes it has been served, plus the
+/// opening `pull_ahead_bytes` window. Bounded by ADR commitment.
+pub const DEFAULT_PULL_SHARE_RATIO_PERCENT: u64 = 400;
+
 /// Default size at which the download-receipt log rotates (#802): 128 MiB.
 /// With the default `retained_files` this bounds the audit log to ~640 MiB
 /// of `data_dir` while still keeping a multi-hundred-MiB delivery history.
@@ -1137,6 +1153,7 @@ fn resolve_cache(
     one_section(|bag| resolve_cache_into(cli, file, data_dir, bag))
 }
 
+#[allow(clippy::too_many_lines)] // one flat field-by-field resolution; splitting obscures it.
 fn resolve_cache_into(
     cli: &crate::cli::run::CacheArgs,
     file: Option<&types::CacheConfig>,
@@ -1242,6 +1259,34 @@ fn resolve_cache_into(
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
+    let pull_ahead_bytes = file
+        .and_then(|c| c.pull_ahead_bytes)
+        .unwrap_or(DEFAULT_PULL_AHEAD_BYTES);
+    let max_unrecouped_leech_bytes = file
+        .and_then(|c| c.max_unrecouped_leech_bytes)
+        .unwrap_or(DEFAULT_MAX_UNRECOUPED_LEECH_BYTES);
+    let pull_share_ratio_percent = file
+        .and_then(|c| c.pull_share_ratio_percent)
+        .unwrap_or(DEFAULT_PULL_SHARE_RATIO_PERCENT);
+
+    // A single request's speculative pull-ahead window must fit within the
+    // node-wide unrecouped-leech budget (#856). Otherwise one request can drive
+    // the global counter past the cap before its first voucher clears, so the
+    // budget cannot accommodate even one window and every speculative serve
+    // refuses immediately. `max_unrecouped_leech_bytes == 0` disables the global
+    // cap, so the check only binds when the budget is enabled.
+    bag.check_with(
+        max_unrecouped_leech_bytes == 0 || pull_ahead_bytes <= max_unrecouped_leech_bytes,
+        "cache.pull_ahead_bytes",
+        || {
+            format!(
+                "cache.pull_ahead_bytes ({pull_ahead_bytes}) must not exceed \
+                 cache.max_unrecouped_leech_bytes ({max_unrecouped_leech_bytes}): a single \
+                 request's pull-ahead window cannot be larger than the node-wide \
+                 unrecouped-leech budget"
+            )
+        },
+    );
 
     ResolvedCache {
         cache_dir,
@@ -1257,6 +1302,9 @@ fn resolve_cache_into(
         node_to_node_pull_through_enabled,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
+        pull_ahead_bytes,
+        max_unrecouped_leech_bytes,
+        pull_share_ratio_percent,
     }
 }
 
@@ -4009,6 +4057,46 @@ mod tests {
         anyhow::ensure!(
             msg.contains("cache.origin.path") && msg.contains("must not be empty"),
             "error lacked context: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_rejects_window_larger_than_leech_budget() -> anyhow::Result<()> {
+        // #856: a per-request pull-ahead window larger than the node-wide
+        // unrecouped-leech budget is rejected — one request could drive the global
+        // counter past the cap before its first voucher clears.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            pull_ahead_bytes: Some(8 * 1024 * 1024),
+            max_unrecouped_leech_bytes: Some(1024 * 1024),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected window-vs-budget rejection"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("cache.pull_ahead_bytes") && msg.contains("max_unrecouped_leech_bytes"),
+            "error lacked context: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_allows_large_window_when_global_cap_disabled() -> anyhow::Result<()> {
+        // `max_unrecouped_leech_bytes == 0` disables the global cap, so the
+        // window-vs-budget check does not bind.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            pull_ahead_bytes: Some(8 * 1024 * 1024),
+            max_unrecouped_leech_bytes: Some(0),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.pull_ahead_bytes == 8 * 1024 * 1024,
+            "window not preserved when the global cap is disabled"
         );
         Ok(())
     }

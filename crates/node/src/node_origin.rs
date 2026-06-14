@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::U256;
+use alloy::primitives::{Address, B256, U256};
 use bytes::Bytes;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
@@ -56,7 +56,8 @@ use decdn_reputation::{
 
 use crate::buyer_channel::ChannelOpener;
 use crate::client_requester::{
-    BlobTooLargeClaim, HashMismatch, PullTimeout, UpstreamVoucherRejected, VoucherProgress,
+    BlobTooLargeClaim, HashMismatch, PullTimeout, UpstreamPull, UpstreamPullHeader,
+    UpstreamVoucherRejected, VoucherProgress, open_progressive_pull as open_progressive_upstream,
     stream_fetch_tracked,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
@@ -181,6 +182,256 @@ impl NodeOrigin {
     pub fn provision(&self, deps: NodeOriginDeps) {
         if self.deps.set(deps).is_err() {
             warn!("NodeOrigin provisioned more than once; keeping the first dependency set");
+        }
+    }
+
+    /// Open a window-paced progressive pull for `hash` (#856), the streaming
+    /// counterpart of [`Origin::fetch`]'s buffered pull. Runs the same
+    /// discover → probe → rank → open-channel pipeline, but instead of buffering
+    /// the whole blob it returns the upstream header (so the caller can sign its
+    /// own `StreamResponse`) and a live [`NodeProgressivePull`] the caller drives
+    /// chunk-by-chunk — forwarding each chunk to the paying downstream client and
+    /// teeing it into the cache — so per-request speculative exposure is bounded
+    /// to the caller's window rather than the entire upstream cost.
+    ///
+    /// Candidate fallback happens at OPEN time only: it walks the ranked
+    /// candidates until one successfully opens (handshake + verified response),
+    /// because once the caller starts forwarding it is committed to that
+    /// upstream's `total_bytes`. Returns `None` if pull-through is unprovisioned,
+    /// no provider is reachable, or every candidate declined.
+    pub async fn open_progressive_pull(
+        &self,
+        hash: Hash,
+    ) -> Option<(UpstreamPullHeader, NodeProgressivePull)> {
+        let deps = self.deps.get()?;
+        let hash_bytes = *hash.as_bytes();
+        let providers = discover(deps, hash_bytes).await;
+        if providers.is_empty() {
+            deps.metrics.node_pull_no_providers();
+            debug!(%hash, "node-origin: no providers discovered for window-paced pull");
+            return None;
+        }
+        deps.metrics.node_pull_attempt();
+        let ranked = probe_and_rank(deps, providers, hash_bytes).await;
+        for candidate in ranked.iter().take(MAX_PROVIDER_ATTEMPTS) {
+            if let Some(opened) = self.open_from_candidate(deps, candidate, hash_bytes).await {
+                return Some(opened);
+            }
+        }
+        None
+    }
+
+    /// Resolve, open/reuse a channel, and open a progressive upstream pull from
+    /// one candidate. Returns the header + driver on a clean open; `None`
+    /// (try the next candidate) on an unresolvable address, channel-open failure,
+    /// or a declined/erroring response (classified like the buffered path).
+    async fn open_from_candidate(
+        &self,
+        deps: &NodeOriginDeps,
+        candidate: &Candidate,
+        hash_bytes: [u8; 32],
+    ) -> Option<(UpstreamPullHeader, NodeProgressivePull)> {
+        let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
+            return None;
+        };
+        let Some(provider_addr) = deps
+            .addr_resolver
+            .address_of(&DhtNodeId::from_bytes(candidate.node_id))
+        else {
+            debug!("node-origin: candidate has no resolvable operator address; skipping");
+            return None;
+        };
+        let ctx = match deps
+            .buyer
+            .open_or_reuse_channel(provider_addr, deps.config.deposit_hint)
+            .await
+        {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                deps.metrics.node_pull_channel_open_failure();
+                debug!(%provider_addr, %err, "node-origin: buyer channel open/reuse failed");
+                return None;
+            }
+        };
+        match open_progressive_upstream(
+            &deps.endpoint,
+            EndpointAddr::new(pk),
+            &ctx,
+            &deps.slash_domain,
+            provider_addr,
+            hash_bytes,
+            0,
+            now_micros(),
+            deps.config.max_blob_size_bytes,
+        )
+        .await
+        {
+            Ok((header, pull)) => Some((
+                header,
+                NodeProgressivePull {
+                    deps: Arc::clone(&self.deps),
+                    pull,
+                    pk,
+                    provider_addr,
+                    channel_id: ctx.channel_id,
+                    started: Instant::now(),
+                    delivered: 0,
+                    node_id: candidate.node_id,
+                    hash_bytes,
+                    prior_amount: ctx.prior_amount,
+                    prior_bytes_delivered: ctx.prior_bytes_delivered,
+                },
+            )),
+            Err(err) => {
+                // No bytes were forwarded and no voucher was paid yet, so there is
+                // nothing to persist; just classify and try the next candidate.
+                classify_pull_failure(deps, pk, provider_addr, &err);
+                None
+            }
+        }
+    }
+}
+
+/// A live window-paced node→node pull (#856) handed to the `cdn/client/v1`
+/// serve path. Wraps the [`UpstreamPull`] transport with the node-origin
+/// bookkeeping (buyer-watermark persistence #852, reputation scoring, region
+/// accounting) so the serve handler only has to pump chunks and call one
+/// terminal method. Obtain via [`NodeOrigin::open_progressive_pull`].
+#[derive(Debug)]
+pub struct NodeProgressivePull {
+    deps: Arc<OnceLock<NodeOriginDeps>>,
+    pull: UpstreamPull,
+    pk: PublicKey,
+    provider_addr: Address,
+    channel_id: B256,
+    started: Instant,
+    /// Bytes pulled (and forwarded) on this stream — the region/reputation count.
+    delivered: u64,
+    /// Candidate node id, for region accounting.
+    node_id: [u8; 32],
+    /// Blob hash, for the prefetch acquisition-ledger feed (#820).
+    hash_bytes: [u8; 32],
+    /// Channel cumulative amount/bytes BEFORE this pull, so the finalize path can
+    /// compute this pull's spend/byte delta for the prefetch ledger (#820).
+    prior_amount: U256,
+    prior_bytes_delivered: U256,
+}
+
+impl NodeProgressivePull {
+    /// Read and forward the next upstream chunk, paying the upstream per voucher
+    /// interval. `Ok(None)` signals the upstream `StreamEnd`. Tracks delivered
+    /// bytes for the success-path region/reputation accounting.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`UpstreamPull::next_chunk`] errors (chunk-size / overrun /
+    /// mid-stream `StreamError` / voucher rejection).
+    pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
+        let chunk = self.pull.next_chunk().await?;
+        if let Some(bytes) = &chunk {
+            self.delivered = self.delivered.saturating_add(bytes.len() as u64);
+        }
+        Ok(chunk)
+    }
+
+    /// Finalize a cleanly-completed pull: run the upstream completeness +
+    /// whole-blob hash check, persist the buyer watermark (#852), and score the
+    /// provider (`Delivered` + region on success, classified failure otherwise).
+    ///
+    /// # Errors
+    ///
+    /// [`HashMismatch`] (paid-but-corrupt) or a short delivery — the same set
+    /// [`UpstreamPull::finish`] surfaces. The watermark is persisted either way.
+    pub async fn finish(self) -> anyhow::Result<()> {
+        let Self {
+            deps,
+            pull,
+            pk,
+            provider_addr,
+            channel_id,
+            started,
+            delivered,
+            node_id,
+            hash_bytes,
+            prior_amount,
+            prior_bytes_delivered,
+        } = self;
+        // Capture the acked watermark before `finish` consumes the pull so a
+        // paid-but-corrupt delivery is still persisted (#852).
+        let watermark = pull.progress();
+        let verify = pull.finish().await;
+        let elapsed = started.elapsed();
+        let Some(deps) = deps.get() else {
+            // Unprovisioned under us (cannot happen in practice — we got here via
+            // a provisioned open) — surface the verify result without scoring.
+            return verify.map(|_| ());
+        };
+        persist_buyer_progress(deps, provider_addr, channel_id, &watermark);
+        // Feed the prefetch ledger (#820) on both Ok and Err — see the buffered
+        // path; the window path is demand-miss today, so the observer no-ops, but
+        // wiring it keeps the ledger correct if a prefetch pull is ever routed here.
+        feed_acquisition_observer(
+            deps,
+            hash_bytes,
+            &watermark,
+            prior_amount,
+            prior_bytes_delivered,
+        );
+        match verify {
+            Ok(_) => {
+                record_outcome(
+                    deps,
+                    pk,
+                    &Outcome::Delivered {
+                        bytes: delivered,
+                        elapsed,
+                    },
+                );
+                deps.region_accountant
+                    .record_pulled(&node_id, delivered)
+                    .await;
+                Ok(())
+            }
+            Err(err) => {
+                classify_pull_failure(deps, pk, provider_addr, &err);
+                Err(err)
+            }
+        }
+    }
+
+    /// Abandon the pull (the downstream client dropped, underpaid, or a
+    /// `next_chunk` errored). Persists whatever was paid (#852) and, when a
+    /// `cause` error is supplied, scores the provider for it. Closes the upstream
+    /// connection so we stop receiving and paying immediately.
+    pub fn abandon(self, cause: Option<&anyhow::Error>) {
+        let Self {
+            deps,
+            pull,
+            pk,
+            provider_addr,
+            channel_id,
+            hash_bytes,
+            prior_amount,
+            prior_bytes_delivered,
+            ..
+        } = self;
+        let watermark = pull.abort();
+        let Some(deps) = deps.get() else {
+            return;
+        };
+        persist_buyer_progress(deps, provider_addr, channel_id, &watermark);
+        // A paid-but-abandoned pull still advanced the watermark (#852); feed its
+        // spend to the prefetch ledger (#820) for the same reason as the buffered
+        // path's Err arm — see `feed_acquisition_observer`.
+        feed_acquisition_observer(
+            deps,
+            hash_bytes,
+            &watermark,
+            prior_amount,
+            prior_bytes_delivered,
+        );
+        if let Some(err) = cause {
+            classify_pull_failure(deps, pk, provider_addr, err);
         }
     }
 }
@@ -425,44 +676,16 @@ async fn pull_from_candidate(
     // the delivery-speed reputation signal for a reason unrelated to the network
     // pull.
     let elapsed = started.elapsed();
-    // Persist whatever the upstream acked, regardless of Ok/Err: a mid-stream
-    // failure or a paid-but-corrupt (hash-mismatch) delivery can still have
-    // advanced the upstream's accepted-voucher watermark. Skipping this is the
-    // #852 bug — the channel re-signs a stale voucher on its next reuse and is
-    // rejected. The bytes are already paid for, so a persist failure must not
-    // fail the pull; surface it loudly instead (it breaks the next reuse).
-    if let Some((nonce, bytes_delivered, amount)) = progress.acked()
-        && let Err(err) = deps.buyer.record_progress(
-            provider_addr,
-            ctx.channel_id,
-            nonce,
-            bytes_delivered,
-            amount,
-        )
-    {
-        deps.metrics.node_pull_progress_persist_failure();
-        warn!(%provider_addr, %err, "node-origin: failed to persist buyer voucher progress");
-    }
-    // Surface this pull's cost to the prefetch ledger (#820) for BOTH a
-    // successful and a paid-but-failed delivery: the voucher watermark — and
-    // thus real spend — can advance even on a mid-stream failure (#852), and the
-    // rolling-1h prefetch budget must account for every micro-USDC spent, not
-    // just the successes (else the budget gate silently under-counts and can be
-    // overspent by repeated failing pulls). Per-pull spend/bytes are the
-    // channel-cumulative watermark minus the channel's prior cumulative
-    // (`progress` is seeded from `ctx.prior_*` inside `stream_fetch_tracked`),
-    // i.e. the delta for THIS pull, not the running total. The observer itself
-    // filters to prefetch-initiated pulls; demand-miss pulls are ignored there.
-    if let Some(obs) = &deps.acquisition_observer
-        && let Some((_, bytes_delivered, amount)) = progress.acked()
-    {
-        let spent = narrow_pull_delta(amount.saturating_sub(ctx.prior_amount), "spend");
-        let acquired = narrow_pull_delta(
-            bytes_delivered.saturating_sub(ctx.prior_bytes_delivered),
-            "bytes",
-        );
-        obs.on_pull(hash_bytes, spent, acquired);
-    }
+    persist_buyer_progress(deps, provider_addr, ctx.channel_id, &progress);
+    // Surface this pull's cost to the prefetch ledger (#820); see the helper for
+    // why this fires on both success and a paid-but-failed delivery.
+    feed_acquisition_observer(
+        deps,
+        hash_bytes,
+        &progress,
+        ctx.prior_amount,
+        ctx.prior_bytes_delivered,
+    );
     match result {
         Ok(bytes) => {
             record_outcome(
@@ -488,57 +711,90 @@ async fn pull_from_candidate(
             Some(bytes)
         }
         Err(err) => {
-            // An oversized-blob claim is OUR ceiling, not the provider's fault —
-            // it may legitimately serve larger blobs to nodes configured with a
-            // higher `max_blob_size`. Like the channel-open failure above, record
-            // it for observability but don't tar its reputation; just try the
-            // next candidate (#840).
-            if err.downcast_ref::<BlobTooLargeClaim>().is_some() {
-                deps.metrics.node_pull_too_large();
-                debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
-                return None;
-            }
-            // OUR own per-candidate deadline firing — a possibly mis-sized local
-            // `pull_timeout`, not evidence the provider is unreachable. Like the
-            // channel-open failure above, record it for observability but don't
-            // tar its reputation locally or over gossip (#857).
-            if err.downcast_ref::<PullTimeout>().is_some() {
-                deps.metrics.node_pull_timeout();
-                debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; not tarring upstream reputation");
-                return None;
-            }
-            // The upstream rejected a voucher WE presented — a stale nonce (#852),
-            // deposit exhaustion, or a channel mismatch. That is our payment-side
-            // fault, not the provider's, so skip the candidate without recording a
-            // reputation observation (#857). This arm is intentionally reason-
-            // agnostic: every `VoucherRejectReason` abandons the candidate. The
-            // typed reason is carried for future per-reason handling (e.g. honoring
-            // `RetryLater` by resending the same voucher rather than abandoning),
-            // which is not yet wired — same terminal behavior as the pre-#857 code.
-            if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
-                deps.metrics.node_pull_voucher_rejected();
-                debug!(%provider_addr, %err, "node-origin: upstream rejected our voucher (our payment fault); not tarring upstream reputation");
-                return None;
-            }
-            // A whole-blob hash mismatch (the typed `HashMismatch` sentinel,
-            // matched by `downcast_ref` — not a brittle message string) means the
-            // peer was reachable and paid but served wrong bytes → Corruption;
-            // everything else is an unreachable/transport failure. The one residual
-            // buyer-side error that still lands here is a failure to sign/encode our
-            // OWN voucher (`self_pay`): that signals a catastrophic local fault (a
-            // broken signer), not the routine honest-provider mis-scoring #857
-            // fixes, so it is intentionally not exonerated — a single stray
-            // `Unreachable` is negligible next to a node whose payment side is dead.
-            let outcome = if err.downcast_ref::<HashMismatch>().is_some() {
-                Outcome::Corruption
-            } else {
-                Outcome::Unreachable
-            };
-            debug!(%provider_addr, %err, ?outcome, "node-origin: upstream pull failed");
-            record_outcome(deps, pk, &outcome);
+            classify_pull_failure(deps, pk, provider_addr, &err);
             None
         }
     }
+}
+
+/// Persist whatever the upstream acked, regardless of Ok/Err (#852): a
+/// mid-stream failure or a paid-but-corrupt (hash-mismatch) delivery can still
+/// have advanced the upstream's accepted-voucher watermark. Skipping this lets
+/// the channel re-sign a stale voucher on its next reuse and be rejected. The
+/// bytes are already paid for, so a persist failure must not fail the pull;
+/// surface it loudly instead (it breaks the next reuse). Shared by the buffered
+/// [`pull_from_candidate`] and the window-paced [`NodeProgressivePull`] (#856).
+fn persist_buyer_progress(
+    deps: &NodeOriginDeps,
+    provider_addr: Address,
+    channel_id: B256,
+    progress: &VoucherProgress,
+) {
+    if let Some((nonce, bytes_delivered, amount)) = progress.acked()
+        && let Err(err) =
+            deps.buyer
+                .record_progress(provider_addr, channel_id, nonce, bytes_delivered, amount)
+    {
+        deps.metrics.node_pull_progress_persist_failure();
+        warn!(%provider_addr, %err, "node-origin: failed to persist buyer voucher progress");
+    }
+}
+
+/// Classify a failed pull and fold the appropriate (or no) reputation outcome,
+/// shared by the buffered and window-paced paths (#856). Buyer-side faults are
+/// exonerated (don't tar the provider); a hash mismatch is `Corruption`;
+/// everything else is `Unreachable`.
+// Straight-line downcast → classify → log chain; the tracing macros inflate the
+// cognitive-complexity metric past threshold (same inflation noted on the
+// pre-extraction `pull_from_candidate`). Splitting the four sentinel arms would
+// scatter one linear classification across helpers.
+#[allow(clippy::cognitive_complexity)]
+fn classify_pull_failure(
+    deps: &NodeOriginDeps,
+    pk: PublicKey,
+    provider_addr: Address,
+    err: &anyhow::Error,
+) {
+    // An oversized-blob claim is OUR ceiling, not the provider's fault — it may
+    // legitimately serve larger blobs to nodes configured with a higher
+    // `max_blob_size`. Record it for observability but don't tar reputation (#840).
+    if err.downcast_ref::<BlobTooLargeClaim>().is_some() {
+        deps.metrics.node_pull_too_large();
+        debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
+        return;
+    }
+    // OUR own per-candidate deadline firing — a possibly mis-sized local
+    // `pull_timeout`, not evidence the provider is unreachable. Don't tar its
+    // reputation locally or over gossip (#857).
+    if err.downcast_ref::<PullTimeout>().is_some() {
+        deps.metrics.node_pull_timeout();
+        debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; not tarring upstream reputation");
+        return;
+    }
+    // The upstream rejected a voucher WE presented — a stale nonce (#852),
+    // deposit exhaustion, or a channel mismatch. That is our payment-side fault,
+    // not the provider's, so skip the candidate without recording a reputation
+    // observation (#857). Reason-agnostic: every `VoucherRejectReason` abandons.
+    if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
+        deps.metrics.node_pull_voucher_rejected();
+        debug!(%provider_addr, %err, "node-origin: upstream rejected our voucher (our payment fault); not tarring upstream reputation");
+        return;
+    }
+    // A whole-blob hash mismatch (the typed `HashMismatch` sentinel, matched by
+    // `downcast_ref` — not a brittle message string) means the peer was reachable
+    // and paid but served wrong bytes → Corruption; everything else is an
+    // unreachable/transport failure. The one residual buyer-side error that still
+    // lands here is a failure to sign/encode our OWN voucher (`self_pay`): a
+    // catastrophic local fault (a broken signer), not the routine honest-provider
+    // mis-scoring #857 fixes, so it is intentionally not exonerated — a single
+    // stray `Unreachable` is negligible next to a node whose payment side is dead.
+    let outcome = if err.downcast_ref::<HashMismatch>().is_some() {
+        Outcome::Corruption
+    } else {
+        Outcome::Unreachable
+    };
+    debug!(%provider_addr, %err, ?outcome, "node-origin: upstream pull failed");
+    record_outcome(deps, pk, &outcome);
 }
 
 /// The combined local+network reputation for `pk` at `now_secs`, as the `f32`
@@ -552,14 +808,50 @@ fn combined_reputation(deps: &NodeOriginDeps, pk: PublicKey, now_secs: u64) -> f
     combined_score(Some(local), network, &deps.rep_cfg) as f32
 }
 
+/// Feed the prefetch acquisition ledger (#820) with THIS pull's spend/byte
+/// deltas, for BOTH a successful and a paid-but-failed delivery (the watermark —
+/// and thus real spend — can advance even on a mid-stream failure #852, and the
+/// rolling-1h budget must account for every micro-USDC spent, not just the
+/// successes, or the gate silently under-counts and can be overspent). Deltas are
+/// the acked watermark minus the channel's prior cumulative (the delta for THIS
+/// pull, not the running total). No-op when no observer is attached or nothing
+/// was acked.
+///
+/// Fires for ALL pull paths — the buffered `pull_from_candidate` AND the
+/// window-paced `NodeProgressivePull` finalize — so the ledger never silently
+/// misses spend that a future routing change pushes onto the window path. The
+/// observer itself filters to prefetch-initiated pulls; a demand-miss pull (the
+/// entire window-paced serve path today) is a harmless no-op inside `on_pull`.
+fn feed_acquisition_observer(
+    deps: &NodeOriginDeps,
+    hash_bytes: [u8; 32],
+    progress: &VoucherProgress,
+    prior_amount: U256,
+    prior_bytes_delivered: U256,
+) {
+    if let Some(obs) = &deps.acquisition_observer
+        && let Some((_, bytes_delivered, amount)) = progress.acked()
+    {
+        let spent = narrow_pull_delta(amount.saturating_sub(prior_amount), "spend", &deps.metrics);
+        let acquired = narrow_pull_delta(
+            bytes_delivered.saturating_sub(prior_bytes_delivered),
+            "bytes",
+            &deps.metrics,
+        );
+        obs.on_pull(hash_bytes, spent, acquired);
+    }
+}
+
 /// Narrow a per-pull `U256` micro-USDC / byte delta to `u64` for the prefetch
 /// ledger (#820). A real per-pull delta never approaches `u64::MAX`; an overflow
-/// signals upstream voucher-accounting corruption, so log it loudly and fall
-/// back to `0` — the same under-count-not-over-count direction the rest of the
-/// prefetch ledger uses. Clamping HIGH (`u64::MAX`) would instead poison the
+/// signals upstream voucher-accounting corruption, so log it loudly, bump
+/// `node_pull_delta_overflow` so it is alertable (not just log-grep-able), and
+/// fall back to `0` — the same under-count-not-over-count direction the rest of
+/// the prefetch ledger uses. Clamping HIGH (`u64::MAX`) would instead poison the
 /// rolling budget sum and silently pin the gate to permanent exhaustion.
-fn narrow_pull_delta(value: U256, field: &str) -> u64 {
+fn narrow_pull_delta(value: U256, field: &str, metrics: &Metrics) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| {
+        metrics.node_pull_delta_overflow();
         warn!(%value, field, "node-origin: per-pull prefetch {field} delta exceeds u64; recording 0");
         0
     })

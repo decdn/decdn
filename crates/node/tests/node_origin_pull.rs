@@ -24,12 +24,14 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Result;
 use async_trait::async_trait;
+use bytes::BytesMut;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{CacheEngine, Hash};
 use decdn_common::admin::RegionBytes;
 use decdn_incentive::{
-    ChannelState, ChannelStateStore, MemoryChannelStateStore, ProbeSlashData, StreamSlashData,
-    bind_node_id_domain, slash_judge_domain, voucher_domain,
+    ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore,
+    ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
+    signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::ChannelOpener;
 use decdn_node::client_requester::ChannelContext;
@@ -39,17 +41,19 @@ use decdn_node::dht::{
     ConfigOriginDirectory, ConfigStakerSet, NegativeProbeCache, NodeAddressResolver,
     OriginDirectory, StakerSet, StaticNodeAddressDirectory,
 };
+use decdn_node::leech_governor::{LeechCaps, LeechGovernor};
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps};
 use decdn_node::probe_client::probe_once;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver};
 use decdn_protocol::client::{
-    ChunkData, ClientMessage, StreamError, StreamResponse, StreamResponseBody, VoucherRejectReason,
+    ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
+    StreamResponse, StreamResponseBody, VoucherRejectReason,
 };
 use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
 use decdn_protocol::{
-    ALPN_CLIENT, ALPN_PROBE, CHUNK_SIZE, ProbeMessage, decode_message, encode_message, read_frame,
-    write_frame,
+    ALPN_CLIENT, ALPN_PROBE, CHUNK_SIZE, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, ProbeMessage,
+    decode_message, encode_message, encode_stream_request, read_frame, write_frame,
 };
 use decdn_reputation::{
     LocalReputation, LocalReputationConfig, NetworkReputation, NetworkReputationConfig,
@@ -61,7 +65,7 @@ use iroh::endpoint::Connection;
 mod support;
 use support::{
     HandlerDomains, build_handler_full, cache_with_blob, fresh_key, local_endpoint,
-    permissive_limiter,
+    permissive_limiter, spawn_server,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -2349,5 +2353,1327 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
     ep_b.close().await;
     ep_a.close().await;
     task_a.await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #856 — window-paced pull-through end-to-end (leaf → B → A).
+//
+// These exercise the FUSED serve path the prior tests in this file do not:
+// instead of calling `Origin::fetch` directly (the buffered pull), a real leaf
+// client makes a bound `cdn/client/v1` request to node B, whose `ClientHandler`
+// has the window-paced provider attached. B opens a progressive pull from A,
+// forwards each chunk to the leaf while teeing it into B's cache, and paces the
+// upstream spend by the leaf's vouchers. The drop test is the headline #856
+// regression: a leaf that drops right after the first interval must NOT make B
+// front the whole blob upstream.
+// ---------------------------------------------------------------------------
+
+/// What a `leaf_paced_pull` observed.
+struct LeafOutcome {
+    received: u64,
+    acks: u64,
+    completed: bool,
+    hash_ok: bool,
+}
+
+async fn read_client(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMessage> {
+    let frame = read_frame(recv)
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf read frame: {e}"))?;
+    let (msg, _) =
+        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("leaf decode: {e}"))?;
+    Ok(msg)
+}
+
+async fn write_client(send: &mut iroh::endpoint::SendStream, msg: &ClientMessage) -> Result<()> {
+    let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("leaf encode: {e}"))?;
+    write_frame(send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf write: {e}"))?;
+    Ok(())
+}
+
+/// A leaf client that drives B's window-paced serve: it sends a bound
+/// `StreamRequest` (so B's `pull_authorized` passes), then pays one cumulative
+/// voucher per interval as bytes arrive. With `drop_after_acks = Some(n)` it
+/// closes the connection immediately after the n-th `VoucherAck` — the #856
+/// abandon shape.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn leaf_paced_pull(
+    leaf_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    leaf_node_id: B256,
+    leaf_eth: &Arc<PrivateKeySigner>,
+    channel_id: B256,
+    hash: Hash,
+    rate: u64,
+    drop_after_acks: Option<u64>,
+) -> Result<LeafOutcome> {
+    use alloy::signers::SignerSync;
+
+    let conn = leaf_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf open_bi: {e}"))?;
+
+    let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
+    let ext = StreamRequestExt {
+        voucher_interval_mb: None,
+        binding: Some(ClientBinding {
+            ethereum_address: leaf_eth.address().into(),
+            binding_signature,
+        }),
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: channel_id.into(),
+        byte_offset: 0,
+        timestamp_us: 0x9001,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
+
+    let resp = match read_client(&mut recv).await? {
+        ClientMessage::StreamResponse(r) => r,
+        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
+    };
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
+    let total = resp.body.total_bytes;
+    let interval_bytes = resp
+        .voucher_interval_mb
+        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
+        .saturating_mul(MB_BYTES);
+
+    let mut buf = BytesMut::new();
+    let mut cumulative: u64 = 0;
+    let mut unvouchered: u64 = 0;
+    let mut acks: u64 = 0;
+    loop {
+        match read_client(&mut recv).await? {
+            ClientMessage::ChunkData(chunk) => {
+                buf.extend_from_slice(&chunk.bytes);
+                let len = chunk.bytes.len() as u64;
+                cumulative = cumulative.saturating_add(len);
+                unvouchered = unvouchered.saturating_add(len);
+                let boundary = unvouchered >= interval_bytes && interval_bytes > 0;
+                let closing = cumulative >= total && unvouchered > 0;
+                if boundary || closing {
+                    acks += 1;
+                    let amount = U256::from(cumulative)
+                        .saturating_mul(U256::from(rate))
+                        .div_ceil(U256::from(MB_BYTES));
+                    let signed = Voucher {
+                        channel_id,
+                        amount,
+                        nonce: U256::from(acks),
+                        bytes_delivered: U256::from(cumulative),
+                        token: TOKEN,
+                    }
+                    .sign(leaf_eth.as_ref(), &voucher_dom())
+                    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+                    write_client(
+                        &mut send,
+                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
+                    )
+                    .await?;
+                    match read_client(&mut recv).await? {
+                        ClientMessage::VoucherAck => {}
+                        other => anyhow::bail!("expected VoucherAck, got {other:?}"),
+                    }
+                    unvouchered = 0;
+                    if drop_after_acks == Some(acks) {
+                        conn.close(0u32.into(), b"leaf-drop");
+                        return Ok(LeafOutcome {
+                            received: cumulative,
+                            acks,
+                            completed: false,
+                            hash_ok: false,
+                        });
+                    }
+                }
+            }
+            ClientMessage::StreamEnd => break,
+            ClientMessage::StreamError(e) => anyhow::bail!("leaf saw stream error: {e:?}"),
+            other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
+        }
+    }
+    conn.close(0u32.into(), b"done");
+    Ok(LeafOutcome {
+        received: cumulative,
+        acks,
+        completed: true,
+        hash_ok: Hash::new(&buf) == hash,
+    })
+}
+
+/// Build node B: an empty-cache `ClientHandler` with the window-paced provider
+/// (pointing at upstream `providers`) and the leaf's channel registered. Returns
+/// the handler, B's dial target, B's endpoint, and the buyer-progress log.
+#[allow(clippy::too_many_arguments)]
+async fn build_node_b(
+    a_id: iroh::PublicKey,
+    a_addr: std::net::SocketAddr,
+    a_eth_addr: Address,
+    hash: Hash,
+    ab_channel_id: B256,
+    b_buyer: &Arc<PrivateKeySigner>,
+    leaf_channel_id: B256,
+    leaf_eth_addr: Address,
+    leaf_deposit: U256,
+    max_blob_size_bytes: u64,
+) -> Result<(
+    Arc<decdn_node::handlers::client::ClientHandler>,
+    EndpointAddr,
+    iroh::Endpoint,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    decdn_cache::CacheEngine,
+    Arc<Metrics>,
+)> {
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let b_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    // Prime B's iroh address cache for A so NodeId-only dialing in the pull
+    // resolves (same priming the buffered tests use).
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(a_addr),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) = one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth_addr);
+    let (origin, recorded) = provisioned_origin(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        ab_channel_id,
+        b_buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        providers,
+        addr_map,
+    );
+
+    // B's empty cache (the tee fills it) and the leaf's channel in B's store.
+    let cache_tmp = tempfile::tempdir()?;
+    let cache_b = decdn_cache::CacheEngine::open(cache_tmp.path(), vec![], 64).await?;
+    let cache_handle = cache_b.clone();
+    // Leak the tempdir guard for the test's lifetime (kept alive by the returned
+    // engine's open store anyway).
+    std::mem::forget(cache_tmp);
+    let store_b = Arc::new(MemoryChannelStateStore::new());
+    store_b.record(&ChannelState::new(
+        leaf_channel_id,
+        leaf_eth_addr,
+        TOKEN,
+        leaf_deposit,
+    ))?;
+    let limiter = permissive_limiter(&b_metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_b = build_handler_full(
+        b_id,
+        &b_eth,
+        &b_metrics,
+        limiter,
+        cache_b,
+        store_b as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        max_blob_size_bytes,
+        16,
+    )?;
+    // Window-paced pull-through: the deadline accommodates the full
+    // discover→probe→pull, and the window is the default ~1 MiB (one interval).
+    handler_b.attach_pull_through(Duration::from_secs(20));
+    handler_b.attach_window_pull_through(
+        Arc::new(origin),
+        decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
+    );
+
+    let target = EndpointAddr::new(b_id).with_ip_addr(addr_b);
+    Ok((handler_b, target, ep_b, recorded, cache_handle, b_metrics))
+}
+
+/// Spin up A (holds the blob, serves probe + client). Returns the pieces the
+/// caller needs to build B and run the leaf.
+async fn spawn_node_a(
+    payload: &[u8],
+    ab_channel_id: B256,
+    b_buyer_addr: Address,
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Arc<PrivateKeySigner>,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+)> {
+    let hash = Hash::new(payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let (cache_a, hash_a, tmp_a) = cache_with_blob(payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    std::mem::forget(tmp_a);
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        ab_channel_id,
+        b_buyer_addr,
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+    Ok((a_id, addr_a, a_eth, ep_a, task_a))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
+    let payload = vec![0xCDu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    let ab_channel_id = B256::repeat_byte(0xA1);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+
+    anyhow::ensure!(outcome.completed, "leaf delivery did not complete");
+    anyhow::ensure!(outcome.hash_ok, "leaf received bytes failed the hash check");
+    anyhow::ensure!(
+        outcome.received == total_bytes,
+        "leaf received {} of {total_bytes} bytes",
+        outcome.received
+    );
+    // The headline #856 behavior: PAYLOAD_LEN (1.5 MiB) exceeds the default
+    // ~1 MiB window, so the pull MUST have paused at the window frontier and
+    // resumed as the leaf's vouchers cleared. Assert the pause actually fired —
+    // a regression that broke the resume could still pass the full-delivery
+    // checks above (the blob would simply never arrive), so pin the pause
+    // explicitly rather than only implicitly.
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_window_paused_total")? >= 1,
+        "the window pause/resume path must have engaged for a blob larger than the window"
+    );
+    // B cached the (verified) blob — it is now a holder for future requests.
+    anyhow::ensure!(
+        cache_b.has(hash).await?,
+        "B must promote the teed blob on a complete delivery"
+    );
+    // B's buyer channel to A advanced to the full blob (one persisted watermark
+    // covering all bytes: nonce 2, 1.5 MiB, cumulative amount 15).
+    anyhow::ensure!(
+        progress_log(&recorded)?
+            == vec![(
+                a_eth.address(),
+                U256::from(2),
+                U256::from(total_bytes),
+                U256::from(15)
+            )],
+        "expected B's upstream watermark at the full blob, got {:?}",
+        progress_log(&recorded)?
+    );
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+/// A resumed cache-miss request (`byte_offset > 0`) must NOT engage the fused
+/// window path: the incremental whole-blob BLAKE3 is only valid from offset 0,
+/// so the handler gates the fused serve on `req.byte_offset == 0` and falls a
+/// resumed miss back to the buffered path (`client.rs` §window-paced gate). With
+/// the window provider attached but no buffered origin on B's empty cache, the
+/// buffered fallback cleanly refuses. The regression this guards: dropping the
+/// offset-0 gate would route a resumed request into the fused path, which pulls
+/// and verifies from byte 0 and would mis-serve / mis-cache the blob (#856).
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()> {
+    use alloy::signers::SignerSync;
+
+    let payload = vec![0x7Eu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA7);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x7F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+
+    // Send a request resuming from one interval in (byte_offset > 0), with a
+    // valid ownership binding so authorization is NOT the reason for refusal —
+    // the offset gate must be.
+    let conn = leaf_ep
+        .connect(b_target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf open_bi: {e}"))?;
+    let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
+    let ext = StreamRequestExt {
+        voucher_interval_mb: None,
+        binding: Some(ClientBinding {
+            ethereum_address: leaf_eth.address().into(),
+            binding_signature,
+        }),
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: leaf_channel_id.into(),
+        byte_offset: MB_BYTES,
+        timestamp_us: 0x9007,
+    };
+    let payload_bytes =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame(&mut send, &payload_bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
+
+    let resp = match read_client(&mut recv).await? {
+        ClientMessage::StreamResponse(r) => r,
+        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
+    };
+    // The resumed miss is refused by the buffered fallback (no buffered origin),
+    // NOT served by the fused path.
+    anyhow::ensure!(
+        !resp.body.ok,
+        "resumed offset>0 miss must be refused, not served; error={:?}",
+        resp.error
+    );
+    conn.close(0u32.into(), b"done");
+
+    // The fused window path must never have run: no pause, no tee finalize, no
+    // upstream verify — and crucially B must have made NO upstream pull (empty
+    // progress log) and cached NOTHING. A regression that dropped the offset-0
+    // gate would trip at least the upstream pull (non-empty log) and likely the
+    // tee.
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_window_paused_total")? == 0,
+        "fused window pause must not fire for a resumed (offset>0) request"
+    );
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_tee_finalize_failed_total")? == 0,
+        "fused tee must not run for a resumed (offset>0) request"
+    );
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_upstream_verify_failed_total")? == 0,
+        "fused upstream verify must not run for a resumed (offset>0) request"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "B must not have pulled upstream for a resumed (offset>0) miss, got {:?}",
+        progress_log(&recorded)?
+    );
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "B must not have cached anything for a refused resumed request"
+    );
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<()> {
+    // The #856 attack: a leaf that owns a channel requests a large blob, takes
+    // the first interval, acks one voucher, then drops. B must stop pulling — its
+    // upstream spend is bounded to ~one window, NOT the whole blob.
+    let payload = vec![0x4Du8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    let ab_channel_id = B256::repeat_byte(0xA2);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x2F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        Some(1),
+    )
+    .await?;
+    anyhow::ensure!(
+        !outcome.completed,
+        "leaf was supposed to drop, not complete"
+    );
+    anyhow::ensure!(
+        outcome.acks == 1,
+        "leaf should have acked exactly one voucher"
+    );
+
+    // Give B a moment to observe the drop and persist its bounded watermark.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The headline assertion: B's persisted upstream spend is bounded to ~one
+    // window (it forwarded one interval, collected the voucher, then hit the
+    // dropped connection on the next chunk). It must be far below the whole blob.
+    let log = progress_log(&recorded)?;
+    let upstream_bytes: u64 = log.last().map_or(0, |(_, _, bytes, _)| {
+        u64::try_from(*bytes).unwrap_or(u64::MAX)
+    });
+    let one_window = decdn_common::config::DEFAULT_PULL_AHEAD_BYTES;
+    anyhow::ensure!(
+        upstream_bytes <= one_window + 2 * (CHUNK_SIZE as u64),
+        "B's upstream spend ({upstream_bytes}) must be bounded to ~one window ({one_window}), \
+         not the whole {total_bytes}-byte blob"
+    );
+    anyhow::ensure!(
+        upstream_bytes < total_bytes,
+        "B must not have pulled the whole blob ({upstream_bytes} vs {total_bytes})"
+    );
+    // B did not complete the fill, so it must NOT have cached the blob.
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "an abandoned fill must not promote the blob into B's cache"
+    );
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Result<()> {
+    // #856 pre-flight deposit guard: with a finite `max_blob_size_bytes`, a
+    // channel whose remaining deposit cannot cover the worst-case blob cost is
+    // refused (signed `NotFound`) BEFORE any upstream pull — no USDC fronted.
+    let payload = vec![0x9Eu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA3);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x3F);
+    // max_blob_size_bytes = 64 MiB → ceiling = min_payment(64 MiB, RATE) = 640
+    // µUSDC; the leaf's deposit of 1 µUSDC cannot cover it. The blob itself is
+    // well under 64 MiB, so this is the deposit guard firing, not the size gate.
+    let max_blob_size_bytes = 64 * 1024 * 1024;
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(1u64),
+        max_blob_size_bytes,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let refused = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await
+    .is_err();
+    anyhow::ensure!(
+        refused,
+        "an underfunded channel must be refused (signed NotFound), not served"
+    );
+    // No upstream pull was attempted: nothing persisted, nothing cached.
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "the deposit guard must reject before any upstream spend, got {:?}",
+        progress_log(&recorded)?
+    );
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "a deposit-refused request must not fill B's cache"
+    );
+    assert_counter(
+        &b_metrics,
+        "serve_stream_rejected_insufficient_deposit_total",
+        1,
+    )?;
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_leech_stall_refuses_without_spinning() -> Result<()> {
+    // #856 (C1 regression): when a seed-leech cap denies the speculative pull
+    // mid-stream while the request has no completed interval to recoup, the serve
+    // loop must REFUSE (abandon the partial fill) rather than busy-spin with no
+    // await. We pin a per-peer opening allowance of one chunk and a 0% share ratio
+    // (no growth) with the global budget off, so after the very first chunk the
+    // peer is over its allowance with nothing collectable — the exact stall shape.
+    // The whole interaction must resolve well within the deadline (a regression
+    // that reintroduces the spin hangs here), B must not cache the partial blob,
+    // and the share-ratio pause must have fired exactly once.
+    let payload = vec![0x5Au8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA4);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x4F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    handler_b.attach_leech_governor(Arc::new(LeechGovernor::new(
+        LeechCaps::new_unchecked(0, CHUNK_SIZE as u64, 0),
+        Arc::clone(&b_metrics),
+    )));
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(10),
+        leaf_paced_pull(
+            &leaf_ep,
+            b_target,
+            leaf_node_id,
+            &leaf_eth,
+            leaf_channel_id,
+            hash,
+            RATE,
+            None,
+        ),
+    )
+    .await;
+    anyhow::ensure!(
+        resolved.is_ok(),
+        "window serve busy-spun under a seed-leech stall instead of refusing (C1)"
+    );
+
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "a leech-stalled serve must not promote the partial blob"
+    );
+    let upstream_bytes: u64 = progress_log(&recorded)?
+        .last()
+        .map_or(0, |(_, _, bytes, _)| {
+            u64::try_from(*bytes).unwrap_or(u64::MAX)
+        });
+    anyhow::ensure!(
+        upstream_bytes < PAYLOAD_LEN as u64,
+        "a leech-stalled serve must not pull the whole blob ({upstream_bytes} bytes)"
+    );
+    // The share-ratio cap denied the speculative pull (the loop re-checks before
+    // each pull, so it fires once per stalled iteration before the refusal).
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_share_ratio_paused_total")? >= 1,
+        "the share-ratio pause must have fired at least once"
+    );
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+/// Spin up a lying upstream A: it answers probes truthfully (`has_blob`) but
+/// serves wrong bytes of the advertised length on the client stream. Same shape
+/// as [`spawn_node_a`] so it drops into [`build_node_b`].
+async fn spawn_lying_node_a(
+    served_wrong: Vec<u8>,
+    advertised_bytes: u64,
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Arc<PrivateKeySigner>,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+)> {
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_lying_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        served_wrong,
+        advertised_bytes,
+        RATE,
+    );
+    Ok((a_id, addr_a, a_eth, ep_a, task_a))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
+    // #856: when the fused serve path forwards an upstream that then fails its
+    // whole-blob hash check at finalization (a bait-and-switch upstream), B must
+    // NOT promote the corrupt blob, the leaf's own hash check rejects it, and the
+    // `upstream_verify_failed` counter fires. A small (single-interval) blob keeps
+    // the buyer↔upstream voucher exchange to one closing voucher.
+    let honest = vec![0x77u8; 4096];
+    let hash = Hash::new(&honest);
+    let served_wrong = vec![0x88u8; 4096];
+    anyhow::ensure!(Hash::new(&served_wrong) != hash, "fixtures must differ");
+    let advertised_bytes = u64::try_from(honest.len()).unwrap_or(u64::MAX);
+
+    let ab_channel_id = B256::repeat_byte(0xA6);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_lying_node_a(served_wrong, advertised_bytes).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x6F);
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    // The serve forwards corrupt bytes, then closes without a `StreamEnd` once the
+    // upstream fails verification, so the leaf's read returns an error rather than
+    // a clean completion — either way it must not see a verified blob.
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await;
+    if let Ok(o) = &outcome {
+        anyhow::ensure!(
+            !o.hash_ok,
+            "a corrupt-upstream serve must never deliver a hash-verified blob"
+        );
+    }
+
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "B must not promote a blob that failed upstream verification"
+    );
+    assert_counter(
+        &b_metrics,
+        "node_pull_through_upstream_verify_failed_total",
+        1,
+    )?;
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+/// A leaf that takes the first interval of bytes, then signs and sends a voucher
+/// that *underpays* (a token amount well below the rate floor) instead of paying.
+/// Drives B's `collect_voucher` to `VoucherOutcome::Rejected` mid-window. Returns
+/// once it observes B's `StreamError` rejection (or the stream drops).
+async fn leaf_underpays_first_voucher(
+    leaf_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    leaf_node_id: B256,
+    leaf_eth: &Arc<PrivateKeySigner>,
+    channel_id: B256,
+    hash: Hash,
+) -> Result<()> {
+    let conn = leaf_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf open_bi: {e}"))?;
+
+    let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = {
+        use alloy::signers::SignerSync;
+        leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec()
+    };
+    let ext = StreamRequestExt {
+        voucher_interval_mb: None,
+        binding: Some(ClientBinding {
+            ethereum_address: leaf_eth.address().into(),
+            binding_signature,
+        }),
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: channel_id.into(),
+        byte_offset: 0,
+        timestamp_us: 0x9002,
+    };
+    write_frame(
+        &mut send,
+        &encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
+
+    let resp = match read_client(&mut recv).await? {
+        ClientMessage::StreamResponse(r) => r,
+        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
+    };
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
+    let interval_bytes = resp
+        .voucher_interval_mb
+        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
+        .saturating_mul(MB_BYTES);
+
+    // Read chunks until the first interval boundary, then underpay it.
+    let mut cumulative: u64 = 0;
+    loop {
+        match read_client(&mut recv).await? {
+            ClientMessage::ChunkData(chunk) => {
+                cumulative = cumulative.saturating_add(chunk.bytes.len() as u64);
+                if cumulative >= interval_bytes {
+                    break;
+                }
+            }
+            ClientMessage::StreamEnd => anyhow::bail!("stream ended before the first interval"),
+            other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
+        }
+    }
+
+    let signed = Voucher {
+        channel_id,
+        amount: U256::from(1u64), // far below the rate floor for one interval
+        nonce: U256::from(1u64),
+        bytes_delivered: U256::from(cumulative),
+        token: TOKEN,
+    }
+    .sign(leaf_eth.as_ref(), &voucher_dom())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    write_client(
+        &mut send,
+        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
+    )
+    .await?;
+
+    // B must reject the underpayment. A StreamError (the explicit rejection) or a
+    // dropped stream (EOF) both signal the refusal.
+    match read_client(&mut recv).await {
+        Ok(ClientMessage::StreamError(_)) | Err(_) => Ok(()),
+        Ok(other) => anyhow::bail!("expected a StreamError for the underpayment, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> {
+    // #856: a leaf that underpays a mid-window voucher must be cleanly rejected
+    // (VoucherOutcome::Rejected), B must abandon the partial fill (nothing cached),
+    // its upstream spend stays bounded to ~one window, and the client-abandoned
+    // counter fires.
+    let payload = vec![0x7Cu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA7);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x7F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    leaf_underpays_first_voucher(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+    )
+    .await?;
+
+    // Let B observe the rejection and abandon.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "an underpaid serve must not promote the partial blob"
+    );
+    let upstream_bytes: u64 = progress_log(&recorded)?
+        .last()
+        .map_or(0, |(_, _, bytes, _)| {
+            u64::try_from(*bytes).unwrap_or(u64::MAX)
+        });
+    let one_window = decdn_common::config::DEFAULT_PULL_AHEAD_BYTES;
+    anyhow::ensure!(
+        upstream_bytes <= one_window + 2 * (CHUNK_SIZE as u64),
+        "B's upstream spend ({upstream_bytes}) must stay bounded to ~one window ({one_window})"
+    );
+    assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_global_budget_exhausted_refuses_admission() -> Result<()> {
+    // #856: when the node-wide unrecouped-leech budget is already exhausted (by
+    // unrelated speculative traffic), a fresh speculative pull is refused at
+    // admission — signed `NotFound`, no upstream spend, nothing cached — and the
+    // budget pause metric fires.
+    let payload = vec![0x6Bu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA5);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x5F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    let gov = Arc::new(LeechGovernor::new(
+        // `new_unchecked`: a tiny global budget below the opening window, so the
+        // global circuit breaker binds on the first admission (the scenario under
+        // test). `LeechCaps::new` rejects this pairing by design.
+        LeechCaps::new_unchecked(
+            CHUNK_SIZE as u64,
+            decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
+            100,
+        ),
+        Arc::clone(&b_metrics),
+    ));
+    // Pre-exhaust the global budget through an unrelated peer.
+    gov.record_pulled(
+        &[0xEEu8; 32],
+        decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
+    );
+    handler_b.attach_leech_governor(gov);
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let refused = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await
+    .is_err();
+    anyhow::ensure!(
+        refused,
+        "an exhausted global leech budget must refuse the pull (signed NotFound)"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "admission refusal must precede any upstream spend, got {:?}",
+        progress_log(&recorded)?
+    );
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "a budget-refused request must not fill B's cache"
+    );
+    assert_counter(&b_metrics, "node_pull_through_leech_budget_paused_total", 1)?;
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Result<()> {
+    // #856 step (4): the fused serve opens the upstream pull, reads `total_bytes`
+    // from the signed header, and — if it exceeds this node's `max_blob_size_bytes`
+    // — signs `BlobTooLarge` (wire `NotFound`), abandons BOTH the upstream pull and
+    // the cache tee, and forwards nothing. The regression this guards: a dropped
+    // size gate would fuse-serve an over-ceiling blob; a forgotten `tee.abandon()`
+    // on this arm would strand the in-flight tee claim for the hash. We assert the
+    // refusal, the `blob_too_large` metric, that no voucher was paid upstream
+    // (channel opened, zero bytes pulled), and that nothing was cached.
+    let payload = vec![0xB1u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA6);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x6F);
+    // 1 MiB ceiling, below the 1.5 MiB blob, so the SIZE gate trips — but the
+    // deposit guard (ceiling = min_payment(1 MiB, RATE) = 10 µUSDC) passes against
+    // the funded leaf, so we exercise step (4), not the step (1) deposit guard.
+    let max_blob_size_bytes = 1024 * 1024;
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        max_blob_size_bytes,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let refused = leaf_paced_pull(
+        &leaf_ep,
+        b_target.clone(),
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await
+    .is_err();
+    anyhow::ensure!(
+        refused,
+        "an upstream blob over the size ceiling must be refused (signed NotFound), not fused-served"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "the size gate must abort before any voucher is paid upstream, got {:?}",
+        progress_log(&recorded)?
+    );
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "an oversized-upstream refusal must not promote the blob into B's cache"
+    );
+    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 1)?;
+    // The tee claim was released on the abort arm: a second request for the SAME
+    // hash is not wedged on a stranded in-flight entry — it reaches the size gate
+    // again and is refused identically (a leaked tee would instead hang/coalesce).
+    let retry_sk = fresh_key();
+    let retry_node_id = B256::from(*retry_sk.public().as_bytes());
+    let (retry_ep, _) = local_endpoint(retry_sk, vec![]).await?;
+    let refused_again = leaf_paced_pull(
+        &retry_ep,
+        b_target,
+        retry_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await
+    .is_err();
+    anyhow::ensure!(
+        refused_again,
+        "a repeat request for the same hash must be refused again, not wedged on a stranded tee claim"
+    );
+    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 2)?;
+
+    retry_ep.close().await;
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
+    // #856 step (2): the per-peer share ratio can deny a speculative pull at
+    // *admission*, before any upstream byte is pulled — distinct from the
+    // mid-stream stall (`window_pull_through_leech_stall_*`) and the global-budget
+    // admission refusal (`..._global_budget_exhausted_*`). A peer with zero opening
+    // allowance and a 0% share ratio (and no prior service) is over its ceiling on
+    // the very first check, so the serve signs `CacheMiss` (wire `NotFound`) and
+    // the share-ratio pause fires once, with no upstream spend and nothing cached.
+    let payload = vec![0xC2u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA8);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x8F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    // No opening allowance, no share-ratio growth, global budget off: the peer is
+    // immediately over its (zero) ceiling at the first admission poll. These caps
+    // satisfy `LeechCaps::new` (a `0` global budget disables the window≤budget
+    // cross-check), so the validated constructor is used here.
+    let gov = Arc::new(LeechGovernor::new(
+        LeechCaps::new(0, 0, 0).map_err(|e| anyhow::anyhow!("invalid caps: {e}"))?,
+        Arc::clone(&b_metrics),
+    ));
+    handler_b.attach_leech_governor(gov);
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let refused = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await
+    .is_err();
+    anyhow::ensure!(
+        refused,
+        "a peer over its per-peer share ratio must be refused at admission (signed NotFound)"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "the share-ratio admission refusal must precede any upstream spend, got {:?}",
+        progress_log(&recorded)?
+    );
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "a share-ratio-refused request must not fill B's cache"
+    );
+    assert_counter(&b_metrics, "node_pull_through_share_ratio_paused_total", 1)?;
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
     Ok(())
 }

@@ -513,6 +513,12 @@ pub async fn run(
         .cache
         .node_to_node_pull_through_enabled
         .then(crate::node_origin::NodeOrigin::new);
+    // A shared `Arc<NodeOrigin>` handle for the window-paced serve path (#856).
+    // `NodeOrigin` is `Clone` over an `Arc<OnceLock<deps>>`, so this clone sees
+    // the dependencies `provision`ed (below) on the chain's copy. Held so the
+    // client handler can drive progressive pulls directly, bypassing the buffered
+    // `populate` for the fused pull-and-forward path.
+    let pull_through_origin = node_origin.clone().map(Arc::new);
     let cache = build_cache(
         &cfg,
         Arc::clone(&node_metrics),
@@ -948,6 +954,30 @@ pub async fn run(
         // up; it gets a full fresh outer-deadline budget to complete from
         // scratch (the foreground future was dropped, taking its partial work).
         client_handler.attach_background_fill(pull_through_bg_shutdown.clone(), outer_deadline);
+        // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
+        // available, serve cache misses by fusing the upstream pull with
+        // downstream delivery (bounded by `pull_ahead_bytes`) instead of the
+        // buffered `populate`, and govern aggregate speculation with the
+        // seed-leech caps. The deposit pre-check and per-request window apply
+        // even without the governor; the governor adds the global budget + the
+        // per-peer share ratio.
+        if let Some(origin) = &pull_through_origin {
+            client_handler
+                .attach_window_pull_through(Arc::clone(origin), cfg.cache.pull_ahead_bytes);
+            // The resolver already enforces `pull_ahead_bytes <=
+            // max_unrecouped_leech_bytes` (with the `0`-disables carve-out), so
+            // this validated build is belt-and-suspenders — a self-contradicting
+            // pairing is a bring-up error, not a silently-degraded governor.
+            let leech_caps = crate::leech_governor::LeechCaps::new(
+                cfg.cache.max_unrecouped_leech_bytes,
+                cfg.cache.pull_ahead_bytes,
+                cfg.cache.pull_share_ratio_percent,
+            )
+            .context("invalid seed-leech caps: opening window exceeds the global budget")?;
+            client_handler.attach_leech_governor(Arc::new(
+                crate::leech_governor::LeechGovernor::new(leech_caps, Arc::clone(&node_metrics)),
+            ));
+        }
     }
 
     // On-chain buyer-side service (#744). When this node pulls content from an
@@ -2746,6 +2776,10 @@ mod tests {
                 node_to_node_pull_through_enabled: false,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
+                pull_ahead_bytes: decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
+                max_unrecouped_leech_bytes:
+                    decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
+                pull_share_ratio_percent: decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,

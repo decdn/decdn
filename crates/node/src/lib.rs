@@ -14,6 +14,7 @@ pub mod commands;
 pub mod dht;
 pub mod dispatch;
 pub mod handlers;
+pub mod leech_governor;
 pub mod metrics;
 pub mod node_origin;
 pub mod payment_settlement;
