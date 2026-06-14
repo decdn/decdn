@@ -22,7 +22,7 @@ const BUDGET_WINDOW_SECS: u64 = 3600;
 /// Outcome of a prefetch decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefetchDecision {
-    /// Proceed to acquire the hash (the live acquisition is a #650 follow-up).
+    /// Proceed to acquire the hash (drives the live background acquisition, #820).
     Acquire,
     /// Do not acquire; carries the first gate that rejected.
     Skip(SkipReason),
@@ -127,8 +127,8 @@ impl PrefetchPolicy {
     }
 
     /// Record a completed prefetch acquisition (drives budget + demand-quality
-    /// denominator). Exercised by unit tests this slice; wired to the live
-    /// acquisition path in the #650 follow-up.
+    /// denominator). Called by the acquisition observer on a prefetch-initiated
+    /// pull (#820), and directly by unit tests.
     pub fn record_acquisition(&self, micro_usdc: u64, bytes: u64, now: u64) {
         if let Ok(mut led) = self.ledgers.lock() {
             led.spend.push_back((now, micro_usdc));
@@ -236,6 +236,8 @@ mod tests {
             threshold_window_secs: 300,
             demand_quality_min_ratio: 0.1,
             demand_quality_window_secs: 3600,
+            max_concurrent_acquisitions: 4,
+            acquisition_timeout_secs: 30,
         }
     }
 

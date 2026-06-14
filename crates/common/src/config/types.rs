@@ -820,4 +820,11 @@ pub struct PrefetchConfig {
     /// Rolling-window length (seconds) for the demand-quality predicate.
     /// Absent => `3600`. Must be `> 0`.
     pub demand_quality_window_secs: Option<u64>,
+    /// Maximum prefetch acquisitions running concurrently (#820). Caps the
+    /// background fan-out of speculative pulls so prefetch cannot starve demand
+    /// traffic. Absent => `4`. Must be `> 0`.
+    pub max_concurrent_acquisitions: Option<u32>,
+    /// Wall-clock deadline (seconds) for a single prefetch acquisition's
+    /// pull-through (#820). Absent => `30`. Must be `> 0`.
+    pub acquisition_timeout_secs: Option<u64>,
 }

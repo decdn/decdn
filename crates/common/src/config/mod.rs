@@ -196,6 +196,11 @@ pub const DEFAULT_PREFETCH_THRESHOLD_WINDOW_SECS: u64 = 300;
 pub const DEFAULT_PREFETCH_DEMAND_QUALITY_MIN_RATIO: f64 = 0.1;
 /// Default `prefetch.demand_quality_window_secs` (ADR 022 §Prefetch Decision table).
 pub const DEFAULT_PREFETCH_DEMAND_QUALITY_WINDOW_SECS: u64 = 3600;
+/// Default `prefetch.max_concurrent_acquisitions` (#820): bound the speculative
+/// background fan-out so prefetch cannot starve demand traffic.
+pub const DEFAULT_PREFETCH_MAX_CONCURRENT_ACQUISITIONS: u32 = 4;
+/// Default `prefetch.acquisition_timeout_secs` (#820): per-acquisition pull deadline.
+pub const DEFAULT_PREFETCH_ACQUISITION_TIMEOUT_SECS: u64 = 30;
 
 /// Load config from file (if present) and merge with CLI args.
 ///
@@ -2124,6 +2129,24 @@ fn resolve_prefetch_into(
         "prefetch.demand_quality_window_secs must be > 0",
     );
 
+    let max_concurrent_acquisitions = file
+        .and_then(|p| p.max_concurrent_acquisitions)
+        .unwrap_or(DEFAULT_PREFETCH_MAX_CONCURRENT_ACQUISITIONS);
+    bag.check(
+        max_concurrent_acquisitions > 0,
+        "prefetch.max_concurrent_acquisitions",
+        "prefetch.max_concurrent_acquisitions must be > 0",
+    );
+
+    let acquisition_timeout_secs = file
+        .and_then(|p| p.acquisition_timeout_secs)
+        .unwrap_or(DEFAULT_PREFETCH_ACQUISITION_TIMEOUT_SECS);
+    bag.check(
+        acquisition_timeout_secs > 0,
+        "prefetch.acquisition_timeout_secs",
+        "prefetch.acquisition_timeout_secs must be > 0",
+    );
+
     ResolvedPrefetch {
         enabled,
         require_authorized_origin,
@@ -2132,6 +2155,8 @@ fn resolve_prefetch_into(
         threshold_window_secs,
         demand_quality_min_ratio,
         demand_quality_window_secs,
+        max_concurrent_acquisitions,
+        acquisition_timeout_secs,
     }
 }
 

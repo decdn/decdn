@@ -608,8 +608,8 @@ pub struct DecdnMetrics {
     /// Prefetch acquisitions where the origin gate was disabled (bypassed).
     /// Visible name: `decdn_prefetch_acquisitions_bypassed_total`.
     pub prefetch_acquisitions_bypassed: Counter,
-    /// Cumulative micro-USDC paid for prefetch acquisitions. `0` until the
-    /// #650 follow-up wires real acquisition. Visible name:
+    /// Cumulative micro-USDC paid for prefetch acquisitions (#820). Incremented
+    /// on each successful speculative paid pull. Visible name:
     /// `decdn_prefetch_spend_usdc_total`.
     pub prefetch_spend_usdc: Counter,
     /// Times the rolling-1h prefetch budget was hit, blocking acquisitions
@@ -627,6 +627,18 @@ pub struct DecdnMetrics {
     /// `1` while the demand-quality auto-throttle suppresses prefetch, else
     /// `0`. Visible name: `decdn_prefetch_throttle_active`.
     pub prefetch_throttle_active: Gauge,
+    /// Speculative acquisitions whose pull-through completed and cached the blob
+    /// (#820). Visible name: `decdn_prefetch_acquire_succeeded_total`.
+    pub prefetch_acquire_succeeded: Counter,
+    /// Speculative acquisitions whose pull-through found no source or errored
+    /// (#820). Visible name: `decdn_prefetch_acquire_failed_total`.
+    pub prefetch_acquire_failed: Counter,
+    /// Speculative acquisitions that hit their per-acquisition deadline (#820).
+    /// Visible name: `decdn_prefetch_acquire_timeout_total`.
+    pub prefetch_acquire_timeout: Counter,
+    /// Speculative acquisitions dropped because the concurrency cap was full
+    /// (#820). Visible name: `decdn_prefetch_acquire_dropped_saturated_total`.
+    pub prefetch_acquire_dropped_saturated: Counter,
     /// Paid-delivery (`serve_stream`) requests refused because the blob was
     /// deliberately evicted between probe and stream (#279). One `Counter` per
     /// reason — like the `dispatch_rejected_*` convention — because the metrics
@@ -858,6 +870,32 @@ impl Metrics {
         } else {
             self.decdn.prefetch_acquisitions_bypassed.inc();
         }
+    }
+
+    /// Add `micro_usdc` to the cumulative prefetch spend (#820). Called from the
+    /// acquisition observer on each successful speculative paid pull.
+    pub fn add_prefetch_spend(&self, micro_usdc: u64) {
+        self.decdn.prefetch_spend_usdc.inc_by(micro_usdc);
+    }
+
+    /// A speculative acquisition cached the blob (#820).
+    pub fn prefetch_acquire_succeeded(&self) {
+        self.decdn.prefetch_acquire_succeeded.inc();
+    }
+
+    /// A speculative acquisition found no source or errored (#820).
+    pub fn prefetch_acquire_failed(&self) {
+        self.decdn.prefetch_acquire_failed.inc();
+    }
+
+    /// A speculative acquisition hit its per-acquisition deadline (#820).
+    pub fn prefetch_acquire_timeout(&self) {
+        self.decdn.prefetch_acquire_timeout.inc();
+    }
+
+    /// A speculative acquisition was dropped at the concurrency cap (#820).
+    pub fn prefetch_acquire_dropped_saturated(&self) {
+        self.decdn.prefetch_acquire_dropped_saturated.inc();
     }
 
     /// Refresh the demand-quality gauges from the policy state. `ratio` is
