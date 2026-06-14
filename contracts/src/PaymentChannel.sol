@@ -9,6 +9,7 @@ import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/Sig
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 import { IFeeRouterSettlement } from "./interfaces/IFeeRouterSettlement.sol";
 import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
@@ -35,6 +36,7 @@ import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
 ///         never the router, so re-pointing invalidates no signatures).
 contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     using SafeERC20 for IERC20;
+    using EnumerableSet for EnumerableSet.Bytes32Set;
 
     // -----------------------------------------------------------------
     // Roles
@@ -165,13 +167,14 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///         already happened; the un-withdrawn provider share stays in this
     ///         contract until anyone calls `flushDeferredSettlement` post-unpause.
     ///         The amount/bytes are recomputed from the (now `Closed`) `Channel`.
-    /// @dev    There is no on-chain enumeration of deferred ids: a pending flush is
-    ///         discoverable only via the indexed `SettlementDeferred` event (the
-    ///         flag itself is readable but only if the id is already known).
-    ///         Driving the eventual `flushDeferredSettlement` is therefore an
-    ///         off-chain-indexer responsibility; the funds remain safe and
-    ///         permissionlessly flushable in the meantime.
-    mapping(bytes32 channelId => bool) public settlementDeferred;
+    /// @dev    Enumerable on-chain: a keeper can list every pending id via
+    ///         `deferredSettlementCount` + `deferredSettlements(offset, limit)` and
+    ///         drain them without replaying the `SettlementDeferred` event log.
+    ///         Membership is also readable per-id via the `settlementDeferred` view.
+    ///         Ids are added in the `settleChannel` defer branch and removed in
+    ///         `flushDeferredSettlement`; the funds stay safe and permissionlessly
+    ///         flushable while parked.
+    EnumerableSet.Bytes32Set private _deferredSettlements;
 
     // -----------------------------------------------------------------
     // Events (ADR 003 § Events)
@@ -524,7 +527,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
             // funds move (aderyn reentrancy-state-change FP).
             // aderyn-ignore-next-line(reentrancy-state-change)
             if (IFeeRouterSettlement(feeRouter).paused()) {
-                settlementDeferred[channelId] = true;
+                // `add` always returns true here — a channel settles exactly once
+                // (status is now `Closed`), so the id cannot already be present.
+                // slither-disable-next-line unused-return
+                _deferredSettlements.add(channelId);
                 emit SettlementDeferred(channelId, ch.provider, settleAmount, settleBytes);
             } else {
                 _route(ch.provider, settleBytes, settleAmount);
@@ -536,24 +542,65 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
 
     /// @notice Any address: route the provider settle leg deferred by
     ///         `settleChannel` when `FeeRouter` was paused. Safe to retry — a
-    ///         still-paused router reverts the whole call, leaving the deferral
-    ///         flag set; once routed, a re-call reverts `NoDeferredSettlement`. The
-    ///         amount/bytes are recomputed from the closed channel, which
-    ///         `settleChannel` froze (no `withdraw` is possible once `Closed`), so
-    ///         they equal the provider share still held here.
+    ///         still-paused router reverts the whole call and the channel stays in
+    ///         the deferred set; a successful flush removes it, so any later call
+    ///         reverts `NoDeferredSettlement`. The amount/bytes are recomputed from
+    ///         the closed channel, which `settleChannel` froze (no `withdraw` is
+    ///         possible once `Closed`), so they equal the provider share still held
+    ///         here.
     function flushDeferredSettlement(bytes32 channelId) external nonReentrant {
-        if (!settlementDeferred[channelId]) revert NoDeferredSettlement();
+        // `remove` clears the id and reports presence in one step (checks-effects):
+        // false means it was never deferred (or already flushed). Removing before
+        // the external route means a paused router reverts the whole tx and
+        // restores the set entry for a later retry.
+        if (!_deferredSettlements.remove(channelId)) revert NoDeferredSettlement();
         Channel storage ch = channels[channelId];
 
         uint256 settleAmount = ch.claimedAmount - ch.withdrawnAmount;
         uint256 settleBytes = ch.claimedBytes - ch.withdrawnBytes;
 
-        // Clear before the external route (checks-effects-interactions): a paused
-        // router reverts the whole tx and restores the flag for a later retry.
-        settlementDeferred[channelId] = false;
         _route(ch.provider, settleBytes, settleAmount);
 
         emit DeferredSettlementFlushed(channelId, ch.provider, settleAmount, settleBytes);
+    }
+
+    /// @notice True if `channelId` has a provider settle leg awaiting
+    ///         `flushDeferredSettlement`. Preserves the legacy per-id read.
+    function settlementDeferred(bytes32 channelId) external view returns (bool) {
+        return _deferredSettlements.contains(channelId);
+    }
+
+    /// @notice Number of channels with a provider settle leg awaiting flush.
+    function deferredSettlementCount() external view returns (uint256) {
+        return _deferredSettlements.length();
+    }
+
+    /// @notice Paginated view of channel ids awaiting `flushDeferredSettlement`,
+    ///         so a keeper can drain pending settlements without replaying the
+    ///         `SettlementDeferred` event log.
+    /// @dev    Order is unstable across flushes — `flushDeferredSettlement` removes
+    ///         via swap-and-pop, relocating the tail element into the freed slot —
+    ///         so indices are not stable across mutations. A robust keeper drain
+    ///         re-reads `deferredSettlements(0, n)` and flushes the head each round
+    ///         until `deferredSettlementCount()` is 0; a loop that pages forward
+    ///         while flushing can skip an id the swap-and-pop moved behind the
+    ///         cursor.
+    function deferredSettlements(uint256 offset, uint256 limit) external view returns (bytes32[] memory page) {
+        uint256 len = _deferredSettlements.length();
+        if (offset >= len || limit == 0) {
+            return new bytes32[](0);
+        }
+        // `remaining > 0` given the `offset >= len` guard above. Take `size` as the
+        // smaller of `limit` and `remaining` directly — never forming `offset +
+        // limit`, so a defensive `limit == type(uint256).max` clamps instead of
+        // reverting on overflow. `offset + i < offset + size <= len`, so every
+        // `at(offset + i)` is in bounds.
+        uint256 remaining = len - offset;
+        uint256 size = limit < remaining ? limit : remaining;
+        page = new bytes32[](size);
+        for (uint256 i = 0; i < size; i++) {
+            page[i] = _deferredSettlements.at(offset + i);
+        }
     }
 
     /// @notice Client or provider: refund `deposit - withdrawnAmount` to the client
