@@ -240,6 +240,11 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         // wedged on a `(salt, evidence)` pair — including across a pause longer
         // than `REVEAL_WINDOW` — since they can re-commit the same salt once it
         // expires (#854). `uint64(block.timestamp)` is safe past year ~2554.
+        // Permissionless and unbonded by design: the slot is keyed by the opaque
+        // commitment, not by `msg.sender` (authority lives in the preimage and is
+        // checked at reveal), so overwriting a third party's *expired* slot only
+        // resets a timer bound to their own address — it cannot redirect the
+        // reward. The bond is pulled at reveal in `_resolve`, never here.
         if (existing != 0) {
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp <= uint256(existing) + REVEAL_WINDOW) revert CommitmentExists();
@@ -518,7 +523,8 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     ///      finality leg), return the bond, and emit `Slashed`. The commitment
     ///      `keccak256(abi.encode(evidenceHash, salt, msg.sender))` binds the challenger, so a
     ///      mempool copy of this reveal (different `msg.sender`) finds no
-    ///      commitment and cannot claim the reward (#854).
+    ///      commitment and cannot claim the reward (#854). A mismatched `salt` or
+    ///      evidence likewise reconstructs an unknown commitment → `NoCommitment`.
     function _resolve(address operator, OffenseType offenseType, bytes32 evidenceHash, bytes32 salt) internal {
         bytes32 commitment = keccak256(abi.encode(evidenceHash, salt, msg.sender));
         uint64 committedAt = commitments[commitment];
