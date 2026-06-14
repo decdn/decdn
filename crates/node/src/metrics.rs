@@ -293,6 +293,16 @@ pub struct DecdnMetrics {
     /// being withdrawn and warrants investigating the RPC / wallet. Operator-
     /// visible name: `decdn_redemption_failures_total`.
     pub redemption_failures: Counter,
+    /// Buyer-side reclaim-sweep attempts (`try_reclaim`) that failed — a failed
+    /// `getChannel`/`reclaimExpired` RPC, a receipt wait, an on-chain revert, or
+    /// a failed store write when clearing the local record after a reclaim/drop
+    /// (#906). Each is otherwise only a single `warn!` per hourly sweep; a
+    /// sustained rate means an expired channel's refundable deposit is not being
+    /// recovered (check the gas wallet / RPC). Pairs with the `error!`
+    /// escalation once the same channel fails `RECLAIM_ESCALATION_THRESHOLD`
+    /// consecutive sweeps. Operator-visible name:
+    /// `decdn_buyer_reclaim_failures_total`.
+    pub buyer_reclaim_failures: Counter,
     /// Channel-lifecycle reconciliation the settlement watcher could not apply
     /// from the live event stream: a failed `register_open_channel` /
     /// `update_channel_deposit` / `forget_channel` store write (#751), or a
@@ -1017,6 +1027,14 @@ impl Metrics {
     /// (#751). Pairs with the `warn!` in `redeemer_loop`.
     pub fn redemption_failure(&self) {
         self.decdn.redemption_failures.inc();
+    }
+
+    /// A buyer-side reclaim-sweep attempt (`try_reclaim`) failed — an RPC/receipt
+    /// error, an on-chain revert, or a failed store write when clearing the local
+    /// record (#906). Pairs with the per-attempt `warn!` in `try_reclaim` and the
+    /// threshold `error!` in `reclaim_once`.
+    pub fn buyer_reclaim_failure(&self) {
+        self.decdn.buyer_reclaim_failures.inc();
     }
 
     /// An auto-settlement trigger fired and the seller path `closeChannel`d a

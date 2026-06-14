@@ -1031,6 +1031,7 @@ pub async fn run(
         decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr),
         U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
         cfg.blockchain.buyer_max_approve,
+        Arc::clone(&node_metrics),
     )
     .await
     {
