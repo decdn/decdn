@@ -135,6 +135,7 @@ impl LeechCaps {
     /// isolation. Prefer [`LeechCaps::new`] everywhere else; reaching for this in
     /// production wiring would silently reintroduce the self-contradicting state
     /// `new` rejects.
+    #[doc(hidden)]
     #[must_use]
     pub const fn new_unchecked(config: LeechCapsConfig) -> Self {
         Self {

@@ -4109,6 +4109,36 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn cache_byte_percent_knobs_round_trip_from_toml() -> anyhow::Result<()> {
+        // #894: the Bytes/Percent newtypes are `#[serde(transparent)]`, so the
+        // wire form stays a bare integer and wrapping the formerly-`u64` knobs is
+        // non-breaking. Assert a real TOML `[cache]` block deserializes the bare
+        // integers straight into the typed fields — the promise the newtypes make.
+        let file: crate::config::FileConfig = ::toml::from_str(
+            "[cache]\npull_ahead_bytes = 1048576\nmax_unrecouped_leech_bytes = 2097152\npull_share_ratio_percent = 200\n",
+        )?;
+        let cache = file
+            .cache
+            .ok_or_else(|| anyhow::anyhow!("missing [cache] section"))?;
+        anyhow::ensure!(
+            cache.pull_ahead_bytes == Some(decdn_config_types::Bytes::new(1_048_576)),
+            "pull_ahead_bytes did not round-trip: {:?}",
+            cache.pull_ahead_bytes
+        );
+        anyhow::ensure!(
+            cache.max_unrecouped_leech_bytes == Some(decdn_config_types::Bytes::new(2_097_152)),
+            "max_unrecouped_leech_bytes did not round-trip: {:?}",
+            cache.max_unrecouped_leech_bytes
+        );
+        anyhow::ensure!(
+            cache.pull_share_ratio_percent == Some(decdn_config_types::Percent::new(200)),
+            "pull_share_ratio_percent did not round-trip: {:?}",
+            cache.pull_share_ratio_percent
+        );
+        Ok(())
+    }
+
     // -------------------------------------------------------------------
     // Multi-origin fallback config validation (#284)
     //
