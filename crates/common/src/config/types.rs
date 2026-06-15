@@ -374,7 +374,7 @@ pub struct CacheConfig {
     /// speculative exposure. The serve loop floors the effective window at one
     /// voucher interval so it can always make progress, so a value below one
     /// interval (including `0`) collapses to one-interval pacing, not one chunk.
-    pub pull_ahead_bytes: Option<u64>,
+    pub pull_ahead_bytes: Option<decdn_config_types::Bytes>,
     /// Node-wide circuit breaker on aggregate speculative pull-through spend, in
     /// bytes (#856, ADR 037 `max_unrecouped_leech_bytes`). Absent =>
     /// [`crate::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES`]. When the rolling
@@ -382,14 +382,14 @@ pub struct CacheConfig {
     /// pull-through pauses and resumes as the node serves and recoups. Bounds
     /// distributed manufactured-demand abuse in aggregate. `0` disables the
     /// global cap (the per-request window and per-peer ratio still apply).
-    pub max_unrecouped_leech_bytes: Option<u64>,
+    pub max_unrecouped_leech_bytes: Option<decdn_config_types::Bytes>,
     /// Per-peer speculative-pull ceiling as a percentage of bytes served to that
     /// peer (#856, ADR 037 `share_ratio`); `100` == 1.0×. Absent =>
     /// [`crate::config::DEFAULT_PULL_SHARE_RATIO_PERCENT`]. The node will not
     /// pull more than this ratio of what it has served a peer, plus an opening
     /// allowance of `pull_ahead_bytes`, bounding concentrated single-peer abuse.
     /// `0` pins a peer to only the opening window.
-    pub pull_share_ratio_percent: Option<u64>,
+    pub pull_share_ratio_percent: Option<decdn_config_types::Percent>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.

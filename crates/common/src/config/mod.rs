@@ -1259,15 +1259,23 @@ fn resolve_cache_into(
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
+    // Resolve the seed-leech knobs to their typed `Bytes` / `Percent` form and
+    // keep them typed through the cross-field check and `ResolvedCache`
+    // construction below, so a bytes<->percent (or bytes<->bytes) transposition
+    // inside this resolver is a compile error too.
     let pull_ahead_bytes = file
         .and_then(|c| c.pull_ahead_bytes)
-        .unwrap_or(DEFAULT_PULL_AHEAD_BYTES);
-    let max_unrecouped_leech_bytes = file
-        .and_then(|c| c.max_unrecouped_leech_bytes)
-        .unwrap_or(DEFAULT_MAX_UNRECOUPED_LEECH_BYTES);
-    let pull_share_ratio_percent = file
-        .and_then(|c| c.pull_share_ratio_percent)
-        .unwrap_or(DEFAULT_PULL_SHARE_RATIO_PERCENT);
+        .unwrap_or(decdn_config_types::Bytes::new(DEFAULT_PULL_AHEAD_BYTES));
+    let max_unrecouped_leech_bytes =
+        file.and_then(|c| c.max_unrecouped_leech_bytes)
+            .unwrap_or(decdn_config_types::Bytes::new(
+                DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
+            ));
+    let pull_share_ratio_percent =
+        file.and_then(|c| c.pull_share_ratio_percent)
+            .unwrap_or(decdn_config_types::Percent::new(
+                DEFAULT_PULL_SHARE_RATIO_PERCENT,
+            ));
 
     // A single request's speculative pull-ahead window must fit within the
     // node-wide unrecouped-leech budget (#856). Otherwise one request can drive
@@ -1276,7 +1284,7 @@ fn resolve_cache_into(
     // refuses immediately. `max_unrecouped_leech_bytes == 0` disables the global
     // cap, so the check only binds when the budget is enabled.
     bag.check_with(
-        max_unrecouped_leech_bytes == 0 || pull_ahead_bytes <= max_unrecouped_leech_bytes,
+        max_unrecouped_leech_bytes.get() == 0 || pull_ahead_bytes <= max_unrecouped_leech_bytes,
         "cache.pull_ahead_bytes",
         || {
             format!(
@@ -4068,8 +4076,8 @@ mod tests {
         // counter past the cap before its first voucher clears.
         let cli = empty_cache_args();
         let toml = types::CacheConfig {
-            pull_ahead_bytes: Some(8 * 1024 * 1024),
-            max_unrecouped_leech_bytes: Some(1024 * 1024),
+            pull_ahead_bytes: Some(decdn_config_types::Bytes::new(8 * 1024 * 1024)),
+            max_unrecouped_leech_bytes: Some(decdn_config_types::Bytes::new(1024 * 1024)),
             ..Default::default()
         };
         let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
@@ -4089,14 +4097,44 @@ mod tests {
         // window-vs-budget check does not bind.
         let cli = empty_cache_args();
         let toml = types::CacheConfig {
-            pull_ahead_bytes: Some(8 * 1024 * 1024),
-            max_unrecouped_leech_bytes: Some(0),
+            pull_ahead_bytes: Some(decdn_config_types::Bytes::new(8 * 1024 * 1024)),
+            max_unrecouped_leech_bytes: Some(decdn_config_types::Bytes::new(0)),
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
         anyhow::ensure!(
-            resolved.pull_ahead_bytes == 8 * 1024 * 1024,
+            resolved.pull_ahead_bytes == decdn_config_types::Bytes::new(8 * 1024 * 1024),
             "window not preserved when the global cap is disabled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cache_byte_percent_knobs_round_trip_from_toml() -> anyhow::Result<()> {
+        // #894: the Bytes/Percent newtypes are `#[serde(transparent)]`, so the
+        // wire form stays a bare integer and wrapping the formerly-`u64` knobs is
+        // non-breaking. Assert a real TOML `[cache]` block deserializes the bare
+        // integers straight into the typed fields — the promise the newtypes make.
+        let file: crate::config::FileConfig = ::toml::from_str(
+            "[cache]\npull_ahead_bytes = 1048576\nmax_unrecouped_leech_bytes = 2097152\npull_share_ratio_percent = 200\n",
+        )?;
+        let cache = file
+            .cache
+            .ok_or_else(|| anyhow::anyhow!("missing [cache] section"))?;
+        anyhow::ensure!(
+            cache.pull_ahead_bytes == Some(decdn_config_types::Bytes::new(1_048_576)),
+            "pull_ahead_bytes did not round-trip: {:?}",
+            cache.pull_ahead_bytes
+        );
+        anyhow::ensure!(
+            cache.max_unrecouped_leech_bytes == Some(decdn_config_types::Bytes::new(2_097_152)),
+            "max_unrecouped_leech_bytes did not round-trip: {:?}",
+            cache.max_unrecouped_leech_bytes
+        );
+        anyhow::ensure!(
+            cache.pull_share_ratio_percent == Some(decdn_config_types::Percent::new(200)),
+            "pull_share_ratio_percent did not round-trip: {:?}",
+            cache.pull_share_ratio_percent
         );
         Ok(())
     }

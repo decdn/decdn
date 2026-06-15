@@ -42,8 +42,8 @@ pub use probe_hold::{
 // NOT re-exported as `decdn_cache::Hash` — that name stays the store
 // hash above.
 pub use decdn_config_types::{
-    DEFAULT_MAX_PROBE_HOLDS, DEFAULT_USER_AGENT, DecompressMode, HashParseError, OriginKind,
-    OriginUrl, PinDiff, PinnedHashes, RetryPolicy, parse_origin_url, redact_for_log,
+    Bytes, DEFAULT_MAX_PROBE_HOLDS, DEFAULT_USER_AGENT, DecompressMode, HashParseError, OriginKind,
+    OriginUrl, Percent, PinDiff, PinnedHashes, RetryPolicy, parse_origin_url, redact_for_log,
 };
 
 /// Convert a config-vocabulary [`decdn_config_types::Hash`] into the
