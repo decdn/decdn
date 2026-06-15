@@ -13,7 +13,7 @@ All blobs are content-addressed by their BLAKE3 hash. The hash is computed once 
 
 The protocol is content-agnostic. It stores and delivers arbitrary blobs with no assumptions about format, structure, or metadata. Applications may define their own metadata or manifest layers on top (e.g., linking multiple blobs, adding descriptive fields), but these are opaque to the delivery network — the protocol sees only hashes and bytes.
 
-Blob identity is intrinsic to the content: the same bytes always produce the same hash, regardless of which node holds them. Clients verify every received blob against its known hash — no node can serve corrupted data without immediate detection.
+Blob identity is intrinsic to the content: the same bytes always produce the same hash, regardless of which node holds them. Clients verify every received blob against its known hash — no node can serve corrupted data without immediate detection. Because BLAKE3 is a Merkle tree whose root is the content hash, verification is per-range, not only whole-blob: any chunk range — partial, resumed from an offset, or sourced from a distinct node — is independently verifiable against the root, so a corrupt range is rejected on receipt without possessing the rest of the blob (see [ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)).
 
 The mapping from hash to the actual backing storage location (e.g., which S3 key, which local file path) is internal to each origin-backed node and never exposed to the network. Other nodes and clients have no knowledge of a node's backend — they only know hashes and NodeIds.
 

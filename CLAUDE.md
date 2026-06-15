@@ -10,9 +10,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
 
 **ADR note:**
 
-- **Next ADR number: 038.** File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by listing `adr/` for the highest number before creating a new ADR.
+- **Next ADR number: 039.** File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by listing `adr/` for the highest number before creating a new ADR.
 - **Do not reuse numbers:** 004, 010, 027, 029, 032, 033, 034, 035 (retired or reclassified — see history below).
-- **Canonical ADRs (recent):** 028, 030, 031, 036, 037.
+- **Canonical ADRs (recent):** 028, 030, 031, 036, 037, 038.
 - **History:**
   - 026 (tokenomics) — **Genesis Bond Credit removal:** the on-chain Genesis Bond Credit mechanism (the `CapacityBond` grant/vest/claim/forfeit surface, `GENESIS_GRANTOR_ROLE`, `PendingCredit`, the credit leg of slashing/escrow, and `claimSlashGateEpochs`) is gone. Its 5pp earmark folds back into the operational DAO Treasury (group 2, now a flat 15% — 30% at TGE, then 48-month linear); any retroactive testnet-operator recognition is a discretionary off-chain Treasury TGE-unlock with no contract surface. Slashing and granted-appeal refunds are now bond-only. Touched ADRs 026, 016, 028, 036, 008, architecture, glossary, and observability/key-rotation appendices.
   - 036 (`036-served-bytes-voting-weight.md`): supersedes voting-weight clauses of ADR 009 §Production and ADR 026 §Governance; promotes `FeeRouter.bytesPerEpoch` from analytics-only to governance-canonical, adds `windowEpochs` governable parameter, adds `slashedAtEpoch` zero-out on `CapacityBond`.

@@ -61,6 +61,7 @@ The implementation language, the peer mesh's shape, the content-addressing primi
 2. [ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh)
 3. [ADR 002 — Content Addressing](002-content-addressing.md#adr-002-content-addressing)
 4. [ADR 005 — Wire Protocol](005-protocol.md#adr-005-wire-protocol)
+5. [ADR 038 — Bao Verified-Range Streaming on cdn/client/v1](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)
 
 ### Chapter 2 — Discovery
 
