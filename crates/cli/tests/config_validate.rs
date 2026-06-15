@@ -355,9 +355,15 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             node_to_node_pull_through_enabled: false,
             node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
-            pull_ahead_bytes: decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
-            max_unrecouped_leech_bytes: decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
-            pull_share_ratio_percent: decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
+            pull_ahead_bytes: decdn_cache::Bytes::new(
+                decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
+            ),
+            max_unrecouped_leech_bytes: decdn_cache::Bytes::new(
+                decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
+            ),
+            pull_share_ratio_percent: decdn_cache::Percent::new(
+                decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
+            ),
             pull_through_require_authorized_origin: false,
         },
         payment: ResolvedPayment {

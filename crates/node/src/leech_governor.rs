@@ -25,6 +25,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use decdn_cache::{Bytes, Percent};
+
 use crate::metrics::Metrics;
 
 /// Hard cap on the per-peer leech table. Each tracked peer costs one `peers`
@@ -35,9 +37,6 @@ use crate::metrics::Metrics;
 /// forgotten); an actively-pulling leecher is touched every chunk, so it is
 /// never the eviction victim.
 const MAX_TRACKED_PEERS: usize = 65_536;
-
-/// Fixed-point denominator for `share_ratio_percent` (so `100` == 1.0×).
-const SHARE_RATIO_SCALE: u64 = 100;
 
 /// A [`LeechCaps`] could not be constructed because the opening per-peer window
 /// (`initial_allowance_bytes`) does not fit inside the finite global budget
@@ -75,16 +74,32 @@ pub struct LeechCaps {
     /// Node-wide circuit breaker on aggregate speculative spend, in bytes.
     /// `0` disables the global cap (unbounded — the per-request window and the
     /// share ratio remain in force).
-    max_unrecouped_leech_bytes: u64,
+    max_unrecouped_leech_bytes: Bytes,
     /// Per-peer initial pull allowance for a peer with no service history — the
     /// opening window. Set equal to `pull_ahead_bytes` so a fresh peer can be
     /// served exactly the first window before its share ratio must catch up.
-    initial_allowance_bytes: u64,
+    initial_allowance_bytes: Bytes,
     /// Per-peer pull ceiling as a percentage of bytes served to that peer
     /// (`100` == 1.0×). `0` pins the peer to only its `initial_allowance_bytes`
     /// (no growth with service); large values effectively disable the per-peer
     /// cap, leaving only the global budget.
-    share_ratio_percent: u64,
+    share_ratio_percent: Percent,
+}
+
+/// Named parameters for [`LeechCaps::new`] / [`LeechCaps::new_unchecked`] (#894).
+///
+/// A struct rather than three positional arguments: the two byte quantities
+/// (`max_unrecouped_leech_bytes`, `initial_allowance_bytes`) can no longer be
+/// transposed at a call site without a compile error, and the distinct [`Bytes`]
+/// / [`Percent`] types stop a bytes↔percent swap besides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeechCapsConfig {
+    /// Node-wide circuit breaker on aggregate speculative spend. `0` disables.
+    pub max_unrecouped_leech_bytes: Bytes,
+    /// Per-peer opening allowance for a peer with no service history.
+    pub initial_allowance_bytes: Bytes,
+    /// Per-peer pull ceiling as a percentage of bytes served (`100` == 1.0×).
+    pub share_ratio_percent: Percent,
 }
 
 impl LeechCaps {
@@ -97,11 +112,9 @@ impl LeechCaps {
     ///
     /// [`WindowExceedsBudget`] when `max_unrecouped_leech_bytes > 0` and
     /// `initial_allowance_bytes > max_unrecouped_leech_bytes`.
-    pub const fn new(
-        max_unrecouped_leech_bytes: u64,
-        initial_allowance_bytes: u64,
-        share_ratio_percent: u64,
-    ) -> Result<Self, WindowExceedsBudget> {
+    pub const fn new(config: LeechCapsConfig) -> Result<Self, WindowExceedsBudget> {
+        let max_unrecouped_leech_bytes = config.max_unrecouped_leech_bytes.get();
+        let initial_allowance_bytes = config.initial_allowance_bytes.get();
         if max_unrecouped_leech_bytes > 0 && initial_allowance_bytes > max_unrecouped_leech_bytes {
             return Err(WindowExceedsBudget {
                 initial_allowance_bytes,
@@ -109,9 +122,9 @@ impl LeechCaps {
             });
         }
         Ok(Self {
-            max_unrecouped_leech_bytes,
-            initial_allowance_bytes,
-            share_ratio_percent,
+            max_unrecouped_leech_bytes: config.max_unrecouped_leech_bytes,
+            initial_allowance_bytes: config.initial_allowance_bytes,
+            share_ratio_percent: config.share_ratio_percent,
         })
     }
 
@@ -122,16 +135,13 @@ impl LeechCaps {
     /// isolation. Prefer [`LeechCaps::new`] everywhere else; reaching for this in
     /// production wiring would silently reintroduce the self-contradicting state
     /// `new` rejects.
+    #[doc(hidden)]
     #[must_use]
-    pub const fn new_unchecked(
-        max_unrecouped_leech_bytes: u64,
-        initial_allowance_bytes: u64,
-        share_ratio_percent: u64,
-    ) -> Self {
+    pub const fn new_unchecked(config: LeechCapsConfig) -> Self {
         Self {
-            max_unrecouped_leech_bytes,
-            initial_allowance_bytes,
-            share_ratio_percent,
+            max_unrecouped_leech_bytes: config.max_unrecouped_leech_bytes,
+            initial_allowance_bytes: config.initial_allowance_bytes,
+            share_ratio_percent: config.share_ratio_percent,
         }
     }
 }
@@ -222,9 +232,10 @@ impl LeechGovernor {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 
         // Global budget first: a node-wide breach pauses every peer.
-        if self.caps.max_unrecouped_leech_bytes > 0 {
+        let max_unrecouped = self.caps.max_unrecouped_leech_bytes.get();
+        if max_unrecouped > 0 {
             let unrecouped = guard.global_pulled.saturating_sub(guard.global_served);
-            if unrecouped >= self.caps.max_unrecouped_leech_bytes {
+            if unrecouped >= max_unrecouped {
                 drop(guard);
                 self.metrics.node_pull_through_leech_budget_paused();
                 return false;
@@ -234,11 +245,10 @@ impl LeechGovernor {
         // Per-peer share ratio: allowance = initial + served × share_ratio.
         let tick = guard.next_tick();
         let peer_entry = guard.touch(peer, tick);
-        let allowance = self.caps.initial_allowance_bytes.saturating_add(
-            peer_entry
-                .served
-                .saturating_mul(self.caps.share_ratio_percent)
-                / SHARE_RATIO_SCALE,
+        let allowance = self.caps.initial_allowance_bytes.get().saturating_add(
+            self.caps
+                .share_ratio_percent
+                .scale_saturating(peer_entry.served),
         );
         if peer_entry.pulled >= allowance {
             drop(guard);
@@ -324,7 +334,11 @@ mod tests {
         // with a larger opening window to isolate the global circuit breaker, a
         // combination `LeechCaps::new` rightly rejects.
         LeechGovernor::new(
-            LeechCaps::new_unchecked(max, initial, ratio_percent),
+            LeechCaps::new_unchecked(LeechCapsConfig {
+                max_unrecouped_leech_bytes: Bytes::new(max),
+                initial_allowance_bytes: Bytes::new(initial),
+                share_ratio_percent: Percent::new(ratio_percent),
+            }),
             Arc::new(Metrics::new()),
         )
     }
@@ -336,7 +350,12 @@ mod tests {
     fn new_rejects_window_above_finite_budget() {
         // Finite budget smaller than the opening window: a fresh peer's first
         // window could never be admitted, so construction must fail.
-        let rejected = LeechCaps::new(1_000, 1_001, 100);
+        let caps = |max: u64, initial: u64| LeechCapsConfig {
+            max_unrecouped_leech_bytes: Bytes::new(max),
+            initial_allowance_bytes: Bytes::new(initial),
+            share_ratio_percent: Percent::new(100),
+        };
+        let rejected = LeechCaps::new(caps(1_000, 1_001));
         assert!(
             matches!(
                 rejected,
@@ -348,9 +367,9 @@ mod tests {
             "finite budget below the opening window must be rejected: {rejected:?}"
         );
         // Window exactly equal to the budget is admissible.
-        assert!(LeechCaps::new(1_000, 1_000, 100).is_ok());
+        assert!(LeechCaps::new(caps(1_000, 1_000)).is_ok());
         // A `0` global budget disables the global cap, so any window is valid.
-        assert!(LeechCaps::new(0, u64::MAX, 100).is_ok());
+        assert!(LeechCaps::new(caps(0, u64::MAX)).is_ok());
     }
 
     #[test]
