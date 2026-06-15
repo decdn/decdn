@@ -1259,15 +1259,20 @@ fn resolve_cache_into(
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
+    // Unwrap the typed config knobs to bare `u64` for the cross-field check and
+    // the diagnostic messages; they are re-wrapped into the typed `ResolvedCache`
+    // fields below.
     let pull_ahead_bytes = file
         .and_then(|c| c.pull_ahead_bytes)
-        .unwrap_or(DEFAULT_PULL_AHEAD_BYTES);
-    let max_unrecouped_leech_bytes = file
-        .and_then(|c| c.max_unrecouped_leech_bytes)
-        .unwrap_or(DEFAULT_MAX_UNRECOUPED_LEECH_BYTES);
-    let pull_share_ratio_percent = file
-        .and_then(|c| c.pull_share_ratio_percent)
-        .unwrap_or(DEFAULT_PULL_SHARE_RATIO_PERCENT);
+        .map_or(DEFAULT_PULL_AHEAD_BYTES, decdn_config_types::Bytes::get);
+    let max_unrecouped_leech_bytes = file.and_then(|c| c.max_unrecouped_leech_bytes).map_or(
+        DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
+        decdn_config_types::Bytes::get,
+    );
+    let pull_share_ratio_percent = file.and_then(|c| c.pull_share_ratio_percent).map_or(
+        DEFAULT_PULL_SHARE_RATIO_PERCENT,
+        decdn_config_types::Percent::get,
+    );
 
     // A single request's speculative pull-ahead window must fit within the
     // node-wide unrecouped-leech budget (#856). Otherwise one request can drive
@@ -1302,9 +1307,9 @@ fn resolve_cache_into(
         node_to_node_pull_through_enabled,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
-        pull_ahead_bytes,
-        max_unrecouped_leech_bytes,
-        pull_share_ratio_percent,
+        pull_ahead_bytes: decdn_config_types::Bytes::new(pull_ahead_bytes),
+        max_unrecouped_leech_bytes: decdn_config_types::Bytes::new(max_unrecouped_leech_bytes),
+        pull_share_ratio_percent: decdn_config_types::Percent::new(pull_share_ratio_percent),
     }
 }
 
@@ -4068,8 +4073,8 @@ mod tests {
         // counter past the cap before its first voucher clears.
         let cli = empty_cache_args();
         let toml = types::CacheConfig {
-            pull_ahead_bytes: Some(8 * 1024 * 1024),
-            max_unrecouped_leech_bytes: Some(1024 * 1024),
+            pull_ahead_bytes: Some(decdn_config_types::Bytes::new(8 * 1024 * 1024)),
+            max_unrecouped_leech_bytes: Some(decdn_config_types::Bytes::new(1024 * 1024)),
             ..Default::default()
         };
         let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
@@ -4089,13 +4094,13 @@ mod tests {
         // window-vs-budget check does not bind.
         let cli = empty_cache_args();
         let toml = types::CacheConfig {
-            pull_ahead_bytes: Some(8 * 1024 * 1024),
-            max_unrecouped_leech_bytes: Some(0),
+            pull_ahead_bytes: Some(decdn_config_types::Bytes::new(8 * 1024 * 1024)),
+            max_unrecouped_leech_bytes: Some(decdn_config_types::Bytes::new(0)),
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
         anyhow::ensure!(
-            resolved.pull_ahead_bytes == 8 * 1024 * 1024,
+            resolved.pull_ahead_bytes == decdn_config_types::Bytes::new(8 * 1024 * 1024),
             "window not preserved when the global cap is disabled"
         );
         Ok(())

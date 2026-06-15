@@ -26,7 +26,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use decdn_cache::origin::{FilesystemOrigin, Origin, OriginFetch};
-use decdn_cache::{CacheEngine, Hash};
+use decdn_cache::{Bytes, CacheEngine, Hash, Percent};
 use decdn_common::admin::RegionBytes;
 use decdn_incentive::{
     ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore,
@@ -41,7 +41,7 @@ use decdn_node::dht::{
     ConfigOriginDirectory, ConfigStakerSet, NegativeProbeCache, NodeAddressResolver,
     OriginDirectory, StakerSet, StaticNodeAddressDirectory,
 };
-use decdn_node::leech_governor::{LeechCaps, LeechGovernor};
+use decdn_node::leech_governor::{LeechCaps, LeechCapsConfig, LeechGovernor};
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps};
 use decdn_node::probe_client::probe_once;
@@ -3480,7 +3480,11 @@ async fn window_pull_through_leech_stall_refuses_without_spinning() -> Result<()
     )
     .await?;
     handler_b.attach_leech_governor(Arc::new(LeechGovernor::new(
-        LeechCaps::new_unchecked(0, CHUNK_SIZE as u64, 0),
+        LeechCaps::new_unchecked(LeechCapsConfig {
+            max_unrecouped_leech_bytes: Bytes::new(0),
+            initial_allowance_bytes: Bytes::new(CHUNK_SIZE as u64),
+            share_ratio_percent: Percent::new(0),
+        }),
         Arc::clone(&b_metrics),
     )));
     let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -3839,11 +3843,11 @@ async fn window_pull_through_global_budget_exhausted_refuses_admission() -> Resu
         // `new_unchecked`: a tiny global budget below the opening window, so the
         // global circuit breaker binds on the first admission (the scenario under
         // test). `LeechCaps::new` rejects this pairing by design.
-        LeechCaps::new_unchecked(
-            CHUNK_SIZE as u64,
-            decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
-            100,
-        ),
+        LeechCaps::new_unchecked(LeechCapsConfig {
+            max_unrecouped_leech_bytes: Bytes::new(CHUNK_SIZE as u64),
+            initial_allowance_bytes: Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES),
+            share_ratio_percent: Percent::new(100),
+        }),
         Arc::clone(&b_metrics),
     ));
     // Pre-exhaust the global budget through an unrelated peer.
@@ -4030,7 +4034,12 @@ async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
     // satisfy `LeechCaps::new` (a `0` global budget disables the window≤budget
     // cross-check), so the validated constructor is used here.
     let gov = Arc::new(LeechGovernor::new(
-        LeechCaps::new(0, 0, 0).map_err(|e| anyhow::anyhow!("invalid caps: {e}"))?,
+        LeechCaps::new(LeechCapsConfig {
+            max_unrecouped_leech_bytes: Bytes::new(0),
+            initial_allowance_bytes: Bytes::new(0),
+            share_ratio_percent: Percent::new(0),
+        })
+        .map_err(|e| anyhow::anyhow!("invalid caps: {e}"))?,
         Arc::clone(&b_metrics),
     ));
     handler_b.attach_leech_governor(gov);
