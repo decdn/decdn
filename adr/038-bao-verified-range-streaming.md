@@ -26,7 +26,7 @@ The `cdn/client/v1` delivery payload carries bao's native **interleaved verified
 A blob's content hash is the root of a BLAKE3 Merkle tree over fixed-size chunk groups (`iroh-blobs`' group size, 16 KiB). To deliver a range, the serving node emits the chunk-group data interleaved with the sibling/spine hashes that connect those groups to the root. The receiver:
 
 - Verifies each group against the root **incrementally**, rejecting corruption at the offending group rather than only at stream end (early rejection).
-- Verifies a range that begins at any offset, because the proof anchors that range to the root independently of earlier bytes.
+- Verifies a range at chunk-group granularity, because the proof anchors that range to the root independently of earlier bytes. A resumed fetch restarts at the next unverified 16 KiB chunk-group boundary — the offset of the next byte to fetch, group-aligned — not at an arbitrary mid-group byte, which avoids any off-by-one between the verified prefix and the resume request.
 
 Proof overhead is `O(log n)` in the blob size — on the order of a kilobyte of sibling hashes for a multi-gigabyte blob — and is paid only at range boundaries, not per chunk.
 
@@ -38,9 +38,9 @@ The `StreamResponse` / `Voucher` / `VoucherAck` / `StreamEnd` envelope is unchan
 
 ### Serve side
 
-A node serving a range exports a verified range from its store: it reads the persisted outboard and emits the bao encoding for the requested chunk-group range. The outboard is already on disk from import; the serve path performs no re-hashing of held content.
+A node serving a range exports a verified range from its store: it reads the persisted outboard and emits the bao encoding for the requested chunk-group range. The outboard is already on disk from import; the serve path performs no re-hashing of held content. The client-facing `cdn/client/v1` payload is **always** bao-encoded — there is no raw-byte path on the protocol wire, so the receiver's decoder never needs a flat-hasher fallback.
 
-The **origin-cold** path is exempt by nature: on the very first pull straight from an origin, the node streams while still building the outboard during import, so it cannot yet emit proofs for not-yet-imported bytes. That path is inherently sequential single-source (one origin, whole object). Verified-range serving applies to every subsequent serve from a node that holds the blob's outboard.
+This holds even when a node does not yet hold the blob, because the **origin acquisition hop is internal, not `cdn/client/v1`.** When a node sources a blob from a **non-peer origin backend** (S3/R2/B2), it receives raw bytes with no bao proofs — the origin is not a deCDN peer, and the outboard does not exist until the blob is hashed. The node imports and verifies the blob against the requested content hash, materializing the outboard, and serves bao ranges to clients from that point. A genuine origin-cold serve therefore cannot pipeline origin→client byte-for-byte the way a node-to-node pull can; it pays a one-time import latency before the first verified range, borne once per origin-backed node per blob. A **node-to-node** cache-miss pull is unaffected: the upstream holder serves bao, which the serving node verifies and forwards as it tees to its own store ([ADR 037 § Node serving](037-regional-proxy-warming.md#node-serving-window-paced-pull-through)), so that path stays pipelined and bao end-to-end.
 
 ### Receive side
 
@@ -70,7 +70,7 @@ Range-addressed discovery — advertising "I hold bytes `[a, b)` of `H`" on `cdn
 
 - The delivery payload format changes; every node and client must produce/consume the bao encoding. This is a clean break rather than a migration only because `cdn/client/v1` is pre-finalisation.
 - Payment meters proof bytes as well as content bytes (`~0.4%` overhead), so payers pay a small premium for the integrity proofs.
-- The origin-cold first pull cannot offer verified ranges and remains sequential single-source until the blob is imported and its outboard exists.
+- A genuine origin-cold serve (sourcing from a non-peer origin backend) must import the blob and build its outboard before it can serve verified ranges, so it does not pipeline origin→client and the first such serve pays a one-time import latency. The client-facing wire is still bao; only the internal origin hop is non-pipelined.
 
 ### Risks
 
@@ -89,7 +89,7 @@ Range-addressed discovery — advertising "I hold bytes `[a, b)` of `H`" on `cdn
 1. A `cdn/client/v1` request that begins at `byte_offset > 0` verifies the received range against the requested content hash on its own, with no dependency on bytes before the offset; a corrupt tail is rejected.
 2. Verification is incremental: a corrupt chunk group is rejected at that group rather than only at stream finalization.
 3. `ChunkData` payloads carry the bao interleaved verified-stream encoding; the `StreamResponse` / `Voucher` / `VoucherAck` / `StreamEnd` envelope and the voucher cadence are unchanged, with vouchers interleaved by framing the bao byte stream into `voucher_interval_mb` pieces.
-4. The serving node emits verified ranges from the persisted outboard without re-hashing held content; the origin-cold first pull is exempt and remains sequential single-source until import completes.
+4. The serving node emits verified ranges from the persisted outboard without re-hashing held content; the client-facing `cdn/client/v1` payload is always bao-encoded, with no raw-byte fallback. A node sourcing a blob from a non-peer origin backend imports and builds its outboard before serving verified ranges (one-time import latency); a node-to-node cache-miss pull stays pipelined because the upstream holder already serves bao.
 5. The publisher CLI is unchanged — it computes the flat BLAKE3 root, links no blob store, and the root matches the outboard a node derives on first import.
 6. Paid bytes equal the bytes delivered on the wire, inclusive of interleaved proof nodes; there is no separate metering path that excludes proof bytes.
 7. A whole-blob fetch from `byte_offset == 0` against a single source yields bytes identical to the prior flat-hasher path and verifies against the same content hash.
