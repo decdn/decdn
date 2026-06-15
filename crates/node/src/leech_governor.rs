@@ -92,7 +92,7 @@ pub struct LeechCaps {
 /// (`max_unrecouped_leech_bytes`, `initial_allowance_bytes`) can no longer be
 /// transposed at a call site without a compile error, and the distinct [`Bytes`]
 /// / [`Percent`] types stop a bytes↔percent swap besides.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeechCapsConfig {
     /// Node-wide circuit breaker on aggregate speculative spend. `0` disables.
     pub max_unrecouped_leech_bytes: Bytes,
