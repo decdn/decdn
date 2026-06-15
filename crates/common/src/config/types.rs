@@ -403,6 +403,9 @@ pub struct CacheConfig {
     /// Requires the origin-directory addresses (the `origin_assignment_address`
     /// and `publisher_registry_address` blockchain keys); without them the
     /// directory is empty and the gate fails closed (every pull is refused).
+    /// Only affects the node-to-node reactive pull-through path, so it is a no-op
+    /// unless `node_to_node_pull_through_enabled` is also `true` — with
+    /// pull-through off, a cache miss already returns `NotFound`.
     pub pull_through_require_authorized_origin: Option<bool>,
 }
 

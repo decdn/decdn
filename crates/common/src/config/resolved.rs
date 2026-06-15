@@ -232,6 +232,9 @@ pub struct ResolvedCache {
     /// pull (and its cache-warming write) for a hash whose namespace has no
     /// authorized origin, returning `NotFound`; ranges already held are still
     /// served. `cache.*` is restart-required, so this is read once at bring-up.
+    /// The runtime attaches the gate only when `node_to_node_pull_through_enabled`
+    /// is also set, so it is a no-op without that path (a miss already returns
+    /// `NotFound`).
     pub pull_through_require_authorized_origin: bool,
 }
 
