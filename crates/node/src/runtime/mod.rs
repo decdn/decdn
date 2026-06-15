@@ -790,7 +790,7 @@ pub async fn run(
     };
     let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(
         cfg.prefetch,
-        prefetch_origin_directory,
+        Arc::clone(&prefetch_origin_directory),
     ));
     node_metrics.set_prefetch_enabled(prefetch_engine.enabled());
     // Seed the demand-quality gauges once so they read a sane baseline
@@ -987,6 +987,16 @@ pub async fn run(
             client_handler.attach_leech_governor(Arc::new(
                 crate::leech_governor::LeechGovernor::new(leech_caps, Arc::clone(&node_metrics)),
             ));
+        }
+        // Optional content-authorization gate on the reactive pull-through path
+        // (#821, ADR 037 §Seed-leech caps). Off by default — the cache role stays
+        // permissionless. When the operator opts in, the handler refuses to
+        // initiate an upstream pull for a hash with no authorized origin, reusing
+        // the same directory the prefetch gate consults so "authorized" means the
+        // same thing on both paths (and fails closed when the origin-directory
+        // addresses are unset, since the directory is then empty).
+        if cfg.cache.pull_through_require_authorized_origin {
+            client_handler.attach_pull_origin_gate(Arc::clone(&prefetch_origin_directory));
         }
     }
 
@@ -2801,6 +2811,7 @@ mod tests {
                 max_unrecouped_leech_bytes:
                     decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
                 pull_share_ratio_percent: decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
+                pull_through_require_authorized_origin: false,
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,

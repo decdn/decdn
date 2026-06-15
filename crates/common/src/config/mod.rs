@@ -1268,6 +1268,9 @@ fn resolve_cache_into(
     let pull_share_ratio_percent = file
         .and_then(|c| c.pull_share_ratio_percent)
         .unwrap_or(DEFAULT_PULL_SHARE_RATIO_PERCENT);
+    let pull_through_require_authorized_origin = file
+        .and_then(|c| c.pull_through_require_authorized_origin)
+        .unwrap_or(false);
 
     // A single request's speculative pull-ahead window must fit within the
     // node-wide unrecouped-leech budget (#856). Otherwise one request can drive
@@ -1305,6 +1308,7 @@ fn resolve_cache_into(
         pull_ahead_bytes,
         max_unrecouped_leech_bytes,
         pull_share_ratio_percent,
+        pull_through_require_authorized_origin,
     }
 }
 

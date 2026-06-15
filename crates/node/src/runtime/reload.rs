@@ -810,6 +810,7 @@ impl RuntimeReloadState {
                 max_unrecouped_leech_bytes:
                     decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
                 pull_share_ratio_percent: decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
+                pull_through_require_authorized_origin: false,
             },
             payment: ResolvedPayment {
                 rate_per_mb,
@@ -1309,6 +1310,7 @@ mod tests {
                 max_unrecouped_leech_bytes:
                     decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
                 pull_share_ratio_percent: decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
+                pull_through_require_authorized_origin: false,
             },
             payment: ResolvedPayment {
                 rate_per_mb: rate,

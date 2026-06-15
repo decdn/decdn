@@ -58,6 +58,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::dht::origin::OriginDirectory;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::leech_governor::LeechGovernor;
 use crate::metrics::Metrics;
@@ -136,6 +137,22 @@ impl Drop for BgInflightGuard {
     }
 }
 
+/// Whether the reactive pull-through authorized-origin gate (#821) refuses to
+/// initiate a pull for `hash`. Returns `true` (refuse) only when the operator
+/// opted in — a directory is attached, via
+/// [`ClientHandler::attach_pull_origin_gate`] — AND that directory holds no
+/// authorized origin for the hash's namespace. An unattached gate (the default)
+/// always returns `false`, preserving the permissionless cache role. Free
+/// function so the branch is unit-testable without a full handler / QUIC stream
+/// (the wire `NotFound` it produces is indistinguishable from a plain miss, so
+/// an end-to-end test cannot observe it).
+fn pull_origin_gate_blocks(
+    gate: Option<&Arc<dyn OriginDirectory>>,
+    hash: &crate::dht::origin::Hash,
+) -> bool {
+    gate.is_some_and(|dir| !dir.has_origin(hash))
+}
+
 /// Claim `hash` for a background fill (#859), returning a [`BgInflightGuard`]
 /// the caller must hold for the lifetime of the spawned warm task — dropping it
 /// releases the claim. Returns `None` only if a fill is already in flight for
@@ -171,6 +188,7 @@ enum ServeRejectReason {
     UnknownChannel,
     OwnerMismatch,
     InsufficientDeposit,
+    UnauthorizedOrigin,
 }
 
 impl ServeRejectReason {
@@ -190,7 +208,8 @@ impl ServeRejectReason {
             Self::CacheMiss
             | Self::UnknownChannel
             | Self::OwnerMismatch
-            | Self::InsufficientDeposit => StreamError::NotFound,
+            | Self::InsufficientDeposit
+            | Self::UnauthorizedOrigin => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             Self::BlobTooLarge => StreamError::BlobTooLarge,
@@ -275,6 +294,18 @@ pub struct ClientHandler {
     /// speculative pull-through proceeds and credited from the voucher path.
     /// Unset (tests / feature off) leaves only the per-request window.
     leech_governor: OnceLock<Arc<LeechGovernor>>,
+    /// Optional content-authorization gate on the reactive pull-through path
+    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §Scope and limits), attached via
+    /// [`ClientHandler::attach_pull_origin_gate`] only when the operator sets
+    /// `cache.pull_through_require_authorized_origin = true`. Unset (the default
+    /// and in tests) keeps the permissionless cache role: misses pull through
+    /// unconditionally. When set, a cache miss whose hash has no authorized origin
+    /// in this directory (`has_origin == false`) is refused with `NotFound` before
+    /// any upstream pull or cache-warming write — a pull-*initiation* gate only,
+    /// never consulted for a range already held. Shares the same
+    /// `OriginDirectory` the prefetch gate uses, so the namespace / default-open
+    /// (`namespaceId == 0`) / fail-closed-on-RPC-loss semantics are identical.
+    pull_origin_gate: OnceLock<Arc<dyn OriginDirectory>>,
     /// Speculative-prefetch engine (#820), attached post-construction via
     /// [`ClientHandler::attach_prefetch_engine`]. `None` in tests / when prefetch
     /// is off. When set, the serve path credits bytes served from
@@ -359,6 +390,7 @@ impl ClientHandler {
             pull_through_origin: OnceLock::new(),
             pull_ahead_bytes: OnceLock::new(),
             leech_governor: OnceLock::new(),
+            pull_origin_gate: OnceLock::new(),
             prefetch_engine: OnceLock::new(),
             rate_per_mb,
             delivery_floor,
@@ -442,6 +474,17 @@ impl ClientHandler {
     /// share ratio, and the voucher path credits served bytes to it.
     pub fn attach_leech_governor(&self, governor: Arc<LeechGovernor>) {
         let _ = self.leech_governor.set(governor);
+    }
+
+    /// Attach the reactive-pull-through authorized-origin gate (#821). Called
+    /// once during runtime wiring, only when
+    /// `cache.pull_through_require_authorized_origin = true`; a second call is
+    /// ignored. After this, a cache miss whose hash has no authorized origin in
+    /// `dir` is refused with `NotFound` before any upstream pull. `dir` SHOULD be
+    /// the same `OriginDirectory` the prefetch gate consumes so the two gates
+    /// agree on what "authorized" means.
+    pub fn attach_pull_origin_gate(&self, dir: Arc<dyn OriginDirectory>) {
+        let _ = self.pull_origin_gate.set(dir);
     }
 
     /// Spawn a detached background cache-fill for `hash` (#859), unless one is
@@ -862,6 +905,26 @@ impl ClientHandler {
                 if self.cache.is_evicted(hash) {
                     return self
                         .respond_error(&mut send, &req, ServeRejectReason::EvictedSinceProbe)
+                        .await;
+                }
+                // Content-authorization gate (#821, ADR 037 §Seed-leech caps /
+                // ADR 022 §Scope and limits). When the operator opts in
+                // (`pull_through_require_authorized_origin`), refuse to INITIATE an
+                // upstream pull and its cache-warming write for a hash whose
+                // namespace has no currently-authorized origin — the reactive-path
+                // analogue of the prefetch authorized-origin gate, sharing the same
+                // `OriginDirectory` (namespace / default-open / fail-closed
+                // semantics included). It is a pull-*initiation* gate only: a range
+                // already held is served from the `Ok(true)` arm above, so refusing
+                // held blobs stays `ContentBlacklist`'s job (ADR 011/031). The
+                // directory is attached only when the gate is enabled, so an unset
+                // gate keeps the permissionless cache-role default.
+                if pull_origin_gate_blocks(
+                    self.pull_origin_gate.get(),
+                    &crate::dht::origin::Hash::from_bytes(req.hash),
+                ) {
+                    return self
+                        .respond_error(&mut send, &req, ServeRejectReason::UnauthorizedOrigin)
                         .await;
                 }
                 // Node-to-node cache-miss pull-through (#831). Fronting upstream
@@ -1905,6 +1968,9 @@ impl ClientHandler {
             ServeRejectReason::InsufficientDeposit => {
                 self.metrics.serve_stream_rejected_insufficient_deposit();
             }
+            ServeRejectReason::UnauthorizedOrigin => {
+                self.metrics.serve_stream_rejected_unauthorized_origin();
+            }
         }
         let error = reason.wire_error();
         let rate_per_mb = self.clamped_rate();
@@ -2085,5 +2151,34 @@ mod tests {
             "the hash re-arms once its guard releases"
         );
         drop(other_guard);
+    }
+
+    // #821: the reactive pull-through authorized-origin gate refuses a pull only
+    // when the operator opted in (a directory is attached) AND the hash has no
+    // authorized origin; an unattached gate keeps the permissionless default.
+    #[test]
+    fn pull_origin_gate_decision() {
+        use crate::dht::origin::{ConfigOriginDirectory, Hash as OriginHash, OriginDirectory};
+        use crate::dht::routing::NodeId;
+
+        let h = OriginHash::from_bytes([7u8; 32]);
+
+        // Unattached gate (default): never blocks — cache role stays permissionless.
+        assert!(!pull_origin_gate_blocks(None, &h));
+
+        // Opted in, empty directory: blocks — no authorized origin for the hash.
+        let empty: Arc<dyn OriginDirectory> = Arc::new(ConfigOriginDirectory::empty());
+        assert!(pull_origin_gate_blocks(Some(&empty), &h));
+
+        // Opted in, directory holds an authorized origin: allows the pull.
+        let mut m = HashMap::new();
+        m.insert(h, vec![NodeId::from_bytes([1u8; 32])]);
+        let authorized: Arc<dyn OriginDirectory> = Arc::new(ConfigOriginDirectory::new(m));
+        assert!(!pull_origin_gate_blocks(Some(&authorized), &h));
+        // A different, unclaimed hash through the same directory is still blocked.
+        assert!(pull_origin_gate_blocks(
+            Some(&authorized),
+            &OriginHash::from_bytes([9u8; 32])
+        ));
     }
 }
