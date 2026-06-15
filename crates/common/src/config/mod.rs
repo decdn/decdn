@@ -1259,20 +1259,23 @@ fn resolve_cache_into(
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
-    // Unwrap the typed config knobs to bare `u64` for the cross-field check and
-    // the diagnostic messages; they are re-wrapped into the typed `ResolvedCache`
-    // fields below.
+    // Resolve the seed-leech knobs to their typed `Bytes` / `Percent` form and
+    // keep them typed through the cross-field check and `ResolvedCache`
+    // construction below, so a bytes<->percent (or bytes<->bytes) transposition
+    // inside this resolver is a compile error too.
     let pull_ahead_bytes = file
         .and_then(|c| c.pull_ahead_bytes)
-        .map_or(DEFAULT_PULL_AHEAD_BYTES, decdn_config_types::Bytes::get);
-    let max_unrecouped_leech_bytes = file.and_then(|c| c.max_unrecouped_leech_bytes).map_or(
-        DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
-        decdn_config_types::Bytes::get,
-    );
-    let pull_share_ratio_percent = file.and_then(|c| c.pull_share_ratio_percent).map_or(
-        DEFAULT_PULL_SHARE_RATIO_PERCENT,
-        decdn_config_types::Percent::get,
-    );
+        .unwrap_or(decdn_config_types::Bytes::new(DEFAULT_PULL_AHEAD_BYTES));
+    let max_unrecouped_leech_bytes =
+        file.and_then(|c| c.max_unrecouped_leech_bytes)
+            .unwrap_or(decdn_config_types::Bytes::new(
+                DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
+            ));
+    let pull_share_ratio_percent =
+        file.and_then(|c| c.pull_share_ratio_percent)
+            .unwrap_or(decdn_config_types::Percent::new(
+                DEFAULT_PULL_SHARE_RATIO_PERCENT,
+            ));
 
     // A single request's speculative pull-ahead window must fit within the
     // node-wide unrecouped-leech budget (#856). Otherwise one request can drive
@@ -1281,7 +1284,7 @@ fn resolve_cache_into(
     // refuses immediately. `max_unrecouped_leech_bytes == 0` disables the global
     // cap, so the check only binds when the budget is enabled.
     bag.check_with(
-        max_unrecouped_leech_bytes == 0 || pull_ahead_bytes <= max_unrecouped_leech_bytes,
+        max_unrecouped_leech_bytes.get() == 0 || pull_ahead_bytes <= max_unrecouped_leech_bytes,
         "cache.pull_ahead_bytes",
         || {
             format!(
@@ -1307,9 +1310,9 @@ fn resolve_cache_into(
         node_to_node_pull_through_enabled,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
-        pull_ahead_bytes: decdn_config_types::Bytes::new(pull_ahead_bytes),
-        max_unrecouped_leech_bytes: decdn_config_types::Bytes::new(max_unrecouped_leech_bytes),
-        pull_share_ratio_percent: decdn_config_types::Percent::new(pull_share_ratio_percent),
+        pull_ahead_bytes,
+        max_unrecouped_leech_bytes,
+        pull_share_ratio_percent,
     }
 }
 

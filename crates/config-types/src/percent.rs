@@ -42,9 +42,15 @@ impl Percent {
     /// Apply this percentage to `bytes`, saturating on overflow:
     /// `bytes * percent / 100`. Owns the `SHARE_RATIO_SCALE` division so the
     /// scale is never mismatched at a call site.
+    ///
+    /// The product is computed in `u128` so a `bytes * percent` that overflows
+    /// `u64` is divided *before* it is clamped — clamping the raw product first
+    /// (e.g. `u64::saturating_mul`) would divide `u64::MAX` by 100 and return a
+    /// value ~100× too small rather than a true saturated `u64::MAX`.
     #[must_use]
-    pub const fn scale_saturating(self, bytes: u64) -> u64 {
-        bytes.saturating_mul(self.0) / SHARE_RATIO_SCALE
+    pub fn scale_saturating(self, bytes: u64) -> u64 {
+        let scaled = u128::from(bytes) * u128::from(self.0) / u128::from(SHARE_RATIO_SCALE);
+        u64::try_from(scaled).unwrap_or(u64::MAX)
     }
 }
 
@@ -87,10 +93,16 @@ mod tests {
 
     #[test]
     fn scale_saturating_saturates_instead_of_overflowing() {
-        // The multiply saturates at u64::MAX before the divide, no panic.
+        // The product is computed in u128, so an overflowing `bytes * percent`
+        // is divided before it is clamped and the result saturates at u64::MAX —
+        // not u64::MAX/100, which clamping the raw product first would yield.
+        assert_eq!(Percent::new(u64::MAX).scale_saturating(u64::MAX), u64::MAX);
+        // Regression for the mid-range overflow: 2.0× of just over half of
+        // u64::MAX exceeds u64::MAX, so it must saturate. A u64 saturating_mul
+        // before the divide returned ~u64::MAX/100 here.
         assert_eq!(
-            Percent::new(u64::MAX).scale_saturating(u64::MAX),
-            u64::MAX / SHARE_RATIO_SCALE
+            Percent::new(200).scale_saturating(u64::MAX / 2 + 1),
+            u64::MAX
         );
     }
 }
