@@ -28,7 +28,10 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///           - Per-region concurrent-appeal cap (`BODY_CONCURRENT_APPEAL_CAP`)
 ///             is enforced as a single hard ceiling per region, not by
 ///             requesting body identity.
-///           - Perjury denylist + 365-day rejection cooldown are deferred.
+///           - Perjury denylist (365-day suspension on a false sworn
+///             declaration) is deferred. The ADR 031 rejection cooldown
+///             (three rejections inside a rolling, governance-tunable window
+///             → a full-window lockout) is implemented via `filerRejections`.
 contract ContentBlacklist is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -55,6 +58,16 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // float; widen on production redeploy.
     uint256 internal constant APPEAL_BOND_FLOOR = 50e18;
     uint256 internal constant APPEAL_BOND_CEILING = 5000e18;
+
+    // ADR 031 § APPEAL_FILER_REJECTION_COOLDOWN — three rejections inside a
+    // rolling window lock the filer out of `openBlacklistAppeal` for another
+    // full window (audit finding H-4). The threshold is fixed at three by the
+    // `RejectionWindow` fixed-size ring; the window length is governance-tunable
+    // via `setRejectionCooldownWindow`, bounded for the same reason `appealBond`
+    // is. Default matches the ADR 011 90-day rolling-cooldown spec.
+    uint64 internal constant REJECTION_COOLDOWN_WINDOW_DEFAULT = 90 days;
+    uint64 internal constant REJECTION_COOLDOWN_WINDOW_FLOOR = 1 days;
+    uint64 internal constant REJECTION_COOLDOWN_WINDOW_CEILING = 365 days;
 
     bytes32 internal constant GLOBAL_REGION = bytes32("GLOBAL");
 
@@ -93,6 +106,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ERC20Burnable public immutable token;
 
     uint256 public appealBond;
+
+    /// @notice Governance-tunable rolling window for the ADR 031 rejection
+    ///         cooldown — serves as both the lookback over a filer's recent
+    ///         rejections and the lockout duration once three accumulate.
+    ///         Bounded to [REJECTION_COOLDOWN_WINDOW_FLOOR,
+    ///         REJECTION_COOLDOWN_WINDOW_CEILING]. `uint64` like every other
+    ///         appeal-machinery time field, so no widen/narrow casts are needed.
+    uint64 public rejectionCooldownWindow;
 
     // -----------------------------------------------------------------
     // Storage — blacklist entries
@@ -146,6 +167,21 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         bug across concurrent appeals).
     mapping(bytes32 region => mapping(bytes32 hash => bool)) public hasActiveAppeal;
 
+    /// @notice ADR 031 § APPEAL_FILER_REJECTION_COOLDOWN rolling-window state.
+    ///         `rejections` holds the three most recent rejection timestamps
+    ///         (chronological; 0 marks an empty slot); `cooldownUntilAt` is
+    ///         non-zero while the filer is locked out. Packs into one slot.
+    struct RejectionWindow {
+        uint64[3] rejections;
+        uint64 cooldownUntilAt;
+    }
+
+    /// @notice Per-filer rejection cooldown state. Throttles abusive filers
+    ///         whose appeals are repeatedly rejected (audit finding H-4) — the
+    ///         success-path `lastRatifiedSuccessAt` cap does not cover them, so
+    ///         without this the only brake on rejected-appeal spam is the bond.
+    mapping(address filer => RejectionWindow) public filerRejections;
+
     // -----------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------
@@ -172,6 +208,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     event BlacklistAppealLapsed(uint256 indexed appealId, uint8 reason);
 
     event AppealBondUpdated(uint256 oldValue, uint256 newValue);
+    event RejectionCooldownWindowUpdated(uint64 oldValue, uint64 newValue);
 
     // -----------------------------------------------------------------
     // Errors
@@ -194,6 +231,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error AppealAlreadyActive(bytes32 region, bytes32 hash);
     error HashHasActiveAppeal(bytes32 region, bytes32 hash);
     error FrequencyCapHit(uint64 nextAvailableAt);
+    error FilerInRejectionCooldown(uint64 cooldownUntilAt);
     error UnauthorizedStanding(StandingPath path);
     error OperatorRegionMismatch(bytes32 appealRegion, bytes32 filerRegion);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
@@ -211,6 +249,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         capacityBondRegion = ICapacityBondRegionView(address(capacityBond_));
         token = token_;
         appealBond = appealBond_;
+        rejectionCooldownWindow = REJECTION_COOLDOWN_WINDOW_DEFAULT;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
     }
@@ -362,6 +401,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             if (block.timestamp < nextAvailable) revert FrequencyCapHit(nextAvailable);
         }
 
+        // ADR 031 § APPEAL_FILER_REJECTION_COOLDOWN (audit H-4): an abusive
+        // filer whose appeals keep getting rejected is locked out for the
+        // rolling window, independent of the success-path frequency cap above.
+        // Cheap single SLOAD, so it precedes the standing / external-call checks.
+        uint64 cooldownUntilAt = filerRejections[msg.sender].cooldownUntilAt;
+        // forge-lint: disable-next-line(block-timestamp)
+        if (cooldownUntilAt > block.timestamp) revert FilerInRejectionCooldown(cooldownUntilAt);
+
         // Enum-range check first. Operator standing additionally gets the
         // current-region match below (ADR 011 § Standing path 2); the
         // TokenHolder synthetic-standing clawback (admissibility condition (c)
@@ -437,6 +484,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         a.bond = 0;
         a.status = AppealStatus.Rejected;
         hasActiveAppeal[a.region][a.hash] = false;
+        _recordRejection(a.filer);
         if (bondBurned != 0) token.burn(bondBurned);
         emit BlacklistAppealRejected(appealId, bondBurned);
     }
@@ -515,6 +563,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         return _appeals.length;
     }
 
+    /// @notice Full ADR 031 rejection-window record for `filer`. The public
+    ///         `filerRejections` auto-getter omits the fixed-size `rejections`
+    ///         array, so this explicit accessor exposes it for off-chain audit.
+    function getFilerRejectionWindow(address filer) external view returns (RejectionWindow memory) {
+        return filerRejections[filer];
+    }
+
     // -----------------------------------------------------------------
     // Governance setters
     // -----------------------------------------------------------------
@@ -524,6 +579,16 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         uint256 old = appealBond;
         appealBond = newBond;
         emit AppealBondUpdated(old, newBond);
+    }
+
+    /// @notice Governance-tunable ADR 031 rejection cooldown window (rolling
+    ///         lookback == lockout duration). Bounded for the same reason as
+    ///         `appealBond` — keeps the abuse throttle inside sane limits.
+    function setRejectionCooldownWindow(uint64 newWindow) external onlyRole(GOVERNANCE_ROLE) {
+        _enforceRejectionCooldownWindowBounds(newWindow);
+        uint64 old = rejectionCooldownWindow;
+        rejectionCooldownWindow = newWindow;
+        emit RejectionCooldownWindowUpdated(old, newWindow);
     }
 
     /// @notice Convenience for the post-deployment role grant
@@ -568,6 +633,36 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     function _enforceAppealBondBounds(uint256 value) internal pure {
         if (value < APPEAL_BOND_FLOOR || value > APPEAL_BOND_CEILING) {
             revert ParamOutOfBounds({ value: value, floor: APPEAL_BOND_FLOOR, ceiling: APPEAL_BOND_CEILING });
+        }
+    }
+
+    function _enforceRejectionCooldownWindowBounds(uint64 value) internal pure {
+        if (value < REJECTION_COOLDOWN_WINDOW_FLOOR || value > REJECTION_COOLDOWN_WINDOW_CEILING) {
+            revert ParamOutOfBounds(value, REJECTION_COOLDOWN_WINDOW_FLOOR, REJECTION_COOLDOWN_WINDOW_CEILING);
+        }
+    }
+
+    /// @dev ADR 031 § APPEAL_FILER_REJECTION_COOLDOWN. Appends the current time
+    ///      to the filer's three-slot ring (dropping the oldest) and, if all
+    ///      three rejections fall inside `rejectionCooldownWindow`, locks the
+    ///      filer out for a fresh full window. The ring is cleared on lockout so
+    ///      the filer starts from zero once the cooldown elapses. Rejections that
+    ///      age out of the rolling window simply never accumulate to three.
+    function _recordRejection(address filer) internal {
+        RejectionWindow storage w = filerRejections[filer];
+        uint64 nowTs = uint64(block.timestamp);
+        w.rejections[0] = w.rejections[1];
+        w.rejections[1] = w.rejections[2];
+        w.rejections[2] = nowTs;
+        uint64 oldest = w.rejections[0];
+        uint64 window = rejectionCooldownWindow;
+        // `oldest != 0` means the ring is full (three rejections recorded); if
+        // the oldest of those three is still inside the window, all three are.
+        if (oldest != 0 && nowTs - oldest <= window) {
+            w.cooldownUntilAt = nowTs + window;
+            w.rejections[0] = 0;
+            w.rejections[1] = 0;
+            w.rejections[2] = 0;
         }
     }
 }

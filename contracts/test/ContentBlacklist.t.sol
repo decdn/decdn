@@ -535,4 +535,160 @@ contract ContentBlacklistTest is Test {
         bondMock.setGate(uint64(block.timestamp - 9 days), 7 days);
         assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
     }
+
+    // -----------------------------------------------------------------
+    // ADR 031 § APPEAL_FILER_REJECTION_COOLDOWN (audit finding H-4)
+    // -----------------------------------------------------------------
+
+    /// @dev Seeds a fresh REGION_US entry for `h`, has `filer` open an appeal
+    ///      on it, and has the multisig reject that appeal.
+    function _openAndReject(bytes32 h) internal {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, h);
+        vm.prank(filer);
+        uint256 id = blacklist.openBlacklistAppeal(h, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        vm.prank(multisig);
+        blacklist.rejectBlacklistAppeal(id);
+    }
+
+    /// @notice Three in-window rejections lock the filer out of
+    ///         `openBlacklistAppeal` for a full window — the bond is no longer
+    ///         the only brake on rejected-appeal spam across distinct entries.
+    function test_rejectionCooldown_locksOutAfterThreeRejections() public {
+        _openAndReject(bytes32(uint256(1)));
+        _openAndReject(bytes32(uint256(2)));
+        // Two rejections: not yet locked out.
+        assertEq(blacklist.getFilerRejectionWindow(filer).cooldownUntilAt, 0);
+
+        _openAndReject(bytes32(uint256(3)));
+        uint64 cooldownUntil = blacklist.getFilerRejectionWindow(filer).cooldownUntilAt;
+        assertEq(cooldownUntil, uint64(block.timestamp) + 90 days);
+
+        // A fresh appeal on a distinct live entry is rejected at intake.
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
+        vm.prank(filer);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerInRejectionCooldown.selector, cooldownUntil));
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+    }
+
+    /// @notice Two rejections never trip the cooldown — an occasional rejected
+    ///         appeal does not penalize an otherwise legitimate filer.
+    function test_rejectionCooldown_twoRejectionsDoNotLockOut() public {
+        _openAndReject(bytes32(uint256(1)));
+        _openAndReject(bytes32(uint256(2)));
+        assertEq(blacklist.getFilerRejectionWindow(filer).cooldownUntilAt, 0);
+
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(3)));
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(3))));
+    }
+
+    /// @notice The cooldown lifts once the window elapses; the filer can file
+    ///         again afterwards.
+    function test_rejectionCooldown_liftsAfterWindow() public {
+        _openAndReject(bytes32(uint256(1)));
+        _openAndReject(bytes32(uint256(2)));
+        _openAndReject(bytes32(uint256(3)));
+        uint64 cooldownUntil = blacklist.getFilerRejectionWindow(filer).cooldownUntilAt;
+        assertGt(cooldownUntil, 0);
+
+        vm.warp(uint256(cooldownUntil) + 1);
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(4))));
+    }
+
+    /// @notice The rolling window resets: rejections that age out of the window
+    ///         never accumulate to three, so a later rejection does not lock out.
+    function test_rejectionCooldown_rollingWindowResets() public {
+        _openAndReject(bytes32(uint256(1)));
+        _openAndReject(bytes32(uint256(2)));
+        // Let the 90-day window roll past the first two rejections.
+        vm.warp(block.timestamp + 91 days);
+        _openAndReject(bytes32(uint256(3)));
+        // The two stale rejections aged out → the third does NOT trip a cooldown.
+        assertEq(blacklist.getFilerRejectionWindow(filer).cooldownUntilAt, 0);
+
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(4))));
+    }
+
+    /// @notice One filer's cooldown does not affect a different, well-behaved
+    ///         filer — the throttle is strictly per-filer.
+    function test_rejectionCooldown_doesNotAffectOtherFilers() public {
+        _openAndReject(bytes32(uint256(1)));
+        _openAndReject(bytes32(uint256(2)));
+        _openAndReject(bytes32(uint256(3)));
+        assertGt(blacklist.getFilerRejectionWindow(filer).cooldownUntilAt, 0);
+
+        address filer2 = address(0xF2);
+        vm.prank(admin);
+        token.transfer(filer2, APPEAL_BOND);
+        vm.prank(filer2);
+        token.approve(address(blacklist), type(uint256).max);
+        bondMock.setRegion(filer2, "US", "", 0);
+
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
+        vm.prank(filer2);
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(4))));
+        assertEq(blacklist.getFilerRejectionWindow(filer2).cooldownUntilAt, 0);
+    }
+
+    /// @notice The lockout consults the governance-tunable window: tightening it
+    ///         lets a wider rejection spacing avoid a lockout the default would
+    ///         have triggered.
+    function test_rejectionCooldown_usesGovernedWindow() public {
+        vm.prank(admin);
+        blacklist.setRejectionCooldownWindow(1 days);
+
+        _openAndReject(bytes32(uint256(1)));
+        _openAndReject(bytes32(uint256(2)));
+        vm.warp(block.timestamp + 2 days);
+        _openAndReject(bytes32(uint256(3)));
+        // Beyond the 1-day governed window the third rejection ages the oldest
+        // out, so no lockout — the default 90-day window would have locked out.
+        assertEq(blacklist.getFilerRejectionWindow(filer).cooldownUntilAt, 0);
+    }
+
+    function test_setRejectionCooldownWindow_updatesValue() public {
+        vm.prank(admin);
+        blacklist.setRejectionCooldownWindow(30 days);
+        assertEq(blacklist.rejectionCooldownWindow(), 30 days);
+    }
+
+    function test_setRejectionCooldownWindow_revertsOutOfBounds() public {
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ContentBlacklist.ParamOutOfBounds.selector, uint256(366 days), uint256(1 days), uint256(365 days)
+            )
+        );
+        blacklist.setRejectionCooldownWindow(366 days);
+    }
+
+    function test_setRejectionCooldownWindow_revertsWithoutGovernanceRole() public {
+        _expectMissingRole(filer, blacklist.GOVERNANCE_ROLE());
+        vm.prank(filer);
+        blacklist.setRejectionCooldownWindow(30 days);
+    }
 }
