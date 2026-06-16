@@ -17,7 +17,7 @@ We are building a decentralized CDN with two participant roles: **nodes** (provi
 
 Use **Rust** as the implementation language and **iroh** as the core networking library.
 
-iroh versioning policy: pin to a specific version in `Cargo.toml` (e.g. `iroh = "1.0"`) rather than an open range. The current evaluated baseline is **1.0** (iroh 1.0, iroh-blobs 0.103, iroh-gossip 0.101, iroh-metrics 1.0; bumped from the 0.98 baseline in #918). Upgrades are deliberate — evaluate API compatibility, update `Cargo.toml`, and record the new baseline here before merging. `Cargo.lock` is committed and acts as the true pin within a given version constraint.
+iroh versioning policy: pin to the minor version in `Cargo.toml` rather than an open range, so a `cargo update` can take patch releases but never a minor without a deliberate bump. For the post-1.0 crates this needs a tilde requirement (`iroh = "~1.0"` → `>=1.0.0, <1.1.0`); a plain caret (`iroh = "1.0"`) would float the whole 1.x line. On the 0.x line the plain caret already minor-pins (`iroh-blobs = "0.103"` → `>=0.103.0, <0.104.0`). The current evaluated baseline is **1.0** (iroh 1.0, iroh-blobs 0.103, iroh-gossip 0.101, iroh-metrics 1.0; bumped from the 0.98 baseline in #918). Upgrades are deliberate — evaluate API compatibility, update `Cargo.toml`, and record the new baseline here before merging. `Cargo.lock` is committed and acts as the true pin within a given version constraint.
 
 Specifically:
 
