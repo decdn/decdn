@@ -1,7 +1,7 @@
 //! A percentage config value with fixed-point scale (#894).
 //!
 //! A transparent newtype around `u64` for the seed-leech share ratio
-//! (`100` == 1.0×). Distinct from [`Bytes`](crate::Bytes) so the percent
+//! (`100` == 1.0×). Distinct from [`Bytes`] so the percent
 //! cannot be transposed with a byte quantity threaded alongside it — the
 //! bytes↔percent confusion seam #894 closes.
 //!
@@ -14,6 +14,8 @@
 //! integer.
 
 use serde::{Deserialize, Serialize};
+
+use crate::Bytes;
 
 /// Fixed-point denominator for [`Percent`] (so `100` == 1.0×).
 const SHARE_RATIO_SCALE: u64 = 100;
@@ -48,9 +50,9 @@ impl Percent {
     /// (e.g. `u64::saturating_mul`) would divide `u64::MAX` by 100 and return a
     /// value ~100× too small rather than a true saturated `u64::MAX`.
     #[must_use]
-    pub fn scale_saturating(self, bytes: u64) -> u64 {
-        let scaled = u128::from(bytes) * u128::from(self.0) / u128::from(SHARE_RATIO_SCALE);
-        u64::try_from(scaled).unwrap_or(u64::MAX)
+    pub fn scale_saturating(self, bytes: Bytes) -> Bytes {
+        let scaled = u128::from(bytes.get()) * u128::from(self.0) / u128::from(SHARE_RATIO_SCALE);
+        Bytes::new(u64::try_from(scaled).unwrap_or(u64::MAX))
     }
 }
 
@@ -82,13 +84,25 @@ mod tests {
     #[test]
     fn scale_saturating_applies_the_ratio() {
         // 1.0× returns the input.
-        assert_eq!(Percent::new(100).scale_saturating(1_000), 1_000);
+        assert_eq!(
+            Percent::new(100).scale_saturating(Bytes::new(1_000)),
+            Bytes::new(1_000)
+        );
         // 4.0× quadruples.
-        assert_eq!(Percent::new(400).scale_saturating(1_000), 4_000);
+        assert_eq!(
+            Percent::new(400).scale_saturating(Bytes::new(1_000)),
+            Bytes::new(4_000)
+        );
         // Fractional (50%) halves, truncating.
-        assert_eq!(Percent::new(50).scale_saturating(101), 50);
+        assert_eq!(
+            Percent::new(50).scale_saturating(Bytes::new(101)),
+            Bytes::new(50)
+        );
         // 0% pins to nothing.
-        assert_eq!(Percent::new(0).scale_saturating(1_000), 0);
+        assert_eq!(
+            Percent::new(0).scale_saturating(Bytes::new(1_000)),
+            Bytes::new(0)
+        );
     }
 
     #[test]
@@ -96,13 +110,16 @@ mod tests {
         // The product is computed in u128, so an overflowing `bytes * percent`
         // is divided before it is clamped and the result saturates at u64::MAX —
         // not u64::MAX/100, which clamping the raw product first would yield.
-        assert_eq!(Percent::new(u64::MAX).scale_saturating(u64::MAX), u64::MAX);
+        assert_eq!(
+            Percent::new(u64::MAX).scale_saturating(Bytes::new(u64::MAX)),
+            Bytes::new(u64::MAX)
+        );
         // Regression for the mid-range overflow: 2.0× of just over half of
         // u64::MAX exceeds u64::MAX, so it must saturate. A u64 saturating_mul
         // before the divide returned ~u64::MAX/100 here.
         assert_eq!(
-            Percent::new(200).scale_saturating(u64::MAX / 2 + 1),
-            u64::MAX
+            Percent::new(200).scale_saturating(Bytes::new(u64::MAX / 2 + 1)),
+            Bytes::new(u64::MAX)
         );
     }
 }

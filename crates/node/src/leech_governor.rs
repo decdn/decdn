@@ -48,8 +48,8 @@ const MAX_TRACKED_PEERS: usize = 65_536;
 /// state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowExceedsBudget {
-    pub initial_allowance_bytes: u64,
-    pub max_unrecouped_leech_bytes: u64,
+    pub initial_allowance_bytes: Bytes,
+    pub max_unrecouped_leech_bytes: Bytes,
 }
 
 impl std::fmt::Display for WindowExceedsBudget {
@@ -113,9 +113,13 @@ impl LeechCaps {
     /// [`WindowExceedsBudget`] when `max_unrecouped_leech_bytes > 0` and
     /// `initial_allowance_bytes > max_unrecouped_leech_bytes`.
     pub const fn new(config: LeechCapsConfig) -> Result<Self, WindowExceedsBudget> {
-        let max_unrecouped_leech_bytes = config.max_unrecouped_leech_bytes.get();
-        let initial_allowance_bytes = config.initial_allowance_bytes.get();
-        if max_unrecouped_leech_bytes > 0 && initial_allowance_bytes > max_unrecouped_leech_bytes {
+        let max_unrecouped_leech_bytes = config.max_unrecouped_leech_bytes;
+        let initial_allowance_bytes = config.initial_allowance_bytes;
+        // `.get()` comparison rather than `Bytes: Ord` because derived `Ord` is
+        // not `const`-callable and this is a `const fn`.
+        if !max_unrecouped_leech_bytes.is_zero()
+            && initial_allowance_bytes.get() > max_unrecouped_leech_bytes.get()
+        {
             return Err(WindowExceedsBudget {
                 initial_allowance_bytes,
                 max_unrecouped_leech_bytes,
@@ -150,9 +154,9 @@ impl LeechCaps {
 #[derive(Debug, Default, Clone, Copy)]
 struct PeerLeech {
     /// Bytes speculatively pulled to satisfy this peer's cache-miss requests.
-    pulled: u64,
+    pulled: Bytes,
     /// Bytes served to this peer (raises its pull allowance).
-    served: u64,
+    served: Bytes,
     /// Last-touch tick for LRU eviction.
     last_tick: u64,
 }
@@ -160,9 +164,9 @@ struct PeerLeech {
 #[derive(Debug, Default)]
 struct LeechState {
     /// Node-wide bytes speculatively pulled (saturating).
-    global_pulled: u64,
+    global_pulled: Bytes,
     /// Node-wide bytes served (saturating); recoups the global budget.
-    global_served: u64,
+    global_served: Bytes,
     peers: HashMap<[u8; 32], PeerLeech>,
     /// LRU index ordered by each peer's `last_tick`, so the least-recently
     /// touched peer (the eviction victim) is the first entry — `O(log n)` to
@@ -232,8 +236,8 @@ impl LeechGovernor {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 
         // Global budget first: a node-wide breach pauses every peer.
-        let max_unrecouped = self.caps.max_unrecouped_leech_bytes.get();
-        if max_unrecouped > 0 {
+        let max_unrecouped = self.caps.max_unrecouped_leech_bytes;
+        if !max_unrecouped.is_zero() {
             let unrecouped = guard.global_pulled.saturating_sub(guard.global_served);
             if unrecouped >= max_unrecouped {
                 drop(guard);
@@ -245,7 +249,7 @@ impl LeechGovernor {
         // Per-peer share ratio: allowance = initial + served × share_ratio.
         let tick = guard.next_tick();
         let peer_entry = guard.touch(peer, tick);
-        let allowance = self.caps.initial_allowance_bytes.get().saturating_add(
+        let allowance = self.caps.initial_allowance_bytes.saturating_add(
             self.caps
                 .share_ratio_percent
                 .scale_saturating(peer_entry.served),
@@ -261,7 +265,12 @@ impl LeechGovernor {
     /// Account `bytes` speculatively pulled for `peer` (raises the node-wide
     /// unrecouped frontier and the peer's pulled total). Call as chunks are
     /// pulled in the window-paced loop.
+    ///
+    /// `bytes` is `u64` (not [`Bytes`]) because it arrives from a network-boundary
+    /// `chunk.len()` cast; it is wrapped to [`Bytes`] here so callers convert once
+    /// at the edge rather than at every call site.
     pub fn record_pulled(&self, peer: &[u8; 32], bytes: u64) {
+        let bytes = Bytes::new(bytes);
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         guard.global_pulled = guard.global_pulled.saturating_add(bytes);
         let tick = guard.next_tick();
@@ -275,7 +284,11 @@ impl LeechGovernor {
     /// peer's share allowance). Called from the voucher path for ALL accepted
     /// downstream deliveries — cache-hit and pull-through alike — so an honest
     /// peer's service history credits its ratio.
+    ///
+    /// `bytes` is `u64` for the same network-boundary reason as
+    /// [`record_pulled`](Self::record_pulled); wrapped to [`Bytes`] internally.
     pub fn record_served(&self, peer: &[u8; 32], bytes: u64) {
+        let bytes = Bytes::new(bytes);
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         guard.global_served = guard.global_served.saturating_add(bytes);
         let tick = guard.next_tick();
@@ -356,15 +369,13 @@ mod tests {
             share_ratio_percent: Percent::new(100),
         };
         let rejected = LeechCaps::new(caps(1_000, 1_001));
-        assert!(
-            matches!(
-                rejected,
-                Err(WindowExceedsBudget {
-                    initial_allowance_bytes: 1_001,
-                    max_unrecouped_leech_bytes: 1_000,
-                })
-            ),
-            "finite budget below the opening window must be rejected: {rejected:?}"
+        assert_eq!(
+            rejected.err(),
+            Some(WindowExceedsBudget {
+                initial_allowance_bytes: Bytes::new(1_001),
+                max_unrecouped_leech_bytes: Bytes::new(1_000),
+            }),
+            "finite budget below the opening window must be rejected with the typed payload"
         );
         // Window exactly equal to the budget is admissible.
         assert!(LeechCaps::new(caps(1_000, 1_000)).is_ok());

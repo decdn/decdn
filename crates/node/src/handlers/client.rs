@@ -36,7 +36,7 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{CacheEngine, CacheError, Hash, TeeOpen, TeeSink};
+use decdn_cache::{Bytes, CacheEngine, CacheError, Hash, TeeOpen, TeeSink};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
@@ -288,7 +288,7 @@ pub struct ClientHandler {
     /// Per-request pipeline window in bytes (#856, ADR 037 `pull_ahead_bytes`),
     /// set with [`ClientHandler::attach_window_pull_through`]. The window-paced
     /// loop pulls at most this many bytes ahead of cleared downstream payment.
-    pull_ahead_bytes: OnceLock<u64>,
+    pull_ahead_bytes: OnceLock<Bytes>,
     /// Node-wide seed-leech caps (#856, ADR 037), attached via
     /// [`ClientHandler::attach_leech_governor`]. Consulted before/while a
     /// speculative pull-through proceeds and credited from the voucher path.
@@ -463,7 +463,7 @@ impl ClientHandler {
     /// offset-0 cache-miss request that proves channel ownership is served by the
     /// fused pull-and-forward path bounded by `pull_ahead_bytes`, instead of the
     /// buffered `populate` path.
-    pub fn attach_window_pull_through(&self, origin: Arc<NodeOrigin>, pull_ahead_bytes: u64) {
+    pub fn attach_window_pull_through(&self, origin: Arc<NodeOrigin>, pull_ahead_bytes: Bytes) {
         let _ = self.pull_through_origin.set(origin);
         let _ = self.pull_ahead_bytes.set(pull_ahead_bytes);
     }
@@ -1160,8 +1160,7 @@ impl ClientHandler {
             let interval_bytes = self.voucher_interval_mb.saturating_mul(MB_BYTES).max(1);
             self.pull_ahead_bytes
                 .get()
-                .copied()
-                .unwrap_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES)
+                .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
                 .max(interval_bytes)
         };
         let ceiling = min_payment(guard_bytes, rate_per_mb);
@@ -1304,15 +1303,19 @@ impl ClientHandler {
             .pull_ahead_bytes
             .get()
             .copied()
-            .unwrap_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES)
-            .max(interval_bytes);
+            .unwrap_or(Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES))
+            .max(Bytes::new(interval_bytes));
         let peer = client_node_id.0;
+        // Typed total so the window-budget comparisons below stay `Bytes`-vs-`Bytes`.
+        let total = Bytes::new(total_bytes);
 
-        let mut pulled: u64 = 0;
-        let mut served_paid: u64 = 0;
+        let mut pulled = Bytes::default();
+        let mut served_paid = Bytes::default();
         // Bytes forwarded since the last completed interval (the sub-interval
         // remainder), and the completed-but-unpaid interval deltas awaiting
-        // collection — together these are the unrecouped frontier.
+        // collection — together these are the unrecouped frontier. Deliberately
+        // `u64`, not `Bytes`: these are voucher-domain deltas consumed by
+        // `collect_voucher` (rate × MB), not window-budget byte quantities.
         let mut unvouchered: u64 = 0;
         let mut pending: VecDeque<u64> = VecDeque::new();
         let mut upstream_done = false;
@@ -1322,7 +1325,7 @@ impl ClientHandler {
             // --- pull-ahead phase: forward chunks until the window is reached,
             // the caps refuse, or the upstream is exhausted ---
             let mut window_hit = false;
-            while !upstream_done && pulled < total_bytes {
+            while !upstream_done && pulled < total {
                 if pulled.saturating_sub(served_paid) >= window {
                     window_hit = true;
                     break;
@@ -1340,7 +1343,7 @@ impl ClientHandler {
                         // successful forward would under-count already-paid bytes
                         // on the abandon paths, leaving the abuse caps blind to
                         // spend the node really incurred (#856).
-                        pulled = pulled.saturating_add(len);
+                        pulled = pulled.saturating_add(Bytes::new(len));
                         self.leech_record_pulled(&peer, len);
                         if let Err(e) = tee.write(&chunk).await {
                             // A LOCAL store fault on already-paid bytes — distinct
@@ -1395,10 +1398,10 @@ impl ClientHandler {
             // iteration to free the window — a completed interval (drained in
             // order), else the closing partial once the whole blob is pulled. A
             // short upstream never earns a closing voucher from the client. ---
-            let done_pulling = upstream_done || pulled >= total_bytes;
+            let done_pulling = upstream_done || pulled >= total;
             let to_collect = if let Some(delta) = pending.pop_front() {
                 Some(delta)
-            } else if done_pulling && pulled >= total_bytes && unvouchered > 0 {
+            } else if done_pulling && pulled >= total && unvouchered > 0 {
                 let closing = unvouchered;
                 unvouchered = 0;
                 Some(closing)
@@ -1420,7 +1423,7 @@ impl ClientHandler {
                     .await
                 {
                     Ok(VoucherOutcome::Accepted) => {
-                        served_paid = served_paid.saturating_add(delta);
+                        served_paid = served_paid.saturating_add(Bytes::new(delta));
                     }
                     Ok(VoucherOutcome::Rejected) => {
                         self.abandon_window_serve(pull, tee);
@@ -1453,7 +1456,7 @@ impl ClientHandler {
                 // cause is already metered by `may_pull`. Log the partial progress
                 // so a throttled-but-not-dead serve is visible to an operator.
                 tracing::debug!(
-                    %hash, %channel_id, pulled, served_paid,
+                    %hash, %channel_id, pulled = pulled.get(), served_paid = served_paid.get(),
                     "window pull-through throttled by seed-leech cap with nothing to recoup; dropping partial fill"
                 );
                 pull.abandon(None);
@@ -1464,7 +1467,7 @@ impl ClientHandler {
 
             // Done when there is nothing left to pull and nothing left to collect
             // (full delivery), or the upstream came up short (no closing voucher).
-            if pending.is_empty() && done_pulling && (unvouchered == 0 || pulled < total_bytes) {
+            if pending.is_empty() && done_pulling && (unvouchered == 0 || pulled < total) {
                 break;
             }
         }
@@ -1519,7 +1522,7 @@ impl ClientHandler {
                 tee.abandon();
                 self.metrics.node_pull_through_upstream_verify_failed();
                 tracing::warn!(
-                    %hash, %channel_id, served_paid, total_bytes, error = %e,
+                    %hash, %channel_id, served_paid = served_paid.get(), total_bytes, error = %e,
                     "window pull-through upstream failed final verification; not caching, no StreamEnd sent"
                 );
                 let _ = send.finish();
