@@ -34,11 +34,13 @@ decdn-node = { path = "crates/node" }
 # library build graph).
 decdn-cli = { path = "crates/cli" }
 
-# Networking (iroh ecosystem, pinned per ADR 000)
-iroh = "0.98"
-iroh-blobs = { version = "0.100", features = ["fs-store"] }
-iroh-gossip = { version = "0.98", features = ["net"] }
-iroh-metrics = "0.38"
+# Networking (iroh ecosystem, pinned per ADR 000). The committed Cargo.lock
+# is the true pin; these caret constraints just bound the major. Upgrades are
+# deliberate — bump Cargo.lock and record the new baseline in ADR 000.
+iroh = "1"
+iroh-blobs = { version = "0.103", features = ["fs-store"] }
+iroh-gossip = { version = "0.101", features = ["net"] }
+iroh-metrics = "1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -147,14 +149,17 @@ aws-config = { version = "1.8", default-features = false, features = [
     "sso",
     "rt-tokio",
 ] }
-# Pinned at 1.129 (last release using sha2 ^0.10): aws-sdk-s3 1.130 bumped to
-# sha2 ^0.11 (stable). The lockfile already carries sha2 0.10.9 alongside
-# iroh-base 0.98's `=0.11.0-rc.5` exact pin (cargo treats stable and
-# pre-release majors as separate); allowing aws-sdk-s3 to pull stable
-# 0.11.x would add a *third* sha2 entry, fattening the cargo deny
-# `multiple-versions` warning. Re-evaluate when iroh bumps to a release
-# that no longer pins `sha2 = "=0.11.0-rc.5"`.
-aws-sdk-s3 = { version = "=1.129.0", default-features = false, features = ["http-1x", "rt-tokio"] }
+# Unpinned (#918): previously exact-pinned at `=1.129.0` (last release on
+# sha2 ^0.10) because iroh-base 0.98 carried a `sha2 = "=0.11.0-rc.5"` pin —
+# letting aws-sdk-s3 1.130 pull stable sha2 0.11 would have made a *third*
+# sha2 entry. iroh 1.0 now uses stable sha2 0.11.0, so aws-sdk-s3 1.130
+# unifies with iroh-base on sha2 0.11 (sha2 stays at two versions: 0.11.0
+# here + iroh, 0.10.9 via alloy). Cost of lifting: aws 1.130 moves its whole
+# RustCrypto stack to the 0.11 generation, adding `sha1` (0.11) and `hmac`
+# (0.13) alongside the 0.10-gen copies alloy still pulls — two extra cargo
+# deny `multiple-versions` warnings, accepted to drop the exact pin so S3 SDK
+# patches (incl. security fixes) flow.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["http-1x", "rt-tokio"] }
 aws-smithy-http-client = { version = "1.1", default-features = false, features = [
     "default-client",
     "rustls-aws-lc",
