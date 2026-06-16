@@ -744,18 +744,24 @@ pub async fn run(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Operator-policy prefetch engine (ADR 022 §Prefetch; #650/#651). Off by
-    // default. The authorized-origin gate reads from an origin directory: when
-    // the operator configures the OriginAssignment + PublisherRegistry
-    // addresses, use the chain-backed `ChainOriginDirectory` — a live,
-    // event-fed cache resolving hash → namespace → authorized origin → active
-    // NodeId (ADR 022 §FIND_VALUE Flow), reusing the already-bootstrapped
-    // `staker_set` for operator liveness. Without those addresses the engine
-    // falls back to an empty `ConfigOriginDirectory` (the gate rejects every
-    // hash, which only matters once an operator sets `prefetch.enabled`). The
-    // enabled gauge is published regardless so dashboards have a uniform schema
-    // across enabled/disabled nodes (appendix-observability §Prefetch).
-    let prefetch_origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> = match (
+    // Origin directory shared by three consumers so "authorized origin" means
+    // the same thing everywhere: the prefetch authorized-origin gate (ADR 022
+    // §Prefetch Decision; #650/#651), the reactive pull-through authorized-origin
+    // gate (#821, ADR 037), and the node-origin FIND_VALUE last-resort fallback
+    // used when the DHT returns no providers (ADR 022 §FIND_VALUE Flow; #912).
+    // All consume one `Arc` so the chain directory backs the fallback for every
+    // node, independent of whether prefetch is enabled. When the operator
+    // configures the OriginAssignment + PublisherRegistry addresses, use the
+    // chain-backed `ChainOriginDirectory` — a live, event-fed cache resolving
+    // hash → namespace → authorized origin → active NodeId, reusing the
+    // already-bootstrapped `staker_set` for operator liveness. Without those
+    // addresses this is an empty `ConfigOriginDirectory`: both gates reject
+    // every hash (the prefetch gate only matters once an operator sets
+    // `prefetch.enabled`) and the FIND_VALUE fallback resolves nothing (same
+    // prior behavior). The prefetch enabled gauge is published regardless so
+    // dashboards have a uniform schema across enabled/disabled nodes
+    // (appendix-observability §Prefetch).
+    let origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> = match (
         cfg.blockchain.origin_assignment_address.as_deref(),
         cfg.blockchain.publisher_registry_address.as_deref(),
     ) {
@@ -790,7 +796,7 @@ pub async fn run(
     };
     let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(
         cfg.prefetch,
-        Arc::clone(&prefetch_origin_directory),
+        Arc::clone(&origin_directory),
     ));
     node_metrics.set_prefetch_enabled(prefetch_engine.enabled());
     // Seed the demand-quality gauges once so they read a sane baseline
@@ -997,7 +1003,7 @@ pub async fn run(
         // same thing on both paths (and fails closed when the origin-directory
         // addresses are unset, since the directory is then empty).
         if cfg.cache.pull_through_require_authorized_origin {
-            client_handler.attach_pull_origin_gate(Arc::clone(&prefetch_origin_directory));
+            client_handler.attach_pull_origin_gate(Arc::clone(&origin_directory));
         }
     }
 
@@ -1357,11 +1363,16 @@ pub async fn run(
                 endpoint: ep.clone(),
                 routing_table: Arc::clone(&dht_routing),
                 staker_set: Arc::clone(&staker_set),
-                // Origin-directory fallback is empty for the initial network —
-                // DHT discovery is the primary path. Populating it from
-                // `dht.static_origins` is a follow-up.
-                origin_directory: Arc::new(crate::dht::ConfigOriginDirectory::empty())
-                    as Arc<dyn crate::dht::OriginDirectory>,
+                // FIND_VALUE last-resort fallback when the DHT returns no
+                // providers (ADR 022 §FIND_VALUE Flow; #912). Shares the single
+                // origin directory built above with the prefetch and reactive
+                // pull-through gates, so a configured `ChainOriginDirectory`
+                // backs this fallback for every node, not just prefetch-enabled
+                // ones. Absent chain addresses it is empty (same prior
+                // behavior). NOTE: if a future decision ever drops speculative
+                // prefetch, this `Arc` must be repointed here, not deleted — it
+                // is independently required by ADR 022.
+                origin_directory: Arc::clone(&origin_directory),
                 addr_resolver: Arc::clone(resolver),
                 buyer: Arc::clone(buyer) as Arc<dyn crate::buyer_channel::ChannelOpener>,
                 self_id: crate::dht::NodeId::from_bytes(*secret_key.public().as_bytes()),
