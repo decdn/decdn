@@ -48,7 +48,7 @@ The receiver replaces the flat `blake3::Hasher` with a bao verifying decoder fed
 
 ### Payment metering
 
-Paid bytes are the bytes transferred on the wire — content data **plus** the interleaved proof nodes. The proof is real bandwidth the operator serves, and metering the raw stream keeps payment a single byte count with no special case. Excluding proof bytes would require payer and node to agree on how many proof bytes were interleaved, adding a dispute and reconciliation surface for a `~0.4%` overhead; the byte count over the delivered stream is the no-special-case choice and is the one adopted.
+Paid bytes are the bytes transferred on the wire — content data **plus** the interleaved proof nodes. The proof is real bandwidth the operator serves, and metering the raw stream keeps payment a single byte count with no special case. Excluding proof bytes would require payer and node to agree on how many proof bytes were interleaved, adding a dispute and reconciliation surface for a `~0.4%` overhead (one 64-byte node per 16 KiB group ≈ 1/256 of content); the byte count over the delivered stream is the no-special-case choice and is the one adopted.
 
 ### Scope boundary
 

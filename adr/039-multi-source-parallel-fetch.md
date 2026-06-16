@@ -50,7 +50,7 @@ When the queue is empty but a few units remain outstanding on slow sources, the 
 
 ### Payment and channels
 
-Each source is paid over its own payment channel with cumulative per-channel vouchers ([ADR 003 § Payment Model](003-payments.md#adr-003-payment-model)); a source is paid only for the verified bytes it delivered. The client must hold, per admitted source, a channel whose remaining deposit covers the bytes it expects to assign that source — mirroring the node-side pre-flight deposit guard ([ADR 037 § Implementation status](037-regional-proxy-warming.md#node-serving-window-paced-pull-through)) from the payer's side. Sources price independently via `rate_per_mb`; the selection preference for cheaper sources and the work-stealing bias toward faster ones together steer spend, with no cross-source settlement — each channel is independent.
+Each source is paid over its own payment channel with cumulative per-channel vouchers ([ADR 003 § Payment Model](003-payments.md#adr-003-payment-model)); a source is paid only for the verified bytes it delivered. The client must hold, per admitted source, a channel whose remaining deposit covers the bytes it expects to assign that source — mirroring the node-side pre-flight deposit guard ([ADR 037 § Implementation status](037-regional-proxy-warming.md#implementation-status-856)) from the payer's side. Sources price independently via `rate_per_mb`; the selection preference for cheaper sources and the work-stealing bias toward faster ones together steer spend, with no cross-source settlement — each channel is independent.
 
 ### Engagement gate
 
