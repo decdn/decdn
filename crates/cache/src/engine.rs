@@ -641,7 +641,7 @@ impl CacheEngine {
     /// lose to a hostile-origin amplification window.
     ///
     /// **Why iroh-blobs drives the loop instead of us:** the sweep
-    /// function (`gc::gc_run_once`) lives in iroh-blobs 0.100's private
+    /// function (`gc::gc_run_once`) lives in iroh-blobs 0.103's private
     /// `store::gc` module and is not re-exported, and `Blobs::delete`
     /// is `pub(crate)`. The only externally-reachable trigger is
     /// `Options::gc`. #520 tracks switching to a runtime-driven loop
@@ -684,7 +684,7 @@ impl CacheEngine {
         // last cycle and the snapshot taken this cycle is exactly the
         // hash set the previous sweep deleted (the cache crate has no
         // other public delete path: `Blobs::delete` is `pub(crate)` in
-        // iroh-blobs 0.100). Bytes for that diff is what the previous
+        // iroh-blobs 0.103). Bytes for that diff is what the previous
         // sweep reclaimed; we attribute it on the *current* cb fire.
         // First-cycle fires bump the runs counter but emit zero on
         // the reclaim counter because there is no prior snapshot.

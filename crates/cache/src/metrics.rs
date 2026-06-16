@@ -4,7 +4,7 @@
 //! family per ADR `appendix-observability`. The exported metric names
 //! all carry the OpenMetrics-encoder-appended `_total` suffix even
 //! though the corresponding Rust struct fields here do not — that's
-//! `iroh-metrics 0.38.3 encoding.rs:490` writing `_total` for every
+//! `iroh-metrics 1.0.1 encoding.rs:109` writing `_total` for every
 //! `Counter`. The `PromQL` fragments below use the exported names so
 //! operators can paste them verbatim into a Prometheus query.
 //!
@@ -121,7 +121,7 @@ pub struct CacheMetrics {
     /// emits a `tracing::warn!` when that happens).
     ///
     /// Field name omits `_total`: the `OpenMetrics` encoder appends it
-    /// automatically (`iroh-metrics` 0.38.3 `encoding.rs:490`), so the
+    /// automatically (`iroh-metrics` 1.0.1 `encoding.rs:109`), so the
     /// emitted name is `decdn_cache_gc_runs_total`.
     pub gc_runs: Counter,
     /// Bytes reclaimed by the iroh-blobs GC, attributed across cycles
