@@ -390,6 +390,23 @@ pub struct CacheConfig {
     /// allowance of `pull_ahead_bytes`, bounding concentrated single-peer abuse.
     /// `0` pins a peer to only the opening window.
     pub pull_share_ratio_percent: Option<decdn_config_types::Percent>,
+    /// Content-authorization gate on the reactive cache-miss pull-through path
+    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §Scope and limits). Absent =>
+    /// `false` (the cache role stays permissionless, unchanged network
+    /// behavior). When `true`, the node refuses to *initiate* an upstream pull
+    /// and the associated cache-warming write for a hash whose namespace has no
+    /// currently-authorized origin via `OriginAssignment.getOrigins(namespaceId)`
+    /// (with `namespaceId == 0` resolving to the default-open allow-list, same as
+    /// the prefetch gate), returning `NotFound` to the requesting client. It is a
+    /// pull-*initiation* gate only: a range the node already holds is served
+    /// regardless — refusing held blobs is `ContentBlacklist`'s job (ADR 011/031).
+    /// Requires the origin-directory addresses (the `origin_assignment_address`
+    /// and `publisher_registry_address` blockchain keys); without them the
+    /// directory is empty and the gate fails closed (every pull is refused).
+    /// Only affects the node-to-node reactive pull-through path, so it is a no-op
+    /// unless `node_to_node_pull_through_enabled` is also `true` — with
+    /// pull-through off, a cache miss already returns `NotFound`.
+    pub pull_through_require_authorized_origin: Option<bool>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.

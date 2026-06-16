@@ -61,6 +61,7 @@ The implementation language, the peer mesh's shape, the content-addressing primi
 2. [ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh)
 3. [ADR 002 — Content Addressing](002-content-addressing.md#adr-002-content-addressing)
 4. [ADR 005 — Wire Protocol](005-protocol.md#adr-005-wire-protocol)
+5. [ADR 038 — Bao Verified-Range Streaming on cdn/client/v1](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)
 
 ### Chapter 2 — Discovery
 
@@ -69,6 +70,7 @@ How a client or node finds the right peer for a given hash. The DHT is the prima
 1. [ADR 022 — Content Discovery at Scale (DHT)](022-content-discovery.md#adr-022--content-discovery-at-scale)
 2. [ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment)
 3. [ADR 037 — Latency-Driven Proxy Warming for Regional Locality](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)
+4. [ADR 039 — Multi-Source Parallel Fetch Scheduling on cdn/client/v1](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)
 
 ### Chapter 3 — Payments
 
