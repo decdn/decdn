@@ -34,15 +34,13 @@ decdn-node = { path = "crates/node" }
 # library build graph).
 decdn-cli = { path = "crates/cli" }
 
-# Networking (iroh ecosystem, pinned per ADR 000). `~1.0` (not `1.0`) keeps
-# the post-1.0 crates minor-pinned (`>=1.0.0, <1.1.0`) so a `cargo update`
-# can't silently jump a minor — matching the deliberate-upgrade policy and
-# the strictness the old `0.98` caret gave on the 0.x line. `iroh-blobs` /
-# `iroh-gossip` are still 0.x, where the plain caret already minor-pins.
-iroh = "~1.0"
+# Networking (iroh ecosystem, pinned per ADR 000). The committed Cargo.lock
+# is the true pin; these caret constraints just bound the major. Upgrades are
+# deliberate — bump Cargo.lock and record the new baseline in ADR 000.
+iroh = "1.0"
 iroh-blobs = { version = "0.103", features = ["fs-store"] }
 iroh-gossip = { version = "0.101", features = ["net"] }
-iroh-metrics = "~1.0"
+iroh-metrics = "1.0"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
