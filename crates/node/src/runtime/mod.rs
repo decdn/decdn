@@ -745,10 +745,11 @@ pub async fn run(
         RecordStoreConfig::default(),
     )));
     // Origin directory shared by the prefetch authorized-origin gate (ADR 022
-    // §Prefetch; #650/#651) AND the node-origin FIND_VALUE last-resort fallback
-    // (ADR 022 §FIND_VALUE Flow; #912) — both consume one `Arc` so the chain
-    // directory backs the fallback for every node, independent of whether
-    // prefetch is enabled. When the operator configures the OriginAssignment +
+    // §Prefetch Decision; #650/#651) AND the node-origin FIND_VALUE last-resort
+    // fallback used when the DHT returns no providers (ADR 022 §FIND_VALUE
+    // Flow; #912) — both consume one `Arc` so the chain directory backs the
+    // fallback for every node, independent of whether prefetch is enabled. When
+    // the operator configures the OriginAssignment +
     // PublisherRegistry addresses, use the chain-backed `ChainOriginDirectory`
     // — a live, event-fed cache resolving hash → namespace → authorized origin
     // → active NodeId, reusing the already-bootstrapped `staker_set` for
