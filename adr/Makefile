@@ -59,8 +59,10 @@ BOOK_SRCS := \
   architecture.md \
   _build/part-1-foundations.md \
   000-language.md 001-network.md 002-content-addressing.md 005-protocol.md \
+  038-bao-verified-range-streaming.md \
   _build/part-2-discovery.md \
   022-content-discovery.md 015-zero-rtt.md 037-regional-proxy-warming.md \
+  039-multi-source-parallel-fetch.md \
   _build/part-3-payments.md \
   003-payments.md 012-client.md 024-account-abstraction.md \
   _build/part-4-tokenomics.md \

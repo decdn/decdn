@@ -103,7 +103,7 @@ The node-side serving behavior of this ADR — the window-paced pull-through han
 
 Scoped deferrals tracked as follow-ups (this ADR remains the design they implement):
 
-- **Partial-blob (bao range) store and serving.** #856 pulls and tees the whole blob at `byte_offset == 0` and verifies the whole-blob BLAKE3 incrementally; a *resumed* cache-miss request (`byte_offset > 0`) falls back to the buffered path. Range-addressed availability in `cdn/dht/v1` (§ DHT advertising stays whole-blob) is likewise deferred.
+- **Partial-blob (bao range) store and serving** — specified in [ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1). #856 pulls and tees the whole blob at `byte_offset == 0` and verifies the whole-blob BLAKE3 incrementally; a *resumed* cache-miss request (`byte_offset > 0`) falls back to the buffered path. Range-addressed availability in `cdn/dht/v1` (§ DHT advertising stays whole-blob) is likewise deferred.
 - **Pipelined look-ahead beyond one interval.** The window is honored as a byte bound — the *pull* runs ahead by the full `pull_ahead_bytes`, but downstream vouchers are collected one interval at a time (one per serve-loop iteration), so payments are recouped serially: a `pull_ahead_bytes` set well above one voucher interval bounds exposure as specified but does not yet overlap multiple in-flight interval payments.
 
 No wire-format change is introduced (consistent with the [ADR 005 Cross-ADR note](#cross-adr-impact) below): the `StreamRequest` / `StreamResponse` surface and `cdn/client/v1` framing are unchanged.
