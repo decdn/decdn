@@ -32,6 +32,20 @@ impl Bytes {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// Add two byte quantities, saturating at `u64::MAX`. Typed on both sides so
+    /// a byte count can only be added to another byte count, never to a value
+    /// carrying a different unit.
+    #[must_use]
+    pub const fn saturating_add(self, rhs: Bytes) -> Bytes {
+        Bytes(self.0.saturating_add(rhs.0))
+    }
+
+    /// Subtract `rhs` from this quantity, saturating at `0`.
+    #[must_use]
+    pub const fn saturating_sub(self, rhs: Bytes) -> Bytes {
+        Bytes(self.0.saturating_sub(rhs.0))
+    }
 }
 
 impl std::fmt::Display for Bytes {
@@ -63,5 +77,20 @@ mod tests {
     #[test]
     fn display_delegates_to_inner() {
         assert_eq!(Bytes::new(256).to_string(), "256");
+    }
+
+    #[test]
+    fn saturating_add_saturates_at_max() {
+        assert_eq!(Bytes::new(2).saturating_add(Bytes::new(3)), Bytes::new(5));
+        assert_eq!(
+            Bytes::new(u64::MAX).saturating_add(Bytes::new(1)),
+            Bytes::new(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn saturating_sub_saturates_at_zero() {
+        assert_eq!(Bytes::new(5).saturating_sub(Bytes::new(3)), Bytes::new(2));
+        assert_eq!(Bytes::new(3).saturating_sub(Bytes::new(5)), Bytes::new(0));
     }
 }

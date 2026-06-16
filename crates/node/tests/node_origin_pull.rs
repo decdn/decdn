@@ -3005,7 +3005,7 @@ async fn build_node_b(
     handler_b.attach_pull_through(Duration::from_secs(20));
     handler_b.attach_window_pull_through(
         Arc::new(origin),
-        decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
+        decdn_cache::Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES),
     );
 
     let target = EndpointAddr::new(b_id).with_ip_addr(addr_b);
