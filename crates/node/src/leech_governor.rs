@@ -115,7 +115,9 @@ impl LeechCaps {
     pub const fn new(config: LeechCapsConfig) -> Result<Self, WindowExceedsBudget> {
         let max_unrecouped_leech_bytes = config.max_unrecouped_leech_bytes;
         let initial_allowance_bytes = config.initial_allowance_bytes;
-        if max_unrecouped_leech_bytes.get() > 0
+        // `.get()` comparison rather than `Bytes: Ord` because derived `Ord` is
+        // not `const`-callable and this is a `const fn`.
+        if !max_unrecouped_leech_bytes.is_zero()
             && initial_allowance_bytes.get() > max_unrecouped_leech_bytes.get()
         {
             return Err(WindowExceedsBudget {
@@ -235,7 +237,7 @@ impl LeechGovernor {
 
         // Global budget first: a node-wide breach pauses every peer.
         let max_unrecouped = self.caps.max_unrecouped_leech_bytes;
-        if max_unrecouped.get() > 0 {
+        if !max_unrecouped.is_zero() {
             let unrecouped = guard.global_pulled.saturating_sub(guard.global_served);
             if unrecouped >= max_unrecouped {
                 drop(guard);
@@ -263,6 +265,10 @@ impl LeechGovernor {
     /// Account `bytes` speculatively pulled for `peer` (raises the node-wide
     /// unrecouped frontier and the peer's pulled total). Call as chunks are
     /// pulled in the window-paced loop.
+    ///
+    /// `bytes` is `u64` (not [`Bytes`]) because it arrives from a network-boundary
+    /// `chunk.len()` cast; it is wrapped to [`Bytes`] here so callers convert once
+    /// at the edge rather than at every call site.
     pub fn record_pulled(&self, peer: &[u8; 32], bytes: u64) {
         let bytes = Bytes::new(bytes);
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -278,6 +284,9 @@ impl LeechGovernor {
     /// peer's share allowance). Called from the voucher path for ALL accepted
     /// downstream deliveries — cache-hit and pull-through alike — so an honest
     /// peer's service history credits its ratio.
+    ///
+    /// `bytes` is `u64` for the same network-boundary reason as
+    /// [`record_pulled`](Self::record_pulled); wrapped to [`Bytes`] internally.
     pub fn record_served(&self, peer: &[u8; 32], bytes: u64) {
         let bytes = Bytes::new(bytes);
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);

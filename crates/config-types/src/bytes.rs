@@ -33,6 +33,14 @@ impl Bytes {
         self.0
     }
 
+    /// Whether this is zero bytes. A domain-named alternative to `.get() == 0`
+    /// for the "`0` disables the cap" sentinel checks on the seed-leech budget,
+    /// `const` so it stays usable in the validated `const fn` constructors.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
     /// Add two byte quantities, saturating at `u64::MAX`. Typed on both sides so
     /// a byte count can only be added to another byte count, never to a value
     /// carrying a different unit.
@@ -92,5 +100,12 @@ mod tests {
     fn saturating_sub_saturates_at_zero() {
         assert_eq!(Bytes::new(5).saturating_sub(Bytes::new(3)), Bytes::new(2));
         assert_eq!(Bytes::new(3).saturating_sub(Bytes::new(5)), Bytes::new(0));
+    }
+
+    #[test]
+    fn is_zero_tracks_the_sentinel() {
+        assert!(Bytes::new(0).is_zero());
+        assert!(Bytes::default().is_zero());
+        assert!(!Bytes::new(1).is_zero());
     }
 }

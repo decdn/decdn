@@ -1313,7 +1313,9 @@ impl ClientHandler {
         let mut served_paid = Bytes::default();
         // Bytes forwarded since the last completed interval (the sub-interval
         // remainder), and the completed-but-unpaid interval deltas awaiting
-        // collection — together these are the unrecouped frontier.
+        // collection — together these are the unrecouped frontier. Deliberately
+        // `u64`, not `Bytes`: these are voucher-domain deltas consumed by
+        // `collect_voucher` (rate × MB), not window-budget byte quantities.
         let mut unvouchered: u64 = 0;
         let mut pending: VecDeque<u64> = VecDeque::new();
         let mut upstream_done = false;
