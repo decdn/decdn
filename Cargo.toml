@@ -37,10 +37,10 @@ decdn-cli = { path = "crates/cli" }
 # Networking (iroh ecosystem, pinned per ADR 000). The committed Cargo.lock
 # is the true pin; these caret constraints just bound the major. Upgrades are
 # deliberate — bump Cargo.lock and record the new baseline in ADR 000.
-iroh = "1.0"
+iroh = "1"
 iroh-blobs = { version = "0.103", features = ["fs-store"] }
 iroh-gossip = { version = "0.101", features = ["net"] }
-iroh-metrics = "1.0"
+iroh-metrics = "1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
