@@ -226,6 +226,16 @@ pub struct ResolvedCache {
     /// Per-peer share ratio as a percentage (#856, ADR 037 `share_ratio`;
     /// `100` == 1.0×). Default [`crate::config::DEFAULT_PULL_SHARE_RATIO_PERCENT`].
     pub pull_share_ratio_percent: decdn_config_types::Percent,
+    /// Gate the reactive cache-miss pull-through path on an authorized origin
+    /// (#821, ADR 037 §Seed-leech caps). Default `false` — the cache role stays
+    /// permissionless. When `true`, the handler refuses to initiate an upstream
+    /// pull (and its cache-warming write) for a hash whose namespace has no
+    /// authorized origin, returning `NotFound`; ranges already held are still
+    /// served. `cache.*` is restart-required, so this is read once at bring-up.
+    /// The runtime attaches the gate only when `node_to_node_pull_through_enabled`
+    /// is also set, so it is a no-op without that path (a miss already returns
+    /// `NotFound`).
+    pub pull_through_require_authorized_origin: bool,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors

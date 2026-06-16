@@ -750,6 +750,15 @@ pub struct DecdnMetrics {
     /// value isolates near-empty-deposit pull-through abuse. Visible name:
     /// `decdn_serve_stream_rejected_insufficient_deposit_total`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
+    /// `serve_stream` cache-miss requests refused before any upstream pull
+    /// because the operator's `pull_through_require_authorized_origin` gate is on
+    /// and the hash's namespace has no currently-authorized origin (#821, ADR 037
+    /// §Seed-leech caps). Wire-indistinguishable from `cache_miss` (signed as
+    /// `NotFound`), so this server-side counter is the only place the distinction
+    /// lives — a rising value shows how much unclaimed-content warming the gate is
+    /// shedding. Visible name:
+    /// `decdn_serve_stream_rejected_unauthorized_origin_total`.
+    pub serve_stream_rejected_unauthorized_origin: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -1258,6 +1267,13 @@ impl Metrics {
     /// so no upstream pull was started.
     pub fn serve_stream_rejected_insufficient_deposit(&self) {
         self.decdn.serve_stream_rejected_insufficient_deposit.inc();
+    }
+
+    /// Record a `serve_stream` cache-miss refused by the authorized-origin gate
+    /// (#821): `pull_through_require_authorized_origin` is on and the hash's
+    /// namespace has no authorized origin, so no upstream pull was started.
+    pub fn serve_stream_rejected_unauthorized_origin(&self) {
+        self.decdn.serve_stream_rejected_unauthorized_origin.inc();
     }
 
     /// The window-paced serve loop paused the upstream pull at `pull_ahead_bytes`
@@ -2031,7 +2047,7 @@ mod tests {
         // #876. Each `serve_stream` reject branch maps to a distinct counter
         // because the metrics backend has no per-field labels and the wire
         // `StreamError` deliberately conflates the three `NotFound` reasons.
-        // The exported names carry the encoder-appended `_total` suffix. All six
+        // The exported names carry the encoder-appended `_total` suffix. All
         // must be exposed at zero on a fresh registry (so dashboards don't read
         // `(no data)`) and each method must bump exactly its own counter.
         let metrics = Metrics::new();
@@ -2043,6 +2059,7 @@ mod tests {
             "decdn_serve_stream_rejected_unknown_channel_total",
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
+            "decdn_serve_stream_rejected_unauthorized_origin_total",
         ];
         let text = metrics.encode().unwrap();
         for name in reasons {
@@ -2059,6 +2076,7 @@ mod tests {
         metrics.serve_stream_rejected_unknown_channel();
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
+        metrics.serve_stream_rejected_unauthorized_origin();
 
         let text = metrics.encode().unwrap();
         for name in reasons {
