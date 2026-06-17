@@ -171,8 +171,8 @@ fn write_params(
             "binding_nonce": p.binding_nonce,
             "registration_nonce": p.registration_nonce,
             "multiaddrs": p.multiaddr_count,
-            "binding_sig": format!("0x{}", chain_ctx::hex_encode(p.binding_sig)),
-            "ed25519_sig": format!("0x{}", chain_ctx::hex_encode(p.ed25519_sig)),
+            "binding_sig": format!("0x{}", alloy::hex::encode(p.binding_sig)),
+            "ed25519_sig": format!("0x{}", alloy::hex::encode(p.ed25519_sig)),
         });
         return writeln!(w, "{value}");
     }
@@ -184,8 +184,8 @@ fn write_params(
     writeln!(w, "binding_nonce={}", p.binding_nonce)?;
     writeln!(w, "registration_nonce={}", p.registration_nonce)?;
     writeln!(w, "multiaddrs={}", p.multiaddr_count)?;
-    writeln!(w, "binding_sig=0x{}", chain_ctx::hex_encode(p.binding_sig))?;
-    writeln!(w, "ed25519_sig=0x{}", chain_ctx::hex_encode(p.ed25519_sig))?;
+    writeln!(w, "binding_sig=0x{}", alloy::hex::encode(p.binding_sig))?;
+    writeln!(w, "ed25519_sig=0x{}", alloy::hex::encode(p.ed25519_sig))?;
     match tx {
         Some(h) => writeln!(w, "submitted=true tx={h:#x}"),
         None => writeln!(w, "submitted=false dry_run=true"),
