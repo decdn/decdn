@@ -16,8 +16,10 @@ decdn-common = { workspace = true }
 # `key-gen` (this crate) and the runtime loader in `decdn-node` both load
 # the eth keystore via `decdn_incentive::eth_identity` (#406). Lives in
 # `incentive` per `appendix-poc-production-seams.md` §Seam 1 — clients
-# (voucher signers per ADR 003) and nodes share the keystore surface.
-decdn-incentive = { workspace = true }
+# (voucher signers per ADR 003) and nodes share the keystore surface. The
+# `redb` feature backs `decdn fetch`'s persistent buyer-channel store (#940),
+# so a channel opens once and is reused (watermark resumed) across invocations.
+decdn-incentive = { workspace = true, features = ["redb"] }
 # `decdn fetch` (issue #391): the standalone client-side paid pull reuses the
 # shared `cdn/client/v1` requester. `client-pull` depends only on `blake3` for
 # content verification (NOT iroh-blobs), so the CLI's iroh-blobs-free invariant

@@ -36,7 +36,6 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
-use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
     AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, DepositOutcome, StoreError,
@@ -45,6 +44,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::client_requester::ChannelContext;
+// The buyer-channel open kernel (#940) — the `openChannel` tx + `ChannelOpened`
+// decode + state/ctx build, and the one-time USDC approval — now live in the
+// shared `decdn-client-pull` crate (re-exported here as `client_requester`).
+use crate::client_requester::buyer_channel::{OpenedChannel, ensure_allowance, open_channel};
 use crate::metrics::Metrics;
 use crate::payment_settlement::{
     MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range, unix_now,
@@ -85,15 +88,6 @@ const RECLAIM_ESCALATION_THRESHOLD: u32 = 6;
 /// this window is missed (it is reclaim-able only after its long expiry anyway);
 /// promote to config if operators need a full-lifetime scan.
 const BUYER_RECONCILE_LOOKBACK_BLOCKS: u64 = 700_000;
-
-/// Re-approve the `PaymentChannel` spender when the standing USDC allowance has
-/// fallen below this floor. Set to half of `U256::MAX` so a single max approval
-/// covers effectively unlimited deposits, and a restart with the approval
-/// already in place skips the redundant `approve` tx (it stays far above this
-/// floor) while a never-approved node (allowance `0`) trips it.
-fn approval_floor() -> U256 {
-    U256::MAX >> 1
-}
 
 /// Aborts the wrapped task on drop so a node-restart cycle never leaks the
 /// reclaim-sweep task. Same pattern as the seller service's `AbortOnDrop`.
@@ -428,72 +422,30 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     ) -> Result<ChannelContext> {
         let deposit = deposit_hint.max(self.default_deposit).max(self.min_deposit);
 
-        let receipt = self
-            .contract
-            .openChannel(provider_addr, deposit)
-            .send()
-            .await
-            .context("submit openChannel")?
-            .get_receipt()
-            .await
-            .context("await openChannel receipt")?;
-        if !receipt.status() {
-            anyhow::bail!(
-                "openChannel reverted (provider {provider_addr}, deposit {deposit}); \
-                 check USDC balance/allowance and that the provider is active"
-            );
-        }
+        // The openChannel tx, the authoritative ChannelOpened-from-receipt
+        // decode, and the state/ctx construction are the shared kernel (#940).
+        // What stays node-specific: from the moment the kernel returns, the
+        // deposit is escrowed on-chain, so a failure to persist locally leaves
+        // it tracked ONLY on-chain. The reclaim sweep iterates `load_all` and so
+        // never sees an unpersisted channel, so we escalate to `error!` with the
+        // open tx for manual reconcile (the bootstrap reconciliation scan, #763,
+        // also covers this on the next restart).
+        let OpenedChannel { state, ctx, tx } = open_channel(
+            &self.contract,
+            Arc::clone(&self.signer),
+            &self.voucher_domain,
+            self.token,
+            self.self_address,
+            provider_addr,
+            deposit,
+        )
+        .await?;
 
-        // From here the deposit is escrowed on-chain. Until `record` persists,
-        // the channel is tracked ONLY on-chain — and the buyer path has no
-        // chain-log recovery yet (no `getChannelsByClient` reconciliation at
-        // bootstrap), so the reclaim sweep, which only iterates `load_all`, will
-        // never see an unpersisted channel. Both failure paths below therefore
-        // escalate to `error!` with the tx hash so an operator can reconcile /
-        // reclaim the deposit manually. (A bootstrap reconciliation scan that
-        // would automate this is tracked in #763, gated on the cache-miss hook.)
-        let tx = receipt.transaction_hash;
-
-        // Decode this tx's `ChannelOpened` event from the receipt for the
-        // authoritative `channelId` + `expiresAt`. This is atomic with the
-        // open: a successful tx guarantees the event is present, so we can
-        // always persist the channel — unlike a follow-up `getChannel` call,
-        // whose transient failure would leave the on-chain deposit orphaned
-        // (opened but untracked, re-opened on the next miss). Filtering on
-        // `client`/`provider` also confirms we decoded our own open.
-        let Some(opened) = receipt
-            .inner
-            .logs()
-            .iter()
-            .filter_map(|log| log.log_decode::<PaymentChannel::ChannelOpened>().ok())
-            .map(|decoded| decoded.inner.data)
-            .find(|ev| ev.client == self.self_address && ev.provider == provider_addr)
-        else {
-            error!(
-                %tx,
-                provider = %provider_addr,
-                %deposit,
-                "openChannel tx mined but its ChannelOpened event was not found in the receipt \
-                 logs (ABI/contract skew?); the deposit is escrowed on-chain but UNTRACKED locally \
-                 and will not be auto-reclaimed — reconcile manually against the tx"
-            );
-            anyhow::bail!(
-                "ChannelOpened event for provider {provider_addr} not found in openChannel \
-                 receipt logs (tx {tx})"
-            );
-        };
-        let channel_id = opened.channelId;
-        // The `ChannelOpened` event's `expiresAt` is `uint256`; clamp to `u64`
-        // (a too-far expiry only ever means the reclaim sweep waits longer).
-        let expires_at = u64::try_from(opened.expiresAt).unwrap_or(u64::MAX);
-
-        let state =
-            BuyerChannelState::new(channel_id, provider_addr, self.token, deposit, expires_at);
         if let Err(err) = self.store.record(&state) {
             error!(
                 %tx,
                 provider = %provider_addr,
-                %channel_id,
+                channel_id = %state.channel_id,
                 %deposit,
                 %err,
                 "buyer channel opened on-chain (deposit escrowed) but persisting the local record \
@@ -502,19 +454,8 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             );
             return Err(err).context("persist newly-opened buyer channel");
         }
-        info!(
-            provider = %provider_addr,
-            %channel_id,
-            %deposit,
-            expires_at,
-            "opened buyer payment channel"
-        );
 
-        Ok(ChannelContext::for_buyer_channel(
-            &state,
-            Arc::clone(&self.signer),
-            self.voucher_domain.clone(),
-        ))
+        Ok(ctx)
     }
 
     /// Persist the cumulative voucher totals after a delivery exchange so a
@@ -756,43 +697,6 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
             amount,
         )
     }
-}
-
-/// Read the current USDC allowance for the `PaymentChannel` spender and, if it
-/// has fallen below [`approval_floor`], issue a one-time max approval.
-async fn ensure_allowance<P: Provider + Clone>(
-    provider: &P,
-    token: Address,
-    owner: Address,
-    spender: Address,
-) -> Result<()> {
-    let erc20 = Erc20::new(token, provider.clone());
-    let current = erc20
-        .allowance(owner, spender)
-        .call()
-        .await
-        .context("read USDC allowance")?;
-    if current >= approval_floor() {
-        debug!(%current, "USDC allowance already sufficient; skipping approve");
-        return Ok(());
-    }
-    let receipt = erc20
-        .approve(spender, U256::MAX)
-        .send()
-        .await
-        .context("submit USDC approve")?
-        .get_receipt()
-        .await
-        .context("await USDC approve receipt")?;
-    if !receipt.status() {
-        anyhow::bail!("USDC approve transaction reverted");
-    }
-    info!(
-        %token,
-        %spender,
-        "issued one-time max USDC approval for PaymentChannel deposits"
-    );
-    Ok(())
 }
 
 /// Background reclaim sweep: periodically reclaim the deposit of any tracked

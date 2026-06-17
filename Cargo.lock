@@ -2644,6 +2644,7 @@ dependencies = [
  "decdn-protocol",
  "iroh",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2708,8 +2709,10 @@ dependencies = [
  "decdn-protocol",
  "ed25519-dalek 2.2.0",
  "iroh",
+ "postcard",
  "proptest",
  "rand 0.10.1",
+ "redb",
  "rpassword",
  "serde",
  "tempfile",

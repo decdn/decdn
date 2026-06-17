@@ -24,6 +24,10 @@
 //!   (`byte_offset == 0`); a resumed fetch cannot recompute the whole-blob hash
 //!   from a suffix (bao tree-hash verification is out of scope).
 
+/// Buyer-side `PaymentChannel` open kernel (#940), shared by the node service
+/// and the CLI.
+pub mod buyer_channel;
+
 use std::sync::Arc;
 use std::time::Duration;
 
