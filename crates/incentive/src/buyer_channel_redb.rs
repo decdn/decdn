@@ -557,4 +557,82 @@ mod tests {
         ));
         assert!(!store.forget_if_channel(p, B256::ZERO).unwrap());
     }
+
+    #[test]
+    fn load_all_returns_every_recorded_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
+        store.record(&state(1, 1, 10, 1)).unwrap();
+        store.record(&state(2, 1, 10, 1)).unwrap();
+        let mut providers: Vec<_> = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.provider)
+            .collect();
+        providers.sort();
+        assert_eq!(
+            providers,
+            vec![Address::repeat_byte(1), Address::repeat_byte(2)]
+        );
+    }
+
+    #[test]
+    fn forget_removes_entry_and_is_noop_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
+        let p = Address::repeat_byte(7);
+        store.record(&state(7, 1, 10, 1)).unwrap();
+        store.forget(p).unwrap();
+        assert!(store.get_by_provider(p).unwrap().is_none());
+        // Forgetting an absent provider is a no-op, not an error.
+        store.forget(p).unwrap();
+    }
+
+    #[test]
+    fn forget_if_channel_only_deletes_the_matching_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
+        let p = Address::repeat_byte(7);
+        store.record(&state(7, 1, 10, 1)).unwrap(); // channel_id == 0x07..07
+        // A stale channel id must NOT delete the live row (CAS guard).
+        assert!(!store.forget_if_channel(p, B256::repeat_byte(9)).unwrap());
+        assert!(store.get_by_provider(p).unwrap().is_some());
+        // The matching channel id deletes it.
+        assert!(store.forget_if_channel(p, B256::repeat_byte(7)).unwrap());
+        assert!(store.get_by_provider(p).unwrap().is_none());
+    }
+
+    #[test]
+    fn add_deposit_adds_and_guards_channel_and_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
+        let p = Address::repeat_byte(7);
+        let cid = B256::repeat_byte(7);
+        store.record(&state(7, 1, 10, 1)).unwrap(); // deposit 1_000_000
+
+        // Matching channel → deposit grows by `additional`.
+        assert!(matches!(
+            store.add_deposit(p, cid, U256::from(500_000u64)).unwrap(),
+            DepositOutcome::Added(d) if d == U256::from(1_500_000u64)
+        ));
+        // Wrong channel id → mismatch, no change.
+        assert!(matches!(
+            store
+                .add_deposit(p, B256::repeat_byte(9), U256::from(1u64))
+                .unwrap(),
+            DepositOutcome::ChannelMismatch
+        ));
+        // Unknown provider → unknown, no change.
+        assert!(matches!(
+            store
+                .add_deposit(Address::repeat_byte(8), cid, U256::from(1u64))
+                .unwrap(),
+            DepositOutcome::UnknownProvider
+        ));
+        assert_eq!(
+            store.get_by_provider(p).unwrap().unwrap().deposit,
+            U256::from(1_500_000u64)
+        );
+    }
 }
