@@ -11,27 +11,42 @@ use std::path::Path;
 use std::str::FromStr;
 
 use decdn_common::config::load_file_config;
+use decdn_common::redact::redact_userinfo;
 use iroh::{RelayMap, RelayMode, RelayUrl};
 
 /// Resolve the relay URLs for a client command. The `--relay-url` override
 /// (`flag`) wins; otherwise `network.relay_urls` from the config (with the
 /// deprecated singular `relay_url` folded in) is used. An absent config file
-/// resolves to an empty list.
+/// — including an explicit `--config` path that does not exist — resolves to
+/// an empty list rather than an error, so a client dialing a direct `--addr`
+/// needs no config at all.
 pub fn resolve_relays(
     flag: Option<&str>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Vec<RelayUrl>> {
     let raw: Vec<String> = if let Some(s) = flag {
         vec![s.to_owned()]
-    } else {
+    } else if config_path.is_none_or(Path::exists) {
+        // `None` → `load_file_config` resolves the default path (and returns
+        // an empty default when it is absent). An explicit path is only loaded
+        // when it exists; a present-but-malformed file still surfaces its parse
+        // error.
         let net = load_file_config(config_path)?.network.unwrap_or_default();
         match net.relay_urls {
             Some(urls) if !urls.is_empty() => urls,
             _ => net.relay_url.into_iter().collect(),
         }
+    } else {
+        Vec::new()
     };
     raw.iter()
-        .map(|s| RelayUrl::from_str(s).map_err(|e| anyhow::anyhow!("invalid relay url {s:?}: {e}")))
+        .map(|s| {
+            // Redact any `user:pass@` userinfo before echoing a malformed entry
+            // into an error that may reach logs (mirrors node bring-up's
+            // `parse_relay_urls`).
+            RelayUrl::from_str(s)
+                .map_err(|e| anyhow::anyhow!("invalid relay url {:?}: {e}", redact_userinfo(s)))
+        })
         .collect()
 }
 
@@ -96,6 +111,24 @@ mod tests {
         let cfg = write_config("");
         let relays = resolve_relays(None, Some(cfg.path())).unwrap();
         assert!(relays.is_empty());
+    }
+
+    #[test]
+    fn missing_explicit_config_path_yields_empty_not_error() {
+        // A `--config` path that does not exist must not fail relay resolution:
+        // a client dialing a direct `--addr` supplies no relays at all.
+        let missing = Path::new("/nonexistent/decdn-relay-test-does-not-exist.toml");
+        let relays = resolve_relays(None, Some(missing)).expect("missing config must not error");
+        assert!(relays.is_empty());
+    }
+
+    #[test]
+    fn malformed_relay_error_redacts_userinfo() {
+        // A malformed entry carrying credentials must not leak them in the error.
+        let err = resolve_relays(Some("http://user:s3cret@ relay"), None)
+            .expect_err("malformed relay url must error");
+        let msg = err.to_string();
+        assert!(!msg.contains("s3cret"), "password must be redacted: {msg}");
     }
 
     #[test]
