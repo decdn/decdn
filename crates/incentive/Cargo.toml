@@ -6,6 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 description = "Payment channels, bonding, and voucher management for deCDN"
 
+[features]
+# Persistent buyer-channel store (`buyer_channel_redb`). Off by default so the
+# contracts/voucher logic doesn't pull redb/postcard; the CLI (`decdn fetch`,
+# #940) enables it for cross-invocation channel reuse.
+redb = ["dep:redb", "dep:postcard"]
+
 [dependencies]
 decdn-common = { workspace = true }
 decdn-protocol = { workspace = true }
@@ -20,6 +26,8 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 rpassword = { workspace = true }
 zeroize = { workspace = true }
+redb = { workspace = true, optional = true }
+postcard = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

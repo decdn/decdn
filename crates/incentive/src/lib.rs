@@ -21,6 +21,9 @@
 
 pub mod bind_sig;
 pub mod buyer_channel;
+/// Persistent buyer-channel store (#940); requires the `redb` feature.
+#[cfg(feature = "redb")]
+pub mod buyer_channel_redb;
 pub mod capacity_bond;
 pub mod channel;
 pub mod client_bridge;
