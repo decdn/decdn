@@ -36,7 +36,6 @@ use decdn_protocol::{
 };
 use iroh::PublicKey;
 use iroh::TransportAddr;
-use iroh::Watcher as _;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
@@ -883,22 +882,19 @@ fn now_us() -> u64 {
 /// relay-only connections have no IP key, so the per-IP rate-limit layer
 /// is skipped for them.
 fn peer_ip(conn: &Connection) -> Option<IpAddr> {
-    let paths = conn.paths().peek().clone();
+    let paths = conn.paths();
     paths
         .iter()
-        .find(|p| p.is_selected() && !p.is_closed())
+        .find(iroh::endpoint::Path::is_selected)
         .and_then(|p| match p.remote_addr() {
             TransportAddr::Ip(addr) => Some(addr.ip()),
             _ => None,
         })
         .or_else(|| {
-            paths
-                .iter()
-                .filter(|p| !p.is_closed())
-                .find_map(|p| match p.remote_addr() {
-                    TransportAddr::Ip(addr) => Some(addr.ip()),
-                    _ => None,
-                })
+            paths.iter().find_map(|p| match p.remote_addr() {
+                TransportAddr::Ip(addr) => Some(addr.ip()),
+                _ => None,
+            })
         })
 }
 

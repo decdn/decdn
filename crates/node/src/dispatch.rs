@@ -41,7 +41,6 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 use governor::{DefaultKeyedRateLimiter, Quota};
 use iroh::TransportAddr;
-use iroh::Watcher as _;
 use iroh::endpoint::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -574,22 +573,19 @@ impl ConnectionLimiter {
 /// silently no-op on freshly-accepted connections and an attacker churning
 /// identities could bypass the layer in that race window.
 fn peer_ip(conn: &Connection) -> Option<IpAddr> {
-    let paths = conn.paths().peek().clone();
+    let paths = conn.paths();
     paths
         .iter()
-        .find(|p| p.is_selected() && !p.is_closed())
+        .find(iroh::endpoint::Path::is_selected)
         .and_then(|p| match p.remote_addr() {
             TransportAddr::Ip(addr) => Some(addr.ip()),
             _ => None,
         })
         .or_else(|| {
-            paths
-                .iter()
-                .filter(|p| !p.is_closed())
-                .find_map(|p| match p.remote_addr() {
-                    TransportAddr::Ip(addr) => Some(addr.ip()),
-                    _ => None,
-                })
+            paths.iter().find_map(|p| match p.remote_addr() {
+                TransportAddr::Ip(addr) => Some(addr.ip()),
+                _ => None,
+            })
         })
 }
 
