@@ -322,17 +322,15 @@ where
         deposit,
     )
     .await?;
-    if let Err(e) = store.record(&opened.state) {
-        // The deposit is escrowed on-chain; a failed local record leaves it
-        // untracked (reconcile against the tx).
-        return Err(anyhow::Error::new(e)).map_err(|e: anyhow::Error| {
-            e.context(format!(
-                "buyer channel opened on-chain (tx {}) but persisting it failed; the deposit is \
-                 escrowed but untracked — reconcile manually",
-                opened.tx
-            ))
-        });
-    }
+    // The deposit is escrowed on-chain; a failed local record leaves it
+    // untracked (reconcile against the tx).
+    store.record(&opened.state).map_err(|e| {
+        anyhow::anyhow!(
+            "buyer channel opened on-chain (tx {}) but persisting it failed; the deposit is \
+             escrowed but untracked — reconcile manually: {e}",
+            opened.tx
+        )
+    })?;
     Ok(opened.ctx)
 }
 
