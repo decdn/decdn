@@ -3145,6 +3145,7 @@ async fn build_node_b(
         b_buyer,
         &[(leaf_channel_id, leaf_eth_addr, leaf_deposit)],
         max_blob_size_bytes,
+        64,
     )
     .await
 }
@@ -3153,6 +3154,13 @@ async fn build_node_b(
 /// store, so a test can drive multiple concurrent leaf requests against the same
 /// node B (each leaf needs its own channel to avoid sharing voucher state). The
 /// single-leaf [`build_node_b`] is a thin wrapper over this.
+///
+/// `engine_max_blob_mb` caps B's cache-engine store (`CacheEngine::open`'s
+/// `max_blob_mb`). It is independent of the handler's `max_blob_size_bytes`
+/// (which gates the *serve*): setting the engine cap below the blob size while
+/// leaving the handler cap permissive lets a test force `tee.finish()` to reject
+/// the promote on an otherwise-successful delivery (#896). Most callers pass the
+/// default `64`.
 #[allow(clippy::too_many_arguments)]
 async fn build_node_b_with_leaves(
     a_id: iroh::PublicKey,
@@ -3163,6 +3171,7 @@ async fn build_node_b_with_leaves(
     b_buyer: &Arc<PrivateKeySigner>,
     leaves: &[(B256, Address, U256)],
     max_blob_size_bytes: u64,
+    engine_max_blob_mb: u64,
 ) -> Result<(
     Arc<decdn_node::handlers::client::ClientHandler>,
     EndpointAddr,
@@ -3207,7 +3216,8 @@ async fn build_node_b_with_leaves(
 
     // B's empty cache (the tee fills it) and the leaf's channel in B's store.
     let cache_tmp = tempfile::tempdir()?;
-    let cache_b = decdn_cache::CacheEngine::open(cache_tmp.path(), vec![], 64).await?;
+    let cache_b =
+        decdn_cache::CacheEngine::open(cache_tmp.path(), vec![], engine_max_blob_mb).await?;
     let cache_handle = cache_b.clone();
     // Leak the tempdir guard for the test's lifetime (kept alive by the returned
     // engine's open store anyway).
@@ -3454,6 +3464,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
             ),
         ],
         0,
+        64,
     )
     .await?;
     let task_b = spawn_server_concurrent(ep_b.clone(), handler_b);
@@ -4044,6 +4055,119 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
         "node_pull_through_upstream_verify_failed_total",
         1,
     )?;
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_tee_finalize_failure_serves_but_does_not_cache() -> Result<()> {
+    // #896: the sibling of `window_pull_through_lying_upstream_is_not_cached`. Here
+    // the upstream is HONEST (whole-blob hash verifies, so `pull.finish()` is Ok),
+    // but B's cache-engine store rejects the promote at `tee.finish()`. The bytes
+    // were already forwarded and paid, so delivery MUST still complete (the leaf
+    // gets every byte plus `StreamEnd`); only the warm-cache benefit is forfeited.
+    // This is the alertable "served but not cached" path: the
+    // `node_pull_through_tee_finalize_failed` counter fires while the
+    // `upstream_verify_failed` counter does not. We hit the `BlobTooLarge` (warn)
+    // arm of that branch; the sibling `HashMismatch` (error) arm — a forwarded-vs-
+    // teed stream divergence — is deliberately NOT covered here. It differs only in
+    // log level (same metric, same served-anyway control flow) and would require an
+    // engine-internal fault injector that the node-level harness cannot supply.
+    //
+    // Deterministic store-fault injection without a mock: B's engine cap
+    // (`engine_max_blob_mb = 1` → 1 MiB) sits exactly one byte below the blob
+    // (1 MiB + 1). The cap is enforced mid-stream by `count_and_cap_stream`, so a
+    // breach that lands before the final chunk would generally surface as an
+    // in-loop `tee.write` failure (the `node_pull_through_local_tee_failed` path)
+    // instead. Sizing the blob to
+    // exactly `cap + 1` byte guarantees the breach lands on the FINAL chunk: every
+    // `tee.write` has already succeeded and there is no further write, so the
+    // overrun surfaces only at `tee.finish()` — the branch under test. The handler
+    // cap stays `0` (unlimited) so the serve is never rejected up front.
+    let payload = vec![0xC9u8; 1024 * 1024 + 1];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+
+    let ab_channel_id = B256::repeat_byte(0xC9);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x9C);
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics) = build_node_b_with_leaves(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        &[(
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+        )],
+        0, // handler cap: unlimited, so the serve proceeds and `pull.finish()` is Ok
+        1, // engine cap: 1 MiB = total - 1, so `tee.finish()` rejects the promote
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+
+    // Delivery still succeeded despite the failed promote: the leaf saw `StreamEnd`
+    // and received every (hash-verified) byte.
+    anyhow::ensure!(
+        outcome.completed,
+        "delivery must still complete when only the cache promote fails"
+    );
+    anyhow::ensure!(outcome.hash_ok, "leaf received bytes failed the hash check");
+    anyhow::ensure!(
+        outcome.received == total_bytes,
+        "leaf received {} of {total_bytes} bytes",
+        outcome.received
+    );
+    // ...and the leaf actually PAID for those bytes (this is "served", not free):
+    // a 1 MiB+ blob crosses at least one voucher interval, so ≥1 ack must land.
+    anyhow::ensure!(
+        outcome.acks > 0,
+        "the served bytes must have been paid for (no voucher ack observed)"
+    );
+    // The warm-cache benefit was forfeited: B is NOT a holder for this blob.
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "B must not promote a blob whose tee finalize failed"
+    );
+    // The alertable "served but not cached" metric fired exactly once...
+    assert_counter(&b_metrics, "node_pull_through_tee_finalize_failed_total", 1)?;
+    // ...and we hit the tee-finalize branch, NOT the upstream-verify branch (the
+    // upstream was honest) nor the in-loop `tee.write` failure branch.
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_upstream_verify_failed_total")? == 0,
+        "honest upstream must not trip the upstream-verify branch"
+    );
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_local_tee_failed_total")? == 0,
+        "a final-chunk cap breach must surface at finish, not as an in-loop tee.write failure"
+    );
 
     leaf_ep.close().await;
     ep_b.close().await;
