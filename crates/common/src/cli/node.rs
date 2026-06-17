@@ -112,6 +112,18 @@ pub enum NodeCommand {
     /// served" maps to `decdn_cache_bytes_returned_total` until the
     /// network-side `cdn/client/v1` egress counter (#317) lands.
     Top(TopArgs),
+    /// Register this node on-chain via `CapacityBond.registerNode` (ADR 019
+    /// § Step 2.3). Loads the local iroh node key and Ethereum keystore,
+    /// builds the EIP-712 `bindingSignature` and the ed25519 ownership
+    /// signature locally, and submits the registration transaction. This
+    /// is the only `node` subcommand that talks to the chain rather than a
+    /// running node's admin RPC.
+    ///
+    /// Phase 2.1/2.2 (`approve` + `bond` + `declareMbps`) are a
+    /// precondition: the contract reverts if the operator's bond does not
+    /// cover `minBond` / the declared-capacity curve. Pass `--dry-run` to
+    /// print the parameters and signatures without submitting.
+    Register(RegisterArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -472,6 +484,77 @@ pub struct PeersArgs {
     /// Roundtrip timeout in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
+}
+
+/// `decdn node register` — submit `CapacityBond.registerNode` (ADR 019
+/// § Step 2.3).
+///
+/// Unlike the other `node` subcommands this performs an on-chain
+/// transaction, so it needs the blockchain coordinates (`rpc_url`,
+/// `chain_id`, `capacity_bond_address`) and the operator's keys rather than
+/// an admin URL. Each is taken from a flag when present, otherwise from the
+/// `[blockchain]` / `[identity]` tables of the TOML config (same file the
+/// daemon reads), otherwise the built-in default.
+#[derive(Args, Debug)]
+pub struct RegisterArgs {
+    /// ISO 3166-1 alpha-2 country code submitted as the on-chain
+    /// `regionHint` (ADR 030). Self-reported, accepted at face value.
+    #[arg(long, value_name = "CODE")]
+    pub region: String,
+
+    /// QUIC multiaddr to register, e.g.
+    /// `/ip4/203.0.113.10/udp/4433/quic-v1`. Repeatable. NAT'd nodes may
+    /// register a relay placeholder and promote direct addresses later via
+    /// `updateMultiaddrs`; omitting it entirely registers an empty set and
+    /// relies on gossip / iroh discovery for reachability.
+    #[arg(long = "multiaddr", value_name = "MA")]
+    pub multiaddrs: Vec<String>,
+
+    /// Path to the TOML config file supplying `[blockchain]` / `[identity]`
+    /// fields not passed as flags. Takes precedence over the top-level
+    /// `decdn --config`; falls through to `~/.decdn/node.toml`.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// JSON-RPC endpoint URL. Overrides `blockchain.rpc_url`.
+    #[arg(long, value_name = "URL")]
+    pub rpc_url: Option<String>,
+
+    /// `CapacityBond` contract address. Overrides
+    /// `blockchain.capacity_bond_address`.
+    #[arg(long, value_name = "ADDR")]
+    pub capacity_bond_address: Option<String>,
+
+    /// EIP-712 `chainId` for the binding-signature domain and the ed25519
+    /// ownership digest. Overrides `blockchain.chain_id`; must match the
+    /// `CapacityBond` deployment chain or the signatures are rejected
+    /// on-chain.
+    #[arg(long, value_name = "ID")]
+    pub chain_id: Option<u64>,
+
+    /// Ethereum keystore file. Overrides `blockchain.eth_keystore`; defaults
+    /// to `<data_dir>/keystore.json`.
+    #[arg(long, value_name = "PATH")]
+    pub keystore: Option<PathBuf>,
+
+    /// Data directory holding `node.secret`. Overrides `identity.data_dir`;
+    /// defaults to the platform data dir (`~/.local/share/decdn`).
+    #[arg(long, value_name = "PATH")]
+    pub data_dir: Option<PathBuf>,
+
+    /// File whose contents are the keystore password. Consulted after the
+    /// `DECDN_KEYSTORE_PASSWORD` env var and before an interactive prompt.
+    #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
+    pub keystore_password_file: Option<PathBuf>,
+
+    /// Build and print the registration parameters and signatures without
+    /// submitting the transaction.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit the result as JSON instead of human-readable `key=value` lines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `decdn node top` — live metrics view (issue #275).

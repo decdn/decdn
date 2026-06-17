@@ -27,6 +27,7 @@ pub mod client_bridge;
 pub mod client_reputation;
 pub mod erc20;
 pub mod eth_identity;
+pub mod node_register;
 pub mod origin_assignment;
 pub mod payment_channel;
 pub mod probe_sig;

@@ -12,3 +12,4 @@ pub mod node;
 pub mod node_top;
 pub mod probe;
 pub mod probe_client;
+pub mod register;

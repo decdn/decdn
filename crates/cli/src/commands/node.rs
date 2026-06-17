@@ -62,6 +62,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
         cli::NodeCommand::Drain(d) => drain(d, global_config).await,
         cli::NodeCommand::Top(t) => crate::commands::node_top::run(t, global_config).await,
+        cli::NodeCommand::Register(r) => crate::commands::register::run(r, global_config).await,
     }
 }
 
