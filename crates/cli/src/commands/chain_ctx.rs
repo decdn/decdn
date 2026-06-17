@@ -129,17 +129,6 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
     })
 }
 
-/// Lowercase hex without a dependency on a hex crate in this binary. Shared
-/// by the `register` / `bond` output formatters.
-pub fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
 /// Parse a contract/account address with a labelled error.
 pub fn parse_address(value: &str, label: &str) -> anyhow::Result<Address> {
     value
