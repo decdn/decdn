@@ -2644,6 +2644,7 @@ dependencies = [
  "decdn-protocol",
  "iroh",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

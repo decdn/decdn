@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Shared cdn/client/v1 paid-pull requester used by both the node (node-to-node miss pulls) and the CLI (client fetch / bundle pull)"
+description = "Shared client-side paid-pull machinery used by both the node (node-to-node miss pulls) and the CLI (client fetch / bundle pull): the cdn/client/v1 requester and the buyer PaymentChannel open kernel"
 
 [dependencies]
 decdn-protocol = { workspace = true }
@@ -15,6 +15,7 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
