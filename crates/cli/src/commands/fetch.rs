@@ -28,7 +28,7 @@ use decdn_client_pull::{ChannelContext, VoucherProgress, stream_fetch_tracked};
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_common::identity::fresh_secret_key;
-use decdn_incentive::buyer_channel::BuyerChannelStore;
+use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelStore};
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
@@ -249,15 +249,23 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     )
     .await;
 
-    if let Some((nonce, bytes_delivered, amount)) = progress.acked()
-        && let Err(e) = store.advance_progress(provider, channel_id, nonce, bytes_delivered, amount)
-    {
-        // The bytes were paid for; a failed watermark write only risks a
-        // rejected reuse next time, so warn rather than mask the fetch outcome.
-        eprintln!(
-            "warning: failed to persist voucher watermark for channel {channel_id} \
-             (provider {provider}): {e}"
-        );
+    if let Some((nonce, bytes_delivered, amount)) = progress.acked() {
+        // The bytes were paid for; any failure to persist the new watermark only
+        // risks a rejected reuse next time, so warn rather than mask the fetch
+        // outcome. A non-`Advanced` outcome (unknown provider / channel replaced
+        // / regression) means the watermark did NOT move — same hazard as a
+        // backend error — so surface it too rather than dropping it on the floor.
+        match store.advance_progress(provider, channel_id, nonce, bytes_delivered, amount) {
+            Ok(AdvanceOutcome::Advanced) => {}
+            Ok(other) => eprintln!(
+                "warning: voucher watermark not persisted for channel {channel_id} \
+                 (provider {provider}): {other:?}; the next reuse may re-sign a stale nonce"
+            ),
+            Err(e) => eprintln!(
+                "warning: failed to persist voucher watermark for channel {channel_id} \
+                 (provider {provider}): {e}"
+            ),
+        }
     }
 
     let blob = result?;
@@ -309,6 +317,15 @@ where
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentChannel.usdc(): {e}"))?;
+    // Clamp the deposit up to the on-chain floor so `openChannel` can't revert
+    // for under-funding on a network with a higher `minDeposit` (matches the
+    // node's buyer path and the `--deposit-micro-usdc` help text).
+    let min_deposit = contract
+        .minDeposit()
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("read PaymentChannel.minDeposit(): {e}"))?;
+    let deposit = deposit.max(min_deposit);
     if max_approve {
         ensure_allowance(rpc, token, self_address, payment_channel_addr).await?;
     }

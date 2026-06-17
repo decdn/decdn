@@ -29,7 +29,7 @@ use crate::ChannelContext;
 /// fallen below this floor. Half of `U256::MAX` so one max approval covers
 /// effectively unlimited deposits and a re-run with the approval already in
 /// place skips the redundant `approve`, while a never-approved wallet (allowance
-/// `0`) trips it. Mirrors `node::buyer_channel::approval_floor`.
+/// `0`) trips it.
 fn approval_floor() -> U256 {
     U256::MAX >> 1
 }

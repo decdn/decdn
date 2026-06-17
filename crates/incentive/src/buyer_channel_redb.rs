@@ -139,6 +139,25 @@ impl RedbBuyerChannelStore {
         decdn_common::identity::ensure_data_dir(data_dir)
             .map_err(|err| StoreError::Backend(format!("ensure data dir: {err}")))?;
         let path = data_dir.join(BUYER_CHANNELS_DB_FILE);
+        // Reject a zero-length file. `redb::Database::create` treats both "absent"
+        // and "present but empty" as "create a fresh database", so a `truncate -s 0`
+        // or a filesystem rollback that nukes content but keeps the inode would
+        // silently wipe the persisted watermark — the next reuse would re-sign a
+        // stale nonce, or a second channel would open and escrow another deposit.
+        // After the first commit the file is non-zero forever in normal operation,
+        // so a zero length means the store was deliberately or accidentally wiped.
+        // (Mirrors the node store's guard.)
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+            return Err(StoreError::Corrupt {
+                channel_id: None,
+                detail: format!(
+                    "buyer channel store at {} is empty (length 0) — a truncation or filesystem \
+                     rollback would silently wipe the voucher watermark. Restore from backup, or \
+                     delete the file deliberately to start fresh (forfeiting channel reuse).",
+                    path.display()
+                ),
+            });
+        }
         let db = Database::create(&path)
             .map_err(|err| StoreError::Backend(format!("open buyer channel db: {err}")))?;
         Ok(Self { db })
@@ -505,6 +524,23 @@ mod tests {
         // The committed watermark is still the forward advance.
         let got = store.get_by_provider(provider).unwrap().unwrap();
         assert_eq!(got.last_nonce, U256::from(2u64));
+    }
+
+    #[test]
+    fn rejects_zero_length_db_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("d");
+        // First open creates the data dir (0700) and a non-empty db.
+        {
+            let s = RedbBuyerChannelStore::open(&data).unwrap();
+            s.record(&state(7, 1, 1000, 100)).unwrap();
+        }
+        // Simulate a truncation / filesystem rollback that zeroes the file.
+        std::fs::File::create(data.join("buyer-channels.redb")).unwrap();
+        // Reopening must refuse rather than silently start a fresh (empty) store
+        // that would wipe the watermark.
+        let err = RedbBuyerChannelStore::open(&data).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt { .. }), "{err:?}");
     }
 
     #[test]
