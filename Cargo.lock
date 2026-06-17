@@ -2613,6 +2613,7 @@ dependencies = [
  "blake3",
  "clap",
  "decdn-cache",
+ "decdn-client-pull",
  "decdn-common",
  "decdn-gossip",
  "decdn-incentive",

@@ -18,6 +18,14 @@ decdn-common = { workspace = true }
 # `incentive` per `appendix-poc-production-seams.md` §Seam 1 — clients
 # (voucher signers per ADR 003) and nodes share the keystore surface.
 decdn-incentive = { workspace = true }
+# `decdn fetch` (issue #391): the standalone client-side paid pull reuses the
+# shared `cdn/client/v1` requester. `client-pull` depends only on `blake3` for
+# content verification (NOT iroh-blobs), so the CLI's iroh-blobs-free invariant
+# (#578) holds — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
+decdn-client-pull = { workspace = true }
+# `fetch` parses on-chain identifiers (channel id, token + contract addresses)
+# and builds the EIP-712 voucher/slash domains via `decdn_incentive`.
+alloy = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
