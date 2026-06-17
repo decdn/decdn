@@ -2632,6 +2632,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "decdn-client-pull"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "blake3",
+ "bytes",
+ "decdn-incentive",
+ "decdn-protocol",
+ "iroh",
+ "tokio",
+]
+
+[[package]]
 name = "decdn-common"
 version = "0.1.0"
 dependencies = [
@@ -2717,6 +2731,7 @@ dependencies = [
  "clap",
  "decdn-cache",
  "decdn-cli",
+ "decdn-client-pull",
  "decdn-common",
  "decdn-gossip",
  "decdn-incentive",

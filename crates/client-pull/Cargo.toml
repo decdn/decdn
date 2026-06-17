@@ -1,0 +1,20 @@
+[package]
+name = "decdn-client-pull"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared cdn/client/v1 paid-pull requester used by both the node (node-to-node miss pulls) and the CLI (client fetch / bundle pull)"
+
+[dependencies]
+decdn-protocol = { workspace = true }
+decdn-incentive = { workspace = true }
+alloy = { workspace = true }
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+iroh = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

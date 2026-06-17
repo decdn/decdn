@@ -9,6 +9,7 @@ members = [
     "crates/reputation",
     "crates/gossip",
     "crates/common",
+    "crates/client-pull",
     "crates/cli",
 ]
 exclude = ["contracts"]
@@ -27,6 +28,7 @@ decdn-incentive = { path = "crates/incentive" }
 decdn-reputation = { path = "crates/reputation" }
 decdn-gossip = { path = "crates/gossip" }
 decdn-common = { path = "crates/common" }
+decdn-client-pull = { path = "crates/client-pull" }
 decdn-node = { path = "crates/node" }
 # Bin crate; only ever a dev-dependency (node integration tests reuse the
 # `probe_client` 0-RTT helper, ADR 015). Dev-dep cycle with `decdn-cli`'s
