@@ -600,6 +600,81 @@ contract SlashJudgeTest is Test {
     }
 
     // -----------------------------------------------------------------
+    // Serve-time (responseTs) ripening-window anchor (ADR 030 item 2, #801)
+    // -----------------------------------------------------------------
+
+    function test_blacklist_serveTimeWindow_stalledChallengeStillSlashes() public {
+        // Edge 2 (#801): the node served us-east-blacklisted content WHILE in
+        // us-east, then flipped us-east -> eu-west. Under `block.timestamp` scope the
+        // prev (us-east) leg ripens out once `block.timestamp - effective >= window`,
+        // so a stalled challenge would escape. Anchoring the window to the served
+        // `responseTs` (which predates the flip) keeps us-east in scope -> still
+        // slashable. Reachable only when `window < maxEvidenceAge`: governance can set
+        // the window to its 3d floor while evidence age is 5d, so the gap is real.
+        slasher.setGate(0, 3 days); // window = 3d (< 5d evidence age); gate unused (changed region)
+        uint64 nowSec = uint64(block.timestamp);
+        uint64 responseTsSec = nowSec - 4 days; // served 4d ago, within the 5d evidence age
+        uint64 effective = nowSec - (3 days + 1); // flipped just over `window` ago, AFTER the serve
+        slasher.setRegion(node, "eu-west", "us-east", effective);
+        blacklist.setEntry(bytes32("us-east"), BLOB, responseTsSec - 1000); // us-east entry predates the serve
+        // block.timestamp scope would drop the prev leg (block.timestamp - effective
+        // = 3d + 1 >= 3d -> escape); responseTs scope keeps it (responseTs < effective
+        // -> elapsed 0 -> prev applies).
+        SlashJudge.StreamMsg memory s = _stream(true, 10, uint64(uint256(responseTsSec) * 1_000_000));
+        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
+        vm.prank(challenger);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    function test_blacklist_honestRelocator_currentLegSlashesAccepted() public {
+        // Edge 1 (#801, accepted residual): the node served compliantly WHILE in
+        // us-east (no us-east entry), then GENUINELY relocated to eu-west. The
+        // current-region leg (entry.region == regionHint) applies regardless of when
+        // the serve happened, so the old serve becomes slashable once eu-west holds an
+        // entry that predates it. Exempting the pre-relocation serve would need
+        // region-at-responseTs history, which the single `regionPrev` slot cannot
+        // provide; the edge is accepted and pinned here so any future change to the
+        // posture is a conscious one. NOTE: this slash is via the CURRENT-region leg,
+        // which `scopedRegions` never gates on the window, so this test is
+        // independent of the responseTs-vs-block.timestamp anchor — it passes under
+        // both and guards the posture, not this PR's change specifically.
+        uint64 nowSec = uint64(block.timestamp);
+        uint64 responseTsSec = nowSec - 2 hours; // served 2h ago, while in us-east
+        uint64 effective = nowSec - 1 hours; // relocated to eu-west AFTER the serve
+        slasher.setRegion(node, "eu-west", "us-east", effective);
+        blacklist.setEntry(bytes32("eu-west"), BLOB, nowSec - 3 hours); // eu-west entry predates the serve
+        // us-east (serve-time region) has NO entry -> the serve was compliant when made.
+        SlashJudge.StreamMsg memory s = _stream(true, 10, uint64(uint256(responseTsSec) * 1_000_000));
+        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
+        vm.prank(challenger);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
+        assertEq(slasher.slashCount(), 1);
+    }
+
+    function test_blacklist_multiChangeResidual_serveTimeRegionUnrecoverable() public {
+        // Accepted residual (#801): `regionPrev` is a SINGLE slot. After two region
+        // changes (us-east -> eu-west -> ap-south) the slot holds eu-west, so the
+        // region the node was in at serve time (us-east) is unrecoverable. A us-east
+        // entry the node actually served is therefore out of scope -> NOT slashable.
+        // Reconstructing the serve-time region would need multi-level history
+        // (rejected on EIP-170 grounds); this pins the limitation so widening
+        // `regionPrev` history is a conscious change. In production the two flips are
+        // window-spaced, so this is reachable only when MAX_EVIDENCE_AGE_US exceeds
+        // the window; the mock isolates the scope logic from that spacing.
+        uint64 nowSec = uint64(block.timestamp);
+        uint64 responseTsSec = nowSec - 1 hours; // served while in us-east, before both flips
+        uint64 effective = nowSec - 30 minutes; // most recent flip (eu-west -> ap-south)
+        slasher.setRegion(node, "ap-south", "eu-west", effective); // current ap-south, prev eu-west; us-east lost
+        blacklist.setEntry(bytes32("us-east"), BLOB, nowSec - 2 hours); // us-east entry predates the serve
+        SlashJudge.StreamMsg memory s = _stream(true, 10, uint64(uint256(responseTsSec) * 1_000_000));
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
+        assertEq(slasher.slashCount(), 0);
+    }
+
+    // -----------------------------------------------------------------
     // Commit–reveal front-running mitigation (#854)
     // -----------------------------------------------------------------
 

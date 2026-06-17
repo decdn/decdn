@@ -166,11 +166,39 @@ contract RegionScopeLibTest is Test {
     }
 
     function test_scopedRegions_effectiveInFutureDoesNotUnderflow() public view {
-        // Defensive guard: `nowTs < effective` (only reachable via a test-time
-        // clock rewind) must not revert. It saturates `elapsed` to 0 → in window,
-        // so prev conservatively still applies.
+        // `nowTs < effective` must not revert: it saturates `elapsed` to 0 → in
+        // window, so prev conservatively still applies. For the read-path caller
+        // this is only reachable via a clock rewind, but for the slash-path caller
+        // (#801) it is the common production case — the served `responseTs` predates
+        // a later region change. See the serve-time tests below.
         (bytes32 cur,, bool prevApplies) = h.scopedRegions(GLOBAL_REGION, "eu-west", "us-east", NOW, NOW + 100, WINDOW);
         assertEq(cur, bytes32("eu-west"));
         assertTrue(prevApplies);
+    }
+
+    function test_scopedRegions_serveBeforeRegionChange_prevApplies() public view {
+        // Slash-path semantics (#801): `nowTs` is the served `responseTs`, which
+        // precedes `effective` whenever the operator changed region AFTER serving.
+        // `elapsed` saturates to 0, so the serve-time (prev) region stays in scope —
+        // intended behavior (closes flip-then-stall evasion), not just a guard.
+        uint64 effective = NOW; // region changed "now"
+        uint64 responseTs = NOW - 1 days; // ...but the serve was a day earlier
+        (bytes32 cur, bytes32 prev, bool prevApplies) =
+            h.scopedRegions(GLOBAL_REGION, "eu-west", "us-east", responseTs, effective, WINDOW);
+        assertEq(cur, bytes32("eu-west"));
+        assertTrue(prevApplies);
+        assertEq(prev, bytes32("us-east"));
+    }
+
+    function test_scopedRegions_serveAfterRipening_prevDropped() public view {
+        // Counterpart: a serve made AFTER the change ripened (responseTs is > window
+        // past effective) is outside the prev leg — the flip has fully taken effect
+        // for serves made once it ripened.
+        uint64 effective = NOW - 10 days;
+        uint64 responseTs = NOW; // serve well past effective + window
+        (bytes32 cur,, bool prevApplies) =
+            h.scopedRegions(GLOBAL_REGION, "eu-west", "us-east", responseTs, effective, WINDOW);
+        assertEq(cur, bytes32("eu-west"));
+        assertFalse(prevApplies);
     }
 }

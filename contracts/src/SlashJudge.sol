@@ -478,6 +478,12 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     ///      the operator's current region, OR (still inside the ripening window)
     ///      its previous region. Region keys are read from `CapacityBond` and
     ///      packed to `bytes32` to match `ContentBlacklist`'s region keying.
+    ///      The ripening window is evaluated at the served `responseTs`, NOT at
+    ///      challenge-submission time (ADR 030 § Region-stability window item 2,
+    ///      #801): a punitive slash asks "was this *past* serve in scope", which
+    ///      shares the response-anchor the entry-liveness check already uses. This
+    ///      is the slash-path counterpart to `ContentBlacklist`'s read-path
+    ///      predicate, which stays anchored to `block.timestamp`.
     function _regionalLiveBefore(address operator, bytes32 blobHash, uint64 responseTsUs) private view returns (bool) {
         (
             string memory regionHint,
@@ -489,10 +495,15 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
         ) = capacityBondRegion.regionScopeData(operator);
 
         uint64 effective = RegionScopeLib.effectiveSince(regionLastChanged, firstBondedAt, gateActivatedAt);
-        // forge-lint: disable-next-line(block-timestamp)
-        (bytes32 cur, bytes32 prev, bool prevApplies) = RegionScopeLib.scopedRegions(
-            GLOBAL_REGION, regionHint, regionPrev, uint64(block.timestamp), effective, window
-        );
+        // Anchor the ripening window to the served response (μs → s), not the
+        // current block — closes the flip-then-stall prev-leg evasion (#801). The
+        // floor (round-down) is deliberate: it can only make `responseTsSec` earlier,
+        // i.e. `elapsed` smaller, keeping the prev region in scope a hair longer —
+        // the conservative/pro-slash direction; it never rounds a serve forward past
+        // a ripening boundary.
+        uint64 responseTsSec = uint64(responseTsUs / 1_000_000);
+        (bytes32 cur, bytes32 prev, bool prevApplies) =
+            RegionScopeLib.scopedRegions(GLOBAL_REGION, regionHint, regionPrev, responseTsSec, effective, window);
 
         if (cur != bytes32(0) && _liveBefore(cur, blobHash, responseTsUs)) return true;
         if (prevApplies && _liveBefore(prev, blobHash, responseTsUs)) return true;
