@@ -428,6 +428,48 @@ contract PaymentChannelTest is Test {
         assertEq(router.totalRouted(), 500e6);
     }
 
+    /// @dev #890: a paused `FeeRouter` makes `withdraw` revert (unlike `settleChannel`,
+    ///      it does not defer). The revert rolls back the watermark advance, so nothing
+    ///      is trapped — the provider re-submits the identical voucher after unpause.
+    function test_withdraw_routerPaused_revertsThenSucceedsAfterUnpause() public {
+        bytes32 id = _open();
+        uint256 amount = 400e6;
+        uint256 bytesDelivered = 40_000_000;
+        bytes memory sig = _sign(id, amount, 1, bytesDelivered);
+
+        router.setPaused(true);
+        vm.prank(provider);
+        vm.expectRevert(bytes("MockSettlementRouter: paused"));
+        channel.withdraw(id, amount, 1, bytesDelivered, sig);
+
+        // The whole tx rolled back: no routing happened and the watermark never moved.
+        assertEq(router.callCount(), 0);
+        PaymentChannel.Channel memory chBefore = channel.getChannel(id);
+        assertEq(chBefore.claimedAmount, 0);
+        // The claim-watermark nonce must roll back too: a stuck `claimedNonce`
+        // would brick the honest retry below with `NonMonotonicNonce` — the exact
+        // "nothing is trapped" property #890 protects.
+        assertEq(chBefore.claimedNonce, 0);
+        assertEq(chBefore.claimedBytes, 0);
+        assertEq(chBefore.withdrawnAmount, 0);
+        assertEq(chBefore.withdrawnBytes, 0);
+
+        // After unpause the same voucher withdraws cleanly — no lost or duplicated accounting.
+        router.setPaused(false);
+        vm.prank(provider);
+        channel.withdraw(id, amount, 1, bytesDelivered, sig);
+
+        assertEq(router.callCount(), 1);
+        (address op, uint256 b, uint256 amt) = router.calls(0);
+        assertEq(op, provider);
+        assertEq(b, bytesDelivered);
+        assertEq(amt, amount);
+
+        PaymentChannel.Channel memory chAfter = channel.getChannel(id);
+        assertEq(chAfter.withdrawnAmount, amount);
+        assertEq(chAfter.withdrawnBytes, bytesDelivered);
+    }
+
     function test_withdraw_onlyProvider() public {
         bytes32 id = _open();
         bytes memory sig = _sign(id, 400e6, 1, 40_000_000);

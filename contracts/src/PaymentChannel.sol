@@ -387,6 +387,13 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///         voucher has nothing to dispute (ADR 003 § Operator early withdrawal).
     /// @dev `_verifyVoucher` may staticcall an ERC-1271 client before the watermark
     ///      writes; safe under `nonReentrant` + checks-effects-interactions.
+    /// @dev Unlike `settleChannel`, `withdraw` deliberately does NOT defer under a
+    ///      paused `FeeRouter` (#890). It strands no client funds — the channel stays
+    ///      `Open` — and a revert here rolls back the claim- and withdrawal-watermark
+    ///      writes above, so nothing is trapped: the provider re-submits the same voucher once
+    ///      the router is unpaused. The deferred-settlement tolerance exists only for
+    ///      `settleChannel`, where a paused router would otherwise freeze a client
+    ///      refund mid-exit (#849/#889).
     // slither-disable-next-line reentrancy-no-eth
     function withdraw(
         bytes32 channelId,
@@ -699,7 +706,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     // -----------------------------------------------------------------
     // Pause control (PAUSER_ROLE — emergency multisig). Pause blocks new
     // channels only; every existing-channel exit path stays callable so funds
-    // are never trapped.
+    // are never trapped. `withdraw` is the one exit that may transiently revert
+    // under a paused router by design (#890) — it strands no funds, so the
+    // provider just retries post-unpause rather than deferring like
+    // `settleChannel`.
     // -----------------------------------------------------------------
 
     function pause() external onlyRole(PAUSER_ROLE) {
