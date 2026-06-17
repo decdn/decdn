@@ -494,7 +494,10 @@ pub struct PeersArgs {
 /// `chain_id`, `capacity_bond_address`) and the operator's keys rather than
 /// an admin URL. Each is taken from a flag when present, otherwise from the
 /// `[blockchain]` / `[identity]` tables of the TOML config (same file the
-/// daemon reads), otherwise the built-in default.
+/// daemon reads). `rpc_url` and `capacity_bond_address` are required (no
+/// default — registration errors if neither flag nor config supplies them);
+/// `chain_id`, `keystore`, and `data_dir` fall back to built-in defaults
+/// (see each field).
 #[derive(Args, Debug)]
 pub struct RegisterArgs {
     /// ISO 3166-1 alpha-2 country code submitted as the on-chain
@@ -538,7 +541,7 @@ pub struct RegisterArgs {
     pub keystore: Option<PathBuf>,
 
     /// Data directory holding `node.secret`. Overrides `identity.data_dir`;
-    /// defaults to the platform data dir (`~/.local/share/decdn`).
+    /// defaults to `~/.decdn`.
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 

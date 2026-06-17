@@ -98,7 +98,8 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     })?;
     let node_id = B256::from_slice(node_secret.public().as_bytes());
 
-    let signer = load_operator_signer(args, &resolved.keystore)?;
+    let signer =
+        load_operator_signer(resolved_password_file(args), resolved.keystore.clone()).await?;
     let operator = signer.address();
 
     let provider = ProviderBuilder::new()
@@ -265,18 +266,25 @@ fn resolved_password_file(args: &cli::RegisterArgs) -> Option<PathBuf> {
 /// Load the operator's Ethereum keystore signer, sourcing the password from
 /// the `DECDN_KEYSTORE_PASSWORD` env var, then `--keystore-password-file`,
 /// then an interactive prompt — the same precedence the daemon uses.
-fn load_operator_signer(
-    args: &cli::RegisterArgs,
-    keystore: &Path,
+///
+/// `load_signer` runs the keystore's scrypt KDF, which is CPU-heavy
+/// (hundreds of ms); it is offloaded to `spawn_blocking` so it doesn't stall
+/// the async executor, matching `decdn-node`'s runtime keystore load.
+async fn load_operator_signer(
+    password_file: Option<PathBuf>,
+    keystore: PathBuf,
 ) -> anyhow::Result<PrivateKeySigner> {
     let mut sources = vec![PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV)];
-    if let Some(path) = resolved_password_file(args) {
+    if let Some(path) = password_file {
         sources.push(PasswordSource::File(path));
     }
     sources.push(PasswordSource::Prompt { confirm: false });
     let password = eth_identity::read_password(&sources, "eth keystore password")?;
-    eth_identity::load_signer(keystore, &password)
-        .with_context(|| format!("failed to load keystore at {}", keystore.display()))
+    let display = keystore.display().to_string();
+    tokio::task::spawn_blocking(move || eth_identity::load_signer(&keystore, &password))
+        .await
+        .context("keystore decryption task panicked")?
+        .with_context(|| format!("failed to load keystore at {display}"))
 }
 
 /// Load the partial config from `config_path`. An explicit path that is
@@ -328,11 +336,14 @@ fn resolve(args: &cli::RegisterArgs, file: &RegisterFileConfig) -> anyhow::Resul
         .chain_id
         .or_else(|| bc.and_then(|b| b.chain_id))
         .unwrap_or(DEFAULT_CHAIN_ID);
+    // `expand_tilde` is applied to whichever explicit value wins (flag OR
+    // config) — config-file paths get `~` expansion too, not just flags. The
+    // `default_data_dir` fallback is already absolute.
     let data_dir = args
         .data_dir
         .clone()
-        .map(|p| expand_tilde(&p))
         .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
+        .map(|p| expand_tilde(&p))
         .or_else(cli::default_data_dir)
         .ok_or_else(|| {
             anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
@@ -340,9 +351,11 @@ fn resolve(args: &cli::RegisterArgs, file: &RegisterFileConfig) -> anyhow::Resul
     let keystore = args
         .keystore
         .clone()
-        .map(|p| expand_tilde(&p))
         .or_else(|| bc.and_then(|b| b.eth_keystore.clone()))
-        .unwrap_or_else(|| eth_identity::keystore_path(&data_dir));
+        .map_or_else(
+            || eth_identity::keystore_path(&data_dir),
+            |p| expand_tilde(&p),
+        );
     Ok(Resolved {
         rpc_url,
         chain_id,

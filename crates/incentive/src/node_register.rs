@@ -59,7 +59,9 @@ pub fn ownership_message_digest(
 /// ceiling (`maxMultiaddrSize`, default 1,024 bytes); that bound is reported by
 /// the on-chain revert rather than re-checked here.
 pub fn pack_multiaddrs(addrs: &[String]) -> anyhow::Result<Vec<u8>> {
-    let mut out = Vec::new();
+    // Each entry is a 2-byte length prefix + its bytes; pre-size to avoid
+    // reallocating as entries are appended.
+    let mut out = Vec::with_capacity(addrs.iter().map(|a| a.len() + 2).sum());
     for addr in addrs {
         let bytes = addr.as_bytes();
         let len = u16::try_from(bytes.len()).map_err(|_| {
