@@ -1471,6 +1471,205 @@ fn spawn_a_lying_server(
     })
 }
 
+/// A protocol-correct upstream that serves the *right* bytes but pauses, on the
+/// client stream, between reading B's `StreamRequest` and emitting any bytes: it
+/// fires `received` once B's upstream request lands, then blocks on `release`
+/// before streaming. Because B opens its tee sink *before* it dials upstream, the
+/// `received` signal proves B's coalescing owner-pull is in flight and B's cache
+/// is still empty — so a test can open a second same-hash request against B while
+/// the gate is held and deterministically drive it into the `TeeOpen::InFlight`
+/// coalescing branch (#895/#305: one upstream pull, no double spend). Modelled on
+/// [`serve_wrong_bytes`] but honest + gated.
+async fn serve_gated_correct_bytes(
+    conn: Connection,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    served: &[u8],
+    rate: u64,
+    received: &tokio::sync::Notify,
+    release: &tokio::sync::Notify,
+) -> Result<()> {
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
+    let req_msg = {
+        let frame = read_frame(&mut recv)
+            .await
+            .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
+        decode_message::<ClientMessage>(&frame)
+            .map_err(|e| anyhow::anyhow!("decode request: {e}"))?
+            .0
+    };
+    let ClientMessage::StreamRequest(req) = req_msg else {
+        anyhow::bail!("gated upstream: expected a StreamRequest");
+    };
+    // The upstream request landed (B's owner tee is in flight, cache still empty);
+    // hold here until the test has opened the coalescing second request.
+    received.notify_one();
+    release.notified().await;
+    let body = StreamResponseBody {
+        hash: req.hash,
+        ok: true,
+        rate_per_mb: rate,
+        total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
+        channel_id: req.channel_id,
+        timestamp_us: req.timestamp_us,
+        redirect: None,
+    };
+    let slash_sig = StreamSlashData::from_response_body(&body)
+        .sign(eth.as_ref(), slash)
+        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+        .as_bytes()
+        .to_vec();
+    let resp = StreamResponse {
+        body,
+        error: None,
+        voucher_interval_mb: Some(1),
+        slash_sig,
+    };
+    write_frame(
+        &mut send,
+        &encode_message(&ClientMessage::StreamResponse(resp))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    for chunk in served.chunks(CHUNK_SIZE) {
+        write_frame(
+            &mut send,
+            &encode_message(&ClientMessage::ChunkData(ChunkData {
+                bytes: chunk.to_vec(),
+            }))?,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
+    }
+    // Ack the closing voucher so the buyer proceeds to the integrity check (a
+    // sub-interval blob produces exactly one closing voucher).
+    let voucher_msg = {
+        let frame = read_frame(&mut recv)
+            .await
+            .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
+        decode_message::<ClientMessage>(&frame)
+            .map_err(|e| anyhow::anyhow!("decode voucher: {e}"))?
+            .0
+    };
+    if let ClientMessage::Voucher(_) = voucher_msg {
+        write_frame(&mut send, &encode_message(&ClientMessage::VoucherAck)?)
+            .await
+            .map_err(|e| anyhow::anyhow!("write ack: {e}"))?;
+    }
+    write_frame(&mut send, &encode_message(&ClientMessage::StreamEnd)?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write end: {e}"))?;
+    let _ = send.finish();
+    conn.closed().await;
+    Ok(())
+}
+
+/// Spawn the gated honest upstream (see [`serve_gated_correct_bytes`]). Answers
+/// probes truthfully; gates only the client stream. The returned `received` /
+/// `release` notifies coordinate the test's hand-off.
+#[allow(clippy::too_many_arguments)]
+fn spawn_a_gated_server(
+    ep: iroh::Endpoint,
+    a_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    served: Vec<u8>,
+    advertised_bytes: u64,
+    rate: u64,
+    received: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let eth = Arc::clone(&a_eth);
+            let dom = slash.clone();
+            let served = served.clone();
+            if conn.alpn() == ALPN_PROBE {
+                tokio::spawn(async move {
+                    let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
+                });
+            } else {
+                let received = Arc::clone(&received);
+                let release = Arc::clone(&release);
+                tokio::spawn(async move {
+                    let _ = serve_gated_correct_bytes(
+                        conn, &eth, &dom, &served, rate, &received, &release,
+                    )
+                    .await;
+                });
+            }
+        }
+    })
+}
+
+/// Spin up a gated honest upstream A holding `payload`. Same return shape as
+/// [`spawn_lying_node_a`] plus the `received` / `release` gate handles. No
+/// channel store is needed — the hand-rolled server acks the buyer's voucher
+/// directly.
+async fn spawn_gated_node_a(
+    payload: &[u8],
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Arc<PrivateKeySigner>,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+)> {
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let received = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let advertised_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let task_a = spawn_a_gated_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        payload.to_vec(),
+        advertised_bytes,
+        RATE,
+        Arc::clone(&received),
+        Arc::clone(&release),
+    );
+    Ok((a_id, addr_a, a_eth, ep_a, task_a, received, release))
+}
+
+/// Like `support::spawn_server` but spawns a task per accepted connection instead
+/// of awaiting `handler.accept` inline, so node B can serve concurrent client
+/// connections. The inline server serializes connections (fine for one-leaf
+/// tests): while the first serve is parked on an in-flight upstream pull, the
+/// accept loop never reaches the second connection, so the second leaf's connect
+/// times out and the concurrent same-hash test fails. Mirrors the production
+/// per-connection dispatch.
+fn spawn_server_concurrent(
+    server_ep: iroh::Endpoint,
+    handler: Arc<decdn_node::handlers::client::ClientHandler>,
+) -> tokio::task::JoinHandle<()> {
+    use iroh::protocol::ProtocolHandler;
+    tokio::spawn(async move {
+        while let Some(incoming) = server_ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move {
+                let _ = handler.accept(conn).await;
+            });
+        }
+    })
+}
+
 /// A protocol-correct upstream that serves the *right* bytes but rejects the
 /// closing voucher with `StreamError(VoucherRejected { StaleNonce })` instead of
 /// `VoucherAck` — the buyer-side payment failure of #857/#852. Drives the
@@ -2934,6 +3133,41 @@ async fn build_node_b(
     decdn_cache::CacheEngine,
     Arc<Metrics>,
 )> {
+    build_node_b_with_leaves(
+        a_id,
+        a_addr,
+        a_eth_addr,
+        hash,
+        ab_channel_id,
+        b_buyer,
+        &[(leaf_channel_id, leaf_eth_addr, leaf_deposit)],
+        max_blob_size_bytes,
+    )
+    .await
+}
+
+/// Like [`build_node_b`] but registers an arbitrary set of leaf channels in B's
+/// store, so a test can drive multiple concurrent leaf requests against the same
+/// node B (each leaf needs its own channel to avoid sharing voucher state). The
+/// single-leaf [`build_node_b`] is a thin wrapper over this.
+#[allow(clippy::too_many_arguments)]
+async fn build_node_b_with_leaves(
+    a_id: iroh::PublicKey,
+    a_addr: std::net::SocketAddr,
+    a_eth_addr: Address,
+    hash: Hash,
+    ab_channel_id: B256,
+    b_buyer: &Arc<PrivateKeySigner>,
+    leaves: &[(B256, Address, U256)],
+    max_blob_size_bytes: u64,
+) -> Result<(
+    Arc<decdn_node::handlers::client::ClientHandler>,
+    EndpointAddr,
+    iroh::Endpoint,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    decdn_cache::CacheEngine,
+    Arc<Metrics>,
+)> {
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let b_eth = Arc::new(PrivateKeySigner::random());
@@ -2976,12 +3210,14 @@ async fn build_node_b(
     // engine's open store anyway).
     std::mem::forget(cache_tmp);
     let store_b = Arc::new(MemoryChannelStateStore::new());
-    store_b.record(&ChannelState::new(
-        leaf_channel_id,
-        leaf_eth_addr,
-        TOKEN,
-        leaf_deposit,
-    ))?;
+    for (leaf_channel_id, leaf_eth_addr, leaf_deposit) in leaves {
+        store_b.record(&ChannelState::new(
+            *leaf_channel_id,
+            *leaf_eth_addr,
+            TOKEN,
+            *leaf_deposit,
+        ))?;
+    }
     let limiter = permissive_limiter(&b_metrics);
     let domains = HandlerDomains {
         slash: slash_domain(),
@@ -3152,6 +3388,175 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     );
 
     leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+/// #895 (#305 no-double-spend): two concurrent same-hash leaf requests against a
+/// node B with an empty cache must open exactly ONE upstream pull. The first
+/// request owns the tee sink and pulls from A; the second hits `TeeOpen::InFlight`
+/// and waits on the coalesced fill (`await_coalesced_fill`) rather than opening a
+/// second upstream pull — which would double-spend real USDC on the B↔A channel.
+/// The cache-level coalescing primitive is unit-tested (`engine.rs`
+/// `tee_sink_coalesces_concurrent_fills`); this pins the handler-side consequence
+/// at the layer that actually spends.
+///
+/// Determinism: a gated upstream A parks after receiving B's (single) upstream
+/// request. Because B opens its tee sink before dialing upstream, the gate signal
+/// proves the owner pull is in flight and B's cache is still empty, so the second
+/// leaf — launched while the gate is held — is expected to coalesce. The
+/// no-double-spend
+/// assertions hold for every interleaving regardless.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Result<()> {
+    // A sub-interval blob keeps the gated upstream's voucher exchange to one
+    // closing voucher (a multi-window cadence would need an interleaved server);
+    // coalescing is independent of blob size.
+    let payload = vec![0xC0u8; 4096];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+
+    let ab_channel_id = B256::repeat_byte(0xA8);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a, received, release) =
+        spawn_gated_node_a(&payload).await?;
+
+    // Two distinct leaf channels so the two concurrent serves do not share voucher
+    // state.
+    let leaf1_eth = Arc::new(PrivateKeySigner::random());
+    let leaf2_eth = Arc::new(PrivateKeySigner::random());
+    let leaf1_channel_id = B256::repeat_byte(0x81);
+    let leaf2_channel_id = B256::repeat_byte(0x82);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b_with_leaves(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        &[
+            (
+                leaf1_channel_id,
+                leaf1_eth.address(),
+                U256::from(DEPOSIT_MICRO_USDC),
+            ),
+            (
+                leaf2_channel_id,
+                leaf2_eth.address(),
+                U256::from(DEPOSIT_MICRO_USDC),
+            ),
+        ],
+        0,
+    )
+    .await?;
+    let task_b = spawn_server_concurrent(ep_b.clone(), handler_b);
+
+    // Leaf 1: the owner pull. Spawn it, then wait for A to confirm B's single
+    // upstream request landed (tee in flight, cache empty).
+    let leaf1_sk = fresh_key();
+    let leaf1_node_id = B256::from(*leaf1_sk.public().as_bytes());
+    let (leaf1_ep, _) = local_endpoint(leaf1_sk, vec![]).await?;
+    let leaf1_target = b_target.clone();
+    let leaf1_eth_c = Arc::clone(&leaf1_eth);
+    let leaf1_task = tokio::spawn(async move {
+        leaf_paced_pull(
+            &leaf1_ep,
+            leaf1_target,
+            leaf1_node_id,
+            &leaf1_eth_c,
+            leaf1_channel_id,
+            hash,
+            RATE,
+            None,
+        )
+        .await
+    });
+
+    // Bounded so a gated-server task that errored before signaling (e.g. B's
+    // first upstream frame is no longer a bare `StreamRequest`) surfaces as a
+    // readable failure instead of hanging until the CI job timeout.
+    tokio::time::timeout(Duration::from_secs(20), received.notified())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "gated upstream A never signaled `received` — its task likely errored \
+                 before reading B's upstream StreamRequest"
+            )
+        })?;
+
+    // Leaf 2: the coalescing request. With the gate still held, B's cache is empty
+    // and leaf 1's tee owns the in-flight fill, so leaf 2 hits `TeeOpen::InFlight`.
+    // The brief pause lets leaf 2 reach that branch before we release A; the
+    // no-double-spend assertions below hold regardless of interleaving.
+    let leaf2_sk = fresh_key();
+    let leaf2_node_id = B256::from(*leaf2_sk.public().as_bytes());
+    let (leaf2_ep, _) = local_endpoint(leaf2_sk, vec![]).await?;
+    let leaf2_target = b_target.clone();
+    let leaf2_eth_c = Arc::clone(&leaf2_eth);
+    let leaf2_task = tokio::spawn(async move {
+        leaf_paced_pull(
+            &leaf2_ep,
+            leaf2_target,
+            leaf2_node_id,
+            &leaf2_eth_c,
+            leaf2_channel_id,
+            hash,
+            RATE,
+            None,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Release A: the single upstream pull completes, the tee promotes the blob,
+    // and leaf 2's coalesced wait resolves and serves from cache.
+    release.notify_one();
+
+    let out1 = leaf1_task.await??;
+    let out2 = leaf2_task.await??;
+
+    for (label, out) in [("leaf 1", &out1), ("leaf 2", &out2)] {
+        anyhow::ensure!(out.completed, "{label} delivery did not complete");
+        anyhow::ensure!(out.hash_ok, "{label} received bytes failed the hash check");
+        anyhow::ensure!(
+            out.received == total_bytes,
+            "{label} received {} of {total_bytes} bytes",
+            out.received
+        );
+    }
+
+    // The no-double-spend guarantee (#305): B persisted exactly ONE upstream
+    // watermark to A, covering one blob. A second upstream pull would record a
+    // second entry — the regression is caught by the entry COUNT, not the byte
+    // total (a resumed second pull would re-report the same cumulative bytes, not
+    // double them, since `StubOpener` resumes from the prior watermark).
+    let upstream = progress_log(&recorded)?;
+    anyhow::ensure!(
+        upstream.len() == 1,
+        "concurrent same-hash requests must open ONE upstream pull, got {upstream:?}"
+    );
+    let entry = upstream
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no upstream watermark recorded"))?;
+    anyhow::ensure!(
+        u64::try_from(entry.2).unwrap_or(u64::MAX) == total_bytes,
+        "the single upstream pull must cover exactly one blob, got {entry:?}"
+    );
+    // B promoted the single coalesced fill (now a holder for future requests).
+    anyhow::ensure!(
+        cache_b.has(hash).await?,
+        "B must promote the single coalesced fill"
+    );
+    // The honest upstream must not trip the corruption counter.
+    anyhow::ensure!(
+        counter_value(&b_metrics, "node_pull_through_upstream_verify_failed_total")? == 0,
+        "an honest upstream must not trip the verify-failed counter"
+    );
+
     ep_b.close().await;
     ep_a.close().await;
     task_a.await?;
