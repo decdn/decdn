@@ -290,9 +290,13 @@ contract CapacityBondRegionE2ETest is Test {
         assertEq(bond.lifetimeOffenseCount(REG_OPERATOR), 1);
     }
 
-    /// @notice Once the region change ripens (past REGION_WINDOW), the previous
-    ///         region's entry no longer applies and the node is not slashable for
-    ///         it — the flip has fully taken effect.
+    /// @notice A serve made AFTER the region change ripens (the served `responseTs`
+    ///         is more than REGION_WINDOW past the flip) is outside the previous
+    ///         region's scope and not slashable for a prev-region entry — the flip
+    ///         has fully taken effect. The slash window is anchored to `responseTs`
+    ///         (ADR 030 item 2, #801), so the serve, not the challenge time, is what
+    ///         must post-date ripening: here the response is taken ~1h before a
+    ///         challenge that lands well past the window.
     function test_crossContract_regionalSlash_prevRegionAfterWindow() public {
         (, SlashJudge judge) = _deployBlacklistAndJudge();
         _bondAndRegister();
@@ -301,8 +305,12 @@ contract CapacityBondRegionE2ETest is Test {
         vm.prank(REG_OPERATOR);
         bond.updateRegion("eu-west");
 
-        // Past the window: us-east (prev) entry is out of scope; eu-west has none.
-        vm.warp(block.timestamp + REGION_WINDOW + 1);
+        // The serve post-dates ripening: `responseTs - effective` (flip) exceeds
+        // REGION_WINDOW, so us-east (prev) is out of scope and eu-west has no entry.
+        // We warp a full window + 1h past the flip, then take responseTs = now - 5s;
+        // the 5s only keeps responseTs validly in the past for liveness/skew — it is
+        // the flip being > a window before responseTs that drops the prev leg.
+        vm.warp(block.timestamp + REGION_WINDOW + 1 hours);
         uint64 ts = uint64(block.timestamp * 1_000_000 - 5_000_000);
         SlashJudge.StreamMsg memory s = _stream(ts);
         bytes memory sig = _signStream(judge, s); // sign before prank (see _submitBlacklistSlash)

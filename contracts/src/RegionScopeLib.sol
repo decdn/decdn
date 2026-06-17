@@ -73,7 +73,17 @@ library RegionScopeLib {
     /// @param globalRegion The global-scope sentinel (`bytes32("GLOBAL")`).
     /// @param regionHint   Operator's current attested region (string).
     /// @param regionPrev   Operator's previous region (string; "" if never changed).
-    /// @param nowTs        Current `block.timestamp`.
+    /// @param nowTs        The instant the ripening window is measured at, in
+    ///                     **seconds** (same unit as `block.timestamp` and
+    ///                     `effective`/`window`). The read-path caller
+    ///                     (`ContentBlacklist`) passes `block.timestamp` ("what
+    ///                     should I serve now"); the slash-path caller
+    ///                     (`SlashJudge`) passes the served `responseTs` floored
+    ///                     to seconds (`uint64(responseTsUs / 1_000_000)`, "was
+    ///                     this past serve in scope") — ADR 030 § Region-stability
+    ///                     window item 2 (#801). Callers MUST NOT pass μs here:
+    ///                     a μs `nowTs` makes `elapsed` ~1e6× too large and
+    ///                     silently mis-scopes the window.
     /// @param effective    The `effectiveSince` stamp for the operator.
     /// @param window       REGION_STABILITY_WINDOW (seconds).
     /// @return currentKey  Packed current region, or `bytes32(0)` when it is empty
@@ -87,11 +97,16 @@ library RegionScopeLib {
     ///      `prev != current` dedup so `SlashJudge` and `ContentBlacklist` cannot
     ///      drift. Each caller layers its own liveness predicate (response-anchored
     ///      `_liveBefore` vs. point-in-time `_isLive`) over the returned keys.
-    ///      In production `effective` is always a past stamp (timestamps increase
-    ///      monotonically per block), so `elapsed` equals `nowTs - effective`. The
-    ///      saturating guard for `nowTs < effective` — only reachable via test-time
-    ///      clock rewinds — avoids an underflow revert and conservatively treats it
-    ///      as "just changed" (prev still applies). `regionPrev == ""` packs to
+    ///      For the read-path (`block.timestamp`) caller, `effective` is always a
+    ///      past stamp (timestamps increase monotonically per block), so `elapsed`
+    ///      equals `nowTs - effective`. For the slash-path caller `nowTs` is the
+    ///      served `responseTs` in seconds (`responseTsUs / 1_000_000`), which CAN
+    ///      precede `effective` whenever the operator
+    ///      changed region *after* serving (the common evasion case): the saturating
+    ///      guard for `nowTs < effective` then yields `elapsed == 0`, conservatively
+    ///      treating the serve as "before the change ripened" so the prev (serve-time)
+    ///      region stays in scope — exactly the intended slash semantics, not merely
+    ///      a defensive underflow guard. `regionPrev == ""` packs to
     ///      `bytes32(0)` (never a real key, since `addHashRegional` rejects it), so
     ///      an empty prev never applies.
     function scopedRegions(
