@@ -10,6 +10,7 @@ pub mod bundle;
 pub mod chain_ctx;
 pub mod client_endpoint;
 pub mod config;
+pub mod discovery;
 pub mod fetch;
 pub mod key_gen;
 pub mod node;
