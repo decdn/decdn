@@ -1,4 +1,5 @@
-//! Reusable `cdn/client/v1` requester for node-to-node paid pulls (#317).
+//! Reusable `cdn/client/v1` paid-pull requester, shared by the node
+//! (node-to-node miss pulls, #317) and the CLI (client fetch / bundle pull).
 //!
 //! [`stream_fetch`] performs one full delivery exchange against a remote node:
 //! it sends a [`StreamRequest`], validates and verifies the signed
@@ -30,7 +31,6 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::signers::local::PrivateKeySigner;
 use bytes::{Bytes, BytesMut};
-use decdn_cache::Hash;
 use decdn_incentive::{BuyerChannelState, StreamSlashData, Voucher, signed_to_wire_voucher};
 use decdn_protocol::client::{
     ClientMessage, StreamError, StreamRequest, StreamResponse, VoucherRejectReason,
@@ -505,8 +505,9 @@ async fn fetch_inner(
         anyhow::bail!("server sent {cumulative} of {expected} promised bytes before StreamEnd");
     }
     // Whole-blob integrity check on a full fetch (see module docs for the
-    // resume caveat).
-    if byte_offset == 0 && Hash::new(&blob) != Hash::from_bytes(hash) {
+    // resume caveat). `blake3::hash` is exactly what iroh-blobs content-
+    // addresses with, so this is the same check the node performs.
+    if byte_offset == 0 && blake3::hash(&blob) != blake3::Hash::from_bytes(hash) {
         conn.close(0u32.into(), b"hash-mismatch");
         // Typed sentinel (not a bare string) so callers can `downcast_ref` to
         // classify a paid-but-corrupt delivery; `Display` keeps the same text.
@@ -588,7 +589,7 @@ pub struct UpstreamPull {
 impl std::fmt::Debug for UpstreamPull {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamPull")
-            .field("hash", &Hash::from_bytes(self.hash))
+            .field("hash", &blake3::Hash::from_bytes(self.hash))
             .field("expected", &self.expected)
             .field("cumulative", &self.cumulative)
             .field("ended", &self.ended)
@@ -817,8 +818,8 @@ impl UpstreamPull {
         // Whole-blob integrity on a full fetch — the incremental hash over the
         // forwarded chunks must equal the requested content hash.
         if self.byte_offset == 0 {
-            let digest = Hash::from_bytes(*self.hasher.finalize().as_bytes());
-            if digest != Hash::from_bytes(self.hash) {
+            let digest = self.hasher.finalize();
+            if digest != blake3::Hash::from_bytes(self.hash) {
                 self.conn.close(0u32.into(), b"hash-mismatch");
                 return Err(anyhow::Error::new(HashMismatch));
             }
@@ -980,29 +981,27 @@ const fn variant_name(msg: &ClientMessage) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// The progressive pull verifies integrity with an INCREMENTAL BLAKE3 over
-    /// the forwarded chunks (`UpstreamPull::finish`) instead of `Hash::new` over
-    /// a buffered blob (`fetch_inner`). This pins the equivalence the swap relies
-    /// on: feeding a hasher chunk-by-chunk yields the same content hash
+    /// the forwarded chunks (`UpstreamPull::finish`) instead of `blake3::hash`
+    /// over a buffered blob (`fetch_inner`). This pins the equivalence the swap
+    /// relies on: feeding a hasher chunk-by-chunk yields the same content hash
     /// iroh-blobs addresses with, for any chunk split.
     #[test]
     fn incremental_blake3_matches_whole_blob_hash() {
         let payload: Vec<u8> = (0..300_000u32)
             .map(|i| u8::try_from(i % 256).unwrap_or(0))
             .collect();
-        let whole = Hash::new(&payload);
+        let whole = blake3::hash(&payload);
 
         for chunk_len in [1usize, 7, 1024, 65_536, payload.len()] {
             let mut hasher = blake3::Hasher::new();
             for chunk in payload.chunks(chunk_len) {
                 hasher.update(chunk);
             }
-            let incremental = Hash::from_bytes(*hasher.finalize().as_bytes());
+            let incremental = hasher.finalize();
             assert_eq!(
                 incremental, whole,
-                "incremental hash with chunk_len={chunk_len} must equal Hash::new"
+                "incremental hash with chunk_len={chunk_len} must equal blake3::hash"
             );
         }
     }

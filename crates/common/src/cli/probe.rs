@@ -7,15 +7,10 @@ use clap::Args;
 /// Probe a running deCDN node over the `cdn/probe/v1` ALPN.
 ///
 /// Connects to the target node, sends a [`ProbeRequest`](decdn_protocol::message::ProbeRequest),
-/// and prints the [`ProbeResponse`](decdn_protocol::message::ProbeResponse). At least one of
-/// `--addr` or `--relay-url` must be provided.
+/// and prints the [`ProbeResponse`](decdn_protocol::message::ProbeResponse). Reachability (a
+/// direct `--addr` or a relay) is validated at runtime rather than by a clap `ArgGroup`,
+/// because the relay can also come from config (`network.relay_urls`, #935).
 #[derive(Args, Debug)]
-#[command(group(
-    clap::ArgGroup::new("target")
-        .required(true)
-        .multiple(true)
-        .args(["addr", "relay_url"]),
-))]
 pub struct ProbeArgs {
     /// Target node id (iroh `EndpointId`, z-base32).
     #[arg(long, value_name = "ID")]
@@ -32,7 +27,9 @@ pub struct ProbeArgs {
     #[arg(long, value_name = "HOST:PORT")]
     pub addr: Option<SocketAddr>,
 
-    /// iroh relay URL to use for discovery-based resolution.
+    /// iroh relay URL to use for discovery-based resolution. Overrides
+    /// `network.relay_urls` from config when set (#935); omit it to use the
+    /// configured relays.
     #[arg(long, value_name = "URL")]
     pub relay_url: Option<String>,
 

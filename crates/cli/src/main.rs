@@ -25,7 +25,8 @@ async fn main() -> anyhow::Result<()> {
                 commands::config::config_validate(config_path.as_deref(), &validate)
             }
         },
-        Command::Probe(args) => commands::probe::probe(&args).await,
+        Command::Probe(args) => commands::probe::probe(&args, config_path.as_deref()).await,
+        Command::Fetch(args) => commands::fetch::fetch(&args, config_path.as_deref()).await,
         Command::Node(args) => commands::node::node_dispatch(&args, config_path.as_deref()).await,
         Command::Bundle(args) => commands::bundle::bundle_dispatch(&args).await,
     }

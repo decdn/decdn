@@ -28,6 +28,7 @@ anvil-e2e = []
 [dependencies]
 decdn-protocol = { workspace = true }
 decdn-cache = { workspace = true }
+decdn-client-pull = { workspace = true }
 decdn-incentive = { workspace = true }
 decdn-reputation = { workspace = true }
 decdn-gossip = { workspace = true }

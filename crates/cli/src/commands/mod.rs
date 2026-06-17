@@ -8,7 +8,9 @@
 pub mod bond;
 pub mod bundle;
 pub mod chain_ctx;
+pub mod client_endpoint;
 pub mod config;
+pub mod fetch;
 pub mod key_gen;
 pub mod node;
 pub mod node_top;

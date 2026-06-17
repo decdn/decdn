@@ -2613,6 +2613,7 @@ dependencies = [
  "blake3",
  "clap",
  "decdn-cache",
+ "decdn-client-pull",
  "decdn-common",
  "decdn-gossip",
  "decdn-incentive",
@@ -2629,6 +2630,20 @@ dependencies = [
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "walkdir",
+]
+
+[[package]]
+name = "decdn-client-pull"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "blake3",
+ "bytes",
+ "decdn-incentive",
+ "decdn-protocol",
+ "iroh",
+ "tokio",
 ]
 
 [[package]]
@@ -2717,6 +2732,7 @@ dependencies = [
  "clap",
  "decdn-cache",
  "decdn-cli",
+ "decdn-client-pull",
  "decdn-common",
  "decdn-gossip",
  "decdn-incentive",

@@ -27,35 +27,39 @@ fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
 /// and this process builds a fresh endpoint — so the first (and only)
 /// attempt resolves 1-RTT; the machinery exists for the node's long-lived
 /// reuse, not the CLI's.
-pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
+pub async fn probe(
+    args: &cli::ProbeArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     use std::str::FromStr;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use iroh::endpoint::presets;
-    use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
+    use iroh::{Endpoint, EndpointAddr, PublicKey};
 
     use decdn_common::identity::fresh_secret_key;
+
+    use super::client_endpoint;
 
     let node_id = PublicKey::from_str(&args.node_id)
         .map_err(|e| anyhow::anyhow!("invalid --node-id {:?}: {e}", args.node_id))?;
     let hash = parse_hash(&args.hash)?;
 
-    let relay_url = match args.relay_url.as_deref() {
-        Some(s) => Some(
-            RelayUrl::from_str(s).map_err(|e| anyhow::anyhow!("invalid --relay-url {s:?}: {e}"))?,
-        ),
-        None => None,
-    };
+    // Relays come from `network.relay_urls` in config; `--relay-url` overrides (#935).
+    let relays = client_endpoint::resolve_relays(args.relay_url.as_deref(), config_path)?;
+    if args.addr.is_none() && relays.is_empty() {
+        anyhow::bail!(
+            "no way to reach the node: pass --addr, or set network.relay_urls in config \
+             (or --relay-url)"
+        );
+    }
 
     // Bind to an unspecified IPv4 address in both cases. Loopback-only binding
     // prevents the probe client from reaching a non-loopback `--addr`, which
     // is the whole point of the subcommand. `0.0.0.0:0` lets the OS pick an
     // ephemeral port on any interface; we're a client, nothing listens here.
     let bind_addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0);
-    let relay_mode = match relay_url.clone() {
-        Some(url) => RelayMode::Custom(RelayMap::from_iter([url])),
-        None => RelayMode::Disabled,
-    };
+    let relay_mode = client_endpoint::relay_mode(&relays);
 
     let client_sk = fresh_secret_key();
     let endpoint = Endpoint::builder(presets::Minimal)
@@ -75,8 +79,9 @@ pub async fn probe(args: &cli::ProbeArgs) -> anyhow::Result<()> {
     if let Some(addr) = args.addr {
         target = target.with_ip_addr(addr);
     }
-    if let Some(url) = relay_url {
-        target = target.with_relay_url(url);
+    // Attach a relay hint so a node dialed without --addr is reachable via relay.
+    if let Some(url) = relays.first() {
+        target = target.with_relay_url(url.clone());
     }
 
     let timeout = Duration::from_millis(args.timeout_ms);

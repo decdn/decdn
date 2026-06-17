@@ -9,7 +9,11 @@
 pub mod admin;
 pub mod buyer_channel;
 pub mod channel_store;
-pub mod client_requester;
+/// The `cdn/client/v1` paid-pull requester now lives in the shared
+/// `decdn-client-pull` crate (reused by the CLI's client fetch / bundle pull).
+/// Re-exported under the original module path so node call sites and the
+/// integration tests keep their `client_requester::…` paths.
+pub use decdn_client_pull as client_requester;
 pub mod commands;
 pub mod dht;
 pub mod dispatch;

@@ -18,6 +18,11 @@ decdn-common = { workspace = true }
 # `incentive` per `appendix-poc-production-seams.md` §Seam 1 — clients
 # (voucher signers per ADR 003) and nodes share the keystore surface.
 decdn-incentive = { workspace = true }
+# `decdn fetch` (issue #391): the standalone client-side paid pull reuses the
+# shared `cdn/client/v1` requester. `client-pull` depends only on `blake3` for
+# content verification (NOT iroh-blobs), so the CLI's iroh-blobs-free invariant
+# (#578) holds — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
+decdn-client-pull = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -48,9 +53,11 @@ tempfile = { workspace = true }
 # settings `decdn-node` uses, so the dep tree stays unified.
 reqwest = { workspace = true }
 # `node register` (ADR 019 § Step 2.3) submits `CapacityBond.registerNode`
-# on-chain: it needs alloy's provider/contract/signer surface. alloy is
-# already in this binary's tree via `decdn-incentive` (a normal dep), so
-# this exposes the existing crate to CLI source without new bloat.
+# on-chain: it needs alloy's provider/contract/signer surface. `decdn fetch`
+# (#391) also uses it to parse on-chain identifiers and build the EIP-712
+# voucher/slash domains. alloy is already in this binary's tree via
+# `decdn-incentive` (a normal dep), so this exposes the existing crate to CLI
+# source without new bloat.
 alloy = { workspace = true }
 
 [dev-dependencies]

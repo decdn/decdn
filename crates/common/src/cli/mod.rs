@@ -9,6 +9,7 @@
 pub mod bundle;
 pub mod common;
 pub mod config_cmd;
+pub mod fetch;
 pub mod key_gen;
 pub mod node;
 pub mod probe;
@@ -17,6 +18,7 @@ pub mod run;
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs};
 pub use common::{ConfigPathSource, LogFormat, default_config_path, default_data_dir};
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
+pub use fetch::FetchArgs;
 pub use key_gen::KeyGenArgs;
 pub use node::{
     AnnounceArgs, BondArgs, ChainArgs, ChannelsArgs, DrainArgs, EvictArgs, HealthArgs, NodeArgs,
@@ -68,6 +70,9 @@ pub enum Command {
     Config(ConfigArgs),
     /// Probe a running node over the `cdn/probe/v1` ALPN.
     Probe(ProbeArgs),
+    /// Fetch a single content-addressed blob from a node over the paid
+    /// `cdn/client/v1` path, paying per-MB from an open `PaymentChannel`.
+    Fetch(FetchArgs),
     /// Operator-local admin commands that query a running node
     /// over its loopback HTTP surface (ADR 025).
     Node(NodeArgs),
