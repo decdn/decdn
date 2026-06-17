@@ -97,6 +97,13 @@ pub struct FetchArgs {
     #[arg(long, value_name = "MICRO_USDC")]
     pub deposit_micro_usdc: Option<u64>,
 
+    /// Reject a delivery whose claimed total size exceeds this many MiB
+    /// **before** buffering it — guards client memory against a provider that
+    /// over-claims `total_bytes`. Defaults to 1024 MiB (the node's default
+    /// serve ceiling); raise it to fetch larger blobs.
+    #[arg(long, value_name = "MB", default_value_t = 1024)]
+    pub max_blob_mb: u64,
+
     /// Overall timeout for the fetch, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     pub timeout_ms: u64,

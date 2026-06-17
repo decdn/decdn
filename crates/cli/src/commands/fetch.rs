@@ -233,6 +233,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // `stream_fetch_tracked` reports the acked watermark via `progress` even on
     // an error/timeout, so a paid-but-failed delivery still advances the stored
     // watermark — otherwise the next reuse would re-sign a stale nonce.
+    let max_blob_bytes = args.max_blob_mb.saturating_mul(1024 * 1024);
     let mut progress = VoucherProgress::default();
     let result = stream_fetch_tracked(
         &endpoint,
@@ -244,7 +245,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         0,
         timestamp_us,
         Duration::from_millis(args.timeout_ms),
-        0,
+        max_blob_bytes,
         &mut progress,
     )
     .await;
@@ -391,6 +392,7 @@ mod tests {
             keystore: None,
             data_dir: Some(PathBuf::from("/tmp/d")),
             deposit_micro_usdc: None,
+            max_blob_mb: 1024,
             timeout_ms: 30_000,
         }
     }
