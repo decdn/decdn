@@ -1545,7 +1545,9 @@ async fn serve_gated_correct_bytes(
         .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
     }
     // Ack the closing voucher so the buyer proceeds to the integrity check (a
-    // sub-interval blob produces exactly one closing voucher).
+    // sub-interval blob produces exactly one closing voucher). Fail fast on
+    // anything else so a future protocol drift surfaces here, not as an opaque
+    // buyer-side stall.
     let voucher_msg = {
         let frame = read_frame(&mut recv)
             .await
@@ -1554,11 +1556,12 @@ async fn serve_gated_correct_bytes(
             .map_err(|e| anyhow::anyhow!("decode voucher: {e}"))?
             .0
     };
-    if let ClientMessage::Voucher(_) = voucher_msg {
-        write_frame(&mut send, &encode_message(&ClientMessage::VoucherAck)?)
-            .await
-            .map_err(|e| anyhow::anyhow!("write ack: {e}"))?;
-    }
+    let ClientMessage::Voucher(_) = voucher_msg else {
+        anyhow::bail!("gated upstream: expected a closing Voucher, got {voucher_msg:?}");
+    };
+    write_frame(&mut send, &encode_message(&ClientMessage::VoucherAck)?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write ack: {e}"))?;
     write_frame(&mut send, &encode_message(&ClientMessage::StreamEnd)?)
         .await
         .map_err(|e| anyhow::anyhow!("write end: {e}"))?;
