@@ -19,8 +19,9 @@ pub use common::{ConfigPathSource, LogFormat, default_config_path, default_data_
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use key_gen::KeyGenArgs;
 pub use node::{
-    AnnounceArgs, ChannelsArgs, DrainArgs, EvictArgs, HealthArgs, NodeArgs, NodeCommand, PeersArgs,
-    RegionStatsArgs, RegisterArgs, ReloadArgs, ReputationArgs, StatusArgs, TopArgs,
+    AnnounceArgs, BondArgs, ChainArgs, ChannelsArgs, DrainArgs, EvictArgs, HealthArgs, NodeArgs,
+    NodeCommand, PeersArgs, RegionStatsArgs, RegisterArgs, ReloadArgs, ReputationArgs, StatusArgs,
+    TopArgs,
 };
 pub use probe::ProbeArgs;
 pub use run::RunArgs;

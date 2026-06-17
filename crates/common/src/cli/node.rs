@@ -124,6 +124,13 @@ pub enum NodeCommand {
     /// cover `minBond` / the declared-capacity curve. Pass `--dry-run` to
     /// print the parameters and signatures without submitting.
     Register(RegisterArgs),
+    /// Stake to a capacity tier on-chain via `CapacityBond.bond` +
+    /// `declareMbps` (ADR 019 § Step 2.1–2.2). Idempotent: tops the active
+    /// bond up to `max(minBond, bondRequired(mbps))`, approving and bonding
+    /// only the shortfall, so re-running after a partial failure converges
+    /// rather than over-bonding. Run this before `decdn node register`. Pass
+    /// `--dry-run` to print the plan without submitting.
+    Bond(BondArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -486,33 +493,16 @@ pub struct PeersArgs {
     pub timeout_ms: u64,
 }
 
-/// `decdn node register` — submit `CapacityBond.registerNode` (ADR 019
-/// § Step 2.3).
-///
-/// Unlike the other `node` subcommands this performs an on-chain
-/// transaction, so it needs the blockchain coordinates (`rpc_url`,
-/// `chain_id`, `capacity_bond_address`) and the operator's keys rather than
-/// an admin URL. Each is taken from a flag when present, otherwise from the
-/// `[blockchain]` / `[identity]` tables of the TOML config (same file the
-/// daemon reads). `rpc_url` and `capacity_bond_address` are required (no
-/// default — registration errors if neither flag nor config supplies them);
-/// `chain_id`, `keystore`, and `data_dir` fall back to built-in defaults
-/// (see each field).
+/// Shared blockchain coordinates + keys for the on-chain `node` subcommands
+/// (`register`, `bond`). Flattened into each command's args so they expose
+/// an identical flag group. Each field is taken from a flag when present,
+/// otherwise the `[blockchain]` / `[identity]` tables of the TOML config
+/// (same file the daemon reads). `rpc_url` and `capacity_bond_address` are
+/// required (no default — the command errors if neither flag nor config
+/// supplies them); `chain_id`, `keystore`, and `data_dir` fall back to
+/// built-in defaults (see each field).
 #[derive(Args, Debug)]
-pub struct RegisterArgs {
-    /// ISO 3166-1 alpha-2 country code submitted as the on-chain
-    /// `regionHint` (ADR 030). Self-reported, accepted at face value.
-    #[arg(long, value_name = "CODE")]
-    pub region: String,
-
-    /// QUIC multiaddr to register, e.g.
-    /// `/ip4/203.0.113.10/udp/4433/quic-v1`. Repeatable. NAT'd nodes may
-    /// register a relay placeholder and promote direct addresses later via
-    /// `updateMultiaddrs`; omitting it entirely registers an empty set and
-    /// relies on gossip / iroh discovery for reachability.
-    #[arg(long = "multiaddr", value_name = "MA")]
-    pub multiaddrs: Vec<String>,
-
+pub struct ChainArgs {
     /// Path to the TOML config file supplying `[blockchain]` / `[identity]`
     /// fields not passed as flags. Takes precedence over the top-level
     /// `decdn --config`; falls through to `~/.decdn/node.toml`.
@@ -528,10 +518,9 @@ pub struct RegisterArgs {
     #[arg(long, value_name = "ADDR")]
     pub capacity_bond_address: Option<String>,
 
-    /// EIP-712 `chainId` for the binding-signature domain and the ed25519
-    /// ownership digest. Overrides `blockchain.chain_id`; must match the
-    /// `CapacityBond` deployment chain or the signatures are rejected
-    /// on-chain.
+    /// EIP-712 `chainId` for signing domains. Overrides
+    /// `blockchain.chain_id`; must match the `CapacityBond` deployment chain
+    /// or any signatures are rejected on-chain.
     #[arg(long, value_name = "ID")]
     pub chain_id: Option<u64>,
 
@@ -550,14 +539,54 @@ pub struct RegisterArgs {
     #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
     pub keystore_password_file: Option<PathBuf>,
 
-    /// Build and print the registration parameters and signatures without
-    /// submitting the transaction.
+    /// Build and print what would be submitted without sending any
+    /// transaction.
     #[arg(long)]
     pub dry_run: bool,
 
     /// Emit the result as JSON instead of human-readable `key=value` lines.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `decdn node register` — submit `CapacityBond.registerNode` (ADR 019
+/// § Step 2.3). Performs an on-chain transaction rather than talking to a
+/// running node's admin RPC.
+#[derive(Args, Debug)]
+pub struct RegisterArgs {
+    /// ISO 3166-1 alpha-2 country code submitted as the on-chain
+    /// `regionHint` (ADR 030). Self-reported, accepted at face value.
+    #[arg(long, value_name = "CODE")]
+    pub region: String,
+
+    /// QUIC multiaddr to register, e.g.
+    /// `/ip4/203.0.113.10/udp/4433/quic-v1`. Repeatable. NAT'd nodes may
+    /// register a relay placeholder and promote direct addresses later via
+    /// `updateMultiaddrs`; omitting it entirely registers an empty set and
+    /// relies on gossip / iroh discovery for reachability.
+    #[arg(long = "multiaddr", value_name = "MA")]
+    pub multiaddrs: Vec<String>,
+
+    #[command(flatten)]
+    pub chain: ChainArgs,
+}
+
+/// `decdn node bond` — stake to a capacity tier via `CapacityBond.bond` +
+/// `declareMbps` (ADR 019 § Step 2.1–2.2). Idempotent: it tops the active
+/// bond up to `max(minBond, bondRequired(mbps))`, approving and bonding only
+/// the shortfall, so a re-run after a partial failure converges instead of
+/// over-bonding. A precondition for `decdn node register`.
+#[derive(Args, Debug)]
+pub struct BondArgs {
+    /// Declared serving capacity in Mbps. The TOKEN bond is computed from the
+    /// on-chain `bondRequired(mbps)` curve — you do not pass a token amount.
+    /// Must fall within the governable `[minCapacityMbps, maxCapacityMbps]`
+    /// band or the on-chain `declareMbps` reverts.
+    #[arg(long, value_name = "MBPS")]
+    pub mbps: u64,
+
+    #[command(flatten)]
+    pub chain: ChainArgs,
 }
 
 /// `decdn node top` — live metrics view (issue #275).
