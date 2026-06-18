@@ -15,10 +15,10 @@ pub mod node;
 pub mod probe;
 pub mod run;
 
-pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs};
+pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
 pub use common::{ConfigPathSource, LogFormat, default_config_path, default_data_dir};
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
-pub use fetch::FetchArgs;
+pub use fetch::{ClientFetchArgs, FetchArgs};
 pub use key_gen::KeyGenArgs;
 pub use node::{
     AnnounceArgs, BondArgs, ChainArgs, ChannelsArgs, DrainArgs, EvictArgs, HealthArgs, NodeArgs,

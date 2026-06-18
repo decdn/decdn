@@ -9,14 +9,16 @@
 //! and the determinism requirement that makes bundle-as-blob distribution
 //! viable.
 //!
-//! Only `bundle create` ships in this iteration. `bundle pull` is blocked
-//! on a client-side fetch primitive that doesn't exist yet — leaving the
-//! `BundleCommand` enum single-variant signals "planned" without
-//! committing to a wire shape.
+//! `bundle create` produces manifests; `bundle pull` (#391) realizes them —
+//! fetching every referenced blob over the paid `cdn/client/v1` path
+//! (`decdn fetch`'s primitive), with per-entry node discovery and bounded
+//! concurrency.
 
 use std::path::PathBuf;
 
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
+
+use super::fetch::ClientFetchArgs;
 
 /// Top-level `decdn bundle` group.
 #[derive(Args, Debug)]
@@ -25,8 +27,11 @@ pub struct BundleArgs {
     pub cmd: BundleCommand,
 }
 
-/// Subcommands under `decdn bundle`. `Pull` is deferred (see
-/// [`appendix-bundles`](../../../adr/appendix-bundles.md) § Future work).
+/// Subcommands under `decdn bundle`.
+// `Pull` is larger than `Create` (it flattens the full `ClientFetchArgs`), but
+// this enum is parsed exactly once per process; boxing the variant only to
+// satisfy the lint would fight clap's `Subcommand` derive for no real saving.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum BundleCommand {
     /// Walk a directory, BLAKE3-hash every regular file, and emit a
@@ -34,6 +39,12 @@ pub enum BundleCommand {
     /// identical output, so the manifest's own BLAKE3 is stable across
     /// runs — that is what makes single-hash bundle distribution work.
     Create(BundleCreateArgs),
+
+    /// Fetch every blob a bundle references into an output directory over the
+    /// paid `cdn/client/v1` path (#391). The bundle is read from a local file
+    /// (`-i`) or fetched first by its own hash (`--hash`); each entry is then
+    /// discovered + fetched independently, with `--jobs` concurrency.
+    Pull(BundlePullArgs),
 }
 
 /// `decdn bundle create` — produce a bundle manifest from a directory.
@@ -73,4 +84,55 @@ pub struct BundleCreateArgs {
     /// hash publishers distribute.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `decdn bundle pull` — fetch a bundle's blobs into a directory.
+///
+/// The bundle source is exactly one of `-i <file>` (a local manifest) or
+/// `--hash <b3>` (fetch the manifest blob first, then its entries). Both then
+/// run the same per-entry fetch loop. The network/chain/target flags come from
+/// the flattened [`ClientFetchArgs`] — `--node-id` pins every entry to one node,
+/// otherwise each entry is discovered independently (#936/#391).
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("bundle_source").required(true).args(["input", "hash"])))]
+pub struct BundlePullArgs {
+    /// Local bundle manifest file to pull. Mutually exclusive with `--hash`.
+    #[arg(short = 'i', long, value_name = "FILE")]
+    pub input: Option<PathBuf>,
+
+    /// BLAKE3 hash (64 hex, optional `0x`/`b3:` prefix) of the bundle manifest
+    /// blob to fetch first, then pull. Mutually exclusive with `-i`.
+    #[arg(long, value_name = "HASH")]
+    pub hash: Option<String>,
+
+    /// Output directory the bundle's files are written under (created if
+    /// absent). Each entry's relative path is resolved within this root;
+    /// `..`/absolute/escaping paths are rejected.
+    #[arg(short = 'o', long, value_name = "DIR")]
+    pub output: PathBuf,
+
+    /// Maximum entries fetched concurrently. Fetches sharing one provider's
+    /// channel are still serialized (a channel's vouchers use a strictly
+    /// increasing nonce), so effective parallelism is bounded by the number of
+    /// distinct providers in flight.
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    pub jobs: usize,
+
+    /// Re-fetch and overwrite entries whose destination file already exists.
+    /// Default is skip-existing (resume-friendly: a completed file is only
+    /// renamed into place after BLAKE3 verification, so a present file is good).
+    #[arg(long)]
+    pub overwrite: bool,
+
+    /// Print what would be fetched (paths + sizes) and exit without any network
+    /// or chain activity.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit a one-line JSON summary instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+
+    #[command(flatten)]
+    pub common: ClientFetchArgs,
 }
