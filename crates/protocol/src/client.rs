@@ -603,6 +603,14 @@ pub enum VoucherRejectReason {
     /// validation-enum counterpart — `voucher_reject_reason` never returns this;
     /// the `cdn/client/v1` handler emits it directly.
     Expired,
+    /// The node has signed a cooperative-close waiver for this channel (ADR 003
+    /// §Cooperative close): it has committed to settling at the current
+    /// watermark and serves no further bytes. The voucher itself may be valid —
+    /// the client should stop streaming and submit the cooperative close (or
+    /// fall back to `closeChannel`) rather than resend. No validation-enum
+    /// counterpart — `voucher_reject_reason` never returns this; the
+    /// `cdn/client/v1` handler emits it directly, like `Expired`/`RetryLater`.
+    CooperativeCloseSigned,
 }
 
 #[cfg(test)]
@@ -877,6 +885,7 @@ mod tests {
             VoucherRejectReason::InsufficientDeposit,
             VoucherRejectReason::RetryLater,
             VoucherRejectReason::Expired,
+            VoucherRejectReason::CooperativeCloseSigned,
         ]
         .into_iter()
         .enumerate()

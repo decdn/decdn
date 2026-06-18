@@ -408,6 +408,7 @@ mod tests {
             U256::from(4_096u64),
             Some([0xABu8; 65]),
             1_900_000_000,
+            false,
         )
     }
 
@@ -446,6 +447,7 @@ mod tests {
             s.last_bytes_delivered(),
             s.last_signature().copied(),
             s.expires_at,
+            s.cooperative_close_signed(),
         );
         store.record(&advanced)?;
         let all = store.load_all()?;

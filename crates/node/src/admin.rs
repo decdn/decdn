@@ -2164,6 +2164,7 @@ mod tests {
             U256::from(last_amount), // bytes_delivered — irrelevant to the snapshot
             None,
             0,
+            false,
         )
     }
 

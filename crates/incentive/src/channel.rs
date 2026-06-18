@@ -94,6 +94,15 @@ pub struct ChannelState {
     /// so the seller path uses this to close (and stop serving) beforehand
     /// (#327). Set as a field — not advanced through [`Self::apply_voucher`].
     pub expires_at: u64,
+    /// `true` once the node has signed a cooperative-close waiver for this
+    /// channel (ADR 003 §Cooperative close). The node commits to settling at the
+    /// current `last_*` watermark, so it MUST stop serving the channel: the
+    /// seller handler refuses new delivery streams while this is set, protecting
+    /// the node from delivering past the amount it waived to. Private — set only
+    /// via [`Self::mark_cooperative_close_signed`] (persisted) and read via
+    /// [`Self::cooperative_close_signed`]; defaults `false` (including for
+    /// records hydrated from a pre-cooperative-close store schema).
+    cooperative_close_signed: bool,
 }
 
 impl ChannelState {
@@ -116,6 +125,7 @@ impl ChannelState {
             last_bytes_delivered: U256::ZERO,
             last_signature: None,
             expires_at: 0,
+            cooperative_close_signed: false,
         }
     }
 
@@ -147,6 +157,7 @@ impl ChannelState {
         last_bytes_delivered: U256,
         last_signature: Option<[u8; 65]>,
         expires_at: u64,
+        cooperative_close_signed: bool,
     ) -> Self {
         Self {
             channel_id,
@@ -158,6 +169,7 @@ impl ChannelState {
             last_bytes_delivered,
             last_signature,
             expires_at,
+            cooperative_close_signed,
         }
     }
 
@@ -187,6 +199,37 @@ impl ChannelState {
     #[must_use]
     pub const fn last_signature(&self) -> Option<&[u8; 65]> {
         self.last_signature.as_ref()
+    }
+
+    /// `true` once the node has signed a cooperative-close waiver for this
+    /// channel — the seller path MUST stop serving it (ADR 003 §Cooperative
+    /// close). See the [field invariant](Self).
+    #[must_use]
+    pub const fn cooperative_close_signed(&self) -> bool {
+        self.cooperative_close_signed
+    }
+
+    /// Durably record that a cooperative-close waiver was signed for this
+    /// channel, then set the in-memory flag — mirroring [`Self::apply_voucher`]'s
+    /// clone-record-swap discipline (#527): persist first, advance in-memory
+    /// state only on `Ok`, so a store failure leaves `self` unchanged and the
+    /// node has not yet returned a waiver it can't remember. Idempotent — a
+    /// channel already flagged re-records the same state.
+    ///
+    /// # Errors
+    ///
+    /// [`ChannelError::Store`] if the persistent write (or fsync) failed; the
+    /// in-memory flag is left unchanged so the caller does not send a waiver for
+    /// state it never committed.
+    pub fn mark_cooperative_close_signed(
+        &mut self,
+        store: &dyn ChannelStateStore,
+    ) -> Result<(), ChannelError> {
+        let mut next = self.clone();
+        next.cooperative_close_signed = true;
+        store.record(&next)?;
+        *self = next;
+        Ok(())
     }
 
     /// Validate `signed` against this channel's invariants and, on success,
