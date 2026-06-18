@@ -980,6 +980,8 @@ const fn variant_name(msg: &ClientMessage) -> &'static str {
         ClientMessage::VoucherAck => "VoucherAck",
         ClientMessage::StreamEnd => "StreamEnd",
         ClientMessage::StreamError(_) => "StreamError",
+        ClientMessage::CooperativeCloseRequest(_) => "CooperativeCloseRequest",
+        ClientMessage::CooperativeCloseAuth(_) => "CooperativeCloseAuth",
     }
 }
 

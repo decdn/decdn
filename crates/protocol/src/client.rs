@@ -74,6 +74,12 @@ pub const VOUCHER_SIG_LEN: usize = 65;
 /// [`VOUCHER_SIG_LEN`] (ADR 024 §18); pinned by [`ClientBinding::validate`].
 pub const BINDING_SIG_LEN: usize = 65;
 
+/// Exact byte length of a provider's `CooperativeClose` waiver signature
+/// (`r‖s‖v`, 32+32+1). Same EOA off-chain EIP-712 signing form as the others
+/// (ADR 024 §18); pinned by [`CooperativeCloseAuth::validate`]. ADR 003
+/// §Cooperative close.
+pub const COOPERATIVE_CLOSE_SIG_LEN: usize = 65;
+
 /// Top-level protocol enum for `cdn/client/v1`. Variant order is frozen per
 /// ADR 013 — new variants MUST be appended at the end.
 ///
@@ -100,6 +106,15 @@ pub enum ClientMessage {
     /// [`StreamError::VoucherRejected`]); delivery-side errors instead ride in
     /// [`StreamResponse::error`].
     StreamError(StreamError),
+    /// discriminant 7 — payer → node, asks the node to co-sign a cooperative
+    /// close at the channel's final state so the payer can settle on-chain
+    /// without the dispute window (ADR 003 §Cooperative close). Standalone
+    /// request/response — not tied to an active delivery stream.
+    CooperativeCloseRequest(CooperativeCloseRequest),
+    /// discriminant 8 — node → payer, the node's `CooperativeClose` waiver over
+    /// the final `(amount, nonce, bytes_delivered)` tuple it holds for the
+    /// channel.
+    CooperativeCloseAuth(CooperativeCloseAuth),
 }
 
 impl ClientMessage {
@@ -124,11 +139,13 @@ impl ClientMessage {
         match self {
             Self::StreamResponse(resp) => resp.validate(),
             Self::Voucher(voucher) => voucher.validate(),
+            Self::CooperativeCloseAuth(auth) => auth.validate(),
             Self::StreamRequest(_)
             | Self::ChunkData(_)
             | Self::VoucherAck
             | Self::StreamEnd
-            | Self::StreamError(_) => Ok(()),
+            | Self::StreamError(_)
+            | Self::CooperativeCloseRequest(_) => Ok(()),
         }
     }
 }
@@ -430,6 +447,55 @@ impl Voucher {
     pub const fn validate(&self) -> Result<(), MessageValidationError> {
         if self.signature.len() != VOUCHER_SIG_LEN {
             return Err(MessageValidationError::InvalidVoucherSigLen {
+                len: self.signature.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Payer → node request asking the node to co-sign a cooperative close
+/// (ADR 003 §Cooperative close). The node looks up the highest voucher it holds
+/// for `channel_id` and answers with a [`CooperativeCloseAuth`] waiving the
+/// dispute window. Carries only the channel id — the node declares the final
+/// `(amount, nonce, bytes_delivered)` it is willing to settle at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CooperativeCloseRequest {
+    /// `channelId = keccak256(client, provider, channelNonce)` (ADR 003).
+    pub channel_id: [u8; 32],
+}
+
+/// Node → payer cooperative-close waiver (ADR 003 §Cooperative close). The node
+/// declares the final state it holds and signs the on-chain `CooperativeClose`
+/// EIP-712 typed data over `{channelId, amount, nonce, bytesDelivered, token}`.
+///
+/// The payer cross-checks the declared `(amount, nonce, bytes_delivered)`
+/// against a voucher it actually signed, then submits both signatures to
+/// `PaymentChannel.cooperativeClose` for an immediate, window-free settle.
+/// `amount`/`nonce`/`bytes_delivered` are 256-bit big-endian values for the
+/// same reason as [`Voucher`] — no `U256` in the protocol crate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CooperativeCloseAuth {
+    /// `channel_id` echoed from the [`CooperativeCloseRequest`].
+    pub channel_id: [u8; 32],
+    /// Cumulative final payment, big-endian `uint256`.
+    pub amount: [u8; 32],
+    /// Final voucher nonce, big-endian `uint256`.
+    pub nonce: [u8; 32],
+    /// Cumulative final bytes delivered, big-endian `uint256`.
+    pub bytes_delivered: [u8; 32],
+    /// Provider's EOA secp256k1 EIP-712 `CooperativeClose` signature (`r‖s‖v`,
+    /// exactly [`COOPERATIVE_CLOSE_SIG_LEN`]).
+    pub signature: Vec<u8>,
+}
+
+impl CooperativeCloseAuth {
+    /// Validate the wire-level `signature` length ([`COOPERATIVE_CLOSE_SIG_LEN`]).
+    /// The cryptographic check (recovery against the channel's provider) happens
+    /// in `decdn_incentive` once the typed data is reconstructed.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.signature.len() != COOPERATIVE_CLOSE_SIG_LEN {
+            return Err(MessageValidationError::InvalidCooperativeCloseSigLen {
                 len: self.signature.len(),
             });
         }
@@ -748,6 +814,24 @@ mod tests {
         assert_eq!(
             first_byte(&ClientMessage::StreamError(StreamError::NotFound))?,
             6
+        );
+        assert_eq!(
+            first_byte(&ClientMessage::CooperativeCloseRequest(
+                CooperativeCloseRequest {
+                    channel_id: [0u8; 32],
+                }
+            ))?,
+            7
+        );
+        assert_eq!(
+            first_byte(&ClientMessage::CooperativeCloseAuth(CooperativeCloseAuth {
+                channel_id: [0u8; 32],
+                amount: [0u8; 32],
+                nonce: [0u8; 32],
+                bytes_delivered: [0u8; 32],
+                signature: vec![0u8; COOPERATIVE_CLOSE_SIG_LEN],
+            }))?,
+            8
         );
         Ok(())
     }
