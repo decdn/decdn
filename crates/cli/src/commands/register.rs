@@ -12,12 +12,18 @@
 //! is not already posted (run `decdn node bond` first). `--dry-run` builds
 //! and prints everything (it still reads the chain for the nonces the
 //! signatures depend on) but does not submit.
+//!
+//! The signing + submit path is factored into `submit_registration` so
+//! `decdn setup` (#933) can drive Step 2.3 with the same already-loaded
+//! signer + provider it used for bonding, decrypting the keystore once.
 
 use std::io;
 use std::path::Path;
 
 use alloy::primitives::{Address, B256, Bytes};
+use alloy::providers::Provider;
 use alloy::signers::SignerSync;
+use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::identity;
@@ -34,27 +40,80 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     let cb_addr =
         chain_ctx::parse_address(&resolved.capacity_bond_address, "capacity_bond_address")?;
 
+    let signer = chain_ctx::load_operator_signer(&args.chain, &resolved.keystore).await?;
+    let provider = chain_ctx::build_provider(&resolved.rpc_url, &signer)?;
+
+    let outcome = submit_registration(
+        &provider,
+        &signer,
+        &resolved.data_dir,
+        cb_addr,
+        resolved.chain_id,
+        &args.region,
+        &args.multiaddrs,
+        args.chain.dry_run,
+    )
+    .await?;
+
+    let mut out = io::stdout().lock();
+    let label = if outcome.tx.is_some() {
+        "failed to write result"
+    } else {
+        "failed to write dry-run output"
+    };
+    write_outcome(&mut out, &outcome, args.chain.json).context(label)?;
+    Ok(())
+}
+
+/// Registration parameters + result, owned so the formatter and `decdn setup`
+/// can read them after the signer/provider go out of scope. `tx` is `Some`
+/// after a successful submit, `None` for a dry run.
+pub(crate) struct RegisterOutcome {
+    pub(crate) node_id: B256,
+    pub(crate) operator: Address,
+    pub(crate) chain_id: u64,
+    pub(crate) capacity_bond: Address,
+    pub(crate) region: String,
+    pub(crate) binding_nonce: u64,
+    pub(crate) registration_nonce: u64,
+    pub(crate) multiaddr_count: usize,
+    pub(crate) binding_sig: Vec<u8>,
+    pub(crate) ed25519_sig: Vec<u8>,
+    pub(crate) tx: Option<B256>,
+}
+
+/// Build the binding + ownership signatures and submit `registerNode`
+/// (ADR 019 § Step 2.3) against an already-built `provider` and `signer`.
+/// `dry_run` reads the chain for the nonces the signatures depend on but does
+/// not submit. Shared by `run` and `decdn setup` so the keystore is decrypted
+/// once across bond + register.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn submit_registration<P: Provider + Clone>(
+    provider: &P,
+    signer: &PrivateKeySigner,
+    data_dir: &Path,
+    cb_addr: Address,
+    chain_id: u64,
+    region: &str,
+    multiaddrs: &[String],
+    dry_run: bool,
+) -> anyhow::Result<RegisterOutcome> {
     // Load the iroh node key. Require it to already exist — `load_or_generate`
     // would otherwise mint a *fresh* identity and register that, silently
     // diverging from the key the daemon serves under. Operators create it with
-    // `decdn key-gen`.
+    // `decdn key-gen` (or `decdn setup`).
+    let key_path = identity::key_path(data_dir);
     anyhow::ensure!(
-        identity::key_path(&resolved.data_dir).exists(),
+        key_path.exists(),
         "no node key at {}; run `decdn key-gen` first (register binds the existing iroh identity)",
-        identity::key_path(&resolved.data_dir).display(),
+        key_path.display(),
     );
-    let node_secret = identity::load_or_generate(&resolved.data_dir).with_context(|| {
-        format!(
-            "failed to load node key from {}",
-            resolved.data_dir.display()
-        )
-    })?;
+    let node_secret = identity::load_or_generate(data_dir)
+        .with_context(|| format!("failed to load node key from {}", data_dir.display()))?;
     let node_id = B256::from_slice(node_secret.public().as_bytes());
 
-    let signer = chain_ctx::load_operator_signer(&args.chain, &resolved.keystore).await?;
     let operator = signer.address();
-    let provider = chain_ctx::build_provider(&resolved.rpc_url, &signer)?;
-    let bond = CapacityBond::new(cb_addr, &provider);
+    let bond = CapacityBond::new(cb_addr, provider);
 
     // Nonces feed both signature digests, so they are read even on a dry run.
     let binding_nonce: u64 =
@@ -72,49 +131,43 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     // EIP-712 BindNodeId signature (Ethereum key). `sign_hash_sync` yields a
     // low-s, 27/28-`v` 65-byte signature accepted by the on-chain OZ
     // `SignatureChecker` (same path as `decdn_incentive::bind_sig`).
-    let domain = bind_sig::bind_node_id_domain(resolved.chain_id, cb_addr);
+    let domain = bind_sig::bind_node_id_domain(chain_id, cb_addr);
     let bind_hash = bind_sig::binding_signing_hash(node_id, binding_nonce, &domain);
     let binding_sig = signer.sign_hash_sync(&bind_hash)?.as_bytes().to_vec();
 
     // ed25519 ownership signature (iroh node key) over the contract's
     // ownership digest.
-    let digest = node_register::ownership_message_digest(
-        node_id,
-        operator,
-        resolved.chain_id,
-        registration_nonce,
-    );
+    let digest =
+        node_register::ownership_message_digest(node_id, operator, chain_id, registration_nonce);
     let ed25519_sig = node_secret.sign(digest.as_slice()).to_bytes().to_vec();
 
-    let multiaddrs = node_register::pack_multiaddrs(&args.multiaddrs)?;
+    let packed_multiaddrs = node_register::pack_multiaddrs(multiaddrs)?;
 
-    let params = Params {
+    let mut outcome = RegisterOutcome {
         node_id,
         operator,
-        chain_id: resolved.chain_id,
+        chain_id,
         capacity_bond: cb_addr,
-        region: &args.region,
+        region: region.to_string(),
         binding_nonce,
         registration_nonce,
-        multiaddr_count: args.multiaddrs.len(),
-        binding_sig: &binding_sig,
-        ed25519_sig: &ed25519_sig,
+        multiaddr_count: multiaddrs.len(),
+        binding_sig: binding_sig.clone(),
+        ed25519_sig: ed25519_sig.clone(),
+        tx: None,
     };
 
-    if args.chain.dry_run {
-        let mut out = io::stdout().lock();
-        write_params(&mut out, &params, args.chain.json, None)
-            .context("failed to write dry-run output")?;
-        return Ok(());
+    if dry_run {
+        return Ok(outcome);
     }
 
     let pending = bond
         .registerNode(
             node_id,
-            Bytes::from(multiaddrs),
-            args.region.clone(),
-            Bytes::from(binding_sig.clone()),
-            Bytes::from(ed25519_sig.clone()),
+            Bytes::from(packed_multiaddrs),
+            region.to_string(),
+            Bytes::from(binding_sig),
+            Bytes::from(ed25519_sig),
         )
         .send()
         .await
@@ -130,63 +183,46 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
         "registerNode reverted (tx {tx}); most likely the bond does not cover minBond / the \
          declared-capacity curve, the nodeId/address is already bound, or a signature was rejected",
     );
-
-    let mut out = io::stdout().lock();
-    write_params(&mut out, &params, args.chain.json, Some(tx)).context("failed to write result")?;
-    Ok(())
+    outcome.tx = Some(tx);
+    Ok(outcome)
 }
 
-/// Registration parameters, for printing in both dry-run and post-submit paths.
-struct Params<'a> {
-    node_id: B256,
-    operator: Address,
-    chain_id: u64,
-    capacity_bond: Address,
-    region: &'a str,
-    binding_nonce: u64,
-    registration_nonce: u64,
-    multiaddr_count: usize,
-    binding_sig: &'a [u8],
-    ed25519_sig: &'a [u8],
-}
-
-/// Write the parameters as JSON or grep-friendly `key=value` lines. `tx` is
+/// Write the outcome as JSON or grep-friendly `key=value` lines. `tx` is
 /// `Some` after a successful submit, `None` for a dry run. Pure (`&mut impl
 /// Write`) so the output shape is unit-testable without a chain.
-fn write_params(
+pub(crate) fn write_outcome(
     w: &mut impl io::Write,
-    p: &Params<'_>,
+    o: &RegisterOutcome,
     json: bool,
-    tx: Option<B256>,
 ) -> io::Result<()> {
     if json {
         let value = serde_json::json!({
-            "submitted": tx.is_some(),
-            "tx": tx.map(|h| format!("{h:#x}")),
-            "node_id": format!("{:#x}", p.node_id),
-            "operator": format!("{:#x}", p.operator),
-            "chain_id": p.chain_id,
-            "capacity_bond": format!("{:#x}", p.capacity_bond),
-            "region": p.region,
-            "binding_nonce": p.binding_nonce,
-            "registration_nonce": p.registration_nonce,
-            "multiaddrs": p.multiaddr_count,
-            "binding_sig": format!("0x{}", alloy::hex::encode(p.binding_sig)),
-            "ed25519_sig": format!("0x{}", alloy::hex::encode(p.ed25519_sig)),
+            "submitted": o.tx.is_some(),
+            "tx": o.tx.map(|h| format!("{h:#x}")),
+            "node_id": format!("{:#x}", o.node_id),
+            "operator": format!("{:#x}", o.operator),
+            "chain_id": o.chain_id,
+            "capacity_bond": format!("{:#x}", o.capacity_bond),
+            "region": o.region,
+            "binding_nonce": o.binding_nonce,
+            "registration_nonce": o.registration_nonce,
+            "multiaddrs": o.multiaddr_count,
+            "binding_sig": format!("0x{}", alloy::hex::encode(&o.binding_sig)),
+            "ed25519_sig": format!("0x{}", alloy::hex::encode(&o.ed25519_sig)),
         });
         return writeln!(w, "{value}");
     }
-    writeln!(w, "node_id={:#x}", p.node_id)?;
-    writeln!(w, "operator={:#x}", p.operator)?;
-    writeln!(w, "chain_id={}", p.chain_id)?;
-    writeln!(w, "capacity_bond={:#x}", p.capacity_bond)?;
-    writeln!(w, "region={}", p.region)?;
-    writeln!(w, "binding_nonce={}", p.binding_nonce)?;
-    writeln!(w, "registration_nonce={}", p.registration_nonce)?;
-    writeln!(w, "multiaddrs={}", p.multiaddr_count)?;
-    writeln!(w, "binding_sig=0x{}", alloy::hex::encode(p.binding_sig))?;
-    writeln!(w, "ed25519_sig=0x{}", alloy::hex::encode(p.ed25519_sig))?;
-    match tx {
+    writeln!(w, "node_id={:#x}", o.node_id)?;
+    writeln!(w, "operator={:#x}", o.operator)?;
+    writeln!(w, "chain_id={}", o.chain_id)?;
+    writeln!(w, "capacity_bond={:#x}", o.capacity_bond)?;
+    writeln!(w, "region={}", o.region)?;
+    writeln!(w, "binding_nonce={}", o.binding_nonce)?;
+    writeln!(w, "registration_nonce={}", o.registration_nonce)?;
+    writeln!(w, "multiaddrs={}", o.multiaddr_count)?;
+    writeln!(w, "binding_sig=0x{}", alloy::hex::encode(&o.binding_sig))?;
+    writeln!(w, "ed25519_sig=0x{}", alloy::hex::encode(&o.ed25519_sig))?;
+    match o.tx {
         Some(h) => writeln!(w, "submitted=true tx={h:#x}"),
         None => writeln!(w, "submitted=false dry_run=true"),
     }
@@ -197,25 +233,39 @@ fn write_params(
 mod tests {
     use super::*;
 
-    #[test]
-    fn dry_run_output_has_signatures() {
-        let p = Params {
+    fn sample_outcome(tx: Option<B256>) -> RegisterOutcome {
+        RegisterOutcome {
             node_id: B256::repeat_byte(0xAB),
             operator: Address::repeat_byte(0xCD),
             chain_id: 31337,
             capacity_bond: Address::repeat_byte(0x01),
-            region: "DE",
+            region: "DE".to_string(),
             binding_nonce: 0,
             registration_nonce: 0,
             multiaddr_count: 1,
-            binding_sig: &[0x11; 65],
-            ed25519_sig: &[0x22; 64],
-        };
+            binding_sig: vec![0x11; 65],
+            ed25519_sig: vec![0x22; 64],
+            tx,
+        }
+    }
+
+    #[test]
+    fn dry_run_output_has_signatures() {
+        let o = sample_outcome(None);
         let mut buf = Vec::new();
-        write_params(&mut buf, &p, false, None).unwrap();
+        write_outcome(&mut buf, &o, false).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("submitted=false dry_run=true"), "{s}");
         assert!(s.contains("ed25519_sig=0x2222"), "{s}");
         assert!(s.contains("region=DE"), "{s}");
+    }
+
+    #[test]
+    fn submitted_output_has_tx() {
+        let o = sample_outcome(Some(B256::repeat_byte(0x55)));
+        let mut buf = Vec::new();
+        write_outcome(&mut buf, &o, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("submitted=true tx=0x5555"), "{s}");
     }
 }

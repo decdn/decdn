@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Probe(args) => commands::probe::probe(&args, config_path.as_deref()).await,
         Command::Fetch(args) => commands::fetch::fetch(&args, config_path.as_deref()).await,
+        Command::Setup(args) => commands::setup::run(&args, config_path.as_deref()).await,
         Command::Node(args) => commands::node::node_dispatch(&args, config_path.as_deref()).await,
         Command::Bundle(args) => {
             commands::bundle::bundle_dispatch(&args, config_path.as_deref()).await

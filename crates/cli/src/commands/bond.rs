@@ -51,37 +51,39 @@ pub async fn run(args: &cli::BondArgs, global_config: Option<&Path>) -> anyhow::
     Ok(())
 }
 
-/// What `bond` intends to do, computed from chain state.
-struct Plan {
-    mbps: u64,
-    token: Address,
-    capacity_bond: Address,
+/// What `bond` intends to do, computed from chain state. `pub(crate)` so
+/// `decdn setup` can reuse the same top-up plan for its pre-flight checks and
+/// confirmation prompt without re-deriving the curve math (#933).
+pub(crate) struct Plan {
+    pub(crate) mbps: u64,
+    pub(crate) token: Address,
+    pub(crate) capacity_bond: Address,
     /// `bondRequired(mbps)` under the current curve (base units).
-    required: U256,
+    pub(crate) required: U256,
     /// `max(minBond, required)` — what `registerNode` needs in place.
-    target: U256,
+    pub(crate) target: U256,
     /// Active bond before this command.
-    prior: U256,
+    pub(crate) prior: U256,
     /// `target − prior` (saturating) — what we approve + bond.
-    shortfall: U256,
+    pub(crate) shortfall: U256,
     /// Whether `declareMbps` is needed (the operator isn't already at `mbps`).
-    needs_declare: bool,
+    pub(crate) needs_declare: bool,
 }
 
 /// Transaction hashes from a non-dry run; `None` for steps that were skipped
 /// (no shortfall, allowance already sufficient, tier already declared).
 #[derive(Default)]
-struct Outcome {
-    approve: Option<B256>,
-    bond: Option<B256>,
-    declare: Option<B256>,
+pub(crate) struct Outcome {
+    pub(crate) approve: Option<B256>,
+    pub(crate) bond: Option<B256>,
+    pub(crate) declare: Option<B256>,
 }
 
 /// Read chain state and compute the top-up plan. Validates the tier against
 /// the on-chain capacity band up front, so an out-of-band `--mbps` is rejected
 /// before any bond is posted rather than stranding one behind a `declareMbps`
 /// revert.
-async fn build_plan<P: Provider + Clone>(
+pub(crate) async fn build_plan<P: Provider + Clone>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     operator: Address,
     mbps: U256,
@@ -118,7 +120,7 @@ async fn build_plan<P: Provider + Clone>(
 /// Submit the needed transactions in order: approve (if allowance short) →
 /// bond (if shortfall) → declareMbps (if not already at the tier). Each step
 /// is independently skippable, which is what makes the command idempotent.
-async fn execute<P: Provider + Clone>(
+pub(crate) async fn execute<P: Provider + Clone>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     provider: P,
     plan: &Plan,
@@ -211,7 +213,7 @@ async fn execute<P: Provider + Clone>(
 /// `dry_run` distinguishes a `--dry-run` preview from a real run that was a
 /// no-op (already at the target tier) — both submit nothing, but only the
 /// former is a dry run.
-fn write_plan(
+pub(crate) fn write_plan(
     w: &mut impl io::Write,
     p: &Plan,
     json: bool,
