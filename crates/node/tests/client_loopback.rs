@@ -25,14 +25,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use decdn_cache::CacheEngine;
 use decdn_incentive::{
-    ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore,
-    bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
+    ChannelState, ChannelStateStore, CooperativeClose, EPHEMERAL_BINDING_NONCE,
+    MemoryChannelStateStore, SignedCooperativeClose, bind_node_id_domain, binding_signing_hash,
+    slash_judge_domain, voucher_domain,
 };
 use decdn_node::client_requester::{
     ChannelContext, ChannelLedger, Cumulative, UpstreamVoucherRejected, VoucherProgress,
@@ -43,9 +44,12 @@ use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver, UNKNOWN_REGION};
 use decdn_protocol::client::{
-    ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, VoucherRejectReason,
+    ClientBinding, ClientMessage, CooperativeCloseRequest, StreamRequest, StreamRequestExt,
+    VoucherRejectReason,
 };
-use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
+use decdn_protocol::{
+    ALPN_CLIENT, decode_message, encode_message, encode_stream_request, read_frame, write_frame,
+};
 use iroh::{Endpoint, EndpointAddr};
 
 mod support;
@@ -1960,6 +1964,7 @@ async fn register_open_channel_is_idempotent_and_preserves_watermark() -> anyhow
         U256::from(2_048u64),
         Some([0x11; 65]),
         0,
+        false,
     );
     store.record(&advanced)?;
 
@@ -2359,5 +2364,141 @@ async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Resul
             .await?,
         "the derived outer deadline must let a pull exceeding one per-candidate budget complete"
     );
+    Ok(())
+}
+
+/// Open a bidi stream, send one arbitrary [`ClientMessage`], and return the
+/// first decoded reply — the cooperative-close analogue of [`raw_request`].
+async fn raw_message_request(
+    client_ep: &Endpoint,
+    target: EndpointAddr,
+    msg: &ClientMessage,
+) -> anyhow::Result<ClientMessage> {
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    let frame = read_frame(&mut recv)
+        .await
+        .map_err(|e| anyhow::anyhow!("read frame (stream reset?): {e}"))?;
+    let (m, _rest) =
+        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    Ok(m)
+}
+
+/// End-to-end cooperative close (ADR 003 §Cooperative close): a channel with an
+/// advanced watermark answers a `CooperativeCloseRequest` with a waiver that
+/// recovers to the node's eth key over the on-chain `CooperativeClose` typed
+/// data, persists the no-longer-serving flag, and refuses subsequent delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 4096];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    // Seed a channel with a real watermark (nonce 5) — there is something to waive.
+    let signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let last_amount = U256::from(4_000u64);
+    let last_nonce = U256::from(5u64);
+    let last_bytes = U256::from(2_048u64);
+    let store_inner = Arc::new(MemoryChannelStateStore::new());
+    store_inner.record(&ChannelState::hydrate(
+        channel_id(),
+        signer.address(),
+        TOKEN,
+        deposit,
+        last_amount,
+        last_nonce,
+        last_bytes,
+        Some([0x11; 65]),
+        0,
+        false,
+    ))?;
+    let store: Arc<dyn ChannelStateStore> = store_inner.clone();
+    let (target, server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+
+    // (1) Request the waiver.
+    let reply = raw_message_request(
+        &client_ep,
+        target.clone(),
+        &ClientMessage::CooperativeCloseRequest(CooperativeCloseRequest {
+            channel_id: channel_id().0,
+        }),
+    )
+    .await?;
+    let auth = match reply {
+        ClientMessage::CooperativeCloseAuth(a) => a,
+        other => anyhow::bail!("expected CooperativeCloseAuth, got {other:?}"),
+    };
+    anyhow::ensure!(auth.channel_id == channel_id().0, "channel id echoed");
+    anyhow::ensure!(
+        U256::from_be_bytes(auth.amount) == last_amount,
+        "amount = watermark"
+    );
+    anyhow::ensure!(
+        U256::from_be_bytes(auth.nonce) == last_nonce,
+        "nonce = watermark"
+    );
+    anyhow::ensure!(
+        U256::from_be_bytes(auth.bytes_delivered) == last_bytes,
+        "bytes = watermark"
+    );
+
+    // (2) The waiver recovers to the NODE's eth key over the CooperativeClose
+    //     typed data — exactly what the on-chain `_verifyCooperativeClose` checks.
+    let close = CooperativeClose {
+        channel_id: channel_id(),
+        amount: last_amount,
+        nonce: last_nonce,
+        bytes_delivered: last_bytes,
+        token: TOKEN,
+    };
+    let waiver = SignedCooperativeClose {
+        close,
+        signature: Signature::try_from(auth.signature.as_slice())?,
+    };
+    waiver.verify_signer(server_eth.address(), &payment_domain())?;
+
+    // (3) The no-longer-serving flag was persisted.
+    let persisted = store_inner
+        .get(channel_id())?
+        .ok_or_else(|| anyhow::anyhow!("channel missing after waiver"))?;
+    anyhow::ensure!(
+        persisted.cooperative_close_signed(),
+        "cooperative-close flag must persist after signing"
+    );
+
+    // (4) A subsequent delivery request is refused — the blob is present, so
+    //     without the waiver it would serve; the flag makes it `ok: false`.
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: channel_id().0,
+        byte_offset: 0,
+        timestamp_us: 1,
+    };
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(r) => {
+            anyhow::ensure!(
+                !r.body.ok,
+                "delivery must be refused on a cooperatively-closed channel"
+            );
+        }
+        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
+    }
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
     Ok(())
 }

@@ -759,6 +759,13 @@ pub struct DecdnMetrics {
     /// shedding. Visible name:
     /// `decdn_serve_stream_rejected_unauthorized_origin_total`.
     pub serve_stream_rejected_unauthorized_origin: Counter,
+    /// New delivery refused because the channel has a signed cooperative-close
+    /// waiver (ADR 003 §Cooperative close) — the node committed to settling at
+    /// the watermark and serves no further bytes. Wire-indistinguishable from
+    /// `unknown_channel` (signed as `NotFound`), so this counter is the only
+    /// place the distinction lives. Visible name:
+    /// `decdn_serve_stream_rejected_cooperative_close_signed_total`.
+    pub serve_stream_rejected_cooperative_close_signed: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -1274,6 +1281,14 @@ impl Metrics {
     /// namespace has no authorized origin, so no upstream pull was started.
     pub fn serve_stream_rejected_unauthorized_origin(&self) {
         self.decdn.serve_stream_rejected_unauthorized_origin.inc();
+    }
+
+    /// Record a `serve_stream` delivery refused because the channel has a signed
+    /// cooperative-close waiver (ADR 003 §Cooperative close).
+    pub fn serve_stream_rejected_cooperative_close_signed(&self) {
+        self.decdn
+            .serve_stream_rejected_cooperative_close_signed
+            .inc();
     }
 
     /// The window-paced serve loop paused the upstream pull at `pull_ahead_bytes`
@@ -2060,6 +2075,7 @@ mod tests {
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_unauthorized_origin_total",
+            "decdn_serve_stream_rejected_cooperative_close_signed_total",
         ];
         let text = metrics.encode().unwrap();
         for name in reasons {
@@ -2077,6 +2093,7 @@ mod tests {
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
         metrics.serve_stream_rejected_unauthorized_origin();
+        metrics.serve_stream_rejected_cooperative_close_signed();
 
         let text = metrics.encode().unwrap();
         for name in reasons {

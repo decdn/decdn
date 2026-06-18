@@ -40,12 +40,12 @@ use decdn_cache::{Bytes, CacheEngine, CacheError, Hash, TeeOpen, TeeSink};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
-    ChannelId, ChannelState, ChannelStateStore, StreamSlashData, VoucherActivity, verify_binding,
-    voucher_reject_reason, wire_voucher_to_signed,
+    ChannelId, ChannelState, ChannelStateStore, CooperativeClose, StreamSlashData, VoucherActivity,
+    verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
-    ChunkData, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    StreamResponseBody, VoucherRejectReason,
+    ChunkData, ClientMessage, CooperativeCloseAuth, CooperativeCloseRequest, StreamError,
+    StreamRequest, StreamRequestExt, StreamResponse, StreamResponseBody, VoucherRejectReason,
 };
 use decdn_protocol::{
     ALPN_CLIENT, APP_ERR_RATE_LIMITED, FrameError, MB_BYTES, decode_message, encode_message,
@@ -189,6 +189,7 @@ enum ServeRejectReason {
     OwnerMismatch,
     InsufficientDeposit,
     UnauthorizedOrigin,
+    CooperativeCloseSigned,
 }
 
 impl ServeRejectReason {
@@ -205,11 +206,16 @@ impl ServeRejectReason {
             // miss reasons (#856): it must be wire-indistinguishable so a probing
             // client cannot map out other clients' channel balances; the
             // distinction survives only in the per-reason metric.
+            // `CooperativeCloseSigned` collapses to `NotFound` with the other
+            // miss reasons: a channel being cooperatively settled is no longer
+            // serving, and the refusal stays wire-indistinguishable from an
+            // unknown channel (no leak that a waiver was signed).
             Self::CacheMiss
             | Self::UnknownChannel
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
-            | Self::UnauthorizedOrigin => StreamError::NotFound,
+            | Self::UnauthorizedOrigin
+            | Self::CooperativeCloseSigned => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             Self::BlobTooLarge => StreamError::BlobTooLarge,
@@ -839,8 +845,8 @@ impl ClientHandler {
         bound_addr: Arc<Mutex<Option<Address>>>,
         client_node_id: B256,
     ) -> anyhow::Result<()> {
-        let (req, ext) = match read_stream_request(&mut recv).await {
-            Ok(pair) => pair,
+        let first = match read_first_message(&mut recv).await {
+            Ok(first) => first,
             Err(StreamReadError { err, app_code }) => {
                 reset_stream(&mut send, &mut recv, app_code);
                 return Err(err);
@@ -848,13 +854,23 @@ impl ClientHandler {
         };
 
         // Stream-cap exhausted: reset the stream with no signed response.
-        // Signing a `StreamResponse` per rejected request would let a request
-        // flood amplify into CPU exhaustion (an ECDSA signature per reject) —
-        // the cap exists to shed load, not to add work to the reject path.
+        // Signing a `StreamResponse` (or a cooperative-close waiver) per rejected
+        // request would let a request flood amplify into CPU exhaustion (an ECDSA
+        // signature per reject) — the cap exists to shed load, not to add work to
+        // the reject path.
         if permit.is_none() {
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
             return Ok(());
         }
+
+        // A cooperative-close request is a standalone sign-and-reply exchange,
+        // not a delivery (ADR 003 §Cooperative close).
+        let (req, ext) = match first {
+            FirstMessage::Delivery(req, ext) => (req, ext),
+            FirstMessage::CooperativeClose(cc) => {
+                return self.handle_cooperative_close(send, cc).await;
+            }
+        };
 
         // Verify an ephemeral client binding if present (ADR 005 §Client
         // identity binding) and remember the recovered address for the
@@ -1057,6 +1073,18 @@ impl ClientHandler {
                 .respond_error(&mut send, &req, ServeRejectReason::UnknownChannel)
                 .await;
         };
+
+        // A channel with a signed cooperative-close waiver is being settled at
+        // its final watermark — the node committed to serving no further bytes
+        // on it (ADR 003 §Cooperative close). Refuse new delivery, collapsing to
+        // `NotFound` so it stays wire-indistinguishable from an unknown channel.
+        // The in-flight backstop is in `collect_voucher` (a stream already
+        // running when the waiver was signed stops at its next voucher).
+        if channel.lock().await.state.cooperative_close_signed() {
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::CooperativeCloseSigned)
+                .await;
+        }
 
         // A verified client binding MUST match the channel's authorized client.
         // Otherwise this connection is requesting paid delivery on a channel it
@@ -1684,6 +1712,20 @@ impl ClientHandler {
             return Ok(VoucherOutcome::Rejected);
         }
 
+        // Cooperative-close gate (ADR 003 §Cooperative close): if the node signed
+        // a waiver for this channel (possibly on a separate stream while this one
+        // was mid-flight), it committed to settling at the watermark as of that
+        // moment and must serve no further bytes. Reject in-band so the client
+        // stops and settles, rather than delivering past the amount waived to.
+        // Bounds the loss from signing mid-stream to one voucher interval, so no
+        // "don't sign while delivering" interlock is needed.
+        if guard.state.cooperative_close_signed() {
+            drop(guard);
+            self.write_reject(send, VoucherRejectReason::CooperativeCloseSigned)
+                .await?;
+            return Ok(VoucherOutcome::Rejected);
+        }
+
         let new_bytes = guard
             .bytes_delivered_cumulative
             .saturating_add(U256::from(delta_bytes));
@@ -1974,6 +2016,10 @@ impl ClientHandler {
             ServeRejectReason::UnauthorizedOrigin => {
                 self.metrics.serve_stream_rejected_unauthorized_origin();
             }
+            ServeRejectReason::CooperativeCloseSigned => {
+                self.metrics
+                    .serve_stream_rejected_cooperative_close_signed();
+            }
         }
         let error = reason.wire_error();
         let rate_per_mb = self.clamped_rate();
@@ -2020,6 +2066,75 @@ impl ClientHandler {
             .await
             .map_err(|e| anyhow::anyhow!("write failed: {e}"))
     }
+
+    /// Answer a [`CooperativeCloseRequest`] (ADR 003 §Cooperative close): sign a
+    /// `CooperativeClose` waiver over the channel's current voucher watermark and
+    /// reply with a [`CooperativeCloseAuth`] so the client can settle on-chain
+    /// without the dispute window.
+    ///
+    /// Best-effort by design: an unknown channel, or one with no accepted voucher
+    /// yet (`last_nonce == 0` — nothing to waive; the client uses the zero-voucher
+    /// close path), is answered by finishing the stream with no auth, and the
+    /// client falls back to `closeChannel`. Signing happens before the waiver flag
+    /// is persisted, and the flag is persisted (durably, mirroring #527) before
+    /// the auth is sent — so a store failure leaves the channel still serveable
+    /// and the node has not handed out a waiver it won't remember. Once flagged,
+    /// the node serves no further bytes on the channel (the `serve_stream` and
+    /// `collect_voucher` gates).
+    async fn handle_cooperative_close(
+        &self,
+        mut send: SendStream,
+        req: CooperativeCloseRequest,
+    ) -> anyhow::Result<()> {
+        let channel_id = ChannelId::from(req.channel_id);
+        let Some(channel) = self.channels.lock().await.get(&channel_id).cloned() else {
+            // Unknown channel — no waiver to give. Finish cleanly; client falls back.
+            let _ = send.finish();
+            return Ok(());
+        };
+
+        let auth = {
+            // Hold the per-channel lock across read-watermark → sign → persist so
+            // a concurrent voucher cannot advance the watermark between the value
+            // we sign and the flag we set. Signing is local and fast.
+            let mut guard = channel.lock().await;
+            if guard.state.last_nonce() == U256::ZERO {
+                // No voucher accepted yet: nothing to settle. Finish; client
+                // falls back to the zero-voucher close.
+                drop(guard);
+                let _ = send.finish();
+                return Ok(());
+            }
+            let close = CooperativeClose {
+                channel_id,
+                amount: guard.state.last_amount(),
+                nonce: guard.state.last_nonce(),
+                bytes_delivered: guard.state.last_bytes_delivered(),
+                token: guard.state.token,
+            };
+            let signed = close
+                .sign(self.eth_signer.as_ref(), &self.voucher_domain)
+                .map_err(|e| anyhow::anyhow!("cooperative-close waiver signing failed: {e}"))?;
+            // Persist the no-longer-serving flag before returning the waiver. On a
+            // store failure this propagates (no auth sent) and the channel stays
+            // serveable — safe.
+            guard
+                .state
+                .mark_cooperative_close_signed(self.channel_state_store.as_ref())?;
+            CooperativeCloseAuth {
+                channel_id: req.channel_id,
+                amount: guard.state.last_amount().to_be_bytes(),
+                nonce: guard.state.last_nonce().to_be_bytes(),
+                bytes_delivered: guard.state.last_bytes_delivered().to_be_bytes(),
+                signature: signed.signature.as_bytes().to_vec(),
+            }
+        };
+
+        self.write_message(&mut send, &ClientMessage::CooperativeCloseAuth(auth))
+            .await?;
+        let _ = send.finish();
+        Ok(())
+    }
 }
 
 /// Outcome of a single batch-boundary voucher exchange.
@@ -2063,13 +2178,23 @@ fn reset_stream(send: &mut SendStream, recv: &mut RecvStream, code: u32) {
     let _ = recv.stop(v);
 }
 
-/// Read one framed [`ClientMessage::StreamRequest`] with a timeout, returning
-/// the base request plus its [`StreamRequestExt`] parsed from the trailing
-/// bytes (the ADR 005 two-phase pattern). An absent extension yields
-/// `StreamRequestExt::default()`.
-async fn read_stream_request(
-    recv: &mut RecvStream,
-) -> Result<(StreamRequest, StreamRequestExt), StreamReadError> {
+/// The first message on a fresh `cdn/client/v1` stream: either a paid delivery
+/// request or a standalone cooperative-close request (ADR 003 §Cooperative
+/// close). Both open a bidirectional stream and lead with one [`ClientMessage`].
+enum FirstMessage {
+    /// A paid delivery: [`StreamRequest`] plus its [`StreamRequestExt`].
+    Delivery(StreamRequest, StreamRequestExt),
+    /// A request for the node's cooperative-close waiver.
+    CooperativeClose(CooperativeCloseRequest),
+}
+
+/// Read the first framed [`ClientMessage`] on a stream with a timeout. A
+/// [`ClientMessage::StreamRequest`] yields [`FirstMessage::Delivery`] (with its
+/// [`StreamRequestExt`] parsed from the trailing bytes — the ADR 005 two-phase
+/// pattern; an absent extension yields `StreamRequestExt::default()`); a
+/// [`ClientMessage::CooperativeCloseRequest`] yields
+/// [`FirstMessage::CooperativeClose`]. Any other variant is a protocol fault.
+async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, StreamReadError> {
     let frame = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_frame(recv)).await {
         Err(_) => {
             return Err(StreamReadError {
@@ -2094,10 +2219,13 @@ async fn read_stream_request(
                     app_code: APP_ERR_MALFORMED_MESSAGE,
                 }
             })?;
-            Ok((req, ext))
+            Ok(FirstMessage::Delivery(req, ext))
+        }
+        Ok((ClientMessage::CooperativeCloseRequest(req), _)) => {
+            Ok(FirstMessage::CooperativeClose(req))
         }
         Ok((_, _)) => Err(StreamReadError {
-            err: anyhow::anyhow!("expected ClientMessage::StreamRequest"),
+            err: anyhow::anyhow!("expected StreamRequest or CooperativeCloseRequest"),
             app_code: 0x01, // UNSUPPORTED_MESSAGE
         }),
         Err(e) => Err(StreamReadError {
