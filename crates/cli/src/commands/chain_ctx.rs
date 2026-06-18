@@ -16,6 +16,7 @@ use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::cli::common::expand_tilde;
 use decdn_common::config::DEFAULT_CHAIN_ID;
+use decdn_common::redact::redact_userinfo;
 use decdn_incentive::eth_identity::{self, PasswordSource};
 use serde::Deserialize;
 
@@ -171,11 +172,9 @@ pub fn build_provider(
 ) -> anyhow::Result<impl Provider + Clone> {
     Ok(ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
-        .connect_http(
-            rpc_url
-                .parse()
-                .with_context(|| format!("rpc_url {rpc_url:?} is not a valid URL"))?,
-        ))
+        .connect_http(rpc_url.parse().with_context(|| {
+            format!("rpc_url {:?} is not a valid URL", redact_userinfo(rpc_url))
+        })?))
 }
 
 #[cfg(test)]

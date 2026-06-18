@@ -24,6 +24,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::identity;
+use decdn_common::redact::redact_userinfo;
 use decdn_incentive::Erc20;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::eth_identity;
@@ -457,12 +458,13 @@ async fn dry_run_without_keys(
     mbps: u64,
     json: bool,
 ) -> anyhow::Result<()> {
-    let provider = ProviderBuilder::new().connect_http(
-        resolved
-            .rpc_url
-            .parse()
-            .with_context(|| format!("rpc_url {:?} is not a valid URL", resolved.rpc_url))?,
-    );
+    let provider =
+        ProviderBuilder::new().connect_http(resolved.rpc_url.parse().with_context(|| {
+            format!(
+                "rpc_url {:?} is not a valid URL",
+                redact_userinfo(&resolved.rpc_url)
+            )
+        })?);
     let bond_contract = CapacityBond::new(cb_addr, &provider);
     let m = U256::from(mbps);
     let min_cap = bond_contract
@@ -592,10 +594,12 @@ async fn fetch_date_header(client: &reqwest::Client, url: &str, head: bool) -> O
 }
 
 /// Parse an RFC 7231 IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) to a Unix
-/// timestamp (seconds). Returns `None` on any deviation from that fixed format
-/// — HTTP servers are required to emit it, and the obsolete RFC 850 / asctime
-/// forms aren't worth parsing for a best-effort skew check. The zone token is
-/// trusted as GMT and not re-validated.
+/// timestamp (seconds). Returns `None` if the day/month/year/time fields are
+/// missing or out of range. Deliberately lenient rather than a strict format
+/// check: the leading weekday token is ignored and the trailing zone token is
+/// trusted as GMT (neither is validated). The obsolete RFC 850 / asctime forms
+/// still fail because their field layout differs — good enough for a
+/// best-effort skew probe against a server that should emit IMF-fixdate.
 fn parse_http_date(s: &str) -> Option<i64> {
     let tokens: Vec<&str> = s.split_whitespace().collect();
     let day: i64 = tokens.get(1)?.parse().ok()?;
@@ -609,6 +613,10 @@ fn parse_http_date(s: &str) -> Option<i64> {
         || !(0..=59).contains(&min)
         || !(0..=60).contains(&sec)
         || !(1..=31).contains(&day)
+        // Bound the year so `days_from_civil(...) * 86_400` can't overflow i64
+        // from a malformed/adversarial Date header. IMF-fixdate years are
+        // 4-digit, so this rejects nothing valid.
+        || !(1970..=9999).contains(&year)
     {
         return None;
     }
@@ -651,12 +659,16 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 /// non-affirmative answer (a non-interactive stdin reads as "no").
 fn confirm(shortfall: U256, target: U256, mbps: u64) -> io::Result<bool> {
     if shortfall == U256::ZERO {
-        // Already bonded to target (e.g. `node bond` was run manually) — there
-        // is nothing to deposit, only register.
-        print!("Bond already at target {target} (tier {mbps} Mbps); register node? [y/N] ");
+        // Already bonded to target (e.g. `node bond` was run manually) — no
+        // deposit, but `declareMbps` and/or `registerNode` may still submit.
+        print!(
+            "Bond already at target {target} (tier {mbps} Mbps); proceed with on-chain setup \
+             (declare tier and/or register, as needed)? [y/N] "
+        );
     } else {
         print!(
-            "Submit bond of {shortfall} base units (target {target}, tier {mbps} Mbps) and register? [y/N] "
+            "Submit bond of {shortfall} base units (target {target}, tier {mbps} Mbps) and complete \
+             on-chain setup (declare + register, as needed)? [y/N] "
         );
     }
     io::stdout().flush()?;
@@ -779,6 +791,13 @@ mod tests {
         assert_eq!(parse_http_date("Thu, 01 Jan 1970 24:00:00 GMT"), None);
         assert_eq!(parse_http_date("Thu, 00 Jan 1970 00:00:00 GMT"), None);
         assert_eq!(parse_http_date("Thu, 32 Jan 1970 00:00:00 GMT"), None);
+        // Out-of-band years are rejected so `days * 86_400` can't overflow i64.
+        assert_eq!(parse_http_date("Thu, 01 Jan 1969 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Thu, 01 Jan 10000 00:00:00 GMT"), None);
+        assert_eq!(
+            parse_http_date("Thu, 01 Jan 292471210647 00:00:00 GMT"),
+            None
+        );
     }
 
     #[test]
