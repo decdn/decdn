@@ -148,6 +148,12 @@ mod sol_types {
             /// and a matching provider `CooperativeClose` waiver over the same
             /// final tuple (ADR 003 §Cooperative close). Callable by client or
             /// provider. Open-only.
+            ///
+            /// NOTE: this selector ships with the companion
+            /// `PaymentChannel.cooperativeClose` contract change — calling it
+            /// against a deployment that predates that change reverts (no such
+            /// function). Callers gate on a configured contract version / chain
+            /// rather than assuming every deployment exposes it.
             function cooperativeClose(
                 bytes32 channelId,
                 uint256 amount,
@@ -225,6 +231,8 @@ mod sol_types {
             /// Channel cooperatively closed and settled in one tx (no dispute
             /// window). The watcher drops the persisted `ChannelState` exactly
             /// as it does for `ChannelSettled` — `Closed` is terminal either way.
+            /// Emitted only by deployments carrying the companion
+            /// `cooperativeClose` contract change; older ones never emit it.
             event ChannelCooperativelyClosed(
                 bytes32 indexed channelId,
                 address indexed provider,
