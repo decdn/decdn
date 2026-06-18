@@ -268,12 +268,10 @@ async fn resolve_target_node(
     hash: [u8; 32],
 ) -> anyhow::Result<(PublicKey, Address)> {
     if let Some(raw) = &args.node_id {
-        if args.addr.is_none() && relays.is_empty() {
-            anyhow::bail!(
-                "no way to reach the node: pass --addr, or set network.relay_urls in \
-                 config (or --relay-url)"
-            );
-        }
+        // No reachability pre-check: the endpoint is discovery-enabled, so a
+        // node-id resolves via `[network.discovery]` / `presets::N0` (plus its
+        // default relays) even without `--addr` or configured relays. `clap`
+        // guarantees `--provider-address` is present alongside `--node-id`.
         let node_id = PublicKey::from_str(raw)
             .map_err(|e| anyhow::anyhow!("invalid --node-id {raw:?}: {e}"))?;
         let provider_raw = args
@@ -373,9 +371,9 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let channel_id = ctx.channel_id;
 
     let mut target = EndpointAddr::new(node_id);
-    // A direct `--addr` only applies to the explicit-node path; a discovered
-    // node is reached via the resolved address + relay hint.
-    if let (Some(addr), Some(_)) = (args.addr, &args.node_id) {
+    // `--addr` requires `--node-id` (clap), so it only pins the explicit-node
+    // path; a discovered node is reached via its resolved address + relay hint.
+    if let Some(addr) = args.addr {
         target = target.with_ip_addr(addr);
     }
     if let Some(url) = relays.first() {

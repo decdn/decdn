@@ -48,13 +48,11 @@ pub async fn probe(
     // explicit `--addr` when discovery is configured.
     let relays = client_endpoint::resolve_relays(args.relay_url.as_deref(), config_path)?;
     let discovery = client_endpoint::client_discovery(config_path)?;
-    if args.addr.is_none() && relays.is_empty() && discovery.is_empty() {
-        anyhow::bail!(
-            "no way to reach the node: pass --addr, set network.relay_urls / \
-             network.discovery in config (or --relay-url)"
-        );
-    }
 
+    // No reachability pre-check: the endpoint is discovery-enabled, so a node-id
+    // resolves via `[network.discovery]` / `presets::N0` (plus its default
+    // relays) even without `--addr` or configured relays. A direct `--addr`
+    // still pins the address when given.
     let endpoint = client_endpoint::client_endpoint(&relays, &discovery).await?;
 
     let mut target = EndpointAddr::new(node_id);

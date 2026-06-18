@@ -85,10 +85,16 @@ pub fn client_discovery(config_path: Option<&Path>) -> anyhow::Result<ResolvedDi
 /// iroh `NodeId`. With no `[network.discovery]` config we use `presets::N0`
 /// (the n0-hosted pkarr/DNS lookup the node defaults to); with operator
 /// discovery configured we compose only the *resolution* legs onto
-/// `presets::Minimal`. Relay handling is unchanged (#935): the resolved relay
-/// list drives `relay_mode`, overriding any preset relay default.
+/// `presets::Minimal`.
 ///
-/// ponytail: the pkarr *publisher* leg the node wires (`network.discovery.pkarr_url`)
+/// Relay selection is an independent leg, mirroring the node's `build_endpoint`:
+/// a configured relay list (`--relay-url`/`network.relay_urls`, #935) becomes a
+/// `RelayMode::Custom` map; with no custom relays we keep `presets::N0`'s n0
+/// default relay map, and on `presets::Minimal` (operator discovery) we restore
+/// `RelayMode::Default` — dropping the n0 *discovery* leg must not also disable
+/// relays, or a NodeId-only dial of a NAT'd node could not connect.
+///
+/// Note: the pkarr *publisher* leg the node wires (`network.discovery.pkarr_url`)
 /// is intentionally omitted — a one-shot client resolves peers, it never
 /// publishes its own ephemeral address record. Resolution for an operator
 /// namespace goes through its `dns_origin`, which `resolve_config` already
@@ -99,16 +105,25 @@ pub async fn client_endpoint(
     discovery: &ResolvedDiscovery,
 ) -> anyhow::Result<Endpoint> {
     let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
-    let base = if discovery.is_empty() {
+    let mut builder = if discovery.is_empty() {
         Endpoint::builder(presets::N0)
     } else {
         add_resolution_lookups(Endpoint::builder(presets::Minimal), discovery)?
     };
-    base.secret_key(fresh_secret_key())
-        .relay_mode(relay_mode(relays))
+    builder = builder
+        .secret_key(fresh_secret_key())
         // ADR 015 §Session Ticket Management: matches the node's endpoint so the
         // 0-RTT mechanism is identical; harmless for the one-shot CLI.
-        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE)
+        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE);
+    builder = if !relays.is_empty() {
+        builder.relay_mode(relay_mode(relays))
+    } else if discovery.is_empty() {
+        builder // presets::N0 already carries the n0 default relay map.
+    } else {
+        // presets::Minimal sets no relay mode; restore the n0 default.
+        builder.relay_mode(RelayMode::Default)
+    };
+    builder
         .bind_addr(bind_addr)
         .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
         .bind()

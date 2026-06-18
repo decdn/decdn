@@ -31,8 +31,9 @@ use clap::Args;
 pub struct FetchArgs {
     /// Target node id (iroh `EndpointId`, z-base32). Omit it to auto-discover:
     /// `fetch` reads the active node set from `CapacityBond`, probes the
-    /// region-nearest candidates, and picks one that holds the blob (#936).
-    #[arg(long, value_name = "ID")]
+    /// region-nearest candidates, and picks one that holds the blob (#936). When
+    /// set, `--provider-address` is required (they pair).
+    #[arg(long, value_name = "ID", requires = "provider_address")]
     pub node_id: Option<String>,
 
     /// BLAKE3 hash of the blob to fetch: 64 hex chars (optional `0x` prefix).
@@ -44,8 +45,10 @@ pub struct FetchArgs {
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
 
-    /// Direct socket address of the target node (e.g. `127.0.0.1:4433`).
-    #[arg(long, value_name = "HOST:PORT")]
+    /// Direct socket address of the target node (e.g. `127.0.0.1:4433`). Only
+    /// meaningful with an explicit `--node-id`; auto-discovery resolves the
+    /// address itself, so this requires `--node-id`.
+    #[arg(long, value_name = "HOST:PORT", requires = "node_id")]
     pub addr: Option<SocketAddr>,
 
     /// iroh relay URL to use for discovery-based resolution. Overrides
@@ -57,7 +60,8 @@ pub struct FetchArgs {
     /// opened/reused against it, and the response `slash_sig` must recover to it
     /// (ADR 014 §1); a mismatch aborts the pull. Omit it when auto-discovering
     /// (no `--node-id`): it is derived from the selected node's registry entry.
-    #[arg(long, value_name = "0xADDR")]
+    /// Pairs with `--node-id`, so it requires it.
+    #[arg(long, value_name = "0xADDR", requires = "node_id")]
     pub provider_address: Option<String>,
 
     /// JSON-RPC endpoint for on-chain channel open. Overrides
@@ -82,9 +86,12 @@ pub struct FetchArgs {
     #[arg(long, value_name = "0xADDR")]
     pub capacity_bond_address: Option<String>,
 
-    /// Client region (ISO 3166-1 alpha-2) used to prefer same-region nodes when
-    /// auto-discovering (#936). Overrides `identity.region`; when unset and no
-    /// config region is found, discovery skips the region-first ordering.
+    /// Client region used to prefer same-region nodes when auto-discovering
+    /// (#936). Matched by case-insensitive equality against each node's on-chain
+    /// self-attested region (`CapacityBond` `regionHint`, ISO 3166-1 alpha-2 per
+    /// ADR 030 — e.g. `US`, `DE`), so pass the same form operators register.
+    /// Overrides `identity.region`; when unset (and no config region), discovery
+    /// skips the region-first ordering.
     #[arg(long, value_name = "REGION")]
     pub region: Option<String>,
 

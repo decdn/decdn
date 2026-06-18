@@ -11,6 +11,7 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::ProviderBuilder;
 use anyhow::Context;
+use decdn_common::redact::redact_userinfo;
 use decdn_incentive::capacity_bond::CapacityBond;
 use iroh::PublicKey;
 
@@ -30,7 +31,9 @@ pub struct NodeCandidate {
     /// (the channel is opened/reused against it and the `slash_sig` verified
     /// against it).
     pub eth_address: Address,
-    /// Optional ISO-3166 region hint for locality-aware selection.
+    /// The node's self-attested region (ISO 3166-1 alpha-2, ADR 030), used for
+    /// locality-aware selection. Always a string from the registry — empty when
+    /// the node registered without one.
     pub region_hint: String,
 }
 
@@ -65,11 +68,10 @@ pub async fn active_nodes(
     rpc_url: &str,
     capacity_bond_addr: Address,
 ) -> anyhow::Result<Vec<NodeCandidate>> {
-    let provider = ProviderBuilder::new().connect_http(
-        rpc_url
-            .parse()
-            .with_context(|| format!("rpc_url {rpc_url:?} is not a valid URL"))?,
-    );
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().with_context(|| {
+        // Redact any `user:pass@` userinfo: an RPC URL can embed an API key.
+        format!("rpc_url {:?} is not a valid URL", redact_userinfo(rpc_url))
+    })?);
     let registry = CapacityBond::new(capacity_bond_addr, provider);
 
     let mut out = Vec::new();
@@ -114,7 +116,9 @@ pub fn select_candidates(
     if let Some(region) = client_region.map(str::trim).filter(|r| !r.is_empty()) {
         // Stable sort by a bool key: same-region (`false`) sorts before the rest
         // (`true`), and within each group the on-chain order is preserved.
-        candidates.sort_by_key(|c| !c.region_hint.eq_ignore_ascii_case(region));
+        // `region_hint` is trimmed too — on-chain data is operator-submitted and
+        // may carry stray whitespace.
+        candidates.sort_by_key(|c| !c.region_hint.trim().eq_ignore_ascii_case(region));
     }
     candidates.truncate(k);
     candidates
@@ -169,7 +173,7 @@ mod tests {
             active,
             lastMultiaddrUpdate: 0,
             multiaddrs: Bytes::new(),
-            regionHint: "us-east".to_string(),
+            regionHint: "US".to_string(),
         }
     }
 
@@ -191,7 +195,7 @@ mod tests {
         let key = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let c = candidate_from(&node_info(*key.as_bytes(), true)).unwrap();
         assert_eq!(c.eth_address, Address::repeat_byte(0xab));
-        assert_eq!(c.region_hint, "us-east");
+        assert_eq!(c.region_hint, "US");
     }
 
     fn candidate(seed: u8, region: &str) -> NodeCandidate {
@@ -204,7 +208,7 @@ mod tests {
 
     fn probed(seed: u8, rtt_ms: f64, has_live_channel: bool) -> Probed {
         Probed {
-            candidate: candidate(seed, "us-east"),
+            candidate: candidate(seed, "US"),
             rtt_ms,
             has_live_channel,
         }
@@ -212,15 +216,18 @@ mod tests {
 
     #[test]
     fn select_puts_same_region_first_and_caps_at_k() {
+        // Regions are on-chain self-attested ISO 3166-1 alpha-2 codes (ADR 030);
+        // seed 4 carries stray case + whitespace to exercise the trim +
+        // case-insensitive match.
         let cands = vec![
-            candidate(1, "eu-west"),
-            candidate(2, "us-east"),
-            candidate(3, "eu-west"),
-            candidate(4, "US-EAST"), // case-insensitive match
+            candidate(1, "DE"),
+            candidate(2, "US"),
+            candidate(3, "DE"),
+            candidate(4, " us "),
         ];
-        let out = select_candidates(cands, Some("us-east"), 3);
+        let out = select_candidates(cands, Some("US"), 3);
         assert_eq!(out.len(), 3, "capped at k");
-        // Both us-east entries (seeds 2 and 4) come first, in their original order.
+        // Both US entries (seeds 2 and 4) come first, in their original order.
         assert_eq!(out[0].eth_address, Address::repeat_byte(2));
         assert_eq!(out[1].eth_address, Address::repeat_byte(4));
         assert_eq!(out[2].eth_address, Address::repeat_byte(1));
@@ -228,7 +235,7 @@ mod tests {
 
     #[test]
     fn select_without_region_preserves_order_and_caps() {
-        let cands = vec![candidate(1, "eu-west"), candidate(2, "us-east")];
+        let cands = vec![candidate(1, "DE"), candidate(2, "US")];
         // Unknown region (None) and blank region both skip reordering.
         for region in [None, Some("  ")] {
             let out = select_candidates(cands.clone(), region, 5);
