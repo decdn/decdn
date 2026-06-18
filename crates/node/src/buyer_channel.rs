@@ -1124,10 +1124,14 @@ async fn reconcile_one_opened<P: Provider + Clone>(
         }
         // Backend/IO/permission fault — the row may be perfectly healthy and
         // overwriting it would clobber a live channel. Skip; a later boot retries.
+        // `AlreadyOpen` (another process holds the store lock) can't arise from
+        // this read — the store is already open by this process — but it is the
+        // same "store unavailable, don't decide" case, so skip it too.
         Err(
             err @ (StoreError::Backend(_)
             | StoreError::Io(_)
-            | StoreError::PermissionTighten { .. }),
+            | StoreError::PermissionTighten { .. }
+            | StoreError::AlreadyOpen { .. }),
         ) => {
             warn!(
                 provider = %ch.provider,
