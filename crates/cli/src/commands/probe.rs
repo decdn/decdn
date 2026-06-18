@@ -34,10 +34,7 @@ pub async fn probe(
     use std::str::FromStr;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use iroh::endpoint::presets;
-    use iroh::{Endpoint, EndpointAddr, PublicKey};
-
-    use decdn_common::identity::fresh_secret_key;
+    use iroh::{EndpointAddr, PublicKey};
 
     use super::client_endpoint;
 
@@ -45,35 +42,18 @@ pub async fn probe(
         .map_err(|e| anyhow::anyhow!("invalid --node-id {:?}: {e}", args.node_id))?;
     let hash = parse_hash(&args.hash)?;
 
-    // Relays come from `network.relay_urls` in config; `--relay-url` overrides (#935).
+    // Relays come from `network.relay_urls` in config; `--relay-url` overrides
+    // (#935). Discovery (#936): `[network.discovery]` composes operator
+    // resolution legs, else `presets::N0`, so a node-id can be dialed without an
+    // explicit `--addr` when discovery is configured.
     let relays = client_endpoint::resolve_relays(args.relay_url.as_deref(), config_path)?;
-    if args.addr.is_none() && relays.is_empty() {
-        anyhow::bail!(
-            "no way to reach the node: pass --addr, or set network.relay_urls in config \
-             (or --relay-url)"
-        );
-    }
+    let discovery = client_endpoint::client_discovery(config_path)?;
 
-    // Bind to an unspecified IPv4 address in both cases. Loopback-only binding
-    // prevents the probe client from reaching a non-loopback `--addr`, which
-    // is the whole point of the subcommand. `0.0.0.0:0` lets the OS pick an
-    // ephemeral port on any interface; we're a client, nothing listens here.
-    let bind_addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0);
-    let relay_mode = client_endpoint::relay_mode(&relays);
-
-    let client_sk = fresh_secret_key();
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .secret_key(client_sk)
-        .relay_mode(relay_mode)
-        // ADR 015 §Session Ticket Management: shared ticket-cache size
-        // (iroh's default is 256). Harmless for the one-shot CLI; matches
-        // the node's endpoint so the mechanism is identical.
-        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE)
-        .bind_addr(bind_addr)
-        .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
-        .bind()
-        .await
-        .map_err(|e| anyhow::anyhow!("endpoint bind failed: {e}"))?;
+    // No reachability pre-check: the endpoint is discovery-enabled, so a node-id
+    // resolves via `[network.discovery]` / `presets::N0` (plus its default
+    // relays) even without `--addr` or configured relays. A direct `--addr`
+    // still pins the address when given.
+    let endpoint = client_endpoint::client_endpoint(&relays, &discovery).await?;
 
     let mut target = EndpointAddr::new(node_id);
     if let Some(addr) = args.addr {

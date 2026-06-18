@@ -61,6 +61,11 @@ reqwest = { workspace = true }
 # `decdn-incentive` (a normal dep), so this exposes the existing crate to CLI
 # source without new bloat.
 alloy = { workspace = true }
+# `decdn fetch` auto-discovery (#936) probes its top-K candidates concurrently
+# via `join_all`; `probe_once` is not `Send` (its `&dyn ProbeMetrics` param), so
+# single-task `join_all` is used over `tokio::spawn`. Combinators only — no
+# iroh-blobs, so the #578 invariant holds.
+futures-util = { workspace = true }
 
 [dev-dependencies]
 # Integration tests in `tests/admin_peers.rs` exercise the loopback admin

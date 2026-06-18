@@ -7,12 +7,16 @@
 //! config list. An absent config file yields no relays, so a client that dials
 //! a direct `--addr` needs no config at all.
 
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::Path;
 use std::str::FromStr;
 
-use decdn_common::config::load_file_config;
+use decdn_common::config::{ResolvedDiscovery, load_file_config, resolve_discovery};
+use decdn_common::identity::fresh_secret_key;
 use decdn_common::redact::redact_userinfo;
-use iroh::{RelayMap, RelayMode, RelayUrl};
+use iroh::address_lookup::{DnsAddressLookup, MemoryLookup};
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 
 /// Resolve the relay URLs for a client command. The `--relay-url` override
 /// (`flag`) wins; otherwise `network.relay_urls` from the config (with the
@@ -60,6 +64,117 @@ pub fn relay_mode(relays: &[RelayUrl]) -> RelayMode {
     } else {
         RelayMode::Custom(relays.iter().cloned().collect::<RelayMap>())
     }
+}
+
+/// Resolve `[network.discovery]` for a client command, tolerating a missing
+/// config exactly like [`resolve_relays`]: an explicit `--config` path that does
+/// not exist yields no discovery overrides (→ `presets::N0`), so a client that
+/// dials a direct `--addr` needs no config at all.
+///
+/// # Errors
+///
+/// Surfaces a present-but-malformed config's parse/validation error.
+pub fn client_discovery(config_path: Option<&Path>) -> anyhow::Result<ResolvedDiscovery> {
+    if config_path.is_some_and(|p| !p.exists()) {
+        return Ok(ResolvedDiscovery::default());
+    }
+    resolve_discovery(&load_file_config(config_path)?)
+}
+
+/// Build a one-shot client [`Endpoint`] that can resolve a target node by its
+/// iroh `NodeId`. With no `[network.discovery]` config we use `presets::N0`
+/// (the n0-hosted pkarr/DNS lookup the node defaults to); with operator
+/// discovery configured we compose only the *resolution* legs onto
+/// `presets::Minimal`.
+///
+/// Relay selection is an independent leg, mirroring the node's `build_endpoint`:
+/// a configured relay list (`--relay-url`/`network.relay_urls`, #935) becomes a
+/// `RelayMode::Custom` map; with no custom relays we keep `presets::N0`'s n0
+/// default relay map, and on `presets::Minimal` (operator discovery) we restore
+/// `RelayMode::Default` — dropping the n0 *discovery* leg must not also disable
+/// relays, or a NodeId-only dial of a NAT'd node could not connect.
+///
+/// Note: the pkarr *publisher* leg the node wires (`network.discovery.pkarr_url`)
+/// is intentionally omitted — a one-shot client resolves peers, it never
+/// publishes its own ephemeral address record. Resolution for an operator
+/// namespace goes through its `dns_origin`, which `resolve_config` already
+/// requires whenever `pkarr_url` is set. Upgrade path: add a pkarr resolver leg
+/// here if a deployment ever resolves via pkarr without a DNS bridge.
+pub async fn client_endpoint(
+    relays: &[RelayUrl],
+    discovery: &ResolvedDiscovery,
+) -> anyhow::Result<Endpoint> {
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+    let mut builder = if discovery.is_empty() {
+        Endpoint::builder(presets::N0)
+    } else {
+        add_resolution_lookups(Endpoint::builder(presets::Minimal), discovery)?
+    };
+    builder = builder
+        .secret_key(fresh_secret_key())
+        // ADR 015 §Session Ticket Management: matches the node's endpoint so the
+        // 0-RTT mechanism is identical; harmless for the one-shot CLI.
+        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE);
+    builder = if !relays.is_empty() {
+        builder.relay_mode(relay_mode(relays))
+    } else if discovery.is_empty() {
+        builder // presets::N0 already carries the n0 default relay map.
+    } else {
+        // presets::Minimal sets no relay mode; restore the n0 default.
+        builder.relay_mode(RelayMode::Default)
+    };
+    builder
+        .bind_addr(bind_addr)
+        .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
+        .bind()
+        .await
+        .map_err(|e| anyhow::anyhow!("endpoint bind failed: {e}"))
+}
+
+/// Compose the operator-configured *resolution* legs onto `builder`: a
+/// `DnsAddressLookup` for `dns_origin` and a `MemoryLookup` for any static
+/// peers. Mirrors the node's `add_discovery_lookups` minus the publisher leg
+/// (see [`client_endpoint`]). The peer fields were shape-validated at
+/// resolution; they are re-parsed here into iroh types, and any echoed URL is
+/// `redact_userinfo`'d so a credential-bearing typo never reaches an error.
+fn add_resolution_lookups(
+    mut builder: iroh::endpoint::Builder,
+    discovery: &ResolvedDiscovery,
+) -> anyhow::Result<iroh::endpoint::Builder> {
+    if let Some(origin) = &discovery.dns_origin {
+        builder = builder.address_lookup(DnsAddressLookup::builder(origin.clone()));
+    }
+    if !discovery.peers.is_empty() {
+        let mut infos = Vec::with_capacity(discovery.peers.len());
+        for peer in &discovery.peers {
+            let id = peer.node_id.parse::<PublicKey>().map_err(|e| {
+                anyhow::anyhow!("invalid network.discovery peer id {}: {e}", peer.node_id)
+            })?;
+            let mut addr = EndpointAddr::new(id);
+            if let Some(relay) = &peer.relay_url {
+                let relay_url = relay.parse::<RelayUrl>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid relay_url {:?} for network.discovery peer {}: {e}",
+                        redact_userinfo(relay),
+                        peer.node_id
+                    )
+                })?;
+                addr = addr.with_relay_url(relay_url);
+            }
+            for a in &peer.addrs {
+                let sock = a.parse::<std::net::SocketAddr>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid addr {a:?} for network.discovery peer {}: {e}",
+                        peer.node_id
+                    )
+                })?;
+                addr = addr.with_ip_addr(sock);
+            }
+            infos.push(addr);
+        }
+        builder = builder.address_lookup(MemoryLookup::from_endpoint_info(infos));
+    }
+    Ok(builder)
 }
 
 #[cfg(test)]

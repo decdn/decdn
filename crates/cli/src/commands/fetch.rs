@@ -27,20 +27,25 @@ use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel};
 use decdn_client_pull::{ChannelContext, VoucherProgress, stream_fetch_tracked};
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_common::identity::fresh_secret_key;
 use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelStore};
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{slash_judge_domain, voucher_domain};
-use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
+use super::discovery::{self, NodeCandidate};
+use super::probe_client::probe_once;
 use super::{chain_ctx, client_endpoint};
 
 /// Default deposit when opening a new channel: 10 USDC (ADR 003 § Deposit
 /// Economics recommended minimum). Clamped up to the on-chain `minDeposit`.
 const DEFAULT_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
+
+/// Per-candidate probe timeout during auto-discovery (#936). The K probes run
+/// concurrently, so this bounds selection latency rather than the overall fetch
+/// (`--timeout-ms`); a dead candidate falls out of selection after this.
+const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
 
 /// Parse a user-supplied BLAKE3 hash (64 hex chars, optional `0x` prefix).
 fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -58,9 +63,16 @@ struct ResolvedChain {
     rpc_url: String,
     payment_channel: Address,
     slash_judge: Address,
+    /// `CapacityBond` registry for auto-discovery (no `--node-id`). `None` when
+    /// neither the flag nor `blockchain.capacity_bond_address` is set — only an
+    /// error on the discovery path, never on the explicit-node path.
+    capacity_bond: Option<Address>,
     chain_id: u64,
     keystore: PathBuf,
     data_dir: PathBuf,
+    /// Client region for region-first discovery ordering (`--region` >
+    /// `identity.region`). `None` skips the ordering.
+    region: Option<String>,
     deposit: U256,
     max_approve: bool,
 }
@@ -97,6 +109,20 @@ fn resolve_chain(args: &cli::FetchArgs, file: &FileConfig) -> anyhow::Result<Res
         })?;
     let slash_judge = chain_ctx::parse_address(&sj_raw, "slash_judge_address")?;
 
+    // Optional: only the auto-discovery path reads it, and it errors there if
+    // unset rather than failing every explicit-node fetch.
+    let capacity_bond = args
+        .capacity_bond_address
+        .clone()
+        .or_else(|| bc.and_then(|b| b.capacity_bond_address.clone()))
+        .map(|raw| chain_ctx::parse_address(&raw, "capacity_bond_address"))
+        .transpose()?;
+
+    let region = args
+        .region
+        .clone()
+        .or_else(|| file.identity.as_ref().and_then(|i| i.region.clone()));
+
     let chain_id = args
         .chain_id
         .or_else(|| bc.and_then(|b| b.chain_id))
@@ -132,9 +158,11 @@ fn resolve_chain(args: &cli::FetchArgs, file: &FileConfig) -> anyhow::Result<Res
         rpc_url,
         payment_channel,
         slash_judge,
+        capacity_bond,
         chain_id,
         keystore,
         data_dir,
+        region,
         deposit,
         max_approve,
     })
@@ -147,28 +175,169 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Auto-discover a node to fetch `hash` from (#936): read the active node set
+/// from `CapacityBond`, take the region-nearest [`discovery::SELECT_K`]
+/// candidates, probe them concurrently over `endpoint`, keep those that hold the
+/// blob, and [`discovery::rank`] the holders (preferring a node we already have
+/// a live channel with when it is close enough). Returns the chosen candidate
+/// (its `node_id` to dial and `eth_address` as the provider).
+async fn discover_provider(
+    endpoint: &Endpoint,
+    store: &RedbBuyerChannelStore,
+    rpc_url: &str,
+    capacity_bond: Address,
+    client_region: Option<&str>,
+    relay_hint: Option<RelayUrl>,
+    hash: [u8; 32],
+) -> anyhow::Result<NodeCandidate> {
+    let all = discovery::active_nodes(rpc_url, capacity_bond).await?;
+    if all.is_empty() {
+        anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
+    }
+    let selected = discovery::select_candidates(all, client_region, discovery::SELECT_K);
+
+    let timestamp_us = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros()),
+    )
+    .unwrap_or(u64::MAX);
+
+    // Probe the K candidates concurrently in one task (`probe_once` is not
+    // `Send` — its `&dyn ProbeMetrics` param — so `join_all` over a shared
+    // `&endpoint` beats `tokio::spawn`). `probe_once`'s internal timeout bounds
+    // each leg.
+    let probes = selected.into_iter().map(|cand| {
+        let relay = relay_hint.clone();
+        async move {
+            let mut target = EndpointAddr::new(cand.node_id);
+            if let Some(url) = relay {
+                target = target.with_relay_url(url);
+            }
+            let res = probe_once(
+                endpoint,
+                target,
+                hash,
+                timestamp_us,
+                true,
+                None,
+                Duration::from_millis(SELECT_PROBE_TIMEOUT_MS),
+            )
+            .await;
+            (cand, res.ok())
+        }
+    });
+    let results = futures_util::future::join_all(probes).await;
+
+    // Keep blob-holders with their RTT, tagging whether a live channel exists.
+    // `slash_sig`/correlation are NOT validated here — selection only needs
+    // has_blob + RTT; the chosen node's delivery is fully verified downstream.
+    let probe_count = results.len();
+    let mut holders = Vec::new();
+    for (cand, res) in results {
+        let Some((resp, rtt_ms)) = res else { continue };
+        if !resp.body.has_blob {
+            continue;
+        }
+        let has_live_channel = store
+            .get_by_provider(cand.eth_address)?
+            .is_some_and(|s| !s.is_expired_at(unix_now()));
+        holders.push(discovery::Probed {
+            candidate: cand,
+            rtt_ms,
+            has_live_channel,
+        });
+    }
+
+    let pick = discovery::rank(&holders).ok_or_else(|| {
+        anyhow::anyhow!("none of the {probe_count} probed node(s) hold the requested blob")
+    })?;
+    Ok(pick.candidate.clone())
+}
+
+/// Resolve the node to fetch from: the explicit `--node-id` (today's path,
+/// requiring `--provider-address` and a reachable `--addr`/relay), or
+/// auto-discovery (#936) when `--node-id` is omitted (deriving the provider from
+/// the chosen node's registry entry). Returns `(node_id_to_dial, provider)`.
+async fn resolve_target_node(
+    args: &cli::FetchArgs,
+    chain: &ResolvedChain,
+    endpoint: &Endpoint,
+    store: &RedbBuyerChannelStore,
+    relays: &[RelayUrl],
+    hash: [u8; 32],
+) -> anyhow::Result<(PublicKey, Address)> {
+    if let Some(raw) = &args.node_id {
+        // No reachability pre-check: the endpoint is discovery-enabled, so a
+        // node-id resolves via `[network.discovery]` / `presets::N0` (plus its
+        // default relays) even without `--addr` or configured relays. `clap`
+        // guarantees `--provider-address` is present alongside `--node-id`.
+        let node_id = PublicKey::from_str(raw)
+            .map_err(|e| anyhow::anyhow!("invalid --node-id {raw:?}: {e}"))?;
+        let provider_raw = args
+            .provider_address
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--provider-address is required with --node-id"))?;
+        let provider = chain_ctx::parse_address(provider_raw, "--provider-address")?;
+        return Ok((node_id, provider));
+    }
+
+    let capacity_bond = chain.capacity_bond.ok_or_else(|| {
+        anyhow::anyhow!(
+            "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
+             blockchain.capacity_bond_address), or pass --node-id to dial directly"
+        )
+    })?;
+    let picked = discover_provider(
+        endpoint,
+        store,
+        &chain.rpc_url,
+        capacity_bond,
+        chain.region.as_deref(),
+        relays.first().cloned(),
+        hash,
+    )
+    .await?;
+    eprintln!(
+        "discovered node {} (provider {}, region {:?})",
+        picked.node_id, picked.eth_address, picked.region_hint
+    );
+    Ok((picked.node_id, picked.eth_address))
+}
+
 /// Fetch a single blob over `cdn/client/v1`, auto-opening/reusing a payment
 /// channel, and write it atomically to `--output`. `config_path` (the global
-/// `--config`) supplies relays (#935) and the chain coordinates.
+/// `--config`) supplies relays (#935), discovery (#936), and chain coordinates.
+///
+/// With `--node-id` the node is dialed explicitly (today's path). Without it,
+/// `fetch` auto-discovers (#936): read the active set from `CapacityBond`, probe
+/// the region-nearest candidates, pick a holder (channel-aware ranking), and
+/// derive `--provider-address` from its registry entry.
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
-    let provider = chain_ctx::parse_address(&args.provider_address, "--provider-address")?;
-    let node_id = PublicKey::from_str(&args.node_id)
-        .map_err(|e| anyhow::anyhow!("invalid --node-id {:?}: {e}", args.node_id))?;
 
-    // Relays: `--relay-url` overrides `network.relay_urls` (#935).
+    // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
+    // `[network.discovery]` composes operator resolution legs, else N0 (#936).
     let relays = client_endpoint::resolve_relays(args.relay_url.as_deref(), config_path)?;
-    if args.addr.is_none() && relays.is_empty() {
-        anyhow::bail!(
-            "no way to reach the node: pass --addr, or set network.relay_urls in config \
-             (or --relay-url)"
-        );
-    }
+    let disc = client_endpoint::client_discovery(config_path)?;
 
     let file = load_file_config(config_path)?;
     let chain = resolve_chain(args, &file)?;
 
-    // Buyer signer (vouchers + the openChannel tx). Password from env, else TTY.
+    // The store is read by the discovery channel-aware ranking and recorded into
+    // by open-or-reuse; open it once.
+    let store = RedbBuyerChannelStore::open(&chain.data_dir)?;
+
+    // One discovery-enabled endpoint, reused for probing and the delivery dial.
+    let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
+
+    // Resolve the node to fetch from: explicit `--node-id`, or auto-discover.
+    let (node_id, provider) =
+        resolve_target_node(args, &chain, &endpoint, &store, &relays, hash).await?;
+
+    // Buyer signer (vouchers + the openChannel tx). Loaded after selection so a
+    // failed discovery never prompts for a keystore password. Password from env,
+    // else TTY.
     let password = read_password(
         &[
             PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
@@ -183,8 +352,6 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
     let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-
-    let store = RedbBuyerChannelStore::open(&chain.data_dir)?;
 
     // Reuse a live channel for this provider (resuming its watermark), else open
     // and persist a new one.
@@ -203,19 +370,9 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     .await?;
     let channel_id = ctx.channel_id;
 
-    // Client endpoint — same minimal one-shot setup as `probe`.
-    let bind_addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0);
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .secret_key(fresh_secret_key())
-        .relay_mode(client_endpoint::relay_mode(&relays))
-        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE)
-        .bind_addr(bind_addr)
-        .map_err(|e| anyhow::anyhow!("invalid bind addr {bind_addr}: {e}"))?
-        .bind()
-        .await
-        .map_err(|e| anyhow::anyhow!("endpoint bind failed: {e}"))?;
-
     let mut target = EndpointAddr::new(node_id);
+    // `--addr` requires `--node-id` (clap), so it only pins the explicit-node
+    // path; a discovered node is reached via its resolved address + relay hint.
     if let Some(addr) = args.addr {
         target = target.with_ip_addr(addr);
     }
@@ -379,15 +536,17 @@ mod tests {
 
     fn args() -> cli::FetchArgs {
         cli::FetchArgs {
-            node_id: "n".into(),
+            node_id: Some("n".into()),
             hash: "h".into(),
             output: PathBuf::from("/tmp/out"),
             addr: None,
             relay_url: None,
-            provider_address: "0x0000000000000000000000000000000000000001".into(),
+            provider_address: Some("0x0000000000000000000000000000000000000001".into()),
             rpc_url: None,
             payment_channel_address: None,
             slash_judge_address: None,
+            capacity_bond_address: None,
+            region: None,
             chain_id: None,
             keystore: None,
             data_dir: Some(PathBuf::from("/tmp/d")),
