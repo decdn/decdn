@@ -29,7 +29,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt
@@ -41,7 +41,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
@@ -62,7 +62,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   doc:
@@ -71,7 +71,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -103,7 +103,7 @@ jobs:
     # thing runs in parallel with `test` instead of extending it. Doctest
     # coverage is not the goal (it would need nightly) — execution is.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -135,7 +135,7 @@ jobs:
     # separate job (clean env, no coverage instrumentation / mold) so it never
     # perturbs the required `test` job.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -162,7 +162,7 @@ jobs:
       markdown: ${{ steps.filter.outputs.markdown }}
       scripts: ${{ steps.filter.outputs.scripts }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -255,7 +255,7 @@ jobs:
     steps:
       # fetch-depth: 0 is required: coverage-diff.py runs
       # `git diff origin/<base>...HEAD` and needs full history.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -498,7 +498,7 @@ jobs:
     steps:
       # submodules: recursive — the in-test `forge build` needs the forge-std +
       # openzeppelin-contracts submodules under contracts/lib/.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -532,7 +532,7 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
       - uses: foundry-rs/foundry-toolchain@v1.8.0
         with:
           version: v1.7.1
@@ -564,7 +564,7 @@ jobs:
     steps:
       # submodules: recursive is required — forge-std and openzeppelin-contracts
       # are git submodules under contracts/lib/, and OZ pulls ds-test transitively.
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: ./.github/actions/foundry-setup
@@ -657,7 +657,7 @@ jobs:
     env:
       FOUNDRY_PROFILE: coverage
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: ./.github/actions/foundry-setup
@@ -747,7 +747,7 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6.4.0
         with:
           node-version: '20'
@@ -773,7 +773,7 @@ jobs:
       # `security-events: write` and `actions: read` permissions if
       # GHAS is ever turned on or the repo flips public.
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # cache-profile omitted (none): crytic-compile drives its own `forge
@@ -808,7 +808,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # cache-profile omitted (none): aderyn-ci manages its own build, so we
@@ -880,7 +880,7 @@ jobs:
     # skip here can no longer mask.
     if: needs.changes.outputs.markdown == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: DavidAnson/markdownlint-cli2-action@v23
         with:
           globs: |
@@ -899,7 +899,7 @@ jobs:
     # Job id stays `adr-book-list` — referenced by ci-success needs/allowed-skips.
     if: needs.changes.outputs.adr == 'true'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # `make` is preinstalled on ubuntu-latest; every target is pure shell
       # (awk/sed/grep, no pandoc/typst/mermaid) and runs sub-second. Separate
       # steps so a failure points at the specific guard in the checks UI.
@@ -922,7 +922,7 @@ jobs:
     # (non-blocking by design), so a skip needs no allowed-skips entry.
     if: needs.changes.outputs.scripts == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
