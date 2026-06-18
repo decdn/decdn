@@ -2619,6 +2619,7 @@ dependencies = [
  "decdn-incentive",
  "decdn-node",
  "decdn-protocol",
+ "futures-util",
  "globset",
  "iroh",
  "jsonrpsee",

@@ -91,6 +91,66 @@ pub async fn active_nodes(
     Ok(out)
 }
 
+/// Candidates probed before ranking (decision 3): take the top-K by region,
+/// then probe those K for liveness + blob-holding. At `PoC` scale a small K
+/// keeps the probe fan-out cheap while still giving the ranker a choice.
+pub const SELECT_K: usize = 5;
+
+/// RTT tolerance for preferring an already-open channel over the strictly
+/// nearest node (decision 4): reuse a node the client holds a live channel with
+/// when its RTT is within this multiple of the best observed RTT. Tunable.
+pub const RTT_REUSE_TOLERANCE: f64 = 1.5;
+
+/// Order `candidates` for probing (decision 3): same-region candidates first
+/// (case-insensitive equality on `region_hint` — locality, not geo distance),
+/// then the rest, capped at `k`. When `client_region` is `None` the region-first
+/// ordering is skipped and the first `k` candidates are returned unreordered.
+#[must_use]
+pub fn select_candidates(
+    mut candidates: Vec<NodeCandidate>,
+    client_region: Option<&str>,
+    k: usize,
+) -> Vec<NodeCandidate> {
+    if let Some(region) = client_region.map(str::trim).filter(|r| !r.is_empty()) {
+        // Stable sort by a bool key: same-region (`false`) sorts before the rest
+        // (`true`), and within each group the on-chain order is preserved.
+        candidates.sort_by_key(|c| !c.region_hint.eq_ignore_ascii_case(region));
+    }
+    candidates.truncate(k);
+    candidates
+}
+
+/// A probed candidate that holds the blob, with its measured RTT and whether the
+/// client already has a live payment channel with it.
+#[derive(Debug, Clone)]
+pub struct Probed {
+    /// The node that answered the probe with `has_blob = true`.
+    pub candidate: NodeCandidate,
+    /// Round-trip time measured by the probe, in milliseconds.
+    pub rtt_ms: f64,
+    /// Whether the buyer-channel store already holds a live (non-expired)
+    /// channel for `candidate.eth_address`.
+    pub has_live_channel: bool,
+}
+
+/// Pick the node to fetch from among probed blob-holders (decision 4): prefer a
+/// node the client already has a live channel with when its RTT is within
+/// [`RTT_REUSE_TOLERANCE`]× the best observed RTT; otherwise the lowest-RTT
+/// node. `holders` must already be filtered to blob-holders. Returns `None`
+/// when `holders` is empty.
+#[must_use]
+pub fn rank(holders: &[Probed]) -> Option<&Probed> {
+    let best = holders
+        .iter()
+        .min_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms))?;
+    let threshold = best.rtt_ms * RTT_REUSE_TOLERANCE;
+    holders
+        .iter()
+        .filter(|p| p.has_live_channel && p.rtt_ms <= threshold)
+        .min_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms))
+        .or(Some(best))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -132,5 +192,77 @@ mod tests {
         let c = candidate_from(&node_info(*key.as_bytes(), true)).unwrap();
         assert_eq!(c.eth_address, Address::repeat_byte(0xab));
         assert_eq!(c.region_hint, "us-east");
+    }
+
+    fn candidate(seed: u8, region: &str) -> NodeCandidate {
+        NodeCandidate {
+            node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            eth_address: Address::repeat_byte(seed),
+            region_hint: region.to_string(),
+        }
+    }
+
+    fn probed(seed: u8, rtt_ms: f64, has_live_channel: bool) -> Probed {
+        Probed {
+            candidate: candidate(seed, "us-east"),
+            rtt_ms,
+            has_live_channel,
+        }
+    }
+
+    #[test]
+    fn select_puts_same_region_first_and_caps_at_k() {
+        let cands = vec![
+            candidate(1, "eu-west"),
+            candidate(2, "us-east"),
+            candidate(3, "eu-west"),
+            candidate(4, "US-EAST"), // case-insensitive match
+        ];
+        let out = select_candidates(cands, Some("us-east"), 3);
+        assert_eq!(out.len(), 3, "capped at k");
+        // Both us-east entries (seeds 2 and 4) come first, in their original order.
+        assert_eq!(out[0].eth_address, Address::repeat_byte(2));
+        assert_eq!(out[1].eth_address, Address::repeat_byte(4));
+        assert_eq!(out[2].eth_address, Address::repeat_byte(1));
+    }
+
+    #[test]
+    fn select_without_region_preserves_order_and_caps() {
+        let cands = vec![candidate(1, "eu-west"), candidate(2, "us-east")];
+        // Unknown region (None) and blank region both skip reordering.
+        for region in [None, Some("  ")] {
+            let out = select_candidates(cands.clone(), region, 5);
+            assert_eq!(out[0].eth_address, Address::repeat_byte(1));
+            assert_eq!(out[1].eth_address, Address::repeat_byte(2));
+        }
+    }
+
+    #[test]
+    fn rank_empty_is_none() {
+        assert!(rank(&[]).is_none());
+    }
+
+    #[test]
+    fn rank_prefers_channel_within_tolerance() {
+        // Nearest is seed 1 (10ms, no channel); seed 2 has a channel at 14ms
+        // (≤ 1.5×10 = 15) so it wins on reuse.
+        let holders = vec![probed(1, 10.0, false), probed(2, 14.0, true)];
+        let pick = rank(&holders).unwrap();
+        assert_eq!(pick.candidate.eth_address, Address::repeat_byte(2));
+    }
+
+    #[test]
+    fn rank_falls_back_to_nearest_when_channel_too_slow() {
+        // Channel-holder seed 2 is at 16ms (> 1.5×10 = 15): pick the nearest.
+        let holders = vec![probed(1, 10.0, false), probed(2, 16.0, true)];
+        let pick = rank(&holders).unwrap();
+        assert_eq!(pick.candidate.eth_address, Address::repeat_byte(1));
+    }
+
+    #[test]
+    fn rank_nearest_when_no_channels() {
+        let holders = vec![probed(1, 30.0, false), probed(2, 12.0, false)];
+        let pick = rank(&holders).unwrap();
+        assert_eq!(pick.candidate.eth_address, Address::repeat_byte(2));
     }
 }

@@ -29,9 +29,11 @@ use clap::Args;
 /// come from config, which clap cannot see.
 #[derive(Debug, Clone, Args)]
 pub struct FetchArgs {
-    /// Target node id (iroh `EndpointId`, z-base32).
+    /// Target node id (iroh `EndpointId`, z-base32). Omit it to auto-discover:
+    /// `fetch` reads the active node set from `CapacityBond`, probes the
+    /// region-nearest candidates, and picks one that holds the blob (#936).
     #[arg(long, value_name = "ID")]
-    pub node_id: String,
+    pub node_id: Option<String>,
 
     /// BLAKE3 hash of the blob to fetch: 64 hex chars (optional `0x` prefix).
     #[arg(long, value_name = "HASH")]
@@ -53,9 +55,10 @@ pub struct FetchArgs {
 
     /// The delivering node's Ethereum address (0x-prefixed hex). The channel is
     /// opened/reused against it, and the response `slash_sig` must recover to it
-    /// (ADR 014 §1); a mismatch aborts the pull.
+    /// (ADR 014 §1); a mismatch aborts the pull. Omit it when auto-discovering
+    /// (no `--node-id`): it is derived from the selected node's registry entry.
     #[arg(long, value_name = "0xADDR")]
-    pub provider_address: String,
+    pub provider_address: Option<String>,
 
     /// JSON-RPC endpoint for on-chain channel open. Overrides
     /// `blockchain.rpc_url` from config.
@@ -72,6 +75,18 @@ pub struct FetchArgs {
     /// `verifyingContract`. Overrides `blockchain.slash_judge_address`.
     #[arg(long, value_name = "0xADDR")]
     pub slash_judge_address: Option<String>,
+
+    /// `CapacityBond` contract address (0x hex) — the active-node registry read
+    /// when auto-discovering (no `--node-id`). Overrides
+    /// `blockchain.capacity_bond_address`. Unused on the explicit-node path.
+    #[arg(long, value_name = "0xADDR")]
+    pub capacity_bond_address: Option<String>,
+
+    /// Client region (ISO 3166-1 alpha-2) used to prefer same-region nodes when
+    /// auto-discovering (#936). Overrides `identity.region`; when unset and no
+    /// config region is found, discovery skips the region-first ordering.
+    #[arg(long, value_name = "REGION")]
+    pub region: Option<String>,
 
     /// EIP-712 `chainId` for both domains. Overrides `blockchain.chain_id`;
     /// defaults to Arbitrum Sepolia.

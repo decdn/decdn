@@ -609,6 +609,21 @@ fn resolve_network_into(
     }
 }
 
+/// Resolve just `[network.discovery]` from a loaded [`FileConfig`], for the
+/// one-shot client commands (`decdn fetch`/`probe`) that dial nodes by their
+/// iroh `NodeId` via discovery but do not run the full node `resolve_config`
+/// pass. Applies the exact same shape validation as `resolve_config` does for
+/// this section; an absent `[network]`/`[network.discovery]` yields the empty
+/// default (the caller falls back to `presets::N0`).
+///
+/// # Errors
+///
+/// Fails if any configured discovery field is malformed (same shape checks the
+/// full `resolve_config` pass applies to this section).
+pub fn resolve_discovery(file: &FileConfig) -> anyhow::Result<ResolvedDiscovery> {
+    errors::one_section(|bag| resolve_discovery_into(file.network.as_ref(), bag))
+}
+
 /// Resolve and shape-validate `[network.discovery]` (#818 scope 1), recording
 /// every malformed entry into `bag`.
 ///
