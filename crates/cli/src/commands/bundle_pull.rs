@@ -478,8 +478,7 @@ fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Resul
         println!("{line}");
     } else {
         println!(
-            "pulled {} -> {} ({fetched} fetched, {skipped} skipped, {failed} failed, {total_bytes} bytes)",
-            rep.output,
+            "pulled into {} ({fetched} fetched, {skipped} skipped, {failed} failed, {total_bytes} bytes)",
             output.display()
         );
     }

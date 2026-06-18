@@ -136,7 +136,8 @@ pub struct ClientFetchArgs {
 /// Arguments for `decdn fetch` — one blob to a file, atop [`ClientFetchArgs`].
 #[derive(Debug, Clone, Args)]
 pub struct FetchArgs {
-    /// BLAKE3 hash of the blob to fetch: 64 hex chars (optional `0x` prefix).
+    /// BLAKE3 hash of the blob to fetch: 64 hex chars (optional `0x` or `b3:`
+    /// prefix — the `b3:` form is what bundle manifests carry).
     #[arg(long, value_name = "HASH")]
     pub hash: String,
 
