@@ -16,7 +16,6 @@ use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::cli::common::expand_tilde;
 use decdn_common::config::DEFAULT_CHAIN_ID;
-use decdn_common::redact::redact_userinfo;
 use decdn_incentive::eth_identity::{self, PasswordSource};
 use serde::Deserialize;
 
@@ -173,7 +172,13 @@ pub fn build_provider(
     Ok(ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_http(rpc_url.parse().with_context(|| {
-            format!("rpc_url {:?} is not a valid URL", redact_userinfo(rpc_url))
+            // An rpc_url secret commonly lives in the path/query, which userinfo
+            // redaction wouldn't scrub — so hide the value entirely, matching
+            // `config validate`'s `<redacted> (N chars)`.
+            format!(
+                "rpc_url is not a valid URL (<redacted>, {} chars)",
+                rpc_url.len()
+            )
         })?))
 }
 

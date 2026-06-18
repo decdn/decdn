@@ -24,7 +24,6 @@ use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::identity;
-use decdn_common::redact::redact_userinfo;
 use decdn_incentive::Erc20;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::eth_identity;
@@ -460,9 +459,12 @@ async fn dry_run_without_keys(
 ) -> anyhow::Result<()> {
     let provider =
         ProviderBuilder::new().connect_http(resolved.rpc_url.parse().with_context(|| {
+            // An rpc_url secret commonly lives in the path/query (Infura/Alchemy
+            // keys), which userinfo redaction wouldn't scrub — so hide the value
+            // entirely, matching `config validate`'s `<redacted> (N chars)`.
             format!(
-                "rpc_url {:?} is not a valid URL",
-                redact_userinfo(&resolved.rpc_url)
+                "rpc_url is not a valid URL (<redacted>, {} chars)",
+                resolved.rpc_url.len()
             )
         })?);
     let bond_contract = CapacityBond::new(cb_addr, &provider);
@@ -798,6 +800,9 @@ mod tests {
             parse_http_date("Thu, 01 Jan 292471210647 00:00:00 GMT"),
             None
         );
+        // In-band edges still parse (guards against an off-by-one in `..=9999`;
+        // the 1970 lower edge is covered by `parse_http_date_epoch`).
+        assert!(parse_http_date("Fri, 31 Dec 9999 23:59:59 GMT").is_some());
     }
 
     #[test]
