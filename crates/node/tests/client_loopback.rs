@@ -35,7 +35,8 @@ use decdn_incentive::{
     bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::client_requester::{
-    ChannelContext, VoucherProgress, stream_fetch, stream_fetch_tracked,
+    ChannelContext, ChannelLedger, Cumulative, VoucherProgress, stream_fetch, stream_fetch_shared,
+    stream_fetch_tracked,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
@@ -1630,68 +1631,129 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Per-channel serialization: two un-coordinated streams on one channel both
-/// start from `prior_nonce = 0`, so both sign voucher nonce 1. The per-channel
-/// mutex must serialize application so EXACTLY ONE is accepted (the other is a
-/// stale nonce) — guarding against a lost-update / double-accept race that
-/// would let a second voucher overwrite the first at the same nonce.
+/// Open a cache pre-seeded with TWO distinct blobs (via a shared filesystem
+/// origin, dropped after population), mirroring [`cache_with_blob`] for the
+/// concurrent-pull test that requests two different hashes at once.
+async fn cache_with_two_blobs(
+    a: &[u8],
+    b: &[u8],
+) -> anyhow::Result<(
+    CacheEngine,
+    decdn_cache::Hash,
+    decdn_cache::Hash,
+    tempfile::TempDir,
+)> {
+    let hash_a = decdn_cache::Hash::new(a);
+    let hash_b = decdn_cache::Hash::new(b);
+    let origin_dir = tempfile::tempdir()?;
+    for (payload, hash) in [(a, hash_a), (b, hash_b)] {
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let dir = origin_dir.path().join(shard);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(hex.as_str()), payload)?;
+    }
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    let _ = cache.get(hash_a).await?; // populate local store
+    let _ = cache.get(hash_b).await?;
+    drop(origin_dir);
+    Ok((cache, hash_a, hash_b, cache_dir))
+}
+
+/// Concurrent pulls on ONE channel coordinate through a shared [`ChannelLedger`]:
+/// two simultaneous fetches of two distinct blobs issue vouchers in strict nonce
+/// order (the ledger serializes the sign→send→ack→commit cycle), so BOTH succeed
+/// and the channel advances monotonically. This is the fix for the collision the
+/// old `client_concurrent_same_channel_accepts_one_voucher` test pinned, where two
+/// un-coordinated streams both signed voucher nonce 1 and only one was accepted.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_concurrent_same_channel_accepts_one_voucher() -> anyhow::Result<()> {
-    let payload = vec![0x5Au8; 4096];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
+    let payload_a = vec![0x5Au8; 4096];
+    let payload_b = vec![0xA5u8; 8192];
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth, server_ep, server_task) =
         spawn_handler_server(cache, Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx_a = channel_context(Arc::clone(&signer), deposit);
-    let ctx_b = channel_context(Arc::clone(&signer), deposit);
+    // ONE channel context, ONE shared ledger seeded fresh (all `prior_* == ZERO`),
+    // shared across both concurrent pulls via `Arc`.
+    let ctx = channel_context(Arc::clone(&signer), deposit);
+    let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
     let server_addr = server_eth.address();
     let sd = slash_domain();
     let (ra, rb) = tokio::join!(
-        stream_fetch(
+        stream_fetch_shared(
             &client_ep,
             target.clone(),
-            &ctx_a,
+            &ctx,
+            &ledger,
             &sd,
             server_addr,
-            *hash.as_bytes(),
+            *hash_a.as_bytes(),
             0,
             0x00aa,
             Duration::from_secs(15),
+            0,
         ),
-        stream_fetch(
+        stream_fetch_shared(
             &client_ep,
             target.clone(),
-            &ctx_b,
+            &ctx,
+            &ledger,
             &sd,
             server_addr,
-            *hash.as_bytes(),
+            *hash_b.as_bytes(),
             0,
             0x00bb,
             Duration::from_secs(15),
+            0,
         ),
     );
-    let oks = usize::from(ra.is_ok()) + usize::from(rb.is_ok());
+    // BOTH succeed: the shared ledger serialized voucher issuance, so neither
+    // collided on a nonce. Each pull returns its own verified blob.
+    let bytes_a = ra.map_err(|e| anyhow::anyhow!("pull A failed: {e:?}"))?;
+    let bytes_b = rb.map_err(|e| anyhow::anyhow!("pull B failed: {e:?}"))?;
+    anyhow::ensure!(bytes_a.as_ref() == payload_a.as_slice(), "blob A mismatch");
+    anyhow::ensure!(bytes_b.as_ref() == payload_b.as_slice(), "blob B mismatch");
+
+    // The channel advanced monotonically: at least one voucher per pull (>= 2
+    // total), and the cumulative bytes cover BOTH payloads.
+    let final_cum = ledger.snapshot().await;
     anyhow::ensure!(
-        oks == 1,
-        "exactly one concurrent voucher must be accepted, got {oks} ok (a={ra:?}, b={rb:?})"
+        final_cum.nonce >= U256::from(2u64),
+        "ledger nonce: {} (expected >= 2)",
+        final_cum.nonce
+    );
+    let total_bytes = U256::from(payload_a.len() + payload_b.len());
+    anyhow::ensure!(
+        final_cum.bytes == total_bytes,
+        "ledger bytes: {} (expected {})",
+        final_cum.bytes,
+        total_bytes
     );
 
-    // State advanced exactly once: nonce 1, one stream's bytes, no double-apply.
+    // The node's persisted watermark matches the ledger: the channel applied every
+    // voucher in order, ending at the same cumulative bytes.
     let persisted = store.load_all()?;
     let only = persisted
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
     anyhow::ensure!(
-        only.last_nonce() == U256::from(1u64),
-        "nonce: {}",
-        only.last_nonce()
-    );
-    anyhow::ensure!(
-        only.last_bytes_delivered() == U256::from(payload.len()),
-        "bytes_delivered: {}",
-        only.last_bytes_delivered()
+        only.last_bytes_delivered() == total_bytes,
+        "persisted bytes_delivered: {} (expected {})",
+        only.last_bytes_delivered(),
+        total_bytes
     );
 
     client_ep.close().await;
