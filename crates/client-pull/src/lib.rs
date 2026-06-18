@@ -27,6 +27,7 @@
 /// Buyer-side `PaymentChannel` open kernel (#940), shared by the node service
 /// and the CLI.
 pub mod buyer_channel;
+pub mod ledger;
 
 use std::sync::Arc;
 use std::time::Duration;
