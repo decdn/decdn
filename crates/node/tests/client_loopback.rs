@@ -234,6 +234,94 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     Ok(())
 }
 
+/// Watermark-on-error contract (#852) on the `stream_fetch_tracked` path: when a
+/// pull errors mid-stream *after* at least one voucher was acked, `progress` must
+/// still hold the last acked watermark so the caller can persist what it paid —
+/// it must NOT reset to `None`.
+///
+/// Induced deterministically by deposit exhaustion (no mock server): a 1.5 MiB
+/// blob needs two vouchers — cumulative amount 10 then 15 at `RATE_PER_MB` — but
+/// the channel deposit is 12. The node acks voucher 1 (amount 10 <= 12) and
+/// rejects voucher 2 (amount 15 > 12) as over-deposit, so the fetch errors after
+/// one acked voucher. `progress.acked()` must then report voucher 1 (nonce 1),
+/// proving the copy-back in `stream_fetch_tracked` runs on the error path.
+#[tokio::test(flavor = "multi_thread")]
+async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
+    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → two vouchers (amount 10 then 15).
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    // Between voucher 1's cumulative amount (10) and voucher 2's (15): voucher 1
+    // is acked, voucher 2 is rejected as over-deposit.
+    let deposit = U256::from(12u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(Arc::clone(&client_signer), deposit);
+    let mut progress = VoucherProgress::default();
+
+    let result = stream_fetch_tracked(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+        0,
+        &mut progress,
+    )
+    .await;
+
+    anyhow::ensure!(
+        result.is_err(),
+        "fetch must error when voucher 2 is rejected as over-deposit"
+    );
+    // The contract: the watermark survives the error and reflects the one acked
+    // voucher (nonce 1), so the caller can still persist what it paid.
+    let acked = progress.acked().ok_or_else(|| {
+        anyhow::anyhow!("acked watermark must survive a post-ack error, got None")
+    })?;
+    anyhow::ensure!(
+        acked.0 == U256::from(1u64),
+        "exactly one voucher should be acked before the rejection; acked nonce = {}",
+        acked.0
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// Wiring guard for `decdn node channels` (#749 review, crit 7): a real
 /// signed-voucher accept through the live `ClientHandler` must advance the
 /// shared in-memory [`VoucherActivity`] clock the admin surface reports.
