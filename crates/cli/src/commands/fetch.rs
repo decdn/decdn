@@ -2,18 +2,23 @@
 //! content-addressed blob over `cdn/client/v1` (issues #391, #940).
 //!
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
-//! `--node-id`/`--addr`/`--relay-url`, **auto-open-or-reuse** a `PaymentChannel`
-//! with `--provider-address`, run one delivery exchange via
-//! [`decdn_client_pull::stream_fetch_tracked`] (signing cumulative vouchers,
-//! resuming the channel's persisted watermark), verify the `slash_sig` recovers
-//! to the provider (ADR 014 §1), BLAKE3-check the whole blob, persist the new
-//! watermark, and write the bytes atomically.
+//! `--node-id`/`--addr`/`--relay-url` (or auto-discover one, #936),
+//! **auto-open-or-reuse** a `PaymentChannel` with `--provider-address`, run one
+//! delivery exchange via [`decdn_client_pull::stream_fetch_tracked`] (signing
+//! cumulative vouchers, resuming the channel's persisted watermark), verify the
+//! `slash_sig` recovers to the provider (ADR 014 §1), BLAKE3-check the whole
+//! blob, persist the new watermark, and write the bytes atomically.
 //!
 //! Channel lifecycle (#940): a live channel for the provider in the persistent
 //! [`RedbBuyerChannelStore`] is reused (watermark resumed); otherwise one is
 //! opened on-chain (USDC `approve` if needed → `openChannel`) via the shared
 //! [`decdn_client_pull::buyer_channel::open_channel`] kernel and recorded. The
 //! chain coordinates resolve flag > `[blockchain]`/`[identity]` config > default.
+//!
+//! The chain/discovery/delivery seams (`resolve_chain`, `resolve_target_node`,
+//! `probe_and_rank`, `open_or_reuse`, `fetch_blob`, `write_blob_atomic`) are
+//! `pub(crate)` so `decdn bundle pull` (#391) reuses the same paid-fetch kernel
+//! across a manifest's many entries.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -47,37 +52,64 @@ const DEFAULT_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
 const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
 
-/// Parse a user-supplied BLAKE3 hash (64 hex chars, optional `0x` prefix).
-fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
-    let hex = s.strip_prefix("0x").unwrap_or(s);
+/// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
+/// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
+pub(crate) fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("b3:"))
+        .unwrap_or(s);
     let h = blake3::Hash::from_hex(hex).map_err(|e| {
-        anyhow::anyhow!("invalid --hash {s:?}: expected 64 hex chars (BLAKE3 digest): {e}")
+        anyhow::anyhow!(
+            "invalid hash {s:?}: expected 64 hex chars (BLAKE3 digest), optional `0x`/`b3:` \
+             prefix: {e}"
+        )
     })?;
     Ok(*h.as_bytes())
+}
+
+/// Current unix time in seconds (for channel-expiry checks).
+pub(crate) fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Current unix time in microseconds (the requester-echoed `timestamp_us`).
+pub(crate) fn micros_now() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros()),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Chain coordinates resolved flag > `[blockchain]`/`[identity]` config >
 /// default. Pure (parse-only) so the precedence is unit-testable.
 #[derive(Debug)]
-struct ResolvedChain {
-    rpc_url: String,
-    payment_channel: Address,
-    slash_judge: Address,
+pub(crate) struct ResolvedChain {
+    pub(crate) rpc_url: String,
+    pub(crate) payment_channel: Address,
+    pub(crate) slash_judge: Address,
     /// `CapacityBond` registry for auto-discovery (no `--node-id`). `None` when
     /// neither the flag nor `blockchain.capacity_bond_address` is set — only an
     /// error on the discovery path, never on the explicit-node path.
-    capacity_bond: Option<Address>,
-    chain_id: u64,
-    keystore: PathBuf,
-    data_dir: PathBuf,
+    pub(crate) capacity_bond: Option<Address>,
+    pub(crate) chain_id: u64,
+    pub(crate) keystore: PathBuf,
+    pub(crate) data_dir: PathBuf,
     /// Client region for region-first discovery ordering (`--region` >
     /// `identity.region`). `None` skips the ordering.
-    region: Option<String>,
-    deposit: U256,
-    max_approve: bool,
+    pub(crate) region: Option<String>,
+    pub(crate) deposit: U256,
+    pub(crate) max_approve: bool,
 }
 
-fn resolve_chain(args: &cli::FetchArgs, file: &FileConfig) -> anyhow::Result<ResolvedChain> {
+pub(crate) fn resolve_chain(
+    args: &cli::ClientFetchArgs,
+    file: &FileConfig,
+) -> anyhow::Result<ResolvedChain> {
     let bc = file.blockchain.as_ref();
     let rpc_url = args
         .rpc_url
@@ -168,47 +200,25 @@ fn resolve_chain(args: &cli::FetchArgs, file: &FileConfig) -> anyhow::Result<Res
     })
 }
 
-/// Current unix time in seconds (for channel-expiry checks).
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Auto-discover a node to fetch `hash` from (#936): read the active node set
-/// from `CapacityBond`, take the region-nearest [`discovery::SELECT_K`]
-/// candidates, probe them concurrently over `endpoint`, keep those that hold the
-/// blob, and [`discovery::rank`] the holders (preferring a node we already have
-/// a live channel with when it is close enough). Returns the chosen candidate
-/// (its `node_id` to dial and `eth_address` as the provider).
-async fn discover_provider(
+/// Probe `candidates` for `hash` over `endpoint` and pick the best holder
+/// (channel-aware ranking, #936). Shared by `fetch`'s one-shot discovery and
+/// `bundle pull`'s per-entry discovery (which reads the active set once, then
+/// re-probes this list per entry). `slash_sig`/correlation are NOT validated
+/// here — selection only needs `has_blob` + RTT; the chosen node's delivery is
+/// fully verified downstream. Errors if none of the probed candidates hold it.
+pub(crate) async fn probe_and_rank(
     endpoint: &Endpoint,
     store: &RedbBuyerChannelStore,
-    rpc_url: &str,
-    capacity_bond: Address,
-    client_region: Option<&str>,
-    relay_hint: Option<RelayUrl>,
+    candidates: &[NodeCandidate],
+    relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
 ) -> anyhow::Result<NodeCandidate> {
-    let all = discovery::active_nodes(rpc_url, capacity_bond).await?;
-    if all.is_empty() {
-        anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
-    }
-    let selected = discovery::select_candidates(all, client_region, discovery::SELECT_K);
-
-    let timestamp_us = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_micros()),
-    )
-    .unwrap_or(u64::MAX);
-
-    // Probe the K candidates concurrently in one task (`probe_once` is not
-    // `Send` — its `&dyn ProbeMetrics` param — so `join_all` over a shared
-    // `&endpoint` beats `tokio::spawn`). `probe_once`'s internal timeout bounds
-    // each leg.
-    let probes = selected.into_iter().map(|cand| {
-        let relay = relay_hint.clone();
+    let timestamp_us = micros_now();
+    // Probe concurrently in one task (`probe_once` is not `Send` — its
+    // `&dyn ProbeMetrics` param — so `join_all` over a shared `&endpoint` beats
+    // `tokio::spawn`). `probe_once`'s internal timeout bounds each leg.
+    let probes = candidates.iter().map(|cand| {
+        let relay = relay_hint.cloned();
         async move {
             let mut target = EndpointAddr::new(cand.node_id);
             if let Some(url) = relay {
@@ -229,9 +239,6 @@ async fn discover_provider(
     });
     let results = futures_util::future::join_all(probes).await;
 
-    // Keep blob-holders with their RTT, tagging whether a live channel exists.
-    // `slash_sig`/correlation are NOT validated here — selection only needs
-    // has_blob + RTT; the chosen node's delivery is fully verified downstream.
     let probe_count = results.len();
     let mut holders = Vec::new();
     for (cand, res) in results {
@@ -243,7 +250,7 @@ async fn discover_provider(
             .get_by_provider(cand.eth_address)?
             .is_some_and(|s| !s.is_expired_at(unix_now()));
         holders.push(discovery::Probed {
-            candidate: cand,
+            candidate: cand.clone(),
             rtt_ms,
             has_live_channel,
         });
@@ -255,12 +262,32 @@ async fn discover_provider(
     Ok(pick.candidate.clone())
 }
 
-/// Resolve the node to fetch from: the explicit `--node-id` (today's path,
-/// requiring `--provider-address` and a reachable `--addr`/relay), or
-/// auto-discovery (#936) when `--node-id` is omitted (deriving the provider from
-/// the chosen node's registry entry). Returns `(node_id_to_dial, provider)`.
-async fn resolve_target_node(
-    args: &cli::FetchArgs,
+/// Auto-discover a node to fetch `hash` from (#936): read the active node set
+/// from `CapacityBond`, take the region-nearest [`discovery::SELECT_K`]
+/// candidates, and [`probe_and_rank`] them. Returns the chosen candidate.
+async fn discover_provider(
+    endpoint: &Endpoint,
+    store: &RedbBuyerChannelStore,
+    rpc_url: &str,
+    capacity_bond: Address,
+    client_region: Option<&str>,
+    relay_hint: Option<&RelayUrl>,
+    hash: [u8; 32],
+) -> anyhow::Result<NodeCandidate> {
+    let all = discovery::active_nodes(rpc_url, capacity_bond).await?;
+    if all.is_empty() {
+        anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
+    }
+    let selected = discovery::select_candidates(all, client_region, discovery::SELECT_K);
+    probe_and_rank(endpoint, store, &selected, relay_hint, hash).await
+}
+
+/// Resolve the node to fetch from: the explicit `--node-id` (requiring
+/// `--provider-address`), or auto-discovery (#936) when `--node-id` is omitted
+/// (deriving the provider from the chosen node's registry entry). Returns
+/// `(node_id_to_dial, provider)`.
+pub(crate) async fn resolve_target_node(
+    args: &cli::ClientFetchArgs,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
     store: &RedbBuyerChannelStore,
@@ -294,7 +321,7 @@ async fn resolve_target_node(
         &chain.rpc_url,
         capacity_bond,
         chain.region.as_deref(),
-        relays.first().cloned(),
+        relays.first(),
         hash,
     )
     .await?;
@@ -305,24 +332,86 @@ async fn resolve_target_node(
     Ok((picked.node_id, picked.eth_address))
 }
 
+/// Fetch one blob over `cdn/client/v1` against an already-resolved channel
+/// `ctx` + dial `target`, persisting the voucher watermark afterwards. Returns
+/// the verified blob bytes. The caller is responsible for serializing concurrent
+/// calls that share a channel (`ctx`/`provider`) — vouchers on one channel use a
+/// strictly-increasing nonce, so two in-flight fetches on the same channel would
+/// race it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fetch_blob(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &ChannelContext,
+    slash_dom: &Eip712Domain,
+    provider: Address,
+    store: &RedbBuyerChannelStore,
+    hash: [u8; 32],
+    timeout: Duration,
+    max_blob_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let channel_id = ctx.channel_id;
+    let timestamp_us = micros_now();
+    // `stream_fetch_tracked` reports the acked watermark via `progress` even on
+    // an error/timeout, so a paid-but-failed delivery still advances the stored
+    // watermark — otherwise the next reuse would re-sign a stale nonce.
+    let mut progress = VoucherProgress::default();
+    let result = stream_fetch_tracked(
+        endpoint,
+        target,
+        ctx,
+        slash_dom,
+        provider,
+        hash,
+        0,
+        timestamp_us,
+        timeout,
+        max_blob_bytes,
+        &mut progress,
+    )
+    .await;
+
+    if let Some((nonce, bytes_delivered, amount)) = progress.acked() {
+        // The bytes were paid for; any failure to persist the new watermark only
+        // risks a rejected reuse next time, so warn rather than mask the fetch
+        // outcome. A non-`Advanced` outcome (unknown provider / channel replaced
+        // / regression) means the watermark did NOT move — same hazard as a
+        // backend error — so surface it too rather than dropping it on the floor.
+        match store.advance_progress(provider, channel_id, nonce, bytes_delivered, amount) {
+            Ok(AdvanceOutcome::Advanced) => {}
+            Ok(other) => eprintln!(
+                "warning: voucher watermark not persisted for channel {channel_id} \
+                 (provider {provider}): {other:?}; the next reuse may re-sign a stale nonce"
+            ),
+            Err(e) => eprintln!(
+                "warning: failed to persist voucher watermark for channel {channel_id} \
+                 (provider {provider}): {e}"
+            ),
+        }
+    }
+
+    Ok(result?.to_vec())
+}
+
 /// Fetch a single blob over `cdn/client/v1`, auto-opening/reusing a payment
 /// channel, and write it atomically to `--output`. `config_path` (the global
 /// `--config`) supplies relays (#935), discovery (#936), and chain coordinates.
 ///
-/// With `--node-id` the node is dialed explicitly (today's path). Without it,
-/// `fetch` auto-discovers (#936): read the active set from `CapacityBond`, probe
-/// the region-nearest candidates, pick a holder (channel-aware ranking), and
-/// derive `--provider-address` from its registry entry.
+/// With `--node-id` the node is dialed explicitly. Without it, `fetch`
+/// auto-discovers (#936): read the active set from `CapacityBond`, probe the
+/// region-nearest candidates, pick a holder (channel-aware ranking), and derive
+/// `--provider-address` from its registry entry.
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
+    let common = &args.common;
 
     // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
     // `[network.discovery]` composes operator resolution legs, else N0 (#936).
-    let relays = client_endpoint::resolve_relays(args.relay_url.as_deref(), config_path)?;
+    let relays = client_endpoint::resolve_relays(common.relay_url.as_deref(), config_path)?;
     let disc = client_endpoint::client_discovery(config_path)?;
 
     let file = load_file_config(config_path)?;
-    let chain = resolve_chain(args, &file)?;
+    let chain = resolve_chain(common, &file)?;
 
     // The store is read by the discovery channel-aware ranking and recorded into
     // by open-or-reuse; open it once.
@@ -333,7 +422,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
 
     // Resolve the node to fetch from: explicit `--node-id`, or auto-discover.
     let (node_id, provider) =
-        resolve_target_node(args, &chain, &endpoint, &store, &relays, hash).await?;
+        resolve_target_node(common, &chain, &endpoint, &store, &relays, hash).await?;
 
     // Buyer signer (vouchers + the openChannel tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -368,65 +457,31 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         chain.max_approve,
     )
     .await?;
-    let channel_id = ctx.channel_id;
 
     let mut target = EndpointAddr::new(node_id);
     // `--addr` requires `--node-id` (clap), so it only pins the explicit-node
     // path; a discovered node is reached via its resolved address + relay hint.
-    if let Some(addr) = args.addr {
+    if let Some(addr) = common.addr {
         target = target.with_ip_addr(addr);
     }
     if let Some(url) = relays.first() {
         target = target.with_relay_url(url.clone());
     }
 
-    let timestamp_us = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_micros()),
-    )
-    .unwrap_or(u64::MAX);
-
-    // `stream_fetch_tracked` reports the acked watermark via `progress` even on
-    // an error/timeout, so a paid-but-failed delivery still advances the stored
-    // watermark — otherwise the next reuse would re-sign a stale nonce.
-    let max_blob_bytes = args.max_blob_mb.saturating_mul(1024 * 1024);
-    let mut progress = VoucherProgress::default();
-    let result = stream_fetch_tracked(
+    let max_blob_bytes = common.max_blob_mb.saturating_mul(1024 * 1024);
+    let blob = fetch_blob(
         &endpoint,
         target,
         &ctx,
         &slash_dom,
         provider,
+        &store,
         hash,
-        0,
-        timestamp_us,
-        Duration::from_millis(args.timeout_ms),
+        Duration::from_millis(common.timeout_ms),
         max_blob_bytes,
-        &mut progress,
     )
-    .await;
+    .await?;
 
-    if let Some((nonce, bytes_delivered, amount)) = progress.acked() {
-        // The bytes were paid for; any failure to persist the new watermark only
-        // risks a rejected reuse next time, so warn rather than mask the fetch
-        // outcome. A non-`Advanced` outcome (unknown provider / channel replaced
-        // / regression) means the watermark did NOT move — same hazard as a
-        // backend error — so surface it too rather than dropping it on the floor.
-        match store.advance_progress(provider, channel_id, nonce, bytes_delivered, amount) {
-            Ok(AdvanceOutcome::Advanced) => {}
-            Ok(other) => eprintln!(
-                "warning: voucher watermark not persisted for channel {channel_id} \
-                 (provider {provider}): {other:?}; the next reuse may re-sign a stale nonce"
-            ),
-            Err(e) => eprintln!(
-                "warning: failed to persist voucher watermark for channel {channel_id} \
-                 (provider {provider}): {e}"
-            ),
-        }
-    }
-
-    let blob = result?;
     write_blob_atomic(&args.output, &blob)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", args.output.display()))?;
     println!("fetched {} bytes -> {}", blob.len(), args.output.display());
@@ -439,7 +494,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
 /// (the node service handles reclaim, #940 follow-up — until then a replaced
 /// expired channel's residual deposit is reclaim-able only manually).
 #[allow(clippy::too_many_arguments)]
-async fn open_or_reuse<P>(
+pub(crate) async fn open_or_reuse<P>(
     store: &RedbBuyerChannelStore,
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     rpc: &P,
@@ -511,7 +566,7 @@ where
 
 /// Write `bytes` to `target` atomically: a unique `O_CREAT|O_EXCL` temp in the
 /// destination directory, then an atomic rename-replace.
-fn write_blob_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_blob_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match parent {
@@ -534,11 +589,9 @@ fn write_blob_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn args() -> cli::FetchArgs {
-        cli::FetchArgs {
+    fn common() -> cli::ClientFetchArgs {
+        cli::ClientFetchArgs {
             node_id: Some("n".into()),
-            hash: "h".into(),
-            output: PathBuf::from("/tmp/out"),
             addr: None,
             relay_url: None,
             provider_address: Some("0x0000000000000000000000000000000000000001".into()),
@@ -562,16 +615,16 @@ mod tests {
 
     #[test]
     fn flags_override_config() {
-        let mut a = args();
-        a.rpc_url = Some("http://flag:8545".into());
-        a.chain_id = Some(99);
+        let mut c = common();
+        c.rpc_url = Some("http://flag:8545".into());
+        c.chain_id = Some(99);
         let pc = "0x1111111111111111111111111111111111111111";
-        a.payment_channel_address = Some(pc.into());
-        a.slash_judge_address = Some("0x2222222222222222222222222222222222222222".into());
+        c.payment_channel_address = Some(pc.into());
+        c.slash_judge_address = Some("0x2222222222222222222222222222222222222222".into());
         let file = config(
             "[blockchain]\nrpc_url = \"http://config:8545\"\nchain_id = 1\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
         );
-        let r = resolve_chain(&a, &file).unwrap();
+        let r = resolve_chain(&c, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");
         assert_eq!(r.chain_id, 99);
         assert_eq!(r.payment_channel, Address::from_str(pc).unwrap());
@@ -582,7 +635,7 @@ mod tests {
         let file = config(
             "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_deposit_micro_usdc = 5000000\n",
         );
-        let r = resolve_chain(&args(), &file).unwrap();
+        let r = resolve_chain(&common(), &file).unwrap();
         assert_eq!(r.rpc_url, "http://config:8545");
         // chain_id absent everywhere → default.
         assert_eq!(r.chain_id, DEFAULT_CHAIN_ID);
@@ -599,7 +652,7 @@ mod tests {
         let file = config(
             "[blockchain]\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
         );
-        let err = resolve_chain(&args(), &file).unwrap_err();
+        let err = resolve_chain(&common(), &file).unwrap_err();
         assert!(err.to_string().contains("rpc_url not set"), "{err}");
     }
 
@@ -617,6 +670,10 @@ mod tests {
         let digest = blake3::hash(b"payload");
         let hex = digest.to_hex();
         assert_eq!(parse_hash(&format!("0x{hex}")).unwrap(), *digest.as_bytes());
+        assert_eq!(
+            parse_hash(&format!("b3:{hex}")).unwrap(),
+            *digest.as_bytes()
+        );
         assert_eq!(parse_hash(&hex).unwrap(), *digest.as_bytes());
         assert!(parse_hash("deadbeef").is_err());
     }

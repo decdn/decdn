@@ -20,11 +20,15 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use walkdir::WalkDir;
 
-/// Top-level dispatcher for `decdn bundle ...`. Single-variant today —
-/// `Pull` is deferred (see `appendix-bundles.md` § Future work).
-pub async fn bundle_dispatch(args: &BundleArgs) -> anyhow::Result<()> {
+/// Top-level dispatcher for `decdn bundle ...`. `config_path` (the global
+/// `--config`) is only consumed by `pull` (relays/discovery/chain coordinates);
+/// `create` is purely local.
+pub async fn bundle_dispatch(args: &BundleArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     match &args.cmd {
         BundleCommand::Create(create_args) => bundle_create(create_args).await,
+        BundleCommand::Pull(pull_args) => {
+            super::bundle_pull::bundle_pull(pull_args, config_path).await
+        }
     }
 }
 

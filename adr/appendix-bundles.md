@@ -112,9 +112,9 @@ bundle from the same source tree get the same hash. The exact axes:
 
 A bundle file is just bytes — it has a BLAKE3 like any other blob.
 Origins serve the bundle bytes as one regular blob; publishers announce
-the bundle hash; clients (eventually) fetch the bundle hash, parse the
-JSON, then fetch every `entries[].hash` separately. The bundle is leaf
-data, not a manifest in the protocol sense.
+the bundle hash; clients fetch the bundle hash, parse the JSON, then
+fetch every `entries[].hash` separately. The bundle is leaf data, not a
+manifest in the protocol sense.
 
 ## Non-relationship to [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)'s `DECDNMAN` chunk manifest
 
@@ -154,9 +154,39 @@ chunked single file inside a bundled directory.
   they exist only as on-disk JSON or as opaque blob bytes when published
   through the regular content path.
 
-## Deferred & Open
+## Pull
 
-- `decdn bundle pull -i <file>` and `decdn bundle pull --hash <b3>`
-  are blocked on a client-side fetch primitive that does not exist
-  yet. Both `bundle pull` variants will land in
-  a follow-up once the fetch primitive is implemented.
+`decdn bundle pull` reads a manifest — from a local file (`-i`) or by
+fetching its own blob hash first (`--hash`, mutually exclusive) — and
+fetches every entry over the paid `cdn/client/v1` path (the same kernel
+as `decdn fetch`):
+
+- **Node selection is per entry.** With an explicit `--node-id` every
+  entry is pulled from that one node; otherwise each entry independently
+  discovers a holder among the region-nearest active nodes
+  (`CapacityBond`, read once), so different entries may come from
+  different nodes.
+- **Concurrency** is bounded by `--jobs`. A payment channel's vouchers
+  use a strictly increasing nonce, so fetches that share one provider's
+  channel are serialized by a per-provider lock (which also makes the
+  lazy open-or-reuse first-touch race-free); distinct providers proceed
+  in parallel.
+- **Output** files are written under `-o <dir>` at each entry's relative
+  path, resolved with the § Path-safety rules above (`..`, absolute, and
+  escaping paths rejected). Writes are atomic (temp-then-rename after the
+  BLAKE3 check the fetch path already performs), so a present file is
+  verified-good: pull **skips existing files** by default (re-runs
+  resume), and `--overwrite` forces a re-fetch.
+- **`--dry-run`** reports the plan without any network/chain activity
+  (entries are only enumerable for the `-i` form; `--hash` cannot list
+  them without first fetching the manifest).
+
+Verification is intrinsic: content addressing means every fetched blob
+is BLAKE3-checked against its `entries[].hash` by the fetch path, so
+there is no separate verify toggle.
+
+### Deferred
+
+- Coverage is limited to the region-nearest candidate set probed per
+  entry; an entry no probed node holds fails (re-runnable). Broadening
+  beyond that set is a follow-up.

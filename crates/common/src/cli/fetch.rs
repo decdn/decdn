@@ -2,12 +2,13 @@
 //! content-addressed blob over `cdn/client/v1` (issues #391, #940).
 //!
 //! The paying sibling of [`super::probe::ProbeArgs`]: a one-shot client command
-//! that dials a node by explicit `--node-id`/`--addr`/`--relay-url` and pays
-//! per-MB from a `PaymentChannel`. The channel is **auto-opened and reused**
-//! (#940): `fetch` looks up a live channel with `--provider-address` in its
-//! persistent buyer-channel store, resuming that channel's voucher watermark;
-//! if none exists it opens (and funds) one on-chain and records it. So there is
-//! no `--channel-id` — the channel is derived.
+//! that dials a node by explicit `--node-id`/`--addr`/`--relay-url` (or
+//! auto-discovers one, #936) and pays per-MB from a `PaymentChannel`. The
+//! channel is **auto-opened and reused** (#940): `fetch` looks up a live channel
+//! with `--provider-address` in its persistent buyer-channel store, resuming
+//! that channel's voucher watermark; if none exists it opens (and funds) one
+//! on-chain and records it. So there is no `--channel-id` — the channel is
+//! derived.
 //!
 //! The on-chain coordinates (RPC, contract addresses, chain id, keystore, data
 //! dir) resolve **flag > `[blockchain]`/`[identity]` config > default**, so a
@@ -15,35 +16,34 @@
 //! … --hash … -o …` with no chain flags. Fields are kept as `String`/`Option`
 //! (mirroring [`super::probe::ProbeArgs`]); the `cli` binary parses addresses
 //! and merges the config.
+//!
+//! The network/chain/target/limit flags live in [`ClientFetchArgs`], shared
+//! (via `#[command(flatten)]`) with `decdn bundle pull` (#391) so both client
+//! commands resolve their coordinates and select a node identically.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Args;
 
-/// Arguments for `decdn fetch`.
+/// The network, chain, target, and per-blob-limit flags shared by the paid
+/// client commands (`decdn fetch` and `decdn bundle pull`, #391). Flattened into
+/// each command's args so the resolution (`flag > config > default`) and
+/// node-selection logic have one definition.
 ///
-/// Reachability (a direct `--addr` or a relay) and the required chain
-/// coordinates are validated at runtime rather than by clap, because the relay
-/// (`network.relay_urls`, #935) and the chain coordinates (`[blockchain]`) can
-/// come from config, which clap cannot see.
+/// Reachability and the required chain coordinates are validated at runtime
+/// rather than by clap, because the relay (`network.relay_urls`, #935) and the
+/// chain coordinates (`[blockchain]`) can come from config, which clap cannot
+/// see. The `--node-id`/`--provider-address`/`--addr` pairing IS enforced by
+/// clap `requires`.
 #[derive(Debug, Clone, Args)]
-pub struct FetchArgs {
+pub struct ClientFetchArgs {
     /// Target node id (iroh `EndpointId`, z-base32). Omit it to auto-discover:
-    /// `fetch` reads the active node set from `CapacityBond`, probes the
-    /// region-nearest candidates, and picks one that holds the blob (#936). When
-    /// set, `--provider-address` is required (they pair).
+    /// the active node set is read from `CapacityBond`, the region-nearest
+    /// candidates probed, and one that holds the blob picked (#936). When set,
+    /// `--provider-address` is required (they pair).
     #[arg(long, value_name = "ID", requires = "provider_address")]
     pub node_id: Option<String>,
-
-    /// BLAKE3 hash of the blob to fetch: 64 hex chars (optional `0x` prefix).
-    #[arg(long, value_name = "HASH")]
-    pub hash: String,
-
-    /// Destination path for the fetched blob. Written atomically
-    /// (temp-in-dir then rename); an existing file is replaced.
-    #[arg(short = 'o', long, value_name = "PATH")]
-    pub output: PathBuf,
 
     /// Direct socket address of the target node (e.g. `127.0.0.1:4433`). Only
     /// meaningful with an explicit `--node-id`; auto-discovery resolves the
@@ -122,11 +122,29 @@ pub struct FetchArgs {
     /// Reject a delivery whose claimed total size exceeds this many MiB
     /// **before** buffering it — guards client memory against a provider that
     /// over-claims `total_bytes`. Defaults to 1024 MiB (the node's default
-    /// serve ceiling); raise it to fetch larger blobs.
+    /// serve ceiling); raise it to fetch larger blobs. For `bundle pull` this is
+    /// the per-entry ceiling.
     #[arg(long, value_name = "MB", default_value_t = 1024)]
     pub max_blob_mb: u64,
 
-    /// Overall timeout for the fetch, in milliseconds.
+    /// Overall timeout for a single blob fetch, in milliseconds. For
+    /// `bundle pull` this is the per-entry timeout.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     pub timeout_ms: u64,
+}
+
+/// Arguments for `decdn fetch` — one blob to a file, atop [`ClientFetchArgs`].
+#[derive(Debug, Clone, Args)]
+pub struct FetchArgs {
+    /// BLAKE3 hash of the blob to fetch: 64 hex chars (optional `0x` prefix).
+    #[arg(long, value_name = "HASH")]
+    pub hash: String,
+
+    /// Destination path for the fetched blob. Written atomically
+    /// (temp-in-dir then rename); an existing file is replaced.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: PathBuf,
+
+    #[command(flatten)]
+    pub common: ClientFetchArgs,
 }
