@@ -101,6 +101,16 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     bytes32 public constant VOUCHER_TYPEHASH =
         keccak256("Voucher(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)");
 
+    /// @dev The provider's cooperative-close waiver typehash. Same field shape as
+    ///      a voucher, signed by the PROVIDER (not the client) to attest the
+    ///      final state and waive the dispute window (ADR 003 § Cooperative
+    ///      close). Shares the domain separator with the voucher, so it is
+    ///      likewise bound to this chain + contract; `channelId` (unique per
+    ///      client/provider/channelNonce) pins it to one channel.
+    bytes32 public constant COOPERATIVE_CLOSE_TYPEHASH = keccak256(
+        "CooperativeClose(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)"
+    );
+
     // -----------------------------------------------------------------
     // Immutables + governable state
     // -----------------------------------------------------------------
@@ -210,6 +220,13 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         uint256 clientRefund
     );
     event ChannelExpiredReclaimed(bytes32 indexed channelId, address indexed client, uint256 clientRefund);
+    event ChannelCooperativelyClosed(
+        bytes32 indexed channelId,
+        address indexed provider,
+        uint256 routedAmount,
+        uint256 bytesDelivered,
+        uint256 clientRefund
+    );
     event SettlementDeferred(
         bytes32 indexed channelId, address indexed provider, uint256 settleAmount, uint256 settleBytes
     );
@@ -240,6 +257,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     error DisputeWindowClosed();
     error DisputeWindowActive();
     error InvalidVoucherSignature();
+    error InvalidCooperativeCloseSignature();
     error NonMonotonicNonce(uint256 nonce, uint256 claimedNonce);
     error AmountRegression(uint256 amount, uint256 claimedAmount);
     error BytesRegression(uint256 bytesDelivered, uint256 claimedBytes);
@@ -547,6 +565,73 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         emit ChannelSettled(channelId, ch.provider, settleAmount, settleBytes, clientRefund);
     }
 
+    /// @notice Client or provider: settle immediately at a final state BOTH
+    ///         parties signed, skipping the dispute window. The client's
+    ///         cumulative voucher (`clientVoucherSig`) caps the amount the
+    ///         provider may claim; the provider's matching `CooperativeClose`
+    ///         waiver (`providerCloseSig`) attests it holds no higher voucher and
+    ///         waives the window. With both signatures over the same final tuple
+    ///         there is nothing left to dispute (ADR 003 § Cooperative close), so
+    ///         the client's `deposit - amount` refund and the provider's
+    ///         `amount - withdrawnAmount` settle leg both land in this
+    ///         transaction — no funds wait behind the window.
+    /// @dev Open-only, mirroring `closeChannel`'s pre-expiry gate: a channel
+    ///      already in the dispute window settles through `settleChannel`. The
+    ///      shared `claimed*` watermark is advanced with `strictNonce = false`,
+    ///      so the agreed state MAY equal the current watermark (e.g. the
+    ///      provider already `withdraw`-drained to it and both parties now sign
+    ///      that nonce to release the refund). A waiver below the on-chain
+    ///      watermark reverts `AmountRegression`/`NonMonotonicNonce`, so the
+    ///      on-chain watermark — not the off-chain signature — is the finality
+    ///      anchor and a stale waiver can never under-settle. `_verifyVoucher`
+    ///      and `_verifyCooperativeClose` may staticcall ERC-1271 signers before
+    ///      the state writes; safe under `nonReentrant` + checks-effects-
+    ///      interactions. Mirrors `settleChannel`'s paused-router defer branch so
+    ///      a paused `FeeRouter` cannot freeze the client refund.
+    // slither-disable-next-line reentrancy-no-eth
+    function cooperativeClose(
+        bytes32 channelId,
+        uint256 amount,
+        uint256 nonce,
+        uint256 bytesDelivered,
+        bytes calldata clientVoucherSig,
+        bytes calldata providerCloseSig
+    ) external nonReentrant {
+        Channel storage ch = channels[channelId];
+        _requireOpenAndUnexpired(ch);
+        if (msg.sender != ch.client && msg.sender != ch.provider) revert NotChannelParty();
+
+        _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.client, clientVoucherSig);
+        _verifyCooperativeClose(channelId, amount, nonce, bytesDelivered, ch.provider, providerCloseSig);
+        // Non-strict nonce: the agreed final state may equal the current
+        // watermark; a lower one reverts (the watermark is the finality anchor).
+        _advanceClaimWatermark(ch, amount, nonce, bytesDelivered, false);
+        _requireBytesTrackPayment(ch);
+
+        uint256 settleAmount = ch.claimedAmount - ch.withdrawnAmount;
+        uint256 settleBytes = ch.claimedBytes - ch.withdrawnBytes;
+        uint256 clientRefund = ch.deposit - ch.claimedAmount;
+
+        ch.status = Status.Closed;
+
+        if (clientRefund != 0) usdc.safeTransfer(ch.client, clientRefund);
+        // Identical paused-router tolerance to `settleChannel`: the client refund
+        // already left, so reverting would trap it. Defer the provider leg under a
+        // paused router (flushable post-unpause) instead of failing the exit.
+        if (settleAmount != 0) {
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            if (IFeeRouterSettlement(feeRouter).paused()) {
+                // slither-disable-next-line unused-return
+                _deferredSettlements.add(channelId);
+                emit SettlementDeferred(channelId, ch.provider, settleAmount, settleBytes);
+            } else {
+                _route(ch.provider, settleBytes, settleAmount);
+            }
+        }
+
+        emit ChannelCooperativelyClosed(channelId, ch.provider, settleAmount, settleBytes, clientRefund);
+    }
+
     /// @notice Any address: route the provider settle leg deferred by
     ///         `settleChannel` when `FeeRouter` was paused. Safe to retry — a
     ///         still-paused router reverts the whole call and the channel stays in
@@ -803,6 +888,28 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         );
         bytes32 digest = _hashTypedDataV4(structHash);
         if (!SignatureChecker.isValidSignatureNow(client, digest, signature)) revert InvalidVoucherSignature();
+    }
+
+    /// @dev Verify the provider's EIP-712 cooperative-close waiver (EOA or
+    ///      ERC-1271) over the agreed final tuple. Same field shape and `token`
+    ///      pin as `_verifyVoucher`, but typed as `CooperativeClose` and recovered
+    ///      against the provider — so a client voucher can never stand in for the
+    ///      provider's waiver, nor vice versa.
+    function _verifyCooperativeClose(
+        bytes32 channelId,
+        uint256 amount,
+        uint256 nonce,
+        uint256 bytesDelivered,
+        address provider,
+        bytes calldata signature
+    ) internal view {
+        bytes32 structHash = keccak256(
+            abi.encode(COOPERATIVE_CLOSE_TYPEHASH, channelId, amount, nonce, bytesDelivered, address(usdc))
+        );
+        bytes32 digest = _hashTypedDataV4(structHash);
+        if (!SignatureChecker.isValidSignatureNow(provider, digest, signature)) {
+            revert InvalidCooperativeCloseSignature();
+        }
     }
 
     /// @dev `settleChannel` relies on `FeeRouter.paused()` to defer (not revert)

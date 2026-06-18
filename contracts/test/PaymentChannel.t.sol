@@ -206,14 +206,24 @@ contract PaymentChannelTest is Test {
     bytes32 internal constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
     bytes32 internal constant VOUCHER_TYPEHASH =
         keccak256("Voucher(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)");
+    bytes32 internal constant COOPERATIVE_CLOSE_TYPEHASH = keccak256(
+        "CooperativeClose(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)"
+    );
+
+    // A provider with a known key, needed to sign cooperative-close waivers
+    // (the default `provider` is a bare address with no key).
+    uint256 internal constant PROVIDER_PK = 0xB0B0B0;
+    address internal keyedProvider;
 
     function setUp() public {
         client = vm.addr(CLIENT_PK);
+        keyedProvider = vm.addr(PROVIDER_PK);
 
         usdc = new MockUSDC();
         bond = new MockActiveBond();
         router = new MockSettlementRouter(usdc);
         bond.setActive(provider, true);
+        bond.setActive(keyedProvider, true);
 
         channel = new PaymentChannel({
             usdc_: usdc,
@@ -273,6 +283,55 @@ contract PaymentChannelTest is Test {
         returns (bytes memory)
     {
         return _signFor(address(channel), channelId, amount, nonce, bytesDelivered);
+    }
+
+    /// @dev EIP-712 sign over `channel`'s domain with an arbitrary key and
+    ///      typehash — used for the provider's cooperative-close waiver
+    ///      (`COOPERATIVE_CLOSE_TYPEHASH`, signed with `PROVIDER_PK`).
+    function _signTypedAs(
+        uint256 pk,
+        bytes32 typehash,
+        bytes32 channelId,
+        uint256 amount,
+        uint256 nonce,
+        uint256 bytesDelivered
+    ) internal view returns (bytes memory) {
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("PaymentChannel")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(channel)
+            )
+        );
+        bytes32 structHash = keccak256(abi.encode(typehash, channelId, amount, nonce, bytesDelivered, address(usdc)));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    /// @dev Client voucher signed for the keyed-provider channel (reuses CLIENT_PK).
+    function _signClient(bytes32 channelId, uint256 amount, uint256 nonce, uint256 bytesDelivered)
+        internal
+        view
+        returns (bytes memory)
+    {
+        return _signTypedAs(CLIENT_PK, VOUCHER_TYPEHASH, channelId, amount, nonce, bytesDelivered);
+    }
+
+    /// @dev Provider's cooperative-close waiver over the same final tuple.
+    function _signWaiver(bytes32 channelId, uint256 amount, uint256 nonce, uint256 bytesDelivered)
+        internal
+        view
+        returns (bytes memory)
+    {
+        return _signTypedAs(PROVIDER_PK, COOPERATIVE_CLOSE_TYPEHASH, channelId, amount, nonce, bytesDelivered);
+    }
+
+    function _openKeyed() internal returns (bytes32 channelId) {
+        vm.prank(client);
+        channelId = channel.openChannel(keyedProvider, DEPOSIT);
     }
 
     /// @dev Deploy a forced-inclusion harness and fund/approve the client against it.
@@ -1656,5 +1715,167 @@ contract PaymentChannelTest is Test {
         channel.disputeChannel(id, 200e6, 2, 2_000_000, _sign(id, 200e6, 2, 2_000_000));
         assertEq(uint256(channel.getChannel(id).disputeDeadline), uint256(originalDeadline));
         assertFalse(channel.getChannel(id).extended);
+    }
+
+    // -----------------------------------------------------------------
+    // cooperativeClose (ADR 003 § Cooperative close)
+    // -----------------------------------------------------------------
+
+    function test_cooperativeClose_settlesImmediatelyNoWindow() public {
+        bytes32 id = _openKeyed();
+        uint256 amount = 400e6;
+        uint256 b = 40_000_000;
+
+        vm.prank(client);
+        channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), _signWaiver(id, amount, 1, b));
+
+        // Provider leg routed in the same tx — no time warp, no dispute window.
+        assertEq(router.callCount(), 1);
+        (address op, uint256 routedBytes, uint256 routedAmt) = router.calls(0);
+        assertEq(op, keyedProvider);
+        assertEq(routedBytes, b);
+        assertEq(routedAmt, amount);
+
+        PaymentChannel.Channel memory ch = channel.getChannel(id);
+        assertEq(uint8(ch.status), 2); // Closed
+        assertEq(ch.claimedAmount, amount);
+        // Client refunded deposit - amount immediately.
+        assertEq(usdc.balanceOf(client), 100_000e6 - DEPOSIT + (DEPOSIT - amount));
+    }
+
+    /// @dev The "I've been fully paid, just release my refund" case: the provider
+    ///      already `withdraw`-drained to the watermark, so both sign that same
+    ///      nonce and the client gets an instant refund with no second route.
+    function test_cooperativeClose_afterFullWithdraw_refundsClientNoRoute() public {
+        bytes32 id = _openKeyed();
+        uint256 amount = 400e6;
+        uint256 b = 40_000_000;
+
+        vm.prank(keyedProvider);
+        channel.withdraw(id, amount, 1, b, _signClient(id, amount, 1, b));
+        assertEq(router.callCount(), 1);
+
+        // Cooperative close at the SAME (already-withdrawn) watermark.
+        vm.prank(client);
+        channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), _signWaiver(id, amount, 1, b));
+
+        // No second route — provider was already fully paid via withdraw.
+        assertEq(router.callCount(), 1);
+        assertEq(uint8(channel.getChannel(id).status), 2);
+        assertEq(usdc.balanceOf(client), 100_000e6 - amount);
+    }
+
+    function test_cooperativeClose_eitherPartyMaySubmit() public {
+        bytes32 id = _openKeyed();
+        uint256 amount = 250e6;
+        uint256 b = 25_000_000;
+
+        // Provider submits (symmetric to the client-submits happy path above).
+        vm.prank(keyedProvider);
+        channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), _signWaiver(id, amount, 1, b));
+        assertEq(uint8(channel.getChannel(id).status), 2);
+    }
+
+    function test_cooperativeClose_onlyParty() public {
+        bytes32 id = _openKeyed();
+        uint256 amount = 100e6;
+        uint256 b = 10_000_000;
+        vm.prank(stranger);
+        vm.expectRevert(PaymentChannel.NotChannelParty.selector);
+        channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), _signWaiver(id, amount, 1, b));
+    }
+
+    function test_cooperativeClose_revertsOnBadClientSig() public {
+        bytes32 id = _openKeyed();
+        uint256 amount = 100e6;
+        uint256 b = 10_000_000;
+        // Client voucher signed by the wrong key (the provider's).
+        bytes memory badClient = _signTypedAs(PROVIDER_PK, VOUCHER_TYPEHASH, id, amount, 1, b);
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.InvalidVoucherSignature.selector);
+        channel.cooperativeClose(id, amount, 1, b, badClient, _signWaiver(id, amount, 1, b));
+    }
+
+    function test_cooperativeClose_revertsOnBadProviderWaiver() public {
+        bytes32 id = _openKeyed();
+        uint256 amount = 100e6;
+        uint256 b = 10_000_000;
+        // Waiver signed by the wrong key (the client's) — a client voucher can
+        // never stand in for the provider's waiver.
+        bytes memory badWaiver = _signTypedAs(CLIENT_PK, COOPERATIVE_CLOSE_TYPEHASH, id, amount, 1, b);
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.InvalidCooperativeCloseSignature.selector);
+        channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), badWaiver);
+    }
+
+    /// @dev A provider voucher-typed signature (right key, WRONG typehash) is not a
+    ///      valid waiver — proves the typehash separation, not just signer identity.
+    function test_cooperativeClose_revertsOnWrongTypehashWaiver() public {
+        bytes32 id = _openKeyed();
+        uint256 amount = 100e6;
+        uint256 b = 10_000_000;
+        bytes memory wrongType = _signTypedAs(PROVIDER_PK, VOUCHER_TYPEHASH, id, amount, 1, b);
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.InvalidCooperativeCloseSignature.selector);
+        channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), wrongType);
+    }
+
+    /// @dev Finality anchor: a waiver below the on-chain watermark can never
+    ///      under-settle — it reverts against the advanced `claimed*` state.
+    function test_cooperativeClose_staleWaiverCannotUnderSettle() public {
+        bytes32 id = _openKeyed();
+        // Provider withdraws to a high watermark (500e6, nonce 2).
+        vm.prank(keyedProvider);
+        channel.withdraw(id, 500e6, 2, 50_000_000, _signClient(id, 500e6, 2, 50_000_000));
+
+        // A stale-low cooperative close (400e6) — even at a strictly higher nonce —
+        // regresses the amount and reverts.
+        vm.prank(client);
+        vm.expectRevert(
+            abi.encodeWithSelector(PaymentChannel.AmountRegression.selector, uint256(400e6), uint256(500e6))
+        );
+        channel.cooperativeClose(
+            id, 400e6, 3, 60_000_000, _signClient(id, 400e6, 3, 60_000_000), _signWaiver(id, 400e6, 3, 60_000_000)
+        );
+    }
+
+    function test_cooperativeClose_revertsWhenNotOpen() public {
+        bytes32 id = _openKeyed();
+        uint256 amount = 300e6;
+        uint256 b = 30_000_000;
+        // Start a normal close → status Closing; cooperativeClose is Open-only.
+        vm.prank(client);
+        channel.closeChannel(id, amount, 1, b, _signClient(id, amount, 1, b));
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.ChannelNotOpen.selector);
+        channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), _signWaiver(id, amount, 1, b));
+    }
+
+    /// @dev A paused FeeRouter must not freeze the client refund: the refund lands,
+    ///      the provider leg defers, and a post-unpause flush routes it.
+    function test_cooperativeClose_routerPaused_defersProviderLeg() public {
+        bytes32 id = _openKeyed();
+        uint256 amount = 400e6;
+        uint256 b = 40_000_000;
+
+        router.setPaused(true);
+        vm.prank(client);
+        channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), _signWaiver(id, amount, 1, b));
+
+        // Refund landed despite the paused router; provider leg parked.
+        assertEq(usdc.balanceOf(client), 100_000e6 - amount);
+        assertEq(router.callCount(), 0);
+        assertTrue(channel.settlementDeferred(id));
+        assertEq(channel.deferredSettlementCount(), 1);
+
+        // Flush after unpause routes the deferred provider leg.
+        router.setPaused(false);
+        channel.flushDeferredSettlement(id);
+        assertEq(router.callCount(), 1);
+        (address op, uint256 routedBytes, uint256 routedAmt) = router.calls(0);
+        assertEq(op, keyedProvider);
+        assertEq(routedBytes, b);
+        assertEq(routedAmt, amount);
+        assertFalse(channel.settlementDeferred(id));
     }
 }
