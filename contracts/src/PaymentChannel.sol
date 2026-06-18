@@ -572,9 +572,9 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///         waiver (`providerCloseSig`) attests it holds no higher voucher and
     ///         waives the window. With both signatures over the same final tuple
     ///         there is nothing left to dispute (ADR 003 § Cooperative close), so
-    ///         the client's `deposit - amount` refund and the provider's
-    ///         `amount - withdrawnAmount` settle leg both land in this
-    ///         transaction — no funds wait behind the window.
+    ///         on success the client's `deposit - amount` refund and the
+    ///         provider's `amount - withdrawnAmount` settle leg both land in this
+    ///         one transaction — no funds wait behind the window.
     /// @dev Open-only, mirroring `closeChannel`'s pre-expiry gate: a channel
     ///      already in the dispute window settles through `settleChannel`. The
     ///      shared `claimed*` watermark is advanced with `strictNonce = false`,
@@ -586,8 +586,17 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ///      anchor and a stale waiver can never under-settle. `_verifyVoucher`
     ///      and `_verifyCooperativeClose` may staticcall ERC-1271 signers before
     ///      the state writes; safe under `nonReentrant` + checks-effects-
-    ///      interactions. Mirrors `settleChannel`'s paused-router defer branch so
-    ///      a paused `FeeRouter` cannot freeze the client refund.
+    ///      interactions.
+    /// @dev Unlike `settleChannel`, this does NOT defer under a paused
+    ///      `FeeRouter` — it follows `withdraw`'s posture (#890). `settleChannel`
+    ///      must defer because it acts on a channel already in `Closing`, where a
+    ///      revert would strand the refund (the channel cannot return to `Open`
+    ///      for `reclaimExpired`). Here the channel is `Open` and the transition
+    ///      is atomic `Open → Closed`: if `_route` reverts under a paused router
+    ///      the whole call rolls back, the channel stays `Open`, and nothing is
+    ///      stranded — the caller retries post-unpause or falls back to the
+    ///      `closeChannel` path. So no defer branch (and no deferred-settlement
+    ///      bookkeeping) is warranted.
     // slither-disable-next-line reentrancy-no-eth
     function cooperativeClose(
         bytes32 channelId,
@@ -615,19 +624,11 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
         ch.status = Status.Closed;
 
         if (clientRefund != 0) usdc.safeTransfer(ch.client, clientRefund);
-        // Identical paused-router tolerance to `settleChannel`: the client refund
-        // already left, so reverting would trap it. Defer the provider leg under a
-        // paused router (flushable post-unpause) instead of failing the exit.
-        if (settleAmount != 0) {
-            // aderyn-ignore-next-line(reentrancy-state-change)
-            if (IFeeRouterSettlement(feeRouter).paused()) {
-                // slither-disable-next-line unused-return
-                _deferredSettlements.add(channelId);
-                emit SettlementDeferred(channelId, ch.provider, settleAmount, settleBytes);
-            } else {
-                _route(ch.provider, settleBytes, settleAmount);
-            }
-        }
+        // No paused-router defer (unlike `settleChannel`): a paused `_route`
+        // reverts the whole atomic `Open → Closed` call, leaving the channel
+        // `Open` with nothing stranded. The caller retries post-unpause or falls
+        // back to `closeChannel`.
+        if (settleAmount != 0) _route(ch.provider, settleBytes, settleAmount);
 
         emit ChannelCooperativelyClosed(channelId, ch.provider, settleAmount, settleBytes, clientRefund);
     }

@@ -1851,31 +1851,39 @@ contract PaymentChannelTest is Test {
         channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), _signWaiver(id, amount, 1, b));
     }
 
-    /// @dev A paused FeeRouter must not freeze the client refund: the refund lands,
-    ///      the provider leg defers, and a post-unpause flush routes it.
-    function test_cooperativeClose_routerPaused_defersProviderLeg() public {
+    /// @dev Unlike `settleChannel`, `cooperativeClose` does NOT defer under a
+    ///      paused router (#890 posture): the whole atomic `Open → Closed` call
+    ///      reverts, leaving the channel `Open` with nothing stranded — no refund,
+    ///      no watermark advance, no deferred-settlement entry. The same call
+    ///      succeeds once the router is unpaused.
+    function test_cooperativeClose_routerPaused_revertsThenSucceedsAfterUnpause() public {
         bytes32 id = _openKeyed();
         uint256 amount = 400e6;
         uint256 b = 40_000_000;
 
         router.setPaused(true);
         vm.prank(client);
+        vm.expectRevert(bytes("MockSettlementRouter: paused"));
         channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), _signWaiver(id, amount, 1, b));
 
-        // Refund landed despite the paused router; provider leg parked.
-        assertEq(usdc.balanceOf(client), 100_000e6 - amount);
+        // Whole tx rolled back: channel still Open, nothing routed/deferred/refunded.
+        PaymentChannel.Channel memory chBefore = channel.getChannel(id);
+        assertEq(uint8(chBefore.status), 0); // Open
+        assertEq(chBefore.claimedAmount, 0);
         assertEq(router.callCount(), 0);
-        assertTrue(channel.settlementDeferred(id));
-        assertEq(channel.deferredSettlementCount(), 1);
+        assertEq(channel.deferredSettlementCount(), 0);
+        assertEq(usdc.balanceOf(client), 100_000e6 - DEPOSIT);
 
-        // Flush after unpause routes the deferred provider leg.
+        // After unpause the same signatures settle cleanly in one tx.
         router.setPaused(false);
-        channel.flushDeferredSettlement(id);
+        vm.prank(client);
+        channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), _signWaiver(id, amount, 1, b));
+        assertEq(uint8(channel.getChannel(id).status), 2); // Closed
         assertEq(router.callCount(), 1);
         (address op, uint256 routedBytes, uint256 routedAmt) = router.calls(0);
         assertEq(op, keyedProvider);
         assertEq(routedBytes, b);
         assertEq(routedAmt, amount);
-        assertFalse(channel.settlementDeferred(id));
+        assertEq(usdc.balanceOf(client), 100_000e6 - amount);
     }
 }
