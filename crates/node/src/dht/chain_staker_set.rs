@@ -80,6 +80,7 @@ use tracing::{debug, info, warn};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::{StakerChange, StakerSet};
 use crate::metrics::Metrics;
+use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 
 /// Page size for the initial paginated `getActiveNodes` read.
@@ -287,7 +288,7 @@ async fn watcher_loop<P>(
                 // re-opens during one continuous outage do NOT re-count.
                 metrics.staker_set_watcher_backoff_started();
                 warn!(
-                    %err,
+                    err = %sanitize_rpc_display(&err),
                     backoff_secs = backoff.as_secs(),
                     "ChainStakerSet watcher RPC error; restarting after backoff"
                 );
@@ -444,7 +445,7 @@ async fn apply_operator_change<P>(
             // alongside the loud `warn!`.
             metrics.staker_set_watcher_resolve_failure();
             warn!(
-                %err,
+                err = %sanitize_rpc_display(&err),
                 %operator,
                 "nodeIdOf RPC failed; cached active set may diverge from chain state for this operator"
             );

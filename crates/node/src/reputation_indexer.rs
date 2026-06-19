@@ -41,6 +41,7 @@ use iroh::PublicKey;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::payment_channel::PaymentChannel;
 
@@ -201,7 +202,7 @@ async fn watcher_loop<P>(
             Err(err) => {
                 metrics.reputation_indexer_rpc_failure();
                 warn!(
-                    %err,
+                    err = %sanitize_rpc_display(&err),
                     backoff_secs = backoff.as_secs(),
                     "settlement-indexer RPC error; resubscribing after backoff"
                 );

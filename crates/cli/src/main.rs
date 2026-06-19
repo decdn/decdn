@@ -11,8 +11,23 @@ use clap::Parser;
 use decdn_cli::commands;
 use decdn_common::cli::{self, Cli, Command, ConfigCommand};
 
+/// Print failures through [`decdn_common::redact::sanitize_err_chain`] rather
+/// than letting `anyhow`'s `Termination` impl `Debug`-print the raw chain: a
+/// chain-RPC failure's source error carries the `rpc_url` (API keys live in its
+/// path/query), and this is the single boundary every CLI command propagates
+/// to. See issue #954.
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli.config.map(|p| cli::common::expand_tilde(&p));

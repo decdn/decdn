@@ -85,6 +85,7 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use anyhow::{Context, Result};
+use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
     ChannelId, ChannelState, ChannelStateStore, PendingSettle, PendingSettleStore, StoreError,
@@ -547,7 +548,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             let ch = match self.contract.getChannel(st.channel_id).call().await {
                 Ok(ch) => ch,
                 Err(err) => {
-                    warn!(%err, channel_id = %st.channel_id, "shutdown close: getChannel failed");
+                    warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "shutdown close: getChannel failed");
                     continue;
                 }
             };
@@ -624,14 +625,14 @@ async fn send_close<P: Provider + Clone>(
                         false
                     }
                     Err(err) => {
-                        warn!(%err, %channel_id, "closeChannel receipt failed");
+                        warn!(err = %sanitize_rpc_display(&err), %channel_id, "closeChannel receipt failed");
                         false
                     }
                 }
             })
         }
         Err(err) => {
-            warn!(%err, %channel_id, "closeChannel send failed");
+            warn!(err = %sanitize_rpc_display(&err), %channel_id, "closeChannel send failed");
             None
         }
     }
@@ -659,7 +660,7 @@ async fn record_pending_after_close<P: Provider + Clone>(
             // whole feature targets) the client has no incentive to settle, so
             // the remainder will NOT auto-settle: an operator must intervene.
             error!(
-                %err, %channel_id,
+                err = %sanitize_rpc_display(&err), %channel_id,
                 "post-close getChannel failed; settle obligation NOT recorded — \
                  if clientRefund==0 the remainder will not auto-settle, \
                  call settleChannel(<channel_id>) manually after the dispute window"
@@ -902,7 +903,7 @@ async fn watcher_loop<P: Provider + Clone>(
             }
             Err(err) => {
                 warn!(
-                    %err,
+                    err = %sanitize_rpc_display(&err),
                     backoff_secs = backoff.as_secs(),
                     "PaymentChannel watcher RPC error; restarting after backoff"
                 );
@@ -1781,7 +1782,7 @@ async fn redeem_one<P: Provider + Clone>(
     .await
     {
         metrics.redemption_failure();
-        warn!(%err, %channel_id, "redemption attempt failed");
+        warn!(err = %sanitize_rpc_display(&err), %channel_id, "redemption attempt failed");
     }
 }
 
@@ -2168,7 +2169,7 @@ async fn try_close_for_expiry<P: Provider + Clone>(
     let ch = match contract.getChannel(st.channel_id).call().await {
         Ok(ch) => ch,
         Err(err) => {
-            warn!(%err, channel_id = %st.channel_id, "expiry sweep: getChannel failed");
+            warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "expiry sweep: getChannel failed");
             return;
         }
     };
@@ -2250,7 +2251,7 @@ async fn try_settle<P: Provider + Clone>(
         Err(err) => {
             metrics.settlement_finalize_transient_send();
             warn!(
-                %err, %channel_id, outcome = "transient_send",
+                err = %sanitize_rpc_display(&err), %channel_id, outcome = "transient_send",
                 "settleChannel send failed; will retry next sweep"
             );
             return;
@@ -2261,7 +2262,7 @@ async fn try_settle<P: Provider + Clone>(
         Err(err) => {
             metrics.settlement_finalize_transient_receipt();
             warn!(
-                %err, %channel_id, outcome = "transient_receipt",
+                err = %sanitize_rpc_display(&err), %channel_id, outcome = "transient_receipt",
                 "settleChannel receipt failed; will retry next sweep"
             );
             return;
@@ -2352,7 +2353,7 @@ async fn drop_pending_if_finalized<P: Provider + Clone>(
         }
         Err(err) => {
             record_revert_resolution(metrics, None);
-            warn!(%err, %channel_id, "post-revert getChannel failed; will retry next sweep");
+            warn!(err = %sanitize_rpc_display(&err), %channel_id, "post-revert getChannel failed; will retry next sweep");
         }
     }
 }

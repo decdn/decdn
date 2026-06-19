@@ -98,6 +98,7 @@ use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
 use crate::metrics::Metrics;
+use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::origin_assignment::OriginAssignment;
 use decdn_incentive::publisher_registry::PublisherRegistry;
@@ -584,7 +585,7 @@ async fn watcher_loop<P>(
                 state.arm_resync();
                 metrics.origin_directory_watcher_backoff_started();
                 warn!(
-                    %err,
+                    err = %sanitize_rpc_display(&err),
                     backoff_secs = backoff.as_secs(),
                     "ChainOriginDirectory watcher RPC error; restarting after backoff"
                 );
@@ -872,7 +873,7 @@ async fn on_content_claimed<R: OriginChainReads>(
     });
     if !namespace_known && let Err(err) = resync_namespace(reads, cache, metrics, namespace).await {
         metrics.origin_directory_watcher_resolve_failure();
-        warn!(%err, %namespace, "getOrigins for newly-claimed namespace failed; origins deferred");
+        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins for newly-claimed namespace failed; origins deferred");
     }
 }
 
@@ -887,7 +888,7 @@ async fn on_namespace_changed<R: OriginChainReads>(
 ) {
     if let Err(err) = resync_namespace(reads, cache, metrics, namespace).await {
         metrics.origin_directory_watcher_resolve_failure();
-        warn!(%err, %namespace, "getOrigins re-read failed on activation; namespace origins deferred");
+        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins re-read failed on activation; namespace origins deferred");
     }
 }
 
@@ -900,7 +901,7 @@ async fn on_default_open_changed<R: OriginChainReads>(
 ) {
     if let Err(err) = resync_default_open(reads, cache, metrics).await {
         metrics.origin_directory_watcher_resolve_failure();
-        warn!(%err, "getOrigins(0) re-read failed on default-open change; deferred");
+        warn!(err = %sanitize_rpc_display(&err), "getOrigins(0) re-read failed on default-open change; deferred");
     }
 }
 
@@ -924,7 +925,7 @@ async fn on_origin_removed<R: OriginChainReads>(
     };
     if let Err(err) = resynced {
         metrics.origin_directory_watcher_resolve_failure();
-        warn!(%err, %namespace, %operator, "getOrigins re-read failed on removal; applying precise delta fallback");
+        warn!(err = %sanitize_rpc_display(&err), %namespace, %operator, "getOrigins re-read failed on removal; applying precise delta fallback");
         delta_remove_origin(cache, metrics, namespace, operator);
     }
 }
@@ -973,7 +974,7 @@ async fn resolve_and_store_operators<R: OriginChainReads>(
             Ok(None) => debug!(%op, "authorized operator has no NodeId binding; not probeable"),
             Err(err) => {
                 metrics.origin_directory_watcher_resolve_failure();
-                warn!(%err, %op, "nodeIdOf failed; operator unmapped until a later event");
+                warn!(err = %sanitize_rpc_display(&err), %op, "nodeIdOf failed; operator unmapped until a later event");
             }
         }
     }
