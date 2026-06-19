@@ -67,8 +67,10 @@ pub fn strip_urls(raw: &str) -> Cow<'_, str> {
     match remove_for_url_clauses(raw) {
         // Nothing dropped: feed the original slice on so the borrow survives.
         Cow::Borrowed(s) => redact_bare_urls(s),
-        // A clause was dropped: the bare-URL pass works on the owned result.
-        Cow::Owned(s) => Cow::Owned(redact_bare_urls(&s).into_owned()),
+        // A clause was dropped. Only re-scan when a bare URL might remain;
+        // otherwise hand back the owned buffer without a redundant copy.
+        Cow::Owned(s) if s.contains("://") => Cow::Owned(redact_bare_urls(&s).into_owned()),
+        Cow::Owned(s) => Cow::Owned(s),
     }
 }
 
@@ -82,14 +84,17 @@ fn remove_for_url_clauses(s: &str) -> Cow<'_, str> {
     let mut rest = s;
     while let Some(pos) = rest.find(NEEDLE) {
         out.push_str(rest.get(..pos).unwrap_or(""));
-        let after = rest.get(pos..).unwrap_or("");
-        let Some(close) = after.find(')') else {
-            // Unterminated clause: drop the rest entirely.
-            rest = "";
-            break;
-        };
-        // Resume just past the closing paren of the clause.
-        rest = after.get(close + 1..).unwrap_or("");
+        // reqwest writes ` for url ({url})`; a URL contains no whitespace, so
+        // scan the token to the next whitespace/end rather than the first `)` —
+        // a `)` can appear unescaped in a URL path/query (`url::Url` leaves
+        // sub-delims as-is), and stopping there would strand the secret-bearing
+        // tail. A single trailing `)` (the clause's own close) is then dropped.
+        let after = rest.get(pos + NEEDLE.len()..).unwrap_or("");
+        let url_end = after
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after.len());
+        let tail = after.get(url_end..).unwrap_or("");
+        rest = tail.strip_prefix(')').unwrap_or(tail);
     }
     out.push_str(rest);
     Cow::Owned(out)
@@ -97,10 +102,11 @@ fn remove_for_url_clauses(s: &str) -> Cow<'_, str> {
 
 /// Replace each bare `<scheme>://<token>` in `s` with `<redacted-url>`.
 ///
-/// Keys off the `://` separator and walks back over the scheme letters, so it
-/// matches ANY scheme regardless of case — `http`, `https`, `HTTPS`, `ws`, … —
-/// rather than a hard-coded `http`/`https` prefix that a future non-`reqwest`
-/// renderer (or an uppercased URL) could slip past.
+/// Keys off the `://` separator and walks back over the scheme characters
+/// (RFC 3986: ALPHA / DIGIT / `+` / `-` / `.`), so it matches ANY scheme
+/// regardless of case — `http`, `HTTPS`, `ws`, `git+ssh`, … — rather than a
+/// hard-coded `http`/`https` prefix a future non-`reqwest` renderer (or an
+/// uppercased URL) could slip past.
 fn redact_bare_urls(s: &str) -> Cow<'_, str> {
     if !s.contains("://") {
         return Cow::Borrowed(s);
@@ -108,21 +114,22 @@ fn redact_bare_urls(s: &str) -> Cow<'_, str> {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(sep) = rest.find("://") {
-        // Walk back over the scheme letters (ASCII alnum) to the URL's start.
+        // Walk back over the scheme characters to the URL's start.
         let before = rest.get(..sep).unwrap_or("");
         let scheme_len = before
             .bytes()
             .rev()
-            .take_while(u8::is_ascii_alphanumeric)
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
             .count();
         let url_start = sep - scheme_len;
         out.push_str(rest.get(..url_start).unwrap_or(""));
         out.push_str("<redacted-url>");
-        // Drop the rest of the token: `://` plus everything up to the first
-        // whitespace or closing delimiter.
+        // A URL contains no whitespace; consume the whole token. `)`/`?`/`&`
+        // etc. can be part of the path/query, so only whitespace ends it —
+        // over-consuming adjacent punctuation is safe; leaking a secret is not.
         let after = rest.get(sep + 3..).unwrap_or("");
         let end = after
-            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '"' | '\'' | ','))
+            .find(|c: char| c.is_whitespace())
             .unwrap_or(after.len());
         rest = after.get(end..).unwrap_or("");
     }
@@ -266,6 +273,19 @@ mod tests {
             strip_urls("boom for url (https://a.example/K1) then for url (https://b.example/K2)");
         assert!(!two.contains("K1") && !two.contains("K2"));
         assert_eq!(two, "boom then");
+    }
+
+    #[test]
+    fn strip_urls_strips_url_containing_literal_paren() {
+        // A `)` is a legal unescaped sub-delim in a URL path/query; it must not
+        // end the ` for url (...)` clause early and strand the secret tail.
+        let clause = strip_urls("read failed for url (https://eth.example/pa)th?key=SECRETKEY)");
+        assert!(!clause.contains("SECRETKEY"), "leaked: {clause}");
+        assert_eq!(clause, "read failed");
+        // Same for the bare-URL backstop (no ` for url (` wrapper).
+        let bare = strip_urls("reach https://eth.example/pa)th?key=SECRETKEY now");
+        assert!(!bare.contains("SECRETKEY"), "leaked: {bare}");
+        assert_eq!(bare, "reach <redacted-url> now");
     }
 
     #[test]

@@ -70,8 +70,9 @@ pub async fn active_nodes(
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse().with_context(|| {
         // An rpc_url secret commonly lives in the path/query (Infura/Alchemy
         // keys), which userinfo redaction wouldn't scrub — so hide the value
-        // entirely, matching `config validate`'s `<redacted> (N chars)` and the
-        // sibling parse sites in `chain_ctx` / `setup` (issue #954).
+        // entirely (the policy `config validate` follows of never echoing
+        // rpc_url), like the sibling parse sites in `chain_ctx` / `setup`
+        // (issue #954).
         format!(
             "rpc_url is not a valid URL (<redacted>, {} chars)",
             rpc_url.len()

@@ -36,7 +36,8 @@ fn setup_dry_run_does_not_leak_rpc_url_on_unreachable_endpoint() {
     let data_dir = TempDir::new().expect("temp data dir");
     // Unreachable endpoint; the secret sits in the path where an
     // Infura/Alchemy key would live.
-    let rpc_url = format!("http://127.0.0.1:{}/v3/{FAKE_KEY}", refused_port());
+    let host_port = format!("127.0.0.1:{}", refused_port());
+    let rpc_url = format!("http://{host_port}/v3/{FAKE_KEY}");
 
     let output = Command::new(env!("CARGO_BIN_EXE_decdn"))
         .args(["setup", "--mbps", "100", "--region", "US", "--dry-run"])
@@ -59,15 +60,18 @@ fn setup_dry_run_does_not_leak_rpc_url_on_unreachable_endpoint() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // The secret — and the whole URL — must not appear in either stream.
-    assert!(
-        !stdout.contains(FAKE_KEY) && !stderr.contains(FAKE_KEY),
-        "rpc_url secret leaked.\nstdout: {stdout}\nstderr: {stderr}"
-    );
-    assert!(
-        !stdout.contains("127.0.0.1:1") && !stderr.contains("127.0.0.1:1"),
-        "rpc_url host:port leaked.\nstdout: {stdout}\nstderr: {stderr}"
-    );
+    // The secret — and the whole URL (including its actual host:port) — must
+    // not appear in either stream.
+    for (name, stream) in [("stdout", &stdout), ("stderr", &stderr)] {
+        assert!(
+            !stream.contains(FAKE_KEY),
+            "rpc_url secret leaked on {name}: {stream}"
+        );
+        assert!(
+            !stream.contains(&host_port) && !stream.contains(&*rpc_url),
+            "rpc_url host:port leaked on {name}: {stream}"
+        );
+    }
 
     // Positive checks: the error went through the new `main()` sanitizer
     // boundary (the `Error:` prefix), and the failure is still actionable —
