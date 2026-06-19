@@ -35,14 +35,16 @@ use decdn_incentive::{
     bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::client_requester::{
-    ChannelContext, ChannelLedger, Cumulative, VoucherProgress, stream_fetch, stream_fetch_shared,
-    stream_fetch_tracked,
+    ChannelContext, ChannelLedger, Cumulative, UpstreamVoucherRejected, VoucherProgress,
+    stream_fetch, stream_fetch_shared, stream_fetch_tracked,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver, UNKNOWN_REGION};
-use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
+use decdn_protocol::client::{
+    ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, VoucherRejectReason,
+};
 use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
 use iroh::{Endpoint, EndpointAddr};
 
@@ -227,6 +229,104 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
         only.last_bytes_delivered()
     );
     anyhow::ensure!(only.last_amount() > U256::ZERO, "amount must be non-zero");
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Watermark-on-error contract (#852) on the `stream_fetch_tracked` path: when a
+/// pull errors mid-stream *after* at least one voucher was acked, `progress` must
+/// still hold the last acked watermark so the caller can persist what it paid —
+/// it must NOT reset to `None`.
+///
+/// Induced deterministically by deposit exhaustion (no mock server): a 1.5 MiB
+/// blob needs two vouchers — cumulative amount 10 then 15 at `RATE_PER_MB` — but
+/// the channel deposit is 12. The node acks voucher 1 (amount 10 <= 12) and
+/// rejects voucher 2 (amount 15 > 12) as over-deposit, so the fetch errors after
+/// one acked voucher. `progress.acked()` must then report voucher 1 (nonce 1),
+/// proving the copy-back in `stream_fetch_tracked` runs on the error path.
+#[tokio::test(flavor = "multi_thread")]
+async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
+    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → two vouchers (amount 10 then 15).
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    // Between voucher 1's cumulative amount (10) and voucher 2's (15): voucher 1
+    // is acked, voucher 2 is rejected as over-deposit.
+    let deposit = U256::from(12u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(Arc::clone(&client_signer), deposit);
+    let mut progress = VoucherProgress::default();
+
+    let result = stream_fetch_tracked(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+        0,
+        &mut progress,
+    )
+    .await;
+
+    // Assert the *intended* failure mode, not just any error: voucher 2 must be
+    // rejected mid-stream as over-deposit. A regression that errors for some other
+    // reason (e.g. a transport fault) should fail this test loudly.
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("fetch must error when voucher 2 is over-deposit"))?;
+    let rejected = err
+        .downcast_ref::<UpstreamVoucherRejected>()
+        .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
+    anyhow::ensure!(
+        rejected.reason == VoucherRejectReason::InsufficientDeposit,
+        "voucher 2 must be rejected for InsufficientDeposit; got {:?}",
+        rejected.reason
+    );
+    // The contract: the watermark survives the error and reflects the one acked
+    // voucher (nonce 1), so the caller can still persist what it paid.
+    let acked = progress.acked().ok_or_else(|| {
+        anyhow::anyhow!("acked watermark must survive a post-ack error, got None")
+    })?;
+    anyhow::ensure!(
+        acked.0 == U256::from(1u64),
+        "exactly one voucher should be acked before the rejection; acked nonce = {}",
+        acked.0
+    );
 
     client_ep.close().await;
     server_ep.close().await;
