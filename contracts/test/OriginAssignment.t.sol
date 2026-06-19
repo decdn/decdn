@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { console2 } from "forge-std/console2.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { OriginAssignment } from "../src/OriginAssignment.sol";
@@ -371,6 +372,69 @@ contract OriginAssignmentTest is Test {
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
         );
         oa.addDefaultOpenOperator(opA);
+    }
+
+    /// @dev Build `n` distinct, capacity-bond-active operator addresses. `salt`
+    ///      offsets the address space so two calls produce disjoint sets.
+    function _makeActiveOps(uint160 n, uint160 salt) internal returns (address[] memory ops) {
+        ops = new address[](n);
+        for (uint160 i = 0; i < n; i++) {
+            address op = address(salt + i + 1);
+            ops[i] = op;
+            bond.setActive(op, true);
+        }
+    }
+
+    // Gas guard for the worst-case default-open rebuild at the 500
+    // `DEFAULT_OPEN_MAX_CEILING` (#780). `setDefaultOpenAllowlist` clears the
+    // current set then rebuilds, running a per-element `capacityBond.isActive`
+    // staticcall plus an `EnumerableSet.add` (~3 cold SSTOREs) over all 500
+    // entries. These two tests pin that cost so it can never silently drift
+    // toward the block gas limit.
+    //
+    // Headroom is THIN, not comfortable. `MockBondActivity.isActive` here does a
+    // single SLOAD; the real `CapacityBond.isActive` reads four storage slots
+    // (`_nodes[op].active`, `activeBond`, `unbondingOf.amount`, `ejected`), so
+    // the real per-element cost is ~3 extra cold SLOADs (~2100 gas each =>
+    // ~+3.15M over 500 elements). On top of the ~23.4M measured below that puts
+    // a real single-tx full rebuild at ~26.6M — ~83% of a 32M Arbitrum-class L2
+    // block (~1.2x headroom). Per #780 the team's decision is to KEEP the 500
+    // ceiling: governance is never forced into a 500-element atomic tx because
+    // `addDefaultOpenOperator` / `removeDefaultOpenOperator` deltas exist and
+    // should be preferred for large mutations; a future ceiling reduction is an
+    // optional follow-up. The 25M bound below guards the mock measurement (real
+    // ~28M), catching any regression that would erode the remaining headroom.
+    uint256 internal constant DEFAULT_OPEN_CEILING_GAS_BOUND = 25_000_000;
+
+    function test_defaultOpen_setAllowlist_atCeiling_gas() public {
+        address[] memory ops = _makeActiveOps(500, 0x100000);
+        vm.startPrank(admin);
+        oa.setDefaultOpenMaxOrigins(500);
+        uint256 before = gasleft();
+        oa.setDefaultOpenAllowlist(ops);
+        uint256 used = before - gasleft();
+        vm.stopPrank();
+        console2.log("setDefaultOpenAllowlist(500) gas (mock isActive):", used);
+        assertLt(used, DEFAULT_OPEN_CEILING_GAS_BOUND, "500-element rebuild drifting toward L2 block gas");
+        assertEq(oa.getOrigins(0).length, 500);
+    }
+
+    /// @notice Worst-case REPLACE: a full 500-element set is cleared AND a
+    ///         different 500-element set is rebuilt in one call, so both the
+    ///         remove loop and the add+validate loop run at full width (#780).
+    function test_defaultOpen_replaceAtCeiling_gas() public {
+        address[] memory first = _makeActiveOps(500, 0x100000);
+        address[] memory second = _makeActiveOps(500, 0x200000);
+        vm.startPrank(admin);
+        oa.setDefaultOpenMaxOrigins(500);
+        oa.setDefaultOpenAllowlist(first);
+        uint256 before = gasleft();
+        oa.setDefaultOpenAllowlist(second);
+        uint256 used = before - gasleft();
+        vm.stopPrank();
+        console2.log("setDefaultOpenAllowlist replace 500->500 gas (mock isActive):", used);
+        assertLt(used, DEFAULT_OPEN_CEILING_GAS_BOUND, "500->500 replace drifting toward L2 block gas");
+        assertEq(oa.getOrigins(0).length, 500);
     }
 
     // -----------------------------------------------------------------
