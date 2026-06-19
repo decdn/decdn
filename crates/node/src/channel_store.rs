@@ -202,6 +202,7 @@ impl StoredChannelState {
         self,
         last_signature: Vec<u8>,
         expires_at: u64,
+        cooperative_close_signed: bool,
     ) -> Result<ChannelState, StoreError> {
         if self.schema_version > SUPPORTED_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema {
@@ -231,6 +232,7 @@ impl StoredChannelState {
             U256::from_be_bytes(self.last_bytes_delivered),
             last_signature,
             expires_at,
+            cooperative_close_signed,
         ))
     }
 }
@@ -542,7 +544,7 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
     // version this binary understands; a version above `SUPPORTED_SCHEMA_VERSION`
     // is left for `into_state` to reject (its trailing layout is unknown). A v1
     // record has no trailer and hydrates with an empty signature and `0` expiry.
-    let (last_signature, expires_at, leftover): (Vec<u8>, u64, &[u8]) =
+    let (last_signature, expires_at, after_trailer): (Vec<u8>, u64, &[u8]) =
         if stored.schema_version >= 2 && stored.schema_version <= SUPPORTED_SCHEMA_VERSION {
             let (trailer, rest) =
                 postcard::take_from_bytes::<TrailerV2>(remainder).map_err(|err| {
@@ -554,6 +556,23 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
             (trailer.signature, trailer.expires_at, rest)
         } else {
             (Vec::new(), 0, remainder)
+        };
+    // Cooperative-close waiver flag (ADR 003 §Cooperative close): an optional
+    // trailing `bool` segment that only ever exists on v2+ records. Gate the
+    // decode on `schema_version >= 2`: a v1 record never wrote this segment, so
+    // any bytes after its (empty) trailer are NOT a coop-close `bool` and must
+    // not be decoded as one — doing so would mis-hydrate the flag or corrupt the
+    // load. v2+ records written before the flag existed simply have no trailing
+    // bytes, so they default to `false`, the additive forward-compat the
+    // `take_from_bytes` design intends.
+    let (cooperative_close_signed, leftover): (bool, &[u8]) =
+        if stored.schema_version >= 2 && !after_trailer.is_empty() {
+            postcard::take_from_bytes::<bool>(after_trailer).map_err(|err| StoreError::Corrupt {
+                channel_id: Some(channel_id),
+                detail: format!("postcard decode of coop-close flag failed: {err}"),
+            })?
+        } else {
+            (false, after_trailer)
         };
     // Forward-compat allowance is bounded: a malicious writer could pad
     // megabytes onto every record and silently inflate every read. Log
@@ -570,7 +589,7 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
             "channel state record has unusually large trailing bytes; possible malicious padding or large-additive-field schema skew",
         );
     }
-    stored.into_state(last_signature, expires_at)
+    stored.into_state(last_signature, expires_at, cooperative_close_signed)
 }
 
 impl ChannelStateStore for PersistentChannelStateStore {
@@ -637,6 +656,18 @@ impl ChannelStateStore for PersistentChannelStateStore {
         let trailer_encoded = postcard::to_allocvec(&trailer)
             .map_err(|err| StoreError::Codec(format!("postcard encode of v2 trailer: {err}")))?;
         encoded.extend_from_slice(&trailer_encoded);
+        // Cooperative-close waiver flag (ADR 003 §Cooperative close): a trailing
+        // `bool` segment after the v2 trailer. Appended rather than folded into
+        // `TrailerV2` (which would break decode of existing two-field records)
+        // and rather than bumping the schema version — `decode_record` defaults
+        // it to `false` when the bytes are absent, so old records decode
+        // unchanged and an old binary safely ignores the extra byte (additive
+        // forward-compat, the same posture as the v1→v2 trailer append).
+        let coop_encoded =
+            postcard::to_allocvec(&state.cooperative_close_signed()).map_err(|err| {
+                StoreError::Codec(format!("postcard encode of coop-close flag: {err}"))
+            })?;
+        encoded.extend_from_slice(&coop_encoded);
         let key: [u8; 32] = state.channel_id.into();
 
         let mut write_txn = self
@@ -1409,6 +1440,7 @@ mod tests {
             U256::from(byte) * U256::from(1_024u64),
             Some([byte; 65]),
             1_900_000_000 + u64::from(byte),
+            false,
         )
     }
 
@@ -1692,6 +1724,10 @@ mod tests {
         let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
         encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
         encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
+        // The cooperative-close flag is now a known trailing segment; the
+        // "further additive-field bytes" a future schema would write come after
+        // it, so encode a valid flag first, then the junk a newer writer appended.
+        encoded.extend_from_slice(&postcard::to_allocvec(&s.cooperative_close_signed())?);
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
 
         let mut tx = store.db.begin_write()?;
@@ -1709,6 +1745,66 @@ mod tests {
             *only == s,
             "decoded prefix + signature must equal the original record despite trailing bytes",
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cooperative_close_flag_persists_across_reopen() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let mut s = sample(0x55);
+        anyhow::ensure!(!s.cooperative_close_signed(), "fixture starts unflagged");
+        {
+            let store = PersistentChannelStateStore::open(dir.path())?;
+            store.record(&s)?;
+            // Marking persists the flag (clone-record-swap) and flips it in memory.
+            s.mark_cooperative_close_signed(&store)?;
+            anyhow::ensure!(s.cooperative_close_signed(), "mark sets the in-memory flag");
+        }
+        // Re-open from disk so the value comes from a fresh decode, not memory.
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let loaded = store
+            .get(s.channel_id)?
+            .ok_or_else(|| anyhow::anyhow!("record missing after reopen"))?;
+        anyhow::ensure!(
+            loaded.cooperative_close_signed(),
+            "cooperative-close flag must survive persist + reopen",
+        );
+        anyhow::ensure!(
+            loaded == s,
+            "the full record must round-trip with the flag set"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn record_without_cooperative_close_segment_decodes_false() -> anyhow::Result<()> {
+        // A record written before the flag existed (prefix + v2 trailer only,
+        // no coop segment) must decode with the flag defaulted to `false` rather
+        // than erroring — the additive forward-compat guarantee.
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s = sample(0x66);
+        let key: [u8; 32] = s.channel_id.into();
+        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
+        let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
+        encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
+        encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
+        // Deliberately stop here — no coop-flag segment.
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(CHANNEL_TABLE)?;
+            t.insert(&key, encoded.as_slice())?;
+        }
+        tx.commit()?;
+        let loaded = store
+            .get(s.channel_id)?
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        anyhow::ensure!(
+            !loaded.cooperative_close_signed(),
+            "a record with no coop segment must decode the flag as false",
+        );
+        anyhow::ensure!(loaded == s, "the rest of the record must decode unchanged");
         Ok(())
     }
 
@@ -1759,6 +1855,7 @@ mod tests {
             base.last_bytes_delivered(),
             None,
             0,
+            false,
         );
 
         // Hand-write a v1-shaped record: prefix only, schema_version forced

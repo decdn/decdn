@@ -320,6 +320,7 @@ async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
             U256::from(amount),
             None,
             0,
+            false,
         )
     };
 

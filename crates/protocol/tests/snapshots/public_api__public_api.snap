@@ -31,6 +31,7 @@ pub enum decdn_protocol::client::VoucherRejectReason
 pub decdn_protocol::client::VoucherRejectReason::AmountRegression
 pub decdn_protocol::client::VoucherRejectReason::BadSignature
 pub decdn_protocol::client::VoucherRejectReason::BytesRegression
+pub decdn_protocol::client::VoucherRejectReason::CooperativeCloseSigned
 pub decdn_protocol::client::VoucherRejectReason::Expired
 pub decdn_protocol::client::VoucherRejectReason::InsufficientDeposit
 pub decdn_protocol::client::VoucherRejectReason::RetryLater
@@ -314,6 +315,7 @@ pub enum decdn_protocol::VoucherRejectReason
 pub decdn_protocol::VoucherRejectReason::AmountRegression
 pub decdn_protocol::VoucherRejectReason::BadSignature
 pub decdn_protocol::VoucherRejectReason::BytesRegression
+pub decdn_protocol::VoucherRejectReason::CooperativeCloseSigned
 pub decdn_protocol::VoucherRejectReason::Expired
 pub decdn_protocol::VoucherRejectReason::InsufficientDeposit
 pub decdn_protocol::VoucherRejectReason::RetryLater
