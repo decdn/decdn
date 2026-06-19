@@ -14,6 +14,7 @@ pub mod key_gen;
 pub mod node;
 pub mod probe;
 pub mod run;
+pub mod setup;
 
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
 pub use common::{ConfigPathSource, LogFormat, default_config_path, default_data_dir};
@@ -27,6 +28,7 @@ pub use node::{
 };
 pub use probe::ProbeArgs;
 pub use run::RunArgs;
+pub use setup::SetupArgs;
 
 use std::path::PathBuf;
 
@@ -73,6 +75,11 @@ pub enum Command {
     /// Fetch a single content-addressed blob from a node over the paid
     /// `cdn/client/v1` path, paying per-MB from an open `PaymentChannel`.
     Fetch(FetchArgs),
+    /// Guided node onboarding (ADR 019 Phases 1–2): pre-flight checks,
+    /// key generation, bond, and on-chain registration, with a final
+    /// readiness summary. Thin orchestration over `key-gen` / `node bond` /
+    /// `node register` — submits no transaction the primitives don't.
+    Setup(SetupArgs),
     /// Operator-local admin commands that query a running node
     /// over its loopback HTTP surface (ADR 025).
     Node(NodeArgs),

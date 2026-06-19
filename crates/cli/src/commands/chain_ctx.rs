@@ -171,11 +171,15 @@ pub fn build_provider(
 ) -> anyhow::Result<impl Provider + Clone> {
     Ok(ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
-        .connect_http(
-            rpc_url
-                .parse()
-                .with_context(|| format!("rpc_url {rpc_url:?} is not a valid URL"))?,
-        ))
+        .connect_http(rpc_url.parse().with_context(|| {
+            // An rpc_url secret commonly lives in the path/query, which userinfo
+            // redaction wouldn't scrub — so hide the value entirely, matching
+            // `config validate`'s `<redacted> (N chars)`.
+            format!(
+                "rpc_url is not a valid URL (<redacted>, {} chars)",
+                rpc_url.len()
+            )
+        })?))
 }
 
 #[cfg(test)]
