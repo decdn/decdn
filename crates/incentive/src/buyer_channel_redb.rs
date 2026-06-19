@@ -158,8 +158,14 @@ impl RedbBuyerChannelStore {
                 ),
             });
         }
-        let db = Database::create(&path)
-            .map_err(|err| StoreError::Backend(format!("open buyer channel db: {err}")))?;
+        // A second concurrent opener (another `decdn fetch`/`bundle pull` on the
+        // same data dir) trips redb's process-exclusive write lock. Surface that
+        // as a clear, dedicated error instead of a raw backend string — two
+        // processes must not share one channel's voucher nonce (#942).
+        let db = Database::create(&path).map_err(|err| match err {
+            redb::DatabaseError::DatabaseAlreadyOpen => StoreError::AlreadyOpen { path },
+            other => StoreError::Backend(format!("open buyer channel db: {other}")),
+        })?;
         Ok(Self { db })
     }
 
@@ -451,6 +457,32 @@ mod tests {
             last_bytes_delivered: U256::from(bytes),
             expires_at: 9_999_999_999,
         }
+    }
+
+    #[test]
+    fn second_concurrent_open_is_already_open_not_raw_backend() {
+        // #942: a second opener on the same data dir (a concurrent `decdn fetch`
+        // / `bundle pull`) trips redb's process-exclusive write lock. It must
+        // fail with the dedicated, user-facing `AlreadyOpen` — never a raw redb
+        // backend string — and recover once the first handle drops.
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("d");
+        let first = RedbBuyerChannelStore::open(&data).unwrap();
+
+        let err = RedbBuyerChannelStore::open(&data).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::AlreadyOpen { path } if path == &data.join(BUYER_CHANNELS_DB_FILE)),
+            "wrong error or path: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("another decdn process is using") && msg.contains("--data-dir"),
+            "message must be user-facing, got: {msg}"
+        );
+
+        // Releasing the first handle frees the lock; a fresh open then succeeds.
+        drop(first);
+        RedbBuyerChannelStore::open(&data).expect("reopen after the first handle drops");
     }
 
     #[test]

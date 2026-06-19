@@ -271,6 +271,22 @@ pub enum StoreError {
         /// Underlying I/O error returned by the chmod syscall.
         source: std::io::Error,
     },
+    /// The store's database file is already opened (write-locked) by another
+    /// process — typically a second `decdn fetch`/`bundle pull` against the same
+    /// `--data-dir`. redb holds a process-exclusive lock for the lifetime of the
+    /// open `Database`, so the second opener fails fast rather than letting two
+    /// processes corrupt the shared per-channel voucher nonce (#942). Truly
+    /// concurrent shared-channel fetch is out of scope; run one process per
+    /// data dir, give each a distinct `--data-dir`, or let one process
+    /// multiplex internally.
+    #[error(
+        "another decdn process is using the channel store at {path} — run one fetch/pull \
+         at a time per --data-dir, or give each invocation a separate --data-dir"
+    )]
+    AlreadyOpen {
+        /// Filesystem path of the locked database file.
+        path: std::path::PathBuf,
+    },
 }
 
 /// In-memory [`ChannelStateStore`] for tests and the trait's reference
