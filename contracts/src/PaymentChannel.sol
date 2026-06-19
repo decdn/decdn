@@ -608,29 +608,34 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, Pausable, EIP712 {
     ) external nonReentrant {
         Channel storage ch = channels[channelId];
         _requireOpenAndUnexpired(ch);
-        if (msg.sender != ch.client && msg.sender != ch.provider) revert NotChannelParty();
+        address clientAddr = ch.client;
+        address providerAddr = ch.provider;
+        if (msg.sender != clientAddr && msg.sender != providerAddr) revert NotChannelParty();
 
-        _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.client, clientVoucherSig);
-        _verifyCooperativeClose(channelId, amount, nonce, bytesDelivered, ch.provider, providerCloseSig);
+        _verifyVoucher(channelId, amount, nonce, bytesDelivered, clientAddr, clientVoucherSig);
+        _verifyCooperativeClose(channelId, amount, nonce, bytesDelivered, providerAddr, providerCloseSig);
         // Non-strict nonce: the agreed final state may equal the current
         // watermark; a lower one reverts (the watermark is the finality anchor).
         _advanceClaimWatermark(ch, amount, nonce, bytesDelivered, false);
         _requireBytesTrackPayment(ch);
 
-        uint256 settleAmount = ch.claimedAmount - ch.withdrawnAmount;
-        uint256 settleBytes = ch.claimedBytes - ch.withdrawnBytes;
-        uint256 clientRefund = ch.deposit - ch.claimedAmount;
+        // `_advanceClaimWatermark` set the watermark to the agreed tuple, so
+        // `claimed*` now equal `amount`/`bytesDelivered`; reuse the stack vars
+        // instead of re-reading them from storage.
+        uint256 settleAmount = amount - ch.withdrawnAmount;
+        uint256 settleBytes = bytesDelivered - ch.withdrawnBytes;
+        uint256 clientRefund = ch.deposit - amount;
 
         ch.status = Status.Closed;
 
-        if (clientRefund != 0) usdc.safeTransfer(ch.client, clientRefund);
+        if (clientRefund != 0) usdc.safeTransfer(clientAddr, clientRefund);
         // No paused-router defer (unlike `settleChannel`): a paused `_route`
         // reverts the whole atomic `Open → Closed` call, leaving the channel
         // `Open` with nothing stranded. The caller retries post-unpause or falls
         // back to `closeChannel`.
-        if (settleAmount != 0) _route(ch.provider, settleBytes, settleAmount);
+        if (settleAmount != 0) _route(providerAddr, settleBytes, settleAmount);
 
-        emit ChannelCooperativelyClosed(channelId, ch.provider, settleAmount, settleBytes, clientRefund);
+        emit ChannelCooperativelyClosed(channelId, providerAddr, settleAmount, settleBytes, clientRefund);
     }
 
     /// @notice Any address: route the provider settle leg deferred by
