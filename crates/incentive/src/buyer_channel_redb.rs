@@ -470,7 +470,10 @@ mod tests {
         let first = RedbBuyerChannelStore::open(&data).unwrap();
 
         let err = RedbBuyerChannelStore::open(&data).unwrap_err();
-        assert!(matches!(err, StoreError::AlreadyOpen { .. }), "{err:?}");
+        assert!(
+            matches!(&err, StoreError::AlreadyOpen { path } if path == &data.join(BUYER_CHANNELS_DB_FILE)),
+            "wrong error or path: {err:?}"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("another decdn process is using") && msg.contains("--data-dir"),
