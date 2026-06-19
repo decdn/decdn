@@ -28,6 +28,7 @@ pub mod capacity_bond;
 pub mod channel;
 pub mod client_bridge;
 pub mod client_reputation;
+pub mod cooperative_close;
 pub mod erc20;
 pub mod eth_identity;
 pub mod node_register;
@@ -59,6 +60,7 @@ pub use client_reputation::{
     Admission, ClientReputation, ClientReputationConfig, ClientReputationLedger,
     ClientReputationStore, ConfigError as ClientReputationConfigError, MemoryClientReputationStore,
 };
+pub use cooperative_close::{CooperativeClose, SignedCooperativeClose};
 pub use erc20::Erc20;
 pub use probe_sig::{
     ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION,

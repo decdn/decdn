@@ -144,6 +144,25 @@ mod sol_types {
             /// client. Callable by anyone.
             function settleChannel(bytes32 channelId) external;
 
+            /// Settle in one tx with NO dispute window, given a client voucher
+            /// and a matching provider `CooperativeClose` waiver over the same
+            /// final tuple (ADR 003 §Cooperative close). Callable by client or
+            /// provider. Open-only.
+            ///
+            /// NOTE: this selector ships with the companion
+            /// `PaymentChannel.cooperativeClose` contract change — calling it
+            /// against a deployment that predates that change reverts (no such
+            /// function). Callers gate on a configured contract version / chain
+            /// rather than assuming every deployment exposes it.
+            function cooperativeClose(
+                bytes32 channelId,
+                uint256 amount,
+                uint256 nonce,
+                uint256 bytesDelivered,
+                bytes calldata clientVoucherSig,
+                bytes calldata providerCloseSig
+            ) external;
+
             // -----------------------------------------------------------------
             // Write functions (client/buyer path — #744)
             // -----------------------------------------------------------------
@@ -202,6 +221,19 @@ mod sol_types {
             /// Channel settled and closed. The watcher drops the persisted
             /// `ChannelState` via `ChannelStateStore::forget`.
             event ChannelSettled(
+                bytes32 indexed channelId,
+                address indexed provider,
+                uint256 routedAmount,
+                uint256 bytesDelivered,
+                uint256 clientRefund
+            );
+
+            /// Channel cooperatively closed and settled in one tx (no dispute
+            /// window). The watcher drops the persisted `ChannelState` exactly
+            /// as it does for `ChannelSettled` — `Closed` is terminal either way.
+            /// Emitted only by deployments carrying the companion
+            /// `cooperativeClose` contract change; older ones never emit it.
+            event ChannelCooperativelyClosed(
                 bytes32 indexed channelId,
                 address indexed provider,
                 uint256 routedAmount,

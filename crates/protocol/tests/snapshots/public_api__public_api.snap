@@ -6,6 +6,8 @@ pub mod decdn_protocol
 pub mod decdn_protocol::client
 pub enum decdn_protocol::client::ClientMessage
 pub decdn_protocol::client::ClientMessage::ChunkData(decdn_protocol::client::ChunkData)
+pub decdn_protocol::client::ClientMessage::CooperativeCloseAuth(decdn_protocol::client::CooperativeCloseAuth)
+pub decdn_protocol::client::ClientMessage::CooperativeCloseRequest(decdn_protocol::client::CooperativeCloseRequest)
 pub decdn_protocol::client::ClientMessage::StreamEnd
 pub decdn_protocol::client::ClientMessage::StreamError(decdn_protocol::client::StreamError)
 pub decdn_protocol::client::ClientMessage::StreamRequest(decdn_protocol::client::StreamRequest)
@@ -43,6 +45,16 @@ pub decdn_protocol::client::ClientBinding::binding_signature: alloc::vec::Vec<u8
 pub decdn_protocol::client::ClientBinding::ethereum_address: [u8; 20]
 impl decdn_protocol::client::ClientBinding
 pub const fn decdn_protocol::client::ClientBinding::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
+pub struct decdn_protocol::client::CooperativeCloseAuth
+pub decdn_protocol::client::CooperativeCloseAuth::amount: [u8; 32]
+pub decdn_protocol::client::CooperativeCloseAuth::bytes_delivered: [u8; 32]
+pub decdn_protocol::client::CooperativeCloseAuth::channel_id: [u8; 32]
+pub decdn_protocol::client::CooperativeCloseAuth::nonce: [u8; 32]
+pub decdn_protocol::client::CooperativeCloseAuth::signature: alloc::vec::Vec<u8>
+impl decdn_protocol::client::CooperativeCloseAuth
+pub const fn decdn_protocol::client::CooperativeCloseAuth::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
+pub struct decdn_protocol::client::CooperativeCloseRequest
+pub decdn_protocol::client::CooperativeCloseRequest::channel_id: [u8; 32]
 pub struct decdn_protocol::client::StreamRequest
 pub decdn_protocol::client::StreamRequest::byte_offset: u64
 pub decdn_protocol::client::StreamRequest::channel_id: [u8; 32]
@@ -76,6 +88,7 @@ impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize
 pub const decdn_protocol::client::CHUNK_SIZE: usize
+pub const decdn_protocol::client::COOPERATIVE_CLOSE_SIG_LEN: usize
 pub const decdn_protocol::client::DEFAULT_VOUCHER_INTERVAL_MB: u64
 pub const decdn_protocol::client::MAX_VOUCHER_INTERVAL_MB: u64
 pub const decdn_protocol::client::MB_BYTES: u64
@@ -202,6 +215,8 @@ pub mod decdn_protocol::message
 pub enum decdn_protocol::message::MessageValidationError
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen::len: usize
+pub decdn_protocol::message::MessageValidationError::InvalidCooperativeCloseSigLen
+pub decdn_protocol::message::MessageValidationError::InvalidCooperativeCloseSigLen::len: usize
 pub decdn_protocol::message::MessageValidationError::InvalidSlashSigLen
 pub decdn_protocol::message::MessageValidationError::InvalidSlashSigLen::len: usize
 pub decdn_protocol::message::MessageValidationError::InvalidVoucherSigLen
@@ -237,6 +252,8 @@ pub mod decdn_protocol::region
 pub fn decdn_protocol::region::is_valid_region(&str) -> bool
 pub enum decdn_protocol::ClientMessage
 pub decdn_protocol::ClientMessage::ChunkData(decdn_protocol::client::ChunkData)
+pub decdn_protocol::ClientMessage::CooperativeCloseAuth(decdn_protocol::client::CooperativeCloseAuth)
+pub decdn_protocol::ClientMessage::CooperativeCloseRequest(decdn_protocol::client::CooperativeCloseRequest)
 pub decdn_protocol::ClientMessage::StreamEnd
 pub decdn_protocol::ClientMessage::StreamError(decdn_protocol::client::StreamError)
 pub decdn_protocol::ClientMessage::StreamRequest(decdn_protocol::client::StreamRequest)
@@ -265,6 +282,8 @@ pub decdn_protocol::GossipPayload::ReputationReport(decdn_protocol::gossip::Repu
 pub enum decdn_protocol::MessageValidationError
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen::len: usize
+pub decdn_protocol::MessageValidationError::InvalidCooperativeCloseSigLen
+pub decdn_protocol::MessageValidationError::InvalidCooperativeCloseSigLen::len: usize
 pub decdn_protocol::MessageValidationError::InvalidSlashSigLen
 pub decdn_protocol::MessageValidationError::InvalidSlashSigLen::len: usize
 pub decdn_protocol::MessageValidationError::InvalidVoucherSigLen
