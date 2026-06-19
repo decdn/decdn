@@ -35,14 +35,16 @@ use decdn_incentive::{
     bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::client_requester::{
-    ChannelContext, ChannelLedger, Cumulative, VoucherProgress, stream_fetch, stream_fetch_shared,
-    stream_fetch_tracked,
+    ChannelContext, ChannelLedger, Cumulative, UpstreamVoucherRejected, VoucherProgress,
+    stream_fetch, stream_fetch_shared, stream_fetch_tracked,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver, UNKNOWN_REGION};
-use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
+use decdn_protocol::client::{
+    ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, VoucherRejectReason,
+};
 use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
 use iroh::{Endpoint, EndpointAddr};
 
@@ -301,9 +303,19 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     )
     .await;
 
+    // Assert the *intended* failure mode, not just any error: voucher 2 must be
+    // rejected mid-stream as over-deposit. A regression that errors for some other
+    // reason (e.g. a transport fault) should fail this test loudly.
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("fetch must error when voucher 2 is over-deposit"))?;
+    let rejected = err
+        .downcast_ref::<UpstreamVoucherRejected>()
+        .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
     anyhow::ensure!(
-        result.is_err(),
-        "fetch must error when voucher 2 is rejected as over-deposit"
+        rejected.reason == VoucherRejectReason::InsufficientDeposit,
+        "voucher 2 must be rejected for InsufficientDeposit; got {:?}",
+        rejected.reason
     );
     // The contract: the watermark survives the error and reflects the one acked
     // voucher (nonce 1), so the caller can still persist what it paid.
