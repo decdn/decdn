@@ -43,6 +43,7 @@ use tracing::{debug, info, warn};
 
 use crate::dht::routing::NodeId;
 use crate::metrics::Metrics;
+use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 
 /// Page size for the initial paginated `getActiveNodes` read (matches
@@ -211,7 +212,7 @@ async fn watcher_loop<P>(
                 // staker-set watcher, #788).
                 metrics.node_address_watcher_backoff_started();
                 warn!(
-                    %err,
+                    err = %sanitize_rpc_display(&err),
                     backoff_secs = backoff.as_secs(),
                     "ChainNodeAddressDirectory watcher RPC error; restarting after backoff \
                      (binding map may be briefly stale)"

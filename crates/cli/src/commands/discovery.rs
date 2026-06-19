@@ -11,7 +11,6 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::ProviderBuilder;
 use anyhow::Context;
-use decdn_common::redact::redact_userinfo;
 use decdn_incentive::capacity_bond::CapacityBond;
 use iroh::PublicKey;
 
@@ -69,8 +68,15 @@ pub async fn active_nodes(
     capacity_bond_addr: Address,
 ) -> anyhow::Result<Vec<NodeCandidate>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse().with_context(|| {
-        // Redact any `user:pass@` userinfo: an RPC URL can embed an API key.
-        format!("rpc_url {:?} is not a valid URL", redact_userinfo(rpc_url))
+        // An rpc_url secret commonly lives in the path/query (Infura/Alchemy
+        // keys), which userinfo redaction wouldn't scrub — so hide the value
+        // entirely (the policy `config validate` follows of never echoing
+        // rpc_url), like the sibling parse sites in `chain_ctx` / `setup`
+        // (issue #954).
+        format!(
+            "rpc_url is not a valid URL (<redacted>, {} chars)",
+            rpc_url.len()
+        )
     })?);
     let registry = CapacityBond::new(capacity_bond_addr, provider);
 

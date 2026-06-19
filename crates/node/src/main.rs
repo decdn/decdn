@@ -37,11 +37,24 @@ enum DaemonCommand {
     Run(Box<RunArgs>),
 }
 
+/// Print a fatal bring-up failure through
+/// [`decdn_common::redact::sanitize_err_chain`] rather than letting `anyhow`'s
+/// `Termination` impl `Debug`-print the raw chain: an RPC-reachability failure's
+/// source error carries the `rpc_url` (API keys live in its path/query). Mid-run
+/// chain errors are logged via `tracing` and sanitized at their own call sites.
+/// See issue #954.
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
     let parsed = DaemonCli::parse();
     let config_path = parsed.config.map(|p| cli::common::expand_tilde(&p));
-    match parsed.command {
+    let result = match parsed.command {
         DaemonCommand::Run(run_args) => commands::run(config_path.as_deref(), &run_args).await,
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
+            std::process::ExitCode::FAILURE
+        }
     }
 }

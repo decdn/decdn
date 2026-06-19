@@ -30,6 +30,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context as _, anyhow, bail};
 use decdn_common::cli::{BundlePullArgs, ClientFetchArgs};
 use decdn_common::config::load_file_config;
+use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
@@ -341,7 +342,12 @@ impl EntryOutcome {
     fn failed(path: &str, err: &anyhow::Error) -> Self {
         Self::Failed {
             path: path.to_string(),
-            err: format!("{err:#}"),
+            // Sanitize here, at the single construction site: a per-entry fetch
+            // failure can wrap a chain-RPC error whose source carries the
+            // `rpc_url` (API key in path/query). This outcome is both printed to
+            // stderr and serialized into the `--json` report, neither of which
+            // passes through `main()`'s sanitizer (issue #954).
+            err: sanitize_err_chain(err),
         }
     }
 }

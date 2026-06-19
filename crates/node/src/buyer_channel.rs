@@ -36,6 +36,7 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
+use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
     AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, DepositOutcome, StoreError,
@@ -859,7 +860,7 @@ async fn try_reclaim<P: Provider + Clone>(
     let ch = match contract.getChannel(st.channel_id).call().await {
         Ok(ch) => ch,
         Err(err) => {
-            warn!(%err, channel_id = %st.channel_id, "buyer reclaim: getChannel failed");
+            warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: getChannel failed");
             return ReclaimOutcome::Failed;
         }
     };
@@ -887,12 +888,12 @@ async fn try_reclaim<P: Provider + Clone>(
         Ok(pending) => match pending.get_receipt().await {
             Ok(r) => r,
             Err(err) => {
-                warn!(%err, channel_id = %st.channel_id, "buyer reclaim: receipt failed");
+                warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: receipt failed");
                 return ReclaimOutcome::Failed;
             }
         },
         Err(err) => {
-            warn!(%err, channel_id = %st.channel_id, "buyer reclaim: send failed");
+            warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: send failed");
             return ReclaimOutcome::Failed;
         }
     };
@@ -1207,7 +1208,7 @@ async fn reconcile_orphans_once<P: Provider + Clone>(
     let head = match contract.provider().get_block_number().await {
         Ok(h) => h,
         Err(err) => {
-            warn!(%err, "buyer reconcile: head block read failed; skipping scan this boot");
+            warn!(err = %sanitize_rpc_display(&err), "buyer reconcile: head block read failed; skipping scan this boot");
             return;
         }
     };
@@ -1238,7 +1239,7 @@ async fn reconcile_orphans_once<P: Provider + Clone>(
                 // independent, so a transient `eth_getLogs` failure on one should
                 // not strand orphans in later windows until the next restart.
                 warn!(
-                    %err,
+                    err = %sanitize_rpc_display(&err),
                     from,
                     to,
                     "buyer reconcile: ChannelOpened query failed for this window; skipping it"
@@ -1254,7 +1255,7 @@ async fn reconcile_orphans_once<P: Provider + Clone>(
                 Ok(true) => rehydrated = rehydrated.saturating_add(1),
                 Ok(false) => {}
                 Err(err) => warn!(
-                    %err,
+                    err = %sanitize_rpc_display(&err),
                     channel_id = %event.channelId,
                     "buyer reconcile: skipping event after a per-event fault"
                 ),

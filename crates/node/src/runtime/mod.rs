@@ -46,7 +46,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
-use decdn_common::redact::redact_userinfo;
+use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
 use decdn_incentive::eth_identity::{self, PasswordSource};
 use decdn_incentive::{ChannelStateStore, PendingSettleStore};
 
@@ -655,7 +655,7 @@ pub async fn run(
                 Ok(dir) => Some(Arc::new(dir)),
                 Err(err) => {
                     tracing::warn!(
-                        %err,
+                        err = %sanitize_rpc_display(&err),
                         %capacity_bond_addr,
                         "ChainNodeAddressDirectory bootstrap failed; node→node pull-through is \
                          DISABLED for this process (cannot resolve provider payout addresses). \
@@ -1055,7 +1055,7 @@ pub async fn run(
         Ok(service) => Some(Arc::new(service)),
         Err(err) => {
             tracing::warn!(
-                %err,
+                err = %sanitize_rpc_display(&err),
                 %payment_channel_addr,
                 "buyer-side PaymentChannel bootstrap failed; node→node paid cache-miss pulls are \
                  DISABLED for this process (seller settlement is unaffected). This condition is \
@@ -1482,7 +1482,7 @@ pub async fn run(
             Ok(indexer) => Some(indexer),
             Err(err) => {
                 tracing::warn!(
-                    %err,
+                    err = %sanitize_rpc_display(&err),
                     "settlement indexer bootstrap failed; reputation reporter weights will stay 0"
                 );
                 None
@@ -2669,9 +2669,11 @@ fn spawn_rpc_watchdog(
                 }
                 Err(err) => {
                     if prev_healthy {
-                        // URL omitted for the same reason as the recovery log
-                        // above; `%err` keeps the actionable context.
-                        tracing::warn!(%err, "RPC endpoint unhealthy");
+                        // Sanitize: `probe_rpc` wraps the reqwest error, whose
+                        // Display embeds the full `rpc_url` (an API key may live
+                        // in its path/query, not just userinfo). The transport
+                        // failure class survives; the URL does not (issue #954).
+                        tracing::warn!(err = %sanitize_rpc_display(&err), "RPC endpoint unhealthy");
                     }
                     false
                 }
