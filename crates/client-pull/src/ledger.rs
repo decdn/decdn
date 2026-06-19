@@ -25,7 +25,7 @@ pub struct Cumulative {
 /// amount delta is `ceil(delta_bytes * rate_per_mb / 1 MiB)` so each voucher's
 /// own delta covers its own bytes at the advertised rate (the node checks deltas).
 #[must_use]
-pub fn next_voucher(cur: &Cumulative, delta_bytes: u64, rate_per_mb: u64) -> Cumulative {
+fn next_voucher(cur: &Cumulative, delta_bytes: u64, rate_per_mb: u64) -> Cumulative {
     let amount_delta = U256::from(delta_bytes)
         .saturating_mul(U256::from(rate_per_mb))
         .div_ceil(U256::from(MB_BYTES));
