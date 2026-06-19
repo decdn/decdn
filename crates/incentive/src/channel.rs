@@ -214,7 +214,9 @@ impl ChannelState {
     /// clone-record-swap discipline (#527): persist first, advance in-memory
     /// state only on `Ok`, so a store failure leaves `self` unchanged and the
     /// node has not yet returned a waiver it can't remember. Idempotent — a
-    /// channel already flagged re-records the same state.
+    /// channel already flagged short-circuits to `Ok(())` without re-recording,
+    /// so a retried `CooperativeCloseRequest` (UDP/QUIC retransmits are expected)
+    /// does not trigger a redundant fsync.
     ///
     /// # Errors
     ///
@@ -225,6 +227,9 @@ impl ChannelState {
         &mut self,
         store: &dyn ChannelStateStore,
     ) -> Result<(), ChannelError> {
+        if self.cooperative_close_signed {
+            return Ok(());
+        }
         let mut next = self.clone();
         next.cooperative_close_signed = true;
         store.record(&next)?;

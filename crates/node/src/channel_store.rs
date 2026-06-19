@@ -558,17 +558,22 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
             (Vec::new(), 0, remainder)
         };
     // Cooperative-close waiver flag (ADR 003 §Cooperative close): an optional
-    // trailing `bool` segment after the v2 trailer. Records written before it
-    // existed have no such bytes — default to `false` rather than erroring, the
-    // additive forward-compat the `take_from_bytes` design intends.
-    let (cooperative_close_signed, leftover): (bool, &[u8]) = if after_trailer.is_empty() {
-        (false, after_trailer)
-    } else {
-        postcard::take_from_bytes::<bool>(after_trailer).map_err(|err| StoreError::Corrupt {
-            channel_id: Some(channel_id),
-            detail: format!("postcard decode of coop-close flag failed: {err}"),
-        })?
-    };
+    // trailing `bool` segment that only ever exists on v2+ records. Gate the
+    // decode on `schema_version >= 2`: a v1 record never wrote this segment, so
+    // any bytes after its (empty) trailer are NOT a coop-close `bool` and must
+    // not be decoded as one — doing so would mis-hydrate the flag or corrupt the
+    // load. v2+ records written before the flag existed simply have no trailing
+    // bytes, so they default to `false`, the additive forward-compat the
+    // `take_from_bytes` design intends.
+    let (cooperative_close_signed, leftover): (bool, &[u8]) =
+        if stored.schema_version >= 2 && !after_trailer.is_empty() {
+            postcard::take_from_bytes::<bool>(after_trailer).map_err(|err| StoreError::Corrupt {
+                channel_id: Some(channel_id),
+                detail: format!("postcard decode of coop-close flag failed: {err}"),
+            })?
+        } else {
+            (false, after_trailer)
+        };
     // Forward-compat allowance is bounded: a malicious writer could pad
     // megabytes onto every record and silently inflate every read. Log
     // (don't fail) when the trailer beyond the known fields exceeds a small

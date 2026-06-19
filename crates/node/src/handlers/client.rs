@@ -2117,10 +2117,20 @@ impl ClientHandler {
                 .map_err(|e| anyhow::anyhow!("cooperative-close waiver signing failed: {e}"))?;
             // Persist the no-longer-serving flag before returning the waiver. On a
             // store failure this propagates (no auth sent) and the channel stays
-            // serveable — safe.
-            guard
-                .state
-                .mark_cooperative_close_signed(self.channel_state_store.as_ref())?;
+            // serveable — safe. `mark_cooperative_close_signed` performs a
+            // synchronous fsynced redb write, which must not block a runtime
+            // worker — run it on the blocking pool against a clone and commit back
+            // only on `Ok`, mirroring `apply_voucher` / `update_channel_deposit`.
+            let mut candidate = guard.state.clone();
+            let store = Arc::clone(&self.channel_state_store);
+            let (mark_res, candidate) = tokio::task::spawn_blocking(move || {
+                let res = candidate.mark_cooperative_close_signed(&*store);
+                (res, candidate)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("cooperative-close mark task failed: {e}"))?;
+            mark_res?;
+            guard.state = candidate;
             CooperativeCloseAuth {
                 channel_id: req.channel_id,
                 amount: guard.state.last_amount().to_be_bytes(),
