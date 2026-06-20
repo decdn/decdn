@@ -177,8 +177,30 @@ pub struct StreamRequest {
     pub channel_id: [u8; 32],
     /// Resume position in bytes; `0` for a full-blob fetch.
     pub byte_offset: u64,
+    /// Upper bound on the requested range: the request covers the half-open span
+    /// `[byte_offset, byte_offset + byte_len)`. `0` means "to end-of-blob" (the
+    /// whole-tail default, so an unset value preserves the prior behavior). A
+    /// non-zero `byte_len` lets a node scope a cache-miss origin fetch to exactly
+    /// the requested bytes and meters payment over the range (ADR 005 §Bounded
+    /// byte ranges, ADR 037 §Origin-tier pull-through). Billing-relevant, so it
+    /// lives in the frozen base — every node must understand it.
+    pub byte_len: u64,
     /// Requester-generated microseconds since the Unix epoch, echoed back.
     pub timestamp_us: u64,
+}
+
+impl StreamRequest {
+    /// The bounded range length as an explicit option, decoding the `byte_len`
+    /// sentinel in one place: `None` ⇒ whole tail from `byte_offset`; `Some(n)` ⇒
+    /// exactly `n` bytes. Consumers should read the range through this rather than
+    /// re-deriving the `== 0` sentinel. The authoritative bounds check against the
+    /// blob size lives in `decdn_cache::range_pull::align_range`, which every
+    /// serving-side handler MUST route `(byte_offset, byte_len)` through before
+    /// scoping an origin fetch or metering billing.
+    #[must_use]
+    pub const fn requested_len(&self) -> Option<core::num::NonZeroU64> {
+        core::num::NonZeroU64::new(self.byte_len)
+    }
 }
 
 /// Optional [`StreamRequest`] extension fields (ADR 005 §Client identity
@@ -644,6 +666,7 @@ mod tests {
             hash: [1u8; 32],
             channel_id: [2u8; 32],
             byte_offset: 0,
+            byte_len: 0,
             timestamp_us: 0xdead_beef,
         }
     }
@@ -1051,6 +1074,23 @@ mod tests {
         let decoded: StreamRequest = postcard::from_bytes(&bytes)?;
         assert_eq!(req, decoded);
         assert_eq!(decoded.byte_offset, 1_048_576);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_request_bounded_byte_len_roundtrip() -> Result<(), postcard::Error> {
+        // A bounded range [byte_offset, byte_offset + byte_len) (ADR 005 §Bounded
+        // byte ranges) — byte_len != 0 distinguishes a scoped origin range pull
+        // from the whole-tail default (byte_len == 0).
+        let req = StreamRequest {
+            byte_offset: 1_048_576,
+            byte_len: 262_144,
+            ..sample_request()
+        };
+        let bytes = postcard::to_allocvec(&req)?;
+        let decoded: StreamRequest = postcard::from_bytes(&bytes)?;
+        assert_eq!(req, decoded);
+        assert_eq!(decoded.byte_len, 262_144);
         Ok(())
     }
 

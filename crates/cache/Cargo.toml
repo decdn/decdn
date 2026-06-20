@@ -12,6 +12,11 @@ decdn-config-types = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 iroh-metrics = { workspace = true }
+# bao verified-range codec for origin range-pull verification (#823): turn a
+# raw origin range `[a, b)` + the published `{H}.obao4` outboard into a
+# bao-encoded stream verified against the root `H`, ready for `import_bao_bytes`.
+bao-tree = { workspace = true }
+positioned-io = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

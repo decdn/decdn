@@ -142,6 +142,7 @@ struct StreamRequest {
     hash: Hash,
     channel_id: ChannelId,
     byte_offset: u64,
+    byte_len: u64,       // 0 = to end-of-blob; else bound the range to [byte_offset, byte_offset + byte_len)
     timestamp_us: u64,
     voucher_interval_mb: Option<u64>,
     // Ephemeral client binding (optional; required on first request per connection)
@@ -165,6 +166,12 @@ The requester MUST enforce:
 3. **Failure handling:** when the redirect limit is reached or a cycle is detected, the requester falls back to the next-best node from the original probe results (same as a `ok: false` response).
 
 `byte_offset` supports seek and resume: on failover, the requester reconnects to a different node and resumes from the last BLAKE3-verified byte.
+
+#### Bounded byte ranges
+
+`byte_offset` is the start of a request; `byte_len` bounds its **end**. A request expresses the half-open range `[byte_offset, byte_offset + byte_len)`, with `byte_len == 0` meaning "to end-of-blob" (the prior whole-tail behavior, so an absent/zero value is the unchanged default). A bounded range lets a node scope a cache-miss **origin** fetch to exactly the requested bytes rather than pulling the whole blob to serve a fraction of it — see [ADR 037 § Origin-tier pull-through](037-regional-proxy-warming.md#origin-tier-pull-through-ranged-fetch--external-outboard). It also scopes payment: vouchers meter the delivered range, so `total_bytes` for a bounded request is the range length, not the blob size.
+
+`byte_len` is part of the base `StreamRequest` (not an optional extension): it is billing-relevant — a node that ignored it would over-deliver and over-bill with no slash evidence — so it must be understood by every node. Because `cdn/client/v1` is pre-finalisation (no testnet deployment), this is a **straight in-place addition** to the message, not a Tier-3 evolution: there is no version bump and no compatibility shim ([ADR 013 § Schema evolution](013-schema-evolution.md#adr-013-schema-evolution)). The node MUST reject a `byte_offset + byte_len` that overflows or exceeds the blob size with a `StreamError`.
 
 #### Voucher interval negotiation
 

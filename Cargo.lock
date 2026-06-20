@@ -2582,6 +2582,7 @@ dependencies = [
  "aws-smithy-mocks",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "bao-tree",
  "bytes",
  "chacha20poly1305",
  "decdn-config-types",
@@ -2591,6 +2592,7 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "iroh-metrics",
+ "positioned-io",
  "rand 0.10.1",
  "reqwest",
  "serde",
@@ -6025,6 +6027,7 @@ version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4ec4b80060f033312b99b6874025d9503d2af87aef2dd4c516e253fbfcdada7"
 dependencies = [
+ "byteorder",
  "libc",
  "winapi",
 ]

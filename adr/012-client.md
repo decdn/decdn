@@ -349,6 +349,12 @@ Large files are split into chunks at ingest. A **manifest blob** describes the o
 
 (fixed at ingest). The last chunk is a partial chunk. Chunk size is a convention for origin-produced content — CDN nodes serve any BLAKE3-addressed blob regardless of size.
 
+#### Chunking is the coarse answer for ranged access
+
+Splitting a large file into 256 MiB chunk-blobs, each its own BLAKE3 hash, is the **sanctioned, zero-new-surface answer for ranged access against an origin**. A client wanting "the second GB" of a multi-gigabyte manifest-published file fetches only the ~4 chunk-blobs that cover it (`StreamRequest{hash: chunk.hash}` per chunk, [§ Download flow](#download-flow)); a node filling those from origin on a cache miss pulls only those chunk objects whole — never the entire file — and verifies each whole against its own hash with no bao tree or outboard needed. Chunking bounds origin egress to chunk granularity for the common case at the cost of nothing new.
+
+Two residual cases chunking does not cover: (a) a **single-blob publish** that skips the manifest (one giant BLAKE3-addressed object), and (b) **sub-256-MiB precision** within a chunk. Both are addressed by the finer-grained range-scoped origin pull in [ADR 037 § Origin-tier pull-through](037-regional-proxy-warming.md#origin-tier-pull-through-ranged-fetch--external-outboard), which fetches a bounded `[a, b)` plus the `{H}.obao4` outboard and verifies the range against the root. Publishers SHOULD prefer the manifest/chunk path for large files; the origin-tier range pull is the fallback for content that is not chunked.
+
 ### Manifest format (postcard-encoded)
 
 ```rust

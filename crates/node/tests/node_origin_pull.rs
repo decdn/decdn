@@ -3032,6 +3032,7 @@ async fn leaf_paced_pull(
         hash: *hash.as_bytes(),
         channel_id: channel_id.into(),
         byte_offset: 0,
+        byte_len: 0,
         timestamp_us: 0x9001,
     };
     let payload =
@@ -3643,6 +3644,7 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
         hash: *hash.as_bytes(),
         channel_id: leaf_channel_id.into(),
         byte_offset: MB_BYTES,
+        byte_len: 0,
         timestamp_us: 0x9007,
     };
     let payload_bytes =
@@ -4214,6 +4216,7 @@ async fn leaf_underpays_first_voucher(
         hash: *hash.as_bytes(),
         channel_id: channel_id.into(),
         byte_offset: 0,
+        byte_len: 0,
         timestamp_us: 0x9002,
     };
     write_frame(

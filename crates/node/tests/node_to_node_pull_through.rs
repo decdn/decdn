@@ -432,6 +432,7 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
             hash: *hash.as_bytes(),
             channel_id: channel_id.into(),
             byte_offset: 0,
+            byte_len: 0,
             timestamp_us: 0x00c0_ffee,
         };
         let req_bytes = encode_stream_request(&req, None)
