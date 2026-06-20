@@ -572,25 +572,44 @@ jobs:
           cache-profile: ci
       - run: forge --version
       - run: forge build --sizes --deny warnings
-      # Single test execution: `forge snapshot` runs the whole suite (same
-      # pass/fail gate as `forge test`) AND records gas, replacing a separate
-      # gas-snapshot job that re-ran the entire ci-profile fuzz/invariant suite.
-      # --diff compares against the committed baseline and prints the delta to
-      # stdout (captured for the PR comment below); we deliberately omit --check
-      # so legitimate gas movement doesn't hard-block the PR. The explicit
-      # `set -euo pipefail` (rather than relying on the runner's default shell)
-      # makes the guarantee local and override-proof: a test failure exits
-      # non-zero and pipefail propagates it through `tee`, failing this required
-      # job. forge reports the failing test + revert reason at default
-      # verbosity; re-run locally with -vvvv for full call traces.
+      # Single test execution: `forge snapshot --snap` runs the whole suite
+      # (same pass/fail gate as `forge test`) AND records gas to a temp file in
+      # one pass — no second run of the ci-profile fuzz/invariant suite. We then
+      # FAIL the job if the committed baseline is stale, so a contract change
+      # that moves gas can't merge until the author regenerates and commits it
+      # (the job is path-filtered to `contracts/**`, so it only runs when
+      # contracts actually change).
+      #
+      # The comparison is scoped to DETERMINISTIC entries: lines containing
+      # `runs:` (fuzz mean/median, invariant call counts) are stripped from both
+      # sides first. Foundry's fuzz μ/~ gas is NOT reproducible across machines
+      # even at a fixed seed — the committed values come from a contributor's
+      # box and never match a fresh CI run — so gating on them would fail every
+      # PR. The ~620 non-fuzz entries ARE byte-stable across machines at the
+      # pinned forge + solc version, and every contract has deterministic unit
+      # tests, so a real gas movement still trips the gate. `grep -v` output is
+      # newline-terminated on both sides, so this is also immune to the
+      # trailing-newline difference between forge's writer and editors/hooks.
+      # The deterministic diff is captured for the sticky PR comment (posted
+      # even on failure, below). `set -euo pipefail` makes a test failure
+      # (non-zero `forge snapshot`) abort the job too; re-run locally with -vvvv
+      # for full call traces.
       - name: Test + gas snapshot
+        id: gas
         run: |
           set -euo pipefail
           if [[ ! -f .gas-snapshot ]]; then
             echo "::error::contracts/.gas-snapshot baseline missing; regenerate via 'FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot'"
             exit 1
           fi
-          forge snapshot --diff .gas-snapshot | tee /tmp/gas-diff.txt
+          forge snapshot --snap "${RUNNER_TEMP:-/tmp}/new.gas-snapshot"
+          grep -v 'runs:' .gas-snapshot > "${RUNNER_TEMP:-/tmp}/base.det"
+          grep -v 'runs:' "${RUNNER_TEMP:-/tmp}/new.gas-snapshot" > "${RUNNER_TEMP:-/tmp}/new.det"
+          if ! diff -u "${RUNNER_TEMP:-/tmp}/base.det" "${RUNNER_TEMP:-/tmp}/new.det" > /tmp/gas-diff.txt; then
+            echo "::error::contracts/.gas-snapshot is stale vs the contracts in this PR (deterministic gas changed). Regenerate with 'FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot' and commit the result."
+            cat /tmp/gas-diff.txt
+            exit 1
+          fi
       # Structural enforcement that `TestnetFaucet` never leaks into the
       # production audit surface (issue #636, #452). The contract lives at
       # `testnet/TestnetFaucet.sol` and is wired only from
@@ -625,13 +644,21 @@ jobs:
       # on fork PRs (read-only GITHUB_TOKEN would 403). continue-on-error so a
       # transient GitHub API hiccup in this best-effort tooling never blocks the
       # required gate — mirrors the coverage-comment steps in the `test` job.
-      # The `if` has no always()/status function, so it inherits the implicit
-      # success() gate: this step is skipped if any earlier step (build, the
-      # test+snapshot run, the faucet check) failed — no comment is posted on a
-      # red run. continue-on-error only forgives a failure of THIS step (the
-      # API call), not of the prior gate.
+      # `if: always() && steps.gas.outcome in (success, failure)`: post the
+      # comment WHETHER OR NOT the snapshot gate passed — a stale-gas failure is
+      # exactly when the author needs to see which entries drifted (the gate
+      # step wrote the unified diff to /tmp/gas-diff.txt before exiting). The
+      # `outcome` guard scopes it to runs where the snapshot step actually
+      # executed, so a `forge build` failure (snapshot skipped, no diff file)
+      # posts nothing. A clean run leaves an empty diff and the script renders
+      # "No gas changes vs base." continue-on-error only forgives a failure of
+      # THIS step (the API call), not of the prior gate.
       - name: Post gas snapshot comment
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: >-
+          always()
+          && (steps.gas.outcome == 'success' || steps.gas.outcome == 'failure')
+          && github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         env:
           GH_PR_NUMBER: ${{ github.event.pull_request.number }}

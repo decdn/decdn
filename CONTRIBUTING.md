@@ -182,7 +182,7 @@ forge test                              # default profile: 256 fuzz, 32-depth in
 FOUNDRY_PROFILE=ci forge test           # 1024 fuzz, 256/50-depth (matches CI)
 FOUNDRY_PROFILE=fuzz forge test         # 10k fuzz, 1024/100-depth (nightly/manual)
 FOUNDRY_PROFILE=coverage forge coverage --report lcov
-forge snapshot --diff .gas-snapshot     # current gas vs committed baseline
+FOUNDRY_PROFILE=ci forge snapshot --diff .gas-snapshot   # current gas vs committed baseline
 ```
 
 **Local static analysis:**
@@ -207,14 +207,22 @@ The pre-commit hooks run `forge-fmt` and `solhint` on every commit; `forge-build
 
 **Updating the gas snapshot baseline:**
 
-When a contract change legitimately moves gas, regenerate the committed snapshot in the same PR:
+The `.gas-snapshot` baseline is an **enforced gate**, not advisory. The `solidity build+test` CI
+job (path-filtered to `contracts/**`) regenerates the snapshot under `FOUNDRY_PROFILE=ci` and
+**fails the build if the deterministic entries differ** from the committed file. So when a
+contract change moves gas, regenerate the committed snapshot in the **same PR**:
 
 ```bash
 cd contracts && FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot
 git add .gas-snapshot
 ```
 
-The `solidity-gas-snapshot` CI job posts a sticky PR comment with the diff so reviewers can confirm the change was intentional.
+The gate compares only the deterministic (non-fuzz) entries — lines containing `runs:`
+(fuzz mean/median, invariant call counts) are stripped before the diff. Foundry's fuzz μ/~ gas
+is not reproducible across machines, so those lines drift freely (and a fresh `forge snapshot`
+will rewrite them); only the ~620 non-fuzz entries are byte-stable at the pinned forge + solc
+version and are what the gate enforces. A sticky PR comment shows the deterministic diff on both
+pass (empty) and fail (the drifted entries).
 
 **Interpreting CI findings:**
 
