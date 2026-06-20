@@ -8,7 +8,9 @@ use decdn_cache::range_pull::{
     IROH_BLOCK_SIZE, RangeVerifyError, align_range, encode_verified_range,
 };
 
-const GROUP: u64 = 16 * 1024; // 16 KiB chunk group
+// Bytes per chunk group, derived from the upstream block size (not hard-coded)
+// so an iroh-blobs block-size change can't make these assertions silently wrong.
+const GROUP: u64 = 1u64 << (IROH_BLOCK_SIZE.chunk_log() + 10);
 
 /// Deterministic pseudo-random blob spanning several chunk groups.
 fn make_blob(len: usize) -> Vec<u8> {
@@ -132,7 +134,7 @@ fn encode_verified_range_roundtrips_for_honest_bytes() -> anyhow::Result<()> {
     let data = sub(&blob, aligned.fetch_start(), aligned.fetch_end())?;
 
     // Honest range + honest outboard verifies and produces a non-empty stream.
-    let encoded = encode_verified_range(root, blob_size, &aligned, &data, ob.data.clone())?;
+    let encoded = encode_verified_range(root, blob_size, &aligned, &data, ob.data.clone().into())?;
     anyhow::ensure!(!encoded.is_empty());
     Ok(())
 }
@@ -155,7 +157,7 @@ fn encode_verified_range_rejects_tampered_data() -> anyhow::Result<()> {
         blob_size,
         &aligned,
         &data,
-        ob.data.clone(),
+        ob.data.clone().into(),
     ))?;
     anyhow::ensure!(
         matches!(err, RangeVerifyError::Verification { .. }),
@@ -185,7 +187,7 @@ fn encode_verified_range_rejects_tampered_outboard() -> anyhow::Result<()> {
         blob_size,
         &aligned,
         &data,
-        bad_outboard,
+        bad_outboard.into(),
     ))?;
     anyhow::ensure!(
         matches!(err, RangeVerifyError::Verification { .. }),
@@ -212,7 +214,7 @@ fn encode_verified_range_rejects_wrong_root() -> anyhow::Result<()> {
         blob_size,
         &aligned,
         &data,
-        ob.data.clone(),
+        ob.data.clone().into(),
     ))?;
     anyhow::ensure!(
         matches!(err, RangeVerifyError::Verification { .. }),
@@ -235,7 +237,11 @@ fn encode_verified_range_rejects_wrong_length_outboard() -> anyhow::Result<()> {
     let mut short = ob.data.clone();
     short.truncate(short.len() - 8);
     let err = err_of(encode_verified_range(
-        root, blob_size, &aligned, &data, short,
+        root,
+        blob_size,
+        &aligned,
+        &data,
+        short.into(),
     ))?;
     anyhow::ensure!(
         matches!(err, RangeVerifyError::OutboardSize { .. }),
@@ -263,7 +269,7 @@ async fn widened_import_serves_back_the_requested_subrange() -> anyhow::Result<(
     let aligned = align_range(req_start, req_end - req_start, blob_size)?;
     anyhow::ensure!(aligned.fetch_start() == GROUP && aligned.fetch_end() == 3 * GROUP);
     let data = sub(&blob, aligned.fetch_start(), aligned.fetch_end())?;
-    let encoded = encode_verified_range(root, blob_size, &aligned, &data, ob.data.clone())?;
+    let encoded = encode_verified_range(root, blob_size, &aligned, &data, ob.data.clone().into())?;
 
     let store = MemStore::new();
     store
@@ -305,7 +311,7 @@ async fn non_group_aligned_blob_tail_roundtrips() -> anyhow::Result<()> {
         "tail clamps to blob end, not past it"
     );
     let data = sub(&blob, aligned.fetch_start(), aligned.fetch_end())?;
-    let encoded = encode_verified_range(root, blob_size, &aligned, &data, ob.data.clone())?;
+    let encoded = encode_verified_range(root, blob_size, &aligned, &data, ob.data.clone().into())?;
 
     let store = MemStore::new();
     store

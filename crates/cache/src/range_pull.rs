@@ -1,5 +1,5 @@
 //! Origin range-pull verification (#823, [ADR 037 §Origin-tier
-//! pull-through](../../adr/037-regional-proxy-warming.md)).
+//! pull-through](../../../adr/037-regional-proxy-warming.md)).
 //!
 //! An opaque origin backend (S3/R2/B2/HTTP/fs) serves raw bytes by hash with no
 //! bao tree, so a node that wants only a byte range `[a, b)` of a large blob
@@ -214,7 +214,7 @@ pub fn encode_verified_range(
     blob_size: u64,
     aligned: &AlignedRange,
     range_data: &[u8],
-    outboard: Vec<u8>,
+    outboard: Bytes,
 ) -> Result<Bytes, RangeVerifyError> {
     let tree = BaoTree::new(blob_size, IROH_BLOCK_SIZE);
     let expected = usize::try_from(tree.outboard_size()).unwrap_or(usize::MAX);
@@ -237,8 +237,15 @@ pub fn encode_verified_range(
     // bao "combined" encoding: an 8-byte little-endian size header precedes the
     // interleaved proof+data stream. `iroh-blobs`' `import_bao_reader` reads the
     // header first to frame the tree, then feeds the rest to its decoder, so the
-    // helper owns producing the full importable byte string.
-    let mut encoded = blob_size.to_le_bytes().to_vec();
+    // helper owns producing the full importable byte string. Pre-size the buffer
+    // to the header + fetched range (plus the ~0.4% proof overhead grows once);
+    // `fetch_len` always fits `usize` when `range_data` does, so a failed
+    // conversion just degrades to the default growth.
+    let cap = usize::try_from(aligned.fetch_len())
+        .unwrap_or(0)
+        .saturating_add(8);
+    let mut encoded = Vec::with_capacity(cap);
+    encoded.extend_from_slice(&blob_size.to_le_bytes());
     encode_ranges_validated(&reader, &ob, aligned.chunk_ranges.as_ref(), &mut encoded)
         .map_err(|source| RangeVerifyError::Verification { source })?;
     Ok(Bytes::from(encoded))

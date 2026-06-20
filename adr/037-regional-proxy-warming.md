@@ -122,7 +122,7 @@ Scoped deferrals tracked as follow-ups (this ADR remains the design they impleme
 - **Range-scoped origin pull** (§ [Origin-tier pull-through](#origin-tier-pull-through-ranged-fetch--external-outboard)) — tracked by [#823](https://github.com/decdn/decdn/issues/823). #856 sources a cold blob from origin whole-blob; the `Range`-data + `{H}.obao4` optimization and its whole-blob fallback land on the cache engine's `Origin` adapters independently of the node→node window path.
 - **Pipelined look-ahead beyond one interval.** The window is honored as a byte bound — the *pull* runs ahead by the full `pull_ahead_bytes`, but downstream vouchers are collected one interval at a time (one per serve-loop iteration), so payments are recouped serially: a `pull_ahead_bytes` set well above one voucher interval bounds exposure as specified but does not yet overlap multiple in-flight interval payments.
 
-No wire-format change is introduced (consistent with the [ADR 005 Cross-ADR note](#cross-adr-impact) below): the `StreamRequest` / `StreamResponse` surface and `cdn/client/v1` framing are unchanged.
+The window-paced handler (#856) introduces no wire-format change: its `StreamRequest` / `StreamResponse` surface and `cdn/client/v1` framing are unchanged. The origin-tier path (§ [Origin-tier pull-through](#origin-tier-pull-through-ranged-fetch--external-outboard)) separately consumes the optional `StreamRequest.byte_len` bound added by [ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges) — an absent/zero value is the unchanged whole-tail default — off the same message; see the [Cross-ADR note](#cross-adr-impact) below.
 
 ## Consequences
 
