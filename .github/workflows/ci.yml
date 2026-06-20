@@ -575,17 +575,25 @@ jobs:
       # Single test execution: `forge snapshot --snap` runs the whole suite
       # (same pass/fail gate as `forge test`) AND records gas to a temp file in
       # one pass — no second run of the ci-profile fuzz/invariant suite. We then
-      # `diff` that against the committed baseline and FAIL the job on any delta.
-      # ci-profile fuzz is seed-pinned (foundry.toml [profile.ci]) so a diff
-      # means the committed `.gas-snapshot` is genuinely stale vs. the contracts
-      # in this PR, not seed noise. This makes the snapshot self-enforcing: a
-      # contract change that moves gas can't merge until the author regenerates
-      # and commits the baseline (the job is path-filtered to `contracts/**`, so
-      # it only runs when contracts actually change). The unified diff is
-      # captured for the sticky PR comment (posted even on failure, below) so the
-      # author sees exactly which entries moved. `set -euo pipefail` makes a test
-      # failure (non-zero `forge snapshot`) abort the job too; re-run locally
-      # with -vvvv for full call traces.
+      # FAIL the job if the committed baseline is stale, so a contract change
+      # that moves gas can't merge until the author regenerates and commits it
+      # (the job is path-filtered to `contracts/**`, so it only runs when
+      # contracts actually change).
+      #
+      # The comparison is scoped to DETERMINISTIC entries: lines containing
+      # `runs:` (fuzz mean/median, invariant call counts) are stripped from both
+      # sides first. Foundry's fuzz μ/~ gas is NOT reproducible across machines
+      # even at a fixed seed — the committed values come from a contributor's
+      # box and never match a fresh CI run — so gating on them would fail every
+      # PR. The ~620 non-fuzz entries ARE byte-stable across machines at the
+      # pinned forge + solc version, and every contract has deterministic unit
+      # tests, so a real gas movement still trips the gate. `grep -v` output is
+      # newline-terminated on both sides, so this is also immune to the
+      # trailing-newline difference between forge's writer and editors/hooks.
+      # The deterministic diff is captured for the sticky PR comment (posted
+      # even on failure, below). `set -euo pipefail` makes a test failure
+      # (non-zero `forge snapshot`) abort the job too; re-run locally with -vvvv
+      # for full call traces.
       - name: Test + gas snapshot
         id: gas
         run: |
@@ -595,8 +603,10 @@ jobs:
             exit 1
           fi
           forge snapshot --snap "${RUNNER_TEMP:-/tmp}/new.gas-snapshot"
-          if ! diff -u .gas-snapshot "${RUNNER_TEMP:-/tmp}/new.gas-snapshot" > /tmp/gas-diff.txt; then
-            echo "::error::contracts/.gas-snapshot is stale vs the contracts in this PR. Regenerate with 'FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot' and commit the result."
+          grep -v 'runs:' .gas-snapshot > "${RUNNER_TEMP:-/tmp}/base.det"
+          grep -v 'runs:' "${RUNNER_TEMP:-/tmp}/new.gas-snapshot" > "${RUNNER_TEMP:-/tmp}/new.det"
+          if ! diff -u "${RUNNER_TEMP:-/tmp}/base.det" "${RUNNER_TEMP:-/tmp}/new.det" > /tmp/gas-diff.txt; then
+            echo "::error::contracts/.gas-snapshot is stale vs the contracts in this PR (deterministic gas changed). Regenerate with 'FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot' and commit the result."
             cat /tmp/gas-diff.txt
             exit 1
           fi

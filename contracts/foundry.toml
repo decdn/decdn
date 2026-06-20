@@ -39,14 +39,7 @@ fuzz = { runs = 256 }
 invariant = { runs = 32, depth = 25 }
 
 [profile.ci]
-# Pinned fuzz/invariant seed so ci-profile gas is fully deterministic. This is
-# what lets the gas-snapshot gate run `forge snapshot --check` (ci.yml →
-# `solidity build+test`) without flaking on fuzz mean/median gas: a `--check`
-# failure now means the committed `.gas-snapshot` is genuinely stale vs. the
-# contracts, not seed noise. Exploratory, unpinned fuzzing lives in
-# [profile.fuzz] (nightly / on-demand) so seed-pinning here costs no coverage.
-# Bump the seed deliberately if you ever want a fresh ci input corpus.
-fuzz = { runs = 1024, seed = "0x6465636e" }
+fuzz = { runs = 1024 }
 invariant = { runs = 256, depth = 50 }
 verbosity = 3
 

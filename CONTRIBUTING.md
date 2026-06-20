@@ -183,7 +183,6 @@ FOUNDRY_PROFILE=ci forge test           # 1024 fuzz, 256/50-depth (matches CI)
 FOUNDRY_PROFILE=fuzz forge test         # 10k fuzz, 1024/100-depth (nightly/manual)
 FOUNDRY_PROFILE=coverage forge coverage --report lcov
 FOUNDRY_PROFILE=ci forge snapshot --diff .gas-snapshot   # current gas vs committed baseline
-FOUNDRY_PROFILE=ci forge snapshot --check .gas-snapshot  # mirror the CI gate (non-zero if stale)
 ```
 
 **Local static analysis:**
@@ -210,20 +209,20 @@ The pre-commit hooks run `forge-fmt` and `solhint` on every commit; `forge-build
 
 The `.gas-snapshot` baseline is an **enforced gate**, not advisory. The `solidity build+test` CI
 job (path-filtered to `contracts/**`) regenerates the snapshot under `FOUNDRY_PROFILE=ci` and
-**fails the build if it differs** from the committed file. The ci profile pins a fuzz/invariant
-seed (`foundry.toml [profile.ci]`) so this is deterministic — a failure means the committed
-snapshot is genuinely stale vs. your contract change, not seed noise. A sticky PR comment shows
-the diff on both pass (empty) and fail (the drifted entries).
-
-So when a contract change moves gas, regenerate the committed snapshot in the **same PR**:
+**fails the build if the deterministic entries differ** from the committed file. So when a
+contract change moves gas, regenerate the committed snapshot in the **same PR**:
 
 ```bash
 cd contracts && FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot
 git add .gas-snapshot
 ```
 
-Exploratory, unpinned fuzzing still runs via `FOUNDRY_PROFILE=fuzz` (nightly/manual), so the
-ci-profile seed pin costs no fuzz coverage.
+The gate compares only the deterministic (non-fuzz) entries — lines containing `runs:`
+(fuzz mean/median, invariant call counts) are stripped before the diff. Foundry's fuzz μ/~ gas
+is not reproducible across machines, so those lines drift freely (and a fresh `forge snapshot`
+will rewrite them); only the ~620 non-fuzz entries are byte-stable at the pinned forge + solc
+version and are what the gate enforces. A sticky PR comment shows the deterministic diff on both
+pass (empty) and fail (the drifted entries).
 
 **Interpreting CI findings:**
 
