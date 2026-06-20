@@ -14,6 +14,7 @@ pub mod error;
 pub mod metrics;
 pub mod origin;
 pub mod probe_hold;
+pub mod range_pull;
 pub mod retry;
 
 pub use engine::{CacheEngine, CacheStats, EvictionCandidates, EvictionPreview, TeeOpen, TeeSink};

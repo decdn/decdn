@@ -1115,6 +1115,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
         hash: *hash.as_bytes(),
         channel_id: channel_id().into(),
         byte_offset: 0,
+        byte_len: 0,
         timestamp_us: 0x5678,
     };
     // No binding, no channel: the pure free-egress case (#848). Drive the raw
@@ -1654,6 +1655,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
         hash: *hash.as_bytes(),
         channel_id: channel_id().into(),
         byte_offset: 0,
+        byte_len: 0,
         timestamp_us: 0x00ba_d001,
     };
     let res = raw_request(&client_ep, target, &req, Some(&ext)).await;
@@ -1698,6 +1700,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
         hash: *hash.as_bytes(),
         channel_id: channel_id().into(),
         byte_offset: 0,
+        byte_len: 0,
         timestamp_us: 0x00ba_d002,
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
@@ -2161,6 +2164,7 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
         hash: miss_hash,
         channel_id: channel_id().into(),
         byte_offset: 0,
+        byte_len: 0,
         timestamp_us: 0x0091_1001,
     };
 
@@ -2319,6 +2323,7 @@ async fn pull_through_fills_under_deadline(
         hash: *want.as_bytes(),
         channel_id: channel_id().into(),
         byte_offset: 0,
+        byte_len: 0,
         timestamp_us: 0x0091_1001,
     };
     let owner_sk = fresh_key();
@@ -2485,6 +2490,7 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
         hash: *hash.as_bytes(),
         channel_id: channel_id().0,
         byte_offset: 0,
+        byte_len: 0,
         timestamp_us: 1,
     };
     match raw_request(&client_ep, target, &req, None).await? {

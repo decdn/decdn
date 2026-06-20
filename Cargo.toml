@@ -43,6 +43,13 @@ iroh = "1"
 iroh-blobs = { version = "0.103", features = ["fs-store"] }
 iroh-gossip = { version = "0.101", features = ["net"] }
 iroh-metrics = "1"
+# bao verified-range codec (#823). Pinned to the version `iroh-blobs` 0.103
+# carries transitively (0.16) so the on-disk outboard / interleaved-stream
+# encoding the cache produces is byte-identical to what `import_bao_bytes`
+# consumes — ADR 038 treats this codec as part of the protocol contract, so the
+# pin is deliberate. `positioned-io` is bao-tree's `ReadAt` data-source trait.
+bao-tree = "0.16"
+positioned-io = "0.3"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

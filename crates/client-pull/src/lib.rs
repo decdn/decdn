@@ -458,6 +458,9 @@ async fn fetch_inner(
         hash,
         channel_id: ctx.channel_id.into(),
         byte_offset,
+        // Whole-tail fetch; a bounded range is plumbed by the origin range-pull
+        // path (ADR 037 §Origin-tier pull-through), not these node-to-node pulls.
+        byte_len: 0,
         timestamp_us,
     };
     // Two-phase encode (ADR 005): no ext for node-to-node pulls. The payload is
@@ -738,6 +741,9 @@ pub async fn open_progressive_pull(
         hash,
         channel_id: ctx.channel_id.into(),
         byte_offset,
+        // Whole-tail fetch; a bounded range is plumbed by the origin range-pull
+        // path (ADR 037 §Origin-tier pull-through), not these node-to-node pulls.
+        byte_len: 0,
         timestamp_us,
     };
     let payload = decdn_protocol::encode_stream_request(&req, None)
