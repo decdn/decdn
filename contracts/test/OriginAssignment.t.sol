@@ -392,29 +392,48 @@ contract OriginAssignmentTest is Test {
     // entries. These two tests pin that cost so it can never silently drift
     // toward the block gas limit.
     //
-    // Headroom is THIN, not comfortable. `MockBondActivity.isActive` here does a
-    // single SLOAD; the real `CapacityBond.isActive` reads four storage slots
-    // (`_nodes[op].active`, `activeBond`, `unbondingOf.amount`, `ejected`), so
-    // the real per-element cost is ~3 extra cold SLOADs (~2100 gas each =>
-    // ~+3.15M over 500 elements). On top of the ~23.4M measured below that puts
-    // a real single-tx full rebuild at ~26.6M — ~83% of a 32M Arbitrum-class L2
-    // block (~1.2x headroom). Per #780 the team's decision is to KEEP the 500
-    // ceiling: governance is never forced into a 500-element atomic tx because
-    // `addDefaultOpenOperator` / `removeDefaultOpenOperator` deltas exist and
-    // should be preferred for large mutations; a future ceiling reduction is an
-    // optional follow-up. The 25M bound below guards the mock measurement (real
-    // ~28M), catching any regression that would erode the remaining headroom.
-    uint256 internal constant DEFAULT_OPEN_CEILING_GAS_BOUND = 25_000_000;
+    // Both tests `vm.cool(...)` the contracts immediately before the measured
+    // call so it pays the same EIP-2929 cold first-touch costs it would in a
+    // fresh production transaction — without that, slots warmed by the in-test
+    // setup (`_makeActiveOps`, the `first` build in the replace test) skew the
+    // number in either direction.
+    //
+    // Headroom is THIN, not comfortable. The numbers below are the cold
+    // `gasleft()` delta of the call ALONE (logged via `console2`), NOT the
+    // `.gas-snapshot` entry for the whole test function — the snapshot figure
+    // also includes the 500/1000 `bond.setActive` writes and (for the replace)
+    // the `first` build, so it is much larger and is not the guardrail.
+    //   - fresh 500-element build (worst case): ~24.5M cold gas with the mock
+    //     `MockBondActivity.isActive` (a single SLOAD).
+    //   - 500->500 replace: ~19.2M cold — cheaper than the fresh build because
+    //     the remove path earns SSTORE-clear refunds.
+    // The real `CapacityBond.isActive` reads four storage slots
+    // (`_nodes[op].active`, `activeBond`, `unbondingOf.amount`, `ejected`) vs
+    // the mock's one, i.e. ~3 extra cold SLOADs (~2100 gas each => ~+3.15M over
+    // 500 elements). That puts a real single-tx full rebuild at ~27.6M — ~86%
+    // of a 32M Arbitrum-class L2 block (~1.16x headroom). Per #780 the team's
+    // decision is to KEEP the 500 ceiling: governance is never forced into a
+    // 500-element atomic tx because `addDefaultOpenOperator` /
+    // `removeDefaultOpenOperator` deltas exist and should be preferred for large
+    // mutations; a future ceiling reduction is an optional follow-up. The 26M
+    // bound guards the mock measurement (a trip maps to ~29M real, still clear
+    // of 32M), catching any regression that erodes the remaining headroom.
+    uint256 internal constant DEFAULT_OPEN_CEILING_GAS_BOUND = 26_000_000;
 
     function test_defaultOpen_setAllowlist_atCeiling_gas() public {
         address[] memory ops = _makeActiveOps(500, 0x100000);
         vm.startPrank(admin);
         oa.setDefaultOpenMaxOrigins(500);
+        // Reset every slot warmed by `_makeActiveOps`/`setDefaultOpenMaxOrigins`
+        // to cold so the measured call pays the same first-touch (EIP-2929)
+        // access costs it would in a fresh production transaction.
+        vm.cool(address(oa));
+        vm.cool(address(bond));
         uint256 before = gasleft();
         oa.setDefaultOpenAllowlist(ops);
         uint256 used = before - gasleft();
         vm.stopPrank();
-        console2.log("setDefaultOpenAllowlist(500) gas (mock isActive):", used);
+        console2.log("setDefaultOpenAllowlist(500) cold gas (mock isActive):", used);
         assertLt(used, DEFAULT_OPEN_CEILING_GAS_BOUND, "500-element rebuild drifting toward L2 block gas");
         assertEq(oa.getOrigins(0).length, 500);
     }
@@ -428,11 +447,17 @@ contract OriginAssignmentTest is Test {
         vm.startPrank(admin);
         oa.setDefaultOpenMaxOrigins(500);
         oa.setDefaultOpenAllowlist(first);
+        // Cool both contracts so the measured replace pays cold first-touch on
+        // the slots the `first` build warmed earlier in THIS test transaction.
+        // Without this the per-tx EIP-2929 warm set understates the real
+        // cold-start cost of a 500->500 replace executed in its own tx.
+        vm.cool(address(oa));
+        vm.cool(address(bond));
         uint256 before = gasleft();
         oa.setDefaultOpenAllowlist(second);
         uint256 used = before - gasleft();
         vm.stopPrank();
-        console2.log("setDefaultOpenAllowlist replace 500->500 gas (mock isActive):", used);
+        console2.log("setDefaultOpenAllowlist replace 500->500 cold gas (mock isActive):", used);
         assertLt(used, DEFAULT_OPEN_CEILING_GAS_BOUND, "500->500 replace drifting toward L2 block gas");
         assertEq(oa.getOrigins(0).length, 500);
     }
