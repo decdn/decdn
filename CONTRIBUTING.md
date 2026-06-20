@@ -182,7 +182,8 @@ forge test                              # default profile: 256 fuzz, 32-depth in
 FOUNDRY_PROFILE=ci forge test           # 1024 fuzz, 256/50-depth (matches CI)
 FOUNDRY_PROFILE=fuzz forge test         # 10k fuzz, 1024/100-depth (nightly/manual)
 FOUNDRY_PROFILE=coverage forge coverage --report lcov
-forge snapshot --diff .gas-snapshot     # current gas vs committed baseline
+FOUNDRY_PROFILE=ci forge snapshot --diff .gas-snapshot   # current gas vs committed baseline
+FOUNDRY_PROFILE=ci forge snapshot --check .gas-snapshot  # mirror the CI gate (non-zero if stale)
 ```
 
 **Local static analysis:**
@@ -207,14 +208,22 @@ The pre-commit hooks run `forge-fmt` and `solhint` on every commit; `forge-build
 
 **Updating the gas snapshot baseline:**
 
-When a contract change legitimately moves gas, regenerate the committed snapshot in the same PR:
+The `.gas-snapshot` baseline is an **enforced gate**, not advisory. The `solidity build+test` CI
+job (path-filtered to `contracts/**`) regenerates the snapshot under `FOUNDRY_PROFILE=ci` and
+**fails the build if it differs** from the committed file. The ci profile pins a fuzz/invariant
+seed (`foundry.toml [profile.ci]`) so this is deterministic — a failure means the committed
+snapshot is genuinely stale vs. your contract change, not seed noise. A sticky PR comment shows
+the diff on both pass (empty) and fail (the drifted entries).
+
+So when a contract change moves gas, regenerate the committed snapshot in the **same PR**:
 
 ```bash
 cd contracts && FOUNDRY_PROFILE=ci forge snapshot --snap .gas-snapshot
 git add .gas-snapshot
 ```
 
-The `solidity-gas-snapshot` CI job posts a sticky PR comment with the diff so reviewers can confirm the change was intentional.
+Exploratory, unpinned fuzzing still runs via `FOUNDRY_PROFILE=fuzz` (nightly/manual), so the
+ci-profile seed pin costs no fuzz coverage.
 
 **Interpreting CI findings:**
 
