@@ -9,6 +9,7 @@ pub mod bond;
 pub mod bundle;
 pub mod bundle_pull;
 pub mod chain_ctx;
+pub mod channel;
 pub mod client_endpoint;
 pub mod config;
 pub mod discovery;
