@@ -68,8 +68,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::metrics::Metrics;
 
-/// File name of the receipt log within `data_dir`.
-const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
+/// File name of the receipt log within `data_dir`. Canonical name lives in
+/// `decdn_common` so the daemon writer and the `config validate` summary can't
+/// disagree on where receipts land (#964).
+const RECEIPT_LOG_FILE: &str = decdn_common::config::RECEIPT_LOG_FILE;
 
 /// On-disk file mode (`0o600` — owner-only read+write). Same defense-in-depth
 /// rationale as [`crate::channel_store`]: `data_dir` is already `0o700`, but the

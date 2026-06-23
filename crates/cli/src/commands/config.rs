@@ -307,6 +307,21 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  gossip.max_peer_table_entries: {}",
         resolved.gossip.max_peer_table_entries
     )?;
+    // Download-receipt audit log (#802). The log lives at a fixed filename
+    // inside data_dir; surface the resolved path so an operator can confirm
+    // where receipts land without reading the daemon source, alongside the
+    // rotation cap and retained-backup count that bound its disk use. The path
+    // is derived (not a configurable field) — the daemon writes it to this
+    // canonical name under data_dir.
+    writeln!(
+        w,
+        "  receipts.log_path:        {}",
+        resolved
+            .identity
+            .data_dir
+            .join(config::RECEIPT_LOG_FILE)
+            .display()
+    )?;
     writeln!(
         w,
         "  receipts.max_file_bytes:  {}",
