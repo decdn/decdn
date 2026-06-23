@@ -44,9 +44,10 @@ interface IContentBlacklist {
     function addOperator(address operator) external;
     function removeOperator(address operator) external;
 
-    // Emergency multisig path (3-of-5, no timelock) — hash and origin
-    // Subject to 12-month sunset: blacklistDeadline = deployTimestamp + 365 days
-    // (see ADR 009, Emergency Multisig)
+    // Emergency multisig path (3-of-5, no timelock) — hash and origin.
+    // Permanent (no sunset): unlawful-content removal discharges an ongoing
+    // legal duty — see ADR 009, Emergency Multisig (capability-split sunset).
+    // Only the protocol-wide pause sunsets at 12 months, not this path.
     // Category determines emergency entry expiry:
     //   GENERAL — 14-day auto-expiry (default)
     //   CSAM, TERRORIST — 90-day auto-expiry (severe content must not be re-exposed due to governance latency)
@@ -317,7 +318,7 @@ If `removeHash` or `removeHashRegional` fires while an appeal is open against th
 | Regional governance body | 24 hours after `effectiveAt` |
 | Emergency multisig add | `effectiveAt = addedAt` — slash applies after 2 hours |
 
-The 24-hour window accounts for nodes that are offline or have a long poll interval. The 2-hour emergency window is tight enough to matter for active illegal content while giving online nodes time to act. The emergency multisig path is subject to a 12-month sunset (`blacklistDeadline = deployTimestamp + 365 days`) — see [ADR 009](009-governance.md#emergency-multisig).
+The 24-hour window accounts for nodes that are offline or have a long poll interval. The 2-hour emergency window is tight enough to matter for active illegal content while giving online nodes time to act. The emergency multisig blacklist path is permanent (no sunset): it discharges an ongoing legal duty to remove unlawful content. Under the capability-split sunset, only the protocol-wide pause expires at 12 months, not this path — see [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig).
 
 The compliance window is a governable parameter (hardcoded bounds: minimum 1 hour, maximum 7 days).
 
