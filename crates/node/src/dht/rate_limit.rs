@@ -613,7 +613,12 @@ mod tests {
     fn cheapest_first_global_fires_before_per_ip() {
         let mut cfg = strict_cfg();
         // global burst=1, per-IP burst=1 (both from strict_cfg); loosen
-        // per-peer so it can never be the layer that fires.
+        // per-peer so it can never be the layer that fires. Pin the two
+        // tested layers' refill to effectively zero (1e-9 req/sec) so a slow
+        // CI scheduler can't refill a token mid-test and flake the second
+        // `check`; burst=1 (from strict_cfg) is the only budget either gets.
+        cfg.global_rate_per_sec = 1e-9;
+        cfg.per_ip_rate_per_sec = 1e-9;
         cfg.per_peer_burst = u32::MAX;
         cfg.per_peer_rate_per_sec = 1e9;
         let lim = DhtRateLimiter::new(&cfg, metrics());
@@ -636,6 +641,11 @@ mod tests {
     #[test]
     fn global_before_per_ip_attributes_rejection_to_global_counter() {
         let mut cfg = strict_cfg();
+        // Pin the tested global + per-IP layers to no-refill (1e-9 req/sec) so
+        // a slow CI scheduler can't refill a token between the two `check`
+        // calls; burst=1 (from strict_cfg) is the entire budget.
+        cfg.global_rate_per_sec = 1e-9;
+        cfg.per_ip_rate_per_sec = 1e-9;
         cfg.per_peer_burst = u32::MAX;
         cfg.per_peer_rate_per_sec = 1e9;
         let metrics = metrics();
@@ -665,6 +675,10 @@ mod tests {
     fn trusted_ip_still_subject_to_per_peer_layer() {
         let mut cfg = strict_cfg();
         // Per-peer burst=1 (from strict_cfg) is the only layer that can fire.
+        // Pin its refill to no-refill (1e-9 req/sec) so a slow CI scheduler
+        // can't refill a per-peer token between the two same-peer `check`
+        // calls; burst=1 is the entire per-peer budget.
+        cfg.per_peer_rate_per_sec = 1e-9;
         cfg.per_ip_burst = u32::MAX;
         cfg.per_ip_rate_per_sec = 1e9;
         cfg.global_burst = u32::MAX;
