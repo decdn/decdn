@@ -600,9 +600,13 @@ fn summary_reports_receipt_log_path_and_rotation_cap() -> anyhow::Result<()> {
         c.receipts.retained_files = 7;
     });
     let out = render(None, &cfg)?;
-    // data_dir is /var/lib/decdn in the sample; the log lives at the canonical
-    // filename under it. Derived path tracks the same constant the daemon uses.
-    let expected_path = PathBuf::from("/var/lib/decdn")
+    // The log lives at the canonical filename under the resolved data_dir.
+    // Derive the expected path from the fixture's own data_dir so the
+    // assertion can't drift from the sample, tracking the same constant the
+    // daemon uses.
+    let expected_path = cfg
+        .identity
+        .data_dir
         .join(decdn_common::config::RECEIPT_LOG_FILE)
         .display()
         .to_string();
