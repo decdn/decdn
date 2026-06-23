@@ -40,6 +40,13 @@ fn setup_dry_run_does_not_leak_rpc_url_on_unreachable_endpoint() {
     let rpc_url = format!("http://{host_port}/v3/{FAKE_KEY}");
 
     let output = Command::new(env!("CARGO_BIN_EXE_decdn"))
+        // Pin `$HOME` at the temp dir so default config resolution
+        // (`~/.decdn/node.toml`) can't reach a real config on a developer
+        // machine. Without this, a present `~/.decdn/node.toml` with a custom
+        // `eth_keystore` makes `setup --dry-run` abort on the keystore check
+        // before it ever reaches the RPC path this test exercises — passing in
+        // CI (clean HOME) but failing locally.
+        .env("HOME", data_dir.path())
         .args(["setup", "--mbps", "100", "--region", "US", "--dry-run"])
         .arg("--rpc-url")
         .arg(&rpc_url)
