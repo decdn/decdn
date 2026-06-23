@@ -27,6 +27,8 @@
 /// Buyer-side `PaymentChannel` open kernel (#940), shared by the node service
 /// and the CLI.
 pub mod buyer_channel;
+/// Client-initiated cooperative close (#971), shared by the CLI and the node.
+pub mod cooperative_close;
 mod ledger;
 
 pub use ledger::{ChannelLedger, Cumulative};

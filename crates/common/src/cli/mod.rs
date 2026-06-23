@@ -7,6 +7,7 @@
 //! `crates/node/src/main.rs` and is not part of this module.
 
 pub mod bundle;
+pub mod channel;
 pub mod common;
 pub mod config_cmd;
 pub mod fetch;
@@ -17,6 +18,7 @@ pub mod run;
 pub mod setup;
 
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
+pub use channel::{ChannelArgs, ChannelCommand, CoopCloseArgs};
 pub use common::{ConfigPathSource, LogFormat, default_config_path, default_data_dir};
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use fetch::{ClientFetchArgs, FetchArgs};
@@ -87,4 +89,6 @@ pub enum Command {
     /// linking BLAKE3-content-addressed blobs by relative path. See
     /// `appendix-bundles.md` for the format and issue #391 for status.
     Bundle(BundleArgs),
+    /// Client-side payment-channel lifecycle (`coop-close`).
+    Channel(ChannelArgs),
 }
