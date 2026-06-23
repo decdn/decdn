@@ -6,6 +6,9 @@ version = 2
 # platform-conditional dep with no runtime exposure in our binaries. Each entry
 # records the affected crate, why it is safe to suppress, and what to watch for
 # so a future audit knows when the ignore can be dropped. Status as of 2026-06.
+# The `crate -> dep -> dep` chains below are reverse-dependency paths as produced
+# by `cargo tree -i`: read left-to-right as "is depended on by" (the leftmost
+# crate is the flagged one; each `->` points to a crate that pulls in the prior).
 ignore = [
     # proc-macro-error v0.4.x: unmaintained (RustSec: maintainer unreachable, no
     # release in 4 years; suggested replacements manyhow / proc-macro2-diagnostics).
@@ -26,7 +29,7 @@ ignore = [
     "RUSTSEC-2024-0436",
     # proc-macro-error2 v2.x: unmaintained (RustSec: author confirmed no longer
     # maintained; suggests migrating to manyhow / proc-macro2-diagnostics). This is
-    # the maintained fork of proc-macro-error (itself ignored above as
+    # the formerly-maintained fork of proc-macro-error (itself ignored above as
     # RUSTSEC-2024-0370) and is now unmaintained too. Build-time proc-macro only,
     # no runtime code. Transitive via alloy-sol-macro -> alloy-sol-types -> alloy.
     # No fixed release exists. Re-evaluate when alloy-sol-macro drops it.
