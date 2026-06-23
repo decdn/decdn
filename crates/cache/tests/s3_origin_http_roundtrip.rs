@@ -26,8 +26,8 @@ use std::io::Write;
 use std::sync::Arc;
 
 use decdn_cache::{
-    CacheEngine, Hash, Origin, OriginFetch, OriginPullError, S3Credentials, S3Origin,
-    S3OriginConfig, parse_origin_url,
+    CacheEngine, Hash, Origin, OriginPullError, S3Credentials, S3Origin, S3OriginConfig,
+    parse_origin_url,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -240,9 +240,20 @@ async fn cache_engine_pulls_gzip_from_s3_over_http_and_caches() -> anyhow::Resul
 async fn cache_engine_pulls_zstd_from_s3_over_http_and_caches() -> anyhow::Result<()> {
     let payload: &[u8] = b"engine pull of a zstd blob through the s3 wire path xxxxxxxxxxxx";
     let hash = Hash::new(payload);
-    let server = serve_s3_object(hash, Some("zstd"), zstd_compress(payload)?).await?;
-    let origin: Arc<dyn Origin> = Arc::new(s3_origin_at(&server.uri()).await?);
+    // `expect(1)` proves the second `get` is served from cache, not re-fetched.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{BUCKET}/{}", key_for(hash))))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "zstd")
+                .set_body_bytes(zstd_compress(payload)?),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
 
+    let origin: Arc<dyn Origin> = Arc::new(s3_origin_at(&server.uri()).await?);
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open(tmp.path(), vec![origin], 16).await?;
 
@@ -251,6 +262,18 @@ async fn cache_engine_pulls_zstd_from_s3_over_http_and_caches() -> anyhow::Resul
         &got[..] == payload,
         "engine must return canonical bytes for a zstd-encoded S3 object"
     );
+    anyhow::ensure!(
+        engine.has(hash).await?,
+        "blob must be cached after the zstd miss"
+    );
+
+    let got2 = engine.get(hash).await?;
+    anyhow::ensure!(
+        &got2[..] == payload,
+        "second get must be served from the local cache"
+    );
+    // `expect(1)` on the mock asserts the single HTTP dispatch on drop, so a
+    // re-fetch regression fails this test when `server` is dropped.
     Ok(())
 }
 
@@ -266,16 +289,12 @@ async fn s3_origin_passes_through_uncompressed_over_http() -> anyhow::Result<()>
     let server = serve_s3_object(hash, None, payload.to_vec()).await?;
     let origin = s3_origin_at(&server.uri()).await?;
 
-    match origin.fetch(hash, 16 * 1024 * 1024).await? {
-        OriginFetch::Found { .. } => {}
-        OriginFetch::NotFound => anyhow::bail!("expected Found for an uncompressed object"),
-    }
     let bytes = origin
         .fetch(hash, 16 * 1024 * 1024)
         .await?
         .collect_to_bytes()
         .await?
-        .ok_or_else(|| anyhow::anyhow!("expected Found"))?;
+        .ok_or_else(|| anyhow::anyhow!("expected Found for an uncompressed object"))?;
     anyhow::ensure!(&bytes[..] == payload, "uncompressed body must pass through");
     Ok(())
 }
