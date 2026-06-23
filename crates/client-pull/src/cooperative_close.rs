@@ -143,7 +143,8 @@ struct PreparedClose {
     bytes_delivered: U256,
     /// Client voucher signature (`r‖s‖v`, `v` in 27/28) over the agreed tuple.
     client_sig: Bytes,
-    /// Provider `CooperativeClose` waiver signature, echoed from the auth.
+    /// Provider `CooperativeClose` waiver signature (`r‖s‖v`, `v` in 27/28),
+    /// re-serialized from the parsed auth signature.
     provider_sig: Bytes,
 }
 
@@ -168,6 +169,17 @@ fn prepare_close(
     client_signer: &PrivateKeySigner,
     domain: &Eip712Domain,
 ) -> anyhow::Result<PreparedClose> {
+    // The provider echoes the requested `channel_id`; a mismatch would already
+    // fail signature verification (the digest is rebuilt from the local
+    // `channel_id`), but checking the echo up front gives an actionable error
+    // instead of an opaque "verification failed".
+    if B256::from(auth.channel_id) != channel_id {
+        anyhow::bail!(
+            "provider returned a waiver for the wrong channel: expected {channel_id}, got {}",
+            B256::from(auth.channel_id)
+        );
+    }
+
     let amount = U256::from_be_bytes(auth.amount);
     let nonce = U256::from_be_bytes(auth.nonce);
     let bytes_delivered = U256::from_be_bytes(auth.bytes_delivered);
@@ -222,10 +234,13 @@ fn prepare_close(
         amount,
         nonce,
         bytes_delivered,
-        // `Signature::as_bytes` already emits `v` in the 27/28 convention the
-        // contract's `ECDSA.recover` expects (see node `normalize_voucher_signature`).
+        // `Signature::as_bytes` emits `v` in the 27/28 convention the contract's
+        // `ECDSA.recover` expects (see node `normalize_voucher_signature`). Use the
+        // re-serialized parsed `provider_sig` rather than the raw wire bytes so a
+        // non-canonical `v` (0/1) that parses and verifies still lands on-chain in
+        // the form the contract requires — both sigs go through the same normalizer.
         client_sig: Bytes::from(client_sig.as_bytes().to_vec()),
-        provider_sig: Bytes::from(auth.signature.clone()),
+        provider_sig: Bytes::from(provider_sig.as_bytes().to_vec()),
     })
 }
 
@@ -269,7 +284,7 @@ pub async fn cooperative_close<P: Provider>(
         domain,
     )?;
 
-    let pending = contract
+    let pending = match contract
         .cooperativeClose(
             channel_id,
             prepared.amount,
@@ -280,7 +295,20 @@ pub async fn cooperative_close<P: Provider>(
         )
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("cooperativeClose send failed: {e}"))?;
+    {
+        Ok(pending) => pending,
+        // A deterministic revert (raced `withdraw`/`closeChannel`, or a watermark
+        // regressed against the on-chain `claimed*`) is caught at gas estimation,
+        // so it never reaches a mined receipt — it surfaces here with revert data
+        // attached. That's the non-fatal `Reverted` outcome, so the caller can
+        // fall back to `closeChannel`. A send error *without* revert data is a
+        // genuine transport/RPC failure (connectivity, nonce) and stays an error
+        // the caller should retry, not a settlement signal.
+        Err(e) if e.as_revert_data().is_some() => {
+            return Ok(CooperativeCloseOutcome::Reverted);
+        }
+        Err(e) => return Err(anyhow::anyhow!("cooperativeClose send failed: {e}")),
+    };
     let receipt = pending
         .get_receipt()
         .await
@@ -460,6 +488,34 @@ mod tests {
         )
         .expect_err("wrong-signer waiver must be refused");
         assert!(err.to_string().contains("verification failed"), "{err}");
+    }
+
+    #[test]
+    fn refuses_waiver_for_wrong_channel() {
+        let provider = PrivateKeySigner::random();
+        let client = PrivateKeySigner::random();
+        let token = Address::repeat_byte(0x99);
+        // Provider returns a (well-signed) waiver for a different channel than the
+        // one we asked to close.
+        let auth = provider_auth(
+            &provider,
+            B256::repeat_byte(0xAA),
+            token,
+            U256::from(500u64),
+            U256::from(3u64),
+            U256::from(9000u64),
+        );
+        let err = prepare_close(
+            &auth,
+            B256::repeat_byte(0xBB),
+            provider.address(),
+            token,
+            watermark(500, 3, 9000),
+            &client,
+            &domain(),
+        )
+        .expect_err("wrong-channel waiver must be refused");
+        assert!(err.to_string().contains("wrong channel"), "{err}");
     }
 
     /// Recover the signer of a wire voucher signature over a tuple — test helper
