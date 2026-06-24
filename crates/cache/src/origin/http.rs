@@ -9,15 +9,16 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Context;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::Stream;
 use iroh_blobs::Hash;
 use reqwest::StatusCode;
-use reqwest::header::CONTENT_ENCODING;
+use reqwest::header::{CONTENT_ENCODING, RANGE};
 
+use super::fs::OBAO4_SUFFIX;
 use super::{
-    DEFAULT_USER_AGENT, DecompressMode, Origin, OriginFetch, OriginKind, OriginUrl, decompress,
-    parse_origin_url, redact_for_log,
+    DEFAULT_USER_AGENT, DecompressMode, Origin, OriginFetch, OriginKind, OriginRangeFetch,
+    OriginRangeRequest, OriginUrl, decompress, parse_origin_url, redact_for_log,
 };
 use crate::error::{OriginError, OriginPullError};
 
@@ -359,6 +360,185 @@ impl Origin for HttpOrigin {
                 size_hint,
             })
         })
+    }
+
+    fn fetch_range(
+        &self,
+        hash: Hash,
+        req: OriginRangeRequest,
+        outboard_max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let hex = hash.to_hex();
+            // Outboard first: an origin that doesn't publish `{H}.obao4` can't
+            // be range-pulled, and the outboard read is the cheaper request.
+            // A 404 (or any non-success) on the sibling → degrade to
+            // whole-blob (`Unsupported`), never an error. The data `Range`
+            // request is skipped entirely in that case.
+            let obao4_url = self
+                .base_url
+                .as_url()
+                .join(&format!("{hex}{OBAO4_SUFFIX}"))
+                .with_context(|| format!("failed to build outboard URL for {hash}"))
+                .map_err(OriginPullError::Permanent)?;
+            let Some(outboard) = self.get_bounded(&obao4_url, outboard_max_bytes).await? else {
+                return Ok(OriginRangeFetch::Unsupported);
+            };
+
+            // Ranged data read. `Range: bytes=a-(b-1)` is inclusive-end. A
+            // compliant origin answers `206 Partial Content` with exactly the
+            // requested span. A `200` means the origin ignored `Range` and
+            // would stream the whole blob — refuse and let the engine
+            // whole-blob pull instead of buffering the entire object here.
+            let data_url = self
+                .base_url
+                .as_url()
+                .join(&hex)
+                .with_context(|| format!("failed to build URL for {hash}"))
+                .map_err(OriginPullError::Permanent)?;
+            // Empty span only for a zero-length blob — nothing to range.
+            if req.is_empty() {
+                return Ok(OriginRangeFetch::Ranged {
+                    data: Bytes::new(),
+                    outboard,
+                });
+            }
+            // Inclusive end: HTTP byte ranges are `[a, b]`, our span is
+            // `[fetch_start, fetch_end)`. `fetch_end > fetch_start` here (the
+            // empty-span case returned above), so the subtraction is sound.
+            let range_val = format!("bytes={}-{}", req.fetch_start, req.fetch_end - 1);
+            let want = req.len();
+            let Some(data) = self.get_range_bytes(&data_url, &range_val, want).await? else {
+                return Ok(OriginRangeFetch::Unsupported);
+            };
+            Ok(OriginRangeFetch::Ranged { data, outboard })
+        })
+    }
+}
+
+impl HttpOrigin {
+    /// GET `url` and buffer the whole body, capped at `max_bytes`. Returns
+    /// `Ok(None)` when the origin answers any non-2xx (a missing
+    /// `{H}.obao4` → 404 → degrade to whole-blob). Used for the small sibling
+    /// outboard read on the range-pull path. Redirects stay disabled (SSRF,
+    /// #579): a 3xx is treated as `None` (degrade) rather than followed.
+    async fn get_bounded(
+        &self,
+        url: &reqwest::Url,
+        max_bytes: u64,
+    ) -> Result<Option<Bytes>, OriginPullError> {
+        let url_log = redact_for_log(url);
+        let send_fut = self.client.get(url.clone()).send();
+        let resp = match tokio::time::timeout(self.response_headers_timeout, send_fut).await {
+            Err(_elapsed) => {
+                return Err(OriginPullError::Transient(anyhow::anyhow!(
+                    "origin GET {url_log} headers timed out"
+                )));
+            }
+            Ok(Err(reqwest_err)) => {
+                return Err(classify_reqwest_error(reqwest_err)
+                    .map_inner(|e| e.context(format!("origin GET {url_log} failed"))));
+            }
+            Ok(Ok(resp)) => resp,
+        };
+        // Any non-success (404 missing sibling, 3xx redirect, 5xx) → degrade.
+        // The optimization is best-effort; only transport faults on the send
+        // above are surfaced as errors.
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        if let Some(len) = resp.content_length()
+            && len > max_bytes
+        {
+            return Ok(None);
+        }
+        self.collect_capped(resp, max_bytes, url_log).await
+    }
+
+    /// GET `url` with a `Range` header and buffer the partial body. Returns
+    /// `Ok(None)` when the origin does not honor the range (any status other
+    /// than `206`, e.g. a `200` whole-blob response) or the returned span is
+    /// not exactly `want` bytes — both degrade the engine to a whole-blob
+    /// pull. `want` is capped both as the buffer ceiling and as an exact-length
+    /// check, so an origin that streams the whole object on a `200` is rejected
+    /// at the header (status) before any large buffer is committed.
+    async fn get_range_bytes(
+        &self,
+        url: &reqwest::Url,
+        range_val: &str,
+        want: u64,
+    ) -> Result<Option<Bytes>, OriginPullError> {
+        let url_log = redact_for_log(url);
+        let send_fut = self.client.get(url.clone()).header(RANGE, range_val).send();
+        let resp = match tokio::time::timeout(self.response_headers_timeout, send_fut).await {
+            Err(_elapsed) => {
+                return Err(OriginPullError::Transient(anyhow::anyhow!(
+                    "origin GET {url_log} (range) headers timed out"
+                )));
+            }
+            Ok(Err(reqwest_err)) => {
+                return Err(classify_reqwest_error(reqwest_err)
+                    .map_inner(|e| e.context(format!("origin GET {url_log} (range) failed"))));
+            }
+            Ok(Ok(resp)) => resp,
+        };
+        // Only `206 Partial Content` is an honored range. A `200` means the
+        // origin ignored `Range` and is sending the whole blob — degrade
+        // before reading the (potentially huge) body.
+        if resp.status() != StatusCode::PARTIAL_CONTENT {
+            return Ok(None);
+        }
+        let Some(bytes) = self.collect_capped(resp, want, url_log).await? else {
+            return Ok(None);
+        };
+        // A `206` whose body length differs from the requested span is a
+        // misbehaving origin (multipart/byteranges, off-by-one, truncation).
+        // Degrade rather than feed a wrong-length span to verification.
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != want {
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Drain `resp`'s body into `Bytes`, aborting (returning `Ok(None)`) the
+    /// moment the cumulative size exceeds `max_bytes`. Per-chunk idle timeout
+    /// bounds a slow-trickle origin. Transport errors mid-body surface as
+    /// `Transient`. The range path buffers (rather than streams) because the
+    /// payloads are bounded: the outboard is `O(blob/256)` and the data span
+    /// is the requested range, both far below the whole-blob streaming
+    /// threshold that motivated #271.
+    async fn collect_capped(
+        &self,
+        mut resp: reqwest::Response,
+        max_bytes: u64,
+        url_log: String,
+    ) -> Result<Option<Bytes>, OriginPullError> {
+        let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let mut buf = BytesMut::new();
+        loop {
+            match tokio::time::timeout(self.chunk_idle_timeout, resp.chunk()).await {
+                Err(_elapsed) => {
+                    return Err(OriginPullError::Transient(anyhow::anyhow!(
+                        "origin GET {url_log} body read stalled"
+                    )));
+                }
+                Ok(Err(reqwest_err)) => {
+                    return Err(classify_reqwest_error(reqwest_err)
+                        .map_inner(|e| e.context(format!("origin GET {url_log} body failed"))));
+                }
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(chunk))) => {
+                    if buf.len().saturating_add(chunk.len()) > cap {
+                        // Over the bound → degrade (the optimization is
+                        // best-effort; a too-big sibling/span is treated as
+                        // "not range-pullable", never a hard error).
+                        return Ok(None);
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+            }
+        }
+        Ok(Some(buf.freeze()))
     }
 }
 

@@ -3884,3 +3884,351 @@ async fn empty_origin_vec_returns_no_origin() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ----------------------------------------------------------------------------
+// Origin range pull-through (#962, ADR 037 §Origin-tier pull-through).
+//
+// These exercise the engine's `pull_through_range` path end-to-end against a
+// mocked HTTP origin: a range-scoped pull that fetches only the requested
+// `[a, b)` span plus the sibling `{H}.obao4` outboard, verifies the span
+// against the root `H`, imports a partial blob, and serves the narrower
+// requested sub-range back — without a whole-blob fetch. They also pin the
+// always-correct fallback: an origin that publishes no `{H}.obao4`, or that
+// ignores `Range`, degrades to `Unsupported` and never errors.
+// ----------------------------------------------------------------------------
+
+use bao_tree::io::outboard::PreOrderMemOutboard;
+use decdn_cache::OriginRangeRequest;
+use decdn_cache::engine::RangePullOutcome;
+use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range};
+
+/// Bytes per chunk group, derived from upstream (not hard-coded) so an
+/// iroh-blobs block-size bump can't silently invalidate the assertions.
+const GROUP: u64 = 1u64 << (IROH_BLOCK_SIZE.chunk_log() + 10);
+
+/// Deterministic pseudo-random blob spanning several chunk groups — the same
+/// generator the `range_pull` helper suite uses, so the fixtures match.
+fn make_blob(len: usize) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    let mut x: u32 = 0x9e37_79b9;
+    for b in &mut v {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    v
+}
+
+fn sub(data: &[u8], start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
+    let s = usize::try_from(start)?;
+    let e = usize::try_from(end)?;
+    data.get(s..e)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| anyhow::anyhow!("range [{start}, {end}) out of bounds"))
+}
+
+/// Stand up a wiremock origin that publishes:
+///   - the data object at `/{hex}`, answering `206` for the *exact* aligned
+///     `Range: bytes=a-(b-1)` the engine will request, and
+///   - the sibling outboard at `/{hex}.obao4` (full body, `200`).
+///
+/// `aligned` is the chunk-group-aligned span the engine derives for the
+/// requested sub-range; we pre-compute it so the `Range` matcher pins the
+/// exact header value (proving the fetch is range-scoped, not whole-blob).
+async fn serve_range_origin(
+    blob: &[u8],
+    aligned_start: u64,
+    aligned_end: u64,
+) -> anyhow::Result<(MockServer, Hash, Vec<u8>)> {
+    let server = MockServer::start().await;
+    let ob = PreOrderMemOutboard::create(blob, IROH_BLOCK_SIZE);
+    let root = *ob.root.as_bytes();
+    let hash = Hash::from_bytes(root);
+    let hex = hash.to_hex();
+    let outboard = ob.data.clone();
+
+    // Outboard sibling — full 200.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+
+    // Ranged data — 206 with exactly the aligned span, matched on the precise
+    // Range header the engine sends (inclusive end).
+    let range_val = format!("bytes={aligned_start}-{}", aligned_end - 1);
+    let span = sub(blob, aligned_start, aligned_end)?;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span))
+        .mount(&server)
+        .await;
+
+    Ok((server, hash, outboard))
+}
+
+#[tokio::test]
+async fn range_pull_serves_subrange_without_whole_blob_fetch() -> anyhow::Result<()> {
+    let blob = make_blob(200 * 1024);
+    let blob_size = u64::try_from(blob.len())?;
+    // Client wants [20 KiB, 40 KiB); the fetch widens to [16 KiB, 48 KiB).
+    let (req_start, req_end): (u64, u64) = (20 * 1024, 40 * 1024);
+    let aligned = align_range(req_start, req_end - req_start, blob_size)?;
+    anyhow::ensure!(aligned.fetch_start() == GROUP && aligned.fetch_end() == 3 * GROUP);
+
+    let (server, hash, _ob) =
+        serve_range_origin(&blob, aligned.fetch_start(), aligned.fetch_end()).await?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![Arc::new(HttpOrigin::parse(&server.uri())?) as Arc<dyn Origin>],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let outcome = engine
+        .pull_through_range(hash, req_start, req_end - req_start, blob_size)
+        .await?;
+    anyhow::ensure!(
+        matches!(outcome, RangePullOutcome::Served),
+        "range pull should serve, got {outcome:?}",
+    );
+
+    // The blob is NOT complete (only a partial range imported) — `has` is
+    // false, matching ADR 037 "partial warming copies are not advertised".
+    anyhow::ensure!(
+        !engine.has(hash).await?,
+        "partial range must not be a full holder"
+    );
+
+    // The requested sub-range reads back from the widened partial import.
+    let exported = engine
+        .export_range(hash, req_start, req_end - req_start)
+        .await?;
+    anyhow::ensure!(
+        exported == sub(&blob, req_start, req_end)?,
+        "requested sub-range mismatch",
+    );
+
+    // Only the pulled bytes (aligned span + outboard) are metered as egress —
+    // far less than the whole blob.
+    let pulled = metrics.pull_through_bytes.get();
+    anyhow::ensure!(
+        pulled < blob_size,
+        "must pull less than the whole blob, got {pulled}"
+    );
+    anyhow::ensure!(pulled > 0, "should have metered the pulled span + outboard");
+
+    // Drop the server to prove the range came from the *first* fetch — a
+    // second export does not re-hit the origin.
+    drop(server);
+    let again = engine
+        .export_range(hash, req_start, req_end - req_start)
+        .await?;
+    anyhow::ensure!(again == sub(&blob, req_start, req_end)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_pull_degrades_when_no_outboard_published() -> anyhow::Result<()> {
+    // Origin serves the data object but NOT `{H}.obao4`. The range pull must
+    // degrade to Unsupported (never error) so the caller whole-blob pulls.
+    let blob = make_blob(200 * 1024);
+    let blob_size = u64::try_from(blob.len())?;
+    let payload: &'static [u8] = Box::leak(blob.clone().into_boxed_slice());
+    let (server, hash) = serve_blob(payload).await; // serves /{hex} 200, no obao4
+
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![Arc::new(HttpOrigin::parse(&server.uri())?) as Arc<dyn Origin>],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let outcome = engine
+        .pull_through_range(hash, 20 * 1024, 20 * 1024, blob_size)
+        .await?;
+    anyhow::ensure!(
+        matches!(outcome, RangePullOutcome::Unsupported),
+        "missing outboard must degrade to Unsupported, got {outcome:?}",
+    );
+    // Nothing imported — the whole-blob fallback (get) still works.
+    anyhow::ensure!(!engine.has(hash).await?);
+    let whole = engine.get(hash).await?;
+    anyhow::ensure!(whole[..] == blob[..], "whole-blob fallback serves the blob");
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_pull_degrades_when_origin_ignores_range() -> anyhow::Result<()> {
+    // Origin publishes the outboard but answers `200` (whole blob) to the
+    // ranged request instead of `206`. Must degrade, not import a wrong span.
+    let blob = make_blob(200 * 1024);
+    let blob_size = u64::try_from(blob.len())?;
+    let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+    let hash = Hash::from_bytes(*ob.root.as_bytes());
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ob.data.clone()))
+        .mount(&server)
+        .await;
+    // Range-ignoring origin: 200 with the whole body regardless of Range.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
+        .mount(&server)
+        .await;
+
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![Arc::new(HttpOrigin::parse(&server.uri())?) as Arc<dyn Origin>],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let outcome = engine
+        .pull_through_range(hash, 20 * 1024, 20 * 1024, blob_size)
+        .await?;
+    anyhow::ensure!(
+        matches!(outcome, RangePullOutcome::Unsupported),
+        "a 200 (range ignored) must degrade, got {outcome:?}",
+    );
+    anyhow::ensure!(!engine.has(hash).await?, "nothing imported on degrade");
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_pull_rejects_out_of_bounds_range() -> anyhow::Result<()> {
+    // ADR 005: an out-of-bounds range is rejected (not clamped), surfaced as
+    // an OriginError before any origin fetch.
+    let blob = make_blob(64 * 1024);
+    let blob_size = u64::try_from(blob.len())?;
+    let (server, hash, _ob) = serve_range_origin(&blob, 0, blob_size).await?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![Arc::new(HttpOrigin::parse(&server.uri())?) as Arc<dyn Origin>],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    // Offset past the blob end.
+    let err = err_of(
+        engine
+            .pull_through_range(hash, blob_size + 1, 16, blob_size)
+            .await,
+    )?;
+    anyhow::ensure!(
+        matches!(err, CacheError::OriginError { .. }),
+        "out-of-bounds must surface OriginError, got {err:?}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_pull_no_origin_configured_errors() -> anyhow::Result<()> {
+    let hash = Hash::new(b"no-origin");
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(Vec::new(), Arc::clone(&metrics)).await?;
+    let err = err_of(engine.pull_through_range(hash, 0, 16, 1024).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::NoOrigin { .. }),
+        "no origin must surface NoOrigin, got {err:?}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_pull_falls_back_to_second_origin_outboard() -> anyhow::Result<()> {
+    // First origin publishes no `{H}.obao4` (degrade); the second one does and
+    // serves the range. The fallback chain must reach the second origin.
+    let blob = make_blob(200 * 1024);
+    let blob_size = u64::try_from(blob.len())?;
+    let (req_start, req_end): (u64, u64) = (20 * 1024, 40 * 1024);
+    let aligned = align_range(req_start, req_end - req_start, blob_size)?;
+
+    // First origin: only the data object, no outboard → Unsupported.
+    let payload: &'static [u8] = Box::leak(blob.clone().into_boxed_slice());
+    let (first, hash) = serve_blob(payload).await;
+    // Second origin: full range-pull capability.
+    let (second, hash2, _ob) =
+        serve_range_origin(&blob, aligned.fetch_start(), aligned.fetch_end()).await?;
+    anyhow::ensure!(hash == hash2, "fixtures must address the same blob");
+
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![
+            Arc::new(HttpOrigin::parse(&first.uri())?) as Arc<dyn Origin>,
+            Arc::new(HttpOrigin::parse(&second.uri())?) as Arc<dyn Origin>,
+        ],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let outcome = engine
+        .pull_through_range(hash, req_start, req_end - req_start, blob_size)
+        .await?;
+    anyhow::ensure!(
+        matches!(outcome, RangePullOutcome::Served),
+        "second origin should serve the range, got {outcome:?}",
+    );
+    let exported = engine
+        .export_range(hash, req_start, req_end - req_start)
+        .await?;
+    anyhow::ensure!(exported == sub(&blob, req_start, req_end)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_pull_zero_len_reads_to_end() -> anyhow::Result<()> {
+    // `byte_len == 0` means "to the blob end". Request a tail offset; the
+    // aligned span runs to the blob end, and `export_range` with len 0 reads
+    // the imported tail back.
+    let blob = make_blob(200 * 1024 + 1234); // non-group-aligned tail
+    let blob_size = u64::try_from(blob.len())?;
+    let req_start = blob_size - 4096;
+    let aligned = align_range(req_start, 0, blob_size)?;
+    anyhow::ensure!(aligned.fetch_end() == blob_size, "tail clamps to blob end");
+
+    let (server, hash, _ob) =
+        serve_range_origin(&blob, aligned.fetch_start(), aligned.fetch_end()).await?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![Arc::new(HttpOrigin::parse(&server.uri())?) as Arc<dyn Origin>],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    let outcome = engine
+        .pull_through_range(hash, req_start, 0, blob_size)
+        .await?;
+    anyhow::ensure!(
+        matches!(outcome, RangePullOutcome::Served),
+        "tail range serves"
+    );
+    let exported = engine.export_range(hash, req_start, 0).await?;
+    anyhow::ensure!(
+        exported == sub(&blob, req_start, blob_size)?,
+        "tail sub-range mismatch",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn origin_range_request_len_and_empty() {
+    let r = OriginRangeRequest {
+        fetch_start: 16,
+        fetch_end: 48,
+    };
+    assert_eq!(r.len(), 32);
+    assert!(!r.is_empty());
+    let z = OriginRangeRequest {
+        fetch_start: 10,
+        fetch_end: 10,
+    };
+    assert!(z.is_empty());
+    assert_eq!(z.len(), 0);
+}

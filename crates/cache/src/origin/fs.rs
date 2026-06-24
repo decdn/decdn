@@ -17,11 +17,17 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use iroh_blobs::Hash;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use super::{Origin, OriginFetch, OriginKind};
+use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest};
 use crate::error::OriginPullError;
+
+/// Sibling-key suffix for the published pre-order bao outboard
+/// (`{H}.obao4`), per [ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md).
+/// Shared spelling across the filesystem / HTTP / S3 adapters so an operator
+/// `aws s3 sync`-ing between backends keeps the same object names.
+pub(super) const OBAO4_SUFFIX: &str = ".obao4";
 
 /// Origin backed by a local filesystem directory. Blobs live at
 /// `{base}/{hex[0..2]}/{hex}`; the engine is responsible for BLAKE3
@@ -76,6 +82,17 @@ impl FilesystemOrigin {
         // workspace's anti-indexing lint forbids `&hex[..2]` here.
         let shard = hex.get(..2).unwrap_or("");
         self.base.join(shard).join(hex.as_str())
+    }
+
+    /// Build the sibling outboard path: `{base}/{hex[0..2]}/{hex}.obao4`
+    /// ([ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md)).
+    /// Sits next to the data object so a pre-seed `cp`/`sync` carries both.
+    fn obao4_path_for(&self, hash: Hash) -> PathBuf {
+        let hex = hash.to_hex();
+        let shard = hex.get(..2).unwrap_or("");
+        self.base
+            .join(shard)
+            .join(format!("{}{OBAO4_SUFFIX}", hex.as_str()))
     }
 }
 
@@ -216,6 +233,116 @@ impl Origin for FilesystemOrigin {
             Ok(OriginFetch::Found {
                 stream: Box::pin(stream),
                 size_hint: Some(len),
+            })
+        })
+    }
+
+    fn fetch_range(
+        &self,
+        hash: Hash,
+        req: OriginRangeRequest,
+        outboard_max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            // The sibling outboard is the gate: an origin that doesn't publish
+            // `{H}.obao4` can't be range-pulled, so degrade to whole-blob
+            // before issuing the (more expensive) ranged data read. A missing
+            // outboard is the *expected* path for backends that pre-date the
+            // optimization — `Unsupported`, not an error.
+            let obao4_path = self.obao4_path_for(hash);
+            let outboard = match tokio::fs::read(&obao4_path).await {
+                Ok(b) => b,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(OriginRangeFetch::Unsupported);
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path outboard read failed for {}",
+                        obao4_path.display()
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            };
+            // A wildly oversized outboard is a malformed/foreign `{H}.obao4`;
+            // refuse the optimization rather than buffer it. The engine's
+            // `encode_verified_range` length check is the load-bearing reject,
+            // but bounding the read keeps a hostile sibling from forcing a huge
+            // alloc. Degrade to whole-blob (`Unsupported`) — never a failure.
+            if u64::try_from(outboard.len()).unwrap_or(u64::MAX) > outboard_max_bytes {
+                return Ok(OriginRangeFetch::Unsupported);
+            }
+
+            // Resolve + contain the data path exactly as `fetch` does: a
+            // symlink-escape is a permanent failure, a missing data object is
+            // `Unsupported` (caller will whole-blob pull, which then surfaces
+            // the real `NotFound`).
+            let path = self.path_for(hash);
+            let canonical = match tokio::fs::canonicalize(&path).await {
+                Ok(p) => p,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(OriginRangeFetch::Unsupported);
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path canonicalize failed for {}",
+                        path.display()
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            };
+            if !canonical.starts_with(&self.base) {
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "cache.origin.path entry {} resolves to {} which is outside base {}",
+                    path.display(),
+                    canonical.display(),
+                    self.base.display()
+                )));
+            }
+
+            let mut file = match tokio::fs::File::open(&canonical).await {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(OriginRangeFetch::Unsupported);
+                }
+                Err(err) => {
+                    let msg = format!("cache.origin.path open failed for {}", canonical.display());
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            };
+
+            // Empty span only arises for a zero-length blob; nothing to read.
+            if req.is_empty() {
+                return Ok(OriginRangeFetch::Ranged {
+                    data: Bytes::new(),
+                    outboard: Bytes::from(outboard),
+                });
+            }
+
+            // Seek to the aligned start and read exactly `req.len()` bytes. A
+            // short read (the on-disk object is smaller than the aligned span
+            // the engine derived from the signed blob size) means the origin
+            // copy is stale/truncated — degrade to whole-blob rather than feed
+            // a partial span to verification (which would reject it anyway).
+            if let Err(err) = file.seek(std::io::SeekFrom::Start(req.fetch_start)).await {
+                let msg = format!("cache.origin.path seek failed for {}", canonical.display());
+                return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+            }
+            let want = usize::try_from(req.len()).unwrap_or(usize::MAX);
+            let mut data = vec![0u8; want];
+            if let Err(err) = file.read_exact(&mut data).await {
+                if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Ok(OriginRangeFetch::Unsupported);
+                }
+                let msg = format!(
+                    "cache.origin.path range read failed for {}",
+                    canonical.display()
+                );
+                return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+            }
+
+            Ok(OriginRangeFetch::Ranged {
+                data: Bytes::from(data),
+                outboard: Bytes::from(outboard),
             })
         })
     }
@@ -560,6 +687,114 @@ mod tests {
             payload.len()
         );
         anyhow::ensure!(bytes.as_ref() == payload.as_slice(), "byte mismatch");
+        Ok(())
+    }
+
+    /// Seed a sharded data object plus its sibling `{hex}.obao4` outboard
+    /// under `base`, returning the content hash. Mirrors `path_for` /
+    /// `obao4_path_for`.
+    async fn seed_blob_with_outboard(base: &Path, payload: &[u8]) -> anyhow::Result<Hash> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+        let ob = PreOrderMemOutboard::create(payload, crate::range_pull::IROH_BLOCK_SIZE);
+        let hash = Hash::from_bytes(*ob.root.as_bytes());
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard_dir = base.join(shard);
+        tokio::fs::create_dir_all(&shard_dir).await?;
+        tokio::fs::write(shard_dir.join(hex.as_str()), payload).await?;
+        tokio::fs::write(
+            shard_dir.join(format!("{}{OBAO4_SUFFIX}", hex.as_str())),
+            ob.data,
+        )
+        .await?;
+        Ok(hash)
+    }
+
+    /// A blob with a published `{hex}.obao4` range-fetches: the aligned span
+    /// comes back exactly, plus the full outboard.
+    #[tokio::test]
+    async fn fetch_range_returns_span_and_outboard() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+        let payload = (0..200u32)
+            .flat_map(|i| std::iter::repeat_n((i & 0xff) as u8, 1024))
+            .collect::<Vec<_>>();
+        let hash = seed_blob_with_outboard(&canonical, &payload).await?;
+
+        let req = OriginRangeRequest {
+            fetch_start: 16 * 1024,
+            fetch_end: 48 * 1024,
+        };
+        match origin.fetch_range(hash, req, 1 << 20).await? {
+            OriginRangeFetch::Ranged { data, outboard } => {
+                anyhow::ensure!(
+                    data.as_ref() == payload.get(16 * 1024..48 * 1024).unwrap_or_default(),
+                    "span mismatch",
+                );
+                anyhow::ensure!(!outboard.is_empty(), "outboard must be served");
+            }
+            other => anyhow::bail!("expected Ranged, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// No sibling outboard → degrade to `Unsupported` (the expected path for a
+    /// pre-existing filesystem origin), never an error.
+    #[tokio::test]
+    async fn fetch_range_without_outboard_is_unsupported() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+        // Seed only the data object — no `.obao4`.
+        let payload = vec![7u8; 32 * 1024];
+        let hash = Hash::new(&payload);
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard_dir = canonical.join(shard);
+        tokio::fs::create_dir_all(&shard_dir).await?;
+        tokio::fs::write(shard_dir.join(hex.as_str()), &payload).await?;
+
+        let req = OriginRangeRequest {
+            fetch_start: 0,
+            fetch_end: 16 * 1024,
+        };
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_range(hash, req, 1 << 20).await?,
+                OriginRangeFetch::Unsupported
+            ),
+            "missing outboard must degrade",
+        );
+        Ok(())
+    }
+
+    /// An oversize sibling outboard (beyond `outboard_max_bytes`) degrades
+    /// rather than buffering — a hostile/foreign `{H}.obao4` can't force a huge
+    /// read.
+    #[tokio::test]
+    async fn fetch_range_oversize_outboard_is_unsupported() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+        let payload = vec![3u8; 64 * 1024];
+        let hash = seed_blob_with_outboard(&canonical, &payload).await?;
+        // Cap the outboard read at 1 byte — the real outboard is larger.
+        let req = OriginRangeRequest {
+            fetch_start: 0,
+            fetch_end: 16 * 1024,
+        };
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_range(hash, req, 1).await?,
+                OriginRangeFetch::Unsupported
+            ),
+            "oversize outboard must degrade",
+        );
         Ok(())
     }
 }
