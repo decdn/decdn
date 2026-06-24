@@ -18,13 +18,16 @@ use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use tokio::sync::{Notify, broadcast};
 
-use decdn_config_types::{PinDiff, PinnedHashes, RetryPolicy};
+use decdn_config_types::{CircuitBreakerPolicy, PinDiff, PinnedHashes, RetryPolicy};
 
+use crate::circuit_breaker::{Admission, Clock, OriginBreaker, OriginOutcome, SystemClock};
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind};
 use crate::probe_hold::ProbeHoldOutcome;
-use crate::retry::{classify_io_error, drain_to_bytes, run_with_retry, should_buffer};
+use crate::retry::{
+    TerminalFailure, classify_io_error, drain_to_bytes, run_with_retry_classified, should_buffer,
+};
 use crate::{from_store_hash, to_store_hash};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
@@ -51,6 +54,14 @@ struct Inner {
     /// misbehaving backend or a degraded local store that must
     /// surface, not be masked by trying a different mirror.
     origins: Vec<Arc<dyn Origin>>,
+    /// Per-origin circuit-breakers (#963), parallel to `origins` by
+    /// index. `breakers[i]` fronts `origins[i]`'s pull-through retry
+    /// loop so a sustained outage on one backend fast-fails its misses
+    /// without burning retry/backoff, while the chain still advances to
+    /// the next backend. Always the same length as `origins` (built
+    /// together in `open_full`); an empty `origins` yields an empty
+    /// `breakers` and the `NoOrigin` short-circuit never reaches them.
+    breakers: Vec<OriginBreaker>,
     max_blob_bytes: u64,
     /// Per-hash last-access timestamps for LRU eviction ordering.
     access_times: Mutex<HashMap<Hash, Instant>>,
@@ -623,6 +634,7 @@ impl CacheEngine {
             max_blob_mb,
             pinned,
             RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
             None,
             Duration::ZERO,
         )
@@ -647,14 +659,47 @@ impl CacheEngine {
     /// `Options::gc`. #520 tracks switching to a runtime-driven loop
     /// with manual on-demand GC (`admin_v1_cacheGc` / `decdn node gc`)
     /// once upstream exposes the sweep API.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_full(
         cache_dir: &Path,
         origins: Vec<Arc<dyn Origin>>,
         max_blob_mb: u64,
         pinned: PinnedHashes,
         retry_policy: RetryPolicy,
+        circuit_breaker: CircuitBreakerPolicy,
         metrics: Option<Arc<CacheMetrics>>,
         gc_interval: Duration,
+    ) -> CacheResult<Self> {
+        Self::open_full_with_clock(
+            cache_dir,
+            origins,
+            max_blob_mb,
+            pinned,
+            retry_policy,
+            circuit_breaker,
+            metrics,
+            gc_interval,
+            Arc::new(SystemClock::new()),
+        )
+        .await
+    }
+
+    /// [`Self::open_full`] with an injectable [`Clock`] driving the
+    /// per-origin circuit-breaker cooldown (#963). Production goes
+    /// through `open_full` (which supplies a [`SystemClock`]); tests use
+    /// this to drive the breaker's cooldown deterministically with a
+    /// [`crate::ManualClock`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_full_with_clock(
+        cache_dir: &Path,
+        origins: Vec<Arc<dyn Origin>>,
+        max_blob_mb: u64,
+        pinned: PinnedHashes,
+        retry_policy: RetryPolicy,
+        circuit_breaker: CircuitBreakerPolicy,
+        metrics: Option<Arc<CacheMetrics>>,
+        gc_interval: Duration,
+        clock: Arc<dyn Clock>,
     ) -> CacheResult<Self> {
         tokio::fs::create_dir_all(cache_dir)
             .await
@@ -730,10 +775,20 @@ impl CacheEngine {
         let evicted_log_path = cache_dir.join("evicted.log");
         let evicted = load_evicted_log(&evicted_log_path)?;
 
+        // One breaker per origin, parallel by index. Each shares the
+        // single injected clock and the cache metrics handle so trip /
+        // recovery / short-circuit counters land in the same encoder
+        // output as the rest of the cache group (#963).
+        let breakers = origins
+            .iter()
+            .map(|_| OriginBreaker::new(circuit_breaker, Arc::clone(&clock), metrics.clone()))
+            .collect::<Vec<_>>();
+
         Ok(Self {
             inner: Arc::new(Inner {
                 store,
                 origins,
+                breakers,
                 max_blob_bytes,
                 access_times: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
@@ -1678,13 +1733,34 @@ impl CacheEngine {
         // must surface, not be masked by trying a different one.
         let mut last_err: Option<OriginPullError> = None;
         let mut any_not_found = false;
+        let mut any_short_circuit = false;
         let total = self.inner.origins.len();
         for (idx, origin) in self.inner.origins.iter().enumerate() {
             let origin = Arc::clone(origin);
-            let outcome = run_with_retry(policy, self.inner.metrics.as_ref(), hash, || {
-                self.pull_through_attempt(Arc::clone(&origin), hash, max_blob_bytes, policy)
-            })
-            .await;
+            // Per-origin circuit-breaker (#963). An OPEN breaker
+            // short-circuits this origin *before* the retry/backoff
+            // loop runs, so a sustained outage on this backend costs no
+            // backoff — the chain just advances to the next origin (or,
+            // if every origin is OPEN, surfaces a fast `OriginError`).
+            // `breakers` is parallel to `origins` by index; `get` keeps
+            // the access non-panicking per the workspace anti-panic
+            // policy (a missing slot would be a construction bug, in
+            // which case we degrade to "no breaker" rather than panic).
+            let breaker = self.inner.breakers.get(idx);
+            if breaker.is_some_and(|b| matches!(b.acquire(), Admission::ShortCircuit)) {
+                any_short_circuit = true;
+                if idx + 1 < total {
+                    Self::emit_breaker_short_circuit(hash, idx, origin.kind());
+                }
+                continue;
+            }
+
+            let (outcome, terminal) =
+                run_with_retry_classified(policy, self.inner.metrics.as_ref(), hash, || {
+                    self.pull_through_attempt(Arc::clone(&origin), hash, max_blob_bytes, policy)
+                })
+                .await;
+            Self::record_breaker_outcome(breaker, terminal);
 
             // Track *this iteration's* outcome class so the post-match
             // log records the correct cause. `last_err.is_some()` is
@@ -1753,17 +1829,35 @@ impl CacheEngine {
                 hash,
                 source: e.into_inner(),
             })
+        } else if any_short_circuit {
+            // Every origin that wasn't a definitive NotFound was
+            // short-circuited by an OPEN breaker (#963). There is no
+            // `last_err` to surface (we never ran the retry loop for
+            // those origins), but returning `NotFound` would be wrong —
+            // the blob may well exist; we just refused to pull it while
+            // the origin is shedding load. Surface a fast `OriginError`
+            // so the caller sees "origin unavailable" rather than a
+            // spurious 404, *without* having incurred any backoff.
+            Err(CacheError::OriginError {
+                hash,
+                source: anyhow::anyhow!(
+                    "origin circuit-breaker open: all eligible origins are \
+                     fast-failing during a sustained outage (#963)"
+                ),
+            })
         } else if any_not_found {
             Err(CacheError::NotFound { hash })
         } else {
             // Structurally unreachable: every iteration of the loop
             // above takes exactly one match arm. The five non-`Err`
             // arms all `return`; the `NotFound` arm sets
-            // `any_not_found`; the `Err` arm sets `last_err`. To reach
-            // this branch the chain must be non-empty (`is_empty()`
+            // `any_not_found`; the breaker short-circuit sets
+            // `any_short_circuit`; the `Err` arm sets `last_err`. To
+            // reach this branch the chain must be non-empty (`is_empty()`
             // check at the top of `pull_through`) and have produced
-            // no `last_err` and no `any_not_found` — impossible under
-            // the current `PullThroughOutcome` taxonomy. Reaching it
+            // no `last_err`, no `any_not_found`, and no
+            // `any_short_circuit` — impossible under the current
+            // `PullThroughOutcome` taxonomy. Reaching it
             // would mean a future variant was added without wiring
             // the corresponding flag, and a debug-only assert would
             // compile out in release builds. Emit an operator-visible
@@ -1830,6 +1924,41 @@ impl CacheEngine {
         }
     }
 
+    /// Emit a structured log when a per-origin circuit-breaker (#963)
+    /// short-circuited this origin and the chain is about to advance to
+    /// the next one. The short-circuit counter itself is bumped inside
+    /// [`crate::circuit_breaker::OriginBreaker::acquire`] (so it counts
+    /// even on the chain-final origin, where no advance log fires); this
+    /// is purely the operator-visible advance breadcrumb, gated by the
+    /// caller's `idx + 1 < total` check like [`Self::emit_chain_advance`].
+    ///
+    /// Feed a per-origin breaker the health verdict for a completed
+    /// attempt (#963). A transient that exhausted the retry budget is
+    /// `Unavailable` (counts toward the trip threshold); everything else
+    /// — bytes, `NotFound`, permanent per-object errors (404/4xx/decode/cap),
+    /// and even a `Store`/`HashMismatch`/`BlobTooLarge` (the origin DID
+    /// respond) — is `Available` and resets the failure count. A `None`
+    /// breaker (construction degraded to "no breaker") is a no-op.
+    fn record_breaker_outcome(breaker: Option<&OriginBreaker>, terminal: Option<TerminalFailure>) {
+        let Some(b) = breaker else { return };
+        let outcome = match terminal {
+            Some(TerminalFailure::TransientExhausted) => OriginOutcome::Unavailable,
+            Some(TerminalFailure::Permanent) | None => OriginOutcome::Available,
+        };
+        b.record(outcome);
+    }
+
+    /// A free function (not a method): it touches no engine state — the
+    /// counter bump lives in the breaker — so it takes no `&self`.
+    fn emit_breaker_short_circuit(hash: Hash, idx: usize, origin_kind: OriginKind) {
+        tracing::warn!(
+            hash = %hash,
+            origin_index = idx,
+            origin_kind = ?origin_kind,
+            "advancing to next origin in fallback chain (circuit-breaker open)",
+        );
+    }
+
     /// A single end-to-end pull-through attempt: origin.fetch +
     /// (buffer-then-commit | stream-and-commit) + hash verify + tag
     /// promote. Body-phase errors classified as
@@ -1839,8 +1968,8 @@ impl CacheEngine {
     /// they are deterministic and retry would not help.
     ///
     /// Why this method instead of inlining into `pull_through`: the
-    /// retry loop ([`run_with_retry`]) needs a callable that produces
-    /// a fresh attempt on each invocation — the side-channel `Arc`s,
+    /// retry loop ([`run_with_retry_classified`]) needs a callable that
+    /// produces a fresh attempt on each invocation — the side-channel `Arc`s,
     /// `TempTag`s, and origin futures all have to be re-created per
     /// attempt and can't be reused across iterations.
     #[allow(clippy::too_many_lines)] // Linear per-attempt flow; the failure-classification arms each need their own context comment, and splitting them across functions would obscure the sequence more than the length.
@@ -2909,6 +3038,7 @@ mod tests {
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cm)),
             Duration::ZERO,
         )
@@ -3462,6 +3592,7 @@ mod tests {
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cm)),
             Duration::ZERO,
         )
@@ -3507,6 +3638,7 @@ mod tests {
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cm)),
             Duration::ZERO,
         )
@@ -3533,6 +3665,7 @@ mod tests {
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cm)),
             Duration::ZERO,
         )
@@ -3561,6 +3694,7 @@ mod tests {
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cm)),
             Duration::ZERO,
         )
@@ -3600,6 +3734,7 @@ mod tests {
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cm)),
             Duration::ZERO,
         )
@@ -3639,6 +3774,7 @@ mod tests {
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cm)),
             Duration::ZERO,
         )
@@ -3907,6 +4043,7 @@ mod tests {
             10,
             crate::PinnedHashes::empty(),
             crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cm)),
             Duration::ZERO,
         )

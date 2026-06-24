@@ -298,6 +298,24 @@ pub struct CacheConfig {
     /// partial sections (e.g. just `max_retries = 5`) get the rest of
     /// the fields filled from defaults.
     pub origin_retry: Option<decdn_config_types::RetryPolicy>,
+    /// Per-origin circuit-breaker policy (#963). Fronts each origin's
+    /// pull-through retry loop: after `failure_threshold` consecutive
+    /// origin-unavailable failures (transient errors that exhausted the
+    /// retry budget — NOT 404s or other permanent per-object errors) the
+    /// breaker trips OPEN and fast-fails every miss for `cooldown_ms`
+    /// without incurring any retry/backoff, then admits
+    /// `half_open_max_calls` trial pulls to probe recovery. Absent =>
+    /// defaults from [`decdn_config_types::CircuitBreakerPolicy::default`]
+    /// (enabled, trip after 5 failures, 30s cooldown, 1 half-open trial).
+    /// Set `enabled = false` (or `failure_threshold = 0`) to opt out and
+    /// reproduce pre-#963 behaviour where every miss runs the full retry
+    /// loop regardless of origin health. Set once at startup; changes
+    /// require a restart.
+    ///
+    /// `CircuitBreakerPolicy` carries `#[serde(default)]` so partial
+    /// sections (e.g. just `cooldown_ms = 60000`) get the rest of the
+    /// fields filled from defaults.
+    pub circuit_breaker: Option<decdn_config_types::CircuitBreakerPolicy>,
     /// Optional `User-Agent` override sent on every HTTP origin
     /// pull-through request (#435). Absent => the workspace default
     /// (`decdn-node/<version>`); set to attribute CDN traffic in origin

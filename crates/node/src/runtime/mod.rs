@@ -2313,6 +2313,7 @@ async fn build_cache(
         cfg.cache.max_blob_size_mb,
         cfg.cache.pinned_hashes.clone(),
         cfg.cache.origin_retry,
+        cfg.cache.circuit_breaker,
         Some(node_metrics.cache_metrics()),
         std::time::Duration::from_secs(cfg.cache.gc_interval_sec),
     )
@@ -2814,6 +2815,7 @@ mod tests {
                 origins,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),
+                circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,

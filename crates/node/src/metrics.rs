@@ -1987,6 +1987,12 @@ mod tests {
             // reference the names below.
             "decdn_cache_gc_runs_total",
             "decdn_cache_gc_bytes_reclaimed_total",
+            // Circuit-breaker counters (#963). Auto-exposed via the
+            // `MetricsGroup` derive; pin the exported names so dashboards
+            // tracking origin-outage load-shed don't silently lose them.
+            "decdn_cache_circuit_breaker_trips_total",
+            "decdn_cache_circuit_breaker_recoveries_total",
+            "decdn_cache_circuit_breaker_short_circuits_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),
@@ -2487,6 +2493,7 @@ mod tests {
             10,
             PinnedHashes::empty(),
             RetryPolicy::default(),
+            decdn_cache::CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cache_handle)),
             std::time::Duration::ZERO,
         )

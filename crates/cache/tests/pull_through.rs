@@ -53,6 +53,7 @@ async fn build_engine_no_retry(
         16,
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         None,
         Duration::ZERO,
     )
@@ -188,6 +189,7 @@ async fn drain_mismatch_tag_deleted_lets_gc_reclaim() -> anyhow::Result<()> {
         16,
         PinnedHashes::empty(),
         RetryPolicy::default(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         Some(Arc::clone(&metrics)),
         gc_interval,
     )
@@ -250,6 +252,7 @@ async fn evict_makes_blob_gc_eligible() -> anyhow::Result<()> {
         16,
         PinnedHashes::empty(),
         RetryPolicy::default(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         Some(Arc::clone(&metrics)),
         gc_interval,
     )
@@ -310,6 +313,7 @@ async fn evict_makes_streaming_cached_blob_gc_eligible() -> anyhow::Result<()> {
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         Some(Arc::clone(&metrics)),
         gc_interval,
     )
@@ -382,6 +386,7 @@ async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         Some(Arc::clone(&metrics)),
         gc_interval,
     )
@@ -476,6 +481,7 @@ async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         Some(Arc::clone(&metrics)),
         gc_interval,
     )
@@ -555,6 +561,7 @@ async fn gc_reclaims_cap_breach_partial_bytes() -> anyhow::Result<()> {
         1, // max_blob_size_mb = 1 MiB; payload is 2 MiB
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         Some(Arc::clone(&metrics)),
         gc_interval,
     )
@@ -627,6 +634,7 @@ async fn gc_disabled_does_not_reclaim_or_emit_metrics() -> anyhow::Result<()> {
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         Some(Arc::clone(&metrics)),
         Duration::ZERO, // GC disabled
     )
@@ -911,6 +919,7 @@ async fn response_headers_timeout_fires_on_silent_server() -> anyhow::Result<()>
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         None,
         Duration::ZERO,
     )
@@ -946,6 +955,7 @@ async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Resul
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         None,
         Duration::ZERO,
     )
@@ -2258,6 +2268,7 @@ async fn build_engine_with_retry(
         16,
         PinnedHashes::empty(),
         policy,
+        decdn_cache::CircuitBreakerPolicy::default(),
         None,
         Duration::ZERO,
     )
@@ -3516,6 +3527,7 @@ async fn build_engine_with_origins(
         16,
         PinnedHashes::empty(),
         fast_retry_policy(3),
+        decdn_cache::CircuitBreakerPolicy::default(),
         Some(metrics),
         Duration::ZERO,
     )
@@ -3691,6 +3703,7 @@ async fn fallback_does_not_advance_on_blob_too_large() -> anyhow::Result<()> {
         1,
         PinnedHashes::empty(),
         fast_retry_policy(3),
+        decdn_cache::CircuitBreakerPolicy::default(),
         Some(Arc::clone(&metrics)),
         Duration::ZERO,
     )

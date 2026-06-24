@@ -319,6 +319,7 @@ async fn cache_engine_retries_transient_via_origin_retry_policy() -> anyhow::Res
         16,
         decdn_cache::PinnedHashes::empty(),
         policy,
+        decdn_cache::CircuitBreakerPolicy::default(),
         None,
         Duration::ZERO,
     )
@@ -656,6 +657,7 @@ async fn cache_engine_miss_pulls_from_s3_and_caches() -> anyhow::Result<()> {
         16,
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         None,
         Duration::ZERO,
     )
@@ -711,6 +713,7 @@ async fn cache_engine_rejects_s3_body_larger_than_max_blob_bytes() -> anyhow::Re
         1, // max_blob_size_mb = 1 MiB
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
+        decdn_cache::CircuitBreakerPolicy::default(),
         None,
         Duration::ZERO,
     )
@@ -771,6 +774,7 @@ async fn cache_engine_s3_truncated_gzip_is_permanent_decompression_failed() -> a
         16,
         decdn_cache::PinnedHashes::empty(),
         policy,
+        decdn_cache::CircuitBreakerPolicy::default(),
         None,
         Duration::ZERO,
     )

@@ -1230,6 +1230,14 @@ fn resolve_cache_into(
         )
         .unwrap_or_default();
 
+    let circuit_breaker = bag
+        .try_with(
+            "cache.circuit_breaker",
+            resolve_circuit_breaker(file.and_then(|c| c.circuit_breaker.as_ref()))
+                .context("invalid cache.circuit_breaker"),
+        )
+        .unwrap_or_default();
+
     // `cache.user_agent` (#435): operator override of the default
     // `decdn-node/<version>` UA we send on every origin pull. We
     // validate the value at config load — both for a clear error
@@ -1326,6 +1334,7 @@ fn resolve_cache_into(
         origins,
         pinned_hashes,
         origin_retry,
+        circuit_breaker,
         user_agent,
         gc_interval_sec,
         max_probe_holds,
@@ -1757,6 +1766,35 @@ pub fn resolve_origin_retry(
         p.buffered_max_bytes,
         MAX_BUFFERED_MAX_BYTES,
     );
+    Ok(p)
+}
+
+/// Resolve the per-origin circuit-breaker policy (#963). Absent =>
+/// defaults via `CircuitBreakerPolicy::default()`. Present partial
+/// sections fill missing fields from the same defaults (handled by
+/// `#[serde(default)]` on `CircuitBreakerPolicy` itself). This function
+/// enforces the one cross-field invariant the type can't express: an
+/// *active* breaker must admit at least one half-open trial, otherwise
+/// it could never probe for recovery and would stay OPEN forever after
+/// the first trip.
+pub fn resolve_circuit_breaker(
+    file: Option<&decdn_config_types::CircuitBreakerPolicy>,
+) -> anyhow::Result<decdn_config_types::CircuitBreakerPolicy> {
+    let p = file.copied().unwrap_or_default();
+    // Only bind the invariant when the breaker is actually active —
+    // a disabled breaker (`enabled = false` or `failure_threshold = 0`)
+    // never reaches HALF-OPEN, so `half_open_max_calls = 0` is harmless
+    // there and an operator opting out shouldn't have to also set a
+    // half-open value.
+    if p.is_active() {
+        anyhow::ensure!(
+            p.half_open_max_calls >= 1,
+            "cache.circuit_breaker: half_open_max_calls ({}) must be >= 1 when the breaker is \
+             active; otherwise it could never admit a trial pull to probe recovery and would \
+             stay open forever after the first trip",
+            p.half_open_max_calls,
+        );
+    }
     Ok(p)
 }
 
@@ -6217,6 +6255,102 @@ mod tests {
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         anyhow::ensure!(resolved.origin_retry.buffered_max_bytes == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_circuit_breaker_defaults_when_absent() -> anyhow::Result<()> {
+        // Absent `cache.circuit_breaker` => defaults from
+        // CircuitBreakerPolicy::default() (#963). Pin the contract so a
+        // default change is a deliberate, test-visible edit.
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        let p = resolved.circuit_breaker;
+        anyhow::ensure!(p.enabled, "breaker on by default");
+        anyhow::ensure!(p.failure_threshold == 5, "default failure_threshold");
+        anyhow::ensure!(p.cooldown_ms == 30_000, "default cooldown_ms");
+        anyhow::ensure!(p.half_open_max_calls == 1, "default half_open_max_calls");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_circuit_breaker_parses_full_section() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            circuit_breaker: Some(decdn_config_types::CircuitBreakerPolicy {
+                enabled: true,
+                failure_threshold: 10,
+                cooldown_ms: 60_000,
+                half_open_max_calls: 3,
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let p = resolved.circuit_breaker;
+        anyhow::ensure!(p.failure_threshold == 10);
+        anyhow::ensure!(p.cooldown_ms == 60_000);
+        anyhow::ensure!(p.half_open_max_calls == 3);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_circuit_breaker_partial_section_inherits_defaults() -> anyhow::Result<()> {
+        // `#[serde(default)]` on CircuitBreakerPolicy fills missing
+        // fields. A partial `[cache.circuit_breaker]` with only
+        // cooldown_ms set must carry the other defaults through.
+        let toml = "[cache.circuit_breaker]\ncooldown_ms = 12345\n";
+        let file: crate::config::FileConfig = ::toml::from_str(toml)?;
+        let p = file
+            .cache
+            .as_ref()
+            .and_then(|c| c.circuit_breaker.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("circuit_breaker missing"))?;
+        anyhow::ensure!(p.cooldown_ms == 12_345);
+        anyhow::ensure!(p.enabled, "default carried through");
+        anyhow::ensure!(p.failure_threshold == 5, "default carried through");
+        anyhow::ensure!(p.half_open_max_calls == 1, "default carried through");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_circuit_breaker_disabled_skips_half_open_invariant() -> anyhow::Result<()> {
+        // A disabled breaker (enabled = false) never reaches HALF-OPEN,
+        // so half_open_max_calls = 0 must resolve cleanly — an operator
+        // opting out shouldn't have to supply a half-open value.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            circuit_breaker: Some(decdn_config_types::CircuitBreakerPolicy::disabled()),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(!resolved.circuit_breaker.enabled);
+        anyhow::ensure!(!resolved.circuit_breaker.is_active());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_circuit_breaker_rejects_zero_half_open_when_active() -> anyhow::Result<()> {
+        // An ACTIVE breaker with half_open_max_calls = 0 could never
+        // probe for recovery and would stay open forever — reject it at
+        // config-load time with a contextualized error.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            circuit_breaker: Some(decdn_config_types::CircuitBreakerPolicy {
+                enabled: true,
+                failure_threshold: 5,
+                cooldown_ms: 30_000,
+                half_open_max_calls: 0,
+            }),
+            ..types::CacheConfig::default()
+        };
+        let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("invalid cache.circuit_breaker"),
+            "error should be contextualized: {msg}"
+        );
         Ok(())
     }
 

@@ -107,8 +107,45 @@ pub(crate) async fn run_with_retry<F, Fut, T>(
     policy: RetryPolicy,
     metrics: Option<&Arc<CacheMetrics>>,
     hash: Hash,
-    mut attempt_fn: F,
+    attempt_fn: F,
 ) -> Result<T, OriginPullError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, OriginPullError>>,
+{
+    run_with_retry_classified(policy, metrics, hash, attempt_fn)
+        .await
+        .0
+}
+
+/// Whether a terminal pull-through failure left the origin looking
+/// *unreachable* (a transient that exhausted the retry budget) or merely
+/// unable to serve *this* object (an immediate permanent — 4xx, decode,
+/// cap). Used by the per-origin circuit-breaker (#963) to decide whether
+/// an attempt counts toward the trip threshold; `run_with_retry` itself
+/// collapses both into `OriginPullError::Permanent`, erasing the
+/// distinction the breaker needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalFailure {
+    /// The terminal error was a transient that exhausted `max_retries`
+    /// (or a `max_retries = 0` single transient). The origin looks
+    /// unavailable.
+    TransientExhausted,
+    /// The terminal error was an immediate `Permanent` — the origin
+    /// responded but can't serve this object. Not an outage.
+    Permanent,
+}
+
+/// [`run_with_retry`] plus a terminal-failure classification for the
+/// circuit-breaker (#963). On `Ok`, the second tuple element is `None`.
+/// On `Err`, it carries whether the failure was a transient-exhaustion
+/// (origin-unavailable) or an immediate permanent (per-object).
+pub(crate) async fn run_with_retry_classified<F, Fut, T>(
+    policy: RetryPolicy,
+    metrics: Option<&Arc<CacheMetrics>>,
+    hash: Hash,
+    mut attempt_fn: F,
+) -> (Result<T, OriginPullError>, Option<TerminalFailure>)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, OriginPullError>>,
@@ -116,8 +153,13 @@ where
     let mut attempt: u32 = 0;
     loop {
         match attempt_fn().await {
-            Ok(value) => return Ok(value),
-            Err(OriginPullError::Permanent(e)) => return Err(OriginPullError::Permanent(e)),
+            Ok(value) => return (Ok(value), None),
+            Err(OriginPullError::Permanent(e)) => {
+                return (
+                    Err(OriginPullError::Permanent(e)),
+                    Some(TerminalFailure::Permanent),
+                );
+            }
             Err(OriginPullError::Transient(e)) => {
                 if attempt >= policy.max_retries {
                     // Only count exhaustion when at least one retry actually
@@ -137,7 +179,10 @@ where
                         err = %e,
                         "origin fetch exhausted retry budget; surfacing as permanent",
                     );
-                    return Err(OriginPullError::Permanent(e));
+                    return (
+                        Err(OriginPullError::Permanent(e)),
+                        Some(TerminalFailure::TransientExhausted),
+                    );
                 }
                 let sleep = delay_for(policy, attempt);
                 let sleep_ms = u64::try_from(sleep.as_millis()).unwrap_or(u64::MAX);

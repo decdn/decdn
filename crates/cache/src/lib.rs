@@ -9,6 +9,7 @@
 //! mode branching or feature flags here. The `node` crate's wiring layer
 //! selects which origin backend to construct.
 
+pub mod circuit_breaker;
 pub mod engine;
 pub mod error;
 pub mod metrics;
@@ -17,6 +18,9 @@ pub mod probe_hold;
 pub mod range_pull;
 pub mod retry;
 
+pub use circuit_breaker::{
+    Admission, BreakerState, Clock, ManualClock, OriginBreaker, OriginOutcome, SystemClock,
+};
 pub use engine::{CacheEngine, CacheStats, EvictionCandidates, EvictionPreview, TeeOpen, TeeSink};
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
 /// The blob-store hash. `decdn_cache::Hash` continues to mean
@@ -43,8 +47,9 @@ pub use probe_hold::{
 // NOT re-exported as `decdn_cache::Hash` — that name stays the store
 // hash above.
 pub use decdn_config_types::{
-    Bytes, DEFAULT_MAX_PROBE_HOLDS, DEFAULT_USER_AGENT, DecompressMode, HashParseError, OriginKind,
-    OriginUrl, Percent, PinDiff, PinnedHashes, RetryPolicy, parse_origin_url, redact_for_log,
+    Bytes, CircuitBreakerPolicy, DEFAULT_MAX_PROBE_HOLDS, DEFAULT_USER_AGENT, DecompressMode,
+    HashParseError, OriginKind, OriginUrl, Percent, PinDiff, PinnedHashes, RetryPolicy,
+    parse_origin_url, redact_for_log,
 };
 
 /// Convert a config-vocabulary [`decdn_config_types::Hash`] into the
