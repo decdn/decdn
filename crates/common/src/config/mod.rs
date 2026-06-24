@@ -197,6 +197,11 @@ pub const DEFAULT_RECEIPT_RETAINED_FILES: u32 = 4;
 /// Ceiling for `receipts.retained_files` (#802). Generous; the total disk
 /// bound is `(retained_files + 1) * max_file_bytes`.
 pub const MAX_RECEIPT_RETAINED_FILES: u32 = 100;
+/// Canonical filename of the download-receipt audit log within `data_dir`
+/// (#802). The path is derived (`data_dir`/this), not a configurable field;
+/// the daemon writer and the `config validate` summary both reference this so
+/// the surfaced path can't drift from where the log actually lands.
+pub const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
 
 /// Default `prefetch.enabled` (ADR 022 §Prefetch Decision): opt-in.
 pub const DEFAULT_PREFETCH_ENABLED: bool = false;
