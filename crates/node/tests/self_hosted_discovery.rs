@@ -11,9 +11,10 @@
 //! n0 DNS, NO n0 pkarr, and (with relays disabled here) NO n0 relay. This
 //! suite stands up two nodes wired **exactly** that way and shows they:
 //!
-//! 1. exchange `NodeAnnounce` gossip and land each other in their
-//!    [`PeerTable`]s (the real [`GossipService`] publisher + subscriber +
-//!    [`validate_envelope`] + peer-table insert path), and
+//! 1. exchange `NodeAnnounce` gossip **mutually** — each node publishes its own
+//!    announce and lands the other in its [`PeerTable`] (the real
+//!    [`GossipService`] publisher + subscriber + `validate_envelope` +
+//!    peer-table insert path, exercised in both directions), and
 //! 2. complete a `cdn/probe/v1` round-trip where the **client resolves the
 //!    server by `NodeId` alone** — the address is supplied only by the
 //!    operator-configured `MemoryLookup`, so a successful connect is direct
@@ -42,15 +43,17 @@
 //! that seeding is **not** part of `GossipService` and is out of scope for #967.
 //!
 //! So this test seeds the two-node mesh deterministically by opening one extra
-//! `subscribe_and_join(global_topic, [peer])` handle on the receiver's own
-//! `Gossip` instance — sharing the same per-`Gossip` topic actor as its
-//! `GossipService` subscriber, the join's dial pulls the receiver into the mesh
-//! with the publisher. The bootstrap peer's address is resolved through the
-//! *same* `MemoryLookup` discovery leg, so the mesh still forms with zero n0
-//! infra. What this does **not** cover: end-to-end mesh *self-bootstrap* by
-//! `GossipService` alone (it has none), nor the live `PkarrPublisher` /
-//! `DnsAddressLookup` legs (those need a real pkarr relay / DNS zone — see the
-//! "future work" note at the bottom).
+//! `subscribe_and_join(global_topic, [peer])` handle on **each** node's own
+//! `Gossip` instance — A joins toward B and B joins toward A. Each join shares
+//! the same per-`Gossip` topic actor as that node's `GossipService` subscriber,
+//! so the join's dial pulls the node into the mesh and, once the membership
+//! forms, broadcasts from *either* publisher reach *both* subscribers. Every
+//! bootstrap peer address is resolved through the *same* `MemoryLookup`
+//! discovery leg, so the mesh still forms with zero n0 infra. What this does
+//! **not** cover: end-to-end mesh *self-bootstrap* by `GossipService` alone (it
+//! has none), nor the live `PkarrPublisher` / `DnsAddressLookup` legs (those
+//! need a real pkarr relay / DNS zone — see the "future work" note at the
+//! bottom).
 
 #![allow(
     clippy::unwrap_used,
@@ -109,6 +112,83 @@ async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     Ok((cache, tmp))
 }
 
+/// Join background gossip tasks after shutdown without silently swallowing a
+/// panic. A [`tokio::task::JoinError`] that is a panic is a real test failure
+/// (e.g. a publisher or subscriber task panicked) and is re-raised here; a
+/// clean cancel or a wind-down timeout are both tolerated.
+async fn join_gossip_tasks(tasks: impl IntoIterator<Item = tokio::task::JoinHandle<()>>) {
+    for h in tasks {
+        match tokio::time::timeout(Duration::from_secs(2), h).await {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) => {
+                if let Ok(panic) = join_err.try_into_panic() {
+                    std::panic::resume_unwind(panic);
+                }
+                // Otherwise the task was cancelled during shutdown — expected.
+            }
+            Err(_elapsed) => {
+                // Task didn't wind down within the grace window; not a panic.
+            }
+        }
+    }
+}
+
+/// Spawn a production [`GossipService`] for a node that subscribes to the global
+/// topic and (because a `region` is set) runs the publisher too, so it both
+/// emits its own `NodeAnnounce` and validates + inserts peers' announces.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_publisher(
+    ep: Endpoint,
+    secret: SecretKey,
+    gossip: iroh_gossip::net::Gossip,
+    region: &str,
+    peers: Arc<RwLock<PeerTable>>,
+    metrics: Arc<dyn decdn_gossip::GossipMetrics>,
+    shutdown: CancellationToken,
+) -> decdn_gossip::GossipHandles {
+    GossipService::spawn(
+        ep,
+        secret,
+        gossip,
+        GossipRuntimeConfig {
+            announce_interval_sec: 60,
+            subscribe_global: true,
+            region: Some(region.to_string()),
+            allowlist: std::collections::HashSet::new(),
+            subscribe_reputation: false,
+            reputation_publish_interval_sec: 3600,
+        },
+        peers,
+        metrics,
+        shutdown,
+        ReputationWiring::default(),
+    )
+    .await
+    .expect("gossip service starts")
+}
+
+/// Check whether `peers` has learned `node_id` via `NodeAnnounce`, asserting the
+/// stored entry carries the expected node id and region. Returns `true` once the
+/// peer is present (the announce arrived and was inserted).
+async fn learned_peer(
+    peers: &RwLock<PeerTable>,
+    node_id: &[u8; 32],
+    expected_region: &str,
+) -> bool {
+    let Some(entry) = peers.read().await.get(node_id).cloned() else {
+        return false;
+    };
+    assert_eq!(
+        &entry.announce.body.node_id, node_id,
+        "stored announce node_id must match the awaited peer"
+    );
+    assert_eq!(
+        entry.announce.body.region, expected_region,
+        "stored announce must carry the region the peer published"
+    );
+    true
+}
+
 fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     let cfg = ResolvedSecurity {
         max_concurrent_handlers: u32::MAX,
@@ -128,17 +208,24 @@ fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
 /// This is the production discovery seam reduced to its offline core: if
 /// `MemoryLookup` cannot resolve a peer, nothing else can — there is no n0
 /// fallback to mask a discovery failure.
+///
+/// Returns the cloned `MemoryLookup` handle too, so the caller can seed a peer
+/// address out-of-band *after* binding (e.g. to teach a node that bound first
+/// about a peer that bound later). The handle stays linked to the endpoint's
+/// live lookup (`MemoryLookup` is `Arc`-backed), so a later
+/// `add_endpoint_info` is visible to the running endpoint.
 async fn bind_discovery_endpoint(
     secret_key: SecretKey,
     alpns: Vec<Vec<u8>>,
     peers: Vec<EndpointAddr>,
-) -> anyhow::Result<(Endpoint, EndpointAddr)> {
+) -> anyhow::Result<(Endpoint, EndpointAddr, MemoryLookup)> {
     let bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    let lookup = MemoryLookup::from_endpoint_info(peers);
     let ep = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key.clone())
         .alpns(alpns)
         .relay_mode(RelayMode::Disabled)
-        .address_lookup(MemoryLookup::from_endpoint_info(peers))
+        .address_lookup(lookup.clone())
         .bind_addr(bind)
         .map_err(|e| anyhow::anyhow!("bind_addr: {e}"))?
         .bind()
@@ -156,36 +243,43 @@ async fn bind_discovery_endpoint(
         other => other,
     };
     let addr = EndpointAddr::new(secret_key.public()).with_ip_addr(socket);
-    Ok((ep, addr))
+    Ok((ep, addr, lookup))
 }
 
 /// Two nodes wired with ONLY operator-configured static-peer-map discovery
-/// (`MemoryLookup` on `presets::Minimal`, relays disabled) exchange a real
-/// `NodeAnnounce` and each lands the other in its [`PeerTable`].
+/// (`MemoryLookup` on `presets::Minimal`, relays disabled) exchange real
+/// `NodeAnnounce`s **mutually** — each lands the other in its [`PeerTable`].
 ///
-/// The publisher (node A, region "US") runs the production [`GossipService`]
-/// publisher; the receiver (node B, subscribe-only on the global topic) runs
-/// the production subscriber, which `validate_envelope`s the announce and
-/// inserts it. The mesh is seeded by one extra bootstrap-join handle on B (see
-/// the module-level coverage caveat); the bootstrap address is resolved through
-/// B's `MemoryLookup`, so no n0 infra participates.
+/// Both nodes carry a region (A "US", B "DE"), so each runs the production
+/// [`GossipService`] publisher *and* subscriber: A publishes and B's subscriber
+/// `validate_envelope`s + inserts A, and symmetrically B publishes and A's
+/// subscriber inserts B. The mesh is seeded by one bootstrap-join handle per
+/// node (A toward B, B toward A; see the module-level coverage caveat); every
+/// bootstrap address resolves through that node's `MemoryLookup`, so no n0 infra
+/// participates.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow::Result<()> {
     let a_secret = SecretKey::generate();
     let b_secret = SecretKey::generate();
     let a_id = *a_secret.public().as_bytes();
+    let b_id = *b_secret.public().as_bytes();
 
-    // Bind A first so we know its addr; B's MemoryLookup is seeded with A, and
-    // A's MemoryLookup is seeded with B once B binds. Both ALPNs include gossip.
-    let (a_ep, a_addr) =
+    // Bind A first so we know its addr; B's MemoryLookup is seeded with A at
+    // bind time, then A's MemoryLookup is seeded with B once B binds. Both
+    // directions resolve peers ONLY through these operator-configured
+    // `MemoryLookup` legs. Both ALPNs include gossip.
+    let (a_ep, a_addr, a_lookup) =
         bind_discovery_endpoint(a_secret.clone(), vec![GOSSIP_ALPN.to_vec()], Vec::new()).await?;
-    let (b_ep, _b_addr) = bind_discovery_endpoint(
+    let (b_ep, b_addr, _b_lookup) = bind_discovery_endpoint(
         b_secret.clone(),
         vec![GOSSIP_ALPN.to_vec()],
         // B learns A's address ONLY through this operator-configured leg.
         vec![a_addr.clone()],
     )
     .await?;
+    // A learns B's address ONLY through this operator-configured leg, seeded
+    // out-of-band now that B has bound and its addr is known.
+    a_lookup.add_endpoint_info(b_addr.clone());
 
     let a_gossip = build_gossip(a_ep.clone());
     let b_gossip = build_gossip(b_ep.clone());
@@ -204,83 +298,77 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
     let metrics: Arc<dyn decdn_gossip::GossipMetrics> = Arc::new(NoopMetrics);
     let shutdown = CancellationToken::new();
 
-    // Node A: publisher with region "US" -> emits NodeAnnounce on global+region.
-    let a_handles = GossipService::spawn(
+    // Node A: publisher with region "US" -> emits NodeAnnounce on global+region
+    // and runs the subscriber that validates + inserts B's announce. Node B is
+    // wired identically with region "DE"; giving B a region (mirroring A)
+    // enables its publisher, so the exchange is mutual.
+    let a_handles = spawn_publisher(
         a_ep.clone(),
         a_secret.clone(),
         a_gossip.clone(),
-        GossipRuntimeConfig {
-            announce_interval_sec: 60,
-            subscribe_global: true,
-            region: Some("US".to_string()),
-            allowlist: std::collections::HashSet::new(),
-            subscribe_reputation: false,
-            reputation_publish_interval_sec: 3600,
-        },
+        "US",
         Arc::clone(&a_peers),
         Arc::clone(&metrics),
         shutdown.clone(),
-        ReputationWiring::default(),
     )
-    .await
-    .expect("node A gossip service starts");
-
-    // Node B: subscribe-only on the global topic (no region -> publisher off).
-    // This is the production subscriber path that validates + inserts.
-    let b_handles = GossipService::spawn(
+    .await;
+    let b_handles = spawn_publisher(
         b_ep.clone(),
         b_secret.clone(),
         b_gossip.clone(),
-        GossipRuntimeConfig {
-            announce_interval_sec: 60,
-            subscribe_global: true,
-            region: None,
-            allowlist: std::collections::HashSet::new(),
-            subscribe_reputation: false,
-            reputation_publish_interval_sec: 3600,
-        },
+        "DE",
         Arc::clone(&b_peers),
         Arc::clone(&metrics),
         shutdown.clone(),
-        ReputationWiring::default(),
     )
-    .await
-    .expect("node B gossip service starts");
+    .await;
 
-    // Seed the mesh: B joins the global topic with A as bootstrap. B's
-    // MemoryLookup resolves A's NodeId -> 127.0.0.1:port, so the dial uses
-    // operator discovery exclusively. This handle shares B's per-Gossip topic
-    // actor with B's GossipService subscriber, so once the mesh forms, A's
-    // broadcasts reach that subscriber. Held to keep the membership alive.
+    // Seed the mesh in both directions: each node opens one bootstrap-join on
+    // the global topic toward the other. A node's `MemoryLookup` resolves the
+    // bootstrap NodeId -> 127.0.0.1:port, so every dial uses operator discovery
+    // exclusively. Each join shares that node's per-Gossip topic actor with its
+    // GossipService subscriber, so once the membership forms, broadcasts from
+    // either publisher reach both subscribers. Held to keep the membership
+    // alive. (See the module-level coverage caveat: GossipService has no
+    // self-bootstrap, so this seeding stands in for the out-of-band swarm seed a
+    // real deployment provides.)
+    let _a_bootstrap = a_gossip
+        .subscribe_and_join(global_topic_id(), vec![b_secret.public()])
+        .await
+        .map_err(|e| anyhow::anyhow!("A bootstrap subscribe_and_join: {e}"))?;
     let _b_bootstrap = b_gossip
         .subscribe_and_join(global_topic_id(), vec![a_secret.public()])
         .await
         .map_err(|e| anyhow::anyhow!("B bootstrap subscribe_and_join: {e}"))?;
 
-    // Fire immediate announces from A rather than waiting the 60s interval.
+    // Fire immediate announces from both nodes rather than waiting the 60s
+    // interval. Both publishers are wired because both nodes carry a region.
     let a_trigger = a_handles
         .announce_trigger
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("node A publisher should be wired (region set)"))?;
+    let b_trigger = b_handles
+        .announce_trigger
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("node B publisher should be wired (region set)"))?;
 
-    // Poll: drive a fresh announce each round and check B's peer table. The
-    // mesh takes a few hundred ms to form (dial + HyParView handshake +
-    // first broadcast); bound generously so a slow CI doesn't flake, but the
-    // happy path resolves in well under a second.
+    // Poll: drive a fresh announce from each node every round and check that B
+    // learned A *and* A learned B. The mesh takes a few hundred ms to form
+    // (dial + HyParView handshake + first broadcast); bound generously so a slow
+    // CI doesn't flake, but the happy path resolves in well under a second.
     let mut saw_a = false;
+    let mut saw_b = false;
     for _ in 0..50 {
         a_trigger.announce_now();
+        b_trigger.announce_now();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Some(entry) = b_peers.read().await.get(&a_id) {
-            assert_eq!(
-                entry.announce.body.node_id, a_id,
-                "stored announce must be A's"
-            );
-            assert_eq!(
-                entry.announce.body.region, "US",
-                "A announced region US; the stored entry must carry it"
-            );
-            saw_a = true;
+        if !saw_a {
+            saw_a = learned_peer(&b_peers, &a_id, "US").await;
+        }
+        if !saw_b {
+            saw_b = learned_peer(&a_peers, &b_id, "DE").await;
+        }
+        if saw_a && saw_b {
             break;
         }
     }
@@ -289,12 +377,16 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
         "node B must learn node A via NodeAnnounce over self-hosted discovery \
          (MemoryLookup only, no n0 DNS/pkarr/relay)"
     );
+    assert!(
+        saw_b,
+        "node A must learn node B via NodeAnnounce over self-hosted discovery \
+         (MemoryLookup only, no n0 DNS/pkarr/relay) — proving MUTUAL insertion"
+    );
 
-    // Teardown.
+    // Teardown. Join the background gossip tasks, re-raising any task panic
+    // rather than dropping it (see `join_gossip_tasks`).
     shutdown.cancel();
-    for h in a_handles.tasks.into_iter().chain(b_handles.tasks) {
-        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-    }
+    join_gossip_tasks(a_handles.tasks.into_iter().chain(b_handles.tasks)).await;
     a_router.shutdown().await.ok();
     b_router.shutdown().await.ok();
     a_ep.close().await;
@@ -318,7 +410,7 @@ async fn probe_roundtrip_resolves_server_by_node_id_via_self_hosted_discovery() 
     // Server endpoint: discovery is irrelevant for *accepting*, but we keep the
     // same Minimal + relays-disabled + empty-MemoryLookup composition so the
     // server, too, is provably free of n0 infra.
-    let (server_ep, server_addr) =
+    let (server_ep, server_addr, _server_lookup) =
         bind_discovery_endpoint(server_secret.clone(), vec![ALPN_PROBE.to_vec()], Vec::new())
             .await?;
 
@@ -360,7 +452,7 @@ async fn probe_roundtrip_resolves_server_by_node_id_via_self_hosted_discovery() 
 
     // Client endpoint: its ONLY way to find the server's address is the
     // operator-configured MemoryLookup seeded with the server's EndpointAddr.
-    let (client_ep, _client_addr) =
+    let (client_ep, _client_addr, _client_lookup) =
         bind_discovery_endpoint(SecretKey::generate(), vec![], vec![server_addr.clone()]).await?;
 
     // Connect by NodeId ONLY — no `.with_ip_addr(...)`. iroh must resolve the
@@ -368,14 +460,17 @@ async fn probe_roundtrip_resolves_server_by_node_id_via_self_hosted_discovery() 
     // is no n0 DNS/pkarr to fall back to, so a successful connect can only mean
     // self-hosted discovery resolved it.
     let target = EndpointAddr::new(server_id);
-    let conn = client_ep
-        .connect(target, ALPN_PROBE)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect (NodeId-only, discovery-resolved): {e}"))?;
+    let conn = tokio::time::timeout(
+        Duration::from_secs(5),
+        client_ep.connect(target, ALPN_PROBE),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connect timed out after 5s (discovery never resolved?)"))?
+    .map_err(|e| anyhow::anyhow!("connect (NodeId-only, discovery-resolved): {e}"))?;
 
-    let (mut send, mut recv) = conn
-        .open_bi()
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
         .await
+        .map_err(|_| anyhow::anyhow!("open_bi timed out after 5s"))?
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
     let req = ProbeRequest {
         hash: [0x5au8; 32],
@@ -386,8 +481,9 @@ async fn probe_roundtrip_resolves_server_by_node_id_via_self_hosted_discovery() 
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
-    let frame = read_frame(&mut recv)
+    let frame = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut recv))
         .await
+        .map_err(|_| anyhow::anyhow!("read_frame timed out after 5s"))?
         .map_err(|e| anyhow::anyhow!("read: {e}"))?;
     let (msg, _rest) = decode_message::<ProbeMessage>(&frame)?;
     let resp: ProbeResponse = match msg {
