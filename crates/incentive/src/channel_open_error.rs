@@ -14,10 +14,13 @@
 //!   out receipt wait, a nonce blip). Retrying typically clears it; the fix is
 //!   infrastructure-side.
 //!
-//! Splitting these lets the node label
-//! `decdn_channel_open_failures_total{reason=…}` so a dashboard distinguishes
-//! "the operator under-funded the gas/USDC wallet" from "the RPC endpoint is
-//! flaky" — the whole point of #966. The classification is driven by the alloy
+//! Splitting these lets the node bump the matching
+//! `decdn_channel_open_failures_{insufficient_deposit,contract_revert,rpc_error}_total`
+//! sibling counter (`iroh_metrics` has no label support, so each class is its own
+//! counter rather than one labeled `{reason=…}` series) and emit the same
+//! `reason` token as a structured-log field, so a dashboard distinguishes "the
+//! operator under-funded the gas/USDC wallet" from "the RPC endpoint is flaky"
+//! — the whole point of #966. The classification is driven by the alloy
 //! error's *revert data*: a deterministic revert carries ABI-encoded error data
 //! (caught at gas estimation, so it surfaces on `send()` before a receipt),
 //! whereas a transport fault carries none. A present revert selector is decoded
@@ -47,7 +50,8 @@ sol! {
 
 /// Which class of failure aborted a buyer `openChannel` attempt (#966). Carried
 /// through the `anyhow` error chain as typed context so the metrics layer can
-/// pick the right `decdn_channel_open_failures_total{reason=…}` counter and
+/// bump the matching `decdn_channel_open_failures_{reason}_total` sibling
+/// counter (one counter per class — `iroh_metrics` has no label support) and
 /// attach a structured `reason` log field, while the human-readable message is
 /// preserved for logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,7 +70,8 @@ pub enum ChannelOpenFailureReason {
 
 impl ChannelOpenFailureReason {
     /// The metric/label and structured-log `reason` token for this class —
-    /// exactly the `decdn_channel_open_failures_total{reason=…}` value.
+    /// the `{reason}` slug in the `decdn_channel_open_failures_{reason}_total`
+    /// sibling counter name and the value of the structured-log `reason` field.
     #[must_use]
     pub const fn as_label(self) -> &'static str {
         match self {

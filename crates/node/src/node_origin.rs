@@ -978,8 +978,12 @@ mod tests {
             ChannelOpenFailureReason::ContractRevert,
             ChannelOpenFailureReason::RpcError,
         ] {
-            // Mirror the real chain: a base error, the kernel's typed reason,
-            // then the caller's wrapping `.context` layers.
+            // Approximate the real chain: a base error, the kernel's typed
+            // reason, then the caller's wrapping `.context` layers. The exact
+            // ordering differs from the submit path — there the kernel attaches
+            // the reason *after* its own `.context("submit openChannel")` — but
+            // `downcast_ref` walks the whole chain irrespective of layer order,
+            // which is exactly what this test pins down.
             let err = anyhow::anyhow!("openChannel send failed: transport down")
                 .context(reason)
                 .context("submit openChannel")

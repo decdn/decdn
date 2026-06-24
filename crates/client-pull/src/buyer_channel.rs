@@ -108,13 +108,18 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// # Errors
 ///
 /// Fails on `openChannel` submit/receipt, a reverted tx, or a missing
-/// `ChannelOpened` event in the receipt logs. Every failure leg attaches a
-/// [`ChannelOpenFailureReason`] into the `anyhow` error chain (recover it with
-/// `err.downcast_ref::<ChannelOpenFailureReason>()`), so a caller can label its
-/// `decdn_channel_open_failures_total{reason=…}` counter without re-parsing the
-/// alloy error: a deterministic revert (with ABI revert data, decoded against
-/// the insufficient-deposit error selectors) is split from a transport/RPC
-/// fault (no revert data) and a mined on-chain revert.
+/// `ChannelOpened` event in the receipt logs. The classified failure legs
+/// (submit, receipt wait, mined revert) attach a [`ChannelOpenFailureReason`]
+/// into the `anyhow` error chain (recover it with
+/// `err.downcast_ref::<ChannelOpenFailureReason>()`), so a caller can bump the
+/// matching `decdn_channel_open_failures_{reason}_total` sibling counter
+/// (`iroh_metrics` has no label support, so each class is its own counter) without
+/// re-parsing the alloy error: a deterministic revert (with ABI revert data,
+/// decoded against the insufficient-deposit error selectors) is split from a
+/// transport/RPC fault (no revert data) and a mined on-chain revert. The
+/// missing-`ChannelOpened` leg carries no reason — the deposit is escrowed but
+/// untracked, so it surfaces as an unclassified error for manual reconciliation
+/// rather than a metric bump.
 pub async fn open_channel<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     signer: Arc<PrivateKeySigner>,
@@ -150,8 +155,12 @@ pub async fn open_channel<P: Provider + Clone>(
         })?;
     if !receipt.status() {
         // A mined revert: the revert reason is not recoverable from the receipt
-        // (no trace), so it is a generic on-chain revert, not the wallet-side
-        // insufficient-deposit class (that one is caught at estimation above).
+        // (no trace), so it is classified as a generic on-chain revert. Most
+        // insufficient-deposit cases are caught at gas estimation above, but
+        // because balance/allowance/`minDeposit` state can change between
+        // estimation and mining, a mined revert *could* still be
+        // insufficient-deposit — it just can't be distinguished here, so it
+        // folds into `ContractRevert`.
         return Err(anyhow::anyhow!(
             "openChannel reverted (provider {provider_addr}, deposit {deposit}); check USDC \
              balance/allowance and that the provider is active"
