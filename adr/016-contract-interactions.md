@@ -582,7 +582,7 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | `KEEPER_ROLE` | BuybackBurner | `executeBuyback()` | Admin / disabled | Keeper bot or governance |
 | `ROUTER_CALLER_ROLE` | FeeRouter | `routeSettlement(op, bytes, amount)` | PaymentChannel | PaymentChannel (and any future settlement-emitting contract) |
 | `GOVERNANCE_ROLE` | ContentBlacklist, FeeRouter, CapacityBond, SlashAppeal | `addHash()`, `removeHash()`, `addOperator()`, `removeOperator()`, `registerRegionalBody()` (ContentBlacklist); `setShares(...)`, `setBuybackBurner(...)`, `setTreasury(...)`, `setWindowEpochs(...)` (FeeRouter); `setMinBond`, `setMinCapacityMbps`, `setMaxCapacityMbps`, `setUnbondingPeriod`, `setK`, `setAlpha` (CapacityBond); `grantAppeal`, `upholdAppeal`, `setAppealBond`, `setChallengerIncentivePool` (SlashAppeal) | Admin | Governor via timelock |
-| `EMERGENCY_ROLE` | ContentBlacklist (emergency functions), fund-holding contracts (`pause()`) | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()` (ContentBlacklist); `pause()` (Pausable contracts only) | Admin | 3-of-5 multisig (12-month sunset) |
+| `EMERGENCY_ROLE` | ContentBlacklist (emergency functions), fund-holding contracts (`pause()`) | `emergencyAdd()`, `emergencyAddOrigin()`, `suspendRegionalBody()` (ContentBlacklist); `pause()` (Pausable contracts only) | Admin | 3-of-5 multisig; capability-split sunset: `pause()` expires at 12 months, unlawful-content removal permanent ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)) |
 | Regional body | ContentBlacklist | `addHashRegional(region)` | Not registered at launch | Per-jurisdiction multisig |
 
 #### Governance-Controlled Parameters
@@ -612,7 +612,7 @@ The three FeeRouter shares (with bounds 40–90 / 5–50 / 0–30 and defaults 6
 - Can add emergency blacklist entries (hashes and origins)
 - Can suspend regional governance bodies
 - **Cannot** withdraw treasury funds, modify fee parameters, or grant roles
-- **12-month sunset:** All emergency functions revert after `block.timestamp > deployTimestamp + 365 days` ([ADR 009](009-governance.md#emergency-multisig))
+- **Capability-split sunset:** the protocol-wide `pause()` reverts after `block.timestamp > deployTimestamp + 365 days` (hardcoded, immutable). The narrow unlawful-content-removal functions — `emergencyAdd()`, `emergencyAddOrigin()`, and `suspendRegionalBody()` — do **not** sunset, because they discharge a permanent, time-critical legal duty and touch no economic, treasury, or governance lever ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig))
 - Emergency blacklist entries expire after 14 days unless ratified by governance
 
 ### Reentrancy Analysis
@@ -745,7 +745,7 @@ The contract surface is identical at launch and at steady state — every contra
 | `FeeRouter` dependency addresses | `buybackBurner = address(0)` permitted at deploy; `setBuybackBurner(addr)` activates it | All wired |
 | `DEFAULT_ADMIN_ROLE` holder | Deployer EOA (handed off to `TimelockController` immediately post-deploy per [§ Post-Deployment Initialization](#post-deployment-initialization) step 8) | `TimelockController` |
 | `DecdnGovernor` activity | Deployed but in bootstrap-multisig phase (first 6–12 months); transition to full operator-weighted DAO voting when active operators ≥ 30 AND total declared capacity ≥ 100 Gbps per [ADR 026 § Governance](026-tokenomics.md#governance) | Active proposal stream under served-bytes-weighted voting per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) |
-| Emergency multisig | Active (12-month sunset; fast-track / reject slash appeals on `SlashAppeal`; bootstrap-governance multisig overlaps for the first 6–12 months) | Active until sunset, then disabled |
+| Emergency multisig | Active (capability-split sunset: `pause()` expires at 12 months, unlawful-content removal permanent; fast-track / reject slash appeals on `SlashAppeal`; bootstrap-governance multisig overlaps for the first 6–12 months) | `pause()` sunset; unlawful-content-removal capability permanent |
 | Default-open allow-list | Empty at deploy; default-open content has no authorized origin until governance seats the first allow-list | Operator set actively maintained by governance |
 | Regional governance bodies | Not registered | Per-jurisdiction multisigs registered as needed |
 | `BuybackBurner.executeBuyback` | Callable from day one; share = 0 means no USDC to swap until `setShares` raises the buyback bucket | Routinely keeper-triggered at steady-state buyback share |
