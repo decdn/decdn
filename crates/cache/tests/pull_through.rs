@@ -4218,6 +4218,52 @@ async fn range_pull_zero_len_reads_to_end() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn range_pull_refuses_logically_evicted_hash() -> anyhow::Result<()> {
+    // A logically-evicted hash (operator takedown / DMCA) must NOT be
+    // re-fetched and re-cached by a range pull — it returns NotFound and
+    // never hits the origin, mirroring `get` / `populate` (#279).
+    let blob = make_blob(200 * 1024);
+    let blob_size = u64::try_from(blob.len())?;
+    let (req_start, req_end): (u64, u64) = (20 * 1024, 40 * 1024);
+    let aligned = align_range(req_start, req_end - req_start, blob_size)?;
+    let (server, hash, _ob) =
+        serve_range_origin(&blob, aligned.fetch_start(), aligned.fetch_end()).await?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine_with_origins(
+        vec![Arc::new(HttpOrigin::parse(&server.uri())?) as Arc<dyn Origin>],
+        Arc::clone(&metrics),
+    )
+    .await?;
+
+    // Evict before any pull. `evict` of an uncached hash just records the
+    // takedown in evicted.log (it is a no-op for the store but sticky).
+    engine.evict(hash).await?;
+    anyhow::ensure!(engine.is_evicted(hash), "hash must be logically evicted");
+
+    let err = err_of(
+        engine
+            .pull_through_range(hash, req_start, req_end - req_start, blob_size)
+            .await,
+    )?;
+    anyhow::ensure!(
+        matches!(err, CacheError::NotFound { .. }),
+        "range pull on an evicted hash must surface NotFound, got {err:?}",
+    );
+    // The eviction guard short-circuits BEFORE any origin egress: nothing was
+    // fetched, nothing was imported, and a miss was counted.
+    anyhow::ensure!(
+        metrics.pull_through_bytes.get() == 0,
+        "evicted range pull must not meter any origin egress",
+    );
+    anyhow::ensure!(metrics.misses.get() >= 1, "eviction must count a miss");
+    anyhow::ensure!(
+        !engine.has(hash).await?,
+        "nothing imported for evicted hash"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn origin_range_request_len_and_empty() {
     let r = OriginRangeRequest {
         fetch_start: 16,

@@ -1457,10 +1457,22 @@ impl CacheEngine {
     /// # Errors
     ///
     /// - [`CacheError::NoOrigin`] — no origin configured.
+    /// - [`CacheError::NotFound`] — the hash is logically evicted (operator
+    ///   takedown / DMCA); a range pull must not silently re-fetch and re-cache
+    ///   evicted content (mirrors [`Self::get`] / [`Self::populate`]).
     /// - [`CacheError::OriginError`] — the requested range is out of bounds for
-    ///   `blob_size` (ADR 005: reject, don't clamp), or a genuine origin
-    ///   transport / store fault occurred. A *missing-outboard* / *no-range*
-    ///   origin is NOT an error — it returns [`RangePullOutcome::Unsupported`].
+    ///   `blob_size` (ADR 005: reject, don't clamp).
+    /// - [`CacheError::Store`] — a local store fault while importing the
+    ///   verified partial blob (disk full / IO). Like the whole-blob
+    ///   pull-through path, a store fault fails fast rather than masking a
+    ///   misbehaving local store behind the next origin.
+    ///
+    /// A genuine origin *transport / verify* fault is NOT surfaced as an error:
+    /// it is recorded in `last_err`, logged, and the chain advances; if every
+    /// origin declines or errors the call returns [`RangePullOutcome::Unsupported`]
+    /// so the caller falls back to a whole-blob pull (which re-surfaces the real
+    /// fault if the blob is genuinely unreachable). A *missing-outboard* /
+    /// *no-range* origin likewise returns [`RangePullOutcome::Unsupported`].
     pub async fn pull_through_range(
         &self,
         hash: Hash,
@@ -1470,6 +1482,17 @@ impl CacheEngine {
     ) -> CacheResult<RangePullOutcome> {
         if self.inner.origins.is_empty() {
             return Err(CacheError::NoOrigin { hash });
+        }
+        // Logical-eviction guard (#279): once an operator has run
+        // `decdn node evict <hash>` (e.g. a DMCA takedown), a subsequent range
+        // pull must not silently re-fetch the evicted span from the origin and
+        // undo the eviction — exactly as `get` / `populate` refuse. The
+        // eviction is sticky for the life of `<cache_dir>/evicted.log`.
+        if self.is_evicted(hash) {
+            if let Some(m) = &self.inner.metrics {
+                m.misses.inc();
+            }
+            return Err(CacheError::NotFound { hash });
         }
         // Reject an out-of-bounds request up front (ADR 005 §Bounded byte
         // ranges: reject, never silently clamp). `align_range` owns the bound
@@ -1493,8 +1516,12 @@ impl CacheEngine {
 
         // Walk the origin fallback chain (#284). A per-origin `Unsupported`
         // (no outboard / no range) advances to the next origin; a genuine
-        // transport / verify / store fault surfaces. The first origin that
-        // serves and verifies a range wins.
+        // origin transport / verify fault is recorded and the chain advances.
+        // A local-store fault (`CacheError::Store`: disk full / IO) fails fast
+        // and is NOT masked by trying another origin — consistent with
+        // whole-blob `pull_through`, where `Store` short-circuits the chain
+        // (a misbehaving *local* store is not fixed by a different *origin*).
+        // The first origin that serves and verifies a range wins.
         let mut last_err: Option<CacheError> = None;
         for origin in &self.inner.origins {
             match self
@@ -1503,6 +1530,8 @@ impl CacheEngine {
             {
                 Ok(RangePullOutcome::Served) => return Ok(RangePullOutcome::Served),
                 Ok(RangePullOutcome::Unsupported) => {}
+                // Local store fault: fail fast, do not advance the chain.
+                Err(e @ CacheError::Store(_)) => return Err(e),
                 Err(e) => last_err = Some(e),
             }
         }
@@ -1858,7 +1887,9 @@ impl CacheEngine {
     /// # Errors
     ///
     /// [`CacheError::Store`] if the store cannot satisfy the range (blob
-    /// absent, or the requested bytes were never imported / verified).
+    /// absent, the requested bytes were never imported / verified, or a
+    /// read-to-end (`byte_len == 0`) was requested against a partial blob whose
+    /// size the store cannot yet report).
     pub async fn export_range(
         &self,
         hash: Hash,
@@ -1883,8 +1914,19 @@ impl CacheEngine {
                         "export_range: blob {hash} not present"
                     )));
                 }
-                iroh_blobs::api::blobs::BlobStatus::Partial { size } => size.unwrap_or(byte_offset),
-                iroh_blobs::api::blobs::BlobStatus::Complete { size } => size,
+                // A partial blob whose size the store cannot yet report is an
+                // explicit failure: silently treating `None` as "ends at
+                // `byte_offset`" would return an empty range for a `byte_len ==
+                // 0` ("to end") read and mask the real cause. Surface it so the
+                // caller retries or falls back to a whole-blob serve.
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: None } => {
+                    return Err(CacheError::Store(anyhow::anyhow!(
+                        "export_range: store cannot report size for partial blob {hash}; \
+                         cannot resolve a read-to-end bound"
+                    )));
+                }
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: Some(size) }
+                | iroh_blobs::api::blobs::BlobStatus::Complete { size } => size,
             }
         } else {
             byte_offset.saturating_add(byte_len)

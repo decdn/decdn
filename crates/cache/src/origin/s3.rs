@@ -34,7 +34,7 @@ use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_smithy_http_client::{Builder as HttpBuilder, tls};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::retry::RetryConfig;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use iroh_blobs::Hash;
 use tokio_util::io::ReaderStream;
 
@@ -682,6 +682,17 @@ impl Origin for S3Origin {
             {
                 return Ok(OriginRangeFetch::Unsupported);
             }
+            // Fast-fail on a `Content-Length` that doesn't match the requested
+            // span BEFORE collecting the body: an origin that ignored `Range`
+            // (and is about to stream the whole object) advertises the full
+            // length here, so we degrade without buffering. The exact-length
+            // gate on the collected bytes below is the load-bearing check;
+            // this only avoids reading a body we already know is wrong-sized.
+            if let Some(len) = resp.content_length()
+                && (len < 0 || u64::try_from(len).unwrap_or(u64::MAX) != want)
+            {
+                return Ok(OriginRangeFetch::Unsupported);
+            }
             let want_usize = usize::try_from(want).unwrap_or(usize::MAX);
             let Some(data) = collect_bounded(resp.body, want_usize).await? else {
                 return Ok(OriginRangeFetch::Unsupported);
@@ -732,23 +743,41 @@ impl S3Origin {
     }
 }
 
-/// Drain an S3 `ByteStream` into `Bytes`, returning `Ok(None)` when the
-/// aggregated body exceeds `cap`. Transport errors mid-body surface as
-/// `Transient`. Range-path payloads are bounded (outboard `O(blob/256)`, data
-/// = the requested span), so buffering is sound — this is not the whole-blob
-/// streaming path.
+/// Drain an S3 `ByteStream` into `Bytes`, returning `Ok(None)` the moment the
+/// cumulative body exceeds `cap`. Streams chunk-by-chunk (via
+/// `ByteStream::try_next`) and aborts on the first over-cap chunk WITHOUT
+/// buffering the rest — a misbehaving origin that ignores `Range` and streams a
+/// huge object (or serves an oversized `.obao4`) can't force a whole-body
+/// allocation. This mirrors the bounded streaming reader in
+/// [`crate::origin::http`] (`collect_capped`); `ByteStream::collect()` is
+/// deliberately NOT used because it buffers the entire body before any cap
+/// check. Transport errors mid-body surface as `Transient`.
 async fn collect_bounded(
-    body: aws_sdk_s3::primitives::ByteStream,
+    mut body: aws_sdk_s3::primitives::ByteStream,
     cap: usize,
 ) -> Result<Option<Bytes>, OriginPullError> {
-    let aggregated = body.collect().await.map_err(|e| {
-        OriginPullError::Transient(anyhow::Error::from(e).context("S3 range body read failed"))
-    })?;
-    let bytes = aggregated.into_bytes();
-    if bytes.len() > cap {
-        return Ok(None);
+    let mut buf = BytesMut::new();
+    loop {
+        match body.try_next().await {
+            Ok(None) => break,
+            Ok(Some(chunk)) => {
+                if buf.len().saturating_add(chunk.len()) > cap {
+                    // Over the bound → degrade. The optimization is best-effort;
+                    // an oversized span/outboard is treated as "not
+                    // range-pullable", never a hard error — and we abort here
+                    // rather than keep draining the body.
+                    return Ok(None);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Err(e) => {
+                return Err(OriginPullError::Transient(
+                    anyhow::Error::from(e).context("S3 range body read failed"),
+                ));
+            }
+        }
     }
-    Ok(Some(bytes))
+    Ok(Some(buf.freeze()))
 }
 
 #[cfg(test)]

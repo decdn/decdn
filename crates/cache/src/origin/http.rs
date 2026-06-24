@@ -488,6 +488,17 @@ impl HttpOrigin {
         if resp.status() != StatusCode::PARTIAL_CONTENT {
             return Ok(None);
         }
+        // A `206` whose advertised `Content-Length` already differs from the
+        // requested span is a misbehaving origin — degrade BEFORE collecting
+        // the body rather than buffering up to `want` bytes only to reject
+        // them. `collect_capped` caps at `want`, and the exact-length gate
+        // below is the load-bearing check, but a wrong `Content-Length` lets
+        // us skip the read entirely.
+        if let Some(len) = resp.content_length()
+            && len != want
+        {
+            return Ok(None);
+        }
         let Some(bytes) = self.collect_capped(resp, want, url_log).await? else {
             return Ok(None);
         };

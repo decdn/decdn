@@ -250,6 +250,29 @@ impl Origin for FilesystemOrigin {
             // outboard is the *expected* path for backends that pre-date the
             // optimization — `Unsupported`, not an error.
             let obao4_path = self.obao4_path_for(hash);
+            // Check the on-disk length via `metadata()` BEFORE reading the
+            // file: a wildly oversized outboard is a malformed/foreign
+            // `{H}.obao4`, and reading it first would buffer the whole thing
+            // into memory only to reject it (an OOM lever for a hostile
+            // sibling). Degrade to whole-blob (`Unsupported`) — never a
+            // failure. The engine's `encode_verified_range` length check is
+            // the load-bearing reject; this just bounds the allocation.
+            match tokio::fs::metadata(&obao4_path).await {
+                Ok(meta) if meta.len() > outboard_max_bytes => {
+                    return Ok(OriginRangeFetch::Unsupported);
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(OriginRangeFetch::Unsupported);
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path outboard metadata failed for {}",
+                        obao4_path.display()
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            }
             let outboard = match tokio::fs::read(&obao4_path).await {
                 Ok(b) => b,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -263,11 +286,9 @@ impl Origin for FilesystemOrigin {
                     return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
                 }
             };
-            // A wildly oversized outboard is a malformed/foreign `{H}.obao4`;
-            // refuse the optimization rather than buffer it. The engine's
-            // `encode_verified_range` length check is the load-bearing reject,
-            // but bounding the read keeps a hostile sibling from forcing a huge
-            // alloc. Degrade to whole-blob (`Unsupported`) — never a failure.
+            // Defense-in-depth: a file that grew between `metadata` and `read`
+            // (TOCTOU) is still rejected on the buffered length. Degrade rather
+            // than feed an oversized outboard to verification.
             if u64::try_from(outboard.len()).unwrap_or(u64::MAX) > outboard_max_bytes {
                 return Ok(OriginRangeFetch::Unsupported);
             }
@@ -794,6 +815,47 @@ mod tests {
                 OriginRangeFetch::Unsupported
             ),
             "oversize outboard must degrade",
+        );
+        Ok(())
+    }
+
+    /// OOM guard: a multi-megabyte `{H}.obao4` against a tiny cap must degrade
+    /// via the `metadata()` length pre-check, BEFORE `tokio::fs::read` buffers
+    /// the whole file into memory. Pre-fix the file was read in full and only
+    /// then compared to the cap.
+    #[tokio::test]
+    async fn fetch_range_oversize_outboard_rejected_before_read() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+        // Seed a real data object so only the outboard size is the gate.
+        let payload = vec![3u8; 64 * 1024];
+        let hash = Hash::new(&payload);
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard_dir = canonical.join(shard);
+        tokio::fs::create_dir_all(&shard_dir).await?;
+        tokio::fs::write(shard_dir.join(hex.as_str()), &payload).await?;
+        // 8 MiB foreign/hostile outboard.
+        tokio::fs::write(
+            shard_dir.join(format!("{}{OBAO4_SUFFIX}", hex.as_str())),
+            vec![0x5Au8; 8 * 1024 * 1024],
+        )
+        .await?;
+
+        let req = OriginRangeRequest {
+            fetch_start: 0,
+            fetch_end: 16 * 1024,
+        };
+        // 4 KiB cap — the 8 MiB outboard is rejected on its metadata length.
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_range(hash, req, 4 * 1024).await?,
+                OriginRangeFetch::Unsupported
+            ),
+            "multi-MiB outboard must degrade without buffering",
         );
         Ok(())
     }

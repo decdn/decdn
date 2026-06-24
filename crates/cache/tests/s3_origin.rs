@@ -1077,6 +1077,52 @@ async fn fetch_range_missing_outboard_is_unsupported() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn fetch_range_oversized_outboard_degrades_without_buffering() -> anyhow::Result<()> {
+    // OOM guard: a hostile/oversized `{H}.obao4` (origin ignoring the bound, or
+    // a foreign object served under the outboard key) must degrade to
+    // `Unsupported` WITHOUT buffering the whole body. The mock omits
+    // Content-Length (matching real chunked responses), so the
+    // `content_length()` pre-check can't short-circuit — this exercises the
+    // streaming abort in `collect_bounded`, which stops at the first over-cap
+    // chunk instead of draining the body via `ByteStream::collect()`.
+    let blob = make_blob(64 * 1024);
+    let hash = Hash::new(&blob);
+    let obao4_key = format!("{}.obao4", expected_key("", hash));
+
+    // 8 MiB outboard against a 4 KiB cap. Pre-fix this 8 MiB would be fully
+    // aggregated before the cap check; post-fix it aborts after ~4 KiB.
+    let huge_outboard = vec![0x5Au8; 8 * 1024 * 1024];
+    let obao4_match = obao4_key.clone();
+    let obao4_rule = mock!(Client::get_object)
+        .match_requests(move |req| req.key() == Some(&obao4_match))
+        .then_output(move || {
+            GetObjectOutput::builder()
+                .body(ByteStream::from(huge_outboard.clone()))
+                .build()
+        });
+    let client = mock_s3_client_match_any(&[&obao4_rule]);
+    let origin = s3_origin(client, "");
+
+    let req = OriginRangeRequest {
+        fetch_start: 0,
+        fetch_end: 16 * 1024,
+    };
+    // Tiny outboard cap forces the over-cap abort path.
+    anyhow::ensure!(
+        matches!(
+            origin.fetch_range(hash, req, 4 * 1024).await?,
+            OriginRangeFetch::Unsupported
+        ),
+        "oversized outboard must degrade to Unsupported",
+    );
+    anyhow::ensure!(
+        obao4_rule.num_calls() == 1,
+        "outboard GET issued exactly once",
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn fetch_range_wrong_length_span_degrades() -> anyhow::Result<()> {
     // Outboard present, but the ranged GET returns a *shorter* body than the
     // requested span (origin ignored Range / truncated). Must degrade, not
