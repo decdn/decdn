@@ -20,7 +20,9 @@ use tokio::sync::{Notify, broadcast};
 
 use decdn_config_types::{CircuitBreakerPolicy, PinDiff, PinnedHashes, RetryPolicy};
 
-use crate::circuit_breaker::{Admission, Clock, OriginBreaker, OriginOutcome, SystemClock};
+use crate::circuit_breaker::{
+    Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
+};
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind};
@@ -1747,20 +1749,32 @@ impl CacheEngine {
             // policy (a missing slot would be a construction bug, in
             // which case we degrade to "no breaker" rather than panic).
             let breaker = self.inner.breakers.get(idx);
-            if breaker.is_some_and(|b| matches!(b.acquire(), Admission::ShortCircuit)) {
-                any_short_circuit = true;
-                if idx + 1 < total {
-                    Self::emit_breaker_short_circuit(hash, idx, origin.kind());
+            // Admit (or short-circuit) under the breaker. The `Proceed`
+            // arm carries a `TrialGuard` that owns any HALF-OPEN trial
+            // slot; it MUST stay alive across the `.await` below so that
+            // a cancelled future (client disconnect / timeout) drops it
+            // and reclaims the slot rather than leaking it (#963). A
+            // `None` breaker (construction degraded to "no breaker")
+            // admits unconditionally with no guard.
+            let trial_guard = match breaker.map(OriginBreaker::acquire) {
+                Some(Admission::ShortCircuit) => {
+                    any_short_circuit = true;
+                    self.emit_breaker_short_circuit_advance(hash, idx, total, origin.kind());
+                    continue;
                 }
-                continue;
-            }
+                Some(Admission::Proceed(_state, guard)) => Some(guard),
+                None => None,
+            };
 
             let (outcome, terminal) =
                 run_with_retry_classified(policy, self.inner.metrics.as_ref(), hash, || {
                     self.pull_through_attempt(Arc::clone(&origin), hash, max_blob_bytes, policy)
                 })
                 .await;
-            Self::record_breaker_outcome(breaker, terminal);
+            // Commit the breaker outcome through the guard (defusing its
+            // cancellation-release path). A `None` guard is the degraded
+            // "no breaker" case and records nothing.
+            Self::record_breaker_outcome(trial_guard, terminal);
 
             // Track *this iteration's* outcome class so the post-match
             // log records the correct cause. `last_err.is_some()` is
@@ -1924,33 +1938,55 @@ impl CacheEngine {
         }
     }
 
-    /// Emit a structured log when a per-origin circuit-breaker (#963)
-    /// short-circuited this origin and the chain is about to advance to
-    /// the next one. The short-circuit counter itself is bumped inside
-    /// [`crate::circuit_breaker::OriginBreaker::acquire`] (so it counts
-    /// even on the chain-final origin, where no advance log fires); this
-    /// is purely the operator-visible advance breadcrumb, gated by the
-    /// caller's `idx + 1 < total` check like [`Self::emit_chain_advance`].
+    /// Commit a per-origin breaker the health verdict for a completed
+    /// attempt (#963) by recording it through the admission's
+    /// [`crate::circuit_breaker::TrialGuard`].
     ///
-    /// Feed a per-origin breaker the health verdict for a completed
-    /// attempt (#963). A transient that exhausted the retry budget is
-    /// `Unavailable` (counts toward the trip threshold); everything else
-    /// — bytes, `NotFound`, permanent per-object errors (404/4xx/decode/cap),
-    /// and even a `Store`/`HashMismatch`/`BlobTooLarge` (the origin DID
-    /// respond) — is `Available` and resets the failure count. A `None`
-    /// breaker (construction degraded to "no breaker") is a no-op.
-    fn record_breaker_outcome(breaker: Option<&OriginBreaker>, terminal: Option<TerminalFailure>) {
-        let Some(b) = breaker else { return };
+    /// A transient that exhausted the retry budget is `Unavailable`
+    /// (counts toward the trip threshold); everything else — bytes,
+    /// `NotFound`, permanent per-object errors (404/4xx/decode/cap), and
+    /// even a `Store`/`HashMismatch`/`BlobTooLarge` (the origin DID
+    /// respond) — is `Available` and resets the failure count.
+    ///
+    /// Recording defuses the guard's cancellation-release path, so the
+    /// HALF-OPEN trial slot it may own is resolved exactly once. A `None`
+    /// guard is the degraded "no breaker" case (construction produced no
+    /// breaker for this index) and records nothing.
+    fn record_breaker_outcome(guard: Option<TrialGuard<'_>>, terminal: Option<TerminalFailure>) {
+        let Some(guard) = guard else { return };
         let outcome = match terminal {
             Some(TerminalFailure::TransientExhausted) => OriginOutcome::Unavailable,
             Some(TerminalFailure::Permanent) | None => OriginOutcome::Available,
         };
-        b.record(outcome);
+        guard.record(outcome);
     }
 
-    /// A free function (not a method): it touches no engine state — the
-    /// counter bump lives in the breaker — so it takes no `&self`.
-    fn emit_breaker_short_circuit(hash: Hash, idx: usize, origin_kind: OriginKind) {
+    /// Handle a per-origin circuit-breaker short-circuit (#963) that
+    /// advances the fallback chain: bump `origin_fallback` and emit the
+    /// operator-visible advance breadcrumb, both gated by `idx + 1 <
+    /// total` so a short-circuit on the chain-final origin neither
+    /// logs nor counts a non-existent advance.
+    ///
+    /// The `origin_fallback` bump matches the non-breaker advances in
+    /// [`Self::emit_chain_advance`] — a short-circuit IS a real
+    /// fallback-chain step, so omitting it would make
+    /// `origin_fallback_total` undercount. The short-circuit *load-shed*
+    /// counter itself is bumped separately inside
+    /// [`crate::circuit_breaker::OriginBreaker::acquire`] (so it counts
+    /// even on the chain-final origin, where no advance fires).
+    fn emit_breaker_short_circuit_advance(
+        &self,
+        hash: Hash,
+        idx: usize,
+        total: usize,
+        origin_kind: OriginKind,
+    ) {
+        if idx + 1 >= total {
+            return;
+        }
+        if let Some(m) = &self.inner.metrics {
+            m.origin_fallback.inc();
+        }
         tracing::warn!(
             hash = %hash,
             origin_index = idx,

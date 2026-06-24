@@ -160,17 +160,109 @@ pub enum BreakerState {
 }
 
 /// Whether the breaker admits a pull-through attempt right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Admission {
+///
+/// A `Proceed` carries a [`TrialGuard`] that owns any HALF-OPEN trial
+/// slot reserved by [`OriginBreaker::acquire`]. The guard MUST be kept
+/// alive across the (possibly-cancelled) origin fetch and then resolved
+/// with [`TrialGuard::record`]; if it is dropped without `record` — the
+/// case when the surrounding future is cancelled mid-await — its `Drop`
+/// releases the reserved slot so a stuck breaker can never leak its
+/// half-open budget. See [`TrialGuard`].
+#[derive(Debug)]
+#[must_use = "a Proceed admission carries a TrialGuard that must be recorded or dropped"]
+pub enum Admission<'b> {
     /// Proceed with the (retry-looped) origin fetch. Carries the state
     /// the breaker was in at admission so the caller knows whether this
     /// is a normal CLOSED request or a HALF-OPEN trial (only for
-    /// logging — `record` handles the transition either way).
-    Proceed(BreakerState),
+    /// logging — `record` handles the transition either way), plus the
+    /// [`TrialGuard`] that releases the trial slot on cancellation.
+    Proceed(BreakerState, TrialGuard<'b>),
     /// Short-circuit: the breaker is OPEN (or HALF-OPEN with its trial
     /// budget exhausted). The caller must fast-fail this miss WITHOUT
     /// running the retry/backoff loop.
     ShortCircuit,
+}
+
+/// RAII guard for one admitted pull-through attempt.
+///
+/// Returned inside [`Admission::Proceed`] by [`OriginBreaker::acquire`].
+/// It exists to make the HALF-OPEN trial budget *cancellation-safe*: a
+/// half-open trial reserves a `half_open_in_flight` slot at admission,
+/// and that slot must be returned even if the surrounding async fetch is
+/// cancelled (client disconnect / timeout) before its outcome is known.
+///
+/// Resolution happens exactly one of two ways:
+///
+/// - [`TrialGuard::record`] commits the outcome — driving the
+///   CLOSED→OPEN, HALF-OPEN→CLOSED, and HALF-OPEN→OPEN transitions — and
+///   defuses the guard so `Drop` does nothing.
+/// - The guard is **dropped without `record`** (the future was
+///   cancelled): `Drop` releases the reserved HALF-OPEN slot (a no-op
+///   for a CLOSED admission, which reserves no slot) without recording
+///   any state transition. The breaker neither closes nor re-opens on a
+///   cancelled trial — it simply reclaims the budget so a later trial is
+///   admitted.
+///
+/// The guard borrows the breaker, so it cannot outlive it; the engine
+/// holds each breaker for the whole pull-through call, which strictly
+/// outlives the guard.
+#[derive(Debug)]
+pub struct TrialGuard<'b> {
+    /// The breaker this admission belongs to, against which
+    /// [`Self::record`] commits the outcome. `None` only for a fully
+    /// inert guard (disabled policy): no breaker, no slot, no recording.
+    breaker: Option<&'b OriginBreaker>,
+    /// Whether this admission reserved a HALF-OPEN trial slot that
+    /// `Drop` must reclaim if `record` is never called (cancellation).
+    /// `false` for a CLOSED admission, which reserves no slot — dropping
+    /// it must NOT touch `half_open_in_flight`. Cleared to `false` by
+    /// [`Self::record`] so a recorded trial is not also released on drop.
+    owns_slot: bool,
+}
+
+impl TrialGuard<'_> {
+    /// A fully inert guard: no breaker, no reserved slot. Dropping it is
+    /// a no-op and `record` does nothing. Used for disabled policies,
+    /// where there is neither a slot to release nor a transition to
+    /// record.
+    const fn inert() -> Self {
+        Self {
+            breaker: None,
+            owns_slot: false,
+        }
+    }
+
+    /// Commit the outcome of the admitted attempt and defuse the guard.
+    ///
+    /// Drives the breaker's state transitions (the private
+    /// `OriginBreaker::record_committed`) and clears `owns_slot` so the
+    /// guard's `Drop` does not also release the HALF-OPEN slot — `record`
+    /// already accounts for the slot it resolves. For an inert guard
+    /// (disabled policy) this is a no-op.
+    pub fn record(mut self, outcome: OriginOutcome) {
+        // Defuse first: from here `record_committed` owns the slot
+        // release, so `Drop` (running at end of scope) must not also
+        // reclaim it.
+        self.owns_slot = false;
+        if let Some(breaker) = self.breaker {
+            breaker.record_committed(outcome);
+        }
+    }
+}
+
+impl Drop for TrialGuard<'_> {
+    fn drop(&mut self) {
+        // Reached without a `record` call only on cancellation. Release
+        // the reserved HALF-OPEN slot — but only if this admission owned
+        // one (CLOSED admissions and inert guards own none) — without
+        // recording a transition, so a cancelled trial reclaims its
+        // budget instead of leaking it.
+        if self.owns_slot
+            && let Some(breaker) = self.breaker
+        {
+            breaker.release_cancelled_trial();
+        }
+    }
 }
 
 /// Internal mutable state, guarded by a single mutex. Kept small and
@@ -194,9 +286,10 @@ struct State {
 ///
 /// Cheap to construct and `Send + Sync`; the engine holds one per origin
 /// in a parallel `Vec`. A disabled policy (`!policy.is_active()`) makes
-/// every [`Self::acquire`] return [`Admission::Proceed`] and every
-/// [`Self::record`] a no-op, so an opted-out operator pays nothing but a
-/// mutex-free `is_active` check on the hot path.
+/// every [`Self::acquire`] return [`Admission::Proceed`] with an inert
+/// guard whose [`TrialGuard::record`] is a no-op, so an opted-out
+/// operator pays nothing but a mutex-free `is_active` check on the hot
+/// path.
 #[derive(Debug)]
 pub struct OriginBreaker {
     policy: CircuitBreakerPolicy,
@@ -247,27 +340,33 @@ impl OriginBreaker {
     /// Returns [`Admission::ShortCircuit`] when the breaker is OPEN
     /// (cooldown not yet elapsed) or HALF-OPEN with no remaining trial
     /// budget — the caller must fast-fail the miss without running the
-    /// retry loop. Otherwise returns [`Admission::Proceed`]; if that
-    /// admission was a HALF-OPEN trial, a [`Self::record`] call MUST
-    /// follow to release the trial slot and resolve the probe.
+    /// retry loop. Otherwise returns [`Admission::Proceed`] carrying a
+    /// [`TrialGuard`]; if that admission was a HALF-OPEN trial, the guard
+    /// owns the reserved trial slot and MUST be resolved — either by
+    /// [`TrialGuard::record`] (which drives the transition) or by being
+    /// dropped on cancellation (which reclaims the slot). Either way the
+    /// slot is never leaked.
     ///
-    /// A disabled policy always returns `Proceed(Closed)`.
-    #[must_use]
-    pub fn acquire(&self) -> Admission {
+    /// A disabled policy always returns `Proceed(Closed, _)` with an
+    /// inert guard.
+    pub fn acquire(&self) -> Admission<'_> {
         if !self.policy.is_active() {
-            return Admission::Proceed(BreakerState::Closed);
+            return Admission::Proceed(BreakerState::Closed, TrialGuard::inert());
         }
         let now = self.clock.now();
         let mut st = self.lock();
         match st.phase {
-            BreakerState::Closed => Admission::Proceed(BreakerState::Closed),
+            // A CLOSED admission reserves no trial slot, so its guard is
+            // inert: only the recorded outcome matters, and dropping it
+            // on cancellation must not touch `half_open_in_flight`.
+            BreakerState::Closed => Admission::Proceed(BreakerState::Closed, self.closed_guard()),
             BreakerState::Open => {
                 if self.cooldown_elapsed(&st, now) {
                     // Transition to HALF-OPEN and admit this caller as
-                    // the first trial.
+                    // the first trial, handing it a slot-owning guard.
                     st.phase = BreakerState::HalfOpen;
                     st.half_open_in_flight = 1;
-                    Admission::Proceed(BreakerState::HalfOpen)
+                    Admission::Proceed(BreakerState::HalfOpen, self.trial_guard())
                 } else {
                     self.short_circuit();
                     Admission::ShortCircuit
@@ -276,7 +375,7 @@ impl OriginBreaker {
             BreakerState::HalfOpen => {
                 if st.half_open_in_flight < self.policy.half_open_max_calls {
                     st.half_open_in_flight = st.half_open_in_flight.saturating_add(1);
-                    Admission::Proceed(BreakerState::HalfOpen)
+                    Admission::Proceed(BreakerState::HalfOpen, self.trial_guard())
                 } else {
                     // Trial budget already in flight — shed extra load
                     // until a trial resolves.
@@ -287,17 +386,51 @@ impl OriginBreaker {
         }
     }
 
-    /// Record the outcome of a pull-through attempt that was admitted by
-    /// [`Self::acquire`]. Drives the CLOSED→OPEN, HALF-OPEN→CLOSED, and
-    /// HALF-OPEN→OPEN transitions.
-    ///
-    /// A disabled policy is a no-op. MUST be called exactly once for
-    /// every `Proceed` admission (and never for a `ShortCircuit`), so
-    /// the HALF-OPEN in-flight trial budget is correctly released.
-    pub fn record(&self, outcome: OriginOutcome) {
-        if !self.policy.is_active() {
-            return;
+    /// Guard for a CLOSED (active-policy) admission: it carries the
+    /// breaker so `record` drives the CLOSED→OPEN transition, but owns no
+    /// half-open slot, so dropping it on cancellation must NOT touch
+    /// `half_open_in_flight` (a CLOSED request reserved none).
+    const fn closed_guard(&self) -> TrialGuard<'_> {
+        TrialGuard {
+            breaker: Some(self),
+            owns_slot: false,
         }
+    }
+
+    /// Guard for a HALF-OPEN trial admission: carries the breaker and
+    /// owns the reserved slot, so a cancelled (dropped-without-record)
+    /// trial releases it.
+    const fn trial_guard(&self) -> TrialGuard<'_> {
+        TrialGuard {
+            breaker: Some(self),
+            owns_slot: true,
+        }
+    }
+
+    /// Release a HALF-OPEN trial slot reserved at admission when the
+    /// trial was cancelled before producing an outcome — `record` was
+    /// never called, so [`TrialGuard::drop`] reclaims the budget here.
+    ///
+    /// No state transition: a cancelled probe is inconclusive, so the
+    /// breaker neither closes nor re-opens. It only returns the slot so a
+    /// subsequent trial is admitted. Releasing while not HALF-OPEN (a
+    /// concurrent re-open already cleared `half_open_in_flight` to 0)
+    /// saturates at 0 rather than underflowing.
+    fn release_cancelled_trial(&self) {
+        let mut st = self.lock();
+        st.half_open_in_flight = st.half_open_in_flight.saturating_sub(1);
+    }
+
+    /// Record the committed outcome of a pull-through attempt that was
+    /// admitted by [`Self::acquire`]. Drives the CLOSED→OPEN,
+    /// HALF-OPEN→CLOSED, and HALF-OPEN→OPEN transitions.
+    ///
+    /// Reached only through [`TrialGuard::record`], so a disabled policy
+    /// never gets here (its admission carries an inert guard whose
+    /// `record` short-circuits). The HALF-OPEN arm releases the trial
+    /// slot this outcome resolves; the guard is already defused, so there
+    /// is no double-release.
+    fn record_committed(&self, outcome: OriginOutcome) {
         let now = self.clock.now();
         let mut st = self.lock();
         match st.phase {
@@ -392,15 +525,30 @@ mod tests {
         }
     }
 
+    /// Acquire, asserting admission, and return the trial guard so the
+    /// caller can `record` (or deliberately drop) it. `Admission` no
+    /// longer derives `PartialEq` (the guard holds a `&` and a `Drop`),
+    /// so admission assertions go through `matches!`.
+    fn admit(b: &OriginBreaker) -> TrialGuard<'_> {
+        match b.acquire() {
+            Admission::Proceed(_, guard) => guard,
+            Admission::ShortCircuit => panic!("expected admission, got short-circuit"),
+        }
+    }
+
+    /// Assert the breaker short-circuits right now.
+    fn assert_short_circuit(b: &OriginBreaker) {
+        assert!(
+            matches!(b.acquire(), Admission::ShortCircuit),
+            "expected short-circuit"
+        );
+    }
+
     /// Drive one admitted attempt to the given outcome, asserting it was
     /// admitted. Keeps the state-machine tests terse without discarding
     /// the `#[must_use]` admission silently.
     fn drive(b: &OriginBreaker, outcome: OriginOutcome) {
-        assert!(
-            matches!(b.acquire(), Admission::Proceed(_)),
-            "expected admission"
-        );
-        b.record(outcome);
+        admit(b).record(outcome);
     }
 
     #[test]
@@ -409,7 +557,7 @@ mod tests {
         assert_eq!(b.state(), BreakerState::Closed);
         assert!(matches!(
             b.acquire(),
-            Admission::Proceed(BreakerState::Closed)
+            Admission::Proceed(BreakerState::Closed, _)
         ));
     }
 
@@ -449,18 +597,14 @@ mod tests {
         }
         assert_eq!(b.state(), BreakerState::Open);
         // While open and before cooldown, acquire short-circuits.
-        assert_eq!(b.acquire(), Admission::ShortCircuit);
+        assert_short_circuit(&b);
         clk.advance(Duration::from_millis(999));
-        assert_eq!(
-            b.acquire(),
-            Admission::ShortCircuit,
-            "cooldown not yet elapsed"
-        );
+        assert_short_circuit(&b);
         // Once cooldown elapses, the next acquire goes half-open.
         clk.advance(Duration::from_millis(1));
         assert!(matches!(
             b.acquire(),
-            Admission::Proceed(BreakerState::HalfOpen)
+            Admission::Proceed(BreakerState::HalfOpen, _)
         ));
         assert_eq!(b.state(), BreakerState::HalfOpen);
     }
@@ -472,9 +616,7 @@ mod tests {
             drive(&b, OriginOutcome::Unavailable);
         }
         clk.advance(Duration::from_secs(1));
-        let adm = b.acquire();
-        assert!(matches!(adm, Admission::Proceed(BreakerState::HalfOpen)));
-        b.record(OriginOutcome::Available);
+        admit(&b).record(OriginOutcome::Available);
         assert_eq!(b.state(), BreakerState::Closed, "trial success -> closed");
         let _ = &clk;
     }
@@ -486,14 +628,10 @@ mod tests {
             drive(&b, OriginOutcome::Unavailable);
         }
         clk.advance(Duration::from_secs(1));
-        assert!(matches!(
-            b.acquire(),
-            Admission::Proceed(BreakerState::HalfOpen)
-        ));
-        b.record(OriginOutcome::Unavailable);
+        admit(&b).record(OriginOutcome::Unavailable);
         assert_eq!(b.state(), BreakerState::Open, "trial failure -> open");
         // And the cooldown timer restarts: an immediate acquire short-circuits.
-        assert_eq!(b.acquire(), Admission::ShortCircuit);
+        assert_short_circuit(&b);
     }
 
     #[test]
@@ -507,13 +645,11 @@ mod tests {
             drive(&b, OriginOutcome::Unavailable);
         }
         clk.advance(Duration::from_secs(1));
-        // First acquire admits the single trial.
-        assert!(matches!(
-            b.acquire(),
-            Admission::Proceed(BreakerState::HalfOpen)
-        ));
+        // First acquire admits the single trial — hold the guard so its
+        // slot stays reserved across the second acquire.
+        let _trial = admit(&b);
         // Second concurrent acquire (trial still in flight) short-circuits.
-        assert_eq!(b.acquire(), Admission::ShortCircuit);
+        assert_short_circuit(&b);
     }
 
     #[test]
@@ -527,11 +663,12 @@ mod tests {
             drive(&b, OriginOutcome::Unavailable);
         }
         clk.advance(Duration::from_secs(1));
-        // Three trials admitted, fourth short-circuits.
-        assert!(matches!(b.acquire(), Admission::Proceed(_)));
-        assert!(matches!(b.acquire(), Admission::Proceed(_)));
-        assert!(matches!(b.acquire(), Admission::Proceed(_)));
-        assert_eq!(b.acquire(), Admission::ShortCircuit);
+        // Three trials admitted (guards held so slots stay reserved),
+        // fourth short-circuits.
+        let _t1 = admit(&b);
+        let _t2 = admit(&b);
+        let _t3 = admit(&b);
+        assert_short_circuit(&b);
     }
 
     #[test]
@@ -550,11 +687,11 @@ mod tests {
     fn disabled_policy_always_proceeds_and_never_trips() {
         let (b, _clk) = breaker(CircuitBreakerPolicy::disabled());
         for _ in 0..100 {
-            assert!(matches!(
-                b.acquire(),
-                Admission::Proceed(BreakerState::Closed)
-            ));
-            b.record(OriginOutcome::Unavailable);
+            let guard = match b.acquire() {
+                Admission::Proceed(BreakerState::Closed, guard) => guard,
+                other => panic!("disabled policy must proceed closed, got {other:?}"),
+            };
+            guard.record(OriginOutcome::Unavailable);
             // disabled record is a no-op; loop just proves no trip.
         }
         assert_eq!(b.state(), BreakerState::Closed);
@@ -589,12 +726,97 @@ mod tests {
         }
         assert_eq!(metrics.circuit_breaker_trips.get(), 1);
         // Short-circuit a miss while open.
-        assert_eq!(b.acquire(), Admission::ShortCircuit);
+        assert_short_circuit(&b);
         assert_eq!(metrics.circuit_breaker_short_circuits.get(), 1);
         // Recover.
         clock.advance(Duration::from_secs(1));
-        let _ = b.acquire();
-        b.record(OriginOutcome::Available);
+        admit(&b).record(OriginOutcome::Available);
         assert_eq!(metrics.circuit_breaker_recoveries.get(), 1);
+    }
+
+    /// Cancellation safety (#963): a HALF-OPEN trial whose guard is
+    /// dropped *without* `record` — exactly what happens when the
+    /// surrounding pull-through future is cancelled mid-await — must
+    /// release its reserved `half_open_in_flight` slot so a subsequent
+    /// trial is admitted. Before the RAII guard, the slot leaked and the
+    /// breaker stuck HALF-OPEN forever, short-circuiting every later
+    /// trial.
+    #[test]
+    fn dropped_trial_guard_releases_half_open_slot() {
+        let (b, clk) = breaker(policy());
+        // Trip to OPEN.
+        for _ in 0..3 {
+            drive(&b, OriginOutcome::Unavailable);
+        }
+        clk.advance(Duration::from_secs(1));
+
+        // First acquire goes HALF-OPEN and reserves the single trial
+        // slot. Simulate cancellation: drop the guard WITHOUT recording,
+        // the way an aborted future would.
+        {
+            let guard = admit(&b);
+            assert_eq!(b.state(), BreakerState::HalfOpen);
+            // While the trial is in flight, the slot is taken: a
+            // concurrent acquire short-circuits (budget == 1).
+            assert_short_circuit(&b);
+            drop(guard); // <-- cancellation point: no `record`.
+        }
+
+        // The slot must have been reclaimed by `Drop`. A subsequent
+        // trial is admitted instead of being starved forever.
+        let guard = admit(&b);
+        assert_eq!(
+            b.state(),
+            BreakerState::HalfOpen,
+            "still probing; slot was reclaimed, not leaked"
+        );
+        // And it resolves normally: a success closes the breaker.
+        guard.record(OriginOutcome::Available);
+        assert_eq!(b.state(), BreakerState::Closed, "trial success -> closed");
+    }
+
+    /// A dropped HALF-OPEN trial guard releases exactly one slot — it
+    /// must not also let `record` double-release, nor must a recorded
+    /// trial's `Drop` over-release. After a multi-slot HALF-OPEN cycle
+    /// where one trial is recorded and others cancelled, the budget is
+    /// fully reclaimed (all slots free) rather than driven negative or
+    /// stuck.
+    #[test]
+    fn mixed_recorded_and_cancelled_trials_reclaim_full_budget() {
+        let p = CircuitBreakerPolicy {
+            half_open_max_calls: 3,
+            ..policy()
+        };
+        let (b, clk) = breaker(p);
+        for _ in 0..3 {
+            drive(&b, OriginOutcome::Unavailable);
+        }
+        clk.advance(Duration::from_secs(1));
+
+        // Admit all three trials, holding their guards.
+        let g1 = admit(&b);
+        let g2 = admit(&b);
+        let g3 = admit(&b);
+        // Budget exhausted: a fourth acquire short-circuits.
+        assert_short_circuit(&b);
+
+        // Cancel two (drop without record), record one as Available.
+        drop(g1);
+        drop(g2);
+        g3.record(OriginOutcome::Available);
+        // The recorded success closed the breaker; the two cancellations
+        // released their slots without underflow.
+        assert_eq!(b.state(), BreakerState::Closed);
+
+        // A fresh CLOSED→OPEN→HALF-OPEN cycle still admits the full
+        // budget, proving no slot leaked from the cancelled pair.
+        for _ in 0..3 {
+            drive(&b, OriginOutcome::Unavailable);
+        }
+        clk.advance(Duration::from_secs(1));
+        let _t1 = admit(&b);
+        let _t2 = admit(&b);
+        let _t3 = admit(&b);
+        assert_short_circuit(&b);
     }
 }
