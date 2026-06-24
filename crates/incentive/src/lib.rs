@@ -26,6 +26,7 @@ pub mod buyer_channel;
 pub mod buyer_channel_redb;
 pub mod capacity_bond;
 pub mod channel;
+pub mod channel_open_error;
 pub mod client_bridge;
 pub mod client_reputation;
 pub mod cooperative_close;
@@ -52,6 +53,7 @@ pub use buyer_channel::{
     MemoryBuyerChannelStore,
 };
 pub use channel::{ChannelError, ChannelId, ChannelState, VoucherApplied};
+pub use channel_open_error::ChannelOpenFailureReason;
 pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
     wire_voucher_to_signed,
