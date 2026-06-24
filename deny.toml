@@ -1,16 +1,38 @@
 [advisories]
 version = 2
-# Transitive unmaintained-crate advisories with no available fix
+# Transitive unmaintained-crate advisories. All four are RUSTSEC "unmaintained"
+# informational notices (not memory-safety / soundness vulnerabilities), none has
+# a patched release, and every one is a build-time-only proc-macro or a
+# platform-conditional dep with no runtime exposure in our binaries. Each entry
+# records the affected crate, why it is safe to suppress, and what to watch for
+# so a future audit knows when the ignore can be dropped. Status as of 2026-06.
+# The `crate -> dep -> dep` chains below are reverse-dependency paths as produced
+# by `cargo tree -i`: read left-to-right as "is depended on by" (the leftmost
+# crate is the flagged one; each `->` points to a crate that pulls in the prior).
 ignore = [
-    # proc-macro-error: unmaintained, transitive via genawaiter -> bao-tree -> iroh-blobs
+    # proc-macro-error v0.4.x: unmaintained (RustSec: maintainer unreachable, no
+    # release in 4 years; suggested replacements manyhow / proc-macro2-diagnostics).
+    # Build-time proc-macro only, no runtime code. Transitive via
+    # genawaiter-proc-macro -> genawaiter -> bao-tree / iroh-blobs. No fixed release
+    # exists. Re-evaluate when iroh-blobs / bao-tree drop their genawaiter dependency.
     "RUSTSEC-2024-0370",
-    # atomic-polyfill: unmaintained, platform-conditional transitive dep (not on linux x86_64)
+    # atomic-polyfill v1.x: unmaintained (RustSec: repo archived/deprecated; upstream
+    # suggests portable-atomic). Platform-conditional dep — not compiled on our
+    # default linux x86_64 / aarch64 targets; only appears under `cargo tree --target
+    # all` via heapless 0.7 -> postcard. No fixed release exists. Re-evaluate when
+    # postcard bumps to a heapless 0.8+ that drops atomic-polyfill.
     "RUSTSEC-2023-0089",
-    # paste: unmaintained, transitive via alloy-primitives
+    # paste v1.0.x: unmaintained (RustSec: author archived the repo; suggested
+    # replacement pastey). Build-time proc-macro only, no runtime code. Transitive
+    # via alloy-primitives -> alloy. No fixed release exists. Re-evaluate when
+    # alloy-primitives drops paste (tracked upstream in the alloy-rs/core repo).
     "RUSTSEC-2024-0436",
-    # proc-macro-error2: unmaintained fork of proc-macro-error (itself already
-    # ignored above as RUSTSEC-2024-0370). Build-time-only proc-macro pulled via
-    # alloy-sol-macro -> alloy; no runtime exposure and no maintained successor.
+    # proc-macro-error2 v2.x: unmaintained (RustSec: author confirmed no longer
+    # maintained; suggests migrating to manyhow / proc-macro2-diagnostics). This is
+    # the formerly-maintained fork of proc-macro-error (itself ignored above as
+    # RUSTSEC-2024-0370) and is now unmaintained too. Build-time proc-macro only,
+    # no runtime code. Transitive via alloy-sol-macro -> alloy-sol-types -> alloy.
+    # No fixed release exists. Re-evaluate when alloy-sol-macro drops it.
     "RUSTSEC-2026-0173",
     # NOTE: the hickory-proto / hickory-net DNS DoS ignores
     # (RUSTSEC-2026-0119 + 0120) were dropped when iroh 1.0 pulled the
