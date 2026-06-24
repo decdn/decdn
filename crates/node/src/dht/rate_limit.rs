@@ -592,6 +592,114 @@ mod tests {
         );
     }
 
+    // ---- #969: explicit evaluation-order + trusted-IP-scope coverage. ADR
+    // 005 §Probe rate limiting (and the mirroring ADR 022 §DHT Rate Limiting
+    // this limiter implements) specify cheapest-first ordering
+    // (global → per-IP → per-peer) and a trusted-IP list that exempts ONLY
+    // the per-IP layer. ----
+
+    /// The global cap is the cheapest (first-checked) layer, so when both the
+    /// global bucket and the per-IP bucket are exhausted, the rejection must
+    /// be attributed to `Global` — never `PerIp`. This pins the
+    /// global-before-per-IP edge of the cheapest-first order specifically
+    /// (the existing `cheapest_first_global_short_circuits_per_peer` pins the
+    /// global-before-per-peer edge).
+    ///
+    /// Construction: global burst=1 and per-IP burst=1 from the *same* IP but
+    /// *distinct* peers (so the per-peer layer never fires and can't be the
+    /// reported layer). The first request drains both global and per-IP; the
+    /// second would fail both, and global — checked first — must win.
+    #[test]
+    fn cheapest_first_global_fires_before_per_ip() {
+        let mut cfg = strict_cfg();
+        // global burst=1, per-IP burst=1 (both from strict_cfg); loosen
+        // per-peer so it can never be the layer that fires. Pin the two
+        // tested layers' refill to effectively zero (1e-9 req/sec) so a slow
+        // CI scheduler can't refill a token mid-test and flake the second
+        // `check`; burst=1 (from strict_cfg) is the only budget either gets.
+        cfg.global_rate_per_sec = 1e-9;
+        cfg.per_ip_rate_per_sec = 1e-9;
+        cfg.per_peer_burst = u32::MAX;
+        cfg.per_peer_rate_per_sec = 1e9;
+        let lim = DhtRateLimiter::new(&cfg, metrics());
+        let i = Some(ip(10, 0, 0, 1));
+        // First request drains both the global and the per-IP bucket.
+        assert_eq!(lim.check(&peer(1), i), Ok(()));
+        // Second request from the SAME IP but a DIFFERENT peer would be
+        // rejected by BOTH the global and the per-IP layer. Cheapest-first
+        // ordering means global is consulted first and short-circuits, so
+        // the reported layer must be `Global`, not `PerIp`.
+        assert_eq!(lim.check(&peer(2), i), Err(DhtRejectLayer::Global));
+    }
+
+    /// The global rejection in `cheapest_first_global_fires_before_per_ip`
+    /// must increment the *global* counter only — a regression that consulted
+    /// per-IP first (or mis-attributed the counter) would bump
+    /// `decdn_dht_rate_limit_rejected_per_ip_total` instead. The
+    /// `Err(DhtRejectLayer::Global)` assertion alone can't catch a counter
+    /// mix-up, so confirm the attribution via the encoded scrape too.
+    #[test]
+    fn global_before_per_ip_attributes_rejection_to_global_counter() {
+        let mut cfg = strict_cfg();
+        // Pin the tested global + per-IP layers to no-refill (1e-9 req/sec) so
+        // a slow CI scheduler can't refill a token between the two `check`
+        // calls; burst=1 (from strict_cfg) is the entire budget.
+        cfg.global_rate_per_sec = 1e-9;
+        cfg.per_ip_rate_per_sec = 1e-9;
+        cfg.per_peer_burst = u32::MAX;
+        cfg.per_peer_rate_per_sec = 1e9;
+        let metrics = metrics();
+        let lim = DhtRateLimiter::new(&cfg, Arc::clone(&metrics));
+        let i = Some(ip(10, 0, 0, 1));
+        assert_eq!(lim.check(&peer(1), i), Ok(()));
+        assert_eq!(lim.check(&peer(2), i), Err(DhtRejectLayer::Global));
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_dht_rate_limit_rejected_global_total 1"),
+            "global must be the counted layer when both global+per-IP would \
+             reject; got:\n{text}"
+        );
+        assert!(
+            text.contains("decdn_dht_rate_limit_rejected_per_ip_total 0"),
+            "per-IP counter must NOT move — global short-circuits first; \
+             got:\n{text}"
+        );
+    }
+
+    /// A trusted IP bypasses the per-IP layer but remains fully subject to the
+    /// per-peer layer. With per-IP and global loosened so neither can fire,
+    /// repeated requests from a trusted IP using the SAME `NodeId` must still
+    /// be rejected by the per-peer bucket — proving the exemption is scoped to
+    /// per-IP only and does not leak into per-peer.
+    #[test]
+    fn trusted_ip_still_subject_to_per_peer_layer() {
+        let mut cfg = strict_cfg();
+        // Per-peer burst=1 (from strict_cfg) is the only layer that can fire.
+        // Pin its refill to no-refill (1e-9 req/sec) so a slow CI scheduler
+        // can't refill a per-peer token between the two same-peer `check`
+        // calls; burst=1 is the entire per-peer budget.
+        cfg.per_peer_rate_per_sec = 1e-9;
+        cfg.per_ip_burst = u32::MAX;
+        cfg.per_ip_rate_per_sec = 1e9;
+        cfg.global_burst = u32::MAX;
+        cfg.global_rate_per_sec = 1e9;
+        cfg.trusted_ips.insert(ip(10, 0, 0, 1));
+        let lim = DhtRateLimiter::new(&cfg, metrics());
+        let trusted = Some(ip(10, 0, 0, 1));
+        let p = peer(1);
+        // First request from the trusted IP + peer admits.
+        assert_eq!(lim.check(&p, trusted), Ok(()));
+        // Second request — same trusted IP, same peer — must reject on the
+        // per-peer layer. If the trust exemption wrongly bypassed per-peer
+        // this would erroneously return `Ok(())`.
+        assert_eq!(lim.check(&p, trusted), Err(DhtRejectLayer::PerPeer));
+        // A different peer from the same trusted IP is admitted: the per-peer
+        // bucket is keyed by NodeId, and the per-IP layer that *would* have
+        // limited a second distinct peer from one IP is the one the trust
+        // exemption legitimately bypasses.
+        assert_eq!(lim.check(&peer(2), trusted), Ok(()));
+    }
+
     fn ip6(segments: [u16; 8]) -> IpAddr {
         IpAddr::V6(std::net::Ipv6Addr::new(
             segments[0],
