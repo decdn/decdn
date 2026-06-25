@@ -48,7 +48,13 @@ async fn main() -> std::process::ExitCode {
     let parsed = DaemonCli::parse();
     let config_path = parsed.config.map(|p| cli::common::expand_tilde(&p));
     let result = match parsed.command {
-        DaemonCommand::Run(run_args) => commands::run(config_path.as_deref(), &run_args).await,
+        // `Box::pin` the bring-up future: the runtime `run` state machine is
+        // large (many sequential await points across endpoint/handler/task
+        // setup) and crosses clippy's `large_futures` threshold. It runs once
+        // per process, so heap-allocating it has no meaningful cost.
+        DaemonCommand::Run(run_args) => {
+            Box::pin(commands::run(config_path.as_deref(), &run_args)).await
+        }
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

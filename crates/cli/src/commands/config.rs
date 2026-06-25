@@ -289,6 +289,16 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  probe.per_peer_rate_per_sec: {}",
+        resolved.probe.per_peer_rate_per_sec
+    )?;
+    writeln!(
+        w,
+        "  probe.global_rate_per_sec: {}",
+        resolved.probe.global_rate_per_sec
+    )?;
+    writeln!(
+        w,
         "  gossip.subscribe_global:  {}",
         resolved.gossip.subscribe_global
     )?;
@@ -485,6 +495,17 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
 
+[probe.rate_limit]
+# per_peer_rate_per_sec = 5.0               # per-peer (NodeId) sustained rate (ADR 005); 0.0 disables the layer
+# per_peer_burst = 5                        # per-peer burst capacity; required > 0 when the rate is > 0
+# per_ip_rate_per_sec = 50.0                # per-IP sustained rate; 0.0 disables
+# per_ip_burst = 200                        # per-IP burst capacity
+# global_rate_per_sec = 1000.0              # global inbound probe sustained rate; 0.0 disables
+# global_burst = 2000                       # global inbound probe burst capacity
+# trusted_ips = []                          # IPs that bypass the per-IP layer only (ADR 005 §Trusted-IP exemption)
+# max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
+# max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
+
 [receipts]
 # max_file_bytes = 134217728                # rotate the download-receipt log at this size (#802); default 128 MiB
 # retained_files = 4                        # rotated backup receipt files retained (#802); 0 keeps none
@@ -526,6 +547,7 @@ mod tests {
         assert!(parsed.gossip.is_some(), "[gossip] header parsed");
         assert!(parsed.security.is_some(), "[security] header parsed");
         assert!(parsed.dht.is_some(), "[dht.rate_limit] header parsed");
+        assert!(parsed.probe.is_some(), "[probe.rate_limit] header parsed");
         assert!(parsed.receipts.is_some(), "[receipts] header parsed");
     }
 }

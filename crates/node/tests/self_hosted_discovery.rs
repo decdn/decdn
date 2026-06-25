@@ -78,7 +78,9 @@ use decdn_gossip::{
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
+use decdn_node::handlers::probe_rate_limit::ProbeRateLimiter;
 use decdn_node::metrics::Metrics;
+use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
     ALPN_PROBE, MAX_RATE_PER_MB, ProbeMessage, TOPIC_GLOBAL, decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse},
@@ -197,6 +199,23 @@ fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
         max_tracked_sources: 4096,
     };
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
+}
+
+/// Permissive `ProbeRateLimiter` — this suite doesn't exercise the ADR 005
+/// probe rate limiter, so all three layers are effectively unbounded.
+fn permissive_probe_rate_limiter(metrics: &Arc<Metrics>) -> Arc<ProbeRateLimiter> {
+    let cfg = RateLimitConfig {
+        per_peer_rate_per_sec: 1e9,
+        per_peer_burst: u32::MAX,
+        per_ip_rate_per_sec: 1e9,
+        per_ip_burst: u32::MAX,
+        global_rate_per_sec: 1e9,
+        global_burst: u32::MAX,
+        trusted_ips: std::collections::HashSet::new(),
+        max_tracked_per_ip: 4096,
+        max_tracked_per_peer: 4096,
+    };
+    Arc::new(ProbeRateLimiter::new(&cfg, Arc::clone(metrics)))
 }
 
 /// Bind an iroh endpoint wired the way `runtime::add_discovery_lookups`
@@ -424,6 +443,7 @@ async fn probe_roundtrip_resolves_server_by_node_id_via_self_hosted_discovery() 
         Arc::new(AtomicU64::new(rate_per_mb)),
         Arc::clone(&metrics),
         limiter,
+        permissive_probe_rate_limiter(&metrics),
         cache,
         Arc::clone(&signer),
         domain.clone(),

@@ -1,449 +1,134 @@
 //! Three-layer token-bucket rate limiter for `cdn/dht/v1` inbound traffic
 //! (ADR 022 §DHT Rate Limiting).
 //!
-//! Distinct from the connection-level [`crate::dispatch::ConnectionLimiter`]:
-//! that limiter caps how many connections we accept; this one caps the
-//! per-request work done on each accepted connection. Both run — the
-//! connection limiter rejects floods at handshake, this layer rejects
-//! per-request floods on a successfully accepted connection.
-//!
-//! # Layered checks
-//!
-//! Layers fire **global → per-IP → per-peer** (cheapest-first ordering, ADR
-//! 022 §DHT Rate Limiting). A request rejected by the global cap never
-//! pays the per-IP map lookup; a per-IP rejection never pays the per-peer
-//! map lookup. The first rejection short-circuits and is the only one
-//! counted in one of
-//! `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total` — one
-//! Counter per layer (the iroh-metrics backend does not support per-field
-//! labels, so we use distinct counters; see `Metrics::dht_rate_limit_rejected_*`
-//! for the deviation rationale from ADR 022 §Observability's labeled-counter
-//! shape and the rolled-up Prometheus query operators can use).
-//!
-//! # Trusted-IP exemption
-//!
-//! Operators MAY exempt source IPs from the per-IP layer only — peer
-//! operators with predictable cross-peer DHT traffic, in-cluster
-//! monitoring, etc. The exemption explicitly does NOT bypass per-peer or
-//! global; a single misbehaving `NodeId` at a trusted IP is still rate
-//! limited, and a global flood from many trusted IPs still hits the
-//! global cap.
+//! This is a thin DHT-flavoured wrapper over the shared
+//! [`crate::rate_limit::ThreeLayerRateLimiter`] engine: it pins the
+//! DHT-specific operator-visible metric names (via a private metrics sink)
+//! and re-exports the config/reject types under their historical DHT names.
+//! The layering, cheapest-first ordering, trusted-IP exemption, keyspace
+//! bound, and batch-token accounting all live in the shared engine — see its
+//! module docs.
 
-use std::collections::HashSet;
-use std::net::IpAddr;
-use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::metrics::Metrics;
+use crate::rate_limit::{
+    RateLimitConfig, RateLimitMetricsSink, RejectLayer, ThreeLayerRateLimiter,
+};
+
+#[cfg(test)]
+use std::collections::HashSet;
+#[cfg(test)]
+use std::net::IpAddr;
+#[cfg(test)]
 use std::time::Duration;
 
-use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota};
-
+#[cfg(test)]
 use crate::dht::routing::NodeId;
-use crate::dispatch::source_key;
-use crate::metrics::Metrics;
 
 /// Resolved DHT rate-limit configuration. See ADR 022 §DHT Rate Limiting.
-///
-/// Each `*_rate_per_sec == 0.0` and the corresponding `*_burst == 0`
-/// disables that layer (operator opt-out). `max_concurrent_handlers`-style
-/// disable semantics, but per-layer.
-#[derive(Debug, Clone)]
-pub struct DhtRateLimitConfig {
-    /// Per-peer (source `NodeId`) sustained rate (requests/second). ADR 022
-    /// default: 20.
-    pub per_peer_rate_per_sec: f64,
-    /// Per-peer burst capacity. ADR 022 default: 40.
-    pub per_peer_burst: u32,
-    /// Per-IP sustained rate (requests/second). ADR 022 default: 100.
-    pub per_ip_rate_per_sec: f64,
-    /// Per-IP burst capacity. ADR 022 default: 200.
-    pub per_ip_burst: u32,
-    /// Global inbound DHT sustained rate (requests/second). ADR 022
-    /// default: 1000.
-    pub global_rate_per_sec: f64,
-    /// Global inbound DHT burst capacity. ADR 022 default: 2000.
-    pub global_burst: u32,
-    /// IPs that bypass the per-IP layer only (per-peer + global still
-    /// apply). Per ADR 022 §Trusted-IP exemption.
-    pub trusted_ips: HashSet<IpAddr>,
-    /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded
-    /// (operator opt-in, the resolver warns).
-    pub max_tracked_per_ip: usize,
-    /// Hard cap on the per-peer keyed-limiter map (#645). `0` => unbounded.
-    pub max_tracked_per_peer: usize,
-}
+/// [`Default`] returns the ADR 022 values (per-peer 20/40, per-IP 100/200,
+/// global 1000/2000).
+pub type DhtRateLimitConfig = RateLimitConfig;
 
-impl Default for DhtRateLimitConfig {
-    fn default() -> Self {
-        Self {
-            per_peer_rate_per_sec: 20.0,
-            per_peer_burst: 40,
-            per_ip_rate_per_sec: 100.0,
-            per_ip_burst: 200,
-            global_rate_per_sec: 1000.0,
-            global_burst: 2000,
-            trusted_ips: HashSet::new(),
-            max_tracked_per_ip: 4096,
-            max_tracked_per_peer: 4096,
+/// Layer that triggered a `cdn/dht/v1` rejection. Alias of the shared
+/// [`RejectLayer`]; the `per_peer`/`per_ip`/`global` label strings are stable.
+pub type DhtRejectLayer = RejectLayer;
+
+/// Routes shared-limiter metric events to the DHT operator-visible counters
+/// (`decdn_dht_rate_limit_*`). ADR 022 §Observability specifies a single
+/// labeled counter, but the `iroh_metrics::MetricsGroup` backend has no
+/// per-field labels, so we surface one Counter per layer (the same deviation
+/// the dispatch counters take); operators recover the rolled-up rate with
+/// `sum(rate(decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`.
+struct DhtRateLimitMetrics(Arc<Metrics>);
+
+impl RateLimitMetricsSink for DhtRateLimitMetrics {
+    fn rejected(&self, layer: RejectLayer) {
+        match layer {
+            RejectLayer::Global => self.0.dht_rate_limit_rejected_global(),
+            RejectLayer::PerIp => self.0.dht_rate_limit_rejected_per_ip(),
+            RejectLayer::PerPeer => self.0.dht_rate_limit_rejected_per_peer(),
         }
+    }
+
+    fn prune_sweep_per_ip(&self) {
+        self.0.dht_rate_limit_prune_sweep_per_ip();
+    }
+
+    fn prune_sweep_per_peer(&self) {
+        self.0.dht_rate_limit_prune_sweep_per_peer();
+    }
+
+    fn set_tracked_per_ip(&self, n: usize) {
+        self.0.dht_rate_limit_tracked_per_ip_set(n);
+    }
+
+    fn set_tracked_per_peer(&self, n: usize) {
+        self.0.dht_rate_limit_tracked_per_peer_set(n);
     }
 }
 
-/// Layer that triggered a rejection. Used as a log/trace field and to
-/// pick the right per-layer Counter to bump
-/// (`decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DhtRejectLayer {
-    /// Per-peer (`NodeId`) bucket exhausted.
-    PerPeer,
-    /// Per-IP bucket exhausted.
-    PerIp,
-    /// Global cap exhausted.
-    Global,
-}
-
-impl DhtRejectLayer {
-    /// Label string for log/metric fields. Stable across releases.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::PerPeer => "per_peer",
-            Self::PerIp => "per_ip",
-            Self::Global => "global",
-        }
-    }
-}
-
-/// Three-layer rate limiter for inbound `cdn/dht/v1` requests.
-///
-/// Methods are `&self` — concurrent admission decisions don't take a write
-/// lock. Each layer uses its own `governor` limiter and the
-/// `Result<(), DhtRejectLayer>` short-circuits at the first rejection.
-///
-/// **Keyspace bound (#645).** The two keyed layers carry per-layer
-/// `cap_per_{ip,peer}` and `pruning_per_{ip,peer}` fields. The flags are
-/// deliberately split (not one shared) so a slow per-IP `retain_recent`
-/// sweep does not block a concurrent per-peer sweep — and vice versa.
+/// Three-layer rate limiter for inbound `cdn/dht/v1` requests. Newtype over the
+/// shared [`ThreeLayerRateLimiter`] that injects the DHT metrics sink.
 #[allow(missing_debug_implementations)]
-pub struct DhtRateLimiter {
-    /// `None` when the layer is disabled. Built once at construction; not
-    /// hot-reloadable in this PR (operators can restart). When made
-    /// reloadable, follow the `ConnectionLimiter` pattern of `ArcSwap` on
-    /// the inner limiter.
-    global: Option<Arc<DefaultDirectRateLimiter>>,
-    /// Keyed by source IP. `None` when disabled.
-    per_ip: Option<Arc<DefaultKeyedRateLimiter<IpAddr>>>,
-    /// Keyed by source `NodeId`. `None` when disabled.
-    per_peer: Option<Arc<DefaultKeyedRateLimiter<NodeId>>>,
-    /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded
-    /// (no lazy prune from `check`; periodic `gc_per_ip` still runs but
-    /// only releases buckets that have refilled to their baseline).
-    cap_per_ip: usize,
-    /// Hard cap on the per-peer keyed-limiter map (#645).
-    cap_per_peer: usize,
-    /// Single-flight guard for `retain_recent` on the per-IP keyed map.
-    pruning_per_ip: AtomicBool,
-    /// Single-flight guard for `retain_recent` on the per-peer keyed map.
-    pruning_per_peer: AtomicBool,
-    trusted_ips: HashSet<IpAddr>,
-    metrics: Arc<Metrics>,
-}
-
-/// RAII reset for [`DhtRateLimiter::pruning_per_ip`] /
-/// [`DhtRateLimiter::pruning_per_peer`] — see [`crate::dispatch`]'s
-/// `PruneGuard` for the full rationale. Briefly: holding one means the
-/// holder owns the single-flight slot for `retain_recent`; on drop
-/// (including drop during panic unwind) the flag is released with
-/// `Release` ordering, so a panic in `retain_recent` cannot permanently
-/// stall the prune codepath.
-struct PruneGuard<'a>(&'a AtomicBool);
-
-impl Drop for PruneGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
+pub struct DhtRateLimiter(ThreeLayerRateLimiter);
 
 impl DhtRateLimiter {
-    /// Build a limiter from the resolved config snapshot.
+    /// Build a limiter from the resolved DHT config snapshot.
     #[must_use]
     pub fn new(cfg: &DhtRateLimitConfig, metrics: Arc<Metrics>) -> Self {
-        Self {
-            global: build_direct_limiter(cfg.global_rate_per_sec, cfg.global_burst),
-            per_ip: build_keyed_limiter(cfg.per_ip_rate_per_sec, cfg.per_ip_burst),
-            per_peer: build_keyed_limiter(cfg.per_peer_rate_per_sec, cfg.per_peer_burst),
-            cap_per_ip: cfg.max_tracked_per_ip,
-            cap_per_peer: cfg.max_tracked_per_peer,
-            pruning_per_ip: AtomicBool::new(false),
-            pruning_per_peer: AtomicBool::new(false),
-            // Store trusted entries under the same /64 mask the lookup applies
-            // (#841), so a configured IPv6 trusted address still matches a
-            // masked inbound key. IPv4 entries are unchanged.
-            trusted_ips: cfg.trusted_ips.iter().copied().map(source_key).collect(),
-            metrics,
-        }
+        Self(ThreeLayerRateLimiter::new(
+            cfg,
+            Arc::new(DhtRateLimitMetrics(metrics)),
+        ))
     }
 
-    /// Try to admit one inbound DHT request. `peer_ip == None` for
-    /// relay-only connections — the per-IP layer is skipped (no key to
-    /// charge), matching the `ConnectionLimiter` precedent at
-    /// [`crate::dispatch::ConnectionLimiter::acquire`].
-    ///
-    /// On rejection, increments the appropriate per-layer counter
-    /// (`decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total`)
-    /// and returns the layer that fired. No counter increment on the
-    /// success path.
-    ///
-    /// Cheapest-first ordering (global → per-IP → per-peer): the first
-    /// layer to reject short-circuits, so a per-peer-flooded request that
-    /// would also have failed the global cap counts as `global` (the
-    /// layer that actually drained the budget).
+    /// Try to admit one inbound DHT request. See
+    /// [`ThreeLayerRateLimiter::check`].
     pub fn check(
         &self,
-        peer_node_id: &NodeId,
-        peer_ip: Option<IpAddr>,
+        peer_node_id: &crate::dht::routing::NodeId,
+        peer_ip: Option<std::net::IpAddr>,
     ) -> Result<(), DhtRejectLayer> {
-        // Charge one unit cheapest-first; bump the per-layer rejection
-        // counter for the layer that drained the budget. The accounting
-        // itself lives in `try_admit_one` so the batch stage-2 path
-        // (`admit_batch_extra`) can reuse it without the metric bump — a
-        // partial-admit boundary is not a request rejection.
-        // `prune = true`: a fresh inbound frame may have inserted a new
-        // keyed-map entry, so run the opportunistic keyspace prune.
-        match self.try_admit_one(peer_node_id, peer_ip, true) {
-            Ok(()) => Ok(()),
-            Err(layer) => {
-                match layer {
-                    DhtRejectLayer::Global => self.metrics.dht_rate_limit_rejected_global(),
-                    DhtRejectLayer::PerIp => self.metrics.dht_rate_limit_rejected_per_ip(),
-                    DhtRejectLayer::PerPeer => self.metrics.dht_rate_limit_rejected_per_peer(),
-                }
-                Err(layer)
-            }
-        }
+        self.0.check(peer_node_id, peer_ip)
     }
 
-    /// Charge exactly one unit from each enabled layer, cheapest-first
-    /// (global → per-IP → per-peer) with short-circuit on the first
-    /// exhausted layer. Does **not** touch any metric — callers decide
-    /// whether a failure is a rejection ([`Self::check`]) or a
-    /// partial-admit boundary ([`Self::admit_batch_extra`]).
-    ///
-    /// `prune` gates the opportunistic keyspace prune (#645). Stage-1
-    /// [`Self::check`] passes `true`; the stage-2 batch loop passes
-    /// `false` because every extra unit it charges keys on the *same*
-    /// `(peer, ip)` stage-1 already inserted — so it can never grow the
-    /// keyed maps, making a per-unit prune check pure overhead (the
-    /// keyspace bound is upheld by stage-1 + the periodic GC sweep).
-    fn try_admit_one(
-        &self,
-        peer_node_id: &NodeId,
-        peer_ip: Option<IpAddr>,
-        prune: bool,
-    ) -> Result<(), DhtRejectLayer> {
-        // Layer 1 — global.
-        if let Some(g) = self.global.as_ref()
-            && g.check().is_err()
-        {
-            return Err(DhtRejectLayer::Global);
-        }
-
-        // Layer 2 — per-IP. Skipped for relay-only connections and for
-        // trusted IPs. The key is masked to its /64 prefix for IPv6 (#841) —
-        // the same mask the dispatch limiter applies — so an attacker rotating
-        // within one IPv6 allocation can't mint a fresh bucket per request.
-        if let (Some(ip), Some(limiter)) = (peer_ip, self.per_ip.as_ref()) {
-            let ip = source_key(ip);
-            if !self.trusted_ips.contains(&ip) {
-                let result = limiter.check_key(&ip);
-                if prune {
-                    self.maybe_prune_per_ip(limiter);
-                }
-                if result.is_err() {
-                    return Err(DhtRejectLayer::PerIp);
-                }
-            }
-        }
-
-        // Layer 3 — per-peer (NodeId).
-        if let Some(limiter) = self.per_peer.as_ref() {
-            let result = limiter.check_key(peer_node_id);
-            if prune {
-                self.maybe_prune_per_peer(limiter);
-            }
-            if result.is_err() {
-                return Err(DhtRejectLayer::PerPeer);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Stage 2 of the two-stage batch admission (ADR 022 §Batch token
-    /// accounting). After [`Self::check`] has charged the stage-1 frame
-    /// token, this consumes up to `extra` (= `n - 1` for a batch of `n`
-    /// hashes) more units cheapest-first, each unit identical to what one
-    /// separate `StoreRequest` admission would charge — so the per-second
-    /// work ceiling is the same whether the publisher sends `n` separate
-    /// `Store`s or one `BatchStore` of size `n` (ADR 022 AC 17).
-    ///
-    /// Returns the number of extra units granted; the first
-    /// `1 + returned` hashes of the batch pass through per-hash
-    /// processing, the remainder are acked `false`. Returns `0` when
-    /// `extra == 0` or the budget is already exhausted.
-    ///
-    /// No rejection counter is bumped: the inbound frame was already
-    /// admitted at stage 1, and the over-budget tail is deferred work the
-    /// publisher retries, not a rejected request. Because the per-unit
-    /// charge short-circuits cheapest-first, the terminating unit may
-    /// consume a global (and per-IP) token without a per-peer token —
-    /// byte-for-byte what the `(k+1)`-th separate `Store` would have done.
+    /// Stage 2 of batch admission. See
+    /// [`ThreeLayerRateLimiter::admit_batch_extra`].
     #[must_use]
     pub fn admit_batch_extra(
         &self,
-        peer_node_id: &NodeId,
-        peer_ip: Option<IpAddr>,
+        peer_node_id: &crate::dht::routing::NodeId,
+        peer_ip: Option<std::net::IpAddr>,
         extra: usize,
     ) -> usize {
-        let mut granted = 0usize;
-        while granted < extra {
-            // `prune = false`: see `try_admit_one` — stage-2 units never
-            // add keyed-map entries, so the prune check is redundant here.
-            if self.try_admit_one(peer_node_id, peer_ip, false).is_err() {
-                break;
-            }
-            granted = granted.saturating_add(1);
-        }
-        granted
+        self.0.admit_batch_extra(peer_node_id, peer_ip, extra)
     }
 
-    /// Opportunistic prune of the per-IP keyed map when it exceeds
-    /// `cap + cap/10`. Single-flighted via `pruning_per_ip`; a contended
-    /// observer skips and the next over-cap observer picks up the work
-    /// once the prior sweep releases the guard. Hot-path cost on the
-    /// no-flood path: one `usize` compare, one relaxed CAS.
-    fn maybe_prune_per_ip(&self, limiter: &Arc<DefaultKeyedRateLimiter<IpAddr>>) {
-        if self.cap_per_ip > 0
-            && limiter.len() > self.cap_per_ip.saturating_add(self.cap_per_ip / 10)
-            && self
-                .pruning_per_ip
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-        {
-            let _guard = PruneGuard(&self.pruning_per_ip);
-            limiter.retain_recent();
-            self.metrics.dht_rate_limit_prune_sweep_per_ip();
-            self.metrics
-                .dht_rate_limit_tracked_per_ip_set(limiter.len());
-        }
-    }
-
-    fn maybe_prune_per_peer(&self, limiter: &Arc<DefaultKeyedRateLimiter<NodeId>>) {
-        if self.cap_per_peer > 0
-            && limiter.len() > self.cap_per_peer.saturating_add(self.cap_per_peer / 10)
-            && self
-                .pruning_per_peer
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-        {
-            let _guard = PruneGuard(&self.pruning_per_peer);
-            limiter.retain_recent();
-            self.metrics.dht_rate_limit_prune_sweep_per_peer();
-            self.metrics
-                .dht_rate_limit_tracked_per_peer_set(limiter.len());
-        }
-    }
-
-    /// Periodic GC sweep for the per-IP keyed map (#645). Returns
-    /// `Some((before, after))` on a sweep that actually ran, or `None`
-    /// when the per-IP layer is disabled or the single-flight CAS was
-    /// lost to a concurrent prune (lazy or another GC tick). Mirrors
-    /// [`crate::dispatch::ConnectionLimiter::gc_per_source`].
+    /// Periodic GC sweep for the per-IP keyed map (#645).
     #[must_use]
     pub fn gc_per_ip(&self) -> Option<(usize, usize)> {
-        let limiter = self.per_ip.as_ref()?.clone();
-        if self
-            .pruning_per_ip
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            let _guard = PruneGuard(&self.pruning_per_ip);
-            let before = limiter.len();
-            limiter.retain_recent();
-            let after = limiter.len();
-            self.metrics.dht_rate_limit_prune_sweep_per_ip();
-            self.metrics.dht_rate_limit_tracked_per_ip_set(after);
-            Some((before, after))
-        } else {
-            None
-        }
+        self.0.gc_per_ip()
     }
 
-    /// Periodic GC sweep for the per-peer keyed map (#645). Sibling of
-    /// [`Self::gc_per_ip`].
+    /// Periodic GC sweep for the per-peer keyed map (#645).
     #[must_use]
     pub fn gc_per_peer(&self) -> Option<(usize, usize)> {
-        let limiter = self.per_peer.as_ref()?.clone();
-        if self
-            .pruning_per_peer
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            let _guard = PruneGuard(&self.pruning_per_peer);
-            let before = limiter.len();
-            limiter.retain_recent();
-            let after = limiter.len();
-            self.metrics.dht_rate_limit_prune_sweep_per_peer();
-            self.metrics.dht_rate_limit_tracked_per_peer_set(after);
-            Some((before, after))
-        } else {
-            None
-        }
+        self.0.gc_per_peer()
     }
 
-    /// Current tracked-key count for the per-IP keyed map (#645). `0`
-    /// when the layer is disabled.
+    /// Current tracked-key count for the per-IP keyed map (#645).
     #[must_use]
     pub fn per_ip_tracked(&self) -> usize {
-        self.per_ip.as_ref().map_or(0, |l| l.len())
+        self.0.per_ip_tracked()
     }
 
     /// Current tracked-key count for the per-peer keyed map (#645).
     #[must_use]
     pub fn per_peer_tracked(&self) -> usize {
-        self.per_peer.as_ref().map_or(0, |l| l.len())
+        self.0.per_peer_tracked()
     }
-}
-
-/// Build a non-keyed (global) governor limiter from a (rate, burst) pair,
-/// or `None` when the layer is disabled. Mirrors the private
-/// `build_keyed_limiter` helper in [`crate::dispatch`] — same `0.0` /
-/// non-finite-rate / zero-burst guards.
-fn build_direct_limiter(rate_per_sec: f64, burst: u32) -> Option<Arc<DefaultDirectRateLimiter>> {
-    let quota = make_quota(rate_per_sec, burst)?;
-    Some(Arc::new(governor::RateLimiter::direct(quota)))
-}
-
-fn build_keyed_limiter<K>(rate_per_sec: f64, burst: u32) -> Option<Arc<DefaultKeyedRateLimiter<K>>>
-where
-    K: std::hash::Hash + Eq + Clone + Send + Sync + 'static,
-{
-    let quota = make_quota(rate_per_sec, burst)?;
-    Some(Arc::new(DefaultKeyedRateLimiter::keyed(quota)))
-}
-
-fn make_quota(rate_per_sec: f64, burst: u32) -> Option<Quota> {
-    if rate_per_sec <= 0.0 || burst == 0 || !rate_per_sec.is_finite() {
-        return None;
-    }
-    let period_secs = 1.0_f64 / rate_per_sec;
-    // Saturate to at least 1ns: a positive but extremely high rate would
-    // otherwise round to 0ns and `Quota::with_period(0)` returns None.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let period_ns = (period_secs * 1_000_000_000.0).max(1.0) as u64;
-    let period = Duration::from_nanos(period_ns);
-    let burst_nz = NonZeroU32::new(burst)?;
-    Some(Quota::with_period(period)?.allow_burst(burst_nz))
 }
 
 #[cfg(test)]
@@ -1015,10 +700,11 @@ mod tests {
             "expected per_ip_tracked <= {bound}, got {final_size}"
         );
         // The lazy-prune path in `check` must also bump the prune-sweep
-        // counter — a regression that dropped the metric call from
-        // `maybe_prune_per_ip` (but kept it on `gc_per_ip`) would not be
-        // caught by `gauge_and_sweep_counter_emit_in_scrape` since that
-        // test only exercises the GC path.
+        // counter — a regression that dropped the metric call from the shared
+        // engine's lazy-prune path (`ThreeLayerRateLimiter::maybe_prune_per_ip`,
+        // but kept it on `gc_per_ip`) would not be caught by
+        // `gauge_and_sweep_counter_emit_in_scrape` since that test only
+        // exercises the GC path.
         let text = metrics_handle.encode().unwrap();
         assert!(
             text.contains("decdn_dht_rate_limit_prune_sweeps_per_ip_total"),
@@ -1080,30 +766,6 @@ mod tests {
             );
         }
         assert_eq!(lim.per_peer_tracked(), 1000);
-    }
-
-    /// Mirrors `dispatch.rs::prune_guard_resets_flag_on_panic`:
-    /// a panic inside the guarded section must still release the
-    /// single-flight flag via `Drop`. Without this, a single panic
-    /// inside `retain_recent` would permanently disable the prune
-    /// codepath for the lifetime of the process — the unbounded-keyspace
-    /// failure #645 exists to prevent.
-    #[test]
-    fn prune_guard_resets_flag_on_panic() {
-        let flag = AtomicBool::new(false);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert!(
-                flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            );
-            let _guard = PruneGuard(&flag);
-            panic!("simulated panic inside retain_recent");
-        }));
-        assert!(result.is_err(), "panic was caught");
-        assert!(
-            !flag.load(Ordering::Acquire),
-            "PruneGuard::drop must release the flag during unwind"
-        );
     }
 
     #[tokio::test]

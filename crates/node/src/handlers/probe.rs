@@ -21,6 +21,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
+use crate::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer};
 use crate::metrics::Metrics;
 
 // Server-side timeouts. Each ceiling exists so a single peer cannot pin a
@@ -127,6 +128,11 @@ pub struct ProbeHandler {
     rate_per_mb: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
+    /// ADR 005 §Probe rate limiting three-layer token-bucket limiter
+    /// (global → per-IP → per-peer, trusted-IP exempting per-IP only). Runs in
+    /// addition to `limiter` (the connection-level [`ConnectionLimiter`]) — see
+    /// [`crate::handlers::probe_rate_limit`] for why both layers run.
+    probe_rate_limiter: Arc<ProbeRateLimiter>,
     /// Cache engine — queried for blob presence and the probe-triggered
     /// eviction hold (ADR 005 §Probe-triggered eviction hold).
     cache: CacheEngine,
@@ -177,6 +183,7 @@ impl ProbeHandler {
         rate_per_mb: Arc<AtomicU64>,
         metrics: Arc<Metrics>,
         limiter: Arc<ConnectionLimiter>,
+        probe_rate_limiter: Arc<ProbeRateLimiter>,
         cache: CacheEngine,
         eth_signer: Arc<PrivateKeySigner>,
         slash_domain: Eip712Domain,
@@ -190,6 +197,7 @@ impl ProbeHandler {
             rate_per_mb,
             metrics,
             limiter,
+            probe_rate_limiter,
             cache,
             eth_signer,
             slash_domain,
@@ -237,6 +245,46 @@ impl ProbeHandler {
                 return Ok(());
             }
         };
+
+        // ADR 005 §Probe rate limiting: three-layer token-bucket limiter
+        // (global → per-IP → per-peer) applied *before* any signature is
+        // computed and *before* any eviction-hold slot is allocated. It runs in
+        // addition to the `ConnectionLimiter` permit above (per-source IP +
+        // global concurrency) — see `probe_rate_limit` module docs for why
+        // both run. Both the requester NodeId and the source IP are available
+        // pre-stream, so a rejected probe never opens a bidi stream.
+        let requester = NodeId::from_bytes(*conn.remote_id().as_bytes());
+        let peer_ip = crate::rate_limit::peer_ip(&conn);
+        if let Err(layer) = self.probe_rate_limiter.check(&requester, peer_ip) {
+            // Load-shedding, not a protocol fault: don't return `Err` (which
+            // iroh would log per rejection, amplifying log volume under flood —
+            // exactly what the attacker wants). The limiter already bumped the
+            // per-layer rejection counter; emit a debug log too so operators
+            // can correlate the offending peer/IP, matching the per-source
+            // (`ConnectionLimiter::acquire_inner`) and DHT
+            // (`close_stream_with_rate_limit`) reject paths.
+            tracing::debug!(
+                layer = layer.as_str(),
+                requester = ?requester,
+                peer_ip = ?peer_ip,
+                "probe request rejected by the three-layer rate limiter"
+            );
+            conn.close(
+                VarInt::from_u32(APP_ERR_RATE_LIMITED),
+                layer.as_str().as_bytes(),
+            );
+            // Wait briefly for the close frame so the peer observes the 0x10
+            // RATE_LIMITED code and the layer label — except on the global
+            // layer, where a flood would otherwise park a task per rejection
+            // (operators pivot on the metric counter, not the close reason,
+            // for a global flood). Per-peer/per-IP rejections are bounded by
+            // their own buckets, so the capped wait is safe.
+            if layer != ProbeRejectLayer::Global {
+                let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
+            }
+            return Ok(());
+        }
+
         let _guard = self.metrics.connection_guard();
 
         // ADR 005 caps probe at 1 bidi stream per connection; the transport-level

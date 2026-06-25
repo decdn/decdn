@@ -5,3 +5,4 @@ pub mod client;
 pub mod dht;
 pub mod limited;
 pub mod probe;
+pub mod probe_rate_limit;
