@@ -18,9 +18,9 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
-use decdn_incentive::BuyerChannelState;
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_channel::PaymentChannel;
+use decdn_incentive::{BuyerChannelState, ChannelOpenFailureReason};
 use tracing::{debug, info};
 
 use crate::ChannelContext;
@@ -108,7 +108,18 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// # Errors
 ///
 /// Fails on `openChannel` submit/receipt, a reverted tx, or a missing
-/// `ChannelOpened` event in the receipt logs.
+/// `ChannelOpened` event in the receipt logs. The classified failure legs
+/// (submit, receipt wait, mined revert) attach a [`ChannelOpenFailureReason`]
+/// into the `anyhow` error chain (recover it with
+/// `err.downcast_ref::<ChannelOpenFailureReason>()`), so a caller can bump the
+/// matching `decdn_channel_open_failures_{reason}_total` sibling counter
+/// (`iroh_metrics` has no label support, so each class is its own counter) without
+/// re-parsing the alloy error: a deterministic revert (with ABI revert data,
+/// decoded against the insufficient-deposit error selectors) is split from a
+/// transport/RPC fault (no revert data) and a mined on-chain revert. The
+/// missing-`ChannelOpened` leg carries no reason — the deposit is escrowed but
+/// untracked, so it surfaces as an unclassified error for manual reconciliation
+/// rather than a metric bump.
 pub async fn open_channel<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     signer: Arc<PrivateKeySigner>,
@@ -118,19 +129,43 @@ pub async fn open_channel<P: Provider + Clone>(
     provider_addr: Address,
     deposit: U256,
 ) -> Result<OpenedChannel> {
-    let receipt = contract
-        .openChannel(provider_addr, deposit)
-        .send()
-        .await
-        .context("submit openChannel")?
+    let pending = match contract.openChannel(provider_addr, deposit).send().await {
+        Ok(pending) => pending,
+        Err(err) => {
+            // A deterministic revert (deposit below `minDeposit`, USDC
+            // balance/allowance too low, provider inactive, …) is caught at gas
+            // estimation, so it surfaces here with ABI revert data attached;
+            // a send error *without* revert data is a transport/RPC fault.
+            let reason =
+                ChannelOpenFailureReason::classify_revert_data(err.as_revert_data().as_ref());
+            return Err(anyhow::Error::new(err))
+                .context("submit openChannel")
+                .context(reason);
+        }
+    };
+    let receipt = pending
         .get_receipt()
         .await
-        .context("await openChannel receipt")?;
+        // A failed receipt wait is always a transport/RPC condition (the tx may
+        // even have landed) — never a settlement decision.
+        .map_err(|err| {
+            anyhow::Error::new(err)
+                .context("await openChannel receipt")
+                .context(ChannelOpenFailureReason::RpcError)
+        })?;
     if !receipt.status() {
-        anyhow::bail!(
+        // A mined revert: the revert reason is not recoverable from the receipt
+        // (no trace), so it is classified as a generic on-chain revert. Most
+        // insufficient-deposit cases are caught at gas estimation above, but
+        // because balance/allowance/`minDeposit` state can change between
+        // estimation and mining, a mined revert *could* still be
+        // insufficient-deposit — it just can't be distinguished here, so it
+        // folds into `ContractRevert`.
+        return Err(anyhow::anyhow!(
             "openChannel reverted (provider {provider_addr}, deposit {deposit}); check USDC \
              balance/allowance and that the provider is active"
-        );
+        )
+        .context(ChannelOpenFailureReason::ContractRevert));
     }
     let tx = receipt.transaction_hash;
 
