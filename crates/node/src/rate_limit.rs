@@ -423,7 +423,10 @@ impl ThreeLayerRateLimiter {
     /// [`crate::dispatch::ConnectionLimiter::gc_per_source`].
     #[must_use]
     pub fn gc_per_ip(&self) -> Option<(usize, usize)> {
-        let limiter = self.per_ip.as_ref()?.clone();
+        // Borrow, don't clone: `len`/`retain_recent` take `&self`, and the
+        // `pruning_per_ip`/`metrics` accesses below touch disjoint fields, so a
+        // shared borrow of `self.per_ip` is sound (matches `maybe_prune_per_ip`).
+        let limiter = self.per_ip.as_ref()?;
         if self
             .pruning_per_ip
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -445,7 +448,8 @@ impl ThreeLayerRateLimiter {
     /// [`Self::gc_per_ip`].
     #[must_use]
     pub fn gc_per_peer(&self) -> Option<(usize, usize)> {
-        let limiter = self.per_peer.as_ref()?.clone();
+        // Borrow, don't clone (see `gc_per_ip`).
+        let limiter = self.per_peer.as_ref()?;
         if self
             .pruning_per_peer
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
