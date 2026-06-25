@@ -22,8 +22,9 @@ use decdn_config_types::{PinDiff, PinnedHashes, RetryPolicy};
 
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
-use crate::origin::{Origin, OriginKind};
+use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest};
 use crate::probe_hold::ProbeHoldOutcome;
+use crate::range_pull::{AlignedRange, align_range, encode_verified_range};
 use crate::retry::{classify_io_error, drain_to_bytes, run_with_retry, should_buffer};
 use crate::{from_store_hash, to_store_hash};
 
@@ -585,6 +586,29 @@ fn append_evicted_log(path: &Path, hash: Hash) -> std::io::Result<()> {
     file.write_all(line.as_bytes())?;
     file.sync_all()?;
     Ok(())
+}
+
+/// Outcome of [`CacheEngine::pull_through_range`] (#823, [ADR 037 §Origin-tier
+/// pull-through](../../../adr/037-regional-proxy-warming.md)).
+///
+/// The range-scoped origin pull is **best-effort**: only [`Self::Served`] means
+/// the requested byte span is now present as a verified partial blob. Every
+/// other variant is a degrade-to-whole-blob signal — the caller falls back to
+/// [`CacheEngine::populate`] / [`CacheEngine::get`], which is never a
+/// correctness or availability failure (ADR 037 §"Fallback is always correct").
+#[derive(Debug)]
+pub enum RangePullOutcome {
+    /// The requested `[byte_offset, byte_offset + byte_len)` was fetched from
+    /// origin as a chunk-group-aligned span, verified against the root `H` via
+    /// the untrusted `{H}.obao4` outboard, and imported as a partial blob. The
+    /// node can now serve the range via iroh-blobs `export_ranges` without a
+    /// whole-blob origin pull.
+    Served,
+    /// No configured origin could serve a range pull (none published
+    /// `{H}.obao4`, none honored `Range`, the outboard was short/absent, or
+    /// `origin_range_pull_enabled` was off at the call site). The caller MUST
+    /// fall back to a whole-blob pull.
+    Unsupported,
 }
 
 impl CacheEngine {
@@ -1399,6 +1423,210 @@ impl CacheEngine {
         Ok(())
     }
 
+    /// Attempt a **range-scoped** origin pull-through for `[byte_offset,
+    /// byte_offset + byte_len)` of `hash` (`byte_len == 0` = to the blob end),
+    /// per [ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md)
+    /// (#823). `blob_size` is the trusted total size — sourced from the signed
+    /// `StreamResponse.total_bytes` (or the manifest `ChunkEntry.size`), never
+    /// from the origin — and is what frames the bao tree.
+    ///
+    /// On success the requested span is fetched chunk-group-aligned, the
+    /// fetched bytes + the untrusted `{H}.obao4` outboard are verified against
+    /// the root `H` ([`crate::range_pull::encode_verified_range`]), and the
+    /// verified span is imported as a **partial** blob via iroh-blobs
+    /// `import_bao_bytes` — no whole-blob origin egress. The node then serves
+    /// the range via `export_ranges` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)).
+    /// Only the actually-pulled bytes (span + outboard) are metered as origin
+    /// egress, tightening the seed-leech caps rather than the whole blob (ADR
+    /// 037 §"Range-scoped origin pulls only tighten the caps").
+    ///
+    /// Returns [`RangePullOutcome::Served`] when the partial range is present,
+    /// or [`RangePullOutcome::Unsupported`] when no origin could range-pull
+    /// (no `{H}.obao4`, no `Range`, short outboard) — in which case the caller
+    /// MUST fall back to a whole-blob [`Self::populate`] / [`Self::get`]. The
+    /// fallback is always correct; the optimization only reduces the origin
+    /// hop's cost.
+    ///
+    /// This is **partial**-blob population: unlike [`Self::populate`] it does
+    /// not promote a named tag or make [`Self::has`] return `true` (which
+    /// requires a `Complete` blob), and it does not announce a DHT insert — a
+    /// node holding only a range is not advertised as a full holder (ADR 037
+    /// §"partial warming copies are not advertised"). A subsequent whole-blob
+    /// pull-through (or further range pulls) completes the blob.
+    ///
+    /// # Errors
+    ///
+    /// - [`CacheError::NoOrigin`] — no origin configured.
+    /// - [`CacheError::NotFound`] — the hash is logically evicted (operator
+    ///   takedown / DMCA); a range pull must not silently re-fetch and re-cache
+    ///   evicted content (mirrors [`Self::get`] / [`Self::populate`]).
+    /// - [`CacheError::OriginError`] — the requested range is out of bounds for
+    ///   `blob_size` (ADR 005: reject, don't clamp).
+    /// - [`CacheError::Store`] — a local store fault while importing the
+    ///   verified partial blob (disk full / IO). Like the whole-blob
+    ///   pull-through path, a store fault fails fast rather than masking a
+    ///   misbehaving local store behind the next origin.
+    ///
+    /// A genuine origin *transport / verify* fault is NOT surfaced as an error:
+    /// it is recorded in `last_err`, logged, and the chain advances; if every
+    /// origin declines or errors the call returns [`RangePullOutcome::Unsupported`]
+    /// so the caller falls back to a whole-blob pull (which re-surfaces the real
+    /// fault if the blob is genuinely unreachable). A *missing-outboard* /
+    /// *no-range* origin likewise returns [`RangePullOutcome::Unsupported`].
+    pub async fn pull_through_range(
+        &self,
+        hash: Hash,
+        byte_offset: u64,
+        byte_len: u64,
+        blob_size: u64,
+    ) -> CacheResult<RangePullOutcome> {
+        if self.inner.origins.is_empty() {
+            return Err(CacheError::NoOrigin { hash });
+        }
+        // Logical-eviction guard (#279): once an operator has run
+        // `decdn node evict <hash>` (e.g. a DMCA takedown), a subsequent range
+        // pull must not silently re-fetch the evicted span from the origin and
+        // undo the eviction — exactly as `get` / `populate` refuse. The
+        // eviction is sticky for the life of `<cache_dir>/evicted.log`.
+        if self.is_evicted(hash) {
+            if let Some(m) = &self.inner.metrics {
+                m.misses.inc();
+            }
+            return Err(CacheError::NotFound { hash });
+        }
+        // Reject an out-of-bounds request up front (ADR 005 §Bounded byte
+        // ranges: reject, never silently clamp). `align_range` owns the bound
+        // check; map its typed error onto the engine's origin-error surface so
+        // the caller sees a coherent `CacheError` rather than a cache-internal
+        // type.
+        let aligned =
+            align_range(byte_offset, byte_len, blob_size).map_err(|e| CacheError::OriginError {
+                hash,
+                source: anyhow::Error::new(e).context("range pull-through: invalid byte range"),
+            })?;
+
+        if let Some(m) = &self.inner.metrics {
+            m.origin_fetches.inc();
+        }
+        let root = *hash.as_bytes();
+        let req = OriginRangeRequest {
+            fetch_start: aligned.fetch_start(),
+            fetch_end: aligned.fetch_end(),
+        };
+
+        // Walk the origin fallback chain (#284). A per-origin `Unsupported`
+        // (no outboard / no range) advances to the next origin; a genuine
+        // origin transport / verify fault is recorded and the chain advances.
+        // A local-store fault (`CacheError::Store`: disk full / IO) fails fast
+        // and is NOT masked by trying another origin — consistent with
+        // whole-blob `pull_through`, where `Store` short-circuits the chain
+        // (a misbehaving *local* store is not fixed by a different *origin*).
+        // The first origin that serves and verifies a range wins.
+        let mut last_err: Option<CacheError> = None;
+        for origin in &self.inner.origins {
+            match self
+                .range_pull_attempt(Arc::clone(origin), hash, root, blob_size, &aligned, req)
+                .await
+            {
+                Ok(RangePullOutcome::Served) => return Ok(RangePullOutcome::Served),
+                Ok(RangePullOutcome::Unsupported) => {}
+                // Local store fault: fail fast, do not advance the chain.
+                Err(e @ CacheError::Store(_)) => return Err(e),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        // Every origin declined the optimization. If any errored, the caller
+        // still falls back to a whole-blob pull (which will surface the real
+        // error if the blob is genuinely unreachable), so prefer the degrade
+        // signal — but log a genuine fault so it isn't silently swallowed.
+        if let Some(e) = last_err {
+            tracing::warn!(
+                %hash,
+                error = %e,
+                "range pull-through attempt errored on every origin; degrading to whole-blob pull",
+            );
+        }
+        Ok(RangePullOutcome::Unsupported)
+    }
+
+    /// One range-pull attempt against a single origin: fetch the aligned span
+    /// plus outboard, verify against `root`, then import the verified partial
+    /// blob. Returns [`RangePullOutcome::Unsupported`] (degrade) for any
+    /// non-error decline; `Err` only for genuine transport / store / verify
+    /// faults.
+    async fn range_pull_attempt(
+        &self,
+        origin: Arc<dyn Origin>,
+        hash: Hash,
+        root: [u8; 32],
+        blob_size: u64,
+        aligned: &AlignedRange,
+        req: OriginRangeRequest,
+    ) -> CacheResult<RangePullOutcome> {
+        let outboard_max = expected_outboard_len(blob_size).saturating_add(64);
+        let (data, outboard) =
+            match origin
+                .fetch_range(hash, req, outboard_max)
+                .await
+                .map_err(|e| CacheError::OriginError {
+                    hash,
+                    source: e.into_inner(),
+                })? {
+                OriginRangeFetch::Ranged { data, outboard } => (data, outboard),
+                // Missing outboard / no range support / object absent → degrade.
+                OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => {
+                    return Ok(RangePullOutcome::Unsupported);
+                }
+            };
+
+        // Meter the actually-pulled bytes (span + outboard) as origin egress —
+        // the bytes really did leave an origin. This is what ADR 037 counts
+        // against the seed-leech caps: the pulled side, not the whole blob.
+        if let Some(m) = &self.inner.metrics {
+            let pulled = u64::try_from(data.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(outboard.len()).unwrap_or(u64::MAX));
+            m.pull_through_bytes.inc_by(pulled);
+        }
+
+        // Verify the untrusted range + outboard against the root `H` and
+        // produce the bao interleaved encoding for `import_bao_bytes`. A
+        // verification failure (tampered range/outboard, wrong root) is a
+        // deterministic protocol violation — degrade to a whole-blob pull
+        // (which re-verifies whole-blob against `H`) rather than erroring, so
+        // a single misbehaving origin can't deny the range entirely. A
+        // wrong-length outboard is the same degrade.
+        let encoded = match encode_verified_range(root, blob_size, aligned, &data, outboard) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    %hash,
+                    kind = ?origin.kind(),
+                    error = %err,
+                    "origin range failed bao verification; degrading to whole-blob pull",
+                );
+                return Ok(RangePullOutcome::Unsupported);
+            }
+        };
+
+        // Import the verified span as a partial blob. The chunk ranges scope
+        // exactly what was verified; iroh-blobs writes them as a partial blob
+        // anchored at `hash`. A store fault here is a real error (local disk /
+        // actor problem), surfaced as `Store`.
+        self.inner
+            .store
+            .blobs()
+            .import_bao_bytes(hash, aligned.chunk_ranges().clone(), encoded)
+            .await
+            .map_err(|e| {
+                CacheError::Store(
+                    anyhow::Error::from(e).context("import_bao_bytes failed for verified range"),
+                )
+            })?;
+
+        Ok(RangePullOutcome::Served)
+    }
+
     /// Begin a node-driven *tee* fill of `hash` (#856): the caller pushes blob
     /// chunks (received from an upstream node→node pull) via [`TeeSink::write`]
     /// while the engine streams them into the store, and [`TeeSink::finish`]
@@ -1641,6 +1869,77 @@ impl CacheEngine {
             .get_bytes(hash)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
+    }
+
+    /// Read `[byte_offset, byte_offset + byte_len)` of `hash` from the local
+    /// store ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)).
+    /// `byte_len == 0` reads to the blob end. Works against a **partial** blob
+    /// imported by [`Self::pull_through_range`] — only the bytes covered by an
+    /// imported (and thus already-verified) range are readable; asking for
+    /// bytes outside the imported span surfaces a [`CacheError::Store`] from
+    /// iroh-blobs rather than zero-filling.
+    ///
+    /// Concatenates the exported range into a contiguous [`Bytes`]; for the
+    /// streaming serve path the node drives iroh-blobs' `export_ranges`
+    /// directly. Provided here so the engine owns the local-read seam for both
+    /// whole-blob ([`Self::get`]) and range serves.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] if the store cannot satisfy the range (blob
+    /// absent, the requested bytes were never imported / verified, or a
+    /// read-to-end (`byte_len == 0`) was requested against a partial blob whose
+    /// size the store cannot yet report).
+    pub async fn export_range(
+        &self,
+        hash: Hash,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> CacheResult<Bytes> {
+        // `byte_len == 0` means "to end"; iroh-blobs `export_ranges` takes a
+        // half-open `Range<u64>`, so resolve the end against the store's known
+        // size. A `RangeFull`-style read isn't directly expressible, so query
+        // the size and build the explicit bound.
+        let end = if byte_len == 0 {
+            match self
+                .inner
+                .store
+                .blobs()
+                .status(hash)
+                .await
+                .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?
+            {
+                iroh_blobs::api::blobs::BlobStatus::NotFound => {
+                    return Err(CacheError::Store(anyhow::anyhow!(
+                        "export_range: blob {hash} not present"
+                    )));
+                }
+                // A partial blob whose size the store cannot yet report is an
+                // explicit failure: silently treating `None` as "ends at
+                // `byte_offset`" would return an empty range for a `byte_len ==
+                // 0` ("to end") read and mask the real cause. Surface it so the
+                // caller retries or falls back to a whole-blob serve.
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: None } => {
+                    return Err(CacheError::Store(anyhow::anyhow!(
+                        "export_range: store cannot report size for partial blob {hash}; \
+                         cannot resolve a read-to-end bound"
+                    )));
+                }
+                iroh_blobs::api::blobs::BlobStatus::Partial { size: Some(size) }
+                | iroh_blobs::api::blobs::BlobStatus::Complete { size } => size,
+            }
+        } else {
+            byte_offset.saturating_add(byte_len)
+        };
+        let bytes = self
+            .inner
+            .store
+            .blobs()
+            .export_ranges(hash, byte_offset..end)
+            .concatenate()
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        Ok(Bytes::from(bytes))
     }
 
     async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
@@ -2264,6 +2563,16 @@ impl Drop for TeeSink {
 fn is_blob_too_large_marker(e: &std::io::Error) -> bool {
     e.get_ref()
         .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BlobTooLargeMarker>)
+}
+
+/// Exact byte length a correct pre-order bao outboard for a `blob_size`-byte
+/// blob has, under iroh-blobs' canonical `IROH_BLOCK_SIZE` (#823). Used to
+/// bound the untrusted `{H}.obao4` read on the range-pull path before
+/// `encode_verified_range`'s authoritative length check rejects a malformed
+/// one. Saturates to `u64::MAX` only if the upstream `outboard_size` ever
+/// exceeds `u64` (it cannot for any real blob).
+fn expected_outboard_len(blob_size: u64) -> u64 {
+    bao_tree::BaoTree::new(blob_size, crate::range_pull::IROH_BLOCK_SIZE).outboard_size()
 }
 
 pub(crate) use crate::origin::BlobTooLargeMarker;
