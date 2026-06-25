@@ -213,6 +213,41 @@ pub struct DecdnMetrics {
     /// Sibling of `dht_rate_limit_tracked_per_ip` for the per-peer map.
     /// Operator-visible name: `decdn_dht_rate_limit_tracked_per_peer` (#645).
     pub dht_rate_limit_tracked_per_peer: Gauge,
+    /// `cdn/probe/v1` requests rejected by the per-peer (`NodeId`) token
+    /// bucket (ADR 005 §Probe rate limiting). One Counter per layer to match
+    /// the existing `dht_rate_limit_rejected_*` / `dispatch_rejected_*`
+    /// convention since the metrics backend doesn't support per-field labels;
+    /// operators recover the rolled-up rate with
+    /// `sum(rate(decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`.
+    /// Operator-visible name: `decdn_probe_rate_limit_rejected_per_peer_total`.
+    pub probe_rate_limit_rejected_per_peer: Counter,
+    /// `cdn/probe/v1` requests rejected by the per-IP token bucket. Sibling
+    /// to `probe_rate_limit_rejected_per_peer` — see its docs. Operator-
+    /// visible name: `decdn_probe_rate_limit_rejected_per_ip_total`.
+    pub probe_rate_limit_rejected_per_ip: Counter,
+    /// `cdn/probe/v1` requests rejected by the global token bucket. Sibling
+    /// to `probe_rate_limit_rejected_per_peer` — see its docs. Operator-
+    /// visible name: `decdn_probe_rate_limit_rejected_global_total`.
+    pub probe_rate_limit_rejected_global: Counter,
+    /// `retain_recent` sweeps of the per-IP probe keyed-limiter map that
+    /// actually ran (single-flight CAS won, layer enabled). Bumped from both
+    /// the lazy-prune path in the limiter's `check` and the periodic
+    /// `gc_per_ip` GC task. Operator-visible name:
+    /// `decdn_probe_rate_limit_prune_sweeps_per_ip_total` (#645).
+    pub probe_rate_limit_prune_sweeps_per_ip: Counter,
+    /// Sibling of `probe_rate_limit_prune_sweeps_per_ip` for the per-peer
+    /// (`NodeId`) keyed-limiter map. Operator-visible name:
+    /// `decdn_probe_rate_limit_prune_sweeps_per_peer_total` (#645).
+    pub probe_rate_limit_prune_sweeps_per_peer: Counter,
+    /// Current size of the per-IP probe keyed-limiter map after the most
+    /// recent prune (lazy or periodic). Pair with
+    /// `decdn_probe_rate_limit_prune_sweeps_per_ip_total` to detect cap
+    /// saturation. Operator-visible name:
+    /// `decdn_probe_rate_limit_tracked_per_ip` (#645).
+    pub probe_rate_limit_tracked_per_ip: Gauge,
+    /// Sibling of `probe_rate_limit_tracked_per_ip` for the per-peer map.
+    /// Operator-visible name: `decdn_probe_rate_limit_tracked_per_peer` (#645).
+    pub probe_rate_limit_tracked_per_peer: Gauge,
     /// `cdn/dht/v1` request handling failed after the request was admitted
     /// by the rate limiter — frame decode error, response write error,
     /// read timeout, etc. Tracked separately from the rate-limit
@@ -304,6 +339,12 @@ pub struct DecdnMetrics {
     /// consecutive sweeps. Operator-visible name:
     /// `decdn_buyer_reclaim_failures_total`.
     pub buyer_reclaim_failures: Counter,
+    /// Idle buyer channels cooperatively closed by the reconcile sweep (#972),
+    /// reclaiming their deposit early instead of waiting for on-chain expiry. A
+    /// healthy capital-efficiency signal — each increment is one deposit freed
+    /// ahead of expiry. Operator-visible name:
+    /// `decdn_buyer_reconcile_settled_total`.
+    pub buyer_reconcile_settled: Counter,
     /// Channel-lifecycle reconciliation the settlement watcher could not apply
     /// from the live event stream: a failed `register_open_channel` /
     /// `update_channel_deposit` / `forget_channel` store write (#751), or a
@@ -1083,6 +1124,12 @@ impl Metrics {
         self.decdn.buyer_reclaim_failures.inc();
     }
 
+    /// The idle-reconcile sweep cooperatively closed one idle buyer channel,
+    /// reclaiming its deposit early (#972).
+    pub fn buyer_reconcile_settled(&self) {
+        self.decdn.buyer_reconcile_settled.inc();
+    }
+
     /// An auto-settlement trigger fired and the seller path `closeChannel`d a
     /// channel to secure its un-redeemed balance on-chain (#742). Pairs with
     /// the `info!` in `try_redeem`.
@@ -1656,6 +1703,47 @@ impl Metrics {
             .set(i64::try_from(n).unwrap_or(i64::MAX));
     }
 
+    /// Record a `cdn/probe/v1` request rejected at the per-peer layer.
+    pub fn probe_rate_limit_rejected_per_peer(&self) {
+        self.decdn.probe_rate_limit_rejected_per_peer.inc();
+    }
+
+    /// Record a `cdn/probe/v1` request rejected at the per-IP layer.
+    pub fn probe_rate_limit_rejected_per_ip(&self) {
+        self.decdn.probe_rate_limit_rejected_per_ip.inc();
+    }
+
+    /// Record a `cdn/probe/v1` request rejected at the global layer.
+    pub fn probe_rate_limit_rejected_global(&self) {
+        self.decdn.probe_rate_limit_rejected_global.inc();
+    }
+
+    /// Record a `retain_recent` sweep of the per-IP probe keyed-limiter
+    /// map (#645).
+    pub fn probe_rate_limit_prune_sweep_per_ip(&self) {
+        self.decdn.probe_rate_limit_prune_sweeps_per_ip.inc();
+    }
+
+    /// Record a `retain_recent` sweep of the per-peer probe keyed-limiter
+    /// map (#645).
+    pub fn probe_rate_limit_prune_sweep_per_peer(&self) {
+        self.decdn.probe_rate_limit_prune_sweeps_per_peer.inc();
+    }
+
+    /// Set the per-IP probe keyed-limiter tracked-size gauge (#645).
+    pub fn probe_rate_limit_tracked_per_ip_set(&self, n: usize) {
+        self.decdn
+            .probe_rate_limit_tracked_per_ip
+            .set(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+
+    /// Set the per-peer probe keyed-limiter tracked-size gauge (#645).
+    pub fn probe_rate_limit_tracked_per_peer_set(&self, n: usize) {
+        self.decdn
+            .probe_rate_limit_tracked_per_peer
+            .set(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+
     /// Record a `cdn/dht/v1` request that was admitted by the rate
     /// limiter but failed after that (frame decode, write, encode,
     /// timeout, etc).
@@ -2038,6 +2126,12 @@ mod tests {
             // reference the names below.
             "decdn_cache_gc_runs_total",
             "decdn_cache_gc_bytes_reclaimed_total",
+            // Circuit-breaker counters (#963). Auto-exposed via the
+            // `MetricsGroup` derive; pin the exported names so dashboards
+            // tracking origin-outage load-shed don't silently lose them.
+            "decdn_cache_circuit_breaker_trips_total",
+            "decdn_cache_circuit_breaker_recoveries_total",
+            "decdn_cache_circuit_breaker_short_circuits_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),
@@ -2538,6 +2632,7 @@ mod tests {
             10,
             PinnedHashes::empty(),
             RetryPolicy::default(),
+            decdn_cache::CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cache_handle)),
             std::time::Duration::ZERO,
         )

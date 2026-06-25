@@ -22,8 +22,8 @@ pub use errors::ConfigErrorBag;
 pub use resolved::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
     ResolvedDiscoveryPeer, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
-    ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedPrefetch, ResolvedReceipts,
-    ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedPrefetch, ResolvedProbe,
+    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -122,6 +122,26 @@ const DEFAULT_DHT_MAX_TRACKED_PER_IP: usize = 4096;
 /// Default hard cap on tracked per-peer (`NodeId`) entries in the DHT
 /// keyed limiter (#645).
 const DEFAULT_DHT_MAX_TRACKED_PER_PEER: usize = 4096;
+/// Default sustained per-peer (`NodeId`) rate for `cdn/probe/v1` inbound
+/// (ADR 005 §Probe rate limiting). Tighter than the DHT layer because a
+/// probe is unauthenticated and cheaper to flood.
+const DEFAULT_PROBE_PER_PEER_RATE_PER_SEC: f64 = 5.0;
+/// Default per-peer burst capacity for `cdn/probe/v1`. ADR 005 default: 5.
+const DEFAULT_PROBE_PER_PEER_BURST: u32 = 5;
+/// Default sustained per-IP rate for `cdn/probe/v1`. ADR 005 default: 50.
+const DEFAULT_PROBE_PER_IP_RATE_PER_SEC: f64 = 50.0;
+/// Default per-IP burst capacity for `cdn/probe/v1`. ADR 005 default: 200.
+const DEFAULT_PROBE_PER_IP_BURST: u32 = 200;
+/// Default sustained global rate for `cdn/probe/v1`. ADR 005 default: 1000.
+const DEFAULT_PROBE_GLOBAL_RATE_PER_SEC: f64 = 1000.0;
+/// Default global burst capacity for `cdn/probe/v1`. ADR 005 default: 2000.
+const DEFAULT_PROBE_GLOBAL_BURST: u32 = 2000;
+/// Default hard cap on tracked per-IP entries in the probe keyed limiter
+/// (#645). Mirrors `DEFAULT_DHT_MAX_TRACKED_PER_IP`.
+const DEFAULT_PROBE_MAX_TRACKED_PER_IP: usize = 4096;
+/// Default hard cap on tracked per-peer (`NodeId`) entries in the probe
+/// keyed limiter (#645).
+const DEFAULT_PROBE_MAX_TRACKED_PER_PEER: usize = 4096;
 /// Default interval between iroh-blobs GC sweeps in seconds (#518). Five
 /// minutes balances the hostile-origin amplification window against the
 /// per-sweep cost of walking the blob list. The window matters because
@@ -275,6 +295,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let gossip = resolve_gossip_into(file.gossip.as_ref(), &mut bag);
     let security = resolve_security_into(file.security.as_ref(), &mut bag);
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
+    let probe = resolve_probe_into(file.probe.as_ref(), &mut bag);
     let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
     let prefetch = resolve_prefetch_into(file.prefetch.as_ref(), &mut bag);
 
@@ -293,6 +314,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         gossip,
         security,
         dht,
+        probe,
         receipts,
         prefetch,
     })
@@ -1230,6 +1252,14 @@ fn resolve_cache_into(
         )
         .unwrap_or_default();
 
+    let circuit_breaker = bag
+        .try_with(
+            "cache.circuit_breaker",
+            resolve_circuit_breaker(file.and_then(|c| c.circuit_breaker.as_ref()))
+                .context("invalid cache.circuit_breaker"),
+        )
+        .unwrap_or_default();
+
     // `cache.user_agent` (#435): operator override of the default
     // `decdn-node/<version>` UA we send on every origin pull. We
     // validate the value at config load — both for a clear error
@@ -1326,6 +1356,7 @@ fn resolve_cache_into(
         origins,
         pinned_hashes,
         origin_retry,
+        circuit_breaker,
         user_agent,
         gc_interval_sec,
         max_probe_holds,
@@ -1757,6 +1788,35 @@ pub fn resolve_origin_retry(
         p.buffered_max_bytes,
         MAX_BUFFERED_MAX_BYTES,
     );
+    Ok(p)
+}
+
+/// Resolve the per-origin circuit-breaker policy (#963). Absent =>
+/// defaults via `CircuitBreakerPolicy::default()`. Present partial
+/// sections fill missing fields from the same defaults (handled by
+/// `#[serde(default)]` on `CircuitBreakerPolicy` itself). This function
+/// enforces the one cross-field invariant the type can't express: an
+/// *active* breaker must admit at least one half-open trial, otherwise
+/// it could never probe for recovery and would stay OPEN forever after
+/// the first trip.
+pub fn resolve_circuit_breaker(
+    file: Option<&decdn_config_types::CircuitBreakerPolicy>,
+) -> anyhow::Result<decdn_config_types::CircuitBreakerPolicy> {
+    let p = file.copied().unwrap_or_default();
+    // Only bind the invariant when the breaker is actually active —
+    // a disabled breaker (`enabled = false` or `failure_threshold = 0`)
+    // never reaches HALF-OPEN, so `half_open_max_calls = 0` is harmless
+    // there and an operator opting out shouldn't have to also set a
+    // half-open value.
+    if p.is_active() {
+        anyhow::ensure!(
+            p.half_open_max_calls >= 1,
+            "cache.circuit_breaker: half_open_max_calls ({}) must be >= 1 when the breaker is \
+             active; otherwise it could never admit a trial pull to probe recovery and would \
+             stay open forever after the first trip",
+            p.half_open_max_calls,
+        );
+    }
     Ok(p)
 }
 
@@ -2403,7 +2463,11 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
         "dht.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let trusted_ips = parse_trusted_ips(rate_limit.and_then(|r| r.trusted_ips.as_deref()), bag);
+    let trusted_ips = parse_trusted_ips(
+        rate_limit.and_then(|r| r.trusted_ips.as_deref()),
+        "dht.rate_limit.trusted_ips",
+        bag,
+    );
 
     let max_tracked_per_ip = rate_limit
         .and_then(|r| r.max_tracked_per_ip)
@@ -2447,8 +2511,125 @@ pub fn resolve_dht(file: Option<&types::DhtConfig>) -> anyhow::Result<ResolvedDh
     one_section(|bag| resolve_dht_into(file, bag))
 }
 
+/// Resolve the `[probe.rate_limit]` section into [`ResolvedProbe`], applying
+/// the ADR 005 §Probe rate limiting defaults and the same validation the DHT
+/// layer uses: each `*_rate_per_sec` finite and `>= 0` (0 disables the layer),
+/// the matching `*_burst > 0` whenever its rate is `> 0` (no deny-all), and
+/// trusted IPs parsed fail-fast. Mirrors [`resolve_dht_into`]; only the
+/// defaults and the `probe.rate_limit.*` field keys differ.
+#[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
+pub fn resolve_probe_into(
+    file: Option<&types::ProbeConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedProbe {
+    // ADR 005 nests the rate-limit knobs under `probe.rate_limit.*` (see
+    // §Trusted-IP exemption — "Configuration key: probe.rate_limit.trusted_ips").
+    let rate_limit = file.and_then(|p| p.rate_limit.as_ref());
+    let per_peer_rate_per_sec = rate_limit
+        .and_then(|r| r.per_peer_rate_per_sec)
+        .unwrap_or(DEFAULT_PROBE_PER_PEER_RATE_PER_SEC);
+    bag.check(
+        per_peer_rate_per_sec.is_finite() && per_peer_rate_per_sec >= 0.0,
+        "probe.rate_limit.per_peer_rate_per_sec",
+        "probe.rate_limit.per_peer_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+    );
+    let per_peer_burst = rate_limit
+        .and_then(|r| r.per_peer_burst)
+        .unwrap_or(DEFAULT_PROBE_PER_PEER_BURST);
+    bag.check(
+        per_peer_rate_per_sec == 0.0 || per_peer_burst > 0,
+        "probe.rate_limit.per_peer_burst",
+        "probe.rate_limit.per_peer_burst must be > 0 when per_peer_rate_per_sec > 0 (set both to 0 to disable)",
+    );
+
+    let per_ip_rate_per_sec = rate_limit
+        .and_then(|r| r.per_ip_rate_per_sec)
+        .unwrap_or(DEFAULT_PROBE_PER_IP_RATE_PER_SEC);
+    bag.check(
+        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec >= 0.0,
+        "probe.rate_limit.per_ip_rate_per_sec",
+        "probe.rate_limit.per_ip_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+    );
+    let per_ip_burst = rate_limit
+        .and_then(|r| r.per_ip_burst)
+        .unwrap_or(DEFAULT_PROBE_PER_IP_BURST);
+    bag.check(
+        per_ip_rate_per_sec == 0.0 || per_ip_burst > 0,
+        "probe.rate_limit.per_ip_burst",
+        "probe.rate_limit.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 (set both to 0 to disable)",
+    );
+
+    let global_rate_per_sec = rate_limit
+        .and_then(|r| r.global_rate_per_sec)
+        .unwrap_or(DEFAULT_PROBE_GLOBAL_RATE_PER_SEC);
+    bag.check(
+        global_rate_per_sec.is_finite() && global_rate_per_sec >= 0.0,
+        "probe.rate_limit.global_rate_per_sec",
+        "probe.rate_limit.global_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+    );
+    let global_burst = rate_limit
+        .and_then(|r| r.global_burst)
+        .unwrap_or(DEFAULT_PROBE_GLOBAL_BURST);
+    bag.check(
+        global_rate_per_sec == 0.0 || global_burst > 0,
+        "probe.rate_limit.global_burst",
+        "probe.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
+    );
+
+    let trusted_ips = parse_trusted_ips(
+        rate_limit.and_then(|r| r.trusted_ips.as_deref()),
+        "probe.rate_limit.trusted_ips",
+        bag,
+    );
+
+    let max_tracked_per_ip = rate_limit
+        .and_then(|r| r.max_tracked_per_ip)
+        .unwrap_or(DEFAULT_PROBE_MAX_TRACKED_PER_IP);
+    let max_tracked_per_peer = rate_limit
+        .and_then(|r| r.max_tracked_per_peer)
+        .unwrap_or(DEFAULT_PROBE_MAX_TRACKED_PER_PEER);
+    // `eprintln!` not `tracing::warn!`: tracing is not initialized at
+    // `resolve_config` time (mirrors `resolve_dht_into`).
+    if max_tracked_per_ip == 0 {
+        eprintln!(
+            "warning: probe.rate_limit.max_tracked_per_ip = 0: per-IP bookkeeping map is unbounded; \
+             an attacker churning source IPs can grow it without limit"
+        );
+    }
+    if max_tracked_per_peer == 0 {
+        eprintln!(
+            "warning: probe.rate_limit.max_tracked_per_peer = 0: per-peer bookkeeping map is unbounded; \
+             an attacker churning NodeIds can grow it without limit"
+        );
+    }
+
+    ResolvedProbe {
+        per_peer_rate_per_sec,
+        per_peer_burst,
+        per_ip_rate_per_sec,
+        per_ip_burst,
+        global_rate_per_sec,
+        global_burst,
+        trusted_ips,
+        max_tracked_per_ip,
+        max_tracked_per_peer,
+    }
+}
+
+/// Convenience wrapper for [`resolve_probe_into`] that takes a fresh
+/// `ConfigErrorBag`. Test-only.
+#[cfg(test)]
+pub fn resolve_probe(file: Option<&types::ProbeConfig>) -> anyhow::Result<ResolvedProbe> {
+    one_section(|bag| resolve_probe_into(file, bag))
+}
+
+/// Parse a trusted-IP list shared by the DHT and probe rate-limit resolvers.
+/// `field_key` is the config path of the offending list (e.g.
+/// `dht.rate_limit.trusted_ips` or `probe.rate_limit.trusted_ips`) so a
+/// malformed entry reports the right key under the bag pattern.
 fn parse_trusted_ips(
     raw: Option<&[String]>,
+    field_key: &'static str,
     bag: &mut ConfigErrorBag,
 ) -> std::collections::HashSet<std::net::IpAddr> {
     let mut out = std::collections::HashSet::new();
@@ -2461,10 +2642,8 @@ fn parse_trusted_ips(
                 out.insert(ip);
             }
             Err(e) => {
-                bag.check_with(false, "dht.rate_limit.trusted_ips", || {
-                    format!(
-                        "dht.rate_limit.trusted_ips entry {entry:?} is not a valid IP address: {e}"
-                    )
+                bag.check_with(false, field_key, || {
+                    format!("{field_key} entry {entry:?} is not a valid IP address: {e}")
                 });
             }
         }
@@ -6221,6 +6400,102 @@ mod tests {
     }
 
     #[test]
+    fn resolve_circuit_breaker_defaults_when_absent() -> anyhow::Result<()> {
+        // Absent `cache.circuit_breaker` => defaults from
+        // CircuitBreakerPolicy::default() (#963). Pin the contract so a
+        // default change is a deliberate, test-visible edit.
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        let p = resolved.circuit_breaker;
+        anyhow::ensure!(p.enabled, "breaker on by default");
+        anyhow::ensure!(p.failure_threshold == 5, "default failure_threshold");
+        anyhow::ensure!(p.cooldown_ms == 30_000, "default cooldown_ms");
+        anyhow::ensure!(p.half_open_max_calls == 1, "default half_open_max_calls");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_circuit_breaker_parses_full_section() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            circuit_breaker: Some(decdn_config_types::CircuitBreakerPolicy {
+                enabled: true,
+                failure_threshold: 10,
+                cooldown_ms: 60_000,
+                half_open_max_calls: 3,
+            }),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        let p = resolved.circuit_breaker;
+        anyhow::ensure!(p.failure_threshold == 10);
+        anyhow::ensure!(p.cooldown_ms == 60_000);
+        anyhow::ensure!(p.half_open_max_calls == 3);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_circuit_breaker_partial_section_inherits_defaults() -> anyhow::Result<()> {
+        // `#[serde(default)]` on CircuitBreakerPolicy fills missing
+        // fields. A partial `[cache.circuit_breaker]` with only
+        // cooldown_ms set must carry the other defaults through.
+        let toml = "[cache.circuit_breaker]\ncooldown_ms = 12345\n";
+        let file: crate::config::FileConfig = ::toml::from_str(toml)?;
+        let p = file
+            .cache
+            .as_ref()
+            .and_then(|c| c.circuit_breaker.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("circuit_breaker missing"))?;
+        anyhow::ensure!(p.cooldown_ms == 12_345);
+        anyhow::ensure!(p.enabled, "default carried through");
+        anyhow::ensure!(p.failure_threshold == 5, "default carried through");
+        anyhow::ensure!(p.half_open_max_calls == 1, "default carried through");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_circuit_breaker_disabled_skips_half_open_invariant() -> anyhow::Result<()> {
+        // A disabled breaker (enabled = false) never reaches HALF-OPEN,
+        // so half_open_max_calls = 0 must resolve cleanly — an operator
+        // opting out shouldn't have to supply a half-open value.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            circuit_breaker: Some(decdn_config_types::CircuitBreakerPolicy::disabled()),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(!resolved.circuit_breaker.enabled);
+        anyhow::ensure!(!resolved.circuit_breaker.is_active());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_circuit_breaker_rejects_zero_half_open_when_active() -> anyhow::Result<()> {
+        // An ACTIVE breaker with half_open_max_calls = 0 could never
+        // probe for recovery and would stay open forever — reject it at
+        // config-load time with a contextualized error.
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            circuit_breaker: Some(decdn_config_types::CircuitBreakerPolicy {
+                enabled: true,
+                failure_threshold: 5,
+                cooldown_ms: 30_000,
+                half_open_max_calls: 0,
+            }),
+            ..types::CacheConfig::default()
+        };
+        let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected error"))?;
+        let msg = format!("{err:#}");
+        anyhow::ensure!(
+            msg.contains("invalid cache.circuit_breaker"),
+            "error should be contextualized: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resolve_cache_defaults_satisfy_invariant() -> anyhow::Result<()> {
         // Regression guard: if either default changes, the pair must still
         // satisfy `max_blob < cache_size`. Lives here so a future edit to
@@ -9318,6 +9593,92 @@ bind_port = 12345
     fn resolve_dht_accepts_zero_max_tracked_per_peer_as_unbounded() {
         let d = dht_rl_with(|r| r.max_tracked_per_peer = Some(0));
         let resolved = resolve_dht(Some(&d)).expect("0 makes the map unbounded");
+        assert_eq!(resolved.max_tracked_per_peer, 0);
+    }
+
+    // ---- #982: `[probe.rate_limit]` resolver (ADR 005 §Probe rate limiting).
+    // Mirrors the `[dht.rate_limit]` resolver tests above; the key regression
+    // guards are the ADR-005 defaults (a tighter per-peer cap than the DHT
+    // layer) and that the field keys in validation errors say `probe.*`. ----
+
+    fn probe_rl_with(mutate: impl FnOnce(&mut types::ProbeRateLimitConfig)) -> types::ProbeConfig {
+        let mut r = types::ProbeRateLimitConfig::default();
+        mutate(&mut r);
+        types::ProbeConfig {
+            rate_limit: Some(r),
+        }
+    }
+
+    #[test]
+    fn resolve_probe_absent_yields_adr005_defaults() {
+        // No `[probe.rate_limit]` section at all => every ADR 005 default.
+        let resolved = resolve_probe(None).expect("absent section is valid");
+        assert!((resolved.per_peer_rate_per_sec - 5.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_peer_burst, 5);
+        assert!((resolved.per_ip_rate_per_sec - 50.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_ip_burst, 200);
+        assert!((resolved.global_rate_per_sec - 1000.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.global_burst, 2000);
+        assert_eq!(
+            resolved.max_tracked_per_ip,
+            DEFAULT_PROBE_MAX_TRACKED_PER_IP
+        );
+        assert_eq!(
+            resolved.max_tracked_per_peer,
+            DEFAULT_PROBE_MAX_TRACKED_PER_PEER
+        );
+        assert!(resolved.trusted_ips.is_empty());
+    }
+
+    #[test]
+    fn resolve_probe_file_override_applies() {
+        let p = probe_rl_with(|r| {
+            r.per_peer_rate_per_sec = Some(7.0);
+            r.per_peer_burst = Some(9);
+        });
+        let resolved = resolve_probe(Some(&p)).expect("valid override");
+        assert!((resolved.per_peer_rate_per_sec - 7.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_peer_burst, 9);
+        // Untouched fields keep their ADR 005 defaults.
+        assert_eq!(resolved.per_ip_burst, 200);
+    }
+
+    #[test]
+    fn resolve_probe_zero_rate_and_burst_disables_layer() {
+        let p = probe_rl_with(|r| {
+            r.per_peer_rate_per_sec = Some(0.0);
+            r.per_peer_burst = Some(0);
+        });
+        let resolved = resolve_probe(Some(&p)).expect("0/0 disables the per-peer layer");
+        assert!(resolved.per_peer_rate_per_sec.abs() < f64::EPSILON);
+        assert_eq!(resolved.per_peer_burst, 0);
+    }
+
+    #[test]
+    fn resolve_probe_rate_positive_with_zero_burst_rejects() {
+        let p = probe_rl_with(|r| {
+            r.per_peer_rate_per_sec = Some(5.0);
+            r.per_peer_burst = Some(0);
+        });
+        let err = resolve_probe(Some(&p)).expect_err("rate>0+burst=0 must reject");
+        assert!(format!("{err:#}").contains("probe.rate_limit.per_peer_burst"));
+    }
+
+    #[test]
+    fn resolve_probe_malformed_trusted_ip_reports_probe_key() {
+        let p = probe_rl_with(|r| r.trusted_ips = Some(vec!["not-an-ip".to_string()]));
+        let err = resolve_probe(Some(&p)).expect_err("malformed IP must reject");
+        assert!(format!("{err:#}").contains("probe.rate_limit.trusted_ips"));
+    }
+
+    #[test]
+    fn resolve_probe_accepts_zero_max_tracked_as_unbounded() {
+        let p = probe_rl_with(|r| {
+            r.max_tracked_per_ip = Some(0);
+            r.max_tracked_per_peer = Some(0);
+        });
+        let resolved = resolve_probe(Some(&p)).expect("0 makes the maps unbounded");
+        assert_eq!(resolved.max_tracked_per_ip, 0);
         assert_eq!(resolved.max_tracked_per_peer, 0);
     }
 }

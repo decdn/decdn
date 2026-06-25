@@ -178,6 +178,12 @@ pub struct ResolvedCache {
     /// Origin pull-through retry policy (#285). Set once at startup;
     /// changes require a process restart.
     pub origin_retry: decdn_config_types::RetryPolicy,
+    /// Per-origin circuit-breaker policy (#963). Fronts each origin's
+    /// pull-through retry loop so a sustained outage fast-fails the
+    /// origin's misses (no retry/backoff incurred) and the cache sheds
+    /// load, then probes for recovery. Set once at startup; changes
+    /// require a process restart.
+    pub circuit_breaker: decdn_config_types::CircuitBreakerPolicy,
     /// `User-Agent` header sent on every HTTP origin pull-through (#435).
     /// Defaults to [`decdn_config_types::DEFAULT_USER_AGENT`] (which embeds
     /// the `decdn-config-types` crate's `CARGO_PKG_VERSION`; the
@@ -458,6 +464,45 @@ impl Default for ResolvedDht {
     }
 }
 
+/// Resolved `cdn/probe/v1` settings (ADR 005 §Probe rate limiting).
+///
+/// Mirrors [`ResolvedDht`] in shape; `Default` returns the ADR 005 defaults
+/// (a tighter per-peer cap than the DHT layer, since probes are
+/// unauthenticated and cheaper to flood) so hand-built `ResolvedConfig` test
+/// sites can write `ResolvedProbe::default()`. The production
+/// `resolve_probe_into` path threads the defaults through the resolver bag.
+#[derive(Debug, Clone)]
+pub struct ResolvedProbe {
+    pub per_peer_rate_per_sec: f64,
+    pub per_peer_burst: u32,
+    pub per_ip_rate_per_sec: f64,
+    pub per_ip_burst: u32,
+    pub global_rate_per_sec: f64,
+    pub global_burst: u32,
+    pub trusted_ips: std::collections::HashSet<std::net::IpAddr>,
+    /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
+    pub max_tracked_per_ip: usize,
+    /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
+    /// => unbounded.
+    pub max_tracked_per_peer: usize,
+}
+
+impl Default for ResolvedProbe {
+    fn default() -> Self {
+        Self {
+            per_peer_rate_per_sec: 5.0,
+            per_peer_burst: 5,
+            per_ip_rate_per_sec: 50.0,
+            per_ip_burst: 200,
+            global_rate_per_sec: 1000.0,
+            global_burst: 2000,
+            trusted_ips: std::collections::HashSet::new(),
+            max_tracked_per_ip: 4096,
+            max_tracked_per_peer: 4096,
+        }
+    }
+}
+
 /// Resolved security / rate-limiting fields.
 #[derive(Debug, Clone)]
 pub struct ResolvedSecurity {
@@ -556,6 +601,7 @@ pub struct ResolvedConfig {
     pub gossip: ResolvedGossip,
     pub security: ResolvedSecurity,
     pub dht: ResolvedDht,
+    pub probe: ResolvedProbe,
     pub receipts: ResolvedReceipts,
     pub prefetch: ResolvedPrefetch,
 }

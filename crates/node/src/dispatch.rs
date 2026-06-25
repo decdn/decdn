@@ -40,11 +40,11 @@ use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use governor::{DefaultKeyedRateLimiter, Quota};
-use iroh::TransportAddr;
 use iroh::endpoint::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::metrics::Metrics;
+use crate::rate_limit::peer_ip;
 use decdn_common::config::ResolvedSecurity;
 
 /// Bucket key for the per-source rate limit. IPv4 addresses are used as-is;
@@ -563,32 +563,6 @@ impl ConnectionLimiter {
             );
         }
     }
-}
-
-/// Extract the remote IP from a connection's currently-selected network path.
-///
-/// Returns `None` for relay-only connections that have no direct IP path.
-/// Path selection may not have completed at the moment `accept` returns;
-/// without the fallback to *any* IP path, the per-source limit would
-/// silently no-op on freshly-accepted connections and an attacker churning
-/// identities could bypass the layer in that race window.
-fn peer_ip(conn: &Connection) -> Option<IpAddr> {
-    // `paths()` returns a snapshot of the *currently open* paths (closed paths
-    // are not retained), so no explicit open-path filter is needed.
-    let paths = conn.paths();
-    paths
-        .iter()
-        .find(iroh::endpoint::Path::is_selected)
-        .and_then(|p| match p.remote_addr() {
-            TransportAddr::Ip(addr) => Some(addr.ip()),
-            _ => None,
-        })
-        .or_else(|| {
-            paths.iter().find_map(|p| match p.remote_addr() {
-                TransportAddr::Ip(addr) => Some(addr.ip()),
-                _ => None,
-            })
-        })
 }
 
 #[cfg(test)]

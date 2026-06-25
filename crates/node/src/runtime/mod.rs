@@ -29,17 +29,16 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable,
 
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
-use crate::dht::{
-    ChainStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet,
-    rate_limit::DhtRateLimitConfig,
-};
+use crate::dht::{ChainStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet};
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::client::{ClientHandler, MAX_CLIENT_STREAMS};
 use crate::handlers::dht::DhtHandler;
 use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::{ProbeHandler, StakeLanePolicy as ProbeStakeLanePolicy};
+use crate::handlers::probe_rate_limit::ProbeRateLimiter;
 use crate::metrics;
 use crate::payment_settlement::PaymentChannelService;
+use crate::rate_limit::RateLimitConfig;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256};
 use alloy::providers::ProviderBuilder;
@@ -75,6 +74,12 @@ const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
 /// `DISPATCH_GC_INTERVAL`) so a future tune to one limiter doesn't drag
 /// the other along.
 const DHT_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Interval between periodic GC sweeps of the probe rate-limiter's per-IP and
+/// per-peer keyed maps (#645, #982). Matches `DHT_RATE_LIMIT_GC_INTERVAL` — the
+/// probe and DHT keyed limiters share the same keyspace-cleanup mental model.
+/// Separate constant so a future tune to one limiter doesn't drag the other.
+const PROBE_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 
 /// QUIC-level idle timeout: the transport closes a connection if no
 /// packets arrive for this long. Set to match ADR 005's 30s
@@ -337,6 +342,51 @@ async fn run_dht_rate_limit_gc(
                         after,
                         dropped = before.saturating_sub(after),
                         "dht rate-limit GC sweep complete"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Sibling of `run_dht_rate_limit_gc` for the `cdn/probe/v1` three-layer
+// limiter (#982). Kept as a separate function (rather than generalized) to
+// match the existing dispatch-GC / dht-GC split and leave the heavily-tested
+// DHT GC task untouched; see that function's note on the cognitive-complexity
+// allow.
+#[allow(clippy::cognitive_complexity)]
+async fn run_probe_rate_limit_gc(
+    limiter: Arc<ProbeRateLimiter>,
+    mut stop_rx: oneshot::Receiver<()>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                tracing::debug!("probe rate-limit GC shutdown signal received");
+                return;
+            }
+            _ = ticker.tick() => {
+                if let Some((before, after)) = limiter.gc_per_ip() {
+                    tracing::debug!(
+                        layer = "per_ip",
+                        before,
+                        after,
+                        dropped = before.saturating_sub(after),
+                        "probe rate-limit GC sweep complete"
+                    );
+                }
+                if let Some((before, after)) = limiter.gc_per_peer() {
+                    tracing::debug!(
+                        layer = "per_peer",
+                        before,
+                        after,
+                        dropped = before.saturating_sub(after),
+                        "probe rate-limit GC sweep complete"
                     );
                 }
             }
@@ -694,11 +744,22 @@ pub async fn run(
             }
         });
 
+    // ADR 005 §Probe rate limiting three-layer token-bucket limiter for
+    // `cdn/probe/v1`. Built from `[probe.rate_limit]` and run *in addition* to
+    // the shared `ConnectionLimiter` (see `probe_rate_limit` module docs); the
+    // per-peer (NodeId) layer it adds is the gap #982 closed.
+    let probe_rate_limit_cfg = RateLimitConfig::from(&cfg.probe);
+    let probe_rate_limiter = Arc::new(ProbeRateLimiter::new(
+        &probe_rate_limit_cfg,
+        Arc::clone(&node_metrics),
+    ));
+
     let probe_handler = Arc::new(ProbeHandler::new(
         secret_key.public(),
         reload_state.rate_per_mb(),
         Arc::clone(&node_metrics),
         Arc::clone(&limiter),
+        Arc::clone(&probe_rate_limiter),
         cache.clone(),
         Arc::clone(&eth_signer),
         slash_domain,
@@ -721,17 +782,7 @@ pub async fn run(
     // Store all wired up; iterative requester-side lookup and the
     // republish scheduler land in PR 4 of #320. Three-layer rate limiter
     // operates at the full ADR 022 spec.
-    let dht_rate_limit_cfg = DhtRateLimitConfig {
-        per_peer_rate_per_sec: cfg.dht.per_peer_rate_per_sec,
-        per_peer_burst: cfg.dht.per_peer_burst,
-        per_ip_rate_per_sec: cfg.dht.per_ip_rate_per_sec,
-        per_ip_burst: cfg.dht.per_ip_burst,
-        global_rate_per_sec: cfg.dht.global_rate_per_sec,
-        global_burst: cfg.dht.global_burst,
-        trusted_ips: cfg.dht.trusted_ips.clone(),
-        max_tracked_per_ip: cfg.dht.max_tracked_per_ip,
-        max_tracked_per_peer: cfg.dht.max_tracked_per_peer,
-    };
+    let dht_rate_limit_cfg = RateLimitConfig::from(&cfg.dht);
     let dht_rate_limiter = Arc::new(DhtRateLimiter::new(
         &dht_rate_limit_cfg,
         Arc::clone(&node_metrics),
@@ -1048,6 +1099,15 @@ pub async fn run(
         decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr),
         U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
         cfg.blockchain.buyer_max_approve,
+        // Idle-reconcile dial wiring (#972): only when node→node pull-through
+        // gave us a node-address resolver to map a provider's address back to a
+        // NodeId. Absent → reconcile is disabled, expiry reclaim runs alone.
+        node_address_resolver
+            .as_ref()
+            .map(|resolver| crate::buyer_channel::BuyerReconcileConfig {
+                endpoint: ep.clone(),
+                resolver: Arc::clone(resolver),
+            }),
         Arc::clone(&node_metrics),
     )
     .await
@@ -1166,6 +1226,15 @@ pub async fn run(
         Arc::clone(&dht_rate_limiter),
         dht_rate_limit_gc_stop_rx,
         DHT_RATE_LIMIT_GC_INTERVAL,
+    ));
+
+    // Probe rate-limiter keyspace GC (#982) — same DoS-shape rationale as the
+    // DHT GC above, for the `cdn/probe/v1` per-IP / per-peer keyed maps.
+    let (probe_rate_limit_gc_stop_tx, probe_rate_limit_gc_stop_rx) = oneshot::channel::<()>();
+    tasks.spawn(run_probe_rate_limit_gc(
+        Arc::clone(&probe_rate_limiter),
+        probe_rate_limit_gc_stop_rx,
+        PROBE_RATE_LIMIT_GC_INTERVAL,
     ));
 
     // DHT republish scheduler (ADR 022 §STORE Flow). The subscribe
@@ -1670,6 +1739,7 @@ pub async fn run(
     }
     let _ = record_store_gc_stop_tx.send(());
     let _ = dht_rate_limit_gc_stop_tx.send(());
+    let _ = probe_rate_limit_gc_stop_tx.send(());
     let _ = republish_stop_tx.send(());
     let _ = bucket_refresh_stop_tx.send(());
     // Admin server shutdown is ordered per `admin_stop_order`:
@@ -2313,6 +2383,7 @@ async fn build_cache(
         cfg.cache.max_blob_size_mb,
         cfg.cache.pinned_hashes.clone(),
         cfg.cache.origin_retry,
+        cfg.cache.circuit_breaker,
         Some(node_metrics.cache_metrics()),
         std::time::Duration::from_secs(cfg.cache.gc_interval_sec),
     )
@@ -2814,6 +2885,7 @@ mod tests {
                 origins,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),
+                circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
@@ -2864,6 +2936,7 @@ mod tests {
                 max_tracked_sources: 4096,
             },
             dht: decdn_common::config::ResolvedDht::default(),
+            probe: decdn_common::config::ResolvedProbe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
             prefetch: decdn_common::config::ResolvedPrefetch::default(),
         };
@@ -3180,6 +3253,42 @@ mod tests {
         assert!(
             result.is_ok(),
             "run_dht_rate_limit_gc must exit within 500ms of shutdown signal; \
+             a 60s hang here means the stop arm of the select was lost"
+        );
+        result
+            .expect("timeout already asserted")
+            .expect("task should not panic");
+    }
+
+    /// `run_probe_rate_limit_gc` (#982) exits promptly when the stop oneshot
+    /// fires. Same shutdown-promptness contract as `run_dht_rate_limit_gc`
+    /// above — the probe GC task is a near-verbatim sibling, so a reordered
+    /// `tokio::select!` arm or a dropped `biased` would extend shutdown by up
+    /// to one `PROBE_RATE_LIMIT_GC_INTERVAL` (60s). Guards the copy-paste seam.
+    #[tokio::test]
+    async fn run_probe_rate_limit_gc_exits_promptly_on_shutdown() {
+        use crate::handlers::probe_rate_limit::ProbeRateLimiter;
+        use crate::metrics::Metrics;
+        use crate::rate_limit::RateLimitConfig;
+
+        let metrics = Arc::new(Metrics::new());
+        let limiter = Arc::new(ProbeRateLimiter::new(&RateLimitConfig::default(), metrics));
+
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        // 60s interval matches the runtime default so the test would hang for
+        // 60s on a regression rather than racing through a shorter interval.
+        let task = tokio::spawn(run_probe_rate_limit_gc(
+            Arc::clone(&limiter),
+            stop_rx,
+            Duration::from_mins(1),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop_tx.send(()).expect("receiver still alive");
+        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
+        assert!(
+            result.is_ok(),
+            "run_probe_rate_limit_gc must exit within 500ms of shutdown signal; \
              a 60s hang here means the stop arm of the select was lost"
         );
         result

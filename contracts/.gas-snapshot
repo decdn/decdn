@@ -1,3 +1,5 @@
+BuybackBurnerBalancerV3ForkTest:test_constructor_validates_against_live_pool() (gas: 0)
+BuybackBurnerBalancerV3ForkTest:test_twap_accumulator_reads_real_pool() (gas: 0)
 BuybackBurnerBalancerV3Test:test_constructor_revertsOnCapFractionOutOfBounds() (gas: 128059)
 BuybackBurnerBalancerV3Test:test_constructor_revertsOnInvertedBand() (gas: 128219)
 BuybackBurnerBalancerV3Test:test_constructor_revertsOnMissingTokenLeg() (gas: 1026486)

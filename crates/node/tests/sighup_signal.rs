@@ -80,6 +80,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             origins: Vec::new(),
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
             origin_retry: decdn_cache::RetryPolicy::default(),
+            circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
             gc_interval_sec: 0,
             max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
@@ -130,6 +131,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             max_tracked_sources: 4096,
         },
         dht: decdn_common::config::ResolvedDht::default(),
+        probe: decdn_common::config::ResolvedProbe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
         prefetch: decdn_common::config::ResolvedPrefetch::default(),
     }

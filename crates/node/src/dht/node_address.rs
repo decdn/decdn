@@ -66,6 +66,18 @@ pub trait NodeAddressResolver: Send + Sync + std::fmt::Debug {
     /// pull from it — there is no address to open a channel to or to verify the
     /// `slash_sig` against.
     fn address_of(&self, node_id: &NodeId) -> Option<Address>;
+
+    /// Reverse lookup: a registered [`NodeId`] currently bound to `address`, or
+    /// `None` if no registered node binds it (deregistered / never seen).
+    ///
+    /// The buyer-channel reconcile (#972) keys channels by the provider's
+    /// operator *address* but must dial the provider by `NodeId` to request a
+    /// cooperative-close waiver. An operator may run several nodes under one
+    /// address; any is dialable for this purpose — they share the operator key
+    /// that signs the waiver — so the first match is returned. `None` is the
+    /// "unreachable / gone" signal: the caller leaves the channel for the
+    /// expiry-reclaim sweep rather than dialing.
+    fn node_id_for(&self, address: &Address) -> Option<NodeId>;
 }
 
 /// Static, in-memory [`NodeAddressResolver`] from a known map. Used by tests and
@@ -86,6 +98,12 @@ impl StaticNodeAddressDirectory {
 impl NodeAddressResolver for StaticNodeAddressDirectory {
     fn address_of(&self, node_id: &NodeId) -> Option<Address> {
         self.map.get(node_id).copied()
+    }
+
+    fn node_id_for(&self, address: &Address) -> Option<NodeId> {
+        self.map
+            .iter()
+            .find_map(|(node_id, addr)| (addr == address).then_some(*node_id))
     }
 }
 
@@ -141,6 +159,25 @@ impl NodeAddressResolver for ChainNodeAddressDirectory {
             Err(poisoned) => {
                 warn!("ChainNodeAddressDirectory bindings RwLock poisoned; recovering inner state");
                 poisoned.into_inner().get(node_id).copied()
+            }
+        }
+    }
+
+    fn node_id_for(&self, address: &Address) -> Option<NodeId> {
+        // O(n) scan of the binding set — the reconcile sweep calls this hourly
+        // for a handful of channels, so a reverse index isn't worth maintaining.
+        // Add a reverse map only if a node ever tracks thousands of buyer
+        // channels.
+        let scan = |guard: &HashMap<NodeId, Address>| {
+            guard
+                .iter()
+                .find_map(|(node_id, addr)| (addr == address).then_some(*node_id))
+        };
+        match self.bindings.read() {
+            Ok(guard) => scan(&guard),
+            Err(poisoned) => {
+                warn!("ChainNodeAddressDirectory bindings RwLock poisoned; recovering inner state");
+                scan(&poisoned.into_inner())
             }
         }
     }
@@ -356,6 +393,16 @@ mod tests {
         let dir = StaticNodeAddressDirectory::new(m);
         assert_eq!(dir.address_of(&nid(1)), Some(addr(0xAA)));
         assert_eq!(dir.address_of(&nid(2)), None);
+    }
+
+    #[test]
+    fn static_directory_reverse_resolves_address_and_misses_unknown() {
+        let mut m = HashMap::new();
+        m.insert(nid(1), addr(0xAA));
+        let dir = StaticNodeAddressDirectory::new(m);
+        assert_eq!(dir.node_id_for(&addr(0xAA)), Some(nid(1)));
+        // No node binds this address → unreachable/gone.
+        assert_eq!(dir.node_id_for(&addr(0xBB)), None);
     }
 
     /// `set_binding` inserts and surfaces the address; the size gauge tracks the

@@ -35,7 +35,6 @@ use decdn_protocol::{
     encode_message, read_frame, write_frame,
 };
 use iroh::PublicKey;
-use iroh::TransportAddr;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
@@ -282,7 +281,7 @@ impl DhtHandler {
             // `peer_ip` here so a relay→direct path switch over the
             // connection's lifetime engages the per-IP layer for
             // subsequent streams.
-            let peer_ip = peer_ip(&conn);
+            let peer_ip = crate::rate_limit::peer_ip(&conn);
             if let Err(layer) = self.rate_limiter.check(&peer.node_id(), peer_ip) {
                 Self::close_stream_with_rate_limit(send, recv, layer);
                 continue;
@@ -875,29 +874,6 @@ fn now_us() -> u64 {
             0
         }
     }
-}
-
-/// Lift the peer IP out of a connection's currently-selected path.
-/// Mirrors the private `peer_ip` helper in [`crate::dispatch`] — same rationale:
-/// relay-only connections have no IP key, so the per-IP rate-limit layer
-/// is skipped for them.
-fn peer_ip(conn: &Connection) -> Option<IpAddr> {
-    // `paths()` returns a snapshot of the *currently open* paths (closed paths
-    // are not retained), so no explicit open-path filter is needed.
-    let paths = conn.paths();
-    paths
-        .iter()
-        .find(iroh::endpoint::Path::is_selected)
-        .and_then(|p| match p.remote_addr() {
-            TransportAddr::Ip(addr) => Some(addr.ip()),
-            _ => None,
-        })
-        .or_else(|| {
-            paths.iter().find_map(|p| match p.remote_addr() {
-                TransportAddr::Ip(addr) => Some(addr.ip()),
-                _ => None,
-            })
-        })
 }
 
 #[cfg(test)]
