@@ -216,8 +216,8 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     /// never outlives the service. Held only for its `Drop`.
     _reconciler: AbortOnDrop,
     /// Aborts the idle-reconcile sweep (#972) on drop. `None` when reconcile is
-    /// disabled (node→node pull-through off, or a zero idle threshold). Held only
-    /// for its `Drop`.
+    /// disabled (node→node pull-through off, so no dial wiring). Held only for its
+    /// `Drop`.
     _idle_reconciler: Option<AbortOnDrop>,
 }
 
@@ -306,8 +306,8 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         ));
 
         // Idle-reconcile sweep (#972): only when the runtime supplied dial wiring
-        // (node→node pull-through on) and a non-zero idle threshold. Without it
-        // the service runs the expiry-reclaim sweep alone, exactly as before.
+        // (node→node pull-through on). Without it the service runs the
+        // expiry-reclaim sweep alone, exactly as before.
         let idle_reconciler = reconcile.map(|cfg| {
             info!(
                 idle_sweeps_threshold = RECONCILE_IDLE_SWEEPS,
@@ -932,9 +932,13 @@ async fn reconcile_one<P: Provider + Clone>(
         return;
     };
     let Ok(public_key) = PublicKey::from_bytes(node_id.as_bytes()) else {
+        // A malformed on-chain registration is a persistent fault. Drop the idle
+        // tally so we back off (~24h) instead of re-warning every hourly sweep;
+        // the expiry-reclaim sweep is still the eventual safety net.
+        obs.remove(&st.channel_id);
         warn!(
             channel_id = %st.channel_id,
-            "reconcile: registered NodeId is not a valid public key; skipping"
+            "reconcile: registered NodeId is not a valid public key; backing off"
         );
         return;
     };
@@ -974,15 +978,23 @@ async fn reconcile_one<P: Provider + Clone>(
             }
         }
         Ok(CooperativeCloseOutcome::Declined) => {
+            // A decline is sticky (the provider has no channel / no accepted
+            // voucher). Back off the idle tally (~24h) so we don't re-dial it
+            // every hourly sweep; the expiry-reclaim sweep remains the net.
+            obs.remove(&st.channel_id);
             debug!(
                 channel_id = %st.channel_id, provider = %st.provider,
-                "reconcile: provider declined cooperative close; leaving for expiry reclaim"
+                "reconcile: provider declined cooperative close; backing off, leaving for expiry reclaim"
             );
         }
         Ok(CooperativeCloseOutcome::Reverted) => {
+            // A revert is persistent until something on-chain changes. Back off
+            // the idle tally (~24h) so we don't burn gas re-submitting every
+            // hourly sweep; the expiry-reclaim sweep remains the net.
+            obs.remove(&st.channel_id);
             warn!(
                 channel_id = %st.channel_id, provider = %st.provider,
-                "reconcile: cooperativeClose reverted on-chain; leaving for expiry reclaim"
+                "reconcile: cooperativeClose reverted on-chain; backing off, leaving for expiry reclaim"
             );
         }
         Err(err) => {

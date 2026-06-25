@@ -166,8 +166,8 @@ impl NodeAddressResolver for ChainNodeAddressDirectory {
     fn node_id_for(&self, address: &Address) -> Option<NodeId> {
         // O(n) scan of the binding set — the reconcile sweep calls this hourly
         // for a handful of channels, so a reverse index isn't worth maintaining.
-        // ponytail: linear scan, add a reverse map only if a node ever tracks
-        // thousands of buyer channels.
+        // Add a reverse map only if a node ever tracks thousands of buyer
+        // channels.
         let scan = |guard: &HashMap<NodeId, Address>| {
             guard
                 .iter()
