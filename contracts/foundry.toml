@@ -55,8 +55,8 @@ invariant = { runs = 1024, depth = 100 }
 optimizer = false
 via_ir = false
 
-# Balancer V3 fork tests (test/*.fork.t.sol) run against live Arbitrum One
-# deployments. They self-skip unless ARBITRUM_RPC_URL is set, so this profile
+# Balancer V3 fork tests (test/*.fork.t.sol) run against live Balancer V3
+# deployments. Each self-skips unless its RPC env var is set, so this profile
 # only matters in CI's `solidity fork test` job, which runs them with the secret.
 # No fuzz/invariant amplification — fork tests are read-only and network-bound,
 # not property tests.
@@ -64,10 +64,15 @@ via_ir = false
 fuzz = { runs = 0 }
 verbosity = 2
 
-# Consumed by the fork tests via vm.rpcUrl("arbitrum"). Point ARBITRUM_RPC_URL at
-# an ARCHIVE endpoint — public RPCs prune state and cannot serve a pinned block.
+# Consumed by the fork tests via vm.rpcUrl(<alias>).
+#   arbitrum — read/validation suite, pins a historical block, needs an ARCHIVE
+#     endpoint (public RPCs prune state and answer a pinned block with
+#     "metadata is not found").
+#   sepolia — swap+burn suite (#995), forks at LATEST and creates its own pool,
+#     so a plain public (non-archive) endpoint suffices.
 [rpc_endpoints]
 arbitrum = "${ARBITRUM_RPC_URL}"
+sepolia = "${SEPOLIA_RPC_URL}"
 
 [fmt]
 line_length = 120

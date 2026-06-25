@@ -11,12 +11,13 @@ import { BuybackBurner } from "./BuybackBurner.sol";
 import { IBalancerV3Router } from "./interfaces/IBalancerV3Router.sol";
 import { IBalancerV3Vault } from "./interfaces/IBalancerV3Vault.sol";
 import { IBalancerV3WeightedPool } from "./interfaces/IBalancerV3WeightedPool.sol";
+import { IPermit2 } from "./interfaces/IPermit2.sol";
 
 /// @title BuybackBurnerBalancerV3
 /// @notice Concrete, deployable `BuybackBurner` that binds the live Balancer V3
 ///         Router and implements the full on-chain MEV-defense stack from
 ///         [ADR 018](../adr/018-liquidity-strategy.md): a single
-///         `swapSingleTokenExactIn` USDC->TOKEN swap with a scoped Vault
+///         `swapSingleTokenExactIn` USDC->TOKEN swap with a scoped Permit2
 ///         approval, a governed `slippageBps`/`minBuybackAmount`/
 ///         `maxBuybackAmount` band, an on-chain per-epoch USDC liquidity cap,
 ///         and an on-chain TWAP `minOut` floor.
@@ -83,6 +84,15 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
     ///         18-decimal fixed point used by the Vault's `*Scaled18` balances.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     uint256 public immutable usdcTo18;
+
+    /// @notice Uniswap Permit2 — the Balancer V3 Router's token-pull authority.
+    ///         A V3 Router pulls `tokenIn` via `permit2.transferFrom`, so the
+    ///         swap authorizes it through Permit2 (ERC20-approve Permit2 + a
+    ///         scoped Permit2 allowance to the Router), not a direct Vault
+    ///         allowance. Canonical on every chain but injected (not hardcoded)
+    ///         so tests can substitute a mock; constructor rejects `address(0)`.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    IPermit2 public immutable permit2;
 
     // -----------------------------------------------------------------
     // Governance-mutable venue + parameters
@@ -162,11 +172,15 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
     /// @param pool_ 80/20 TOKEN/USDC weighted pool (may be zero — governance
     ///        wires it later via `setPool`; base `executeBuyback` reverts
     ///        `PoolNotWired` until both pool and vault are set).
-    /// @param vault_ Balancer V3 Vault (approval target; may be zero at deploy).
+    /// @param vault_ Balancer V3 Vault (pool registration / state reads, not an
+    ///        approval target; may be zero at deploy).
+    /// @param permit2_ Canonical Uniswap Permit2 — the Router's token-pull
+    ///        authority. Non-zero (constructor reverts `ZeroAddress` otherwise).
     struct Config {
         IBalancerV3Router swapRouter_;
         address pool_;
         address vault_;
+        address permit2_;
         uint256 subSwapCount_;
         uint256 subSwapMinBlockGap_;
         uint256 twapMinWindow_;
@@ -180,6 +194,7 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         BuybackBurner(usdc_, token_, admin)
     {
         if (address(cfg.swapRouter_) == address(0)) revert ZeroAddress();
+        if (cfg.permit2_ == address(0)) revert ZeroAddress();
         if (cfg.slippageBps_ >= BPS_DENOMINATOR) revert SlippageOutOfBounds(cfg.slippageBps_, BPS_DENOMINATOR);
         if (
             cfg.epochLiquidityCapFraction_ < CAP_FRACTION_FLOOR || cfg.epochLiquidityCapFraction_ > CAP_FRACTION_CEILING
@@ -192,6 +207,7 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         }
 
         swapRouter = cfg.swapRouter_;
+        permit2 = IPermit2(cfg.permit2_);
         // Inherited `balancerPool`/`balancerVault` are plain storage; setting
         // them here is equivalent to a post-deploy `setPool`/`setVault`.
         balancerPool = cfg.pool_;
@@ -241,24 +257,40 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         //    BEFORE the external swap (effects-before-interactions).
         _accruePerEpochCap(amountIn);
 
-        // 4. Scoped Vault approval (base header invariant #2): approve exactly
-        //    `amountIn` to the VAULT (not the Router — the Vault pulls input
-        //    tokens), then reset to 0 so no standing allowance survives.
-        usdc.forceApprove(balancerVault, amountIn);
+        // 4. Scoped Permit2 approval (base header invariant #2). A Balancer V3
+        //    Router pulls `tokenIn` via `permit2.transferFrom(this, vault, …)`,
+        //    NOT via a direct ERC20 allowance to the Vault — so authorize the
+        //    spend in two scoped legs: ERC20-approve Permit2 for exactly
+        //    `amountIn`, then grant the Router a Permit2 allowance for exactly
+        //    `amountIn`, with an `uint48(block.timestamp)` expiration (Permit2
+        //    reverts a transfer once `block.timestamp > expiration`). The
+        //    expiration is a secondary bound only: on an L2 a single timestamp
+        //    can span several blocks, so confinement comes from the step-6 reset
+        //    plus Permit2's amount-decrement on transfer — together they drive
+        //    the allowance to 0 within this transaction, so no standing
+        //    allowance survives.
+        usdc.forceApprove(address(permit2), amountIn);
+        // `uint160(amountIn)` cannot truncate: `amountIn` is bounded above by the
+        // base-layer `amountIn <= usdc.balanceOf(this)` check, and 6-dec USDC
+        // total supply is ~30 orders of magnitude below 2^160.
+        // forge-lint: disable-next-line(block-timestamp)
+        permit2.approve(address(usdc), address(swapRouter), uint160(amountIn), uint48(block.timestamp));
 
         // 5. Single exact-in swap on the Router with the keeper `minOut`.
         //    `deadline = block.timestamp` gives no standing deadline window;
         //    front-run protection comes from the `minOut`/TWAP floor above plus
         //    the mandatory private-RPC bundle (ADR 018), not the deadline.
-        //    Approval target is the VAULT (set in step 4) per Balancer V3's
-        //    "approve the Vault, call the Router" integration model.
         // forge-lint: disable-next-line(block-timestamp)
         tokenOut = swapRouter.swapSingleTokenExactIn(
             balancerPool, usdc, IERC20(address(token)), amountIn, minOut, block.timestamp, false, ""
         );
 
-        // 6. Reset the scoped approval.
-        usdc.forceApprove(balancerVault, 0);
+        // 6. Reset both legs of the scoped approval. A successful pull already
+        //    decrements both allowances toward 0, but a Router that pulls less
+        //    than `amountIn` would leave a residual standing allowance — these
+        //    resets close that off unconditionally.
+        permit2.approve(address(usdc), address(swapRouter), 0, 0);
+        usdc.forceApprove(address(permit2), 0);
     }
 
     /// @notice Permissionlessly advance the TWAP accumulator with the current
