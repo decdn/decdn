@@ -157,6 +157,14 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     // Governance setters
     // -----------------------------------------------------------------
 
+    /// @dev These setters and the constructor are the only writers of
+    ///      `balancerPool`/`balancerVault`. The base performs NO pool-integrity
+    ///      validation and offers no central post-write hook. A subclass that
+    ///      layers a wiring invariant (see `BuybackBurnerBalancerV3`) MUST
+    ///      override BOTH `setPool` and `setVault` and re-validate after any
+    ///      direct constructor write — every write site carries the obligation
+    ///      independently.
+
     /// @dev `newPool == address(0)` is the documented "not wired" state;
     ///      `executeBuyback` reverts with `PoolNotWired` in that case. Use
     ///      `pause()` for a single-flag disable instead of zeroing the pool.

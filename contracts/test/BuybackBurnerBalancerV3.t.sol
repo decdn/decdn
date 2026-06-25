@@ -656,6 +656,9 @@ contract BuybackBurnerBalancerV3Test is Test {
             abi.encodeWithSelector(BuybackBurnerBalancerV3.PoolNotRegistered.selector, address(other), address(vault))
         );
         bb.setPool(address(other));
+        // A rejected wiring must not partially take effect: the prior good pool
+        // is preserved (the `super.setPool` write is rolled back by the revert).
+        assertEq(bb.balancerPool(), address(pool), "rejected wiring rolled back");
     }
 
     function test_setPool_validatesAndWiresHappyPath() public {
@@ -675,6 +678,20 @@ contract BuybackBurnerBalancerV3Test is Test {
         vm.expectRevert(
             abi.encodeWithSelector(BuybackBurnerBalancerV3.PoolNotRegistered.selector, address(pool), address(v2))
         );
+        bb.setVault(address(v2));
+    }
+
+    function test_setVault_revertsWhenNewVaultReportsInvalidPoolState() public {
+        // The documented danger case: a new Vault registers the pool (so the
+        // isPoolRegistered gate passes) but reports a token set missing the TOKEN
+        // leg, so `_poolState` reverts PoolStateInvalid on the rotation.
+        IERC20[] memory t = new IERC20[](2);
+        t[0] = IERC20(address(usdc));
+        t[1] = IERC20(address(0xDEAD));
+        MockBalancerV3Vault v2 = new MockBalancerV3Vault();
+        v2.setPool(t, _orderedBals(true)); // registered == true by default
+        vm.prank(gov);
+        vm.expectRevert(BuybackBurnerBalancerV3.PoolStateInvalid.selector);
         bb.setVault(address(v2));
     }
 
