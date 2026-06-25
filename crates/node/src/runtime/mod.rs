@@ -1099,6 +1099,15 @@ pub async fn run(
         decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr),
         U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
         cfg.blockchain.buyer_max_approve,
+        // Idle-reconcile dial wiring (#972): only when node→node pull-through
+        // gave us a node-address resolver to map a provider's address back to a
+        // NodeId. Absent → reconcile is disabled, expiry reclaim runs alone.
+        node_address_resolver
+            .as_ref()
+            .map(|resolver| crate::buyer_channel::BuyerReconcileConfig {
+                endpoint: ep.clone(),
+                resolver: Arc::clone(resolver),
+            }),
         Arc::clone(&node_metrics),
     )
     .await

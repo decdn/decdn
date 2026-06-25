@@ -840,6 +840,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher_domain(CHAIN_ID, payment_channel),
         U256::from(DEPOSIT_MICRO_USDC),
         true, // fresh buyer identity → issue the one-time max USDC approval
+        None, // idle-reconcile sweep not under test here
         Arc::new(Metrics::new()),
     )
     .await?;
@@ -1551,6 +1552,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher_domain(CHAIN_ID, payment_channel),
         U256::from(DEPOSIT_MICRO_USDC),
         false,
+        None, // idle-reconcile sweep not under test here
         Arc::new(Metrics::new()),
     )
     .await?;
@@ -1608,6 +1610,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher_domain(CHAIN_ID, payment_channel),
         U256::from(DEPOSIT_MICRO_USDC),
         false,
+        None, // idle-reconcile sweep not under test here
         Arc::new(Metrics::new()),
     )
     .await?;

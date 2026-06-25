@@ -41,6 +41,7 @@ use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
     AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, DepositOutcome, StoreError,
 };
+use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -49,6 +50,10 @@ use crate::client_requester::ChannelContext;
 // decode + state/ctx build, and the one-time USDC approval — now live in the
 // shared `decdn-client-pull` crate (re-exported here as `client_requester`).
 use crate::client_requester::buyer_channel::{OpenedChannel, ensure_allowance, open_channel};
+use crate::client_requester::cooperative_close::{
+    AuthorizedWatermark, CooperativeCloseOutcome, cooperative_close,
+};
+use crate::dht::NodeAddressResolver;
 use crate::metrics::Metrics;
 use crate::payment_settlement::{
     MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range, unix_now,
@@ -76,6 +81,33 @@ const RECLAIM_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 /// reclaim failure usually *is* benign (chain-clock skew), so we wait out a few
 /// sweeps before treating it as a genuine stranded deposit.
 const RECLAIM_ESCALATION_THRESHOLD: u32 = 6;
+
+/// Overall timeout for one cooperative-close attempt in the idle-reconcile sweep
+/// (dial + waiver request + on-chain submit). Short relative to the hourly sweep
+/// — a provider that can't answer promptly is treated as unreachable for this
+/// pass and the channel is left for the next sweep or the expiry reclaim.
+const RECONCILE_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Consecutive idle sweeps (no voucher-nonce progress) before an idle buyer
+/// channel is cooperatively closed. At the hourly [`RECLAIM_SWEEP_INTERVAL`]
+/// that is ~one day of inactivity — long enough that a channel still in active
+/// use is never closed out from under a workload, short enough to free a
+/// genuinely-abandoned deposit well before its (default 90-day) expiry. Not
+/// config-tunable yet (YAGNI); promote to config if an operator needs a
+/// different idle horizon.
+const RECONCILE_IDLE_SWEEPS: u32 = 24;
+
+/// Dial wiring the idle-reconcile sweep needs beyond what the reclaim sweep has
+/// (#972). Built by the runtime only when node→node pull-through is enabled (the
+/// buyer path exists); `None` disables reconcile and the service runs the
+/// expiry-reclaim sweep alone, exactly as before.
+#[derive(Debug, Clone)]
+pub struct BuyerReconcileConfig {
+    /// The node's iroh endpoint, to dial the upstream provider for its waiver.
+    pub endpoint: Endpoint,
+    /// Resolves the provider's operator address back to a dialable `NodeId`.
+    pub resolver: Arc<dyn NodeAddressResolver>,
+}
 
 /// How many blocks back from head the one-shot bootstrap reconciliation scan
 /// looks for orphaned `ChannelOpened(client == self)` events (#763). The buyer
@@ -183,6 +215,10 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     /// dropped (a fast restart) before the scan finishes, so a long backfill
     /// never outlives the service. Held only for its `Drop`.
     _reconciler: AbortOnDrop,
+    /// Aborts the idle-reconcile sweep (#972) on drop. `None` when reconcile is
+    /// disabled (node→node pull-through off, so no dial wiring). Held only for its
+    /// `Drop`.
+    _idle_reconciler: Option<AbortOnDrop>,
 }
 
 impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
@@ -210,6 +246,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         voucher_domain: Eip712Domain,
         default_deposit: U256,
         ensure_max_approval: bool,
+        reconcile: Option<BuyerReconcileConfig>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let contract = PaymentChannel::new(payment_channel_addr, provider.clone());
@@ -268,6 +305,24 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             Arc::clone(&opens_in_flight),
         ));
 
+        // Idle-reconcile sweep (#972): only when the runtime supplied dial wiring
+        // (node→node pull-through on). Without it the service runs the
+        // expiry-reclaim sweep alone, exactly as before.
+        let idle_reconciler = reconcile.map(|cfg| {
+            info!(
+                idle_sweeps_threshold = RECONCILE_IDLE_SWEEPS,
+                "buyer idle-reconcile sweep enabled"
+            );
+            AbortOnDrop(tokio::spawn(reconcile_loop(
+                contract.clone(),
+                Arc::clone(&store),
+                Arc::clone(&signer),
+                voucher_domain.clone(),
+                cfg,
+                Arc::clone(&metrics),
+            )))
+        });
+
         Ok(Self {
             contract,
             store,
@@ -282,6 +337,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             metrics,
             _reclaimer: AbortOnDrop(reclaimer),
             _reconciler: AbortOnDrop(reconciler),
+            _idle_reconciler: idle_reconciler,
         })
     }
 
@@ -717,6 +773,238 @@ async fn reclaim_loop<P: Provider + Clone>(
     loop {
         ticker.tick().await;
         reclaim_once(&contract, &store, self_address, &failures, &metrics).await;
+    }
+}
+
+/// Per-channel idle observation across reconcile sweeps (#972). In-memory only:
+/// a restart re-seeds it, so a channel must be observed idle for
+/// `idle_sweeps_threshold` *post-restart* sweeps before it is reconciled — a
+/// safe bias (we never cooperatively close a channel that might still be in use).
+#[derive(Debug, Clone, Copy)]
+struct IdleObservation {
+    /// The channel's voucher nonce at the last sweep that observed it.
+    last_seen_nonce: U256,
+    /// Consecutive sweeps with no nonce progress.
+    stale_sweeps: u32,
+}
+
+/// Fold this sweep's observed `last_nonce` into the running idle tally for
+/// `channel_id`, returning whether the channel is now idle enough to reconcile.
+///
+/// Any nonce progress since the last sweep resets the tally (the channel is in
+/// active use). A first sighting is recorded but is never immediately idle. Pure
+/// so the idle policy is unit-testable without a clock or a live channel.
+fn observe_idle(
+    obs: &mut HashMap<ChannelId, IdleObservation>,
+    channel_id: ChannelId,
+    last_nonce: U256,
+    idle_sweeps_threshold: u32,
+) -> bool {
+    match obs.get_mut(&channel_id) {
+        None => {
+            obs.insert(
+                channel_id,
+                IdleObservation {
+                    last_seen_nonce: last_nonce,
+                    stale_sweeps: 0,
+                },
+            );
+            false
+        }
+        Some(entry) => {
+            if last_nonce > entry.last_seen_nonce {
+                entry.last_seen_nonce = last_nonce;
+                entry.stale_sweeps = 0;
+                false
+            } else {
+                entry.stale_sweeps = entry.stale_sweeps.saturating_add(1);
+                entry.stale_sweeps >= idle_sweeps_threshold
+            }
+        }
+    }
+}
+
+/// Background idle-reconcile sweep (#972): cooperatively close idle buyer
+/// channels to reclaim their deposit early instead of waiting for expiry. Skips
+/// channels in active use (recent voucher progress) and expired channels (the
+/// reclaim sweep's job). Best-effort — a provider that declines or cannot be
+/// reached is left for the next sweep or the expiry reclaim.
+async fn reconcile_loop<P: Provider + Clone>(
+    contract: PaymentChannel::PaymentChannelInstance<P>,
+    store: Arc<dyn BuyerChannelStore>,
+    signer: Arc<PrivateKeySigner>,
+    voucher_domain: Eip712Domain,
+    config: BuyerReconcileConfig,
+    metrics: Arc<Metrics>,
+) {
+    let mut obs: HashMap<ChannelId, IdleObservation> = HashMap::new();
+    let mut ticker = tokio::time::interval(RECLAIM_SWEEP_INTERVAL);
+    ticker.tick().await; // skip the immediate first tick (bootstrap just ran)
+    loop {
+        ticker.tick().await;
+        reconcile_once(
+            &contract,
+            &store,
+            &signer,
+            &voucher_domain,
+            &config,
+            &mut obs,
+            &metrics,
+        )
+        .await;
+    }
+}
+
+/// One idle-reconcile pass. Errors are logged per channel and never abort the
+/// sweep; the observation map is pruned to the channels still eligible so it
+/// cannot grow unbounded.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_once<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    store: &Arc<dyn BuyerChannelStore>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_domain: &Eip712Domain,
+    config: &BuyerReconcileConfig,
+    obs: &mut HashMap<ChannelId, IdleObservation>,
+    metrics: &Arc<Metrics>,
+) {
+    let states = match store.load_all() {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(%err, "buyer reconcile sweep: failed to load channel state");
+            return;
+        }
+    };
+    let now = unix_now();
+    let mut seen: HashSet<ChannelId> = HashSet::new();
+    for st in &states {
+        // Expired channels are the reclaim sweep's job; a never-paid channel
+        // (nonce 0) has no voucher to settle cooperatively — the provider would
+        // decline — so it too waits for the expiry reclaim.
+        if st.is_expired_at(now) || st.last_nonce.is_zero() {
+            continue;
+        }
+        seen.insert(st.channel_id);
+        if !observe_idle(obs, st.channel_id, st.last_nonce, RECONCILE_IDLE_SWEEPS) {
+            continue;
+        }
+        reconcile_one(
+            contract,
+            store,
+            signer,
+            voucher_domain,
+            config,
+            obs,
+            metrics,
+            st,
+        )
+        .await;
+    }
+    // Drop observations for channels gone this sweep (settled, reclaimed, or
+    // replaced) so the map tracks only currently-eligible channels.
+    obs.retain(|id, _| seen.contains(id));
+}
+
+/// Attempt cooperative close of one idle channel. All failure modes are logged
+/// and swallowed — the expiry-reclaim sweep is the safety net.
+// Linear guard-and-act sequence (resolve NodeId → dial+close → branch on
+// outcome) with per-arm logging; splitting it obscures the flow, mirroring
+// `try_reclaim`.
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+async fn reconcile_one<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    store: &Arc<dyn BuyerChannelStore>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_domain: &Eip712Domain,
+    config: &BuyerReconcileConfig,
+    obs: &mut HashMap<ChannelId, IdleObservation>,
+    metrics: &Arc<Metrics>,
+    st: &BuyerChannelState,
+) {
+    // Resolve the provider's operator address back to a dialable NodeId. A
+    // provider no longer registered (deregistered / gone) is unreachable for
+    // cooperative close — leave the channel for the expiry-reclaim sweep.
+    let Some(node_id) = config.resolver.node_id_for(&st.provider) else {
+        debug!(
+            channel_id = %st.channel_id, provider = %st.provider,
+            "reconcile: provider not registered; leaving idle channel for expiry reclaim"
+        );
+        return;
+    };
+    let Ok(public_key) = PublicKey::from_bytes(node_id.as_bytes()) else {
+        // A malformed on-chain registration is a persistent fault. Drop the idle
+        // tally so we back off (~24h) instead of re-warning every hourly sweep;
+        // the expiry-reclaim sweep is still the eventual safety net.
+        obs.remove(&st.channel_id);
+        warn!(
+            channel_id = %st.channel_id,
+            "reconcile: registered NodeId is not a valid public key; backing off"
+        );
+        return;
+    };
+    let authorized = AuthorizedWatermark {
+        amount: st.last_amount,
+        nonce: st.last_nonce,
+        bytes_delivered: st.last_bytes_delivered,
+    };
+    let outcome = cooperative_close(
+        &config.endpoint,
+        EndpointAddr::new(public_key),
+        contract,
+        st.channel_id,
+        st.provider,
+        st.token,
+        authorized,
+        signer,
+        voucher_domain,
+        RECONCILE_DIAL_TIMEOUT,
+    )
+    .await;
+    match outcome {
+        Ok(CooperativeCloseOutcome::Settled) => {
+            obs.remove(&st.channel_id);
+            metrics.buyer_reconcile_settled();
+            if let Err(err) = store.forget_if_channel(st.provider, st.channel_id) {
+                warn!(
+                    channel_id = %st.channel_id, %err,
+                    "reconcile: channel cooperatively closed on-chain but clearing the local \
+                     record failed; it will be retried and no-op against the closed channel"
+                );
+            } else {
+                info!(
+                    channel_id = %st.channel_id, provider = %st.provider,
+                    "reconcile: idle buyer channel cooperatively closed; deposit reclaimed early"
+                );
+            }
+        }
+        Ok(CooperativeCloseOutcome::Declined) => {
+            // A decline is sticky (the provider has no channel / no accepted
+            // voucher). Back off the idle tally (~24h) so we don't re-dial it
+            // every hourly sweep; the expiry-reclaim sweep remains the net.
+            obs.remove(&st.channel_id);
+            debug!(
+                channel_id = %st.channel_id, provider = %st.provider,
+                "reconcile: provider declined cooperative close; backing off, leaving for expiry reclaim"
+            );
+        }
+        Ok(CooperativeCloseOutcome::Reverted) => {
+            // A revert is persistent until something on-chain changes. Back off
+            // the idle tally (~24h) so we don't burn gas re-submitting every
+            // hourly sweep; the expiry-reclaim sweep remains the net.
+            obs.remove(&st.channel_id);
+            warn!(
+                channel_id = %st.channel_id, provider = %st.provider,
+                "reconcile: cooperativeClose reverted on-chain; backing off, leaving for expiry reclaim"
+            );
+        }
+        Err(err) => {
+            debug!(
+                channel_id = %st.channel_id, provider = %st.provider,
+                err = %sanitize_rpc_display(&err),
+                "reconcile: cooperative close failed (provider unreachable?); leaving for \
+                 expiry reclaim"
+            );
+        }
     }
 }
 
@@ -1322,6 +1610,45 @@ mod tests {
         assert_eq!(ctx.prior_nonce, U256::from(3u64));
         assert_eq!(ctx.prior_bytes_delivered, U256::from(3_000u64));
         assert_eq!(ctx.prior_amount, U256::from(30u64));
+    }
+
+    /// A channel observed for the first time is tracked but never immediately
+    /// idle — reconcile only fires after sustained inactivity (#972).
+    #[test]
+    fn observe_idle_first_sighting_is_not_idle() {
+        let mut obs = HashMap::new();
+        let ch = B256::repeat_byte(0x42);
+        assert!(!observe_idle(&mut obs, ch, U256::from(5u64), 3));
+        assert_eq!(obs.len(), 1);
+    }
+
+    /// With no voucher-nonce progress, a channel becomes idle exactly once it has
+    /// been observed stale for `threshold` consecutive sweeps.
+    #[test]
+    fn observe_idle_marks_idle_after_threshold_without_progress() {
+        let mut obs = HashMap::new();
+        let ch = B256::repeat_byte(0x07);
+        let nonce = U256::from(9u64);
+        // First sighting + the next (threshold-1) stale sweeps are not yet idle.
+        assert!(!observe_idle(&mut obs, ch, nonce, 3)); // first sight
+        assert!(!observe_idle(&mut obs, ch, nonce, 3)); // stale 1
+        assert!(!observe_idle(&mut obs, ch, nonce, 3)); // stale 2
+        assert!(observe_idle(&mut obs, ch, nonce, 3)); // stale 3 → idle
+    }
+
+    /// Any nonce progress (an active pull) resets the idle tally, so a channel in
+    /// use is never cooperatively closed out from under the workload.
+    #[test]
+    fn observe_idle_resets_on_nonce_progress() {
+        let mut obs = HashMap::new();
+        let ch = B256::repeat_byte(0x55);
+        assert!(!observe_idle(&mut obs, ch, U256::from(1u64), 2)); // first sight
+        assert!(!observe_idle(&mut obs, ch, U256::from(1u64), 2)); // stale 1
+        // Progress to nonce 2 → reset; this sweep is not idle.
+        assert!(!observe_idle(&mut obs, ch, U256::from(2u64), 2));
+        // Tally restarts: one stale sweep is below threshold again.
+        assert!(!observe_idle(&mut obs, ch, U256::from(2u64), 2)); // stale 1
+        assert!(observe_idle(&mut obs, ch, U256::from(2u64), 2)); // stale 2 → idle
     }
 
     /// A persistent reclaim failure stays silent for the first few sweeps (the

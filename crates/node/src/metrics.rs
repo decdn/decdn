@@ -339,6 +339,12 @@ pub struct DecdnMetrics {
     /// consecutive sweeps. Operator-visible name:
     /// `decdn_buyer_reclaim_failures_total`.
     pub buyer_reclaim_failures: Counter,
+    /// Idle buyer channels cooperatively closed by the reconcile sweep (#972),
+    /// reclaiming their deposit early instead of waiting for on-chain expiry. A
+    /// healthy capital-efficiency signal — each increment is one deposit freed
+    /// ahead of expiry. Operator-visible name:
+    /// `decdn_buyer_reconcile_settled_total`.
+    pub buyer_reconcile_settled: Counter,
     /// Channel-lifecycle reconciliation the settlement watcher could not apply
     /// from the live event stream: a failed `register_open_channel` /
     /// `update_channel_deposit` / `forget_channel` store write (#751), or a
@@ -1116,6 +1122,12 @@ impl Metrics {
     /// threshold `error!` in `reclaim_once`.
     pub fn buyer_reclaim_failure(&self) {
         self.decdn.buyer_reclaim_failures.inc();
+    }
+
+    /// The idle-reconcile sweep cooperatively closed one idle buyer channel,
+    /// reclaiming its deposit early (#972).
+    pub fn buyer_reconcile_settled(&self) {
+        self.decdn.buyer_reconcile_settled.inc();
     }
 
     /// An auto-settlement trigger fired and the seller path `closeChannel`d a
