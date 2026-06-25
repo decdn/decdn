@@ -13,8 +13,10 @@ pragma solidity 0.8.28;
 ///         `transferFrom`; the buyback never does. Permit2 is deployed at the same
 ///         canonical address on every chain (Nick's-method CREATE2).
 interface IPermit2 {
-    /// @param expiration A `0` value is interpreted by Permit2 as `block.timestamp`
-    ///        (i.e. valid only within the current block), which is exactly the
-    ///        scope the buyback wants for its single same-transaction swap.
+    /// @param expiration Allowance expiry; Permit2 reverts a `transferFrom` once
+    ///        `block.timestamp > expiration`. Pass `uint48(block.timestamp)` to scope
+    ///        the grant to the current block — exactly what the buyback wants for its
+    ///        single same-transaction swap. (Permit2's `approve` also maps a `0`
+    ///        expiration to `block.timestamp`, but the explicit form avoids ambiguity.)
     function approve(address token, address spender, uint160 amount, uint48 expiration) external;
 }

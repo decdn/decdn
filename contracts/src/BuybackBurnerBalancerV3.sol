@@ -259,14 +259,16 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         //    NOT via a direct ERC20 allowance to the Vault — so authorize the
         //    spend in two scoped legs: ERC20-approve Permit2 for exactly
         //    `amountIn`, then grant the Router a Permit2 allowance for exactly
-        //    `amountIn`. Expiration `0` is read by Permit2 as `block.timestamp`,
-        //    so the Permit2 allowance is valid only within the current block; the
-        //    step-6 reset (plus Permit2's amount-decrement on transfer) is what
-        //    confines the spend to this transaction. No standing allowance survives.
+        //    `amountIn`, scoped to the current block via an `uint48(block.timestamp)`
+        //    expiration (Permit2 reverts a transfer once `block.timestamp >
+        //    expiration`). The step-6 reset (plus Permit2's amount-decrement on
+        //    transfer) confines the spend to this transaction; no standing
+        //    allowance survives.
         usdc.forceApprove(address(permit2), amountIn);
         // `uint160(amountIn)` cannot truncate: `amountIn` is bounded by
         // `maxBuybackAmount` and the USDC balance (6-dec), far below 2^160.
-        permit2.approve(address(usdc), address(swapRouter), uint160(amountIn), 0);
+        // forge-lint: disable-next-line(block-timestamp)
+        permit2.approve(address(usdc), address(swapRouter), uint160(amountIn), uint48(block.timestamp));
 
         // 5. Single exact-in swap on the Router with the keeper `minOut`.
         //    `deadline = block.timestamp` gives no standing deadline window;

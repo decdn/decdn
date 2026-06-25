@@ -10,11 +10,8 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
 import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
 import { IBalancerV3Vault } from "../src/interfaces/IBalancerV3Vault.sol";
-import {
-    IBalancerV3RouterInit,
-    IBalancerV3WeightedPoolFactory,
-    IPermit2
-} from "./interfaces/IBalancerV3PoolCreation.sol";
+import { IPermit2 } from "../src/interfaces/IPermit2.sol";
+import { IBalancerV3RouterInit, IBalancerV3WeightedPoolFactory } from "./interfaces/IBalancerV3PoolCreation.sol";
 
 /// @dev 6-decimal stand-in for USDC (the bond/settlement currency).
 contract MintableUSDC is ERC20 {

@@ -12,7 +12,8 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///         never creates or seeds pools, so these signatures must not leak into
 ///         the deployed surface. Signatures are vendored verbatim from
 ///         balancer/balancer-v3-monorepo (`VaultTypes.sol`, `IRouter.sol`,
-///         `WeightedPoolFactory.sol`) and Uniswap `permit2` (`IAllowanceTransfer`).
+///         `WeightedPoolFactory.sol`). Permit2 (`approve`) is reused from the
+///         production `src/interfaces/IPermit2.sol`, not redeclared here.
 
 /// @notice `WeightedPoolFactory.create` + the `VaultTypes` structs it consumes.
 interface IBalancerV3WeightedPoolFactory {
@@ -69,8 +70,5 @@ interface IBalancerV3RouterInit {
     ) external payable returns (uint256 bptAmountOut);
 }
 
-/// @notice Uniswap Permit2 `AllowanceTransfer.approve` — the V3 Router's token-pull
-///         authorization primitive.
-interface IPermit2 {
-    function approve(address token, address spender, uint160 amount, uint48 expiration) external;
-}
+// Permit2 (`approve`) is reused from the production interface
+// `src/interfaces/IPermit2.sol` — not redeclared here.
