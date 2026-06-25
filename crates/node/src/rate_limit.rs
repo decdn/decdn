@@ -56,8 +56,16 @@ use crate::dispatch::source_key;
 
 /// Resolved three-layer rate-limit configuration.
 ///
-/// Each `*_rate_per_sec == 0.0` and the corresponding `*_burst == 0` disables
-/// that layer (operator opt-out), per-layer.
+/// A layer is disabled (its `Option<_>` limiter is `None`) when its quota is
+/// not buildable — see `make_quota`: that is `*_rate_per_sec <= 0.0`, a
+/// non-finite rate, **or** `*_burst == 0`. The intended operator opt-out sets
+/// **both** the rate to `0.0` and the burst to `0`; the config resolver
+/// (`resolve_{dht,probe}_into`) rejects the asymmetric `rate > 0, burst == 0`
+/// combination up front, so in production a layer is only ever disabled via the
+/// both-zero opt-out. A `RateLimitConfig` built directly (bypassing the
+/// resolver) with `rate > 0, burst == 0` will silently disable that layer
+/// rather than error — construct via the `From<&Resolved{Dht,Probe}>` impls or
+/// the resolver to keep that invariant.
 ///
 /// [`Default`] returns the ADR 022 DHT-layer values (the historical default of
 /// this struct). The probe path supplies its own ADR 005 defaults through the
