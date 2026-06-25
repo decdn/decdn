@@ -85,11 +85,6 @@ contract MockBalancerV3Vault {
     function getStaticSwapFeePercentage(address) external view returns (uint256) {
         return swapFeePercentage;
     }
-
-    function pull(IERC20 token, address from, uint256 amount) external {
-        // slither-disable-next-line arbitrary-send-erc20
-        token.transferFrom(from, address(this), amount);
-    }
 }
 
 contract MockBalancerV3WeightedPool {
@@ -104,12 +99,53 @@ contract MockBalancerV3WeightedPool {
     }
 }
 
-/// @notice Minimal Balancer V3 Router mock. Records the caller's USDC allowance
-///         to the Vault in `observedAllowance` (the test asserts it equals
-///         `exactAmountIn`), drives the Vault pull, enforces `minAmountOut`, and
+/// @notice Minimal Uniswap Permit2 (`AllowanceTransfer`) mock — the leg a real
+///         Balancer V3 Router drives to pull `tokenIn`. Stores per-(owner,token,
+///         spender) allowances set via `approve`, and `transferFrom` (called by
+///         the Router) checks the spender's allowance + expiration, decrements
+///         it, and moves tokens via the standard ERC20 allowance the owner
+///         granted Permit2. Mirrors why the burner must ERC20-approve Permit2 AND
+///         grant the Router a scoped Permit2 allowance — a direct Vault allowance
+///         (the V2 model) is never consulted.
+contract MockPermit2 {
+    struct Allow {
+        uint160 amount;
+        uint48 expiration;
+    }
+
+    // owner => token => spender => allowance
+    mapping(address => mapping(address => mapping(address => Allow))) internal allow;
+
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external {
+        // Permit2 reads expiration 0 as "valid this block" (block.timestamp).
+        allow[msg.sender][token][spender] =
+            Allow({ amount: amount, expiration: expiration == 0 ? uint48(block.timestamp) : expiration });
+    }
+
+    /// @dev The scoped Permit2 allowance `owner` granted `spender` for `token`.
+    function allowanceAmount(address owner, address token, address spender) external view returns (uint160) {
+        return allow[owner][token][spender].amount;
+    }
+
+    function transferFrom(address from, address to, uint160 amount, address token) external {
+        Allow storage a = allow[from][token][msg.sender];
+        // forge-lint: disable-next-line(block-timestamp)
+        require(block.timestamp <= a.expiration, "permit2: expired");
+        require(a.amount >= amount, "permit2: insufficient");
+        a.amount -= amount;
+        // slither-disable-next-line arbitrary-send-erc20
+        IERC20(token).transferFrom(from, to, amount);
+    }
+}
+
+/// @notice Minimal Balancer V3 Router mock. Records the scoped Permit2 allowance
+///         the caller granted this Router in `observedAllowance` (the test
+///         asserts it equals `exactAmountIn`), pulls `tokenIn` via Permit2 — the
+///         real V3 token-pull path — into the Vault, enforces `minAmountOut`, and
 ///         pays `amountOut` TOKEN out of its own (pre-funded) balance.
 contract MockBalancerV3Router {
     MockBalancerV3Vault internal vault;
+    MockPermit2 internal permit2;
 
     uint256 public amountOut;
     uint256 public observedAllowance;
@@ -119,8 +155,9 @@ contract MockBalancerV3Router {
 
     error RouterMinOut(uint256 amountOut, uint256 minAmountOut);
 
-    constructor(MockBalancerV3Vault vault_) {
+    constructor(MockBalancerV3Vault vault_, MockPermit2 permit2_) {
         vault = vault_;
+        permit2 = permit2_;
     }
 
     function setAmountOut(uint256 amountOut_) external {
@@ -137,12 +174,12 @@ contract MockBalancerV3Router {
         bool wethIsEth,
         bytes calldata
     ) external returns (uint256) {
-        observedAllowance = tokenIn.allowance(msg.sender, address(vault));
+        observedAllowance = permit2.allowanceAmount(msg.sender, address(tokenIn), address(this));
         lastPool = pool;
         lastDeadline = deadline;
         lastWethIsEth = wethIsEth;
 
-        vault.pull(tokenIn, msg.sender, exactAmountIn);
+        permit2.transferFrom(msg.sender, address(vault), uint160(exactAmountIn), address(tokenIn));
         if (amountOut < minAmountOut) revert RouterMinOut(amountOut, minAmountOut);
         // slither-disable-next-line unchecked-transfer
         tokenOut_.transfer(msg.sender, amountOut);
@@ -158,6 +195,7 @@ contract BuybackBurnerBalancerV3Test is Test {
     MockUSDC internal usdc;
     Token internal token;
     MockBalancerV3Vault internal vault;
+    MockPermit2 internal permit2;
     MockBalancerV3WeightedPool internal pool;
     MockBalancerV3Router internal router;
     BuybackBurnerBalancerV3 internal bb;
@@ -207,7 +245,8 @@ contract BuybackBurnerBalancerV3Test is Test {
         bals[1] = POOL_USDC_18;
         vault.setPool(tokens, bals);
 
-        router = new MockBalancerV3Router(vault);
+        permit2 = new MockPermit2();
+        router = new MockBalancerV3Router(vault, permit2);
 
         bb = _deploy(CAP_FRACTION, MAX_BUYBACK);
         router.setAmountOut(EXPECTED_OUT);
@@ -226,6 +265,7 @@ contract BuybackBurnerBalancerV3Test is Test {
             swapRouter_: IBalancerV3Router(address(router)),
             pool_: address(pool),
             vault_: address(vault),
+            permit2_: address(permit2),
             subSwapCount_: 4,
             subSwapMinBlockGap_: 10,
             twapMinWindow_: TWAP_WINDOW,
@@ -398,14 +438,23 @@ contract BuybackBurnerBalancerV3Test is Test {
     }
 
     // -----------------------------------------------------------------
-    // Scoped Vault approval
+    // Scoped Permit2 approval
     // -----------------------------------------------------------------
 
     function test_scopedApproval_setToAmountInThenResetToZero() public {
         vm.prank(keeper);
         bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
-        assertEq(router.observedAllowance(), BUYBACK_USDC, "allowance scoped to amountIn at swap time");
-        assertEq(usdc.allowance(address(bb), address(vault)), 0, "allowance reset after swap");
+        // The Router observed a Permit2 allowance scoped to exactly amountIn...
+        assertEq(router.observedAllowance(), BUYBACK_USDC, "permit2->router allowance scoped to amountIn at swap time");
+        // ...and both legs of the grant are reset to 0 afterward (no standing allowance).
+        assertEq(
+            permit2.allowanceAmount(address(bb), address(usdc), address(router)),
+            0,
+            "permit2->router allowance reset after swap"
+        );
+        assertEq(usdc.allowance(address(bb), address(permit2)), 0, "erc20->permit2 allowance reset after swap");
+        // The V2-style direct Vault allowance is never set.
+        assertEq(usdc.allowance(address(bb), address(vault)), 0, "no direct vault allowance");
     }
 
     // -----------------------------------------------------------------
@@ -487,6 +536,13 @@ contract BuybackBurnerBalancerV3Test is Test {
     function test_constructor_revertsOnZeroRouter() public {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.swapRouter_ = IBalancerV3Router(address(0));
+        vm.expectRevert(BuybackBurner.ZeroAddress.selector);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_constructor_revertsOnZeroPermit2() public {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.permit2_ = address(0);
         vm.expectRevert(BuybackBurner.ZeroAddress.selector);
         new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
     }
@@ -805,6 +861,7 @@ contract BuybackBurnerBalancerV3Test is Test {
             swapRouter_: IBalancerV3Router(address(router)),
             pool_: address(pool),
             vault_: address(vault),
+            permit2_: address(permit2),
             subSwapCount_: 4,
             subSwapMinBlockGap_: 10,
             twapMinWindow_: TWAP_WINDOW,

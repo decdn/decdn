@@ -18,8 +18,8 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 ///         with `PoolNotWired` until governance calls `setPool` + `setVault`,
 ///         and with `SwapNotImplemented` until a subclass overrides
 ///         `_performSwap` with the live Balancer V3 ABI. Once that override
-///         is in place, the contract performs a single swap against the
-///         Vault then burns the received TOKEN.
+///         is in place, the contract performs a single swap via the Balancer
+///         V3 Router then burns the received TOKEN.
 ///
 ///         MANDATORY `_performSwap` SUBCLASS INVARIANTS (the deployment-PR
 ///         auditor MUST verify these before mainnet — the base contract cannot
@@ -28,9 +28,12 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 ///              require the keeper-supplied `minOut >= twapFloor`; the base
 ///              only rejects `minOut == 0` (no zero-slippage swaps) and bounds
 ///              `amountIn` by the contract's USDC balance.
-///           2. Scope the Vault approval to exactly `amountIn`
-///              (`forceApprove(vault, amountIn)`) and reset it to `0` after the
-///              swap, so no standing USDC allowance survives the call.
+///           2. Scope the input-token approval to exactly `amountIn` and reset
+///              it to `0` after the swap, so no standing USDC allowance survives
+///              the call. The mechanism is venue-specific: a Balancer V3 Router
+///              pulls via Permit2, so the V3 subclass scopes an ERC20 approval to
+///              Permit2 plus a Permit2 allowance to the Router — NOT a direct
+///              Vault allowance (the V2 model).
 ///           3. Optionally cap `amountIn` against a governed per-epoch
 ///              liquidity budget to limit sandwich exposure on thin pools.
 // slither-disable-next-line unimplemented-functions

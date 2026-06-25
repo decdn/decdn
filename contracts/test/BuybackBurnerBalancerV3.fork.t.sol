@@ -34,6 +34,9 @@ contract BuybackBurnerBalancerV3ForkTest is Test {
     address constant POOL = 0x9F52eF16f2Cd76B727460c86eB81A235165161c1;
     address constant USDC = 0xaf88d065e77c8cC2239327C5EDb3A432268e5831; // 6 decimals
     address constant WETH = 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1;
+    // Canonical Uniswap Permit2 (same address on every chain). Unused by these
+    // read-only tests (no swap), but the constructor requires it non-zero.
+    address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     // Pinned for determinism + forge RPC-cache reuse. Safely post-dates the pool
     // (2025-07-31) and below the chain tip. Refresh to any block an archive node
@@ -54,6 +57,7 @@ contract BuybackBurnerBalancerV3ForkTest is Test {
             swapRouter_: IBalancerV3Router(ROUTER),
             pool_: POOL,
             vault_: VAULT,
+            permit2_: PERMIT2,
             subSwapCount_: 4,
             subSwapMinBlockGap_: 1,
             twapMinWindow_: 30 minutes,

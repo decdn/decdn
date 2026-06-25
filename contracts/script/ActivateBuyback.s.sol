@@ -34,14 +34,15 @@ import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
 ///         Required env vars:
 ///           - `TOKEN_ADDRESS`        — protocol TOKEN (ERC20Burnable)
 ///           - `USDC_ADDRESS`         — settlement token
-///           - `BALANCER_ROUTER`      — Balancer V3 Router (call target)
-///           - `BALANCER_VAULT`       — Balancer V3 Vault (approval target)
+///           - `BALANCER_ROUTER`      — Balancer V3 Router (swap call target)
+///           - `BALANCER_VAULT`       — Balancer V3 Vault (pool reads + registration)
 ///           - `BALANCER_POOL`        — 80/20 TOKEN/USDC weighted pool
 ///           - `GOVERNANCE_TIMELOCK`  — Timelock that holds the new burner's roles
 ///           - `FEE_ROUTER`           — deployed FeeRouter
 ///           - `BUYBACK_KEEPER`       — keeper EOA/bot to grant KEEPER_ROLE
 ///
 ///         Optional env vars (defaults from ADR 018 § Parameter Table):
+///           - `PERMIT2_ADDRESS`          (default canonical Permit2, same on every chain)
 ///           - `MAX_BUYBACK_AMOUNT`        (default 10_000e6 USDC)
 ///           - `MIN_BUYBACK_AMOUNT`        (default 100e6 USDC)
 ///           - `SLIPPAGE_BPS`              (default 200)
@@ -67,6 +68,9 @@ contract ActivateBuyback is Script {
             swapRouter_: IBalancerV3Router(vm.envAddress("BALANCER_ROUTER")),
             pool_: vm.envAddress("BALANCER_POOL"),
             vault_: vm.envAddress("BALANCER_VAULT"),
+            // Canonical Uniswap Permit2 (same CREATE2 address on every chain); the
+            // V3 Router pulls the swap's input USDC through it.
+            permit2_: vm.envOr("PERMIT2_ADDRESS", address(0x000000000022D473030F116dDEE9F6B43aC78BA3)),
             subSwapCount_: vm.envOr("SUB_SWAP_COUNT", uint256(4)),
             subSwapMinBlockGap_: vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10)),
             twapMinWindow_: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
