@@ -33,6 +33,9 @@ pub struct FileConfig {
     /// `cdn/dht/v1` Kademlia DHT settings (ADR 022). Absent => defaults
     /// from the ADR 022 §DHT Rate Limiting table.
     pub dht: Option<DhtConfig>,
+    /// `cdn/probe/v1` settings (ADR 005). Absent => defaults from the
+    /// ADR 005 §Probe rate limiting table.
+    pub probe: Option<ProbeConfig>,
     /// Download-receipt audit-log retention settings (#802). Absent =>
     /// defaults (128 MiB per file, 4 retained backups).
     pub receipts: Option<ReceiptsConfig>,
@@ -782,6 +785,59 @@ pub struct DhtRateLimitConfig {
     /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
     /// makes the map unbounded — operator opt-in (#645). Mirrors
     /// `security.max_tracked_sources` for the dispatch layer.
+    pub max_tracked_per_ip: Option<usize>,
+    /// Hard cap on the per-peer (`NodeId`) keyed-limiter map. Absent =>
+    /// 4096. `0` makes the map unbounded (#645).
+    pub max_tracked_per_peer: Option<usize>,
+}
+
+/// `[probe]` section — `cdn/probe/v1` settings (ADR 005).
+///
+/// The rate-limit knobs nest under `[probe.rate_limit]` to match ADR 005
+/// §Probe rate limiting "Trusted-IP exemption" (`probe.rate_limit.trusted_ips`)
+/// and to leave room for other future `probe.*` top-level knobs without
+/// breaking the operator key path.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeConfig {
+    /// Rate-limiter settings (ADR 005 §Probe rate limiting). Absent =>
+    /// the defaults from the ADR (5/50/1000 req/s with 5/200/2000 bursts).
+    pub rate_limit: Option<ProbeRateLimitConfig>,
+}
+
+/// `[probe.rate_limit]` — three-layer token-bucket settings (ADR 005 §Probe
+/// rate limiting).
+///
+/// Mirrors `[dht.rate_limit]` in shape; only the defaults differ (ADR 005
+/// specifies a tighter per-peer cap than ADR 022's DHT layer because a probe
+/// is unauthenticated and cheaper to flood). Setting any `*_rate_per_sec` to
+/// `0.0` disables that layer (operator opt-out); the matching `*_burst` must
+/// also be `0` to avoid a deny-all configuration — the resolver enforces this
+/// pairing, the same way `security.per_source_*` and `dht.rate_limit.*` are
+/// paired.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeRateLimitConfig {
+    /// Per-peer (source `NodeId`) sustained rate. Absent => 5 req/s
+    /// (ADR 005 §Probe rate limiting). `0.0` disables the layer.
+    pub per_peer_rate_per_sec: Option<f64>,
+    /// Per-peer burst capacity. Absent => 5. Required `> 0` when
+    /// `per_peer_rate_per_sec > 0`.
+    pub per_peer_burst: Option<u32>,
+    /// Per-IP sustained rate. Absent => 50 req/s. `0.0` disables.
+    pub per_ip_rate_per_sec: Option<f64>,
+    /// Per-IP burst capacity. Absent => 200.
+    pub per_ip_burst: Option<u32>,
+    /// Global inbound probe sustained rate. Absent => 1000 req/s.
+    pub global_rate_per_sec: Option<f64>,
+    /// Global inbound probe burst capacity. Absent => 2000.
+    pub global_burst: Option<u32>,
+    /// IPs that bypass the per-IP layer only (per-peer + global still
+    /// apply). Format: dotted IPv4 or RFC 5952 IPv6. Absent or empty =>
+    /// no trusted IPs. ADR 005 §Trusted-IP exemption.
+    pub trusted_ips: Option<Vec<String>>,
+    /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
+    /// makes the map unbounded — operator opt-in (#645).
     pub max_tracked_per_ip: Option<usize>,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map. Absent =>
     /// 4096. `0` makes the map unbounded (#645).

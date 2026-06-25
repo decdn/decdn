@@ -849,6 +849,7 @@ impl RuntimeReloadState {
                 max_tracked_sources: 4096,
             },
             dht: decdn_common::config::ResolvedDht::default(),
+            probe: decdn_common::config::ResolvedProbe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
             prefetch: decdn_common::config::ResolvedPrefetch::default(),
         };
@@ -1355,6 +1356,7 @@ mod tests {
             },
             receipts: decdn_common::config::ResolvedReceipts::default(),
             dht: decdn_common::config::ResolvedDht::default(),
+            probe: decdn_common::config::ResolvedProbe::default(),
             prefetch: decdn_common::config::ResolvedPrefetch::default(),
         }
     }
