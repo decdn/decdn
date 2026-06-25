@@ -58,8 +58,10 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ERC20Burnable public immutable token;
 
-    /// @notice Balancer V3 Vault address (Vault pulls input tokens from
-    ///         `msg.sender`, distinct from the Router). Set via `setVault`.
+    /// @notice Balancer V3 Vault address, distinct from the Router. Used for
+    ///         pool registration / state reads (e.g. `isPoolRegistered`), not as
+    ///         an approval target — under V3 the Router pulls `tokenIn` via
+    ///         Permit2 and settles to the Vault. Set via `setVault`.
     address public balancerVault;
 
     /// @notice Balancer V3 pool contract address for the 80/20 TOKEN/USDC pool.

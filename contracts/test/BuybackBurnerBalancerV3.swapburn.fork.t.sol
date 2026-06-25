@@ -278,8 +278,18 @@ contract BuybackBurnerBalancerV3SwapBurnForkTest is Test {
         uint256 bigIn = 20_000e6; // ~8% of seeded USDC depth -> impact > fee+slippage band
         usdc.mint(address(bb), bigIn);
         uint256 floor = _twapFloor(bigIn); // marginal-derived; real exact-in output falls below it
-        vm.expectRevert(); // live Router min-out (slippage) revert, not the contract's floor gate
-        bb.executeBuyback(bigIn, floor);
+        // The revert must come from the LIVE Router's min-out check after real
+        // price impact, NOT from the contract's own floor gate (minOut == floor
+        // passes it). A bare `vm.expectRevert()` accepts any revert and would let
+        // a floor-gate regression masquerade as the intended Router rejection, so
+        // capture the payload and assert it is not `MinOutBelowTwapFloor`.
+        (bool ok, bytes memory err) = address(bb).call(abi.encodeCall(bb.executeBuyback, (bigIn, floor)));
+        assertFalse(ok, "expected a revert from the live Router min-out check");
+        assertGe(err.length, 4, "expected a typed/standard revert payload");
+        assertTrue(
+            bytes4(err) != BuybackBurnerBalancerV3.MinOutBelowTwapFloor.selector,
+            "must revert at the Router, not the contract floor gate"
+        );
     }
 
     /// @notice Floor gating against real curves: a keeper `minOut` just below the

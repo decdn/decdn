@@ -172,7 +172,10 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
     /// @param pool_ 80/20 TOKEN/USDC weighted pool (may be zero — governance
     ///        wires it later via `setPool`; base `executeBuyback` reverts
     ///        `PoolNotWired` until both pool and vault are set).
-    /// @param vault_ Balancer V3 Vault (approval target; may be zero at deploy).
+    /// @param vault_ Balancer V3 Vault (pool registration / state reads, not an
+    ///        approval target; may be zero at deploy).
+    /// @param permit2_ Canonical Uniswap Permit2 — the Router's token-pull
+    ///        authority. Non-zero (constructor reverts `ZeroAddress` otherwise).
     struct Config {
         IBalancerV3Router swapRouter_;
         address pool_;
@@ -259,14 +262,17 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         //    NOT via a direct ERC20 allowance to the Vault — so authorize the
         //    spend in two scoped legs: ERC20-approve Permit2 for exactly
         //    `amountIn`, then grant the Router a Permit2 allowance for exactly
-        //    `amountIn`, scoped to the current block via an `uint48(block.timestamp)`
-        //    expiration (Permit2 reverts a transfer once `block.timestamp >
-        //    expiration`). The step-6 reset (plus Permit2's amount-decrement on
-        //    transfer) confines the spend to this transaction; no standing
+        //    `amountIn`, with an `uint48(block.timestamp)` expiration (Permit2
+        //    reverts a transfer once `block.timestamp > expiration`). The
+        //    expiration is a secondary bound only: on an L2 a single timestamp
+        //    can span several blocks, so confinement comes from the step-6 reset
+        //    plus Permit2's amount-decrement on transfer — together they drive
+        //    the allowance to 0 within this transaction, so no standing
         //    allowance survives.
         usdc.forceApprove(address(permit2), amountIn);
-        // `uint160(amountIn)` cannot truncate: `amountIn` is bounded by
-        // `maxBuybackAmount` and the USDC balance (6-dec), far below 2^160.
+        // `uint160(amountIn)` cannot truncate: `amountIn` is bounded above by the
+        // base-layer `amountIn <= usdc.balanceOf(this)` check, and 6-dec USDC
+        // total supply is ~30 orders of magnitude below 2^160.
         // forge-lint: disable-next-line(block-timestamp)
         permit2.approve(address(usdc), address(swapRouter), uint160(amountIn), uint48(block.timestamp));
 
@@ -279,7 +285,10 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
             balancerPool, usdc, IERC20(address(token)), amountIn, minOut, block.timestamp, false, ""
         );
 
-        // 6. Reset both legs of the scoped approval.
+        // 6. Reset both legs of the scoped approval. A successful pull already
+        //    decrements both allowances toward 0, but a Router that pulls less
+        //    than `amountIn` would leave a residual standing allowance — these
+        //    resets close that off unconditionally.
         permit2.approve(address(usdc), address(swapRouter), 0, 0);
         usdc.forceApprove(address(permit2), 0);
     }

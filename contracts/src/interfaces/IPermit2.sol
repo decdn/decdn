@@ -15,8 +15,8 @@ pragma solidity 0.8.28;
 interface IPermit2 {
     /// @param expiration Allowance expiry; Permit2 reverts a `transferFrom` once
     ///        `block.timestamp > expiration`. Pass `uint48(block.timestamp)` to scope
-    ///        the grant to the current block — exactly what the buyback wants for its
-    ///        single same-transaction swap. (Permit2's `approve` also maps a `0`
+    ///        the grant to the current timestamp — exactly what the buyback wants for
+    ///        its single same-transaction swap. (Permit2's `approve` also maps a `0`
     ///        expiration to `block.timestamp`, but the explicit form avoids ambiguity.)
     function approve(address token, address spender, uint160 amount, uint48 expiration) external;
 }

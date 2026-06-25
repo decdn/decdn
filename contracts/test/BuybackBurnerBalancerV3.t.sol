@@ -32,9 +32,10 @@ contract MockHighDecimalsToken is ERC20 {
 }
 
 /// @notice Minimal Balancer V3 Vault mock. Holds the pool's token set + their
-///         scaled-18 live balances, and exposes `pull` (the leg the Router
-///         drives) which uses the BuybackBurner's scoped allowance — mirroring
-///         "approve the Vault, call the Router".
+///         scaled-18 live balances and answers the pool registration / state
+///         reads (`isPoolRegistered`, `getPoolTokens`, `getCurrentLiveBalances`,
+///         `getStaticSwapFeePercentage`). It is NOT an approval target — under V3
+///         the Router pulls `tokenIn` via Permit2 (see `MockPermit2`).
 contract MockBalancerV3Vault {
     IERC20[] internal tokens;
     uint256[] internal balances18;
@@ -190,7 +191,7 @@ contract MockBalancerV3Router {
 /// @title BuybackBurnerBalancerV3 tests
 /// @notice Covers the live single-swap path, the TWAP `minOut` floor, the
 ///         per-epoch USDC liquidity cap, the min/max buyback band, the scoped
-///         Vault approval lifecycle, and governance-setter access control.
+///         Permit2 approval lifecycle, and governance-setter access control.
 contract BuybackBurnerBalancerV3Test is Test {
     MockUSDC internal usdc;
     Token internal token;
@@ -348,6 +349,28 @@ contract BuybackBurnerBalancerV3Test is Test {
             abi.encodeWithSelector(BuybackBurnerBalancerV3.MinOutBelowTwapFloor.selector, FLOOR_OUT - 1, FLOOR_OUT)
         );
         bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT - 1);
+    }
+
+    /// @notice The Router's own min-out check is the live MEV defense: a keeper
+    ///         `minOut` that clears the contract's floor gate (`== FLOOR_OUT`) but
+    ///         exceeds what the swap realizes reverts at the Router (`RouterMinOut`,
+    ///         NOT the pre-swap floor), and the per-epoch accrual rolls back (CEI)
+    ///         rather than counting a swap that never landed. Offline counterpart
+    ///         to the gated `*.swapburn.fork` live-impact test.
+    function test_executeBuyback_routerMinOutRevert_rollsBackEpochAccrual() public {
+        // Accrue a real buyback first so the post-revert assertion proves a
+        // rollback, not an epoch counter that was simply never touched.
+        vm.prank(keeper);
+        bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
+        assertEq(bb.epochSwappedUsdc(), BUYBACK_USDC, "first buyback accrued");
+
+        // Router now realizes one wei below the forwarded keeper `minOut`.
+        router.setAmountOut(FLOOR_OUT - 1);
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(MockBalancerV3Router.RouterMinOut.selector, FLOOR_OUT - 1, FLOOR_OUT));
+        bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
+
+        assertEq(bb.epochSwappedUsdc(), BUYBACK_USDC, "accrual unchanged after router revert (CEI rollback)");
     }
 
     function test_executeBuyback_revertsTwapNotReady() public {
