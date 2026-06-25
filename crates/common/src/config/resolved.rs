@@ -178,6 +178,12 @@ pub struct ResolvedCache {
     /// Origin pull-through retry policy (#285). Set once at startup;
     /// changes require a process restart.
     pub origin_retry: decdn_config_types::RetryPolicy,
+    /// Per-origin circuit-breaker policy (#963). Fronts each origin's
+    /// pull-through retry loop so a sustained outage fast-fails the
+    /// origin's misses (no retry/backoff incurred) and the cache sheds
+    /// load, then probes for recovery. Set once at startup; changes
+    /// require a process restart.
+    pub circuit_breaker: decdn_config_types::CircuitBreakerPolicy,
     /// `User-Agent` header sent on every HTTP origin pull-through (#435).
     /// Defaults to [`decdn_config_types::DEFAULT_USER_AGENT`] (which embeds
     /// the `decdn-config-types` crate's `CARGO_PKG_VERSION`; the

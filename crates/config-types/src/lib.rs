@@ -14,6 +14,7 @@
 //! lives behind a thin shim in `decdn-cache`.
 
 mod bytes;
+mod circuit_breaker;
 mod decompress;
 mod defaults;
 mod hash;
@@ -23,6 +24,7 @@ mod percent;
 mod retry;
 
 pub use bytes::Bytes;
+pub use circuit_breaker::CircuitBreakerPolicy;
 pub use decompress::DecompressMode;
 pub use defaults::{DEFAULT_MAX_PROBE_HOLDS, DEFAULT_USER_AGENT};
 pub use hash::{Hash, HashParseError, PinDiff, PinnedHashes};

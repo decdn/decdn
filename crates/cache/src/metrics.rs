@@ -1,6 +1,6 @@
 //! Cache-engine `OpenMetrics` counters.
 //!
-//! Nine counters, all monotonic, exposed under the `decdn_cache_*`
+//! Monotonic counters exposed under the `decdn_cache_*`
 //! family per ADR `appendix-observability`. The exported metric names
 //! all carry the OpenMetrics-encoder-appended `_total` suffix even
 //! though the corresponding Rust struct fields here do not — that's
@@ -163,4 +163,40 @@ pub struct CacheMetrics {
     /// automatically, so the emitted name is
     /// `decdn_cache_tag_drop_failures_total`.
     pub tag_drop_failures: Counter,
+    /// Per-origin circuit-breaker trips from CLOSED/HALF-OPEN to OPEN
+    /// (#963). Bumped once each time a breaker opens — on crossing the
+    /// `failure_threshold` from CLOSED, or on a failed HALF-OPEN trial.
+    /// Sustained nonzero rate against a configured origin means that
+    /// origin is having a sustained outage and the cache is shedding the
+    /// retry-backoff storm by fast-failing its misses.
+    ///
+    /// Operator-actionable: a breaker that keeps opening points at an
+    /// unhealthy origin (or a backend the chain is masking). Pair with
+    /// `circuit_breaker_short_circuits` to see how much retry-backoff
+    /// work the breaker saved while open.
+    ///
+    /// Field name omits `_total`: the `OpenMetrics` encoder appends it
+    /// automatically, so the emitted name is
+    /// `decdn_cache_circuit_breaker_trips_total`.
+    pub circuit_breaker_trips: Counter,
+    /// Per-origin circuit-breaker recoveries from HALF-OPEN to CLOSED
+    /// (#963). Bumped once each time a half-open trial succeeds and the
+    /// breaker closes. A trip followed by a recovery is the healthy
+    /// outage→recovery cycle; trips without matching recoveries means an
+    /// origin that keeps failing its half-open probes.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_circuit_breaker_recoveries_total`.
+    pub circuit_breaker_recoveries: Counter,
+    /// Cache misses fast-failed by an OPEN circuit-breaker before the
+    /// retry/backoff loop ran (#963). Each bump is one miss that would
+    /// otherwise have incurred up to the full
+    /// `max_retries`-worth of exponential backoff against a dead origin;
+    /// the breaker shed that cost. The whole point of the feature is to
+    /// drive this counter up during an outage so the retry-exhaustion
+    /// and origin-egress counters stay flat.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_circuit_breaker_short_circuits_total`.
+    pub circuit_breaker_short_circuits: Counter,
 }
