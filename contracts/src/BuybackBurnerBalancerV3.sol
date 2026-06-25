@@ -519,9 +519,10 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
     /// @dev Reads the Vault's scaled-18 balances + the pool's normalized weights
     ///      and locates the USDC and TOKEN legs by address (ignoring any extra
     ///      legs). Reverts `PoolStateInvalid` if either leg is absent, zero-
-    ///      balance, or zero-weight, or if the Vault's token/balance/weight
-    ///      arrays disagree in length — relied on by `_validatePoolWiring` and
-    ///      the swap path (which is why it MUST revert rather than return zeros).
+    ///      balance, or zero-weight, or if the Vault's token/balance arrays and
+    ///      the pool's weight array disagree in length — relied on by
+    ///      `_validatePoolWiring` and the swap path (which is why it MUST revert
+    ///      rather than return zeros).
     function _poolState() internal view returns (uint256 balUsdc18, uint256 balToken18, uint256 wUsdc, uint256 wToken) {
         IBalancerV3Vault vault = IBalancerV3Vault(balancerVault);
         IERC20[] memory tokens = vault.getPoolTokens(balancerPool);
