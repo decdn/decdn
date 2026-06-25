@@ -665,6 +665,34 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ../.github/scripts/post-gas-snapshot-comment.sh /tmp/gas-diff.txt
 
+  solidity-fork-test:
+    name: solidity fork test
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
+    defaults:
+      run:
+        working-directory: contracts
+    env:
+      FOUNDRY_PROFILE: fork
+      # Archive Arbitrum One endpoint. Absent on fork PRs (secrets are withheld)
+      # and in forks that never configured it — the run step below no-ops there,
+      # mirroring the test's own self-skip, so this job never blocks a PR for a
+      # missing secret. The fork tests verify our IBalancerV3* ABIs against the
+      # live deployed bytecode (a thing the unit-test mocks cannot).
+      ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+    steps:
+      # submodules: recursive — forge-std + openzeppelin-contracts are submodules.
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1.8.0
+        with:
+          version: v1.7.1
+      - name: Fork tests (no-op when ARBITRUM_RPC_URL is unset)
+        if: env.ARBITRUM_RPC_URL != ''
+        run: forge test --match-path 'test/*.fork.t.sol' -vv
+
   solidity-coverage:
     name: solidity coverage
     runs-on: ubuntu-latest
