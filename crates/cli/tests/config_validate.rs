@@ -399,6 +399,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             max_tracked_sources: 4096,
         },
         dht: decdn_common::config::ResolvedDht::default(),
+        probe: decdn_common::config::ResolvedProbe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
         prefetch: decdn_common::config::ResolvedPrefetch::default(),
     };

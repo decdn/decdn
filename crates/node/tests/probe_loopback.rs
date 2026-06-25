@@ -21,7 +21,9 @@ use decdn_node::dht::routing::NodeId;
 use decdn_node::dht::staker_set::{ConfigStakerSet, StakerSet};
 use decdn_node::dispatch::{ConnectionLimiter, RejectReason};
 use decdn_node::handlers::probe::{ProbeHandler, StakeLanePolicy};
+use decdn_node::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer};
 use decdn_node::metrics::Metrics;
+use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
     ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, MAX_RATE_PER_MB, ProbeMessage,
     SLASH_SIG_LEN, decode_message, encode_message,
@@ -133,6 +135,35 @@ fn build_handler_bounds(
     floor: u64,
     ceiling: u64,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
+    // Most tests don't exercise the ADR 005 probe rate limiter — wire a
+    // permissive one so only the layer under test (the `ConnectionLimiter`,
+    // hold budget, rate clamp, etc.) can fire.
+    build_handler_with_probe_limiter(
+        server_id,
+        rate,
+        metrics,
+        limiter,
+        permissive_probe_rate_limiter(metrics),
+        cache,
+        floor,
+        ceiling,
+    )
+}
+
+/// Like [`build_handler_bounds`] but with an explicit probe rate limiter, so a
+/// test can install a strict [`ProbeRateLimiter`] (ADR 005 §Probe rate
+/// limiting).
+#[allow(clippy::too_many_arguments)]
+fn build_handler_with_probe_limiter(
+    server_id: iroh::PublicKey,
+    rate: u64,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    probe_limiter: Arc<ProbeRateLimiter>,
+    cache: CacheEngine,
+    floor: u64,
+    ceiling: u64,
+) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
     let signer = Arc::new(PrivateKeySigner::random());
     let domain = test_slash_domain();
     let handler = Arc::new(ProbeHandler::new(
@@ -140,6 +171,7 @@ fn build_handler_bounds(
         Arc::new(AtomicU64::new(rate)),
         Arc::clone(metrics),
         limiter,
+        probe_limiter,
         cache,
         Arc::clone(&signer),
         domain.clone(),
@@ -179,6 +211,7 @@ fn build_handler_with_lane(
         Arc::new(AtomicU64::new(rate)),
         Arc::clone(metrics),
         limiter,
+        permissive_probe_rate_limiter(metrics),
         cache,
         Arc::clone(&signer),
         domain.clone(),
@@ -211,6 +244,23 @@ fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
         max_tracked_sources: 4096,
     };
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
+}
+
+/// Build a permissive `ProbeRateLimiter` for tests that don't exercise the
+/// ADR 005 probe rate-limiting behaviour (all layers effectively unbounded).
+fn permissive_probe_rate_limiter(metrics: &Arc<Metrics>) -> Arc<ProbeRateLimiter> {
+    let cfg = RateLimitConfig {
+        per_peer_rate_per_sec: 1e9,
+        per_peer_burst: u32::MAX,
+        per_ip_rate_per_sec: 1e9,
+        per_ip_burst: u32::MAX,
+        global_rate_per_sec: 1e9,
+        global_burst: u32::MAX,
+        trusted_ips: std::collections::HashSet::new(),
+        max_tracked_per_ip: 4096,
+        max_tracked_per_peer: 4096,
+    };
+    Arc::new(ProbeRateLimiter::new(&cfg, Arc::clone(metrics)))
 }
 
 fn fresh_key() -> SecretKey {
@@ -733,6 +783,119 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
         limiter_probe.per_source_tracked(),
         1,
         "live connection must hit the pre-drained 127.0.0.1 bucket"
+    );
+
+    client_ep.close().await;
+    accept_task
+        .await
+        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
+    server_ep.close().await;
+    Ok(())
+}
+
+/// End-to-end check that the ADR 005 §Probe rate limiting three-layer limiter
+/// (#982) — distinct from the `ConnectionLimiter` exercised above — rejects a
+/// probe with `APP_ERR_RATE_LIMITED` (`0x10`) and the `per_peer` layer label on
+/// the wire.
+///
+/// Strict per-peer burst=1 probe limiter; the per-peer bucket for the client's
+/// `NodeId` is pre-drained out-of-band via `ProbeRateLimiter::check` (the
+/// per-peer layer is keyed by `NodeId` independent of IP, so this is robust to
+/// loopback path selection). The single live connection from that `NodeId` is
+/// then unconditionally rejected at the per-peer layer. Draining directly —
+/// rather than via a throwaway first connection — keeps this deterministic, the
+/// same rationale as `probe_rate_limit_returns_rate_limited_close_code`.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+
+    // Permissive connection limiter so only the probe three-layer limiter can
+    // fire; strict per-peer (burst=1, negligible refill) probe limiter.
+    let conn_limiter = permissive_limiter(&metrics);
+    let strict_probe = RateLimitConfig {
+        per_peer_rate_per_sec: 0.001, // negligible refill within the test window
+        per_peer_burst: 1,
+        per_ip_rate_per_sec: 1e9,
+        per_ip_burst: u32::MAX,
+        global_rate_per_sec: 1e9,
+        global_burst: u32::MAX,
+        trusted_ips: std::collections::HashSet::new(),
+        max_tracked_per_ip: 4096,
+        max_tracked_per_peer: 4096,
+    };
+    let probe_limiter = Arc::new(ProbeRateLimiter::new(&strict_probe, Arc::clone(&metrics)));
+
+    // Pin the client key so we know its NodeId before connecting, then drain
+    // the per-peer bucket for it. `peer_ip = None` skips the (loose) per-IP
+    // layer; the per-peer charge is all we need.
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let client_node = NodeId::from_bytes(*client_id.as_bytes());
+    probe_limiter
+        .check(&client_node, None)
+        .map_err(|l| anyhow::anyhow!("pre-drain unexpectedly rejected: {l:?}"))?;
+
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let (handler, _signer, _domain) = build_handler_with_probe_limiter(
+        server_id,
+        1,
+        &metrics,
+        conn_limiter,
+        Arc::clone(&probe_limiter),
+        cache,
+        0,
+        MAX_RATE_PER_MB,
+    );
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
+    let server_ep_bg = server_ep.clone();
+    let handler_bg = Arc::clone(&handler);
+    let accept_task = tokio::spawn(async move {
+        let incoming = server_ep_bg
+            .accept()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no incoming connection"))?;
+        let connecting = incoming
+            .accept()
+            .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+        let conn = connecting
+            .await
+            .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+        handler_bg
+            .accept(conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let conn = client_ep
+        .connect(target, ALPN_PROBE)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    // Assert both the 0x10 code and the `per_peer` reason bytes: the probe
+    // reject path stamps `RejectLayer::as_str()` into the close frame, so the
+    // label proves the *per-peer* layer fired (the gap #982 closed) rather than
+    // the also-0x10 per-IP or global cap.
+    let close_err = conn.closed().await;
+    let expected = VarInt::from_u32(APP_ERR_RATE_LIMITED);
+    match close_err {
+        ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason })
+            if error_code == expected
+                && reason.as_ref() == ProbeRejectLayer::PerPeer.as_str().as_bytes() => {}
+        other => {
+            anyhow::bail!("expected ApplicationClosed({expected:?}, \"per_peer\"), got {other:?}")
+        }
+    }
+    let scrape = metrics.encode().map_err(|e| anyhow::anyhow!("{e}"))?;
+    assert_eq!(
+        metric_value(&scrape, "decdn_probe_rate_limit_rejected_per_peer_total"),
+        Some(1),
+        "probe per-peer rejection must appear in /metrics scrape:\n{scrape}"
     );
 
     client_ep.close().await;

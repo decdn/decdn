@@ -206,6 +206,91 @@ impl OriginFetch {
     }
 }
 
+/// Result of an [`Origin::fetch_range`] call ([ADR 037 §Origin-tier
+/// pull-through](../../../adr/037-regional-proxy-warming.md), #823).
+///
+/// A range-scoped origin pull fetches only the requested byte span plus the
+/// small sibling `{H}.obao4` outboard, then verifies the span against the
+/// root `H` via [`crate::range_pull::encode_verified_range`] before importing
+/// it as a partial blob — avoiding whole-blob origin egress to serve a byte
+/// range on a cache miss.
+///
+/// The optimization is **best-effort**: when the origin does not publish the
+/// sibling outboard, does not honor `Range`, or the outboard is absent/short,
+/// the adapter returns [`Self::Unsupported`] and the engine degrades to the
+/// existing whole-blob [`Origin::fetch`] pull. That fallback is never a
+/// correctness or availability failure — it only forgoes the cost reduction
+/// (ADR 037 §"Fallback is always correct").
+pub enum OriginRangeFetch {
+    /// The origin served both the requested byte span and the sibling
+    /// `{H}.obao4` outboard. `data` covers exactly
+    /// `[aligned.fetch_start(), aligned.fetch_end())` (the chunk-group-aligned
+    /// span the engine asked for); `outboard` is the untrusted pre-order
+    /// outboard. Neither is trusted until
+    /// [`crate::range_pull::encode_verified_range`] verifies them against `H`.
+    Ranged {
+        /// The aligned data bytes, exactly `aligned.fetch_len()` long.
+        data: Bytes,
+        /// The raw, untrusted `{H}.obao4` outboard bytes.
+        outboard: Bytes,
+    },
+    /// The origin reported the object (data key) does not exist.
+    NotFound,
+    /// The range optimization is not available for this fetch — no published
+    /// outboard, no `Range`/`206` support, or a short/absent outboard. The
+    /// engine degrades to a whole-blob [`Origin::fetch`] pull. This is the
+    /// *expected* path for origins that don't publish `{H}.obao4`, not an
+    /// error.
+    Unsupported,
+}
+
+impl std::fmt::Debug for OriginRangeFetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ranged { data, outboard } => f
+                .debug_struct("Ranged")
+                .field("data_len", &data.len())
+                .field("outboard_len", &outboard.len())
+                .finish(),
+            Self::NotFound => f.write_str("NotFound"),
+            Self::Unsupported => f.write_str("Unsupported"),
+        }
+    }
+}
+
+/// The chunk-group-aligned span a [`Origin::fetch_range`] call must fetch,
+/// passed from the engine to the adapter. Carries both the byte span (for the
+/// data read) and the BLAKE3 [`struct@Hash`] (so the adapter can locate the sibling
+/// `{H}.obao4` outboard key). This is the produced-by-engine half of the range
+/// pull; the verify-against-root half lives in [`crate::range_pull`].
+#[derive(Debug, Clone, Copy)]
+pub struct OriginRangeRequest {
+    /// First byte of the chunk-group-aligned data span to fetch (inclusive).
+    pub fetch_start: u64,
+    /// One past the last byte of the data span to fetch (exclusive). The
+    /// adapter issues an inclusive-end `Range`/`GetObject` read of
+    /// `[fetch_start, fetch_end)`.
+    pub fetch_end: u64,
+}
+
+impl OriginRangeRequest {
+    /// Number of data bytes to fetch (`fetch_end - fetch_start`). Saturating so
+    /// a mis-constructed request can never underflow; the engine always builds
+    /// these from a validated [`crate::range_pull::AlignedRange`], where
+    /// `fetch_end >= fetch_start` holds by construction.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.fetch_end.saturating_sub(self.fetch_start)
+    }
+
+    /// Is the requested span empty? Only true for a zero-length blob; the
+    /// engine never issues an empty range against a non-empty blob.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.fetch_end <= self.fetch_start
+    }
+}
+
 /// An origin backend. Implementors fetch a blob identified by its BLAKE3 hash.
 ///
 /// The origin is **not** responsible for verifying the hash — the cache engine
@@ -232,6 +317,35 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         hash: Hash,
         max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>;
+
+    /// Fetch the chunk-group-aligned byte span `req` of the blob `hash`
+    /// **plus** its sibling `{H}.obao4` outboard, for a range-scoped pull
+    /// ([ADR 037 §Origin-tier pull-through](../../../adr/037-regional-proxy-warming.md),
+    /// #823). `outboard_max_bytes` caps the outboard read (the engine derives
+    /// it from the blob size — an outboard is `O(blob/256)` and an oversize
+    /// one is malformed/foreign).
+    ///
+    /// The default implementation returns [`OriginRangeFetch::Unsupported`],
+    /// so a custom [`Origin`] needs no change and the engine degrades to a
+    /// whole-blob [`Self::fetch`] pull. The three shipped adapters override it.
+    ///
+    /// Like [`Self::fetch`], the origin is a dumb byte store: the returned
+    /// `data` and `outboard` are **untrusted** and verified against the root
+    /// `H` by the engine via [`crate::range_pull::encode_verified_range`]
+    /// before any byte is imported.
+    ///
+    /// Returning [`OriginRangeFetch::Unsupported`] is the correct, expected
+    /// answer whenever the optimization can't apply (no `{H}.obao4`, no
+    /// `Range`/`206`, short outboard) — it is not an error. Only genuine
+    /// transport / permission failures surface as [`OriginPullError`].
+    fn fetch_range(
+        &self,
+        _hash: Hash,
+        _req: OriginRangeRequest,
+        _outboard_max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(OriginRangeFetch::Unsupported) })
+    }
 
     /// Tag identifying the backend type. Surfaced through
     /// [`crate::EvictionPreview::origin_kinds`] so admin dry-run callers

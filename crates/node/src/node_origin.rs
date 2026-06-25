@@ -54,6 +54,8 @@ use decdn_reputation::{
     combined_score,
 };
 
+use decdn_incentive::ChannelOpenFailureReason;
+
 use crate::buyer_channel::ChannelOpener;
 use crate::client_requester::{
     BlobTooLargeClaim, HashMismatch, PullTimeout, UpstreamPull, UpstreamPullHeader,
@@ -73,6 +75,30 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, rank_candidates};
 /// a single unpaid round trip, so a slow candidate is dropped quickly rather
 /// than burning the caller's miss-latency budget on it.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
+/// emitting a structured-log line with the failure-class `reason` (#966).
+///
+/// Bumps the unlabeled `node_pull_channel_open_failures` total and, when the
+/// error chain carries a [`ChannelOpenFailureReason`] (attached by the
+/// `open_channel` kernel for the three `openChannel`-tx failure classes), the
+/// matching `decdn_channel_open_failures_{reason}_total` sibling counter. A
+/// failure with no attached reason — a store fault or an unreclaimed-expired
+/// channel that aborted before the `openChannel` tx — still lands in the
+/// unlabeled total and logs `reason="unclassified"`.
+fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, err: &anyhow::Error) {
+    deps.metrics.node_pull_channel_open_failure();
+    let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
+    if let Some(reason) = reason {
+        deps.metrics.channel_open_failure_by_reason(reason);
+    }
+    debug!(
+        %provider_addr,
+        reason = reason.map_or("unclassified", ChannelOpenFailureReason::as_label),
+        %err,
+        "node-origin: buyer channel open/reuse failed"
+    );
+}
 
 /// Post-pull cost observer (#820). Invoked once per pull that acked any voucher
 /// — a successful delivery OR a paid-but-failed one (whose watermark still
@@ -248,8 +274,7 @@ impl NodeOrigin {
         {
             Ok(ctx) => ctx,
             Err(err) => {
-                deps.metrics.node_pull_channel_open_failure();
-                debug!(%provider_addr, %err, "node-origin: buyer channel open/reuse failed");
+                record_channel_open_failure(deps, provider_addr, &err);
                 return None;
             }
         };
@@ -650,8 +675,7 @@ async fn pull_from_candidate(
         Err(err) => {
             // A channel-open failure is OUR payment-side problem, not the
             // provider's fault — don't tar its reputation; just try the next.
-            deps.metrics.node_pull_channel_open_failure();
-            debug!(%provider_addr, %err, "node-origin: buyer channel open/reuse failed");
+            record_channel_open_failure(deps, provider_addr, &err);
             return None;
         }
     };
@@ -941,6 +965,47 @@ fn now_micros() -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The failure-class `reason` (#966) the `open_channel` kernel attaches to
+    /// the `anyhow` error chain must survive the additional `.context(...)`
+    /// layers `open_and_persist` / `open_or_reuse_channel` wrap around it —
+    /// `record_channel_open_failure`'s `downcast_ref` walks the whole chain, so
+    /// the metric label is recovered regardless of how deep the reason sits.
+    #[test]
+    fn failure_reason_survives_context_wrapping() {
+        for reason in [
+            ChannelOpenFailureReason::InsufficientDeposit,
+            ChannelOpenFailureReason::ContractRevert,
+            ChannelOpenFailureReason::RpcError,
+        ] {
+            // Approximate the real chain: a base error, the kernel's typed
+            // reason, then the caller's wrapping `.context` layers. The exact
+            // ordering differs from the submit path — there the kernel attaches
+            // the reason *after* its own `.context("submit openChannel")` — but
+            // `downcast_ref` walks the whole chain irrespective of layer order,
+            // which is exactly what this test pins down.
+            let err = anyhow::anyhow!("openChannel send failed: transport down")
+                .context(reason)
+                .context("submit openChannel")
+                .context("persist newly-opened buyer channel");
+            let recovered = err.downcast_ref::<ChannelOpenFailureReason>().copied();
+            assert_eq!(
+                recovered,
+                Some(reason),
+                "reason {reason:?} must be recoverable from the wrapped chain"
+            );
+        }
+
+        // An error with no attached reason (e.g. a pure store fault) downcasts
+        // to `None`, so the helper logs `unclassified` and only the unlabeled
+        // total moves.
+        let storeless = anyhow::anyhow!("redb write failed").context("persist buyer channel");
+        assert!(
+            storeless
+                .downcast_ref::<ChannelOpenFailureReason>()
+                .is_none()
+        );
+    }
 
     /// An unprovisioned `NodeOrigin` is a clean miss for any hash, so wiring it
     /// into the engine chain before its dependencies exist (or with the feature

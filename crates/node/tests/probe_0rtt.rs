@@ -28,7 +28,9 @@ use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::ProbeSlashData;
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
+use decdn_node::handlers::probe_rate_limit::ProbeRateLimiter;
 use decdn_node::metrics::Metrics;
+use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{ALPN_PROBE, MAX_RATE_PER_MB, SESSION_TICKET_CACHE_SIZE, SLASH_SIG_LEN};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -68,6 +70,23 @@ fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
         max_tracked_sources: 4096,
     };
     Arc::new(ConnectionLimiter::new(&cfg, Arc::clone(metrics)))
+}
+
+/// Permissive `ProbeRateLimiter` — the 0-RTT suite doesn't exercise the ADR
+/// 005 probe rate limiter, so all three layers are effectively unbounded.
+fn permissive_probe_rate_limiter(metrics: &Arc<Metrics>) -> Arc<ProbeRateLimiter> {
+    let cfg = RateLimitConfig {
+        per_peer_rate_per_sec: 1e9,
+        per_peer_burst: u32::MAX,
+        per_ip_rate_per_sec: 1e9,
+        per_ip_burst: u32::MAX,
+        global_rate_per_sec: 1e9,
+        global_burst: u32::MAX,
+        trusted_ips: std::collections::HashSet::new(),
+        max_tracked_per_ip: 4096,
+        max_tracked_per_peer: 4096,
+    };
+    Arc::new(ProbeRateLimiter::new(&cfg, Arc::clone(metrics)))
 }
 
 /// Server endpoint bound to loopback, relays disabled, with a `Router`
@@ -159,6 +178,7 @@ async fn spawn_core(
         Arc::new(AtomicU64::new(42)),
         Arc::clone(metrics),
         permissive_limiter(metrics),
+        permissive_probe_rate_limiter(metrics),
         cache,
         eth_signer,
         slash_domain,

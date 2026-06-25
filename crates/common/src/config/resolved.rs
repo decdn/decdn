@@ -464,6 +464,45 @@ impl Default for ResolvedDht {
     }
 }
 
+/// Resolved `cdn/probe/v1` settings (ADR 005 §Probe rate limiting).
+///
+/// Mirrors [`ResolvedDht`] in shape; `Default` returns the ADR 005 defaults
+/// (a tighter per-peer cap than the DHT layer, since probes are
+/// unauthenticated and cheaper to flood) so hand-built `ResolvedConfig` test
+/// sites can write `ResolvedProbe::default()`. The production
+/// `resolve_probe_into` path threads the defaults through the resolver bag.
+#[derive(Debug, Clone)]
+pub struct ResolvedProbe {
+    pub per_peer_rate_per_sec: f64,
+    pub per_peer_burst: u32,
+    pub per_ip_rate_per_sec: f64,
+    pub per_ip_burst: u32,
+    pub global_rate_per_sec: f64,
+    pub global_burst: u32,
+    pub trusted_ips: std::collections::HashSet<std::net::IpAddr>,
+    /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
+    pub max_tracked_per_ip: usize,
+    /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
+    /// => unbounded.
+    pub max_tracked_per_peer: usize,
+}
+
+impl Default for ResolvedProbe {
+    fn default() -> Self {
+        Self {
+            per_peer_rate_per_sec: 5.0,
+            per_peer_burst: 5,
+            per_ip_rate_per_sec: 50.0,
+            per_ip_burst: 200,
+            global_rate_per_sec: 1000.0,
+            global_burst: 2000,
+            trusted_ips: std::collections::HashSet::new(),
+            max_tracked_per_ip: 4096,
+            max_tracked_per_peer: 4096,
+        }
+    }
+}
+
 /// Resolved security / rate-limiting fields.
 #[derive(Debug, Clone)]
 pub struct ResolvedSecurity {
@@ -562,6 +601,7 @@ pub struct ResolvedConfig {
     pub gossip: ResolvedGossip,
     pub security: ResolvedSecurity,
     pub dht: ResolvedDht,
+    pub probe: ResolvedProbe,
     pub receipts: ResolvedReceipts,
     pub prefetch: ResolvedPrefetch,
 }

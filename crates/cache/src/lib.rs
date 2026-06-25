@@ -33,7 +33,8 @@ pub use error::{CacheError, CacheResult, OriginError, OriginPullError, Supported
 pub use iroh_blobs::Hash;
 pub use metrics::CacheMetrics;
 pub use origin::{
-    FilesystemOrigin, HttpOrigin, Origin, OriginFetch, S3Credentials, S3Origin, S3OriginConfig,
+    FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest,
+    S3Credentials, S3Origin, S3OriginConfig,
 };
 pub use probe_hold::{
     PROBE_HOLD_DURATION, PROBE_HOLD_MARGIN, PROBE_SLASH_WINDOW, ProbeHoldOutcome,

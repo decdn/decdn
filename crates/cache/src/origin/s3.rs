@@ -34,10 +34,15 @@ use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_smithy_http_client::{Builder as HttpBuilder, tls};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::retry::RetryConfig;
+use bytes::{Bytes, BytesMut};
 use iroh_blobs::Hash;
 use tokio_util::io::ReaderStream;
 
-use super::{DecompressMode, Origin, OriginFetch, OriginKind, OriginUrl, decompress};
+use super::fs::OBAO4_SUFFIX;
+use super::{
+    DecompressMode, Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest,
+    OriginUrl, decompress,
+};
 use crate::error::OriginPullError;
 
 /// Validated, runtime-ready configuration for an [`S3Origin`].
@@ -612,6 +617,167 @@ impl Origin for S3Origin {
             Ok(OriginFetch::Found { stream, size_hint })
         })
     }
+
+    fn fetch_range(
+        &self,
+        hash: Hash,
+        req: OriginRangeRequest,
+        outboard_max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            // Sibling outboard key: `{prefix}{hex[0..2]}/{hex}.obao4`, next to
+            // the data object. A missing key (`NoSuchKey`/404) → degrade to
+            // whole-blob (`Unsupported`), never an error.
+            let data_key = key_for(&self.prefix, hash);
+            let obao4_key = format!("{data_key}{OBAO4_SUFFIX}");
+            let Some(outboard) = self
+                .get_object_bounded(&obao4_key, outboard_max_bytes)
+                .await?
+            else {
+                return Ok(OriginRangeFetch::Unsupported);
+            };
+
+            // Empty span only for a zero-length blob.
+            if req.is_empty() {
+                return Ok(OriginRangeFetch::Ranged {
+                    data: Bytes::new(),
+                    outboard,
+                });
+            }
+
+            // Ranged data read. S3 `Range` is inclusive-end (`bytes=a-b`),
+            // matching HTTP. S3 answers `206` for an honored range; the SDK
+            // surfaces that transparently, so we validate by exact returned
+            // length instead of inspecting the status (a server that ignored
+            // the range returns the whole object and trips the length check).
+            let range_val = format!("bytes={}-{}", req.fetch_start, req.fetch_end - 1);
+            let want = req.len();
+            let log_target = format!("s3://{}/{} (range {range_val})", self.bucket, data_key);
+            let resp = match self
+                .client
+                .get_object()
+                .bucket(self.bucket.as_ref())
+                .key(&data_key)
+                .range(range_val)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                // Reuse the headers-phase classifier. A `NotFound` here is the
+                // data object disappearing between the outboard read and this
+                // read — degrade rather than error (whole-blob pull surfaces
+                // the real `NotFound`).
+                Err(e) => match classify_get_object_error(e, &log_target)? {
+                    OriginFetch::NotFound | OriginFetch::Found { .. } => {
+                        return Ok(OriginRangeFetch::Unsupported);
+                    }
+                },
+            };
+            // A ranged GET that decoded its body would break the offset→byte
+            // mapping the bao proof anchors on; refuse a compressed ranged
+            // object and degrade to the whole-blob path (which decodes safely).
+            if resp
+                .content_encoding()
+                .is_some_and(|e| !e.trim().is_empty())
+            {
+                return Ok(OriginRangeFetch::Unsupported);
+            }
+            // Fast-fail on a `Content-Length` that doesn't match the requested
+            // span BEFORE collecting the body: an origin that ignored `Range`
+            // (and is about to stream the whole object) advertises the full
+            // length here, so we degrade without buffering. The exact-length
+            // gate on the collected bytes below is the load-bearing check;
+            // this only avoids reading a body we already know is wrong-sized.
+            if let Some(len) = resp.content_length()
+                && (len < 0 || u64::try_from(len).unwrap_or(u64::MAX) != want)
+            {
+                return Ok(OriginRangeFetch::Unsupported);
+            }
+            let want_usize = usize::try_from(want).unwrap_or(usize::MAX);
+            let Some(data) = collect_bounded(resp.body, want_usize).await? else {
+                return Ok(OriginRangeFetch::Unsupported);
+            };
+            // Exact-length gate: a server that ignored `Range` (returned the
+            // whole object) or returned multipart bytes is rejected here.
+            if u64::try_from(data.len()).unwrap_or(u64::MAX) != want {
+                return Ok(OriginRangeFetch::Unsupported);
+            }
+            Ok(OriginRangeFetch::Ranged { data, outboard })
+        })
+    }
+}
+
+impl S3Origin {
+    /// GET the object at `key` and buffer the whole body, capped at
+    /// `max_bytes`. Returns `Ok(None)` for a missing key (`NoSuchKey`/404) or
+    /// an over-cap body — both degrade the range pull to a whole-blob fetch.
+    /// Used for the small sibling `{H}.obao4` outboard read.
+    async fn get_object_bounded(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Bytes>, OriginPullError> {
+        let log_target = format!("s3://{}/{}", self.bucket, key);
+        let resp = match self
+            .client
+            .get_object()
+            .bucket(self.bucket.as_ref())
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => match classify_get_object_error(e, &log_target)? {
+                // Missing outboard → degrade (the expected path for origins
+                // that don't publish `{H}.obao4`).
+                OriginFetch::NotFound | OriginFetch::Found { .. } => return Ok(None),
+            },
+        };
+        if let Some(len) = resp.content_length()
+            && (len < 0 || u64::try_from(len).unwrap_or(u64::MAX) > max_bytes)
+        {
+            return Ok(None);
+        }
+        let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        collect_bounded(resp.body, cap).await
+    }
+}
+
+/// Drain an S3 `ByteStream` into `Bytes`, returning `Ok(None)` the moment the
+/// cumulative body exceeds `cap`. Streams chunk-by-chunk (via
+/// `ByteStream::try_next`) and aborts on the first over-cap chunk WITHOUT
+/// buffering the rest — a misbehaving origin that ignores `Range` and streams a
+/// huge object (or serves an oversized `.obao4`) can't force a whole-body
+/// allocation. This mirrors the bounded streaming reader in
+/// [`crate::origin::http`] (`collect_capped`); `ByteStream::collect()` is
+/// deliberately NOT used because it buffers the entire body before any cap
+/// check. Transport errors mid-body surface as `Transient`.
+async fn collect_bounded(
+    mut body: aws_sdk_s3::primitives::ByteStream,
+    cap: usize,
+) -> Result<Option<Bytes>, OriginPullError> {
+    let mut buf = BytesMut::new();
+    loop {
+        match body.try_next().await {
+            Ok(None) => break,
+            Ok(Some(chunk)) => {
+                if buf.len().saturating_add(chunk.len()) > cap {
+                    // Over the bound → degrade. The optimization is best-effort;
+                    // an oversized span/outboard is treated as "not
+                    // range-pullable", never a hard error — and we abort here
+                    // rather than keep draining the body.
+                    return Ok(None);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Err(e) => {
+                return Err(OriginPullError::Transient(
+                    anyhow::Error::from(e).context("S3 range body read failed"),
+                ));
+            }
+        }
+    }
+    Ok(Some(buf.freeze()))
 }
 
 #[cfg(test)]

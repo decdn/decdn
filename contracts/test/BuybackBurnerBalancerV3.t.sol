@@ -39,10 +39,30 @@ contract MockBalancerV3Vault {
     IERC20[] internal tokens;
     uint256[] internal balances18;
     uint256 public swapFeePercentage = 1e16; // 1%, 1e18-scaled
+    bool public registered = true; // global registration toggle for isPoolRegistered
+    // When non-zero, only this pool address is reported registered — lets a test
+    // assert the contract passes the correct pool argument to isPoolRegistered.
+    // address(0) (default) keeps the address-agnostic behavior gated by `registered`.
+    address public registeredPool;
 
     function setPool(IERC20[] calldata tokens_, uint256[] calldata balances18_) external {
         tokens = tokens_;
         balances18 = balances18_;
+    }
+
+    /// @dev Toggle the registration state returned by `isPoolRegistered`.
+    function setRegistered(bool registered_) external {
+        registered = registered_;
+    }
+
+    /// @dev Pin the single pool address `isPoolRegistered` reports as registered.
+    function setRegisteredPool(address pool_) external {
+        registeredPool = pool_;
+    }
+
+    function isPoolRegistered(address pool) external view returns (bool) {
+        if (!registered) return false;
+        return registeredPool == address(0) || pool == registeredPool;
     }
 
     /// @dev Mutate one leg's scaled-18 balance to simulate a spot move.
@@ -446,6 +466,10 @@ contract BuybackBurnerBalancerV3Test is Test {
         bb.setMaxBuybackAmount(1);
         vm.expectRevert();
         bb.setEpochLiquidityCapFraction(1000);
+        vm.expectRevert();
+        bb.setPool(address(pool));
+        vm.expectRevert();
+        bb.setVault(address(vault));
     }
 
     // -----------------------------------------------------------------
@@ -555,14 +579,178 @@ contract BuybackBurnerBalancerV3Test is Test {
         assertEq(bb2.twapPrice(), SPOT, "decoy leg ignored in 3-token pool");
     }
 
-    function test_poolState_revertsOnMissingTokenLeg() public {
-        // Pool has USDC + a decoy but no TOKEN leg -> PoolStateInvalid.
+    function test_poolState_revertsWhenTokenLegRemovedAfterWiring() public {
+        // The pool wired in setUp is valid; mutate the Vault's token set to drop
+        // the TOKEN leg (e.g. a pool re-composition after wiring). The swap-path
+        // read remains the runtime backstop and reverts PoolStateInvalid.
         IERC20[] memory t = new IERC20[](2);
         t[0] = IERC20(address(usdc));
         t[1] = IERC20(address(0xDEAD));
-        BuybackBurnerBalancerV3 bb2 = _deployAgainstPool(t, _orderedWeights(true), _orderedBals(true));
+        vault.setPool(t, _orderedBals(true));
         vm.expectRevert(BuybackBurnerBalancerV3.PoolStateInvalid.selector);
-        bb2.poke(); // poke -> _updateTwapAccumulator -> _spotPrice -> _poolState
+        bb.poke(); // poke -> _updateTwapAccumulator -> _spotPrice -> _poolState
+    }
+
+    // -----------------------------------------------------------------
+    // Fail-fast pool-wiring validation (issue #968)
+    // -----------------------------------------------------------------
+
+    function test_constructor_revertsOnUnregisteredPool() public {
+        MockBalancerV3Vault v2 = new MockBalancerV3Vault();
+        v2.setPool(_orderedTokens(false), _orderedBals(false));
+        v2.setRegistered(false);
+        MockBalancerV3WeightedPool p2 = new MockBalancerV3WeightedPool(_orderedWeights(false));
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.vault_ = address(v2);
+        cfg.pool_ = address(p2);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.PoolNotRegistered.selector, address(p2), address(v2))
+        );
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_constructor_revertsOnMissingTokenLeg() public {
+        // Pool registered but holds USDC + a decoy, no TOKEN leg -> ctor rejects.
+        IERC20[] memory t = new IERC20[](2);
+        t[0] = IERC20(address(usdc));
+        t[1] = IERC20(address(0xDEAD));
+        MockBalancerV3Vault v2 = new MockBalancerV3Vault();
+        v2.setPool(t, _orderedBals(true));
+        MockBalancerV3WeightedPool p2 = new MockBalancerV3WeightedPool(_orderedWeights(true));
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.vault_ = address(v2);
+        cfg.pool_ = address(p2);
+        vm.expectRevert(BuybackBurnerBalancerV3.PoolStateInvalid.selector);
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_constructor_skipsValidationWhenWiringDeferred() public {
+        // pool_ and vault_ == 0: deploy succeeds, validation deferred to wiring.
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.pool_ = address(0);
+        cfg.vault_ = address(0);
+        BuybackBurnerBalancerV3 bb2 =
+            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        assertEq(bb2.balancerPool(), address(0), "pool unwired");
+        assertEq(bb2.balancerVault(), address(0), "vault unwired");
+    }
+
+    function test_setPool_revertsOnUnregisteredPool() public {
+        // The configured Vault now reports the pool as unregistered.
+        vault.setRegistered(false);
+        vm.prank(gov);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.PoolNotRegistered.selector, address(pool), address(vault))
+        );
+        bb.setPool(address(pool));
+    }
+
+    function test_setPool_revertsWhenVaultRegistersOnlyADifferentPool() public {
+        // Vault recognizes only the originally-wired pool; wiring a different
+        // (otherwise valid) pool reverts — proves the contract passes the pool
+        // address through to isPoolRegistered rather than ignoring it.
+        vault.setRegisteredPool(address(pool));
+        MockBalancerV3WeightedPool other = new MockBalancerV3WeightedPool(_orderedWeights(false));
+        vm.prank(gov);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.PoolNotRegistered.selector, address(other), address(vault))
+        );
+        bb.setPool(address(other));
+        // A rejected wiring must not partially take effect: the prior good pool
+        // is preserved (the `super.setPool` write is rolled back by the revert).
+        assertEq(bb.balancerPool(), address(pool), "rejected wiring rolled back");
+    }
+
+    function test_setPool_validatesAndWiresHappyPath() public {
+        MockBalancerV3WeightedPool p2 = new MockBalancerV3WeightedPool(_orderedWeights(false));
+        vm.prank(gov);
+        vm.expectEmit(true, true, false, false, address(bb));
+        emit BuybackBurner.PoolUpdated(address(pool), address(p2));
+        bb.setPool(address(p2));
+        assertEq(bb.balancerPool(), address(p2), "pool re-wired after passing validation");
+    }
+
+    function test_setVault_revertsWhenPoolNotRegisteredWithNewVault() public {
+        MockBalancerV3Vault v2 = new MockBalancerV3Vault();
+        v2.setPool(_orderedTokens(false), _orderedBals(false));
+        v2.setRegistered(false);
+        vm.prank(gov);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.PoolNotRegistered.selector, address(pool), address(v2))
+        );
+        bb.setVault(address(v2));
+    }
+
+    function test_setVault_revertsWhenNewVaultReportsInvalidPoolState() public {
+        // The documented danger case: a new Vault registers the pool (so the
+        // isPoolRegistered gate passes) but reports a token set missing the TOKEN
+        // leg, so `_poolState` reverts PoolStateInvalid on the rotation.
+        IERC20[] memory t = new IERC20[](2);
+        t[0] = IERC20(address(usdc));
+        t[1] = IERC20(address(0xDEAD));
+        MockBalancerV3Vault v2 = new MockBalancerV3Vault();
+        v2.setPool(t, _orderedBals(true)); // registered == true by default
+        vm.prank(gov);
+        vm.expectRevert(BuybackBurnerBalancerV3.PoolStateInvalid.selector);
+        bb.setVault(address(v2));
+    }
+
+    function test_setVault_validatesAndRotatesHappyPath() public {
+        // Rotate to a second Vault that registers the current pool and reports
+        // valid {USDC, TOKEN} legs: validation passes, vault updates, event fires.
+        MockBalancerV3Vault v2 = new MockBalancerV3Vault();
+        v2.setPool(_orderedTokens(false), _orderedBals(false));
+        vm.prank(gov);
+        vm.expectEmit(true, true, false, false, address(bb));
+        emit BuybackBurner.VaultUpdated(address(vault), address(v2));
+        bb.setVault(address(v2));
+        assertEq(bb.balancerVault(), address(v2), "vault rotated after passing validation");
+    }
+
+    function test_setPool_unwireToZeroSkipsValidationAndSucceeds() public {
+        // Zeroing a wired leg is the documented "not wired" path: it must NOT be
+        // rejected by the new override even when the Vault would report the pool
+        // unregistered. Disables the buyback (PoolNotWired) without reverting here.
+        vault.setRegistered(false);
+        vm.prank(gov);
+        bb.setPool(address(0));
+        assertEq(bb.balancerPool(), address(0), "pool unwired");
+    }
+
+    function test_wiring_validatesOnCompletingSetter_eitherOrder() public {
+        // Deploy deferred, then wire in vault-then-pool order; the pool setter
+        // that completes the pair triggers validation and passes.
+        BuybackBurnerBalancerV3 a = _deployDeferred();
+        vm.startPrank(gov);
+        a.setVault(address(vault)); // pool == 0 -> validation skipped
+        a.setPool(address(pool)); // completes the pair -> validates, passes
+        vm.stopPrank();
+        assertEq(a.balancerPool(), address(pool));
+        assertEq(a.balancerVault(), address(vault));
+    }
+
+    function test_wiring_completingSetterValidates_setVaultLast() public {
+        // Reverse order: setPool first (vault == 0, skipped), then setVault
+        // completes the pair against a Vault that reports the pool unregistered.
+        BuybackBurnerBalancerV3 a = _deployDeferred();
+        vault.setRegistered(false);
+        vm.startPrank(gov);
+        a.setPool(address(pool)); // vault == 0 -> validation skipped
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnerBalancerV3.PoolNotRegistered.selector, address(pool), address(vault))
+        );
+        a.setVault(address(vault)); // completes the pair -> validates -> reverts
+        vm.stopPrank();
+    }
+
+    function _deployDeferred() internal returns (BuybackBurnerBalancerV3 a) {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.pool_ = address(0);
+        cfg.vault_ = address(0);
+        a = new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        bytes32 govRole = a.GOVERNANCE_ROLE();
+        vm.prank(admin);
+        a.grantRole(govRole, gov);
     }
 
     function test_twap_tracksRecentSpotAcrossMultipleWindows() public {
