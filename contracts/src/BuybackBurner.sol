@@ -161,7 +161,7 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     ///      `executeBuyback` reverts with `PoolNotWired` in that case. Use
     ///      `pause()` for a single-flag disable instead of zeroing the pool.
     // slither-disable-next-line missing-zero-check
-    function setPool(address newPool) external onlyRole(GOVERNANCE_ROLE) {
+    function setPool(address newPool) public virtual onlyRole(GOVERNANCE_ROLE) {
         address old = balancerPool;
         balancerPool = newPool;
         emit PoolUpdated(old, newPool);
@@ -170,7 +170,7 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     /// @dev `newVault == address(0)` is the documented "not wired" state;
     ///      `executeBuyback` reverts with `PoolNotWired` in that case.
     // slither-disable-next-line missing-zero-check
-    function setVault(address newVault) external onlyRole(GOVERNANCE_ROLE) {
+    function setVault(address newVault) public virtual onlyRole(GOVERNANCE_ROLE) {
         address old = balancerVault;
         balancerVault = newVault;
         emit VaultUpdated(old, newVault);

@@ -152,6 +152,7 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
     error BuybackBandInverted(uint256 minAmount, uint256 maxAmount);
     error UnsupportedTokenDecimals(uint8 decimals);
     error PoolStateInvalid();
+    error PoolNotRegistered(address pool, address vault);
 
     // -----------------------------------------------------------------
     // Construction
@@ -210,6 +211,12 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         uint8 usdcDecimals = IERC20Metadata(address(usdc_)).decimals();
         if (usdcDecimals > 18) revert UnsupportedTokenDecimals(usdcDecimals);
         usdcTo18 = 10 ** (18 - usdcDecimals);
+
+        // Fail-fast on a pool/vault supplied at deploy (issue #968): a `Config`
+        // that wires both must reference a Vault-registered pool containing at
+        // least the {USDC, TOKEN} legs. A `Config` that defers wiring (pool_ or
+        // vault_ == 0) skips this and is rejected later with `PoolNotWired`.
+        _validatePoolWiring();
     }
 
     // -----------------------------------------------------------------
@@ -274,6 +281,31 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         address old = address(swapRouter);
         swapRouter = IBalancerV3Router(newRouter);
         emit SwapRouterUpdated(old, newRouter);
+    }
+
+    /// @inheritdoc BuybackBurner
+    /// @dev Wraps the base setter with fail-fast wiring validation (issue #968):
+    ///      once both pool and vault are set, the new pool must be Vault-
+    ///      registered and contain at least the {USDC, TOKEN} legs, else this
+    ///      reverts (`PoolNotRegistered` / `PoolStateInvalid`) instead of
+    ///      silently accepting a mis-wired or substituted pool. `newPool ==
+    ///      address(0)` stays the documented "not wired" state (validation
+    ///      skipped); prefer `pause()` to disable without unwiring.
+    function setPool(address newPool) public override onlyRole(GOVERNANCE_ROLE) {
+        super.setPool(newPool);
+        _validatePoolWiring();
+    }
+
+    /// @inheritdoc BuybackBurner
+    /// @dev Symmetric to `setPool`: revalidates the (pool, vault) pair so a Vault
+    ///      rotation the current pool is not registered with fails fast. Note the
+    ///      new Vault is the unverified trust root — `_validatePoolWiring` asks it
+    ///      whether the pool is registered AND reads the pool's leg balances from
+    ///      it, so a malicious Vault can satisfy both. That residual surface is
+    ///      bounded by `GOVERNANCE_ROLE` + the 48h timelock, not by this check.
+    function setVault(address newVault) public override onlyRole(GOVERNANCE_ROLE) {
+        super.setVault(newVault);
+        _validatePoolWiring();
     }
 
     /// @notice Rotate the single keeper: revoke `KEEPER_ROLE` from the old
@@ -459,9 +491,36 @@ contract BuybackBurnerBalancerV3 is BuybackBurner {
         return balUsdc18 / usdcTo18;
     }
 
+    /// @dev Fail-fast pool-wiring guard, shared by the constructor and the
+    ///      `setPool`/`setVault` overrides. No-ops while either leg of the
+    ///      (pool, vault) pair is unwired (`address(0)`) — that state stays the
+    ///      documented "not wired" path rejected later by `PoolNotWired`. Once
+    ///      both are set, requires the pool to be registered with the configured
+    ///      Vault (`PoolNotRegistered`) and to contain at least the {USDC, TOKEN}
+    ///      legs with non-zero balances/weights — the latter reusing the same
+    ///      `_poolState` invariant the swap path relies on (`PoolStateInvalid`);
+    ///      additional (decoy) legs are tolerated, exactly as at swap time.
+    ///      Closes the silent mis-wire / pool-substitution gap (issue #968): a
+    ///      bad pool is rejected at wiring time, not first surfaced at swap time.
+    ///      The Vault is the trust root for both checks and is not itself
+    ///      validated (see `setVault`).
+    // slither-disable-next-line unused-return
+    function _validatePoolWiring() internal view {
+        address pool = balancerPool;
+        address vault = balancerVault;
+        if (pool == address(0) || vault == address(0)) return;
+        if (!IBalancerV3Vault(vault).isPoolRegistered(pool)) revert PoolNotRegistered(pool, vault);
+        // Discards the returned balances/weights — called only for its
+        // {USDC, TOKEN}-legs-present-and-non-zero revert (`PoolStateInvalid`).
+        // This revert is load-bearing for the guard: `_poolState` MUST revert on
+        // an invalid leg set (do not soften it to return zeros).
+        _poolState();
+    }
+
     /// @dev Reads the Vault's scaled-18 balances + the pool's normalized weights
-    ///      and locates the USDC and TOKEN legs by address. Reverts
-    ///      `PoolStateInvalid` if either leg is absent or zero-balance.
+    ///      and locates the USDC and TOKEN legs by address (ignoring any extra
+    ///      legs). Reverts `PoolStateInvalid` if either leg is absent or
+    ///      zero-balance — relied on by `_validatePoolWiring` and the swap path.
     function _poolState() internal view returns (uint256 balUsdc18, uint256 balToken18, uint256 wUsdc, uint256 wToken) {
         IBalancerV3Vault vault = IBalancerV3Vault(balancerVault);
         IERC20[] memory tokens = vault.getPoolTokens(balancerPool);
