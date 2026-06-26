@@ -4291,3 +4291,104 @@ async fn origin_range_request_len_and_empty() {
     assert!(z.is_empty());
     assert_eq!(z.len(), 0);
 }
+
+// ----------------------------------------------------------------------------
+// `Origin::size` — the best-effort blob-size probe that scopes a range pull
+// (#823). HTTP uses a `HEAD`; the filesystem origin stats the data object.
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_size_returns_content_length_via_head() -> anyhow::Result<()> {
+    let payload: &[u8] = b"size me up";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    // A real origin's HEAD reply carries `Content-Length` in the header (HEAD
+    // has no body); set it explicitly so reqwest's `content_length()` sees it.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", payload.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+
+    anyhow::ensure!(
+        origin.size(hash).await? == Some(payload.len() as u64),
+        "HEAD Content-Length must be the canonical size",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_size_missing_object_is_none() -> anyhow::Result<()> {
+    let hash = Hash::new(b"absent");
+    let server = MockServer::start().await;
+    // No mounted HEAD route → wiremock answers 404 → unknown size.
+    let origin = HttpOrigin::parse(&server.uri())?;
+    anyhow::ensure!(
+        origin.size(hash).await?.is_none(),
+        "404 HEAD must degrade to None"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_size_compressed_object_is_unknown() -> anyhow::Result<()> {
+    // A `Content-Encoding` HEAD advertises the *encoded* length, not the
+    // canonical blob size — `size` must degrade to `None` so a wrong length
+    // never reaches bao alignment. Mirrors the S3 adapter's coverage.
+    let payload: &[u8] = b"compressed body";
+    let hash = Hash::new(payload);
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", payload.len().to_string())
+                .insert_header("Content-Encoding", "gzip"),
+        )
+        .mount(&server)
+        .await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+    anyhow::ensure!(
+        origin.size(hash).await?.is_none(),
+        "a compressed HEAD must degrade to None"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn origin_size_no_origin_configured_errors() -> anyhow::Result<()> {
+    // `CacheEngine::origin_size` mirrors `pull_through_range`: with no origins
+    // it returns `NoOrigin` (a coherent "can't range-pull" signal) rather than
+    // a silent `None`.
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
+    let err = err_of(engine.origin_size(Hash::new(b"x")).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::NoOrigin { .. }),
+        "expected NoOrigin, got {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs_size_returns_on_disk_length() -> anyhow::Result<()> {
+    let payload: &[u8] = b"on-disk canonical length";
+    let hash = Hash::new(payload);
+    let origin_dir = tempfile::tempdir()?;
+    seed_fs_blob(origin_dir.path(), hash, payload)?;
+    let origin = FilesystemOrigin::new(origin_dir.path()).await?;
+
+    anyhow::ensure!(
+        origin.size(hash).await? == Some(payload.len() as u64),
+        "fs size must be the file length",
+    );
+    // A blob that isn't on disk has no size.
+    anyhow::ensure!(
+        origin.size(Hash::new(b"never seeded")).await?.is_none(),
+        "absent fs object must be None",
+    );
+    Ok(())
+}

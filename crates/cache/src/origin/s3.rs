@@ -31,6 +31,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_smithy_http_client::{Builder as HttpBuilder, tls};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::retry::RetryConfig;
@@ -472,6 +473,56 @@ fn classify_get_object_error(
     }
 }
 
+/// Classify a `HeadObject` error for the best-effort [`Origin::size`] probe.
+/// A 404 / `NotFound` is a missing object, not a fault — return `Ok(None)` so
+/// the engine degrades the range pull to a whole-blob fetch. Transient
+/// transport / 5xx faults surface as [`OriginPullError::Transient`]; anything
+/// else is [`OriginPullError::Permanent`]. Mirrors
+/// [`classify_get_object_error`] but collapses the not-found arm into the
+/// `None` size signal.
+fn classify_head_object_error(
+    err: SdkError<HeadObjectError>,
+    log_target: &str,
+) -> Result<Option<u64>, OriginPullError> {
+    match err {
+        SdkError::ServiceError(service_err) => {
+            let status = service_err.raw().status().as_u16();
+            let inner = service_err.into_err();
+            // The modeled `NotFound`, or a bare 404, means the object is absent
+            // → unknown size, degrade. HeadObject carries no response body, so
+            // the AWS error code is frequently empty on a 404; treat either
+            // signal as not-found.
+            if matches!(inner, HeadObjectError::NotFound(_)) || status == 404 {
+                return Ok(None);
+            }
+            let context = format!(
+                "{log_target}: S3 HeadObject returned {status} ({})",
+                inner.code().unwrap_or("<no error code>")
+            );
+            if is_transient_status(status) {
+                Err(OriginPullError::Transient(
+                    anyhow::Error::from(inner).context(context),
+                ))
+            } else {
+                Err(OriginPullError::Permanent(
+                    anyhow::Error::from(inner).context(context),
+                ))
+            }
+        }
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => {
+            Err(OriginPullError::Transient(
+                anyhow::Error::from(err)
+                    .context(format!("{log_target}: S3 HeadObject transport failure")),
+            ))
+        }
+        // Conservative: classify construction/parse and any future
+        // `#[non_exhaustive]` variant as Permanent (mirrors the GetObject path).
+        other => Err(OriginPullError::Permanent(
+            anyhow::Error::from(other).context(format!("{log_target}: S3 HeadObject failed")),
+        )),
+    }
+}
+
 impl Origin for S3Origin {
     fn kind(&self) -> OriginKind {
         OriginKind::S3
@@ -703,6 +754,44 @@ impl Origin for S3Origin {
                 return Ok(OriginRangeFetch::Unsupported);
             }
             Ok(OriginRangeFetch::Ranged { data, outboard })
+        })
+    }
+
+    fn size(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let key = key_for(&self.prefix, hash);
+            let log_target = format!("s3://{}/{key}", self.bucket);
+            // `HeadObject` returns the object metadata (including
+            // `Content-Length`) without transferring the body — the cheapest
+            // way to learn the canonical blob size before a range pull.
+            let resp = match self
+                .client
+                .head_object()
+                .bucket(self.bucket.as_ref())
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return classify_head_object_error(e, &log_target),
+            };
+            // A `Content-Encoding` object advertises the *encoded* length here,
+            // not the canonical blob size — degrade to unknown, consistent with
+            // `fetch_range` refusing compressed ranges.
+            if resp
+                .content_encoding()
+                .is_some_and(|e| !e.trim().is_empty())
+            {
+                return Ok(None);
+            }
+            // `content_length()` is `Option<i64>`; a negative or absent value is
+            // unusable → unknown size.
+            Ok(resp
+                .content_length()
+                .and_then(|len| u64::try_from(len).ok()))
         })
     }
 }

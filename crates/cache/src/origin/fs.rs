@@ -367,6 +367,52 @@ impl Origin for FilesystemOrigin {
             })
         })
     }
+
+    fn size(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            // The local data object's on-disk length IS the canonical blob size
+            // (filesystem origins never compress), so a `metadata()` stat is an
+            // exact, body-free answer. Resolve + contain the path exactly as
+            // `fetch` / `fetch_range` do so a symlink escape is a permanent
+            // failure, not a silent read outside `base`.
+            let path = self.path_for(hash);
+            let canonical = match tokio::fs::canonicalize(&path).await {
+                Ok(p) => p,
+                // Missing data object → unknown size, degrade to whole-blob
+                // (which then surfaces the real `NotFound`).
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path canonicalize failed for {}",
+                        path.display()
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            };
+            if !canonical.starts_with(&self.base) {
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "cache.origin.path entry {} resolves to {} which is outside base {}",
+                    path.display(),
+                    canonical.display(),
+                    self.base.display()
+                )));
+            }
+            match tokio::fs::metadata(&canonical).await {
+                Ok(meta) => Ok(Some(meta.len())),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path metadata failed for {}",
+                        canonical.display()
+                    );
+                    Err(classify_io_error(err).map_inner(|e| e.context(msg)))
+                }
+            }
+        })
+    }
 }
 
 /// Defense-in-depth running-cap wrapper around a chunk stream. The

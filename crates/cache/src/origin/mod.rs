@@ -347,6 +347,32 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         Box::pin(async { Ok(OriginRangeFetch::Unsupported) })
     }
 
+    /// Best-effort total byte size of the blob `hash`, used to scope a
+    /// range-pull ([`Self::fetch_range`], #823): the bao tree needs the blob's
+    /// **exact** total length to verify a sub-range against the root `H`, and
+    /// the `{H}.obao4` outboard alone only pins the size to within one chunk
+    /// group (`IROH_BLOCK_SIZE`, 16 KiB — the final group's true length isn't in
+    /// the tree). The
+    /// `cdn/client/v1` serving handler calls this on a cold ranged cache miss
+    /// — via [`crate::CacheEngine::origin_size`] — before
+    /// [`crate::CacheEngine::pull_through_range`].
+    ///
+    /// The probe is cheap (HTTP `HEAD` / S3 `HeadObject` / `fs` metadata) and
+    /// **best-effort**: `Ok(None)` means the size is unavailable — the object
+    /// is absent, or the backend reports a `Content-Encoding` whose advertised
+    /// length is the *encoded* size (not the canonical blob length, same trap
+    /// as [`Self::fetch`]'s `size_hint`), or the backend can't answer. The
+    /// engine then degrades the range pull to a whole-blob [`Self::fetch`].
+    /// Only a genuine transport / permission fault surfaces as
+    /// [`OriginPullError`]. The default returns `Ok(None)`, so a custom
+    /// [`Origin`] needs no change and simply never range-pulls.
+    fn size(
+        &self,
+        _hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Tag identifying the backend type. Surfaced through
     /// [`crate::EvictionPreview::origin_kinds`] so admin dry-run callers
     /// can estimate origin egress cost (#439) — `Filesystem` is a local

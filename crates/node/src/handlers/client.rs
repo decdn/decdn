@@ -36,7 +36,7 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{Bytes, CacheEngine, CacheError, Hash, TeeOpen, TeeSink};
+use decdn_cache::{Bytes, CacheEngine, CacheError, Hash, RangePullOutcome, TeeOpen, TeeSink};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
@@ -596,6 +596,60 @@ impl ClientHandler {
         }
     }
 
+    /// Attempt to fill a bounded/offset cache-miss request by pulling only the
+    /// requested byte span from origin (#823, ADR 037 §Origin-tier
+    /// pull-through), rather than the whole
+    /// blob. Returns `Some(total_blob_size)` when the span is now present as a
+    /// verified partial blob (the size is the authoritative whole-blob length
+    /// the size gate advertises to the client), or `None` to degrade to the
+    /// whole-blob pull-through path.
+    ///
+    /// The blob's exact total size is needed up front to anchor the requested
+    /// sub-range in the bao tree, so this first probes the origin
+    /// ([`CacheEngine::origin_size`] — a cheap `HEAD`/`HeadObject`/stat). An
+    /// unknown size, or an origin that can't serve a verified range
+    /// ([`RangePullOutcome::Unsupported`]), degrades to `None`. Every failure
+    /// mode here is best-effort: the caller falls back to a whole-blob pull,
+    /// which is always correct.
+    async fn try_range_pull_through(&self, hash: Hash, req: &StreamRequest) -> Option<u64> {
+        let blob_size = match self.cache.origin_size(hash).await {
+            Ok(Some(size)) => size,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!(%hash, error = %e, "origin size probe failed; degrading to whole-blob pull");
+                return None;
+            }
+        };
+        match self
+            .cache
+            .pull_through_range(hash, req.byte_offset, req.byte_len, blob_size)
+            .await
+        {
+            Ok(RangePullOutcome::Served) => Some(blob_size),
+            Ok(RangePullOutcome::Unsupported) => None,
+            // A local store fault (`pull_through_range` fail-fasts on
+            // `CacheError::Store` — disk-full / IO / a fault in the partial
+            // `import_bao_bytes` path — rather than masking it behind another
+            // origin) is a genuine local problem. It still degrades to the
+            // whole-blob path (so the client isn't denied service if that path
+            // can fill from a different store route), but log it at `warn`: a
+            // fault localized to the partial-import path would otherwise be
+            // silently masked by a succeeding whole-blob fallback, leaving the
+            // range optimization quietly disabled with no operator-visible signal.
+            Err(e @ CacheError::Store(_)) => {
+                tracing::warn!(%hash, error = %e, "range pull-through hit a local store fault; degrading to whole-blob pull");
+                None
+            }
+            // An out-of-bounds range or a logically-evicted hash surfaces as an
+            // error; degrade to the whole-blob path (which re-applies the same
+            // eviction guard and bound checks) rather than failing the stream.
+            Err(e) => {
+                tracing::debug!(%hash, error = %e, "range pull-through declined; degrading to whole-blob pull");
+                None
+            }
+        }
+    }
+
     /// Wait for a concurrent fill of `hash` to land, then report whether the blob
     /// is now present (#856 coalescing). Used when [`CacheEngine::open_tee_sink`]
     /// reported [`TeeOpen::InFlight`]: another request is already pulling this
@@ -908,6 +962,12 @@ impl ClientHandler {
 
         let hash = Hash::from_bytes(req.hash);
 
+        // Set by the origin-tier range pull-through below (#823) when a
+        // bounded/offset cache-miss request was filled as a *partial* blob.
+        // Carries the authoritative whole-blob size (from the origin size
+        // probe) past the size gate, which can't `inspect` a partial blob.
+        let mut range_pulled_size: Option<u64> = None;
+
         // Blob availability gate. A store fault is NOT an absence: `Ok(false)`
         // means the node genuinely lacks the blob (NotFound / EvictedSinceProbe),
         // but `Err` is a transient local store failure that must not masquerade
@@ -959,6 +1019,23 @@ impl ClientHandler {
                 // successful fill, fall through to the normal size-gate +
                 // delivery path; otherwise it stays a `NotFound`.
                 //
+                // Origin-tier range pull-through (#823, ADR 037 §Origin-tier
+                // pull-through). When the
+                // request is a bounded/offset range, scope the cache-miss origin
+                // fetch to exactly the requested span (fetch `[offset, offset+len)`
+                // + the `{H}.obao4` outboard, bao-verify, import a partial blob)
+                // instead of pulling the whole blob to serve a slice. Gated on
+                // the same pull-authorization as the whole-blob fill. Best-effort:
+                // any decline (unknown origin size, no published outboard, no
+                // `Range` support, verify failure) leaves `range_pulled_size` as
+                // `None` and falls through to the whole-blob path below, which is
+                // always correct (ADR 037 §"Fallback is always correct").
+                if (req.byte_offset > 0 || req.byte_len > 0)
+                    && self.pull_authorized(&req, verified_client).await
+                {
+                    range_pulled_size = self.try_range_pull_through(hash, &req).await;
+                }
+
                 // Window-paced pull-through (#856, ADR 037) is the preferred path
                 // when its provider is attached: instead of buffering the whole
                 // blob via `populate` and only THEN serving (fronting 100% of the
@@ -967,8 +1044,22 @@ impl ClientHandler {
                 // exposure is bounded to `pull_ahead_bytes`. It requires an
                 // offset-0 request (the incremental whole-blob hash is only valid
                 // from 0); a resumed miss falls back to the buffered path.
-                if let Some(origin) = self.pull_through_origin.get()
+                //
+                // It also requires `byte_len == 0` (a whole-blob/whole-tail
+                // request): the window loop streams and bills the entire blob, so
+                // routing a *bounded* `byte_len > 0` request here (e.g. when the
+                // range pull declined for lack of an outboard) would over-deliver
+                // and over-bill the whole blob to a client that asked for a
+                // prefix. A bounded request whose range pull declines therefore
+                // falls to the buffered path below, which serves exactly the
+                // requested span via `export_range` (#823).
+                if range_pulled_size.is_some() {
+                    // The requested span is already present as a verified partial
+                    // blob — skip the whole-blob fill and fall through to the
+                    // size gate + delivery (which serves it via `export_range`).
+                } else if let Some(origin) = self.pull_through_origin.get()
                     && req.byte_offset == 0
+                    && req.byte_len == 0
                     && self.pull_authorized(&req, verified_client).await
                 {
                     match self.cache.open_tee_sink(hash) {
@@ -1024,30 +1115,39 @@ impl ClientHandler {
             }
         }
 
-        // Size gate. `has` just confirmed the blob is present and complete, so an
-        // `inspect` error — or a `None` size (a `Partial`/`NotFound` status) — is
-        // a real store fault, NOT a zero-length blob. Advertising `total_bytes: 0`
-        // for a non-empty blob would sign a `StreamResponse` the delivery then
+        // Size gate. An origin-tier range pull (#823) imported only a *partial*
+        // blob, so `inspect`/`has` can't report the whole-blob size — but the
+        // origin size probe already gave us the authoritative total, which the
+        // client needs for resume math. Use it directly in that case. Otherwise
+        // `has` just confirmed the blob is present and complete, so an `inspect`
+        // error — or a `None` size (a `Partial`/`NotFound` status) — is a real
+        // store fault, NOT a zero-length blob. Advertising `total_bytes: 0` for
+        // a non-empty blob would sign a `StreamResponse` the delivery then
         // contradicts, and the receiver (expecting 0 bytes) would abort on the
         // first chunk. Surface the fault instead; only a genuinely complete,
         // zero-length blob yields `total_bytes == 0`.
-        let size = match self.cache.inspect(hash).await {
-            Ok(preview) => preview.size_bytes,
-            Err(e) => {
-                tracing::warn!(%hash, error = %e, "cache `inspect` failed on delivery path");
+        let total_bytes = if let Some(total) = range_pulled_size {
+            total
+        } else {
+            let size = match self.cache.inspect(hash).await {
+                Ok(preview) => preview.size_bytes,
+                Err(e) => {
+                    tracing::warn!(%hash, error = %e, "cache `inspect` failed on delivery path");
+                    return self
+                        .respond_error(&mut send, &req, ServeRejectReason::InternalError)
+                        .await;
+                }
+            };
+            let Some(total_bytes) = size else {
+                tracing::warn!(
+                    %hash,
+                    "blob present per `has` but `inspect` reports no size; treating as fault"
+                );
                 return self
                     .respond_error(&mut send, &req, ServeRejectReason::InternalError)
                     .await;
-            }
-        };
-        let Some(total_bytes) = size else {
-            tracing::warn!(
-                %hash,
-                "blob present per `has` but `inspect` reports no size; treating as fault"
-            );
-            return self
-                .respond_error(&mut send, &req, ServeRejectReason::InternalError)
-                .await;
+            };
+            total_bytes
         };
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
             return self
@@ -1132,6 +1232,7 @@ impl ClientHandler {
             &mut recv,
             hash,
             req.byte_offset,
+            req.byte_len,
             channel_id,
             Some(&channel),
             client_node_id,
@@ -1588,21 +1689,31 @@ impl ClientHandler {
         recv: &mut RecvStream,
         hash: Hash,
         byte_offset: u64,
+        byte_len: u64,
         channel_id: ChannelId,
         channel: Option<&Arc<Mutex<ChannelDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
         interval_mb: u64,
     ) -> anyhow::Result<()> {
-        let blob = self
-            .cache
-            .get(hash)
-            .await
-            .map_err(|e| anyhow::anyhow!("cache get failed: {e}"))?;
-        let offset = usize::try_from(byte_offset)
-            .unwrap_or(usize::MAX)
-            .min(blob.len());
-        let data = blob.slice(offset..);
+        // For a bounded/offset range, serve exactly the requested span from the
+        // store via `export_range` (#823): this works on a complete blob AND on
+        // the *partial* blob an origin-tier range pull imported, and avoids
+        // materializing the whole blob in memory just to slice off a tail. A
+        // whole-blob request (`byte_offset == 0 && byte_len == 0`) keeps the
+        // existing `get` path. Vouchers below meter the actually-served bytes,
+        // so range delivery is billed over the span, not the whole blob.
+        let data = if byte_offset > 0 || byte_len > 0 {
+            self.cache
+                .export_range(hash, byte_offset, byte_len)
+                .await
+                .map_err(|e| anyhow::anyhow!("cache export_range failed: {e}"))?
+        } else {
+            self.cache
+                .get(hash)
+                .await
+                .map_err(|e| anyhow::anyhow!("cache get failed: {e}"))?
+        };
 
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES);
         let mut unvouchered: u64 = 0;

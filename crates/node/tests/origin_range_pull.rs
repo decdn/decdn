@@ -1,0 +1,562 @@
+//! End-to-end test for origin-tier range pull-through on `cdn/client/v1`
+//! (#823, ADR 037 §Origin-tier pull-through; closes the #990 coverage gap).
+//!
+//! A `cdn/client/v1` byte-range request (`StreamRequest` with `byte_offset` /
+//! `byte_len`) against a **cold** cache must fetch only the requested span
+//! from origin — not the whole blob — bao-verify it against the content
+//! address, and assemble the correct bytes back to the paying client. The
+//! engine machinery (`pull_through_range` / `export_range`) and the origin
+//! adapters are unit-tested in `decdn-cache`; this test exercises the full
+//! protocol path through the [`ClientHandler`].
+//!
+//! Two scenarios:
+//! 1. The origin publishes the sibling `{H}.obao4` outboard → the handler
+//!    range-pulls (HEAD for the size, outboard GET, one `206` ranged data GET),
+//!    serves the span, and the blob stays **partial** (never a whole-blob GET).
+//! 2. The origin does NOT publish the outboard → the range pull declines and
+//!    the handler falls back to the buffered whole-blob pull, still serving the
+//!    correct range bytes ("fallback is always correct", ADR 037).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::{Address, B256, U256};
+use alloy::signers::SignerSync;
+use alloy::signers::local::PrivateKeySigner;
+use bao_tree::io::outboard::PreOrderMemOutboard;
+use bytes::BytesMut;
+use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range};
+use decdn_cache::{CacheEngine, Hash, HttpOrigin, Origin};
+use decdn_incentive::{
+    ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore, Voucher,
+    bind_node_id_domain, binding_signing_hash, signed_to_wire_voucher, slash_judge_domain,
+    voucher_domain,
+};
+use decdn_node::handlers::client::ClientHandler;
+use decdn_node::metrics::Metrics;
+use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
+use decdn_protocol::{
+    ALPN_CLIENT, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, encode_stream_request, write_frame,
+};
+use iroh::EndpointAddr;
+use iroh::endpoint::SendStream;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+mod support;
+use support::{
+    HandlerDomains, build_handler_full, fresh_key, local_endpoint, permissive_limiter,
+    read_client_msg, spawn_server, write_client_msg,
+};
+
+const CHAIN_ID: u64 = 421_614;
+const TOKEN: Address = Address::repeat_byte(0x22);
+const RATE_PER_MB: u64 = 10;
+
+fn slash_dom() -> Eip712Domain {
+    slash_judge_domain(CHAIN_ID, Address::repeat_byte(0x11))
+}
+fn voucher_dom() -> Eip712Domain {
+    voucher_domain(CHAIN_ID, Address::repeat_byte(0x34))
+}
+fn binding_dom() -> Eip712Domain {
+    bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99))
+}
+fn domains() -> HandlerDomains {
+    HandlerDomains {
+        slash: slash_dom(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    }
+}
+
+/// A distinctive 200 KiB payload (so a 16 KiB-aligned sub-range is a strict
+/// interior slice) plus its pre-order bao outboard and content hash.
+fn blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {
+    let blob: Vec<u8> = (0..200 * 1024u32)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+    let hash = Hash::from_bytes(*ob.root.as_bytes());
+    (blob, ob.data, hash)
+}
+
+/// Register a single channel owned by `client` and build a `ClientHandler` over
+/// a cache whose only origin is `origin_uri`. Returns the handler plus a cache
+/// clone so the test can inspect `has` after delivery.
+async fn handler_over_http_origin(
+    origin_uri: &str,
+    channel_id: B256,
+    client: Address,
+    server_eth: &Arc<PrivateKeySigner>,
+    server_id: iroh::PublicKey,
+) -> anyhow::Result<(Arc<ClientHandler>, CacheEngine, tempfile::TempDir)> {
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id,
+        client,
+        TOKEN,
+        U256::from(10_000_000u64),
+    ))?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(origin_uri)?);
+    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store;
+    let handler = build_handler_full(
+        server_id,
+        server_eth,
+        &metrics,
+        limiter,
+        cache.clone(),
+        store_dyn,
+        RATE_PER_MB,
+        &domains(),
+        0,
+        16,
+    )?;
+    Ok((handler, cache, cache_dir))
+}
+
+/// A manual `cdn/client/v1` client that requests the bounded range
+/// `[byte_offset, byte_offset + byte_len)` with an ownership binding (so the
+/// server's `pull_authorized` gate passes), pays the vouchers the server
+/// collects, and returns the assembled range bytes. Modeled on
+/// `node_origin_pull::leaf_paced_pull`, but the closing-voucher trigger keys on
+/// the requested `byte_len` — the server advertises the *whole-blob*
+/// `total_bytes`, yet only the range is delivered.
+#[allow(clippy::too_many_arguments)]
+async fn ranged_paid_pull(
+    client_ep: &iroh::Endpoint,
+    target: EndpointAddr,
+    client_node_id: B256,
+    client_eth: &Arc<PrivateKeySigner>,
+    channel_id: B256,
+    hash: Hash,
+    byte_offset: u64,
+    byte_len: u64,
+    rate: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = client_eth
+        .sign_hash_sync(&binding_hash)?
+        .as_bytes()
+        .to_vec();
+    let ext = StreamRequestExt {
+        voucher_interval_mb: None,
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature,
+        }),
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: channel_id.into(),
+        byte_offset,
+        byte_len,
+        timestamp_us: 0x9001,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame_to(&mut send, &payload).await?;
+
+    let resp = match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamResponse(r) => r,
+        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
+    };
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
+    // The advertised size is the *whole* blob; the range delivers `byte_len`.
+    let expected = byte_len;
+    let interval_bytes = resp
+        .voucher_interval_mb
+        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
+        .saturating_mul(MB_BYTES);
+
+    let mut buf = BytesMut::new();
+    let mut cumulative: u64 = 0;
+    let mut unvouchered: u64 = 0;
+    let mut nonce: u64 = 0;
+    loop {
+        match read_client_msg(&mut recv).await? {
+            ClientMessage::ChunkData(chunk) => {
+                buf.extend_from_slice(&chunk.bytes);
+                let len = u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX);
+                cumulative = cumulative.saturating_add(len);
+                unvouchered = unvouchered.saturating_add(len);
+                let boundary = interval_bytes > 0 && unvouchered >= interval_bytes;
+                let closing = cumulative >= expected && unvouchered > 0;
+                if boundary || closing {
+                    nonce += 1;
+                    let amount = U256::from(cumulative)
+                        .saturating_mul(U256::from(rate))
+                        .div_ceil(U256::from(MB_BYTES));
+                    let signed = Voucher {
+                        channel_id,
+                        amount,
+                        nonce: U256::from(nonce),
+                        bytes_delivered: U256::from(cumulative),
+                        token: TOKEN,
+                    }
+                    .sign(client_eth.as_ref(), &voucher_dom())
+                    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+                    write_client_msg(
+                        &mut send,
+                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
+                    )
+                    .await?;
+                    match read_client_msg(&mut recv).await? {
+                        ClientMessage::VoucherAck => {}
+                        ClientMessage::StreamError(e) => {
+                            anyhow::bail!("voucher rejected: {e:?}")
+                        }
+                        other => anyhow::bail!("expected VoucherAck, got {other:?}"),
+                    }
+                    unvouchered = 0;
+                }
+            }
+            ClientMessage::StreamEnd => break,
+            ClientMessage::StreamError(e) => anyhow::bail!("stream error mid-delivery: {e:?}"),
+            other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
+        }
+    }
+    conn.close(0u32.into(), b"done");
+    Ok(buf.to_vec())
+}
+
+async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result<()> {
+    write_frame(send, payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write frame: {e}"))
+}
+
+/// Count `received_requests` matching a predicate, failing loudly if wiremock
+/// recording was disabled (which would make the assertion silently pass).
+async fn count_requests(
+    server: &MockServer,
+    pred: impl Fn(&wiremock::Request) -> bool,
+) -> anyhow::Result<usize> {
+    let reqs = server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("wiremock request recording disabled"))?;
+    Ok(reqs.iter().filter(|r| pred(r)).count())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    // The requested sub-range and the chunk-group-aligned span the engine will
+    // actually fetch (computed with the same helper the engine uses).
+    let (req_off, req_len) = (16 * 1024u64, 32 * 1024u64);
+    let aligned = align_range(req_off, req_len, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    // (1) HEAD → canonical blob size (no body); the origin size probe.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    // (2) sibling outboard GET.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    // (3) ranged data GET → 206 with exactly the aligned span. NOTE: there is
+    // deliberately NO whole-blob (un-ranged) GET mounted, so any attempt to
+    // pull the whole blob would 404 and fail — the range path must be used.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span.clone()))
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x42);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        channel_id,
+        hash,
+        req_off,
+        req_len,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    // The delivered bytes are exactly the requested sub-range of the blob.
+    let want = blob
+        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
+        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "delivered range mismatch: got {} bytes, want {}",
+        got.len(),
+        want.len()
+    );
+
+    // The origin served the range, NOT the whole blob: exactly one ranged GET
+    // and zero un-ranged GETs on the data object.
+    let ranged_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers.contains_key("range")
+    })
+    .await?;
+    let wholeblob_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && !r.headers.contains_key("range")
+    })
+    .await?;
+    anyhow::ensure!(
+        ranged_gets == 1,
+        "expected one ranged data GET, got {ranged_gets}"
+    );
+    anyhow::ensure!(
+        wholeblob_gets == 0,
+        "the whole blob must never be fetched to serve a range, saw {wholeblob_gets} un-ranged GET(s)"
+    );
+
+    // The blob is held only as a partial: a range pull does not promote a
+    // complete blob, so `has` stays false (ADR 037 §partial-not-advertised).
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "a range pull must leave the blob partial, not a full holder"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Result<()> {
+    let (blob, _outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+    let (req_off, req_len) = (16 * 1024u64, 32 * 1024u64);
+
+    let server = MockServer::start().await;
+    // HEAD answers (the size probe succeeds), but NO `{H}.obao4` is published,
+    // so the range pull declines. A plain whole-blob GET IS served, so the
+    // buffered fallback can fill the cache.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x43);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+    )
+    .await?;
+    // Enable the buffered whole-blob pull-through the fallback relies on.
+    handler.attach_pull_through(Duration::from_secs(15));
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        channel_id,
+        hash,
+        req_off,
+        req_len,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    let want = blob
+        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
+        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "fallback must still deliver the correct range bytes"
+    );
+    // The fallback fetched the whole blob, so the node is now a full holder.
+    anyhow::ensure!(
+        cache.has(hash).await?,
+        "the whole-blob fallback must complete and cache the blob"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result<()> {
+    // A ranged cache-miss request WITHOUT an ownership binding must not make the
+    // node front any origin egress: `pull_authorized` fails, so the range pull
+    // (and the whole-blob fallback) is never initiated. This closes the
+    // griefing vector where an unpaid client induces origin HEAD/range traffic.
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    // Mount the full range-pull surface; the assertion is that NONE of it is hit.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x44);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Send a bounded ranged request with NO binding in the extension.
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let ext = StreamRequestExt {
+        voucher_interval_mb: None,
+        binding: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: channel_id.into(),
+        byte_offset: 16 * 1024,
+        byte_len: 32 * 1024,
+        timestamp_us: 0x9001,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame_to(&mut send, &payload).await?;
+
+    // The node refuses (signed `StreamResponse { ok: false }`) — no delivery.
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamResponse(r) => {
+            anyhow::ensure!(!r.body.ok, "unauthorized range request must be refused");
+        }
+        other => anyhow::bail!("expected a refusing StreamResponse, got {other:?}"),
+    }
+    conn.close(0u32.into(), b"done");
+
+    // The load-bearing assertion: the origin was never contacted.
+    let origin_hits = count_requests(&server, |_| true).await?;
+    anyhow::ensure!(
+        origin_hits == 0,
+        "an unauthorized range request must not front any origin egress, saw {origin_hits} request(s)"
+    );
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "no blob should have been cached for an unauthorized request"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
