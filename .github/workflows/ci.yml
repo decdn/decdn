@@ -6,11 +6,14 @@ on:
   pull_request:
     branches: [main]
     # No `edited`: a PR-body edit (e.g. CodeRabbit injecting its walkthrough)
-    # must not restart this heavy matrix (#1005). `edited` never changes the
-    # head SHA, so dropping it leaves no commit without a `CI success` check.
-    # The PR-title lint (pr-title job) stays part of the single `CI success`
-    # gate and accepts the resulting no-revalidate-on-title-only-edit gap —
-    # see that job's NOTE.
+    # must not restart this heavy matrix (#1005). `edited` never advances the
+    # head SHA, so for a PR opened against `main` no commit loses its
+    # `CI success` check. One exception: a PR retargeted onto `main` from another
+    # base also arrives as `edited`, so its head SHA gets no run until the next
+    # push — branch protection then holds it as pending (fail-safe, never a
+    # false green). The PR-title lint (pr-title job) stays part of the single
+    # `CI success` gate and accepts the resulting no-revalidate-on-title-only-
+    # edit gap — see that job's NOTE.
     types: [opened, synchronize, reopened]
   workflow_dispatch:
 
