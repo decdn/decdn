@@ -1291,9 +1291,12 @@ impl PersistentChannelStateStore {
             .db
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        // Force fsync-on-commit, same durability discipline as `record`: a
-        // post-close crash that lost the pending entry would strand a deposit
-        // until expiry (the very gap this guards).
+        // Force fsync-on-commit, same durability discipline as `record`: the
+        // channel is already `Closing` on-chain by the time an entry is written
+        // here, so a post-close crash that lost it would strand the settlement
+        // obligation until someone calls `settleChannel` (the channel is no
+        // longer `Open`, so the expiry-reclaim path does not recover it) — the
+        // very gap this fsync guards. Shared by the seller and buyer tables.
         write_txn
             .set_durability(Durability::Immediate)
             .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;

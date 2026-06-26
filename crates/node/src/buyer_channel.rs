@@ -297,6 +297,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             Arc::clone(&store),
             self_address,
             Arc::clone(&reclaim_failures),
+            Arc::clone(&pending_store),
             Arc::clone(&metrics),
         ));
 
@@ -774,21 +775,41 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
 
 /// Background reclaim sweep: periodically reclaim the deposit of any tracked
 /// buyer channel that has passed its on-chain expiry without the upstream
-/// closing it. Best-effort — errors are logged, never fatal.
+/// closing it, and finalize any buyer channel whose post-unilateral-close
+/// dispute window has elapsed (#988). Best-effort — errors are logged, never
+/// fatal.
+///
+/// The buyer settle pass lives here, in the ALWAYS-spawned reclaim loop, rather
+/// than in the optional idle-reconcile loop: a `buyer_pending_settle_v1` entry
+/// recorded by a unilateral close must keep draining even if node→node
+/// pull-through (and thus the reconcile loop) is later disabled — otherwise the
+/// deposit would strand until a manual `settleChannel`. Settling an
+/// already-closed channel needs no dialing, so it does not depend on the
+/// reconcile wiring.
 async fn reclaim_loop<P: Provider + Clone>(
     contract: PaymentChannel::PaymentChannelInstance<P>,
     store: Arc<dyn BuyerChannelStore>,
     self_address: Address,
     failures: Arc<Mutex<HashMap<ChannelId, u32>>>,
+    pending_store: Arc<dyn PendingSettleStore>,
     metrics: Arc<Metrics>,
 ) {
     let mut ticker = tokio::time::interval(RECLAIM_SWEEP_INTERVAL);
     // Skip the immediate first tick — bootstrap just ran and nothing is near
-    // expiry yet (and it avoids a redundant load_all at startup).
+    // expiry yet (and it avoids a redundant load_all at startup). The settle
+    // pass also waits one interval, matching the seller `sweeper_loop`.
     ticker.tick().await;
     loop {
         ticker.tick().await;
         reclaim_once(&contract, &store, self_address, &failures, &metrics).await;
+        settle_pass(
+            &contract,
+            &pending_store,
+            unix_now(),
+            SettleParty::Buyer,
+            &metrics,
+        )
+        .await;
     }
 }
 
@@ -875,18 +896,9 @@ async fn reconcile_loop<P: Provider + Clone>(
             &metrics,
         )
         .await;
-        // Finalize buyer channels whose dispute window elapsed after a unilateral
-        // close (#988). Reuses the seller settle machinery (`settleChannel` →
-        // revert-resolution) over the SEPARATE buyer pending set, attributing
-        // outcomes to the buyer metric family via `SettleParty::Buyer`.
-        settle_pass(
-            &contract,
-            &pending_store,
-            unix_now(),
-            SettleParty::Buyer,
-            &metrics,
-        )
-        .await;
+        // The buyer settle pass that finalizes these unilateral closes runs in
+        // `reclaim_loop` (always spawned), not here — so pending entries keep
+        // draining even if the reconcile loop is later disabled (#988).
     }
 }
 
@@ -1161,18 +1173,27 @@ async fn escalate_unilateral_close<P: Provider + Clone>(
 ) {
     metrics.buyer_unilateral_close_unreachable();
     if !close_unilateral(contract, signer, voucher_domain, pending_store, metrics, st).await {
-        // The close did not land (RPC/receipt error or revert). Leave the idle
-        // and close tallies in place so the next sweep retries; the expiry
-        // reclaim remains the safety net. The outcome counter was already ticked
-        // by `close_unilateral`.
+        // The close did not land. Reconcile against on-chain status before
+        // deciding to retry: a deterministic revert here usually means the
+        // channel is ALREADY `Closing`/`Closed` (the provider closed it, or a
+        // prior attempt of ours landed but we missed the receipt). Retrying a
+        // `closeChannel` against a non-`Open` channel just reverts every sweep
+        // for up to the 90-day expiry — wasted RPC, and gas if the revert isn't
+        // caught at estimation. Only a still-`Open` channel (a genuine transient
+        // close failure) is left for the next sweep to retry.
+        reconcile_failed_close(contract, store, pending_store, st, obs, close_failures).await;
         return;
     }
     obs.remove(&st.channel_id);
     close_failures.remove(&st.channel_id);
-    // The channel is now `Closing` and the pending-settle entry owns the rest of
-    // its lifecycle, so drop the local buyer record (CAS, so a concurrent re-open
-    // for this provider is never clobbered) — exactly as the seller forgets a
-    // channel after closing it ahead of expiry.
+    forget_after_close(store, st);
+}
+
+/// Drop the local buyer record after a unilateral close (CAS, so a concurrent
+/// re-open for this provider is never clobbered) — the pending-settle entry now
+/// owns the channel's lifecycle, exactly as the seller forgets a channel after
+/// closing it ahead of expiry.
+fn forget_after_close(store: &Arc<dyn BuyerChannelStore>, st: &BuyerChannelState) {
     if let Err(err) = store.forget_if_channel(st.provider, st.channel_id) {
         warn!(
             channel_id = %st.channel_id, %err,
@@ -1180,6 +1201,61 @@ async fn escalate_unilateral_close<P: Provider + Clone>(
              retried and no-op against the closing channel"
         );
     }
+}
+
+/// After a unilateral `closeChannel` attempt returned `false`, read the on-chain
+/// status to avoid an every-sweep revert loop against an already-closed channel:
+/// - `Closing` — a close already landed (ours, with a missed receipt, or a
+///   co-close). Record the settle obligation (idempotent re-stamp) and retire
+///   the local record so we stop re-submitting.
+/// - `Closed` — already finalized; just retire the local record.
+/// - `Open` — a genuine transient close failure; keep the record + tallies so
+///   the next sweep retries.
+/// - read error — keep everything and retry next sweep.
+async fn reconcile_failed_close<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    store: &Arc<dyn BuyerChannelStore>,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    st: &BuyerChannelState,
+    obs: &mut HashMap<ChannelId, IdleObservation>,
+    close_failures: &mut HashMap<ChannelId, u32>,
+) {
+    let ch = match contract.getChannel(st.channel_id).call().await {
+        Ok(ch) => ch,
+        Err(err) => {
+            debug!(
+                channel_id = %st.channel_id, err = %sanitize_rpc_display(&err),
+                "reconcile: post-close-failure getChannel failed; retrying next sweep"
+            );
+            return;
+        }
+    };
+    match ch.status {
+        // A prior close landed (ours with a missed receipt, or a co-close):
+        // record the settle obligation before retiring the record below.
+        PaymentChannel::Status::Closing => {
+            info!(
+                channel_id = %st.channel_id, provider = %st.provider,
+                "reconcile: channel already Closing on-chain (a prior close landed); recording \
+                 settle obligation and retiring the local record"
+            );
+            record_pending_after_unilateral_close(contract, pending_store, st.channel_id).await;
+        }
+        PaymentChannel::Status::Closed => {
+            info!(
+                channel_id = %st.channel_id, provider = %st.provider,
+                "reconcile: channel already Closed on-chain; retiring the local record"
+            );
+        }
+        // `Open` (or any other status) means the close genuinely failed
+        // transiently — keep the record + tallies so the next sweep retries.
+        _ => return,
+    }
+    // Reached only for Closing/Closed: stop re-submitting against a non-Open
+    // channel by retiring the local record + idle/close tallies.
+    obs.remove(&st.channel_id);
+    close_failures.remove(&st.channel_id);
+    forget_after_close(store, st);
 }
 
 /// Submit a unilateral `closeChannel` for `st` signed over the buyer's own
@@ -1216,10 +1292,14 @@ async fn close_unilateral<P: Provider + Clone>(
     {
         Ok(v) => v,
         Err(err) => {
-            metrics.buyer_unilateral_close_rpc_failure();
+            // A signing failure is a LOCAL signer/key fault, not network
+            // unreachability or an on-chain submission failure — so it is
+            // counted in neither #989 bucket (the escalation that brought us
+            // here already ticked `buyer_unilateral_close_unreachable`). It is
+            // also near-impossible for a valid in-memory key.
             warn!(
                 channel_id = %st.channel_id, %err,
-                "reconcile: unilateral close voucher signing failed"
+                "reconcile: unilateral close voucher signing failed (local signer fault)"
             );
             return false;
         }
@@ -1261,8 +1341,8 @@ async fn close_unilateral<P: Provider + Clone>(
             metrics.buyer_unilateral_close_rpc_failure();
             warn!(
                 channel_id = %st.channel_id, tx = %receipt.transaction_hash,
-                "reconcile: unilateral closeChannel reverted on-chain (provider may have already \
-                 withdrawn/closed); leaving for expiry reclaim"
+                "reconcile: unilateral closeChannel reverted on-chain (channel may already be \
+                 closing/closed); caller reconciles on-chain status"
             );
             false
         }
@@ -1288,8 +1368,10 @@ async fn close_unilateral<P: Provider + Clone>(
 /// which is provider-only and never re-derives a buyer/client-side close —
 /// the buyer has NO automatic recovery for a lost entry: the refund settles
 /// only when someone calls `settleChannel` after the window. That call is
-/// permissionless, so the operator can recover it manually (the `warn!` below
-/// carries the channel id), but it will not self-heal.
+/// permissionless, so the operator can recover it manually (the `error!`s below
+/// carry the channel id), but it will not self-heal — hence `error!`, matching
+/// the seller path's `record_pending_after_close` which `error!`s on the same
+/// loss.
 async fn record_pending_after_unilateral_close<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     pending_store: &Arc<dyn PendingSettleStore>,
@@ -1298,7 +1380,7 @@ async fn record_pending_after_unilateral_close<P: Provider + Clone>(
     let settle_after = match contract.getChannel(channel_id).call().await {
         Ok(ch) => ch.disputeDeadline,
         Err(err) => {
-            warn!(
+            error!(
                 err = %sanitize_rpc_display(&err), %channel_id,
                 "reconcile: post-close getChannel failed; settle obligation NOT recorded — the \
                  channel is Closing, so call settleChannel(<channel_id>) manually after the \
@@ -1312,7 +1394,7 @@ async fn record_pending_after_unilateral_close<P: Provider + Clone>(
         settle_after,
     };
     if let Err(err) = pending_store.record_pending(&entry) {
-        warn!(
+        error!(
             %err, %channel_id, settle_after,
             "reconcile: failed to persist buyer pending-settle entry; call \
              settleChannel(<channel_id>) manually after the dispute window to reclaim the refund"
