@@ -345,6 +345,51 @@ pub struct DecdnMetrics {
     /// ahead of expiry. Operator-visible name:
     /// `decdn_buyer_reconcile_settled_total`.
     pub buyer_reconcile_settled: Counter,
+    /// Idle buyer channels the reconcile sweep `closeChannel`d **unilaterally**
+    /// because the provider was unreachable for a cooperative close (#988) —
+    /// either it deregistered (`node_id_for` → `None`) or it failed
+    /// `RECONCILE_CLOSE_ESCALATION_THRESHOLD` consecutive dial/waiver attempts
+    /// with a timeout-shaped error. This is the *timeout-shaped unreachability*
+    /// bucket #989 asks for: it is the count of escalations to the unilateral
+    /// close path, distinct from `buyer_unilateral_close_rpc_failure` (an
+    /// on-chain submission fault). The unilateral close opens the dispute window;
+    /// the buyer settle sweep finalizes it. Operator-visible name:
+    /// `decdn_buyer_unilateral_close_unreachable_total`.
+    pub buyer_unilateral_close_unreachable: Counter,
+    /// Unilateral `closeChannel` submissions (#988) that did NOT secure the
+    /// claim because the RPC send / receipt errored or the tx reverted on-chain
+    /// — an infrastructure or on-chain fault, NOT evidence the provider is
+    /// unreachable (#989). Split from `buyer_unilateral_close_unreachable` so an
+    /// operator can tell "provider genuinely gone" from "our gas wallet / RPC is
+    /// the problem"; a sustained rate here means the early-reclaim optimization
+    /// is failing for a reason the operator can fix. The expiry-reclaim sweep
+    /// remains the safety net. Operator-visible name:
+    /// `decdn_buyer_unilateral_close_rpc_failure_total`.
+    pub buyer_unilateral_close_rpc_failure: Counter,
+    /// Unilateral `closeChannel` submissions (#988) that landed, opening the
+    /// dispute window so the buyer settle sweep can reclaim the deposit ~2 days
+    /// out instead of at the 90-day expiry. The healthy signal of the early
+    /// unilateral path. Operator-visible name:
+    /// `decdn_buyer_unilateral_close_ok_total`.
+    pub buyer_unilateral_close_ok: Counter,
+    /// Buyer `settleChannel` finalization passes (#988) that landed — the
+    /// unilaterally-closed channel cleared its dispute window and the deposit
+    /// refund settled — or that re-read the channel as already-`Closed` (a
+    /// co-settler finalized first). The healthy terminal outcome of the buyer
+    /// close→settle lifecycle. Operator-visible name:
+    /// `decdn_buyer_settle_ok_total`.
+    pub buyer_settle_ok: Counter,
+    /// Buyer `settleChannel` finalization passes (#988) that did not finalize
+    /// this sweep and were left for the next one: a transient RPC send/receipt
+    /// fault, a dispute-extended re-stamp, an unresolved revert, or a pending
+    /// store-write failure. Folds the seller path's finer `transient_*` /
+    /// `restamped` / `confirm_failed` / `persist_failure` split into one
+    /// retry-pending signal — the buyer's settle is a self-refund with the
+    /// expiry-reclaim safety net, so the fine breakdown the revenue-critical
+    /// seller path needs is not warranted here. A sustained rate means buyer
+    /// deposits are not reclaiming early (check gas wallet / RPC). Operator-
+    /// visible name: `decdn_buyer_settle_deferred_total`.
+    pub buyer_settle_deferred: Counter,
     /// Channel-lifecycle reconciliation the settlement watcher could not apply
     /// from the live event stream: a failed `register_open_channel` /
     /// `update_channel_deposit` / `forget_channel` store write (#751), or a
@@ -1128,6 +1173,42 @@ impl Metrics {
     /// reclaiming its deposit early (#972).
     pub fn buyer_reconcile_settled(&self) {
         self.decdn.buyer_reconcile_settled.inc();
+    }
+
+    /// The reconcile sweep escalated an idle channel to a **unilateral**
+    /// `closeChannel` because the provider was unreachable for a cooperative
+    /// close — deregistered, or timing out repeatedly (#988/#989). The
+    /// timeout-shaped-unreachability bucket, distinct from
+    /// `buyer_unilateral_close_rpc_failure`.
+    pub fn buyer_unilateral_close_unreachable(&self) {
+        self.decdn.buyer_unilateral_close_unreachable.inc();
+    }
+
+    /// A unilateral `closeChannel` did not secure the claim — the RPC
+    /// send/receipt errored or the tx reverted on-chain (#988/#989). An
+    /// infrastructure/on-chain fault, not provider unreachability.
+    pub fn buyer_unilateral_close_rpc_failure(&self) {
+        self.decdn.buyer_unilateral_close_rpc_failure.inc();
+    }
+
+    /// A unilateral `closeChannel` landed, opening the dispute window for the
+    /// buyer settle sweep to reclaim the deposit early (#988).
+    pub fn buyer_unilateral_close_ok(&self) {
+        self.decdn.buyer_unilateral_close_ok.inc();
+    }
+
+    /// A buyer `settleChannel` finalization landed, or re-read the channel as
+    /// already-`Closed` (a co-settler finalized first) — either way the buyer's
+    /// deposit refund is recovered (#988).
+    pub fn buyer_settle_ok(&self) {
+        self.decdn.buyer_settle_ok.inc();
+    }
+
+    /// A buyer `settleChannel` finalization did not finalize this sweep and was
+    /// left for the next — a transient RPC fault, a dispute-extended re-stamp,
+    /// an unresolved revert, or a pending store-write failure (#988).
+    pub fn buyer_settle_deferred(&self) {
+        self.decdn.buyer_settle_deferred.inc();
     }
 
     /// An auto-settlement trigger fired and the seller path `closeChannel`d a
@@ -1914,6 +1995,95 @@ impl Metrics {
     }
 }
 
+/// Which side of a `PaymentChannel` the shared settle-finalization helper
+/// ([`crate::payment_settlement::settle_pass`]) is running for, so the same
+/// `settleChannel` → revert-resolution state machine routes its outcome to the
+/// correct metric family. The seller path keeps its full
+/// `settlement_finalize_*` breakdown (revenue-critical); the buyer path
+/// (#988, a self-refund with the expiry-reclaim safety net) folds that into the
+/// compact `buyer_settle_ok` / `buyer_settle_deferred` pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettleParty {
+    /// This node is the provider finalizing a client's drawn-down channel.
+    Seller,
+    /// This node is the buyer reclaiming its own deposit after a unilateral
+    /// close of an unreachable provider's channel.
+    Buyer,
+}
+
+impl SettleParty {
+    /// `settleChannel` landed (or the channel was already `Closed` on re-read).
+    pub(crate) fn finalize_ok(self, m: &Metrics) {
+        match self {
+            Self::Seller => m.settlement_finalize_ok(),
+            Self::Buyer => m.buyer_settle_ok(),
+        }
+    }
+
+    /// `settleChannel` reverted on-chain (raw count). For the buyer this is a
+    /// no-op: the revert is always reclassified by one of the resolution arms
+    /// below, so counting it here too would double-count against the compact
+    /// `buyer_settle_*` pair.
+    pub(crate) fn finalize_reverted(self, m: &Metrics) {
+        if let Self::Seller = self {
+            m.settlement_finalize_reverted();
+        }
+    }
+
+    /// `settleChannel().send()` errored on a transient RPC fault.
+    pub(crate) fn finalize_transient_send(self, m: &Metrics) {
+        match self {
+            Self::Seller => m.settlement_finalize_transient_send(),
+            Self::Buyer => m.buyer_settle_deferred(),
+        }
+    }
+
+    /// `get_receipt()` errored after a successful submit (transient RPC fault).
+    pub(crate) fn finalize_transient_receipt(self, m: &Metrics) {
+        match self {
+            Self::Seller => m.settlement_finalize_transient_receipt(),
+            Self::Buyer => m.buyer_settle_deferred(),
+        }
+    }
+
+    /// A reverted settle re-read as already-`Closed` (a co-settler finalized
+    /// first). For the buyer the deposit is recovered either way, so this is a
+    /// success.
+    pub(crate) fn finalize_confirmed_closed(self, m: &Metrics) {
+        match self {
+            Self::Seller => m.settlement_finalize_confirmed_closed(),
+            Self::Buyer => m.buyer_settle_ok(),
+        }
+    }
+
+    /// A reverted settle re-read as still-`Closing` (a dispute extended the
+    /// window); the gate is re-stamped and retried.
+    pub(crate) fn finalize_restamped(self, m: &Metrics) {
+        match self {
+            Self::Seller => m.settlement_finalize_restamped(),
+            Self::Buyer => m.buyer_settle_deferred(),
+        }
+    }
+
+    /// A reverted settle left unresolved (the confirming read errored or
+    /// returned an unexpected status); the entry is kept for the next sweep.
+    pub(crate) fn finalize_confirm_failed(self, m: &Metrics) {
+        match self {
+            Self::Seller => m.settlement_finalize_confirm_failed(),
+            Self::Buyer => m.buyer_settle_deferred(),
+        }
+    }
+
+    /// A pending-settle store write (`forget_pending` / re-stamp
+    /// `record_pending`) returned a `StoreError` and was swallowed.
+    pub(crate) fn pending_persist_failure(self, m: &Metrics) {
+        match self {
+            Self::Seller => m.settlement_pending_persist_failure(),
+            Self::Buyer => m.buyer_settle_deferred(),
+        }
+    }
+}
+
 /// Bind the `/metrics` HTTP listener synchronously so startup can fail fast
 /// if the port is unavailable. The returned listener is consumed by [`serve`].
 ///
@@ -2375,6 +2545,110 @@ mod tests {
             ("decdn_settlement_finalize_restamped_total", 6),
             ("decdn_settlement_finalize_confirm_failed_total", 7),
             ("decdn_settlement_pending_persist_failures_total", 8),
+        ] {
+            assert!(
+                has_metric_line(&text, name, want),
+                "expected {name} == {want}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn buyer_unilateral_close_and_settle_metrics_start_at_zero_and_increment() {
+        // #988/#989. Lock the operator-visible (suffixed) names so an alert on
+        // the timeout-vs-RPC-failure distinction stays stable, same posture as
+        // the seller settlement-finalize test above.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_buyer_unilateral_close_unreachable_total",
+            "decdn_buyer_unilateral_close_rpc_failure_total",
+            "decdn_buyer_unilateral_close_ok_total",
+            "decdn_buyer_settle_ok_total",
+            "decdn_buyer_settle_deferred_total",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "buyer close/settle counter {name} should start at zero:\n{text}"
+            );
+        }
+
+        // Distinct counts so independence is observable: 1 / 2 / 3 / 4 / 5.
+        metrics.buyer_unilateral_close_unreachable();
+        for _ in 0..2 {
+            metrics.buyer_unilateral_close_rpc_failure();
+        }
+        for _ in 0..3 {
+            metrics.buyer_unilateral_close_ok();
+        }
+        for _ in 0..4 {
+            metrics.buyer_settle_ok();
+        }
+        for _ in 0..5 {
+            metrics.buyer_settle_deferred();
+        }
+
+        let text = metrics.encode().unwrap();
+        for (name, want) in [
+            ("decdn_buyer_unilateral_close_unreachable_total", 1),
+            ("decdn_buyer_unilateral_close_rpc_failure_total", 2),
+            ("decdn_buyer_unilateral_close_ok_total", 3),
+            ("decdn_buyer_settle_ok_total", 4),
+            ("decdn_buyer_settle_deferred_total", 5),
+        ] {
+            assert!(
+                has_metric_line(&text, name, want),
+                "expected {name} == {want}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn settle_party_routes_finalize_signals_to_the_right_family() {
+        // #988/#989. The shared settle-finalize state machine is party-agnostic;
+        // `SettleParty` is what keeps the buyer self-refund metrics from polluting
+        // the revenue-critical seller settlement metrics. Drive every finalize
+        // signal for BOTH parties on one registry and assert the split.
+        let m = Arc::new(Metrics::new());
+
+        // Seller: full breakdown, each signal to its own counter.
+        SettleParty::Seller.finalize_ok(&m);
+        SettleParty::Seller.finalize_reverted(&m);
+        SettleParty::Seller.finalize_transient_send(&m);
+        SettleParty::Seller.finalize_transient_receipt(&m);
+        SettleParty::Seller.finalize_confirmed_closed(&m);
+        SettleParty::Seller.finalize_restamped(&m);
+        SettleParty::Seller.finalize_confirm_failed(&m);
+        SettleParty::Seller.pending_persist_failure(&m);
+
+        // Buyer: compact pair. ok + confirmed_closed → buyer_settle_ok (deposit
+        // recovered either way); reverted is a no-op (reclassified by a
+        // resolution arm); everything else → buyer_settle_deferred.
+        SettleParty::Buyer.finalize_ok(&m); // → buyer_settle_ok
+        SettleParty::Buyer.finalize_confirmed_closed(&m); // → buyer_settle_ok
+        SettleParty::Buyer.finalize_reverted(&m); // → no-op (avoids double count)
+        SettleParty::Buyer.finalize_transient_send(&m); // → buyer_settle_deferred
+        SettleParty::Buyer.finalize_transient_receipt(&m); // → buyer_settle_deferred
+        SettleParty::Buyer.finalize_restamped(&m); // → buyer_settle_deferred
+        SettleParty::Buyer.finalize_confirm_failed(&m); // → buyer_settle_deferred
+        SettleParty::Buyer.pending_persist_failure(&m); // → buyer_settle_deferred
+
+        let text = m.encode().unwrap();
+        for (name, want) in [
+            // Seller family: one each.
+            ("decdn_settlement_finalize_ok_total", 1),
+            ("decdn_settlement_finalize_reverted_total", 1),
+            ("decdn_settlement_finalize_transient_send_total", 1),
+            ("decdn_settlement_finalize_transient_receipt_total", 1),
+            ("decdn_settlement_finalize_confirmed_closed_total", 1),
+            ("decdn_settlement_finalize_restamped_total", 1),
+            ("decdn_settlement_finalize_confirm_failed_total", 1),
+            ("decdn_settlement_pending_persist_failures_total", 1),
+            // Buyer family: ok = 2 (ok + confirmed_closed), deferred = 5
+            // (transient_send + transient_receipt + restamped + confirm_failed +
+            // persist_failure), reverted not counted.
+            ("decdn_buyer_settle_ok_total", 2),
+            ("decdn_buyer_settle_deferred_total", 5),
         ] {
             assert!(
                 has_metric_line(&text, name, want),

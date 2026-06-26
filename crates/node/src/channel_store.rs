@@ -106,6 +106,16 @@ const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 const PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
     TableDefinition::new("pending_settle_v1");
 
+/// redb table holding channels this node closed as the **buyer** (#988) — the
+/// unilateral `closeChannel` of an unreachable provider's idle channel — that
+/// await a `settleChannel` after their dispute window. Same shape as
+/// [`PENDING_SETTLE_TABLE`] (key: `ChannelId` bytes, value: `disputeDeadline`)
+/// but a SEPARATE table so the buyer settle sweep and the seller settle sweep
+/// never settle each other's closes — keeping the two metric families (#989)
+/// cleanly attributed. Lives in the same database file as [`CHANNEL_TABLE`].
+const BUYER_PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
+    TableDefinition::new("buyer_pending_settle_v1");
+
 /// redb table holding the settlement watcher's `ChannelOpened` scan checkpoint
 /// (#751): the last block scanned, so the bring-up backfill resumes across
 /// restarts and covers channels opened while the node was down. Lives in the
@@ -1267,22 +1277,32 @@ impl BuyerChannelStore for BuyerChannelStoreHandle {
     }
 }
 
-impl PendingSettleStore for PersistentChannelStateStore {
-    fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError> {
+impl PersistentChannelStateStore {
+    /// Insert/overwrite a pending-settle entry in `table` (fsync-on-commit). The
+    /// `PENDING_SETTLE_TABLE` and `BUYER_PENDING_SETTLE_TABLE` share this body so
+    /// the seller and buyer pending sets stay byte-for-byte consistent.
+    fn pending_record_in(
+        &self,
+        table_def: TableDefinition<&[u8; 32], u64>,
+        entry: &PendingSettle,
+    ) -> Result<(), StoreError> {
         let key: [u8; 32] = entry.channel_id.into();
         let mut write_txn = self
             .db
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        // Force fsync-on-commit, same durability discipline as `record`: a
-        // post-close crash that lost the pending entry would strand the
-        // provider's un-withdrawn remainder (the very gap this guards).
+        // Force fsync-on-commit, same durability discipline as `record`: the
+        // channel is already `Closing` on-chain by the time an entry is written
+        // here, so a post-close crash that lost it would strand the settlement
+        // obligation until someone calls `settleChannel` (the channel is no
+        // longer `Open`, so the expiry-reclaim path does not recover it) — the
+        // very gap this fsync guards. Shared by the seller and buyer tables.
         write_txn
             .set_durability(Durability::Immediate)
             .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
         {
             let mut table = write_txn
-                .open_table(PENDING_SETTLE_TABLE)
+                .open_table(table_def)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
                 .insert(&key, entry.settle_after)
@@ -1294,14 +1314,17 @@ impl PendingSettleStore for PersistentChannelStateStore {
         Ok(())
     }
 
-    fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError> {
+    /// Load every pending-settle entry from `table` (an absent table is the
+    /// empty set, not an error — first-boot tolerance).
+    fn pending_load_from(
+        &self,
+        table_def: TableDefinition<&[u8; 32], u64>,
+    ) -> Result<Vec<PendingSettle>, StoreError> {
         let read_txn = self
             .db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        // A never-written pending table is an empty set, not an error — same
-        // first-boot tolerance as `load_all`.
-        let table = match read_txn.open_table(PENDING_SETTLE_TABLE) {
+        let table = match read_txn.open_table(table_def) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
             Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
@@ -1321,17 +1344,20 @@ impl PendingSettleStore for PersistentChannelStateStore {
         Ok(out)
     }
 
-    fn forget_pending(&self, channel_id: ChannelId) -> Result<(), StoreError> {
+    /// Remove a pending-settle entry from `table` (a no-op against a
+    /// never-written table, which must not be created as a side effect).
+    fn pending_forget_in(
+        &self,
+        table_def: TableDefinition<&[u8; 32], u64>,
+        channel_id: ChannelId,
+    ) -> Result<(), StoreError> {
         let key: [u8; 32] = channel_id.into();
-
-        // forget on a never-written store is a no-op by contract and must not
-        // create the table as a side effect — same guard as `forget`.
         {
             let read_txn = self
                 .db
                 .begin_read()
                 .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-            match read_txn.open_table(PENDING_SETTLE_TABLE) {
+            match read_txn.open_table(table_def) {
                 Ok(_) => {}
                 Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
                 Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
@@ -1347,7 +1373,7 @@ impl PendingSettleStore for PersistentChannelStateStore {
             .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
         {
             let mut table = write_txn
-                .open_table(PENDING_SETTLE_TABLE)
+                .open_table(table_def)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
                 .remove(&key)
@@ -1357,6 +1383,54 @@ impl PendingSettleStore for PersistentChannelStateStore {
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
         Ok(())
+    }
+}
+
+impl PendingSettleStore for PersistentChannelStateStore {
+    fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError> {
+        self.pending_record_in(PENDING_SETTLE_TABLE, entry)
+    }
+
+    fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError> {
+        self.pending_load_from(PENDING_SETTLE_TABLE)
+    }
+
+    fn forget_pending(&self, channel_id: ChannelId) -> Result<(), StoreError> {
+        self.pending_forget_in(PENDING_SETTLE_TABLE, channel_id)
+    }
+}
+
+/// [`PendingSettleStore`] over the buyer's `buyer_pending_settle_v1` table,
+/// isolated from the seller's `pending_settle_v1` table so the two settle
+/// sweeps never finalize each other's closes (#988). Wraps the same shared
+/// [`PersistentChannelStateStore`] (one redb file, one handle); hand this to the
+/// buyer service as `Arc<dyn PendingSettleStore>`.
+#[derive(Debug, Clone)]
+pub struct BuyerPendingSettleStoreHandle {
+    inner: std::sync::Arc<PersistentChannelStateStore>,
+}
+
+impl BuyerPendingSettleStoreHandle {
+    /// Wrap a shared persistent store as the buyer pending-settle store.
+    #[must_use]
+    pub const fn new(inner: std::sync::Arc<PersistentChannelStateStore>) -> Self {
+        Self { inner }
+    }
+}
+
+impl PendingSettleStore for BuyerPendingSettleStoreHandle {
+    fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError> {
+        self.inner
+            .pending_record_in(BUYER_PENDING_SETTLE_TABLE, entry)
+    }
+
+    fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError> {
+        self.inner.pending_load_from(BUYER_PENDING_SETTLE_TABLE)
+    }
+
+    fn forget_pending(&self, channel_id: ChannelId) -> Result<(), StoreError> {
+        self.inner
+            .pending_forget_in(BUYER_PENDING_SETTLE_TABLE, channel_id)
     }
 }
 
