@@ -5,10 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    # `edited` is included so a title change re-runs the pr-title job below;
-    # without it, branch protection would honor a previously-cached pass
-    # even after the title was edited to a non-conformant value.
-    types: [opened, synchronize, reopened, edited]
+    # No `edited`: a PR-body edit (e.g. CodeRabbit injecting its walkthrough)
+    # must not restart this heavy matrix (#1005). `edited` never changes the
+    # head SHA, so dropping it leaves no commit without a `CI success` check.
+    # The PR-title lint (pr-title job) stays part of the single `CI success`
+    # gate and accepts the resulting no-revalidate-on-title-only-edit gap —
+    # see that job's NOTE.
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -901,11 +904,20 @@ jobs:
   pr-title:
     name: PR title
     runs-on: ubuntu-latest
-    # PR-only check; skipped on push to main and workflow_dispatch and
-    # accepted via ci-success allowed-skips below. Reads PR metadata only
-    # (no PR code is checked out), so running under `pull_request` rather
-    # than the prior `pull_request_target` is safe — the action just hits
-    # the GitHub API with the read-only token.
+    # Conventional-commit lint on the PR title. Part of the single `CI success`
+    # gate (ci-success.needs + allowed-skips below), so a non-conformant title
+    # blocks merge without a second required status check. PR-only — skipped on
+    # push to main and workflow_dispatch and accepted via allowed-skips. Reads
+    # PR metadata only (no PR code is checked out), so plain `pull_request` with
+    # a read-only token is safe — the action just hits the GitHub API.
+    #
+    # NOTE (#1005): this workflow intentionally does NOT trigger on `edited`
+    # (see `on.pull_request.types` above), so a PR-body edit can't restart the
+    # heavy matrix. Consequence for this check: the title is validated on open
+    # and on every push (synchronize), but a title edited to a non-conformant
+    # value with no subsequent push is not re-checked before merge. Any later
+    # push (or reopen) re-validates. Coupling `edited` back in to close that gap
+    # would re-introduce the duplicate-run / stale-green problem #1005 fixed.
     if: github.event_name == 'pull_request'
     permissions:
       pull-requests: read
