@@ -20,6 +20,7 @@ network: defaults
 #   model: small
 
 safe-outputs:
+  report-failure-as-issue: false
   add-labels:
     max: 5
   add-comment:
