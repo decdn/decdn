@@ -403,3 +403,71 @@ fn channels_db_lives_in_data_dir() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// #988: the buyer pending-settle set must be ISOLATED from the seller's, even
+/// though both live in one redb file. A buyer unilateral close recorded via the
+/// `BuyerPendingSettleStoreHandle` must never surface in the seller's
+/// `load_pending` (which the seller settle sweep drains) and vice versa — that
+/// isolation is what keeps the two settle sweeps and their metric families
+/// (#989) from finalizing or mis-attributing each other's closes. Survives a
+/// reopen, since both tables are durable in the same file.
+#[test]
+fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
+    use decdn_incentive::{PendingSettle, PendingSettleStore};
+    use decdn_node::channel_store::BuyerPendingSettleStoreHandle;
+
+    let dir = data_dir()?;
+    let seller_ch = b256!("aa00000000000000000000000000000000000000000000000000000000000000");
+    let buyer_ch = b256!("bb00000000000000000000000000000000000000000000000000000000000000");
+
+    {
+        let concrete = Arc::new(PersistentChannelStateStore::open(dir.path())?);
+        let seller: Arc<dyn PendingSettleStore> = concrete.clone();
+        let buyer: Arc<dyn PendingSettleStore> =
+            Arc::new(BuyerPendingSettleStoreHandle::new(Arc::clone(&concrete)));
+
+        seller.record_pending(&PendingSettle {
+            channel_id: seller_ch,
+            settle_after: 1_000,
+        })?;
+        buyer.record_pending(&PendingSettle {
+            channel_id: buyer_ch,
+            settle_after: 2_000,
+        })?;
+
+        let seller_pending = seller.load_pending()?;
+        let buyer_pending = buyer.load_pending()?;
+        anyhow::ensure!(
+            seller_pending.len() == 1
+                && seller_pending.first().map(|e| e.channel_id) == Some(seller_ch),
+            "seller set must hold only the seller close, got {seller_pending:?}"
+        );
+        anyhow::ensure!(
+            buyer_pending.len() == 1
+                && buyer_pending.first().map(|e| e.channel_id) == Some(buyer_ch),
+            "buyer set must hold only the buyer close, got {buyer_pending:?}"
+        );
+
+        // Forgetting one side never touches the other.
+        buyer.forget_pending(buyer_ch)?;
+        anyhow::ensure!(
+            buyer.load_pending()?.is_empty(),
+            "buyer forget drops the buyer entry"
+        );
+        anyhow::ensure!(
+            seller.load_pending()?.len() == 1,
+            "seller entry is untouched by a buyer forget"
+        );
+    }
+
+    // Reopen: durability + isolation both survive a restart.
+    let concrete = Arc::new(PersistentChannelStateStore::open(dir.path())?);
+    let seller: Arc<dyn PendingSettleStore> = concrete.clone();
+    let buyer: Arc<dyn PendingSettleStore> =
+        Arc::new(BuyerPendingSettleStoreHandle::new(Arc::clone(&concrete)));
+    anyhow::ensure!(
+        seller.load_pending()?.len() == 1 && buyer.load_pending()?.is_empty(),
+        "the seller entry persists and the buyer set is still empty after reopen"
+    );
+    Ok(())
+}

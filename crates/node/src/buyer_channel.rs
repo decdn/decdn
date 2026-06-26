@@ -32,14 +32,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, DepositOutcome, StoreError,
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, DepositOutcome, PendingSettle,
+    PendingSettleStore, StoreError, Voucher,
 };
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio::task::JoinHandle;
@@ -54,9 +55,9 @@ use crate::client_requester::cooperative_close::{
     AuthorizedWatermark, CooperativeCloseOutcome, cooperative_close,
 };
 use crate::dht::NodeAddressResolver;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, SettleParty};
 use crate::payment_settlement::{
-    MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range, unix_now,
+    MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range, settle_pass, unix_now,
 };
 
 /// How often the reclaim sweep scans tracked buyer channels for expiry.
@@ -96,6 +97,18 @@ const RECONCILE_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// config-tunable yet (YAGNI); promote to config if an operator needs a
 /// different idle horizon.
 const RECONCILE_IDLE_SWEEPS: u32 = 24;
+
+/// Consecutive cooperative-close attempts that fail with a timeout-shaped
+/// (dial/waiver-phase) error before the reconcile sweep gives up on a
+/// cooperative close and `closeChannel`s the idle channel **unilaterally**
+/// (#988). A provider that deregistered (`node_id_for` → `None`) is unreachable
+/// immediately and skips this tally; this gates only the *reachable-but-silent*
+/// case — a provider whose registration lingers but never answers the dial. At
+/// the hourly [`RECLAIM_SWEEP_INTERVAL`] that is ~3 hours of sustained silence,
+/// long enough to ride out a transient network blip before spending gas on a
+/// unilateral close that the (default 90-day) expiry reclaim would eventually
+/// make anyway. Not config-tunable yet (YAGNI), matching [`RECONCILE_IDLE_SWEEPS`].
+const RECONCILE_CLOSE_ESCALATION_THRESHOLD: u32 = 3;
 
 /// Dial wiring the idle-reconcile sweep needs beyond what the reclaim sweep has
 /// (#972). Built by the runtime only when node→node pull-through is enabled (the
@@ -247,6 +260,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         default_deposit: U256,
         ensure_max_approval: bool,
         reconcile: Option<BuyerReconcileConfig>,
+        pending_store: Arc<dyn PendingSettleStore>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let contract = PaymentChannel::new(payment_channel_addr, provider.clone());
@@ -311,6 +325,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         let idle_reconciler = reconcile.map(|cfg| {
             info!(
                 idle_sweeps_threshold = RECONCILE_IDLE_SWEEPS,
+                close_escalation_threshold = RECONCILE_CLOSE_ESCALATION_THRESHOLD,
                 "buyer idle-reconcile sweep enabled"
             );
             AbortOnDrop(tokio::spawn(reconcile_loop(
@@ -319,6 +334,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                 Arc::clone(&signer),
                 voucher_domain.clone(),
                 cfg,
+                Arc::clone(&pending_store),
                 Arc::clone(&metrics),
             )))
         });
@@ -835,9 +851,14 @@ async fn reconcile_loop<P: Provider + Clone>(
     signer: Arc<PrivateKeySigner>,
     voucher_domain: Eip712Domain,
     config: BuyerReconcileConfig,
+    pending_store: Arc<dyn PendingSettleStore>,
     metrics: Arc<Metrics>,
 ) {
     let mut obs: HashMap<ChannelId, IdleObservation> = HashMap::new();
+    // Per-channel consecutive cooperative-close failure tally driving the
+    // unilateral-close escalation (#988); in-memory and pruned each pass, same
+    // posture as `obs` and the reclaim `failures` map.
+    let mut close_failures: HashMap<ChannelId, u32> = HashMap::new();
     let mut ticker = tokio::time::interval(RECLAIM_SWEEP_INTERVAL);
     ticker.tick().await; // skip the immediate first tick (bootstrap just ran)
     loop {
@@ -849,6 +870,20 @@ async fn reconcile_loop<P: Provider + Clone>(
             &voucher_domain,
             &config,
             &mut obs,
+            &mut close_failures,
+            &pending_store,
+            &metrics,
+        )
+        .await;
+        // Finalize buyer channels whose dispute window elapsed after a unilateral
+        // close (#988). Reuses the seller settle machinery (`settleChannel` →
+        // revert-resolution) over the SEPARATE buyer pending set, attributing
+        // outcomes to the buyer metric family via `SettleParty::Buyer`.
+        settle_pass(
+            &contract,
+            &pending_store,
+            unix_now(),
+            SettleParty::Buyer,
             &metrics,
         )
         .await;
@@ -866,6 +901,8 @@ async fn reconcile_once<P: Provider + Clone>(
     voucher_domain: &Eip712Domain,
     config: &BuyerReconcileConfig,
     obs: &mut HashMap<ChannelId, IdleObservation>,
+    close_failures: &mut HashMap<ChannelId, u32>,
+    pending_store: &Arc<dyn PendingSettleStore>,
     metrics: &Arc<Metrics>,
 ) {
     let states = match store.load_all() {
@@ -895,22 +932,29 @@ async fn reconcile_once<P: Provider + Clone>(
             voucher_domain,
             config,
             obs,
+            close_failures,
+            pending_store,
             metrics,
             st,
         )
         .await;
     }
-    // Drop observations for channels gone this sweep (settled, reclaimed, or
-    // replaced) so the map tracks only currently-eligible channels.
+    // Drop observations + close tallies for channels gone this sweep (settled,
+    // reclaimed, or replaced) so the maps track only currently-eligible channels.
     obs.retain(|id, _| seen.contains(id));
+    close_failures.retain(|id, _| seen.contains(id));
 }
 
 /// Attempt cooperative close of one idle channel. All failure modes are logged
 /// and swallowed — the expiry-reclaim sweep is the safety net.
-// Linear guard-and-act sequence (resolve NodeId → dial+close → branch on
-// outcome) with per-arm logging; splitting it obscures the flow, mirroring
-// `try_reclaim`.
-#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+// Linear guard-and-act sequence (resolve NodeId → dial+close → branch on each
+// outcome, with the unreachable arms escalating to a unilateral close) with
+// per-arm logging; splitting it obscures the flow, mirroring `try_reclaim`.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cognitive_complexity,
+    clippy::too_many_lines
+)]
 async fn reconcile_one<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn BuyerChannelStore>,
@@ -918,17 +962,33 @@ async fn reconcile_one<P: Provider + Clone>(
     voucher_domain: &Eip712Domain,
     config: &BuyerReconcileConfig,
     obs: &mut HashMap<ChannelId, IdleObservation>,
+    close_failures: &mut HashMap<ChannelId, u32>,
+    pending_store: &Arc<dyn PendingSettleStore>,
     metrics: &Arc<Metrics>,
     st: &BuyerChannelState,
 ) {
     // Resolve the provider's operator address back to a dialable NodeId. A
-    // provider no longer registered (deregistered / gone) is unreachable for
-    // cooperative close — leave the channel for the expiry-reclaim sweep.
+    // provider no longer registered (deregistered / gone) is unreachable for a
+    // cooperative close — but the buyer holds its own voucher, so rather than
+    // wait out the (default 90-day) expiry it `closeChannel`s the idle channel
+    // unilaterally and settles after the dispute window (#988).
     let Some(node_id) = config.resolver.node_id_for(&st.provider) else {
         debug!(
             channel_id = %st.channel_id, provider = %st.provider,
-            "reconcile: provider not registered; leaving idle channel for expiry reclaim"
+            "reconcile: provider not registered; closing idle channel unilaterally"
         );
+        escalate_unilateral_close(
+            contract,
+            store,
+            signer,
+            voucher_domain,
+            pending_store,
+            metrics,
+            st,
+            obs,
+            close_failures,
+        )
+        .await;
         return;
     };
     let Ok(public_key) = PublicKey::from_bytes(node_id.as_bytes()) else {
@@ -936,6 +996,7 @@ async fn reconcile_one<P: Provider + Clone>(
         // tally so we back off (~24h) instead of re-warning every hourly sweep;
         // the expiry-reclaim sweep is still the eventual safety net.
         obs.remove(&st.channel_id);
+        close_failures.remove(&st.channel_id);
         warn!(
             channel_id = %st.channel_id,
             "reconcile: registered NodeId is not a valid public key; backing off"
@@ -963,6 +1024,7 @@ async fn reconcile_one<P: Provider + Clone>(
     match outcome {
         Ok(CooperativeCloseOutcome::Settled) => {
             obs.remove(&st.channel_id);
+            close_failures.remove(&st.channel_id);
             metrics.buyer_reconcile_settled();
             if let Err(err) = store.forget_if_channel(st.provider, st.channel_id) {
                 warn!(
@@ -978,33 +1040,285 @@ async fn reconcile_one<P: Provider + Clone>(
             }
         }
         Ok(CooperativeCloseOutcome::Declined) => {
-            // A decline is sticky (the provider has no channel / no accepted
-            // voucher). Back off the idle tally (~24h) so we don't re-dial it
+            // A decline is sticky (the provider is reachable but has no channel /
+            // no accepted voucher) — NOT unreachability, so do not escalate to a
+            // unilateral close. Back off the idle tally (~24h) so we don't re-dial
             // every hourly sweep; the expiry-reclaim sweep remains the net.
             obs.remove(&st.channel_id);
+            close_failures.remove(&st.channel_id);
             debug!(
                 channel_id = %st.channel_id, provider = %st.provider,
                 "reconcile: provider declined cooperative close; backing off, leaving for expiry reclaim"
             );
         }
         Ok(CooperativeCloseOutcome::Reverted) => {
-            // A revert is persistent until something on-chain changes. Back off
-            // the idle tally (~24h) so we don't burn gas re-submitting every
-            // hourly sweep; the expiry-reclaim sweep remains the net.
+            // A revert is persistent until something on-chain changes (the
+            // provider is reachable; a unilateral close would revert too). Back
+            // off the idle tally (~24h); the expiry-reclaim sweep remains the net.
             obs.remove(&st.channel_id);
+            close_failures.remove(&st.channel_id);
             warn!(
                 channel_id = %st.channel_id, provider = %st.provider,
                 "reconcile: cooperativeClose reverted on-chain; backing off, leaving for expiry reclaim"
             );
         }
         Err(err) => {
-            debug!(
-                channel_id = %st.channel_id, provider = %st.provider,
-                err = %sanitize_rpc_display(&err),
-                "reconcile: cooperative close failed (provider unreachable?); leaving for \
-                 expiry reclaim"
-            );
+            // A dial/waiver-phase failure is timeout-shaped unreachability: the
+            // registration lingers but the provider does not answer. Tolerate a
+            // few sweeps (transient blip) before escalating to a unilateral close
+            // once it has failed `RECONCILE_CLOSE_ESCALATION_THRESHOLD` in a row.
+            match record_close_failure(
+                close_failures,
+                st.channel_id,
+                RECONCILE_CLOSE_ESCALATION_THRESHOLD,
+            ) {
+                CloseEscalation::Escalate { consecutive } => {
+                    debug!(
+                        channel_id = %st.channel_id, provider = %st.provider, consecutive,
+                        err = %sanitize_rpc_display(&err),
+                        "reconcile: cooperative close failed repeatedly (provider unreachable); \
+                         closing idle channel unilaterally"
+                    );
+                    escalate_unilateral_close(
+                        contract,
+                        store,
+                        signer,
+                        voucher_domain,
+                        pending_store,
+                        metrics,
+                        st,
+                        obs,
+                        close_failures,
+                    )
+                    .await;
+                }
+                CloseEscalation::Wait { consecutive } => {
+                    debug!(
+                        channel_id = %st.channel_id, provider = %st.provider, consecutive,
+                        err = %sanitize_rpc_display(&err),
+                        "reconcile: cooperative close failed (provider unreachable?); will retry, \
+                         escalating to unilateral close after {RECONCILE_CLOSE_ESCALATION_THRESHOLD}"
+                    );
+                }
+            }
         }
+    }
+}
+
+/// Whether a run of dial/waiver-phase cooperative-close failures has crossed the
+/// unilateral-close escalation threshold (#988).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseEscalation {
+    /// Close the channel unilaterally now — the provider has been unreachable for
+    /// `consecutive` sweeps.
+    Escalate { consecutive: u32 },
+    /// Keep waiting: only `consecutive` (< threshold) failures so far, still
+    /// inside the transient-blip tolerance.
+    Wait { consecutive: u32 },
+}
+
+/// Fold one dial/waiver-phase cooperative-close failure into the per-channel
+/// consecutive-failure tally and decide whether to escalate to a unilateral
+/// close. Pure so the escalation policy is unit-testable without a live contract
+/// or network, mirroring [`record_reclaim_outcome`]. A provider that *responds*
+/// (settled / declined / reverted) or deregisters is handled by the caller and
+/// clears the tally via `close_failures.remove`, so this only ever counts up.
+fn record_close_failure(
+    close_failures: &mut HashMap<ChannelId, u32>,
+    channel_id: ChannelId,
+    threshold: u32,
+) -> CloseEscalation {
+    let consecutive = {
+        let tally = close_failures.entry(channel_id).or_insert(0);
+        *tally = tally.saturating_add(1);
+        *tally
+    };
+    if consecutive >= threshold {
+        CloseEscalation::Escalate { consecutive }
+    } else {
+        CloseEscalation::Wait { consecutive }
+    }
+}
+
+/// Treat the provider as unreachable and `closeChannel` the idle channel
+/// unilaterally at the buyer's own persisted watermark (#988), recording the
+/// channel for post-dispute-window settlement. Counts the escalation as
+/// timeout-shaped unreachability (#989) and, on a landed close, drops the local
+/// idle/close tallies and the buyer channel record (the pending-settle entry now
+/// owns the lifecycle, mirroring the seller's close-then-forget). A failed close
+/// leaves everything in place so the next sweep (or the expiry reclaim) retries.
+#[allow(clippy::too_many_arguments)]
+async fn escalate_unilateral_close<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    store: &Arc<dyn BuyerChannelStore>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_domain: &Eip712Domain,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    metrics: &Arc<Metrics>,
+    st: &BuyerChannelState,
+    obs: &mut HashMap<ChannelId, IdleObservation>,
+    close_failures: &mut HashMap<ChannelId, u32>,
+) {
+    metrics.buyer_unilateral_close_unreachable();
+    if !close_unilateral(contract, signer, voucher_domain, pending_store, metrics, st).await {
+        // The close did not land (RPC/receipt error or revert). Leave the idle
+        // and close tallies in place so the next sweep retries; the expiry
+        // reclaim remains the safety net. The outcome counter was already ticked
+        // by `close_unilateral`.
+        return;
+    }
+    obs.remove(&st.channel_id);
+    close_failures.remove(&st.channel_id);
+    // The channel is now `Closing` and the pending-settle entry owns the rest of
+    // its lifecycle, so drop the local buyer record (CAS, so a concurrent re-open
+    // for this provider is never clobbered) — exactly as the seller forgets a
+    // channel after closing it ahead of expiry.
+    if let Err(err) = store.forget_if_channel(st.provider, st.channel_id) {
+        warn!(
+            channel_id = %st.channel_id, %err,
+            "reconcile: unilateral close landed but clearing the local record failed; it will be \
+             retried and no-op against the closing channel"
+        );
+    }
+}
+
+/// Submit a unilateral `closeChannel` for `st` signed over the buyer's own
+/// highest persisted watermark, and on success record a [`PendingSettle`] entry
+/// (re-reading `disputeDeadline`) so the buyer settle sweep finalizes it after
+/// the dispute window. Returns `true` only when the close landed on-chain.
+/// Routes the on-chain outcome to the buyer close metrics (#989): a landed close
+/// to `buyer_unilateral_close_ok`, an RPC/receipt error or revert to
+/// `buyer_unilateral_close_rpc_failure`.
+// Linear guard-and-act sequence (sign → send → receipt → branch on status) with
+// per-arm metric + logging; splitting it obscures the flow, mirroring
+// `try_reclaim` and the seller `send_close`.
+#[allow(clippy::cognitive_complexity)]
+async fn close_unilateral<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    client_signer: &Arc<PrivateKeySigner>,
+    voucher_domain: &Eip712Domain,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    metrics: &Arc<Metrics>,
+    st: &BuyerChannelState,
+) -> bool {
+    // Sign our own voucher over the persisted watermark — the client sig the
+    // contract checks against `channel.client` (this node). Honest by
+    // construction: we close at the highest amount we already authorized, and
+    // the dispute window protects the absent provider against a stale nonce.
+    let voucher = match (Voucher {
+        channel_id: st.channel_id,
+        amount: st.last_amount,
+        nonce: st.last_nonce,
+        bytes_delivered: st.last_bytes_delivered,
+        token: st.token,
+    })
+    .sign(client_signer.as_ref(), voucher_domain)
+    {
+        Ok(v) => v,
+        Err(err) => {
+            metrics.buyer_unilateral_close_rpc_failure();
+            warn!(
+                channel_id = %st.channel_id, %err,
+                "reconcile: unilateral close voucher signing failed"
+            );
+            return false;
+        }
+    };
+    let sig = Bytes::from(voucher.signature.as_bytes().to_vec());
+    let pending = match contract
+        .closeChannel(
+            st.channel_id,
+            st.last_amount,
+            st.last_nonce,
+            st.last_bytes_delivered,
+            sig,
+        )
+        .send()
+        .await
+    {
+        Ok(pending) => pending,
+        Err(err) => {
+            metrics.buyer_unilateral_close_rpc_failure();
+            warn!(
+                channel_id = %st.channel_id, err = %sanitize_rpc_display(&err),
+                "reconcile: unilateral closeChannel send failed; leaving for next sweep / expiry reclaim"
+            );
+            return false;
+        }
+    };
+    match pending.get_receipt().await {
+        Ok(receipt) if receipt.status() => {
+            metrics.buyer_unilateral_close_ok();
+            info!(
+                channel_id = %st.channel_id, provider = %st.provider,
+                tx = %receipt.transaction_hash,
+                "reconcile: unilateral closeChannel landed (dispute window open); will settle after window"
+            );
+            record_pending_after_unilateral_close(contract, pending_store, st.channel_id).await;
+            true
+        }
+        Ok(receipt) => {
+            metrics.buyer_unilateral_close_rpc_failure();
+            warn!(
+                channel_id = %st.channel_id, tx = %receipt.transaction_hash,
+                "reconcile: unilateral closeChannel reverted on-chain (provider may have already \
+                 withdrawn/closed); leaving for expiry reclaim"
+            );
+            false
+        }
+        Err(err) => {
+            metrics.buyer_unilateral_close_rpc_failure();
+            warn!(
+                channel_id = %st.channel_id, err = %sanitize_rpc_display(&err),
+                "reconcile: unilateral closeChannel receipt failed; leaving for next sweep / expiry reclaim"
+            );
+            false
+        }
+    }
+}
+
+/// After a unilateral `closeChannel` lands, re-read the channel for the
+/// `disputeDeadline` it just set and persist a [`PendingSettle`] entry so the
+/// buyer settle sweep can `settleChannel` (and reclaim the deposit refund) once
+/// the window elapses (#988). Best-effort: a failed read/write is logged, not
+/// fatal — the close already opened the window. Note the channel is now
+/// `Closing`, so the expiry-reclaim sweep (which needs `Open`) is NOT the
+/// fallback here. Unlike the seller path — whose lost obligations are
+/// re-derived on the next boot by the closing-reconciliation backfill (#839),
+/// which is provider-only and never re-derives a buyer/client-side close —
+/// the buyer has NO automatic recovery for a lost entry: the refund settles
+/// only when someone calls `settleChannel` after the window. That call is
+/// permissionless, so the operator can recover it manually (the `warn!` below
+/// carries the channel id), but it will not self-heal.
+async fn record_pending_after_unilateral_close<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    channel_id: ChannelId,
+) {
+    let settle_after = match contract.getChannel(channel_id).call().await {
+        Ok(ch) => ch.disputeDeadline,
+        Err(err) => {
+            warn!(
+                err = %sanitize_rpc_display(&err), %channel_id,
+                "reconcile: post-close getChannel failed; settle obligation NOT recorded — the \
+                 channel is Closing, so call settleChannel(<channel_id>) manually after the \
+                 dispute window to reclaim the deposit refund"
+            );
+            return;
+        }
+    };
+    let entry = PendingSettle {
+        channel_id,
+        settle_after,
+    };
+    if let Err(err) = pending_store.record_pending(&entry) {
+        warn!(
+            %err, %channel_id, settle_after,
+            "reconcile: failed to persist buyer pending-settle entry; call \
+             settleChannel(<channel_id>) manually after the dispute window to reclaim the refund"
+        );
+    } else {
+        debug!(%channel_id, settle_after, "reconcile: recorded buyer channel for post-dispute settlement");
     }
 }
 
@@ -1677,6 +1991,83 @@ mod tests {
             ReclaimEscalation::Escalate {
                 consecutive: RECLAIM_ESCALATION_THRESHOLD + 1
             },
+        );
+    }
+
+    /// The unilateral-close escalation (#988) waits out a few transient dial
+    /// failures, then escalates on the threshold-th consecutive failure and
+    /// keeps escalating on every subsequent one — same shape as the reclaim
+    /// escalation, so a sustained-unreachable provider is closed unilaterally.
+    #[test]
+    fn close_failures_escalate_only_at_threshold() {
+        let mut failures: HashMap<ChannelId, u32> = HashMap::new();
+        let ch = B256::repeat_byte(0x44);
+        let threshold = RECONCILE_CLOSE_ESCALATION_THRESHOLD;
+        for n in 1..threshold {
+            assert_eq!(
+                record_close_failure(&mut failures, ch, threshold),
+                CloseEscalation::Wait { consecutive: n },
+                "below the threshold the sweep keeps waiting (transient-blip tolerance)"
+            );
+        }
+        assert_eq!(
+            record_close_failure(&mut failures, ch, threshold),
+            CloseEscalation::Escalate {
+                consecutive: threshold
+            },
+            "the threshold-th consecutive failure escalates to a unilateral close"
+        );
+        assert_eq!(
+            record_close_failure(&mut failures, ch, threshold),
+            CloseEscalation::Escalate {
+                consecutive: threshold + 1
+            },
+            "a still-unreachable provider keeps escalating (the close may have failed to land)"
+        );
+    }
+
+    /// A provider that responds (settled/declined/reverted) clears its close
+    /// tally via `close_failures.remove`, so an intermittent dial failure never
+    /// accrues toward an unwarranted unilateral close — modelled here by the
+    /// remove + a fresh count restarting from one.
+    #[test]
+    fn close_failure_tally_resets_after_a_response() {
+        let mut failures: HashMap<ChannelId, u32> = HashMap::new();
+        let ch = B256::repeat_byte(0x55);
+        let threshold = RECONCILE_CLOSE_ESCALATION_THRESHOLD;
+        assert_eq!(
+            record_close_failure(&mut failures, ch, threshold),
+            CloseEscalation::Wait { consecutive: 1 }
+        );
+        // The caller clears the tally when the provider responds.
+        failures.remove(&ch);
+        assert_eq!(
+            record_close_failure(&mut failures, ch, threshold),
+            CloseEscalation::Wait { consecutive: 1 },
+            "a response resets the run, so the next failure restarts from one"
+        );
+    }
+
+    /// Close tallies are independent per channel: one provider going dark does
+    /// not escalate a different, still-flaky channel.
+    #[test]
+    fn close_failure_tallies_are_per_channel() {
+        let mut failures: HashMap<ChannelId, u32> = HashMap::new();
+        let a = B256::repeat_byte(0x66);
+        let b = B256::repeat_byte(0x77);
+        let threshold = 2;
+        assert_eq!(
+            record_close_failure(&mut failures, a, threshold),
+            CloseEscalation::Wait { consecutive: 1 }
+        );
+        assert_eq!(
+            record_close_failure(&mut failures, a, threshold),
+            CloseEscalation::Escalate { consecutive: 2 }
+        );
+        assert_eq!(
+            record_close_failure(&mut failures, b, threshold),
+            CloseEscalation::Wait { consecutive: 1 },
+            "channel b is unaffected by channel a crossing the threshold"
         );
     }
 

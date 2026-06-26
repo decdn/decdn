@@ -1090,6 +1090,14 @@ pub async fn run(
     let buyer_channel_store: Arc<dyn decdn_incentive::BuyerChannelStore> = Arc::new(
         crate::channel_store::BuyerChannelStoreHandle::new(Arc::clone(&concrete_channel_store)),
     );
+    // Buyer pending-settle set (#988): a SEPARATE redb table from the seller's
+    // `pending_settle_store` above, so the buyer settle sweep and the seller
+    // settle sweep never finalize each other's closes (keeps the #989 metric
+    // families cleanly attributed).
+    let buyer_pending_settle_store: Arc<dyn PendingSettleStore> =
+        Arc::new(crate::channel_store::BuyerPendingSettleStoreHandle::new(
+            Arc::clone(&concrete_channel_store),
+        ));
     let buyer_channel_service = match crate::buyer_channel::BuyerChannelService::bootstrap(
         buyer_wallet_provider,
         payment_channel_addr,
@@ -1108,6 +1116,7 @@ pub async fn run(
                 endpoint: ep.clone(),
                 resolver: Arc::clone(resolver),
             }),
+        buyer_pending_settle_store,
         Arc::clone(&node_metrics),
     )
     .await
