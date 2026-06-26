@@ -10,33 +10,35 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 
 /// @title BuybackBurner
 /// @notice Receives the 30% USDC bucket from `FeeRouter.routeSettlement`, swaps
-///         it for TOKEN via the Balancer V3 80/20 pool (ADR 018), and burns
-///         the proceeds (ADR 026 § FeeRouter split → § Slashing and burn).
-/// @dev    This revision ships the inflow + governance-mutable pool wiring; the
-///         concrete Balancer V3 Vault swap ABI integration is deferred to the
-///         deployment PR that targets a live pool. `executeBuyback` reverts
-///         with `PoolNotWired` until governance calls `setPool` + `setVault`,
-///         and with `SwapNotImplemented` until a subclass overrides
-///         `_performSwap` with the live Balancer V3 ABI. Once that override
-///         is in place, the contract performs a single swap via the Balancer
-///         V3 Router then burns the received TOKEN.
+///         it for TOKEN, and burns the proceeds (ADR 026 § FeeRouter split →
+///         § Slashing and burn). The swap venue is NOT fixed here: this base is
+///         venue-neutral and owns only the parts every burner shares — the
+///         keeper entry point, the actual-TOKEN-delta verification, the burn,
+///         USDC rescue, and pausing. The concrete swap, the pool/router wiring,
+///         and any MEV-defense stack live in subclasses (`GuardedBuybackBurner`
+///         adds the shared TWAP/band/cap stack; `BuybackBurnerBalancerV3` and
+///         `BuybackBurnerUniswapV3` bind a live venue).
+/// @dev    `executeBuyback` reverts `PoolNotWired` (via the subclass
+///         `_requireWired` hook) until governance wires the venue, and
+///         `SwapNotImplemented` if `_performSwap` transfers no TOKEN. Once a
+///         subclass override returns a non-zero `tokenOut` backed by a matching
+///         balance delta, the burn fires.
 ///
 ///         MANDATORY `_performSwap` SUBCLASS INVARIANTS (the deployment-PR
-///         auditor MUST verify these before mainnet — the base contract cannot
-///         enforce them because the Vault ABI is unknown here):
+///         auditor MUST verify these before mainnet — the base cannot enforce
+///         them because the venue ABI is unknown here):
 ///           1. Derive the `minOut` floor from an on-chain TWAP/oracle and
-///              require the keeper-supplied `minOut >= twapFloor`; the base
-///              only rejects `minOut == 0` (no zero-slippage swaps) and bounds
+///              require the keeper-supplied `minOut >= twapFloor`; the base only
+///              rejects `minOut == 0` (no zero-slippage swaps) and bounds
 ///              `amountIn` by the contract's USDC balance.
 ///           2. Scope the input-token approval to exactly `amountIn` and reset
 ///              it to `0` after the swap, so no standing USDC allowance survives
-///              the call. The mechanism is venue-specific: a Balancer V3 Router
-///              pulls via Permit2, so the V3 subclass scopes an ERC20 approval to
-///              Permit2 plus a Permit2 allowance to the Router — NOT a direct
-///              Vault allowance (the V2 model).
+///              the call. The mechanism is venue-specific (a Balancer/Uniswap V3
+///              Router pulls via Permit2; another venue may take a direct
+///              allowance).
 ///           3. Optionally cap `amountIn` against a governed per-epoch
 ///              liquidity budget to limit sandwich exposure on thin pools.
-// slither-disable-next-line unimplemented-functions
+///         `GuardedBuybackBurner` implements all three once for every venue.
 abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
@@ -49,7 +51,7 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     // -----------------------------------------------------------------
-    // Immutables + governance-mutable wiring
+    // Immutables
     // -----------------------------------------------------------------
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
@@ -58,22 +60,11 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ERC20Burnable public immutable token;
 
-    /// @notice Balancer V3 Vault address, distinct from the Router. Used for
-    ///         pool registration / state reads (e.g. `isPoolRegistered`), not as
-    ///         an approval target — under V3 the Router pulls `tokenIn` via
-    ///         Permit2 and settles to the Vault. Set via `setVault`.
-    address public balancerVault;
-
-    /// @notice Balancer V3 pool contract address for the 80/20 TOKEN/USDC pool.
-    address public balancerPool;
-
     // -----------------------------------------------------------------
     // Events / Errors
     // -----------------------------------------------------------------
 
     event BuybackExecuted(uint256 usdcIn, uint256 tokenOut);
-    event PoolUpdated(address indexed oldAddr, address indexed newAddr);
-    event VaultUpdated(address indexed oldAddr, address indexed newAddr);
     event UsdcRescued(address indexed to, uint256 amount);
 
     error ZeroAddress();
@@ -103,15 +94,13 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
     // -----------------------------------------------------------------
 
     /// @notice Swap `amountIn` USDC for TOKEN (slippage floor `minOut`), then
-    ///         burn the received TOKEN. Until the Balancer V3 Vault swap ABI
-    ///         is bound (separate deployment PR), reverts with
-    ///         `SwapNotImplemented` even after `setPool` + `setVault` are
-    ///         called. A success path that emitted `BuybackExecuted` with a
-    ///         zero burn would mislead off-chain indexers (I1 fix).
-    /// @dev    Production deployment subclasses this contract and overrides
-    ///         `_performSwap` with the real Vault call; the override returns
-    ///         a non-zero `tokenOut`, which makes the burn fire and the
-    ///         `SwapNotImplemented` revert unreachable.
+    ///         burn the received TOKEN. Reverts `SwapNotImplemented` if the
+    ///         subclass `_performSwap` reports a positive `tokenOut` but
+    ///         transfers nothing — a success path that emitted `BuybackExecuted`
+    ///         with a zero burn would mislead off-chain indexers (I1 fix).
+    /// @dev    Subclasses override `_performSwap` with the real venue call; the
+    ///         override returns a non-zero `tokenOut`, which makes the burn fire
+    ///         and the `SwapNotImplemented` revert unreachable.
     function executeBuyback(uint256 amountIn, uint256 minOut)
         external
         virtual
@@ -124,9 +113,11 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
         // Reject zero-slippage swaps: a `minOut == 0` keeper call (or one
         // front-run into a thin pool) would accept near-zero TOKEN out and
         // burn dust. The TWAP-derived floor on top of this lives in the
-        // subclass `_performSwap` (see header invariants).
+        // guard subclass `_performSwap`.
         if (minOut == 0) revert ZeroMinOut();
-        if (balancerPool == address(0) || balancerVault == address(0)) revert PoolNotWired();
+        // Venue-wiring readiness is a subclass concern (each venue knows what
+        // "wired" means); the hook reverts `PoolNotWired` when not ready.
+        _requireWired();
         // Bound the spend by the contract's actual USDC holdings so a keeper
         // cannot request a swap larger than the buyback bucket.
         uint256 usdcBalance = usdc.balanceOf(address(this));
@@ -148,46 +139,22 @@ abstract contract BuybackBurner is AccessControl, ReentrancyGuard, Pausable {
         emit BuybackExecuted(amountIn, actual);
     }
 
-    /// @dev Abstract hook for the live Balancer V3 swap. The deployment PR
-    ///      that binds the Vault ABI subclasses `BuybackBurner` and provides
-    ///      a concrete `_performSwap` returning the post-swap TOKEN amount.
-    ///      Keeping this `virtual` without a body (a) keeps the base
-    ///      contract abstract — it cannot be deployed by itself — and
-    ///      (b) makes solc's unreachable-code analysis treat the call site
-    ///      as opaque, avoiding the OZ ReentrancyGuard `--deny-warnings`
-    ///      trip that a return-0 base implementation would cause.
+    /// @dev Abstract hook for the concrete venue swap. The subclass performs the
+    ///      USDC->TOKEN swap (the TOKEN landing in this contract) and returns the
+    ///      post-swap TOKEN amount. Keeping this `virtual` without a body keeps
+    ///      the base abstract and makes solc's unreachable-code analysis treat
+    ///      the call site as opaque, avoiding the OZ ReentrancyGuard
+    ///      `--deny-warnings` trip a return-0 base implementation would cause.
     function _performSwap(uint256 amountIn, uint256 minOut) internal virtual returns (uint256);
 
+    /// @dev Abstract wiring-readiness guard. Subclasses revert `PoolNotWired`
+    ///      while their venue (pool/router/vault) is not fully configured, so
+    ///      `executeBuyback` never reaches a swap against an unwired venue.
+    function _requireWired() internal view virtual;
+
     // -----------------------------------------------------------------
-    // Governance setters
+    // USDC rescue + pausing
     // -----------------------------------------------------------------
-
-    /// @dev These setters and the constructor are the only writers of
-    ///      `balancerPool`/`balancerVault`. The base performs NO pool-integrity
-    ///      validation and offers no central post-write hook. A subclass that
-    ///      layers a wiring invariant (see `BuybackBurnerBalancerV3`) MUST
-    ///      override BOTH `setPool` and `setVault` and re-validate after any
-    ///      direct constructor write — every write site carries the obligation
-    ///      independently.
-
-    /// @dev `newPool == address(0)` is the documented "not wired" state;
-    ///      `executeBuyback` reverts with `PoolNotWired` in that case. Use
-    ///      `pause()` for a single-flag disable instead of zeroing the pool.
-    // slither-disable-next-line missing-zero-check
-    function setPool(address newPool) public virtual onlyRole(GOVERNANCE_ROLE) {
-        address old = balancerPool;
-        balancerPool = newPool;
-        emit PoolUpdated(old, newPool);
-    }
-
-    /// @dev `newVault == address(0)` is the documented "not wired" state;
-    ///      `executeBuyback` reverts with `PoolNotWired` in that case.
-    // slither-disable-next-line missing-zero-check
-    function setVault(address newVault) public virtual onlyRole(GOVERNANCE_ROLE) {
-        address old = balancerVault;
-        balancerVault = newVault;
-        emit VaultUpdated(old, newVault);
-    }
 
     /// @notice Recover USDC stranded in this contract — e.g. inflow that
     ///         accumulated while the pool was unwired, residue left by a keeper

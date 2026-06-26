@@ -24,9 +24,9 @@ contract MockUSDC is ERC20 {
 
 /// @notice Test-only TOKEN faucet that hands a configurable amount to the
 ///         caller. Lets `TestableBuybackBurner._performSwap` simulate "the
-///         Vault transferred X TOKEN to the BuybackBurner contract" without
-///         requiring a live Balancer Vault. Pre-funded from the test's
-///         TOKEN holder in `setUp`.
+///         venue transferred X TOKEN to the BuybackBurner contract" without
+///         requiring a live pool. Pre-funded from the test's TOKEN holder in
+///         `setUp`.
 contract TokenSource {
     IERC20 internal token;
 
@@ -42,19 +42,22 @@ contract TokenSource {
     }
 }
 
-/// @notice Concrete `BuybackBurner` subclass for tests. `_performSwap` pulls
-///         `actualTransfer` TOKEN from the `TokenSource` into this contract
-///         (simulating the Balancer Vault's outbound transfer leg) and
-///         returns `reportedReturn` (simulating the Vault's reported
-///         post-swap amount). Decoupling the two fields lets the test
+/// @notice Concrete `BuybackBurner` subclass for tests of the venue-neutral
+///         base. `_performSwap` pulls `actualTransfer` TOKEN from the
+///         `TokenSource` into this contract (simulating the venue's outbound
+///         transfer leg) and returns `reportedReturn` (simulating the venue's
+///         reported post-swap amount). Decoupling the two fields lets the test
 ///         exercise every revert branch in `executeBuyback`:
 ///           - `actualTransfer == 0` → `SwapNotImplemented`
 ///           - `reportedReturn != actualTransfer` → `SwapReportMismatch`
 ///           - both equal and non-zero → happy-path burn + event
+///         A plain `wired` flag stands in for the subclass `_requireWired`
+///         hook so the base `PoolNotWired` path is exercisable without a venue.
 contract TestableBuybackBurner is BuybackBurner {
     TokenSource internal source;
     uint256 public actualTransfer;
     uint256 public reportedReturn;
+    bool public wired;
 
     constructor(IERC20 usdc_, ERC20Burnable token_, address admin, TokenSource source_)
         BuybackBurner(usdc_, token_, admin)
@@ -67,18 +70,28 @@ contract TestableBuybackBurner is BuybackBurner {
         reportedReturn = reported_;
     }
 
+    function setWired(bool wired_) external {
+        wired = wired_;
+    }
+
     function _performSwap(uint256, uint256) internal override returns (uint256) {
         source.feed(actualTransfer);
         return reportedReturn;
     }
+
+    function _requireWired() internal view override {
+        if (!wired) revert PoolNotWired();
+    }
 }
 
 /// @title BuybackBurner smoke tests
-/// @notice Coverage for the abstract `BuybackBurner` via a concrete
+/// @notice Coverage for the venue-neutral `BuybackBurner` via a concrete
 ///         `TestableBuybackBurner`. Covers `executeBuyback` happy + revert
 ///         paths (including the I1 trust-boundary check on the subclass's
-///         reported `tokenOut`), role guards on `setPool`/`setVault`/
-///         `pause`/`unpause`, and constructor zero-address validation.
+///         reported `tokenOut` and the `_requireWired` gate), `pause`/`unpause`
+///         and `rescueUSDC` role guards, and constructor zero-address
+///         validation. Venue-specific wiring (pool/vault/router) is covered in
+///         the per-venue suites.
 contract BuybackBurnerTest is Test {
     MockUSDC internal usdc;
     Token internal token;
@@ -88,8 +101,6 @@ contract BuybackBurnerTest is Test {
     address internal admin = address(0xA11CE);
     address internal keeper = address(0xCAFE);
     address internal pauser = address(0xBAD);
-    address internal pool = address(0x1111);
-    address internal vault = address(0x2222);
 
     uint256 internal constant USDC_AMOUNT = 1000e6;
     uint256 internal constant TOKEN_OUT = 500e18;
@@ -104,13 +115,12 @@ contract BuybackBurnerTest is Test {
         vm.startPrank(admin);
         bb.grantRole(bb.KEEPER_ROLE(), keeper);
         bb.grantRole(bb.PAUSER_ROLE(), pauser);
-        bb.setPool(pool);
-        bb.setVault(vault);
+        bb.setWired(true);
         // Fund the TokenSource with TOKEN so `_performSwap` can hand a
         // configurable amount to the BuybackBurner.
         token.transfer(address(source), 1_000_000e18);
-        // Fund the BuybackBurner with USDC (would arrive via FeeRouter.routeSettlement).
         vm.stopPrank();
+        // Fund the BuybackBurner with USDC (would arrive via FeeRouter.routeSettlement).
         usdc.transfer(address(bb), 10_000_000e6);
     }
 
@@ -164,26 +174,12 @@ contract BuybackBurnerTest is Test {
         bb.executeBuyback(balance + 1, 1);
     }
 
-    function test_executeBuyback_revertsPoolNotWiredWhenPoolUnset() public {
-        // Fresh deployment with vault set but pool unset.
+    function test_executeBuyback_revertsPoolNotWiredWhenUnwired() public {
+        // Fresh deployment left unwired (`wired` defaults false).
         TestableBuybackBurner fresh =
             new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, source);
         vm.startPrank(admin);
         fresh.grantRole(fresh.KEEPER_ROLE(), keeper);
-        fresh.setVault(vault);
-        vm.stopPrank();
-
-        vm.prank(keeper);
-        vm.expectRevert(BuybackBurner.PoolNotWired.selector);
-        fresh.executeBuyback(USDC_AMOUNT, 1);
-    }
-
-    function test_executeBuyback_revertsPoolNotWiredWhenVaultUnset() public {
-        TestableBuybackBurner fresh =
-            new TestableBuybackBurner(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, source);
-        vm.startPrank(admin);
-        fresh.grantRole(fresh.KEEPER_ROLE(), keeper);
-        fresh.setPool(pool);
         vm.stopPrank();
 
         vm.prank(keeper);
@@ -255,44 +251,6 @@ contract BuybackBurnerTest is Test {
         // Supply burned, contract holds no residual TOKEN.
         assertEq(supplyBefore - token.totalSupply(), TOKEN_OUT);
         assertEq(token.balanceOf(address(bb)), bbBalanceBefore);
-    }
-
-    // -----------------------------------------------------------------
-    // setPool / setVault — role guards + event
-    // -----------------------------------------------------------------
-
-    function test_setPool_revertsWithoutGovernanceRole() public {
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector, address(this), bb.GOVERNANCE_ROLE()
-            )
-        );
-        bb.setPool(address(0x9999));
-    }
-
-    function test_setPool_emitsUpdateEvent() public {
-        vm.expectEmit(true, true, false, false, address(bb));
-        emit BuybackBurner.PoolUpdated(pool, address(0x9999));
-        vm.prank(admin);
-        bb.setPool(address(0x9999));
-        assertEq(bb.balancerPool(), address(0x9999));
-    }
-
-    function test_setVault_revertsWithoutGovernanceRole() public {
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector, address(this), bb.GOVERNANCE_ROLE()
-            )
-        );
-        bb.setVault(address(0x9999));
-    }
-
-    function test_setVault_emitsUpdateEvent() public {
-        vm.expectEmit(true, true, false, false, address(bb));
-        emit BuybackBurner.VaultUpdated(vault, address(0x9999));
-        vm.prank(admin);
-        bb.setVault(address(0x9999));
-        assertEq(bb.balancerVault(), address(0x9999));
     }
 
     // -----------------------------------------------------------------

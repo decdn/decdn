@@ -8,6 +8,7 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
 import { IBalancerV3Vault } from "../src/interfaces/IBalancerV3Vault.sol";
 import { IPermit2 } from "../src/interfaces/IPermit2.sol";
@@ -287,7 +288,7 @@ contract BuybackBurnerBalancerV3SwapBurnForkTest is Test {
         assertFalse(ok, "expected a revert from the live Router min-out check");
         assertGe(err.length, 4, "expected a typed/standard revert payload");
         assertTrue(
-            bytes4(err) != BuybackBurnerBalancerV3.MinOutBelowTwapFloor.selector,
+            bytes4(err) != GuardedBuybackBurner.MinOutBelowTwapFloor.selector,
             "must revert at the Router, not the contract floor gate"
         );
     }
@@ -300,7 +301,7 @@ contract BuybackBurnerBalancerV3SwapBurnForkTest is Test {
         _matureTwap();
         usdc.mint(address(bb), AMOUNT_IN);
         uint256 floor = _twapFloor(AMOUNT_IN);
-        vm.expectRevert(abi.encodeWithSelector(BuybackBurnerBalancerV3.MinOutBelowTwapFloor.selector, floor - 1, floor));
+        vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.MinOutBelowTwapFloor.selector, floor - 1, floor));
         bb.executeBuyback(AMOUNT_IN, floor - 1);
     }
 
