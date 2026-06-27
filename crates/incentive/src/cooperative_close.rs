@@ -229,6 +229,34 @@ mod tests {
         Ok(())
     }
 
+    /// Committed EIP-712 digest for the canonical cooperative-close waiver vector
+    /// (`sample_close()` over `sample_domain()`). Parity-pinned against the Solidity
+    /// verifier in `contracts/test/PaymentChannel.t.sol`
+    /// (`test_cooperativeClose_digestMatchesVector`). Unlike
+    /// [`cooperative_close_type_hash_matches_contract`], this covers the *full*
+    /// typed-data digest — typehash + struct encoding + domain (name
+    /// `"PaymentChannel"`, version `"1"`, chainId 421614, verifyingContract
+    /// `0x..1234`) — so a drift in the *Rust-side* encoding or domain
+    /// `name`/`version` is caught here rather than surfacing as unsettleable
+    /// waivers on-chain. The contract-side domain is pinned to this same vector by
+    /// `test_cooperativeClose_domainMatchesVector` (name/version, read live) and
+    /// `test_cooperativeClose_digestMatchesVector` (live typehash).
+    /// Re-derive only on a coordinated, intentional EIP-712 change.
+    const EXPECTED_COOP_CLOSE_DIGEST: B256 =
+        b256!("680080f3ddc99e1f65d2a03b8608b84c01e4e6b97885f2ddbca2f17020d8d627");
+
+    /// The Rust signer's digest for the canonical vector must equal the committed
+    /// value (also asserted from Solidity). Guards Rust↔contract EIP-712 parity.
+    #[test]
+    fn cooperative_close_digest_matches_committed_vector() -> anyhow::Result<()> {
+        let actual = sample_close().signing_hash(&sample_domain());
+        anyhow::ensure!(
+            actual == EXPECTED_COOP_CLOSE_DIGEST,
+            "cooperative-close digest drifted: actual={actual} expected={EXPECTED_COOP_CLOSE_DIGEST}"
+        );
+        Ok(())
+    }
+
     /// A client voucher and a provider waiver over the *same* tuple must produce
     /// *different* digests — the distinct type-string is what stops one standing
     /// in for the other (mirrors the on-chain `_verifyCooperativeClose` vs
