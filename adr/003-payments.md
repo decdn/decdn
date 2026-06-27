@@ -603,7 +603,7 @@ An earlier design considered a router bypass on the grounds that routing node-to
 
 #### Settlement sequence
 
-End-to-end payment-token flow — client→node and node-to-node settlements both use the same `PaymentChannel → FeeRouter.routeSettlement` path — is diagrammed in [ADR 016 §"FeeRouter integration"](016-contract-interactions.md#adr-016-smart-contract-interaction-model). This ADR documents only the `PaymentChannel ↔ FeeRouter` interface contract.
+End-to-end payment-token flow — client→node and node-to-node settlements both use the same `PaymentChannel → FeeRouter.routeSettlement` path — is diagrammed in [ADR 016 § USDC Flow (Payments)](016-contract-interactions.md#usdc-flow-payments). This ADR documents only the `PaymentChannel ↔ FeeRouter` interface contract.
 
 The full three-bucket split applies to every network deployment from launch. Simplified launch configurations are expressed by setting non-active bucket shares to zero via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), not by deploying a reduced-surface stub. The cross-validation invariant in that section ensures any non-zero share has a wired non-zero destination, so the launch share configuration alone determines which downstream contracts must be ready at deploy time.
 
