@@ -103,7 +103,14 @@ use crate::metrics::Metrics;
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::origin_assignment::OriginAssignment;
+// Event structs imported directly so the topic0 dispatch stays under the 100-col
+// width (the fully-qualified `OriginAssignment::<Event>` paths overflow it).
+use decdn_incentive::origin_assignment::OriginAssignment::{
+    AssignmentActivated, AssignmentRevoked, BlacklistedAssignmentPruned,
+    DefaultOpenAllowlistUpdated, DefaultOpenOperatorAdded, DefaultOpenOperatorRemoved,
+};
 use decdn_incentive::publisher_registry::PublisherRegistry;
+use decdn_incentive::publisher_registry::PublisherRegistry::ContentClaimed;
 
 /// Block-window size for the genesis `ContentClaimed` log replay. Kept well
 /// under the common provider `eth_getLogs` 10k-block cap so bootstrap works on
@@ -693,7 +700,7 @@ where
     let mut publisher_events = watch_contract_events(
         contracts.publisher.provider(),
         *contracts.publisher.address(),
-        [PublisherRegistry::ContentClaimed::SIGNATURE_HASH],
+        [ContentClaimed::SIGNATURE_HASH],
     )
     .await
     .context("watch PublisherRegistry events")?;
@@ -701,12 +708,12 @@ where
         contracts.origin.provider(),
         *contracts.origin.address(),
         [
-            OriginAssignment::AssignmentActivated::SIGNATURE_HASH,
-            OriginAssignment::AssignmentRevoked::SIGNATURE_HASH,
-            OriginAssignment::BlacklistedAssignmentPruned::SIGNATURE_HASH,
-            OriginAssignment::DefaultOpenAllowlistUpdated::SIGNATURE_HASH,
-            OriginAssignment::DefaultOpenOperatorAdded::SIGNATURE_HASH,
-            OriginAssignment::DefaultOpenOperatorRemoved::SIGNATURE_HASH,
+            AssignmentActivated::SIGNATURE_HASH,
+            AssignmentRevoked::SIGNATURE_HASH,
+            BlacklistedAssignmentPruned::SIGNATURE_HASH,
+            DefaultOpenAllowlistUpdated::SIGNATURE_HASH,
+            DefaultOpenOperatorAdded::SIGNATURE_HASH,
+            DefaultOpenOperatorRemoved::SIGNATURE_HASH,
         ],
     )
     .await
@@ -728,7 +735,7 @@ where
                 let Some(log) = maybe else { return Ok(()) };
                 state.advance_block(log.block_number);
                 // PublisherRegistry's sole subscribed event is ContentClaimed.
-                let event = PublisherRegistry::ContentClaimed::decode_log_data(&log.inner.data)
+                let event = ContentClaimed::decode_log_data(&log.inner.data)
                     .context("decode ContentClaimed")?;
                 on_content_claimed(
                     contracts, cache, metrics,
@@ -739,33 +746,42 @@ where
                 let Some(log) = maybe else { return Ok(()) };
                 state.advance_block(log.block_number);
                 match log.topic0().copied() {
-                    Some(sig) if sig == OriginAssignment::AssignmentActivated::SIGNATURE_HASH => {
-                        let event = OriginAssignment::AssignmentActivated::decode_log_data(&log.inner.data)
+                    Some(sig) if sig == AssignmentActivated::SIGNATURE_HASH => {
+                        let event = AssignmentActivated::decode_log_data(&log.inner.data)
                             .context("decode AssignmentActivated")?;
                         on_namespace_changed(contracts, cache, metrics, event.namespaceId).await;
                     }
-                    Some(sig) if sig == OriginAssignment::AssignmentRevoked::SIGNATURE_HASH => {
-                        let event = OriginAssignment::AssignmentRevoked::decode_log_data(&log.inner.data)
+                    Some(sig) if sig == AssignmentRevoked::SIGNATURE_HASH => {
+                        let event = AssignmentRevoked::decode_log_data(&log.inner.data)
                             .context("decode AssignmentRevoked")?;
-                        on_origin_removed(contracts, cache, metrics, event.namespaceId, event.operator).await;
+                        on_origin_removed(
+                            contracts, cache, metrics, event.namespaceId, event.operator,
+                        )
+                        .await;
                     }
-                    Some(sig) if sig == OriginAssignment::BlacklistedAssignmentPruned::SIGNATURE_HASH => {
-                        let event = OriginAssignment::BlacklistedAssignmentPruned::decode_log_data(&log.inner.data)
+                    Some(sig) if sig == BlacklistedAssignmentPruned::SIGNATURE_HASH => {
+                        let event = BlacklistedAssignmentPruned::decode_log_data(&log.inner.data)
                             .context("decode BlacklistedAssignmentPruned")?;
-                        on_origin_removed(contracts, cache, metrics, event.namespaceId, event.operator).await;
+                        on_origin_removed(
+                            contracts, cache, metrics, event.namespaceId, event.operator,
+                        )
+                        .await;
                     }
                     // The default-open allow-list events carry no fields we read; the
                     // event is only a signal to re-read `getOrigins(0)` wholesale.
-                    Some(sig) if sig == OriginAssignment::DefaultOpenAllowlistUpdated::SIGNATURE_HASH => {
+                    Some(sig) if sig == DefaultOpenAllowlistUpdated::SIGNATURE_HASH => {
                         on_default_open_changed(contracts, cache, metrics).await;
                     }
-                    Some(sig) if sig == OriginAssignment::DefaultOpenOperatorAdded::SIGNATURE_HASH => {
+                    Some(sig) if sig == DefaultOpenOperatorAdded::SIGNATURE_HASH => {
                         on_default_open_changed(contracts, cache, metrics).await;
                     }
-                    Some(sig) if sig == OriginAssignment::DefaultOpenOperatorRemoved::SIGNATURE_HASH => {
-                        let event = OriginAssignment::DefaultOpenOperatorRemoved::decode_log_data(&log.inner.data)
+                    Some(sig) if sig == DefaultOpenOperatorRemoved::SIGNATURE_HASH => {
+                        let event = DefaultOpenOperatorRemoved::decode_log_data(&log.inner.data)
                             .context("decode DefaultOpenOperatorRemoved")?;
-                        on_origin_removed(contracts, cache, metrics, DEFAULT_OPEN_NAMESPACE, event.operator).await;
+                        on_origin_removed(
+                            contracts, cache, metrics, DEFAULT_OPEN_NAMESPACE, event.operator,
+                        )
+                        .await;
                     }
                     // The filter's topic0 OR-set guarantees only the events above;
                     // ignore anything else rather than panicking (anti-panic policy).

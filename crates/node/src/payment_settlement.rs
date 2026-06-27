@@ -1022,8 +1022,9 @@ async fn run_watcher_once<P: Provider + Clone>(
                 // open of *ours* was persisted, so advancing the checkpoint
                 // from them could leap past an open that later fails and strand
                 // the channel (vouchers rejected `WrongChannel` forever). The
-                // `opened` stream is block-ordered, so the per-cycle hold below
-                // suffices against a later same-stream open.
+                // unified filter returns logs in block order, so ChannelOpened
+                // events still arrive block-ordered; the per-cycle hold below
+                // suffices against a later open.
                 match apply_channel_opened(handler, self_address, usdc_token, &event, false).await {
                     Ok(()) => {
                         advance_checkpoint(checkpoint_store, log.block_number, &mut checkpoint_hw);

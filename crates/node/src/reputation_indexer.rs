@@ -215,10 +215,10 @@ async fn watcher_loop<P>(
     }
 }
 
-// Backfill + two-arm event loop; the dispatch is fundamentally a few branches
-// over two streams (same posture as `chain_staker_set::run_watcher_once`).
-// One-shot backfill followed by the live select reads as a single sequence;
-// splitting the backfill into its own function would obscure the bring-up flow.
+// Backfill + two-event dispatch; fundamentally a few branches over one unified
+// log stream (same posture as `chain_staker_set::run_watcher_once`). One-shot
+// backfill followed by the live drain loop reads as a single sequence; splitting
+// the backfill into its own function would obscure the bring-up flow.
 #[allow(clippy::cognitive_complexity)]
 #[allow(clippy::too_many_lines)]
 async fn run_watcher_once<P>(
