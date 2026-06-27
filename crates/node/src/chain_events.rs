@@ -9,10 +9,11 @@
 //!
 //! The error contract matches the per-event `.watch()` streams this replaces:
 //! the underlying alloy poller swallows transient transport errors and retries
-//! internally, the stream ends (`None`) only when the provider is dropped, and
-//! log decoding is the caller's responsibility — so a malformed log surfaces at
-//! the caller's `decode_log_data`, exactly as a decode error did on the old
-//! typed streams.
+//! internally, the stream ends (`None`) when the alloy provider is dropped OR
+//! the RPC server expires the filter (`filter not found` stops the poller —
+//! e.g. filter expiry or provider rotation), and log decoding is the caller's
+//! responsibility — so a malformed log surfaces at the caller's
+//! `decode_log_data`, exactly as a decode error did on the old typed streams.
 
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;

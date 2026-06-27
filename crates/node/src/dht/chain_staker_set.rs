@@ -304,8 +304,9 @@ async fn watcher_loop<P>(
 /// Run one cycle of the watcher: open a single multi-topic filter over the five
 /// membership events and drain it, demuxing each log by `topic0`, until the
 /// stream ends or a log fails to decode. Returns `Ok(())` if the stream ended
-/// cleanly (provider dropped); returns `Err` on a decode failure, which trips
-/// the caller's backoff exactly as a per-event stream error did before.
+/// cleanly (filter expiry / provider rotation, or the provider being dropped);
+/// returns `Err` on a decode failure, which trips the caller's backoff exactly
+/// as a per-event stream error did before.
 #[allow(clippy::cognitive_complexity)] // 5-arm event-dispatch loop is fundamentally complex; splitting obscures the dispatch table
 async fn run_watcher_once<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
@@ -392,8 +393,13 @@ where
                     .await;
             }
             // The filter's topic0 OR-set guarantees only the events above reach
-            // us; ignore anything else rather than panicking (anti-panic policy).
-            _ => {}
+            // us, so this arm is unreachable today. Don't panic (anti-panic
+            // policy); log it so a future OR-set/dispatch drift (a signature
+            // added to the filter without a match arm) leaves a greppable trail
+            // instead of silently dropping a membership event.
+            _ => {
+                debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
+            }
         }
     }
     Ok(())

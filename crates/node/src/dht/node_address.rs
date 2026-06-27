@@ -265,8 +265,9 @@ async fn watcher_loop<P>(
 
 /// Open a single multi-topic filter over the two binding-mutating events and
 /// drain it, demuxing each log by `topic0`. `Ok(())` on a clean stream end
-/// (provider dropped); `Err` on a decode failure, which trips the caller's
-/// backoff exactly as a per-event stream error did before.
+/// (filter expiry / provider rotation, or the provider being dropped); `Err` on
+/// a decode failure, which trips the caller's backoff exactly as a per-event
+/// stream error did before.
 async fn run_watcher_once<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
     bindings: &Arc<RwLock<HashMap<NodeId, Address>>>,
@@ -310,9 +311,12 @@ where
                     .context("decode NodeDeregistered")?;
                 remove_binding(bindings, metrics, &NodeId::from_bytes(event.nodeId.0));
             }
-            // The filter's topic0 OR-set guarantees only the events above; ignore
-            // anything else rather than panicking (anti-panic policy).
-            _ => {}
+            // Unreachable today (the filter's topic0 OR-set bounds the inputs);
+            // don't panic (anti-panic policy), log it so a future OR-set/dispatch
+            // drift leaves a greppable trail instead of a silently dropped event.
+            _ => {
+                debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
+            }
         }
     }
     Ok(())

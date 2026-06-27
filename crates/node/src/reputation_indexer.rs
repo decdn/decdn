@@ -336,9 +336,12 @@ where
                 )
                 .await?;
             }
-            // The filter's topic0 OR-set guarantees only the events above; ignore
-            // anything else rather than panicking (anti-panic policy).
-            _ => {}
+            // Unreachable today (the filter's topic0 OR-set bounds the inputs);
+            // don't panic (anti-panic policy), log it so a future OR-set/dispatch
+            // drift leaves a greppable trail instead of a silently dropped event.
+            _ => {
+                debug!(topic0 = ?log.topic0(), "unmatched PaymentChannel event in subscribed OR-set");
+            }
         }
     }
     Ok(())

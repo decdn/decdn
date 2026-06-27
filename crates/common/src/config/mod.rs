@@ -8610,6 +8610,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn resolve_blockchain_accepts_min_and_in_range_event_poll_interval() -> anyhow::Result<()> {
+        // Pins the inclusive floor (exactly MIN is accepted, guarding an
+        // off-by-one regression to `>`) and that an in-range value is preserved
+        // through resolution rather than clamped. Mirrors the
+        // `accepts_min_watchdog_interval` boundary test.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let at_min = types::BlockchainConfig {
+            event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&at_min), dir.path())?;
+        assert_eq!(resolved.event_poll_interval_ms, MIN_EVENT_POLL_INTERVAL_MS);
+
+        let in_range = types::BlockchainConfig {
+            event_poll_interval_ms: Some(1000),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&in_range), dir.path())?;
+        assert_eq!(resolved.event_poll_interval_ms, 1000);
+        Ok(())
+    }
+
     // ---- resolve_cache: CLI > file, defaults, tilde expansion ------------
 
     #[test]

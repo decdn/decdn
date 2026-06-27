@@ -918,7 +918,8 @@ async fn watcher_loop<P: Provider + Clone>(
 
 /// One watcher cycle: open a single multi-topic filter over the four channel
 /// events and drain it, demuxing each log by `topic0`, until the stream ends
-/// (provider dropped) or a log fails to decode (transport-equivalent error).
+/// (filter expiry / provider rotation, or the provider being dropped) or a log
+/// fails to decode (transport-equivalent error).
 // 4-arm event-dispatch loop is fundamentally complex; splitting obscures the
 // dispatch table (same posture as `chain_staker_set::run_watcher_once`). The
 // line budget is likewise over by a hair for the same reason.
@@ -1134,15 +1135,15 @@ async fn run_watcher_once<P: Provider + Clone>(
                     // residual manual-`settleChannel` gap noted at the backfill
                     // call site. The re-arm closes the common (no-crash) case.
                     //
-                    // Block fallback differs from the `opened` arm: there a
-                    // missing `block_number` falls back to `checkpoint_hw`,
-                    // safe-by-construction because that arm's own block-ordered
-                    // stream keeps `checkpoint_hw <= failed`. Here `checkpoint_hw`
-                    // is *open*-advanced and unordered against this close, so it
-                    // could exceed the close block and re-arm *above* it —
-                    // silently skipping the close. An unconfirmed log (no block)
-                    // is rare, so fall back to `0`: an idempotent, backoff-paced
-                    // full re-scan that cannot overshoot.
+                    // Block fallback for a missing `block_number` (unconfirmed
+                    // log): fall back to `0` — an idempotent, backoff-paced full
+                    // re-scan that cannot overshoot. Under the unified single
+                    // filter, opens and this close ARE mutually block-ordered, so
+                    // `checkpoint_hw` (open-advanced) is `<=` this close's block
+                    // within a cycle — the old cross-stream overshoot race (when
+                    // opens and closes were separate pollers) no longer exists.
+                    // `0` is kept anyway: a no-block log is rare and the full
+                    // rescan is the simplest provably-safe choice.
                     metrics.watcher_persist_failure();
                     let failed = log.block_number.unwrap_or(0);
                     *backfill_from = Some(backfill_from.map_or(failed, |b| b.min(failed)));
@@ -1155,9 +1156,12 @@ async fn run_watcher_once<P: Provider + Clone>(
                     return Ok(CycleOutcome::RecoveryPending);
                 }
             }
-            // The filter's topic0 OR-set guarantees only the events above;
-            // ignore anything else rather than panicking (anti-panic policy).
-            _ => {}
+            // Unreachable today (the filter's topic0 OR-set bounds the inputs);
+            // don't panic (anti-panic policy), log it so a future OR-set/dispatch
+            // drift leaves a greppable trail instead of a silently dropped event.
+            _ => {
+                debug!(topic0 = ?log.topic0(), "unmatched PaymentChannel event in subscribed OR-set");
+            }
         }
     }
     Ok(CycleOutcome::StreamEnded)
@@ -1444,9 +1448,11 @@ async fn backfill_window<P: Provider + Clone>(
 ///    could persist the checkpoint past a block whose open *of ours* later fails
 ///    to persist, stranding that channel (vouchers rejected `WrongChannel` until
 ///    an unrelated rescan).
-/// 2. **The `opened` stream is strictly block-ordered.** On a persist failure
-///    the cycle returns immediately (see the `opened` arm), so every advance in a
-///    cycle precedes its first failure — and block-ordering then guarantees those
+/// 2. **The unified stream's `ChannelOpened` logs are strictly block-ordered.**
+///    A single multi-topic filter returns logs in block order, so successive
+///    opens advance monotonically. On a persist failure the cycle returns
+///    immediately (see the `opened` arm), so every advance in a cycle precedes
+///    its first failure — and block-ordering then guarantees those
 ///    advanced blocks are all `<=` the failed block. The persisted checkpoint
 ///    therefore never exceeds the failed block, so a restart's checkpoint-floored
 ///    backfill re-covers it. Feeding blocks out of order would let an advance

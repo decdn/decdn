@@ -731,7 +731,7 @@ where
     loop {
         tokio::select! {
             maybe = publisher_events.next() => {
-                // Stream ends (`None`) only when the provider is dropped.
+                // Stream ends (`None`) on provider drop or server filter expiry.
                 let Some(log) = maybe else { return Ok(()) };
                 state.advance_block(log.block_number);
                 // PublisherRegistry's sole subscribed event is ContentClaimed.
@@ -783,9 +783,10 @@ where
                         )
                         .await;
                     }
-                    // The filter's topic0 OR-set guarantees only the events above;
-                    // ignore anything else rather than panicking (anti-panic policy).
-                    _ => {}
+                    // Unreachable today (the filter's topic0 OR-set bounds the
+                    // inputs); don't panic (anti-panic policy), log it so a future
+                    // OR-set/dispatch drift leaves a greppable trail.
+                    _ => debug!(topic0 = ?log.topic0(), "unmatched OriginAssignment event in subscribed OR-set"),
                 }
             }
         }
