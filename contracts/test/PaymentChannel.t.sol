@@ -210,6 +210,25 @@ contract PaymentChannelTest is Test {
         "CooperativeClose(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)"
     );
 
+    // Committed EIP-712 parity vector for the cooperative-close waiver, shared with
+    // the off-chain Rust signer (`crates/incentive/src/cooperative_close.rs`,
+    // `EXPECTED_COOP_CLOSE_DIGEST`). These are synthetic fixed fixtures, not live
+    // deployment config — together with the typehash (read live) and the contract's
+    // domain name/version (read live), they pin the cross-language EIP-712 digest so
+    // a drift would not silently surface as unsettleable waivers on-chain.
+    bytes32 internal constant VEC_COOP_CHANNEL_ID = 0x11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff;
+    uint256 internal constant VEC_COOP_AMOUNT = 10_000_000;
+    uint256 internal constant VEC_COOP_NONCE = 3;
+    uint256 internal constant VEC_COOP_BYTES = 1_048_576;
+    // Arbitrary pinned token (Ethereum-mainnet USDC literal); a fixture value, not
+    // the deployed channel's `usdc`. The vector asserts encoding parity, not a
+    // settleable waiver against any real deployment.
+    address internal constant VEC_COOP_TOKEN = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    uint256 internal constant VEC_COOP_CHAIN_ID = 421_614;
+    address internal constant VEC_COOP_VERIFYING_CONTRACT = 0x0000000000000000000000000000000000001234;
+    bytes32 internal constant VEC_COOP_EXPECTED_DIGEST =
+        0x680080f3ddc99e1f65d2a03b8608b84c01e4e6b97885f2ddbca2f17020d8d627;
+
     // A provider with a known key, needed to sign cooperative-close waivers
     // (the default `provider` is a bare address with no key).
     uint256 internal constant PROVIDER_PK = 0xB0B0B0;
@@ -1818,6 +1837,51 @@ contract PaymentChannelTest is Test {
         vm.prank(client);
         vm.expectRevert(PaymentChannel.InvalidCooperativeCloseSignature.selector);
         channel.cooperativeClose(id, amount, 1, b, _signClient(id, amount, 1, b), wrongType);
+    }
+
+    /// @dev Cross-language EIP-712 parity: the canonical-vector digest, recomputed
+    ///      here with the contract's *live* `COOPERATIVE_CLOSE_TYPEHASH()` and the
+    ///      vector's fixed domain, must equal the value the off-chain Rust signer
+    ///      pins (`EXPECTED_COOP_CLOSE_DIGEST`). Catches a typehash change (read
+    ///      live) and any drift in the Rust signer's struct encoding/framing
+    ///      relative to this recomputation. The contract's own domain
+    ///      `name`/`version` are pinned separately by
+    ///      `test_cooperativeClose_domainMatchesVector`; the contract's runtime
+    ///      struct-encode/`_hashTypedDataV4` path is exercised by the happy-path
+    ///      round-trip tests (e.g. `test_cooperativeClose_settlesImmediatelyNoWindow`).
+    function test_cooperativeClose_digestMatchesVector() public view {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                channel.COOPERATIVE_CLOSE_TYPEHASH(),
+                VEC_COOP_CHANNEL_ID,
+                VEC_COOP_AMOUNT,
+                VEC_COOP_NONCE,
+                VEC_COOP_BYTES,
+                VEC_COOP_TOKEN
+            )
+        );
+        bytes32 domainSep = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("PaymentChannel"),
+                keccak256("1"),
+                VEC_COOP_CHAIN_ID,
+                VEC_COOP_VERIFYING_CONTRACT
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked(hex"1901", domainSep, structHash));
+        assertEq(digest, VEC_COOP_EXPECTED_DIGEST, "coop-close digest drifted from Rust signer vector");
+    }
+
+    /// @dev Closes the loop the manual-recompute test cannot: the *deployed*
+    ///      contract's EIP-712 domain (ERC-5267 `eip712Domain()`) must use the same
+    ///      name/version that went into the pinned digest. A change to
+    ///      `EIP712("PaymentChannel", "1")` fails here even though the vector above
+    ///      hardcodes the strings.
+    function test_cooperativeClose_domainMatchesVector() public view {
+        (, string memory name, string memory version,,,,) = channel.eip712Domain();
+        assertEq(name, "PaymentChannel", "domain name drifted");
+        assertEq(version, "1", "domain version drifted");
     }
 
     /// @dev Finality anchor: a waiver below the on-chain watermark can never
