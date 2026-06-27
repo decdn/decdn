@@ -359,11 +359,15 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     ///
     /// The probe is cheap (HTTP `HEAD` / S3 `HeadObject` / `fs` metadata) and
     /// **best-effort**: `Ok(None)` means the size is unavailable — the object
-    /// is absent, or the backend reports a `Content-Encoding` whose advertised
+    /// is absent, the backend reports a `Content-Encoding` whose advertised
     /// length is the *encoded* size (not the canonical blob length, same trap
-    /// as [`Self::fetch`]'s `size_hint`), or the backend can't answer. The
-    /// engine then degrades the range pull to a whole-blob [`Self::fetch`].
-    /// Only a genuine transport / permission fault surfaces as
+    /// as [`Self::fetch`]'s `size_hint`), or any other non-success status (404,
+    /// permission denied, 5xx, a disabled redirect). Like the outboard read on
+    /// the range-pull path ([`Self::fetch_range`]'s bounded helper), a
+    /// status-level decline degrades to `None` rather than erroring — the engine
+    /// falls back to a whole-blob [`Self::fetch`], which re-surfaces a genuine,
+    /// *persistent* fault (a real 403/5xx) at its proper severity. Only a
+    /// transport-level fault (timeout, connection failure) surfaces here as
     /// [`OriginPullError`]. The default returns `Ok(None)`, so a custom
     /// [`Origin`] needs no change and simply never range-pulls.
     fn size(

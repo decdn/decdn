@@ -190,6 +190,7 @@ enum ServeRejectReason {
     InsufficientDeposit,
     UnauthorizedOrigin,
     CooperativeCloseSigned,
+    RangeNotSatisfiable,
 }
 
 impl ServeRejectReason {
@@ -210,12 +211,20 @@ impl ServeRejectReason {
             // miss reasons: a channel being cooperatively settled is no longer
             // serving, and the refusal stays wire-indistinguishable from an
             // unknown channel (no leak that a waiver was signed).
+            // `RangeNotSatisfiable` collapses to `NotFound` alongside the other
+            // "won't serve this" reasons: an out-of-bounds bounded range is a
+            // client error, but signalling it as `NotFound` (rather than
+            // `InternalError`) keeps it reputation-benign — the requester folds
+            // a node fault into the node's score, and a client's own malformed
+            // range must not penalise the node. The distinction survives in the
+            // per-reason metric.
             Self::CacheMiss
             | Self::UnknownChannel
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
             | Self::UnauthorizedOrigin
-            | Self::CooperativeCloseSigned => StreamError::NotFound,
+            | Self::CooperativeCloseSigned
+            | Self::RangeNotSatisfiable => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             Self::BlobTooLarge => StreamError::BlobTooLarge,
@@ -1153,6 +1162,28 @@ impl ClientHandler {
             return self
                 .respond_error(&mut send, &req, ServeRejectReason::BlobTooLarge)
                 .await;
+        }
+
+        // Bounded-range bounds check (ADR 005 §Bounded byte ranges). Reject an
+        // out-of-bounds range with a `StreamError` *before* signing the success
+        // response below — otherwise the client accepts a signed `ok: true` that
+        // `deliver`'s `export_range` then aborts mid-stream. A whole-blob request
+        // (`byte_offset == 0 && byte_len == 0`) is always in bounds for a present
+        // blob; `byte_len == 0` on a non-zero offset is the in-bounds whole-tail
+        // read. Mirrors `range_pull::align_range`'s bound check on the origin
+        // tier so the serve tier rejects the same ranges.
+        if req.byte_offset > 0 || req.byte_len > 0 {
+            let out_of_bounds = req.byte_offset >= total_bytes
+                || (req.byte_len > 0
+                    && req
+                        .byte_offset
+                        .checked_add(req.byte_len)
+                        .is_none_or(|end| end > total_bytes));
+            if out_of_bounds {
+                return self
+                    .respond_error(&mut send, &req, ServeRejectReason::RangeNotSatisfiable)
+                    .await;
+            }
         }
 
         // Resolve the channel (must be pre-persisted — see module docs / #327).
@@ -2130,6 +2161,9 @@ impl ClientHandler {
             ServeRejectReason::CooperativeCloseSigned => {
                 self.metrics
                     .serve_stream_rejected_cooperative_close_signed();
+            }
+            ServeRejectReason::RangeNotSatisfiable => {
+                self.metrics.serve_stream_rejected_range_not_satisfiable();
             }
         }
         let error = reason.wire_error();

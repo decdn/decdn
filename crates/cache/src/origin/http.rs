@@ -444,7 +444,13 @@ impl Origin for HttpOrigin {
                 }
                 Ok(Ok(resp)) => resp,
             };
-            // A missing object (404) or any non-success → unknown size, degrade.
+            // Any non-success — 404 (absent), 401/403 (permission), 5xx
+            // (outage), or a disabled-redirect 3xx (SSRF, #579) — degrades to
+            // unknown size rather than erroring, mirroring `get_bounded`'s
+            // best-effort outboard read on this same range-pull path. A
+            // *persistent* permission/outage fault re-surfaces with full
+            // severity on the whole-blob `fetch` fallback; abandoning the range
+            // optimization for one HEAD is the intended, cheap degrade.
             if !resp.status().is_success() {
                 return Ok(None);
             }

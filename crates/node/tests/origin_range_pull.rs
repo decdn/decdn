@@ -179,8 +179,13 @@ async fn ranged_paid_pull(
         other => anyhow::bail!("expected StreamResponse, got {other:?}"),
     };
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
-    // The advertised size is the *whole* blob; the range delivers `byte_len`.
-    let expected = byte_len;
+    // The advertised size is the *whole* blob; the range delivers `byte_len`,
+    // or the whole tail (`total_bytes - byte_offset`) when `byte_len == 0`.
+    let expected = if byte_len == 0 {
+        resp.body.total_bytes.saturating_sub(byte_offset)
+    } else {
+        byte_len
+    };
     let interval_bytes = resp
         .voucher_interval_mb
         .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
@@ -458,6 +463,30 @@ async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Re
         cache.has(hash).await?,
         "the whole-blob fallback must complete and cache the blob"
     );
+    // Prove the fallback used an *un-ranged* whole-blob GET and never issued a
+    // ranged data GET: with no `{H}.obao4` the range pull declines at the
+    // outboard probe, so no `Range` request should ever hit the data object.
+    let hex = hash.to_hex();
+    let ranged_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers.contains_key("range")
+    })
+    .await?;
+    let wholeblob_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && !r.headers.contains_key("range")
+    })
+    .await?;
+    anyhow::ensure!(
+        ranged_gets == 0,
+        "no ranged GET should occur once the outboard probe misses, saw {ranged_gets}"
+    );
+    anyhow::ensure!(
+        wholeblob_gets >= 1,
+        "the fallback must fetch the whole blob with an un-ranged GET"
+    );
 
     client_ep.close().await;
     server_ep.close().await;
@@ -554,6 +583,182 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
         !cache.has(hash).await?,
         "no blob should have been cached for an unauthorized request"
     );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
+    // A resume request (`byte_offset > 0`, `byte_len == 0`) is a whole-tail
+    // read: `byte_len == 0` means "to end-of-blob" (ADR 005), NOT zero bytes.
+    // The handler passes it straight through `pull_through_range` /
+    // `export_range`, both of which resolve `0` to the blob end — this proves
+    // the tail is fetched and served, end to end.
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let req_off = 16 * 1024u64;
+    let aligned = align_range(req_off, 0, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    anyhow::ensure!(a_end == blob_size, "a zero-len tail aligns to the blob end");
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned tail out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span))
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x46);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        channel_id,
+        hash,
+        req_off,
+        0, // byte_len == 0 → resume to end
+        RATE_PER_MB,
+    )
+    .await?;
+
+    let want = blob
+        .get(usize::try_from(req_off)?..)
+        .ok_or_else(|| anyhow::anyhow!("offset past blob"))?;
+    anyhow::ensure!(
+        got.as_slice() == want,
+        "a zero-len resume must deliver the whole tail, got {} of {} bytes",
+        got.len(),
+        want.len()
+    );
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "a tail range pull leaves the blob partial"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()> {
+    // ADR 005 §Bounded byte ranges: a range whose end exceeds the blob MUST be
+    // refused with a `StreamError` — and the refusal must land BEFORE a success
+    // response is signed, so the client never accepts an `ok: true` the delivery
+    // then aborts. Exercised against a cache hit so the request reaches the size
+    // gate directly.
+    let (blob, _outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x47);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+    )
+    .await?;
+    // Pre-populate the blob so the ranged request is a cache hit.
+    cache.populate(hash).await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    // `byte_offset` in bounds but `byte_offset + byte_len` past the blob end.
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        channel_id: channel_id.into(),
+        byte_offset: 16 * 1024,
+        byte_len: blob_size,
+        timestamp_us: 0x9001,
+    };
+    let payload = encode_stream_request(&req, Some(&StreamRequestExt::default()))
+        .map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame_to(&mut send, &payload).await?;
+
+    // The refusal must be the very first message and a signed `ok: false` — not
+    // a success followed by a mid-stream abort.
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamResponse(r) => {
+            anyhow::ensure!(
+                !r.body.ok,
+                "an out-of-bounds range must be refused, not served"
+            );
+        }
+        other => anyhow::bail!("expected a refusing StreamResponse, got {other:?}"),
+    }
+    conn.close(0u32.into(), b"done");
 
     client_ep.close().await;
     server_ep.close().await;
