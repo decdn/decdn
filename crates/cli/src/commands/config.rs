@@ -174,6 +174,11 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  rpc_watchdog_interval_sec: {}",
         resolved.blockchain.rpc_watchdog_interval_sec
     )?;
+    writeln!(
+        w,
+        "  event_poll_interval_ms: {}",
+        resolved.blockchain.event_poll_interval_ms
+    )?;
     match resolved.blockchain.settlement_auto_threshold_micro_usdc {
         Some(v) => writeln!(w, "  settlement_auto_threshold_micro_usdc: {v}")?,
         None => writeln!(w, "  settlement_auto_threshold_micro_usdc: disabled")?,
@@ -420,6 +425,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
+# event_poll_interval_ms = 7000      # eth_getFilterChanges poll cadence for chain watchers (#1011); default 7000ms, min 250ms (lower for a local anvil)
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # buyer_deposit_micro_usdc = 10000000            # deposit when the buyer opens a node-to-node PaymentChannel on a miss (#744); default 10 USDC
 # buyer_max_approve = true                       # one-time max USDC approval for PaymentChannel at startup (#744); false to manage the allowance out-of-band

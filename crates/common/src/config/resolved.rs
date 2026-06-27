@@ -111,6 +111,12 @@ pub struct ResolvedBlockchain {
     /// watchdog entirely; otherwise the resolver enforces a minimum (see
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC`).
     pub rpc_watchdog_interval_sec: u64,
+    /// Milliseconds between `eth_getFilterChanges` polls for the chain event
+    /// watchers (#1011). Applied to every provider via `with_poll_interval` so
+    /// it overrides alloy's localhost-detected 250 ms default. Defaults to
+    /// 7000 ms (`DEFAULT_EVENT_POLL_INTERVAL_MS`); the resolver enforces a
+    /// minimum (see `MIN_EVENT_POLL_INTERVAL_MS`).
+    pub event_poll_interval_ms: u64,
     /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the seller
     /// settlement path submits an on-chain `withdraw` (#327). Defaults to
     /// 1 USDC (`1_000_000` `µUSDC`) when unset.

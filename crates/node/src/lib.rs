@@ -8,6 +8,7 @@
 
 pub mod admin;
 pub mod buyer_channel;
+pub mod chain_events;
 pub mod channel_store;
 /// The `cdn/client/v1` paid-pull requester now lives in the shared
 /// `decdn-client-pull` crate (reused by the CLI's client fetch / bundle pull).

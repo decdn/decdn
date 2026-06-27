@@ -84,6 +84,7 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_channel::PaymentChannel;
@@ -96,6 +97,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::chain_events::watch_contract_events;
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, SettleParty};
 
@@ -914,8 +916,10 @@ async fn watcher_loop<P: Provider + Clone>(
     }
 }
 
-/// One watcher cycle: open the four event filters and drain them until one
-/// errors (transport failure) or ends (filter expiry / provider rotation).
+/// One watcher cycle: open a single multi-topic filter over the four channel
+/// events and drain it, demuxing each log by `topic0`, until the stream ends
+/// (filter expiry / provider rotation, or the provider being dropped) or a log
+/// fails to decode (transport-equivalent error).
 // 4-arm event-dispatch loop is fundamentally complex; splitting obscures the
 // dispatch table (same posture as `chain_staker_set::run_watcher_once`). The
 // line budget is likewise over by a hair for the same reason.
@@ -934,30 +938,22 @@ async fn run_watcher_once<P: Provider + Clone>(
     backfill_from: &mut Option<u64>,
     metrics: &Arc<Metrics>,
 ) -> Result<CycleOutcome> {
-    let mut opened = contract
-        .ChannelOpened_filter()
-        .watch()
-        .await
-        .context("watch ChannelOpened")?
-        .into_stream();
-    let mut topped_up = contract
-        .ChannelToppedUp_filter()
-        .watch()
-        .await
-        .context("watch ChannelToppedUp")?
-        .into_stream();
-    let mut settled = contract
-        .ChannelSettled_filter()
-        .watch()
-        .await
-        .context("watch ChannelSettled")?
-        .into_stream();
-    let mut close_initiated = contract
-        .ChannelCloseInitiated_filter()
-        .watch()
-        .await
-        .context("watch ChannelCloseInitiated")?
-        .into_stream();
+    // One multi-topic filter over all four channel events (#1011), replacing the
+    // previous four per-event filters. Installed *before* the bring-up backfill
+    // below, so any event emitted during the backfill RPCs buffers in the stream
+    // rather than falling into a gap — same ordering guarantee as before.
+    let mut events = watch_contract_events(
+        contract.provider(),
+        *contract.address(),
+        [
+            PaymentChannel::ChannelOpened::SIGNATURE_HASH,
+            PaymentChannel::ChannelToppedUp::SIGNATURE_HASH,
+            PaymentChannel::ChannelSettled::SIGNATURE_HASH,
+            PaymentChannel::ChannelCloseInitiated::SIGNATURE_HASH,
+        ],
+    )
+    .await
+    .context("watch PaymentChannel events")?;
 
     // Monotonic high-water mark of the block persisted to the scan checkpoint
     // (#751). Seeded from the stored value so it never regresses across watcher
@@ -1014,167 +1010,161 @@ async fn run_watcher_once<P: Provider + Clone>(
         }
     }
 
-    loop {
-        tokio::select! {
-            ev = opened.next() => match ev {
-                Some(Ok((event, log))) => {
-                    // The scan checkpoint is advanced ONLY here, on a successful
-                    // persist (#751). A `ChannelOpened` is the sole registration
-                    // delivery, and it is the only event that proves we scanned +
-                    // registered opens through its block — the other arms (and
-                    // foreign-channel events) say nothing about whether an earlier
-                    // open of *ours* was persisted, so advancing the checkpoint
-                    // from them could leap past an open that later fails and strand
-                    // the channel (vouchers rejected `WrongChannel` forever). The
-                    // `opened` stream is block-ordered, so the per-cycle hold below
-                    // suffices against a later same-stream open.
-                    match apply_channel_opened(handler, self_address, usdc_token, &event, false)
-                        .await
-                    {
-                        Ok(()) => advance_checkpoint(
-                            checkpoint_store,
-                            log.block_number,
-                            &mut checkpoint_hw,
-                        ),
-                        Err(err) => {
-                            metrics.watcher_persist_failure();
-                            warn!(
-                                %err,
-                                channel_id = %event.channelId,
-                                "failed to persist opened channel; holding scan checkpoint below its block and resubscribing so the backfill re-covers it",
-                            );
-                            // `None` block (unconfirmed) → fall back to the current
-                            // floor, conservatively re-scanning from there.
-                            let failed = log.block_number.unwrap_or(checkpoint_hw);
-                            // Re-arm the bring-up backfill from the failed block so the
-                            // resubscribe forced just below re-scans and re-registers
-                            // the channel. The persisted checkpoint already stays at
-                            // or below `failed` — only the `opened` arm advances it,
-                            // the stream is block-ordered, and we return before any
-                            // higher-block open processes — so a restart's
-                            // checkpoint-floored backfill also re-covers it.
-                            *backfill_from =
-                                Some(backfill_from.map_or(failed, |b| b.min(failed)));
-                            // Don't drain on: return so `watcher_loop` resubscribes
-                            // and the next cycle's backfill recovers the channel now,
-                            // not on some unrelated future stream-end/restart (#751
-                            // MEDIUM-1). Returning here (rather than holding the
-                            // checkpoint and draining on) is also what keeps the
-                            // checkpoint safe without an in-cycle hold. Backoff-paced,
-                            // so a durable store failure backs off instead of
-                            // hot-looping.
-                            return Ok(CycleOutcome::RecoveryPending);
-                        }
+    while let Some(log) = events.next().await {
+        match log.topic0().copied() {
+            Some(sig) if sig == PaymentChannel::ChannelOpened::SIGNATURE_HASH => {
+                let event = PaymentChannel::ChannelOpened::decode_log_data(&log.inner.data)
+                    .context("decode ChannelOpened")?;
+                // The scan checkpoint is advanced ONLY here, on a successful
+                // persist (#751). A `ChannelOpened` is the sole registration
+                // delivery, and it is the only event that proves we scanned +
+                // registered opens through its block — the other arms (and
+                // foreign-channel events) say nothing about whether an earlier
+                // open of *ours* was persisted, so advancing the checkpoint
+                // from them could leap past an open that later fails and strand
+                // the channel (vouchers rejected `WrongChannel` forever). The
+                // unified filter returns logs in block order, so ChannelOpened
+                // events still arrive block-ordered; the per-cycle hold below
+                // suffices against a later open.
+                match apply_channel_opened(handler, self_address, usdc_token, &event, false).await {
+                    Ok(()) => {
+                        advance_checkpoint(checkpoint_store, log.block_number, &mut checkpoint_hw);
                     }
-                }
-                Some(Err(e)) => return Err(e).context("ChannelOpened stream"),
-                None => return Ok(CycleOutcome::StreamEnded),
-            },
-            ev = topped_up.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    // `ChannelToppedUp` is not provider-indexed; `update_channel_deposit`
-                    // is a no-op for channels this node does not track. Does NOT
-                    // advance the scan checkpoint — only the `opened` arm does.
-                    if let Err(err) = handler
-                        .update_channel_deposit(event.channelId, event.newDeposit)
-                        .await
-                    {
+                    Err(err) => {
                         metrics.watcher_persist_failure();
-                        warn!(%err, channel_id = %event.channelId, "failed to apply channel top-up");
-                    } else {
-                        debug!(
-                            channel_id = %event.channelId,
-                            new_deposit = %event.newDeposit,
-                            "channel top-up applied to tracked deposit"
-                        );
-                    }
-                }
-                Some(Err(e)) => return Err(e).context("ChannelToppedUp stream"),
-                None => return Ok(CycleOutcome::StreamEnded),
-            },
-            ev = settled.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    if event.provider != self_address {
-                        continue;
-                    }
-                    if let Err(err) = handler.forget_channel(event.channelId).await {
-                        metrics.watcher_persist_failure();
-                        warn!(%err, channel_id = %event.channelId, "failed to forget settled channel");
-                    } else {
-                        info!(channel_id = %event.channelId, "channel settled; dropped tracked state");
-                    }
-                    // Settlement is final (by us or by the client) — drop any
-                    // pending-settle obligation so the sweep stops retrying.
-                    if let Err(err) = pending_store.forget_pending(event.channelId) {
-                        warn!(%err, channel_id = %event.channelId, "failed to drop pending-settle entry on settle");
-                    }
-                }
-                Some(Err(e)) => return Err(e).context("ChannelSettled stream"),
-                None => return Ok(CycleOutcome::StreamEnded),
-            },
-            ev = close_initiated.next() => match ev {
-                Some(Ok((event, log))) => {
-                    // Dispute monitor is deferred (#324); observe-only there.
-                    debug!(
-                        channel_id = %event.channelId,
-                        initiator = %event.initiator,
-                        "ChannelCloseInitiated observed (dispute monitor deferred, #324)"
-                    );
-                    // Record the settle obligation for any provider-owned close
-                    // (#839) — including a *client*-initiated one, which our own
-                    // close path (`record_pending_after_close`) never sees. The
-                    // event isn't provider-indexed, so `reconcile_closing_channel`
-                    // re-reads to confirm `provider == self`. Idempotent overwrite,
-                    // so double-covering our own closes is harmless. Does NOT
-                    // advance the scan checkpoint — only the `opened` arm does.
-                    if let Err(err) = reconcile_closing_channel(
-                        contract,
-                        self_address,
-                        pending_store,
-                        event.channelId,
-                    )
-                    .await
-                    {
-                        // A swallowed failure here is a lost settle obligation: the
-                        // closing backfill's floor is the *opened* checkpoint, which
-                        // a later open can advance past this close's block, so the
-                        // next boot's scan may never re-cover it. Re-arm the bring-up
-                        // backfill from this block and resubscribe so the *next cycle*
-                        // re-records it within this process (backoff-paced). Unlike
-                        // the `opened` arm, this is not crash-proof: an earlier open
-                        // in this cycle may already have advanced the *persisted*
-                        // checkpoint past this block (the two streams aren't mutually
-                        // ordered), so a crash before the retry lands leaves the
-                        // residual manual-`settleChannel` gap noted at the backfill
-                        // call site. The re-arm closes the common (no-crash) case.
-                        //
-                        // Block fallback differs from the `opened` arm: there a
-                        // missing `block_number` falls back to `checkpoint_hw`,
-                        // safe-by-construction because that arm's own block-ordered
-                        // stream keeps `checkpoint_hw <= failed`. Here `checkpoint_hw`
-                        // is *open*-advanced and unordered against this close, so it
-                        // could exceed the close block and re-arm *above* it —
-                        // silently skipping the close. An unconfirmed log (no block)
-                        // is rare, so fall back to `0`: an idempotent, backoff-paced
-                        // full re-scan that cannot overshoot.
-                        metrics.watcher_persist_failure();
-                        let failed = log.block_number.unwrap_or(0);
-                        *backfill_from =
-                            Some(backfill_from.map_or(failed, |b| b.min(failed)));
                         warn!(
                             %err,
                             channel_id = %event.channelId,
-                            block = failed,
-                            "failed to record pending-settle for observed close; re-arming backfill and resubscribing",
+                            "failed to persist opened channel; holding scan checkpoint below its block and resubscribing so the backfill re-covers it",
                         );
+                        // `None` block (unconfirmed) → fall back to the current
+                        // floor, conservatively re-scanning from there.
+                        let failed = log.block_number.unwrap_or(checkpoint_hw);
+                        // Re-arm the bring-up backfill from the failed block so the
+                        // resubscribe forced just below re-scans and re-registers
+                        // the channel. The persisted checkpoint already stays at
+                        // or below `failed` — only the `opened` arm advances it,
+                        // the stream is block-ordered, and we return before any
+                        // higher-block open processes — so a restart's
+                        // checkpoint-floored backfill also re-covers it.
+                        *backfill_from = Some(backfill_from.map_or(failed, |b| b.min(failed)));
+                        // Don't drain on: return so `watcher_loop` resubscribes
+                        // and the next cycle's backfill recovers the channel now,
+                        // not on some unrelated future stream-end/restart (#751
+                        // MEDIUM-1). Returning here (rather than holding the
+                        // checkpoint and draining on) is also what keeps the
+                        // checkpoint safe without an in-cycle hold. Backoff-paced,
+                        // so a durable store failure backs off instead of
+                        // hot-looping.
                         return Ok(CycleOutcome::RecoveryPending);
                     }
                 }
-                Some(Err(e)) => return Err(e).context("ChannelCloseInitiated stream"),
-                None => return Ok(CycleOutcome::StreamEnded),
-            },
+            }
+            Some(sig) if sig == PaymentChannel::ChannelToppedUp::SIGNATURE_HASH => {
+                let event = PaymentChannel::ChannelToppedUp::decode_log_data(&log.inner.data)
+                    .context("decode ChannelToppedUp")?;
+                // `ChannelToppedUp` is not provider-indexed; `update_channel_deposit`
+                // is a no-op for channels this node does not track. Does NOT
+                // advance the scan checkpoint — only the `opened` arm does.
+                if let Err(err) = handler
+                    .update_channel_deposit(event.channelId, event.newDeposit)
+                    .await
+                {
+                    metrics.watcher_persist_failure();
+                    warn!(%err, channel_id = %event.channelId, "failed to apply channel top-up");
+                } else {
+                    debug!(
+                        channel_id = %event.channelId,
+                        new_deposit = %event.newDeposit,
+                        "channel top-up applied to tracked deposit"
+                    );
+                }
+            }
+            Some(sig) if sig == PaymentChannel::ChannelSettled::SIGNATURE_HASH => {
+                let event = PaymentChannel::ChannelSettled::decode_log_data(&log.inner.data)
+                    .context("decode ChannelSettled")?;
+                if event.provider != self_address {
+                    continue;
+                }
+                if let Err(err) = handler.forget_channel(event.channelId).await {
+                    metrics.watcher_persist_failure();
+                    warn!(%err, channel_id = %event.channelId, "failed to forget settled channel");
+                } else {
+                    info!(channel_id = %event.channelId, "channel settled; dropped tracked state");
+                }
+                // Settlement is final (by us or by the client) — drop any
+                // pending-settle obligation so the sweep stops retrying.
+                if let Err(err) = pending_store.forget_pending(event.channelId) {
+                    warn!(%err, channel_id = %event.channelId, "failed to drop pending-settle entry on settle");
+                }
+            }
+            Some(sig) if sig == PaymentChannel::ChannelCloseInitiated::SIGNATURE_HASH => {
+                let event = PaymentChannel::ChannelCloseInitiated::decode_log_data(&log.inner.data)
+                    .context("decode ChannelCloseInitiated")?;
+                // Dispute monitor is deferred (#324); observe-only there.
+                debug!(
+                    channel_id = %event.channelId,
+                    initiator = %event.initiator,
+                    "ChannelCloseInitiated observed (dispute monitor deferred, #324)"
+                );
+                // Record the settle obligation for any provider-owned close
+                // (#839) — including a *client*-initiated one, which our own
+                // close path (`record_pending_after_close`) never sees. The
+                // event isn't provider-indexed, so `reconcile_closing_channel`
+                // re-reads to confirm `provider == self`. Idempotent overwrite,
+                // so double-covering our own closes is harmless. Does NOT
+                // advance the scan checkpoint — only the `opened` arm does.
+                if let Err(err) = reconcile_closing_channel(
+                    contract,
+                    self_address,
+                    pending_store,
+                    event.channelId,
+                )
+                .await
+                {
+                    // A swallowed failure here is a lost settle obligation: the
+                    // closing backfill's floor is the *opened* checkpoint, which
+                    // a later open can advance past this close's block, so the
+                    // next boot's scan may never re-cover it. Re-arm the bring-up
+                    // backfill from this block and resubscribe so the *next cycle*
+                    // re-records it within this process (backoff-paced). Unlike
+                    // the `opened` arm, this is not crash-proof: an earlier open
+                    // in this cycle may already have advanced the *persisted*
+                    // checkpoint past this block (the two streams aren't mutually
+                    // ordered), so a crash before the retry lands leaves the
+                    // residual manual-`settleChannel` gap noted at the backfill
+                    // call site. The re-arm closes the common (no-crash) case.
+                    //
+                    // Block fallback for a missing `block_number` (unconfirmed
+                    // log): fall back to `0` — an idempotent, backoff-paced full
+                    // re-scan that cannot overshoot. Under the unified single
+                    // filter, opens and this close ARE mutually block-ordered, so
+                    // `checkpoint_hw` (open-advanced) is `<=` this close's block
+                    // within a cycle — the old cross-stream overshoot race (when
+                    // opens and closes were separate pollers) no longer exists.
+                    // `0` is kept anyway: a no-block log is rare and the full
+                    // rescan is the simplest provably-safe choice.
+                    metrics.watcher_persist_failure();
+                    let failed = log.block_number.unwrap_or(0);
+                    *backfill_from = Some(backfill_from.map_or(failed, |b| b.min(failed)));
+                    warn!(
+                        %err,
+                        channel_id = %event.channelId,
+                        block = failed,
+                        "failed to record pending-settle for observed close; re-arming backfill and resubscribing",
+                    );
+                    return Ok(CycleOutcome::RecoveryPending);
+                }
+            }
+            // Unreachable today (the filter's topic0 OR-set bounds the inputs);
+            // don't panic (anti-panic policy), log it so a future OR-set/dispatch
+            // drift leaves a greppable trail instead of a silently dropped event.
+            _ => {
+                debug!(topic0 = ?log.topic0(), "unmatched PaymentChannel event in subscribed OR-set");
+            }
         }
     }
+    Ok(CycleOutcome::StreamEnded)
 }
 
 /// Register a `ChannelOpened` event whose provider is this node so the voucher
@@ -1458,9 +1448,11 @@ async fn backfill_window<P: Provider + Clone>(
 ///    could persist the checkpoint past a block whose open *of ours* later fails
 ///    to persist, stranding that channel (vouchers rejected `WrongChannel` until
 ///    an unrelated rescan).
-/// 2. **The `opened` stream is strictly block-ordered.** On a persist failure
-///    the cycle returns immediately (see the `opened` arm), so every advance in a
-///    cycle precedes its first failure — and block-ordering then guarantees those
+/// 2. **The unified stream's `ChannelOpened` logs are strictly block-ordered.**
+///    A single multi-topic filter returns logs in block order, so successive
+///    opens advance monotonically. On a persist failure the cycle returns
+///    immediately (see the `opened` arm), so every advance in a cycle precedes
+///    its first failure — and block-ordering then guarantees those
 ///    advanced blocks are all `<=` the failed block. The persisted checkpoint
 ///    therefore never exceeds the failed block, so a restart's checkpoint-floored
 ///    backfill re-covers it. Feeding blocks out of order would let an advance

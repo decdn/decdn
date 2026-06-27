@@ -71,12 +71,14 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::chain_events::watch_contract_events;
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::{StakerChange, StakerSet};
 use crate::metrics::Metrics;
@@ -299,12 +301,13 @@ async fn watcher_loop<P>(
     }
 }
 
-/// Run one cycle of the watcher: open the five event filters, drain
-/// them via `tokio::select!` until any one returns an error. Returns
-/// `Ok(())` if the streams ended cleanly (filter expiry / provider
-/// rotation); returns `Err` if a stream observed a transport-level
-/// failure.
-#[allow(clippy::cognitive_complexity)] // 6-arm event-dispatch loop is fundamentally complex; splitting obscures the dispatch table
+/// Run one cycle of the watcher: open a single multi-topic filter over the five
+/// membership events and drain it, demuxing each log by `topic0`, until the
+/// stream ends or a log fails to decode. Returns `Ok(())` if the stream ended
+/// cleanly (filter expiry / provider rotation, or the provider being dropped);
+/// returns `Err` on a decode failure, which trips the caller's backoff exactly
+/// as a per-event stream error did before.
+#[allow(clippy::cognitive_complexity)] // 5-arm event-dispatch loop is fundamentally complex; splitting obscures the dispatch table
 async fn run_watcher_once<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
     active: &Arc<RwLock<HashSet<NodeId>>>,
@@ -321,97 +324,85 @@ where
     // us update the active set without a follow-up `nodeIdOf` RPC, so
     // it's strictly more efficient. Operators with no nodeId binding
     // are never in the active set anyway, so we lose no information.
-    let mut node_registered = registry
-        .NodeRegistered_filter()
-        .watch()
-        .await
-        .context("watch NodeRegistered")?
-        .into_stream();
-    let mut node_deregistered = registry
-        .NodeDeregistered_filter()
-        .watch()
-        .await
-        .context("watch NodeDeregistered")?
-        .into_stream();
-    let mut node_auto_ejected = registry
-        .NodeAutoEjected_filter()
-        .watch()
-        .await
-        .context("watch NodeAutoEjected")?
-        .into_stream();
-    let mut reinstated = registry
-        .Reinstated_filter()
-        .watch()
-        .await
-        .context("watch Reinstated")?
-        .into_stream();
-    let mut unbonding_requested = registry
-        .UnbondingRequested_filter()
-        .watch()
-        .await
-        .context("watch UnbondingRequested")?
-        .into_stream();
+    // One multi-topic filter over all five membership events (#1011), replacing
+    // the previous five per-event filters. Demux below by `topic0`.
+    let mut events = watch_contract_events(
+        registry.provider(),
+        *registry.address(),
+        [
+            CapacityBond::NodeRegistered::SIGNATURE_HASH,
+            CapacityBond::NodeDeregistered::SIGNATURE_HASH,
+            CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
+            CapacityBond::Reinstated::SIGNATURE_HASH,
+            CapacityBond::UnbondingRequested::SIGNATURE_HASH,
+        ],
+    )
+    .await
+    .context("watch CapacityBond membership events")?;
 
-    // All five filters established: this is a successful event-stream cycle.
-    // Clear `down_since` so `decdn_staker_set_watcher_down_seconds` reads 0
-    // for the entire life of this cycle (however long/quiet); it climbs again
-    // only if a stream errors and the loop enters backoff.
+    // Filter established: this is a successful event-stream cycle. Clear
+    // `down_since` so `decdn_staker_set_watcher_down_seconds` reads 0 for the
+    // entire life of this cycle (however long/quiet); it climbs again only if a
+    // log fails to decode and the loop enters backoff, or the stream ends.
     metrics.staker_set_watcher_cycle_established();
 
-    loop {
-        tokio::select! {
-            ev = node_registered.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    apply_change(
-                        active, changes_tx, metrics,
-                        StakerChange::Active(event.nodeId.0.into()),
-                    );
-                }
-                Some(Err(e)) => return Err(e).context("NodeRegistered stream"),
-                None => return Ok(()),
-            },
-            ev = node_deregistered.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    apply_change(
-                        active, changes_tx, metrics,
-                        StakerChange::Inactive(event.nodeId.0.into()),
-                    );
-                }
-                Some(Err(e)) => return Err(e).context("NodeDeregistered stream"),
-                None => return Ok(()),
-            },
-            ev = node_auto_ejected.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    apply_change(
-                        active, changes_tx, metrics,
-                        StakerChange::Inactive(event.nodeId.0.into()),
-                    );
-                }
-                Some(Err(e)) => return Err(e).context("NodeAutoEjected stream"),
-                None => return Ok(()),
-            },
-            ev = reinstated.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    apply_operator_change(
-                        registry, active, changes_tx, metrics, event.operator, true,
-                    )
+    while let Some(log) = events.next().await {
+        // `.copied()` avoids const-in-pattern structural-match; guard-compare
+        // each `topic0` against the event signatures in the filter's OR-set.
+        match log.topic0().copied() {
+            Some(sig) if sig == CapacityBond::NodeRegistered::SIGNATURE_HASH => {
+                let event = CapacityBond::NodeRegistered::decode_log_data(&log.inner.data)
+                    .context("decode NodeRegistered")?;
+                apply_change(
+                    active,
+                    changes_tx,
+                    metrics,
+                    StakerChange::Active(event.nodeId.0.into()),
+                );
+            }
+            Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
+                let event = CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data)
+                    .context("decode NodeDeregistered")?;
+                apply_change(
+                    active,
+                    changes_tx,
+                    metrics,
+                    StakerChange::Inactive(event.nodeId.0.into()),
+                );
+            }
+            Some(sig) if sig == CapacityBond::NodeAutoEjected::SIGNATURE_HASH => {
+                let event = CapacityBond::NodeAutoEjected::decode_log_data(&log.inner.data)
+                    .context("decode NodeAutoEjected")?;
+                apply_change(
+                    active,
+                    changes_tx,
+                    metrics,
+                    StakerChange::Inactive(event.nodeId.0.into()),
+                );
+            }
+            Some(sig) if sig == CapacityBond::Reinstated::SIGNATURE_HASH => {
+                let event = CapacityBond::Reinstated::decode_log_data(&log.inner.data)
+                    .context("decode Reinstated")?;
+                apply_operator_change(registry, active, changes_tx, metrics, event.operator, true)
                     .await;
-                }
-                Some(Err(e)) => return Err(e).context("Reinstated stream"),
-                None => return Ok(()),
-            },
-            ev = unbonding_requested.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    apply_operator_change(
-                        registry, active, changes_tx, metrics, event.operator, false,
-                    )
+            }
+            Some(sig) if sig == CapacityBond::UnbondingRequested::SIGNATURE_HASH => {
+                let event = CapacityBond::UnbondingRequested::decode_log_data(&log.inner.data)
+                    .context("decode UnbondingRequested")?;
+                apply_operator_change(registry, active, changes_tx, metrics, event.operator, false)
                     .await;
-                }
-                Some(Err(e)) => return Err(e).context("UnbondingRequested stream"),
-                None => return Ok(()),
-            },
+            }
+            // The filter's topic0 OR-set guarantees only the events above reach
+            // us, so this arm is unreachable today. Don't panic (anti-panic
+            // policy); log it so a future OR-set/dispatch drift (a signature
+            // added to the filter without a match arm) leaves a greppable trail
+            // instead of silently dropping a membership event.
+            _ => {
+                debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
+            }
         }
     }
+    Ok(())
 }
 
 /// Resolve an operator-indexed event to its `(NodeId, current_active)`

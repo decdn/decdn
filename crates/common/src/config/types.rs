@@ -169,6 +169,14 @@ pub struct BlockchainConfig {
     /// watchdog entirely; absent => default (30s). Non-zero values below
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC` are rejected at config resolution.
     pub rpc_watchdog_interval_sec: Option<u64>,
+    /// Milliseconds between `eth_getFilterChanges` polls for the chain event
+    /// watchers (#1011). Overrides alloy's default, which is 250 ms for a
+    /// localhost RPC (it auto-detects `127.0.0.1`/`localhost`) and 7000 ms
+    /// otherwise — the 250 ms local default floods a dev anvil. Absent =>
+    /// default (`DEFAULT_EVENT_POLL_INTERVAL_MS`, 7000 ms, matching alloy's
+    /// non-local cadence so live-RPC load is unchanged). Values below
+    /// `MIN_EVENT_POLL_INTERVAL_MS` are rejected at config resolution.
+    pub event_poll_interval_ms: Option<u64>,
     /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the node
     /// submits an on-chain `withdraw` for a channel (#327, ADR 003 § Operator
     /// early withdrawal). Larger values amortize gas across more delivery;

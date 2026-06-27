@@ -35,6 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
 use alloy::providers::Provider;
+use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use iroh::PublicKey;
@@ -45,6 +46,7 @@ use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::payment_channel::PaymentChannel;
 
+use crate::chain_events::watch_contract_events;
 use crate::metrics::Metrics;
 use crate::reputation_wiring::NodeSettlementSource;
 
@@ -213,10 +215,10 @@ async fn watcher_loop<P>(
     }
 }
 
-// Backfill + two-arm event loop; the dispatch is fundamentally a few branches
-// over two streams (same posture as `chain_staker_set::run_watcher_once`).
-// One-shot backfill followed by the live select reads as a single sequence;
-// splitting the backfill into its own function would obscure the bring-up flow.
+// Backfill + two-event dispatch; fundamentally a few branches over one unified
+// log stream (same posture as `chain_staker_set::run_watcher_once`). One-shot
+// backfill followed by the live drain loop reads as a single sequence; splitting
+// the backfill into its own function would obscure the bring-up flow.
 #[allow(clippy::cognitive_complexity)]
 #[allow(clippy::too_many_lines)]
 async fn run_watcher_once<P>(
@@ -229,18 +231,20 @@ async fn run_watcher_once<P>(
 where
     P: Provider + Clone,
 {
-    let mut opened = payment
-        .ChannelOpened_filter()
-        .watch()
-        .await
-        .context("watch ChannelOpened")?
-        .into_stream();
-    let mut settled = payment
-        .ChannelSettled_filter()
-        .watch()
-        .await
-        .context("watch ChannelSettled")?
-        .into_stream();
+    // One multi-topic filter over both channel events (#1011), replacing the two
+    // per-event filters. Installed *before* the bring-up backfill below so any
+    // event emitted during the backfill RPCs buffers in the stream — same
+    // ordering guarantee as before. Demux below by `topic0`.
+    let mut events = watch_contract_events(
+        payment.provider(),
+        *payment.address(),
+        [
+            PaymentChannel::ChannelOpened::SIGNATURE_HASH,
+            PaymentChannel::ChannelSettled::SIGNATURE_HASH,
+        ],
+    )
+    .await
+    .context("watch PaymentChannel settlement events")?;
 
     // One-shot bring-up backfill: learn opens first (so settled events can find
     // their counterparty), then process settlements over the same window.
@@ -301,43 +305,46 @@ where
 
     // Filters established and (first cycle) backfill done — the indexer is live.
     info!("settlement-indexer event cycle established");
-    loop {
-        tokio::select! {
-            ev = opened.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    handle_opened(
-                        capacity_bond,
-                        settlement,
-                        state,
-                        metrics,
-                        event.channelId.0,
-                        event.client,
-                        event.provider,
-                    )
-                    .await?;
-                }
-                Some(Err(e)) => return Err(e).context("ChannelOpened stream"),
-                None => return Ok(()),
-            },
-            ev = settled.next() => match ev {
-                Some(Ok((event, log))) => {
-                    handle_settled(
-                        capacity_bond,
-                        settlement,
-                        state,
-                        metrics,
-                        event.channelId.0,
-                        event.provider,
-                        event.routedAmount,
-                        log.block_number,
-                    )
-                    .await?;
-                }
-                Some(Err(e)) => return Err(e).context("ChannelSettled stream"),
-                None => return Ok(()),
-            },
+    while let Some(log) = events.next().await {
+        match log.topic0().copied() {
+            Some(sig) if sig == PaymentChannel::ChannelOpened::SIGNATURE_HASH => {
+                let event = PaymentChannel::ChannelOpened::decode_log_data(&log.inner.data)
+                    .context("decode ChannelOpened")?;
+                handle_opened(
+                    capacity_bond,
+                    settlement,
+                    state,
+                    metrics,
+                    event.channelId.0,
+                    event.client,
+                    event.provider,
+                )
+                .await?;
+            }
+            Some(sig) if sig == PaymentChannel::ChannelSettled::SIGNATURE_HASH => {
+                let event = PaymentChannel::ChannelSettled::decode_log_data(&log.inner.data)
+                    .context("decode ChannelSettled")?;
+                handle_settled(
+                    capacity_bond,
+                    settlement,
+                    state,
+                    metrics,
+                    event.channelId.0,
+                    event.provider,
+                    event.routedAmount,
+                    log.block_number,
+                )
+                .await?;
+            }
+            // Unreachable today (the filter's topic0 OR-set bounds the inputs);
+            // don't panic (anti-panic policy), log it so a future OR-set/dispatch
+            // drift leaves a greppable trail instead of a silently dropped event.
+            _ => {
+                debug!(topic0 = ?log.topic0(), "unmatched PaymentChannel event in subscribed OR-set");
+            }
         }
     }
+    Ok(())
 }
 
 /// Live `ChannelOpened` handler: record the channel's parties, then credit any

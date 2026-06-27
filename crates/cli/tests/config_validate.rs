@@ -333,6 +333,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             payment_channel_address: "0x0000000000000000000000000000000000000001".to_string(),
             capacity_bond_address: "0x0000000000000000000000000000000000000002".to_string(),
             rpc_watchdog_interval_sec: 30,
+            event_poll_interval_ms: 7000,
             redeem_threshold_micro_usdc: 1_000_000,
             buyer_deposit_micro_usdc: 10_000_000,
             buyer_max_approve: true,
