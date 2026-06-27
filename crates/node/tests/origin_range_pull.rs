@@ -83,15 +83,21 @@ fn blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {
 }
 
 /// Register a single channel owned by `client` and build a `ClientHandler` over
-/// a cache whose only origin is `origin_uri`. Returns the handler plus a cache
-/// clone so the test can inspect `has` after delivery.
+/// a cache whose only origin is `origin_uri`. Returns the handler, a cache
+/// clone (so the test can inspect `has` after delivery), and the `Metrics`
+/// handle (so a test can assert per-reason reject counters).
 async fn handler_over_http_origin(
     origin_uri: &str,
     channel_id: B256,
     client: Address,
     server_eth: &Arc<PrivateKeySigner>,
     server_id: iroh::PublicKey,
-) -> anyhow::Result<(Arc<ClientHandler>, CacheEngine, tempfile::TempDir)> {
+) -> anyhow::Result<(
+    Arc<ClientHandler>,
+    CacheEngine,
+    Arc<Metrics>,
+    tempfile::TempDir,
+)> {
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id,
@@ -119,7 +125,21 @@ async fn handler_over_http_origin(
         0,
         16,
     )?;
-    Ok((handler, cache, cache_dir))
+    Ok((handler, cache, metrics, cache_dir))
+}
+
+/// Read a `decdn_<name>` counter's value from the encoded metrics registry.
+/// `name` omits the `decdn_` prefix (e.g. `serve_stream_rejected_..._total`).
+fn counter_value(metrics: &Arc<Metrics>, name: &str) -> anyhow::Result<u64> {
+    let text = metrics
+        .encode()
+        .map_err(|e| anyhow::anyhow!("encode metrics: {e}"))?;
+    let prefix = format!("decdn_{name} ");
+    Ok(text
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0))
 }
 
 /// A manual `cdn/client/v1` client that requests the bounded range
@@ -129,7 +149,7 @@ async fn handler_over_http_origin(
 /// `node_origin_pull::leaf_paced_pull`, but the closing-voucher trigger keys on
 /// the requested `byte_len` — the server advertises the *whole-blob*
 /// `total_bytes`, yet only the range is delivered.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn ranged_paid_pull(
     client_ep: &iroh::Endpoint,
     target: EndpointAddr,
@@ -181,9 +201,22 @@ async fn ranged_paid_pull(
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
     // The advertised size is the *whole* blob; the range delivers `byte_len`,
     // or the whole tail (`total_bytes - byte_offset`) when `byte_len == 0`.
+    // Reject an impossible advertised total rather than saturating to zero — a
+    // server that signed an out-of-range `total_bytes` is a bug the test must
+    // surface, not mask behind an `expected == 0`.
     let expected = if byte_len == 0 {
-        resp.body.total_bytes.saturating_sub(byte_offset)
+        resp.body
+            .total_bytes
+            .checked_sub(byte_offset)
+            .ok_or_else(|| anyhow::anyhow!("response total_bytes is before byte_offset"))?
     } else {
+        let end = byte_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| anyhow::anyhow!("requested range overflows"))?;
+        anyhow::ensure!(
+            end <= resp.body.total_bytes,
+            "response total_bytes is smaller than the requested range end"
+        );
         byte_len
     };
     let interval_bytes = resp
@@ -308,7 +341,7 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+    let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         channel_id,
         client_eth.address(),
@@ -419,7 +452,7 @@ async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Re
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+    let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         channel_id,
         client_eth.address(),
@@ -524,7 +557,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+    let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         channel_id,
         client_eth.address(),
@@ -636,7 +669,7 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+    let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         channel_id,
         client_eth.address(),
@@ -709,7 +742,7 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let (handler, cache, _cache_tmp) = handler_over_http_origin(
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         channel_id,
         client_eth.address(),
@@ -759,6 +792,17 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
         other => anyhow::bail!("expected a refusing StreamResponse, got {other:?}"),
     }
     conn.close(0u32.into(), b"done");
+
+    // Pin the EXACT reject path: the wire `StreamError` collapses to `NotFound`
+    // (shared with cache-miss / unknown-channel), so only the per-reason counter
+    // proves the range-not-satisfiable gate fired rather than some other refusal.
+    anyhow::ensure!(
+        counter_value(
+            &metrics,
+            "serve_stream_rejected_range_not_satisfiable_total"
+        )? == 1,
+        "the out-of-bounds reject must increment the range-not-satisfiable counter"
+    );
 
     client_ep.close().await;
     server_ep.close().await;
