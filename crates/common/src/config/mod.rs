@@ -65,6 +65,14 @@ const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
 /// the watchdog probing the RPC endpoint frequently enough to risk
 /// tripping provider rate limits or exhausting paid quotas.
 const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
+/// Default chain-event filter poll interval (milliseconds). 7000 ms matches
+/// alloy's non-local default, so live-RPC load is unchanged from before #1011;
+/// it overrides alloy's 250 ms localhost default that floods a dev anvil.
+const DEFAULT_EVENT_POLL_INTERVAL_MS: u64 = 7000;
+/// Minimum chain-event filter poll interval. Below this, the ~6 long-lived
+/// watcher filters issue enough `eth_getFilterChanges` to recreate the #1011
+/// flood; it also matches alloy's own localhost floor.
+const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 
 /// Default accrued-claim redemption threshold: 1 USDC (`1_000_000` `µUSDC`).
 /// At this size the ~$0.10 `withdraw` gas is a few percent of the redeemed
@@ -1084,6 +1092,20 @@ fn resolve_blockchain_into(
         },
     );
 
+    let event_poll_interval_ms = file
+        .and_then(|b| b.event_poll_interval_ms)
+        .unwrap_or(DEFAULT_EVENT_POLL_INTERVAL_MS);
+    bag.check_with(
+        event_poll_interval_ms >= MIN_EVENT_POLL_INTERVAL_MS,
+        "blockchain.event_poll_interval_ms",
+        || {
+            format!(
+                "blockchain.event_poll_interval_ms={event_poll_interval_ms} would flood the \
+                 RPC endpoint with eth_getFilterChanges (minimum {MIN_EVENT_POLL_INTERVAL_MS}ms)"
+            )
+        },
+    );
+
     let redeem_threshold_micro_usdc = file
         .and_then(|b| b.redeem_threshold_micro_usdc)
         .unwrap_or(DEFAULT_REDEEM_THRESHOLD_MICRO_USDC);
@@ -1170,6 +1192,7 @@ fn resolve_blockchain_into(
         slash_judge_address,
         chain_id,
         rpc_watchdog_interval_sec,
+        event_poll_interval_ms,
         redeem_threshold_micro_usdc,
         buyer_deposit_micro_usdc,
         buyer_max_approve,
@@ -7957,6 +7980,7 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
+            event_poll_interval_ms: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -7990,6 +8014,7 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             rpc_watchdog_interval_sec: None,
+            event_poll_interval_ms: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8210,6 +8235,7 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(1),
+            event_poll_interval_ms: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8253,6 +8279,7 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
+            event_poll_interval_ms: None,
             redeem_threshold_micro_usdc: Some(0),
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8295,6 +8322,7 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
+            event_poll_interval_ms: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8337,6 +8365,7 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
+            event_poll_interval_ms: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8401,6 +8430,7 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
+            event_poll_interval_ms: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8442,6 +8472,7 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(0),
+            event_poll_interval_ms: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8478,6 +8509,7 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
+            event_poll_interval_ms: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8517,6 +8549,64 @@ mod tests {
             resolved.rpc_watchdog_interval_sec,
             DEFAULT_RPC_WATCHDOG_INTERVAL_SEC
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_event_poll_interval_below_minimum() -> anyhow::Result<()> {
+        // #1011: a sub-minimum interval would recreate the eth_getFilterChanges
+        // flood the knob exists to prevent, so resolution must reject it.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS - 1),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when event poll interval is below the minimum");
+        };
+        let msg = format!("{err:#}");
+        let expected_min = format!("minimum {MIN_EVENT_POLL_INTERVAL_MS}ms");
+        assert!(
+            msg.contains("event_poll_interval_ms") && msg.contains(&expected_min),
+            "error should mention the field and the {expected_min} floor: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_applies_default_event_poll_interval_when_absent() -> anyhow::Result<()> {
+        // Pins the no-config bootstrap path: the default must stay at or above
+        // MIN so an operator without an explicit setting never floods the RPC.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert_eq!(
+            resolved.event_poll_interval_ms,
+            DEFAULT_EVENT_POLL_INTERVAL_MS
+        );
+        assert!(resolved.event_poll_interval_ms >= MIN_EVENT_POLL_INTERVAL_MS);
         Ok(())
     }
 

@@ -65,6 +65,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
             capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
             rpc_watchdog_interval_sec: 30,
+            event_poll_interval_ms: 7000,
             redeem_threshold_micro_usdc: 1_000_000,
             buyer_deposit_micro_usdc: 10_000_000,
             buyer_max_approve: true,

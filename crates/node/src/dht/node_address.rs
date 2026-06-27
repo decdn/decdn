@@ -36,11 +36,13 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::chain_events::watch_contract_events;
 use crate::dht::routing::NodeId;
 use crate::metrics::Metrics;
 use decdn_common::redact::sanitize_rpc_display;
@@ -261,9 +263,10 @@ async fn watcher_loop<P>(
     }
 }
 
-/// Open the two binding-mutating event filters and drain them until either
-/// errors. `Ok(())` on a clean stream end (filter expiry / provider rotation);
-/// `Err` on a transport-level failure.
+/// Open a single multi-topic filter over the two binding-mutating events and
+/// drain it, demuxing each log by `topic0`. `Ok(())` on a clean stream end
+/// (provider dropped); `Err` on a decode failure, which trips the caller's
+/// backoff exactly as a per-event stream error did before.
 async fn run_watcher_once<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
     bindings: &Arc<RwLock<HashMap<NodeId, Address>>>,
@@ -272,42 +275,47 @@ async fn run_watcher_once<P>(
 where
     P: Provider + Clone,
 {
-    let mut node_registered = registry
-        .NodeRegistered_filter()
-        .watch()
-        .await
-        .context("watch NodeRegistered")?
-        .into_stream();
-    let mut node_deregistered = registry
-        .NodeDeregistered_filter()
-        .watch()
-        .await
-        .context("watch NodeDeregistered")?
-        .into_stream();
+    // One multi-topic filter over both binding events (#1011), replacing the
+    // previous two per-event filters. Demux below by `topic0`.
+    let mut events = watch_contract_events(
+        registry.provider(),
+        *registry.address(),
+        [
+            CapacityBond::NodeRegistered::SIGNATURE_HASH,
+            CapacityBond::NodeDeregistered::SIGNATURE_HASH,
+        ],
+    )
+    .await
+    .context("watch CapacityBond binding events")?;
 
-    // Both filters established: a healthy cycle. Clear the down-seconds clock so
-    // it reads 0 for the life of this cycle (it climbs again only on the next
+    // Filter established: a healthy cycle. Clear the down-seconds clock so it
+    // reads 0 for the life of this cycle (it climbs again only on the next
     // error).
     metrics.node_address_watcher_cycle_established();
 
-    loop {
-        tokio::select! {
-            ev = node_registered.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    set_binding(bindings, metrics, NodeId::from_bytes(event.nodeId.0), event.ethAddress);
-                }
-                Some(Err(e)) => return Err(e).context("NodeRegistered stream"),
-                None => return Ok(()),
-            },
-            ev = node_deregistered.next() => match ev {
-                Some(Ok((event, _log))) => {
-                    remove_binding(bindings, metrics, &NodeId::from_bytes(event.nodeId.0));
-                }
-                Some(Err(e)) => return Err(e).context("NodeDeregistered stream"),
-                None => return Ok(()),
-            },
+    while let Some(log) = events.next().await {
+        match log.topic0().copied() {
+            Some(sig) if sig == CapacityBond::NodeRegistered::SIGNATURE_HASH => {
+                let event = CapacityBond::NodeRegistered::decode_log_data(&log.inner.data)
+                    .context("decode NodeRegistered")?;
+                set_binding(
+                    bindings,
+                    metrics,
+                    NodeId::from_bytes(event.nodeId.0),
+                    event.ethAddress,
+                );
+            }
+            Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
+                let event = CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data)
+                    .context("decode NodeDeregistered")?;
+                remove_binding(bindings, metrics, &NodeId::from_bytes(event.nodeId.0));
+            }
+            // The filter's topic0 OR-set guarantees only the events above; ignore
+            // anything else rather than panicking (anti-panic policy).
+            _ => {}
         }
     }
+    Ok(())
 }
 
 /// Insert/update `node_id → address`, republishing the size gauge only when the

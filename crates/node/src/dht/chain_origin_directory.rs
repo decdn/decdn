@@ -89,11 +89,13 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::chain_events::watch_contract_events;
 use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
@@ -660,15 +662,16 @@ async fn resync_pass<R: OriginChainReads>(
     Ok(head)
 }
 
-/// Run one cycle of the watcher: open the seven event filters **first** (so any
-/// event emitted during the subsequent resync RPC buffers in the streams rather
-/// than falling into a gap), then — if armed — run the re-arm resync pass, then
-/// drain the filters via `tokio::select!`, re-reading the authoritative set for
-/// whatever each event signals changed, until any one returns an error.
+/// Run one cycle of the watcher: open the two per-contract multi-topic filters
+/// **first** (so any event emitted during the subsequent resync RPC buffers in
+/// the streams rather than falling into a gap), then — if armed — run the re-arm
+/// resync pass, then drain both filters via `tokio::select!`, demuxing each log
+/// by `topic0` and re-reading the authoritative set for whatever each event
+/// signals changed, until the stream ends or a log fails to decode.
 #[allow(
-    // 7-arm event-dispatch loop across two contracts is fundamentally
-    // complex/long; splitting the filter setup from the select obscures the
-    // dispatch table without reducing real complexity.
+    // 7-event dispatch across two contracts is fundamentally complex/long;
+    // splitting the filter setup from the select obscures the dispatch table
+    // without reducing real complexity.
     clippy::cognitive_complexity,
     clippy::too_many_lines
 )]
@@ -681,55 +684,33 @@ async fn run_watcher_once<P>(
 where
     P: Provider + Clone,
 {
-    let mut content_claimed = contracts
-        .publisher
-        .ContentClaimed_filter()
-        .watch()
-        .await
-        .context("watch ContentClaimed")?
-        .into_stream();
-    let mut activated = contracts
-        .origin
-        .AssignmentActivated_filter()
-        .watch()
-        .await
-        .context("watch AssignmentActivated")?
-        .into_stream();
-    let mut revoked = contracts
-        .origin
-        .AssignmentRevoked_filter()
-        .watch()
-        .await
-        .context("watch AssignmentRevoked")?
-        .into_stream();
-    let mut pruned = contracts
-        .origin
-        .BlacklistedAssignmentPruned_filter()
-        .watch()
-        .await
-        .context("watch BlacklistedAssignmentPruned")?
-        .into_stream();
-    let mut default_updated = contracts
-        .origin
-        .DefaultOpenAllowlistUpdated_filter()
-        .watch()
-        .await
-        .context("watch DefaultOpenAllowlistUpdated")?
-        .into_stream();
-    let mut default_added = contracts
-        .origin
-        .DefaultOpenOperatorAdded_filter()
-        .watch()
-        .await
-        .context("watch DefaultOpenOperatorAdded")?
-        .into_stream();
-    let mut default_removed = contracts
-        .origin
-        .DefaultOpenOperatorRemoved_filter()
-        .watch()
-        .await
-        .context("watch DefaultOpenOperatorRemoved")?
-        .into_stream();
+    // Two multi-topic filters (#1011), one per contract address: ContentClaimed
+    // on PublisherRegistry, and the six assignment / default-open events on
+    // OriginAssignment. Kept per-address (not merged) so a topic0 collision
+    // across contracts can never mis-decode. Installed BEFORE the resync pass
+    // below so any event emitted during resync buffers in the streams rather
+    // than falling into a gap — the original ordering guarantee. Demux by topic0.
+    let mut publisher_events = watch_contract_events(
+        contracts.publisher.provider(),
+        *contracts.publisher.address(),
+        [PublisherRegistry::ContentClaimed::SIGNATURE_HASH],
+    )
+    .await
+    .context("watch PublisherRegistry events")?;
+    let mut origin_events = watch_contract_events(
+        contracts.origin.provider(),
+        *contracts.origin.address(),
+        [
+            OriginAssignment::AssignmentActivated::SIGNATURE_HASH,
+            OriginAssignment::AssignmentRevoked::SIGNATURE_HASH,
+            OriginAssignment::BlacklistedAssignmentPruned::SIGNATURE_HASH,
+            OriginAssignment::DefaultOpenAllowlistUpdated::SIGNATURE_HASH,
+            OriginAssignment::DefaultOpenOperatorAdded::SIGNATURE_HASH,
+            OriginAssignment::DefaultOpenOperatorRemoved::SIGNATURE_HASH,
+        ],
+    )
+    .await
+    .context("watch OriginAssignment events")?;
 
     // Filters are now installed and buffering. Re-establish authoritative state
     // over the outage gap before going live; cleared only on full success, so a
@@ -742,71 +723,55 @@ where
 
     loop {
         tokio::select! {
-            ev = content_claimed.next() => match ev {
-                Some(Ok((event, log))) => {
-                    state.advance_block(log.block_number);
-                    on_content_claimed(
-                        contracts, cache, metrics,
-                        Hash::from_bytes(event.blake3Hash.0), event.namespaceId,
-                    ).await;
+            maybe = publisher_events.next() => {
+                // Stream ends (`None`) only when the provider is dropped.
+                let Some(log) = maybe else { return Ok(()) };
+                state.advance_block(log.block_number);
+                // PublisherRegistry's sole subscribed event is ContentClaimed.
+                let event = PublisherRegistry::ContentClaimed::decode_log_data(&log.inner.data)
+                    .context("decode ContentClaimed")?;
+                on_content_claimed(
+                    contracts, cache, metrics,
+                    Hash::from_bytes(event.blake3Hash.0), event.namespaceId,
+                ).await;
+            }
+            maybe = origin_events.next() => {
+                let Some(log) = maybe else { return Ok(()) };
+                state.advance_block(log.block_number);
+                match log.topic0().copied() {
+                    Some(sig) if sig == OriginAssignment::AssignmentActivated::SIGNATURE_HASH => {
+                        let event = OriginAssignment::AssignmentActivated::decode_log_data(&log.inner.data)
+                            .context("decode AssignmentActivated")?;
+                        on_namespace_changed(contracts, cache, metrics, event.namespaceId).await;
+                    }
+                    Some(sig) if sig == OriginAssignment::AssignmentRevoked::SIGNATURE_HASH => {
+                        let event = OriginAssignment::AssignmentRevoked::decode_log_data(&log.inner.data)
+                            .context("decode AssignmentRevoked")?;
+                        on_origin_removed(contracts, cache, metrics, event.namespaceId, event.operator).await;
+                    }
+                    Some(sig) if sig == OriginAssignment::BlacklistedAssignmentPruned::SIGNATURE_HASH => {
+                        let event = OriginAssignment::BlacklistedAssignmentPruned::decode_log_data(&log.inner.data)
+                            .context("decode BlacklistedAssignmentPruned")?;
+                        on_origin_removed(contracts, cache, metrics, event.namespaceId, event.operator).await;
+                    }
+                    // The default-open allow-list events carry no fields we read; the
+                    // event is only a signal to re-read `getOrigins(0)` wholesale.
+                    Some(sig) if sig == OriginAssignment::DefaultOpenAllowlistUpdated::SIGNATURE_HASH => {
+                        on_default_open_changed(contracts, cache, metrics).await;
+                    }
+                    Some(sig) if sig == OriginAssignment::DefaultOpenOperatorAdded::SIGNATURE_HASH => {
+                        on_default_open_changed(contracts, cache, metrics).await;
+                    }
+                    Some(sig) if sig == OriginAssignment::DefaultOpenOperatorRemoved::SIGNATURE_HASH => {
+                        let event = OriginAssignment::DefaultOpenOperatorRemoved::decode_log_data(&log.inner.data)
+                            .context("decode DefaultOpenOperatorRemoved")?;
+                        on_origin_removed(contracts, cache, metrics, DEFAULT_OPEN_NAMESPACE, event.operator).await;
+                    }
+                    // The filter's topic0 OR-set guarantees only the events above;
+                    // ignore anything else rather than panicking (anti-panic policy).
+                    _ => {}
                 }
-                Some(Err(e)) => return Err(e).context("ContentClaimed stream"),
-                None => return Ok(()),
-            },
-            ev = activated.next() => match ev {
-                Some(Ok((event, log))) => {
-                    state.advance_block(log.block_number);
-                    on_namespace_changed(contracts, cache, metrics, event.namespaceId).await;
-                }
-                Some(Err(e)) => return Err(e).context("AssignmentActivated stream"),
-                None => return Ok(()),
-            },
-            ev = revoked.next() => match ev {
-                Some(Ok((event, log))) => {
-                    state.advance_block(log.block_number);
-                    on_origin_removed(
-                        contracts, cache, metrics, event.namespaceId, event.operator,
-                    ).await;
-                }
-                Some(Err(e)) => return Err(e).context("AssignmentRevoked stream"),
-                None => return Ok(()),
-            },
-            ev = pruned.next() => match ev {
-                Some(Ok((event, log))) => {
-                    state.advance_block(log.block_number);
-                    on_origin_removed(
-                        contracts, cache, metrics, event.namespaceId, event.operator,
-                    ).await;
-                }
-                Some(Err(e)) => return Err(e).context("BlacklistedAssignmentPruned stream"),
-                None => return Ok(()),
-            },
-            ev = default_updated.next() => match ev {
-                Some(Ok((_event, log))) => {
-                    state.advance_block(log.block_number);
-                    on_default_open_changed(contracts, cache, metrics).await;
-                }
-                Some(Err(e)) => return Err(e).context("DefaultOpenAllowlistUpdated stream"),
-                None => return Ok(()),
-            },
-            ev = default_added.next() => match ev {
-                Some(Ok((_event, log))) => {
-                    state.advance_block(log.block_number);
-                    on_default_open_changed(contracts, cache, metrics).await;
-                }
-                Some(Err(e)) => return Err(e).context("DefaultOpenOperatorAdded stream"),
-                None => return Ok(()),
-            },
-            ev = default_removed.next() => match ev {
-                Some(Ok((event, log))) => {
-                    state.advance_block(log.block_number);
-                    on_origin_removed(
-                        contracts, cache, metrics, DEFAULT_OPEN_NAMESPACE, event.operator,
-                    ).await;
-                }
-                Some(Err(e)) => return Err(e).context("DefaultOpenOperatorRemoved stream"),
-                None => return Ok(()),
-            },
+            }
         }
     }
 }
