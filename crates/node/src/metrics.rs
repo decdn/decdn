@@ -882,6 +882,15 @@ pub struct DecdnMetrics {
     /// place the distinction lives. Visible name:
     /// `decdn_serve_stream_rejected_cooperative_close_signed_total`.
     pub serve_stream_rejected_cooperative_close_signed: Counter,
+    /// Delivery refused because the requested bounded range
+    /// `[byte_offset, byte_offset + byte_len)` is out of bounds for the blob
+    /// (ADR 005 §Bounded byte ranges: the node MUST reject an overflowing or
+    /// past-EOF range). Wire-indistinguishable from `cache_miss` (signed as
+    /// `NotFound`), so this server-side counter is the only place the
+    /// distinction lives — a rising value flags clients issuing malformed
+    /// ranges. Visible name:
+    /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
+    pub serve_stream_rejected_range_not_satisfiable: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -1468,6 +1477,12 @@ impl Metrics {
         self.decdn
             .serve_stream_rejected_cooperative_close_signed
             .inc();
+    }
+
+    /// Record a `serve_stream` delivery refused because the requested bounded
+    /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
+    pub fn serve_stream_rejected_range_not_satisfiable(&self) {
+        self.decdn.serve_stream_rejected_range_not_satisfiable.inc();
     }
 
     /// The window-paced serve loop paused the upstream pull at `pull_ahead_bytes`

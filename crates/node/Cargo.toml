@@ -85,6 +85,10 @@ proptest = { workspace = true }
 # otherwise force us to use `libc::raise` directly.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 wiremock = { workspace = true }
+# `tests/origin_range_pull.rs` builds the `{H}.obao4` pre-order outboard a
+# range-pull origin must publish, so the e2e test can verify the cold ranged
+# cdn/client/v1 path (#823/#990). Matches the cache crate's outboard codec.
+bao-tree = { workspace = true }
 # `tests/client_loopback.rs` constructs a real `ChannelReceiptSink` via
 # `receipt_log::spawn_receipt_writer` (which takes a `CancellationToken`) to
 # prove the paid-delivery hot path never blocks on receipt-log I/O (#803).

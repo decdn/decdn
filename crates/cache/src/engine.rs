@@ -1684,6 +1684,47 @@ impl CacheEngine {
         Ok(RangePullOutcome::Served)
     }
 
+    /// Best-effort total byte size of `hash` from the configured origins, for
+    /// scoping a range pull ([`Self::pull_through_range`] needs the exact blob
+    /// size to align + verify a sub-range against the root `H`, and the
+    /// `{H}.obao4` outboard alone doesn't pin the final chunk's length). Walks
+    /// the origin fallback chain ([`Origin::size`] — HTTP `HEAD` / S3
+    /// `HeadObject` / `fs` metadata) and returns the first known size; a
+    /// per-origin `Ok(None)` (no object / compressed / unsupported) or a
+    /// transport error advances the chain.
+    ///
+    /// Returns `Ok(None)` when no origin can answer — the caller MUST then
+    /// degrade to a whole-blob [`Self::populate`] / [`Self::get`]. This is a
+    /// metadata probe only: it never fetches or caches bytes, so unlike
+    /// [`Self::pull_through_range`] it carries no logical-eviction guard (the
+    /// caller's range pull and whole-blob fallback both enforce it).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::NoOrigin`] when no origin is configured (mirrors
+    /// [`Self::pull_through_range`], so the caller sees a coherent "can't
+    /// range-pull" signal rather than a silent `None`).
+    pub async fn origin_size(&self, hash: Hash) -> CacheResult<Option<u64>> {
+        if self.inner.origins.is_empty() {
+            return Err(CacheError::NoOrigin { hash });
+        }
+        for origin in &self.inner.origins {
+            match origin.size(hash).await {
+                Ok(Some(size)) => return Ok(Some(size)),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        %hash,
+                        kind = ?origin.kind(),
+                        error = %e,
+                        "origin size probe failed; trying next origin",
+                    );
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Begin a node-driven *tee* fill of `hash` (#856): the caller pushes blob
     /// chunks (received from an upstream node→node pull) via [`TeeSink::write`]
     /// while the engine streams them into the store, and [`TeeSink::finish`]

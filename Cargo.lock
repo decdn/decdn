@@ -2735,6 +2735,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "bao-tree",
  "blake3",
  "bytes",
  "clap",

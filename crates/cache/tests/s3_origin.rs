@@ -1171,3 +1171,66 @@ async fn fetch_range_wrong_length_span_degrades() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ----------------------------------------------------------------------------
+// `S3Origin::size` issues a `HeadObject` to learn the canonical blob length for
+// scoping a range pull (#823). A `Content-Encoding` object or a missing key
+// yields `None` (degrade to whole-blob); a genuine 5xx surfaces as an error.
+// ----------------------------------------------------------------------------
+
+use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
+use aws_sdk_s3::types::error::NotFound;
+
+#[tokio::test]
+async fn size_returns_head_object_content_length() -> anyhow::Result<()> {
+    let hash = Hash::new(b"size-probe");
+    let key = expected_key("", hash);
+    let rule = mock!(Client::head_object)
+        .match_requests(move |req| req.key() == Some(&key))
+        .then_output(|| HeadObjectOutput::builder().content_length(4096).build());
+    let client = mock_s3_client_match_any(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    anyhow::ensure!(
+        origin.size(hash).await? == Some(4096),
+        "size must be the HeadObject Content-Length"
+    );
+    anyhow::ensure!(rule.num_calls() == 1, "exactly one HeadObject");
+    Ok(())
+}
+
+#[tokio::test]
+async fn size_compressed_object_is_unknown() -> anyhow::Result<()> {
+    // A `Content-Encoding` HeadObject advertises the encoded length, not the
+    // canonical blob size — `size` must degrade to `None`.
+    let hash = Hash::new(b"compressed");
+    let rule = mock!(Client::head_object).then_output(|| {
+        HeadObjectOutput::builder()
+            .content_length(1024)
+            .content_encoding("gzip")
+            .build()
+    });
+    let client = mock_s3_client_match_any(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    anyhow::ensure!(
+        origin.size(hash).await?.is_none(),
+        "compressed object size must be unknown"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn size_missing_object_is_none() -> anyhow::Result<()> {
+    let hash = Hash::new(b"absent");
+    let rule = mock!(Client::head_object)
+        .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+    let client = mock_s3_client_match_any(&[&rule]);
+    let origin = s3_origin(client, "");
+
+    anyhow::ensure!(
+        origin.size(hash).await?.is_none(),
+        "missing object size must be None"
+    );
+    Ok(())
+}
