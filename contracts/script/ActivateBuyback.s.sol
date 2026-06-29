@@ -6,6 +6,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
 
@@ -27,7 +28,7 @@ import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
 ///         calldata blobs governance schedules through the 48h Timelock:
 ///           1. `FeeRouter.setSharesAndDestinations([6000, 3000, 1000], …)`
 ///              (steady-state split, ADR 016 § Deployment Order).
-///           2. `BuybackBurnerBalancerV3.setKeeper(keeper)`.
+///           2. `GuardedBuybackBurner.setKeeper(keeper)`.
 ///         The script holds no privileged role and never touches FeeRouter, so
 ///         it cannot itself activate the bucket — the Timelock proposal does.
 ///
@@ -98,9 +99,9 @@ contract ActivateBuyback is Script {
         console2.log("   FeeRouter.setSharesAndDestinations([6000,3000,1000], {burner, timelock})");
         console2.logBytes(activateCalldata);
 
-        bytes memory keeperCalldata = abi.encodeCall(BuybackBurnerBalancerV3.setKeeper, (keeper));
+        bytes memory keeperCalldata = abi.encodeCall(GuardedBuybackBurner.setKeeper, (keeper));
         console2.log("2) target:", address(burner));
-        console2.log("   BuybackBurnerBalancerV3.setKeeper(keeper)");
+        console2.log("   GuardedBuybackBurner.setKeeper(keeper)");
         console2.logBytes(keeperCalldata);
     }
 }

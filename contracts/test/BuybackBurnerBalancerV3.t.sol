@@ -5,6 +5,7 @@ import { Test } from "forge-std/Test.sol";
 
 import { BuybackBurner } from "../src/BuybackBurner.sol";
 import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { Token } from "../src/Token.sol";
 import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
 
@@ -328,7 +329,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         // And one wei below the new floor reverts with the recomputed floor.
         vm.prank(keeper);
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnerBalancerV3.MinOutBelowTwapFloor.selector, newFloor - 1, newFloor)
+            abi.encodeWithSelector(GuardedBuybackBurner.MinOutBelowTwapFloor.selector, newFloor - 1, newFloor)
         );
         bb.executeBuyback(BUYBACK_USDC, newFloor - 1);
     }
@@ -346,7 +347,7 @@ contract BuybackBurnerBalancerV3Test is Test {
     function test_executeBuyback_revertsWhenMinOutBelowTwapFloor() public {
         vm.prank(keeper);
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnerBalancerV3.MinOutBelowTwapFloor.selector, FLOOR_OUT - 1, FLOOR_OUT)
+            abi.encodeWithSelector(GuardedBuybackBurner.MinOutBelowTwapFloor.selector, FLOOR_OUT - 1, FLOOR_OUT)
         );
         bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT - 1);
     }
@@ -378,7 +379,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         usdc.transfer(address(fresh), 10_000_000e6);
         fresh.poke(); // initialize, but do not span the window
         vm.prank(keeper);
-        vm.expectRevert(BuybackBurnerBalancerV3.TwapNotReady.selector);
+        vm.expectRevert(GuardedBuybackBurner.TwapNotReady.selector);
         fresh.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
     }
 
@@ -386,7 +387,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         // A 100% pool fee would collapse the floor to 0 (fail-open); reject it.
         vault.setSwapFee(1e18);
         vm.prank(keeper);
-        vm.expectRevert(BuybackBurnerBalancerV3.PoolStateInvalid.selector);
+        vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.SwapFeeInvalid.selector, uint256(1e18)));
         bb.executeBuyback(BUYBACK_USDC, FLOOR_OUT);
     }
 
@@ -408,7 +409,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         // runs after the floor) is what reverts.
         vm.prank(keeper);
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnerBalancerV3.BelowMinBuyback.selector, MIN_BUYBACK - 1, MIN_BUYBACK)
+            abi.encodeWithSelector(GuardedBuybackBurner.BelowMinBuyback.selector, MIN_BUYBACK - 1, MIN_BUYBACK)
         );
         bb.executeBuyback(MIN_BUYBACK - 1, 1e25);
     }
@@ -419,7 +420,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         // check (not the floor) is what reverts.
         router.setAmountOut(type(uint256).max / 2);
         vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(BuybackBurnerBalancerV3.AboveMaxBuyback.selector, over, MAX_BUYBACK));
+        vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.AboveMaxBuyback.selector, over, MAX_BUYBACK));
         bb.executeBuyback(over, type(uint256).max / 2);
     }
 
@@ -440,7 +441,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         assertEq(bb.epochSwappedUsdc(), BIG_BUYBACK);
         uint256 cap = 100_000e6;
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnerBalancerV3.EpochCapExceeded.selector, BIG_BUYBACK + BIG_BUYBACK, cap)
+            abi.encodeWithSelector(GuardedBuybackBurner.EpochCapExceeded.selector, BIG_BUYBACK + BIG_BUYBACK, cap)
         );
         bb.executeBuyback(BIG_BUYBACK, BIG_FLOOR); // 120k > 100k cap
         vm.stopPrank();
@@ -454,7 +455,7 @@ contract BuybackBurnerBalancerV3Test is Test {
 
         vm.warp(block.timestamp + 7 days);
         vm.expectEmit(true, false, false, false, address(bb));
-        emit BuybackBurnerBalancerV3.EpochRolled(uint64(block.timestamp / 7 days), 0);
+        emit GuardedBuybackBurner.EpochRolled(uint64(block.timestamp / 7 days), 0);
         vm.prank(keeper);
         bb.executeBuyback(BIG_BUYBACK, BIG_FLOOR);
         assertEq(bb.epochSwappedUsdc(), BIG_BUYBACK, "epoch accrual reset then re-accrued");
@@ -515,7 +516,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         assertEq(bb.slippageBps(), 500);
 
         vm.prank(gov);
-        vm.expectRevert(abi.encodeWithSelector(BuybackBurnerBalancerV3.SlippageOutOfBounds.selector, 10_000, 10_000));
+        vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.SlippageOutOfBounds.selector, 10_000, 10_000));
         bb.setSlippageTolerance(10_000);
     }
 
@@ -525,9 +526,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         assertEq(bb.epochLiquidityCapFraction(), 3000);
 
         vm.prank(gov);
-        vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnerBalancerV3.CapFractionOutOfBounds.selector, 3001, 100, 3000)
-        );
+        vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.CapFractionOutOfBounds.selector, 3001, 100, 3000));
         bb.setEpochLiquidityCapFraction(3001);
     }
 
@@ -573,9 +572,7 @@ contract BuybackBurnerBalancerV3Test is Test {
     function test_constructor_revertsOnCapFractionOutOfBounds() public {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.epochLiquidityCapFraction_ = 3001;
-        vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnerBalancerV3.CapFractionOutOfBounds.selector, 3001, 100, 3000)
-        );
+        vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.CapFractionOutOfBounds.selector, 3001, 100, 3000));
         new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
     }
 
@@ -583,7 +580,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.twapMinWindow_ = 30 minutes - 1;
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnerBalancerV3.TwapWindowTooShort.selector, 30 minutes - 1, 30 minutes)
+            abi.encodeWithSelector(GuardedBuybackBurner.TwapWindowTooShort.selector, 30 minutes - 1, 30 minutes)
         );
         new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
     }
@@ -592,7 +589,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.minBuybackAmount_ = MAX_BUYBACK + 1;
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnerBalancerV3.BuybackBandInverted.selector, MAX_BUYBACK + 1, MAX_BUYBACK)
+            abi.encodeWithSelector(GuardedBuybackBurner.BuybackBandInverted.selector, MAX_BUYBACK + 1, MAX_BUYBACK)
         );
         new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
     }
@@ -600,7 +597,7 @@ contract BuybackBurnerBalancerV3Test is Test {
     function test_setMaxBuybackAmount_revertsBelowMin() public {
         vm.prank(gov);
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnerBalancerV3.BuybackBandInverted.selector, MIN_BUYBACK, MIN_BUYBACK - 1)
+            abi.encodeWithSelector(GuardedBuybackBurner.BuybackBandInverted.selector, MIN_BUYBACK, MIN_BUYBACK - 1)
         );
         bb.setMaxBuybackAmount(MIN_BUYBACK - 1);
     }
@@ -608,7 +605,7 @@ contract BuybackBurnerBalancerV3Test is Test {
     function test_constructor_revertsOnUsdcDecimalsAbove18() public {
         MockHighDecimalsToken bad = new MockHighDecimalsToken();
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
-        vm.expectRevert(abi.encodeWithSelector(BuybackBurnerBalancerV3.UnsupportedTokenDecimals.selector, uint8(19)));
+        vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.UnsupportedTokenDecimals.selector, uint8(19)));
         new BuybackBurnerBalancerV3(IERC20(address(bad)), ERC20Burnable(address(token)), admin, cfg);
     }
 
@@ -744,7 +741,7 @@ contract BuybackBurnerBalancerV3Test is Test {
         MockBalancerV3WeightedPool p2 = new MockBalancerV3WeightedPool(_orderedWeights(false));
         vm.prank(gov);
         vm.expectEmit(true, true, false, false, address(bb));
-        emit BuybackBurner.PoolUpdated(address(pool), address(p2));
+        emit BuybackBurnerBalancerV3.PoolUpdated(address(pool), address(p2));
         bb.setPool(address(p2));
         assertEq(bb.balancerPool(), address(p2), "pool re-wired after passing validation");
     }
@@ -781,9 +778,37 @@ contract BuybackBurnerBalancerV3Test is Test {
         v2.setPool(_orderedTokens(false), _orderedBals(false));
         vm.prank(gov);
         vm.expectEmit(true, true, false, false, address(bb));
-        emit BuybackBurner.VaultUpdated(address(vault), address(v2));
+        emit BuybackBurnerBalancerV3.VaultUpdated(address(vault), address(v2));
         bb.setVault(address(v2));
         assertEq(bb.balancerVault(), address(v2), "vault rotated after passing validation");
+    }
+
+    function test_setPool_resetsGuardStateOnRotation() public {
+        // TWAP is matured in setUp; rotating the pool must reset the inherited
+        // guard state so the floor re-derives against the new pool instead of
+        // carrying the old pool's accumulator.
+        assertEq(bb.twapPrice(), SPOT, "twap matured pre-rotation");
+        MockBalancerV3WeightedPool p2 = new MockBalancerV3WeightedPool(_orderedWeights(false));
+        vm.expectEmit(false, false, false, false, address(bb));
+        emit GuardedBuybackBurner.GuardStateReset();
+        vm.prank(gov);
+        bb.setPool(address(p2));
+        vm.expectRevert(GuardedBuybackBurner.TwapNotReady.selector);
+        bb.twapPrice();
+    }
+
+    function test_setVault_resetsGuardStateOnRotation() public {
+        // The Vault feeds the spot/depth reads; rotating it must reset the
+        // inherited guard state (fail-closed `TwapNotReady` until re-matured).
+        assertEq(bb.twapPrice(), SPOT, "twap matured pre-rotation");
+        MockBalancerV3Vault v2 = new MockBalancerV3Vault();
+        v2.setPool(_orderedTokens(false), _orderedBals(false));
+        vm.expectEmit(false, false, false, false, address(bb));
+        emit GuardedBuybackBurner.GuardStateReset();
+        vm.prank(gov);
+        bb.setVault(address(v2));
+        vm.expectRevert(GuardedBuybackBurner.TwapNotReady.selector);
+        bb.twapPrice();
     }
 
     function test_setPool_unwireToZeroSkipsValidationAndSucceeds() public {
