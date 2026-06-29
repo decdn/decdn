@@ -783,6 +783,34 @@ contract BuybackBurnerBalancerV3Test is Test {
         assertEq(bb.balancerVault(), address(v2), "vault rotated after passing validation");
     }
 
+    function test_setPool_resetsGuardStateOnRotation() public {
+        // TWAP is matured in setUp; rotating the pool must reset the inherited
+        // guard state so the floor re-derives against the new pool instead of
+        // carrying the old pool's accumulator.
+        assertEq(bb.twapPrice(), SPOT, "twap matured pre-rotation");
+        MockBalancerV3WeightedPool p2 = new MockBalancerV3WeightedPool(_orderedWeights(false));
+        vm.expectEmit(false, false, false, false, address(bb));
+        emit GuardedBuybackBurner.GuardStateReset();
+        vm.prank(gov);
+        bb.setPool(address(p2));
+        vm.expectRevert(GuardedBuybackBurner.TwapNotReady.selector);
+        bb.twapPrice();
+    }
+
+    function test_setVault_resetsGuardStateOnRotation() public {
+        // The Vault feeds the spot/depth reads; rotating it must reset the
+        // inherited guard state (fail-closed `TwapNotReady` until re-matured).
+        assertEq(bb.twapPrice(), SPOT, "twap matured pre-rotation");
+        MockBalancerV3Vault v2 = new MockBalancerV3Vault();
+        v2.setPool(_orderedTokens(false), _orderedBals(false));
+        vm.expectEmit(false, false, false, false, address(bb));
+        emit GuardedBuybackBurner.GuardStateReset();
+        vm.prank(gov);
+        bb.setVault(address(v2));
+        vm.expectRevert(GuardedBuybackBurner.TwapNotReady.selector);
+        bb.twapPrice();
+    }
+
     function test_setPool_unwireToZeroSkipsValidationAndSucceeds() public {
         // Zeroing a wired leg is the documented "not wired" path: it must NOT be
         // rejected by the new override even when the Vault would report the pool

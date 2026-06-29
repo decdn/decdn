@@ -118,6 +118,7 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     event EpochCapFractionUpdated(uint256 oldBps, uint256 newBps);
     event EpochRolled(uint64 indexed epoch, uint256 usdcDepthSnapshot);
     event TwapUpdated(uint256 priceCumulative, uint256 timestamp);
+    event GuardStateReset();
 
     error BelowMinBuyback(uint256 amountIn, uint256 floor);
     error AboveMaxBuyback(uint256 amountIn, uint256 ceiling);
@@ -300,6 +301,36 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     function _swap(uint256 amountIn, uint256 minOut) internal virtual returns (uint256 tokenOut);
 
     // -----------------------------------------------------------------
+    // Internal — guard state reset on venue rotation
+    // -----------------------------------------------------------------
+
+    /// @dev Clear the venue-derived guard state — the TWAP accumulator and the
+    ///      per-epoch cap snapshot — so both re-derive from scratch against a
+    ///      freshly wired venue. A concrete burner MUST call this whenever it
+    ///      rotates a price/depth source (the pool, or the Balancer Vault): the
+    ///      accumulator returns to its fail-closed lazy-init state
+    ///      (`twapLastUpdate == 0` ⇒ `_twapPrice` reverts `TwapNotReady` until
+    ///      `twapMinWindow` re-matures against the new venue), and zeroing
+    ///      `epochStartUsdcDepth`/`currentEpochIndex` forces the next swap to
+    ///      re-snapshot depth from the new venue. Without this, a rotation would
+    ///      leave the floor and cap derived from the OLD venue's price/depth
+    ///      until enough time elapsed — fail-open if the stale floor sits below
+    ///      what the new venue warrants.
+    function _resetGuardState() internal {
+        priceCumulative = 0;
+        twapLastUpdate = 0;
+        twapLastSpot = 0;
+        twapAnchorCumulative = 0;
+        twapAnchorTime = 0;
+        twapCurrCumulative = 0;
+        twapCurrTime = 0;
+        currentEpochIndex = 0;
+        epochStartUsdcDepth = 0;
+        epochSwappedUsdc = 0;
+        emit GuardStateReset();
+    }
+
+    // -----------------------------------------------------------------
     // Internal — per-epoch cap
     // -----------------------------------------------------------------
 
@@ -317,6 +348,13 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     function _accruePerEpochCap(uint256 amountIn) internal {
         // forge-lint: disable-next-line(block-timestamp)
         uint64 epoch = uint64(block.timestamp / EPOCH_LENGTH);
+        // `epochStartUsdcDepth == 0` is the lazy-init sentinel for the first
+        // swap of an epoch — a live, wired pool never has zero USDC depth, so 0
+        // unambiguously means "not yet snapshotted". A concrete `_usdcDepthRaw`
+        // backed by `balanceOf` (Uniswap venue) taints this into slither's
+        // strict-equality detector; the sentinel is intentional, same as the
+        // `twapLastUpdate == 0` init guard in `_twapPrice`.
+        // slither-disable-next-line incorrect-equality
         if (epoch != currentEpochIndex || epochStartUsdcDepth == 0) {
             currentEpochIndex = epoch;
             epochStartUsdcDepth = _usdcDepthRaw();

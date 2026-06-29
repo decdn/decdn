@@ -99,6 +99,11 @@ contract BuybackBurnerUniswapV3 is GuardedBuybackBurner {
         if (address(cfg.swapRouter_) == address(0)) revert ZeroAddress();
         swapRouter = cfg.swapRouter_;
         pool = cfg.pool_;
+        // Fail-fast on a mis-wired pool supplied at deploy, symmetric with
+        // `setPool` and the Balancer burner's constructor validation: a non-zero
+        // pool must read as a USDC/TOKEN pair with a live price (`_spotPrice`
+        // reverts otherwise). Zero stays the deferred-wiring path.
+        if (cfg.pool_ != address(0)) _spotPrice();
     }
 
     // -----------------------------------------------------------------
@@ -212,5 +217,10 @@ contract BuybackBurnerUniswapV3 is GuardedBuybackBurner {
         // Fail-fast on a mis-wired pool: a non-zero pool must read as a
         // USDC/TOKEN pair with a live price (`_spotPrice` reverts otherwise).
         if (newPool != address(0)) _spotPrice();
+        // A pool rotation changes the spot/depth source: reset the inherited
+        // TWAP accumulator and per-epoch cap so they re-derive against the new
+        // pool (fail-closed `TwapNotReady` + fresh depth snapshot) rather than
+        // carrying stale state from the old pool.
+        if (newPool != old) _resetGuardState();
     }
 }

@@ -204,6 +204,14 @@ contract BuybackBurnerUniswapV3Test is Test {
         assertEq(bb.usdcTo18(), 1e12);
     }
 
+    function test_constructor_revertsOnMisWiredPool() public {
+        // A non-zero pool supplied at deploy must fail-fast if it is not a
+        // USDC/TOKEN pair (mirrors `setPool` and the Balancer constructor).
+        MockV3Pool bad = new MockV3Pool(SQRTP_ONE_DOLLAR, address(0xDEAD), address(0xBEEF), FEE);
+        vm.expectRevert(BuybackBurnerUniswapV3.PoolStateInvalid.selector);
+        _deploy(address(bad));
+    }
+
     // -----------------------------------------------------------------
     // Spot price math (both token orderings)
     // -----------------------------------------------------------------
@@ -338,6 +346,24 @@ contract BuybackBurnerUniswapV3Test is Test {
         vm.prank(admin);
         bb.setPool(address(0));
         assertEq(bb.pool(), address(0));
+    }
+
+    function test_setPool_resetsGuardStateOnRotation() public {
+        // Mature the accumulator against the current pool.
+        _matureTwap();
+        assertApproxEqRel(bb.twapPrice(), 1e18, 1e12);
+
+        // Rotate to a fresh, valid USDC/TOKEN pool: the guard state must reset
+        // so the floor re-derives against the new pool (fail-closed until the
+        // window re-matures) instead of carrying the old pool's accumulator.
+        MockV3Pool p2 = new MockV3Pool(SQRTP_ONE_DOLLAR, address(usdc), address(token), FEE);
+        vm.expectEmit(false, false, false, false, address(bb));
+        emit GuardedBuybackBurner.GuardStateReset();
+        vm.prank(admin);
+        bb.setPool(address(p2));
+
+        vm.expectRevert(GuardedBuybackBurner.TwapNotReady.selector);
+        bb.twapPrice();
     }
 
     function test_setSwapRouter_revertsOnZero() public {

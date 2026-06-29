@@ -101,7 +101,7 @@ contract ActivateBuyback is Script {
 
         bytes memory keeperCalldata = abi.encodeCall(GuardedBuybackBurner.setKeeper, (keeper));
         console2.log("2) target:", address(burner));
-        console2.log("   BuybackBurnerBalancerV3.setKeeper(keeper)");
+        console2.log("   GuardedBuybackBurner.setKeeper(keeper)");
         console2.logBytes(keeperCalldata);
     }
 }

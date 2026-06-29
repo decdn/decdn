@@ -164,9 +164,12 @@ contract BuybackBurnerBalancerV3 is GuardedBuybackBurner {
     function _swap(uint256 amountIn, uint256 minOut) internal override returns (uint256 tokenOut) {
         usdc.forceApprove(address(permit2), amountIn);
         // `uint160(amountIn)` cannot truncate: `amountIn` is bounded above by the
-        // base-layer `amountIn <= usdc.balanceOf(this)` check, and 6-dec USDC
-        // total supply is ~30 orders of magnitude below 2^160.
+        // base-layer `amountIn <= usdc.balanceOf(this)` check (now in the
+        // `BuybackBurner` parent, so aderyn can no longer see the bound across
+        // the contract split and flags the downcast), and 6-dec USDC total
+        // supply is ~30 orders of magnitude below 2^160.
         // forge-lint: disable-next-line(block-timestamp)
+        // aderyn-ignore-next-line(unsafe-casting)
         permit2.approve(address(usdc), address(swapRouter), uint160(amountIn), uint48(block.timestamp));
 
         // forge-lint: disable-next-line(block-timestamp)
@@ -228,6 +231,11 @@ contract BuybackBurnerBalancerV3 is GuardedBuybackBurner {
         balancerPool = newPool;
         emit PoolUpdated(old, newPool);
         _validatePoolWiring();
+        // A pool rotation changes the spot/depth source: reset the inherited
+        // TWAP accumulator and per-epoch cap so they re-derive against the new
+        // pool (fail-closed `TwapNotReady` + fresh depth snapshot) rather than
+        // carrying stale state from the old pool.
+        if (newPool != old) _resetGuardState();
     }
 
     /// @notice Wire/rotate the Balancer Vault. Symmetric to `setPool`: revalidates
@@ -243,6 +251,11 @@ contract BuybackBurnerBalancerV3 is GuardedBuybackBurner {
         balancerVault = newVault;
         emit VaultUpdated(old, newVault);
         _validatePoolWiring();
+        // The Vault is part of the spot/depth source (`_poolState` reads leg
+        // balances through it): a Vault rotation resets the inherited TWAP
+        // accumulator and per-epoch cap so they re-derive against the new
+        // Vault/pool pair rather than carrying stale state from the old Vault.
+        if (newVault != old) _resetGuardState();
     }
 
     // -----------------------------------------------------------------
