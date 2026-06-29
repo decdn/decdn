@@ -41,7 +41,7 @@ use crate::payment_settlement::PaymentChannelService;
 use crate::rate_limit::RateLimitConfig;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256};
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
@@ -114,6 +114,18 @@ const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// does this implicitly by calling `accept_bi()` exactly once per
 /// connection and then closing.
 const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
+
+/// Apply an explicit filter poll interval to a freshly built provider,
+/// overriding alloy's localhost-detected 250 ms default that floods a local
+/// anvil with `eth_getFilterChanges` (#1011). `set_poll_interval` uses interior
+/// mutability, so this applies to the already-constructed provider and returns
+/// it unchanged in type — wallet/nonce-filler providers route through it too,
+/// because `client()` is a default `Provider` trait method available on every
+/// provider. The interval comes from `blockchain.event_poll_interval_ms`.
+fn with_poll_interval<P: Provider>(provider: P, interval: Duration) -> P {
+    provider.client().set_poll_interval(interval);
+    provider
+}
 
 /// Runtime [`QuicTransportConfig`]. Tests build their own config via
 /// the same builder when they need to shorten the idle timeout to keep
@@ -673,7 +685,13 @@ pub async fn run(
     // Reserved for the settlement indexer's read-only provider (#326); cloned
     // here before `rpc_url` is moved into the wallet providers below.
     let reputation_rpc_url = rpc_url.clone();
-    let chain_provider = ProviderBuilder::new().connect_http(rpc_url.clone());
+    // Explicit filter poll interval for every chain-event provider (#1011),
+    // overriding alloy's 250 ms localhost default that floods a dev anvil.
+    let event_poll_interval = Duration::from_millis(cfg.blockchain.event_poll_interval_ms);
+    let chain_provider = with_poll_interval(
+        ProviderBuilder::new().connect_http(rpc_url.clone()),
+        event_poll_interval,
+    );
     let staker_set: Arc<dyn StakerSet> = Arc::new(
         ChainStakerSet::bootstrap(
             chain_provider,
@@ -696,7 +714,10 @@ pub async fn run(
     let node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>> =
         if cfg.cache.node_to_node_pull_through_enabled {
             match crate::dht::node_address::ChainNodeAddressDirectory::bootstrap(
-                ProviderBuilder::new().connect_http(rpc_url.clone()),
+                with_poll_interval(
+                    ProviderBuilder::new().connect_http(rpc_url.clone()),
+                    event_poll_interval,
+                ),
                 capacity_bond_addr,
                 Arc::clone(&node_metrics),
             )
@@ -829,7 +850,10 @@ pub async fn run(
             })?;
             Arc::new(
                 crate::dht::ChainOriginDirectory::bootstrap(
-                    ProviderBuilder::new().connect_http(rpc_url.clone()),
+                    with_poll_interval(
+                        ProviderBuilder::new().connect_http(rpc_url.clone()),
+                        event_poll_interval,
+                    ),
                     origin_assignment_addr,
                     publisher_registry_addr,
                     capacity_bond_addr,
@@ -955,10 +979,13 @@ pub async fn run(
     // until restart. `SimpleNonceManager` stores nothing — each send re-reads
     // the pending nonce — so a failed send can't gap the lane. The buyer
     // provider below relies on this same property for the retried `reclaimExpired`.
-    let wallet_provider = ProviderBuilder::new()
-        .with_simple_nonce_management()
-        .wallet(EthereumWallet::from((*eth_signer).clone()))
-        .connect_http(rpc_url.clone());
+    let wallet_provider = with_poll_interval(
+        ProviderBuilder::new()
+            .with_simple_nonce_management()
+            .wallet(EthereumWallet::from((*eth_signer).clone()))
+            .connect_http(rpc_url.clone()),
+        event_poll_interval,
+    );
     let payment_service = PaymentChannelService::bootstrap(
         wallet_provider,
         payment_channel_addr,
@@ -1083,13 +1110,24 @@ pub async fn run(
     // on `SimpleNonceManager` re-reading the pending nonce each send (a transient
     // racing collision just gets a fresh nonce on the next attempt), not on the
     // sends being strictly serialized.
-    let buyer_wallet_provider = ProviderBuilder::new()
-        .with_simple_nonce_management()
-        .wallet(EthereumWallet::from((*eth_signer).clone()))
-        .connect_http(rpc_url);
+    let buyer_wallet_provider = with_poll_interval(
+        ProviderBuilder::new()
+            .with_simple_nonce_management()
+            .wallet(EthereumWallet::from((*eth_signer).clone()))
+            .connect_http(rpc_url),
+        event_poll_interval,
+    );
     let buyer_channel_store: Arc<dyn decdn_incentive::BuyerChannelStore> = Arc::new(
         crate::channel_store::BuyerChannelStoreHandle::new(Arc::clone(&concrete_channel_store)),
     );
+    // Buyer pending-settle set (#988): a SEPARATE redb table from the seller's
+    // `pending_settle_store` above, so the buyer settle sweep and the seller
+    // settle sweep never finalize each other's closes (keeps the #989 metric
+    // families cleanly attributed).
+    let buyer_pending_settle_store: Arc<dyn PendingSettleStore> =
+        Arc::new(crate::channel_store::BuyerPendingSettleStoreHandle::new(
+            Arc::clone(&concrete_channel_store),
+        ));
     let buyer_channel_service = match crate::buyer_channel::BuyerChannelService::bootstrap(
         buyer_wallet_provider,
         payment_channel_addr,
@@ -1108,6 +1146,7 @@ pub async fn run(
                 endpoint: ep.clone(),
                 resolver: Arc::clone(resolver),
             }),
+        buyer_pending_settle_store,
         Arc::clone(&node_metrics),
     )
     .await
@@ -1540,7 +1579,10 @@ pub async fn run(
     // reputation is best-effort, so the node still starts (weights stay 0).
     let _settlement_indexer = if cfg.gossip.subscribe_reputation {
         match crate::reputation_indexer::SettlementIndexer::bootstrap(
-            ProviderBuilder::new().connect_http(reputation_rpc_url),
+            with_poll_interval(
+                ProviderBuilder::new().connect_http(reputation_rpc_url),
+                event_poll_interval,
+            ),
             payment_channel_addr,
             capacity_bond_addr,
             Arc::clone(&settlement_source),
@@ -2767,6 +2809,26 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// `with_poll_interval` overrides alloy's localhost-detected 250 ms filter
+    /// poll default (#1011). Building against a `127.0.0.1` URL exercises the
+    /// exact path that triggers the flood — alloy would seed 250 ms — and the
+    /// helper must replace it. No network I/O: `poll_interval()` reads a local
+    /// atomic on the client.
+    #[test]
+    fn with_poll_interval_overrides_alloy_local_default() {
+        let url: alloy::transports::http::reqwest::Url =
+            "http://127.0.0.1:8545".parse().expect("static URL parses");
+        let bare = ProviderBuilder::new().connect_http(url.clone());
+        // Precondition: alloy seeds the 250 ms localhost default we are fixing.
+        assert_eq!(bare.client().poll_interval(), Duration::from_millis(250));
+
+        let provider = with_poll_interval(
+            ProviderBuilder::new().connect_http(url),
+            Duration::from_secs(7),
+        );
+        assert_eq!(provider.client().poll_interval(), Duration::from_secs(7));
+    }
+
     /// `admin_stop_order` defaults to `Early` (the original
     /// `appendix-local-admin-http` ordering) — the admin server stops
     /// before `router.shutdown` for SIGINT/SIGTERM and for any drain
@@ -2870,6 +2932,7 @@ mod tests {
                 payment_channel_address: "0x0000000000000000000000000000000000000001".into(),
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
+                event_poll_interval_ms: 7000,
                 redeem_threshold_micro_usdc: 1_000_000,
                 buyer_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,

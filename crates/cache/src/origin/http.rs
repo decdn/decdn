@@ -13,7 +13,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::Stream;
 use iroh_blobs::Hash;
 use reqwest::StatusCode;
-use reqwest::header::{CONTENT_ENCODING, RANGE};
+use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, RANGE};
 
 use super::fs::OBAO4_SUFFIX;
 use super::{
@@ -412,6 +412,73 @@ impl Origin for HttpOrigin {
                 return Ok(OriginRangeFetch::Unsupported);
             };
             Ok(OriginRangeFetch::Ranged { data, outboard })
+        })
+    }
+
+    fn size(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let hex = hash.to_hex();
+            let url = self
+                .base_url
+                .as_url()
+                .join(&hex)
+                .with_context(|| format!("failed to build URL for {hash}"))
+                .map_err(OriginPullError::Permanent)?;
+            let url_log = redact_for_log(&url);
+            // A `HEAD` is the cheapest way to learn the canonical length — no
+            // body crosses the wire. Redirects stay disabled (SSRF, #579); a
+            // 3xx is a non-success and degrades to `None`.
+            let send_fut = self.client.head(url.clone()).send();
+            let resp = match tokio::time::timeout(self.response_headers_timeout, send_fut).await {
+                Err(_elapsed) => {
+                    return Err(OriginPullError::Transient(anyhow::anyhow!(
+                        "origin HEAD {url_log} headers timed out"
+                    )));
+                }
+                Ok(Err(reqwest_err)) => {
+                    return Err(classify_reqwest_error(reqwest_err)
+                        .map_inner(|e| e.context(format!("origin HEAD {url_log} failed"))));
+                }
+                Ok(Ok(resp)) => resp,
+            };
+            // Any non-success — 404 (absent), 401/403 (permission), 5xx
+            // (outage), or a disabled-redirect 3xx (SSRF, #579) — degrades to
+            // unknown size rather than erroring, mirroring `get_bounded`'s
+            // best-effort outboard read on this same range-pull path. A
+            // *persistent* permission/outage fault re-surfaces with full
+            // severity on the whole-blob `fetch` fallback; abandoning the range
+            // optimization for one HEAD is the intended, cheap degrade.
+            if !resp.status().is_success() {
+                return Ok(None);
+            }
+            // A `Content-Encoding` response advertises the *encoded* length in
+            // `Content-Length`, not the canonical blob size the bao tree needs
+            // — the same trap `fetch` sidesteps for `size_hint`. Treat as
+            // unknown so a compressed origin degrades to a whole-blob pull
+            // rather than feeding a wrong size into bao alignment. (A compressed
+            // *ranged* fetch is separately caught downstream: the S3 adapter
+            // refuses it explicitly, and the HTTP adapter's exact-length gate +
+            // bao verification reject it — either way it degrades, never serves.)
+            if resp
+                .headers()
+                .get(CONTENT_ENCODING)
+                .is_some_and(|v| !v.is_empty())
+            {
+                return Ok(None);
+            }
+            // Read the `Content-Length` header directly rather than
+            // `resp.content_length()`: the latter reflects the (empty) HEAD
+            // response body, not the header, so it cannot surface the object's
+            // true length; the header carries it. A malformed/absent header →
+            // unknown size, degrade.
+            Ok(resp
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok()))
         })
     }
 }

@@ -80,9 +80,9 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, PendingSettleStore,
-    WatcherCheckpointStore, bind_node_id_domain, binding_signing_hash, slash_judge_domain,
-    voucher_domain,
+    BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, MemoryPendingSettleStore,
+    PendingSettleStore, WatcherCheckpointStore, bind_node_id_domain, binding_signing_hash,
+    slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerChannelService;
 use decdn_node::channel_store::{BuyerChannelStoreHandle, PersistentChannelStateStore};
@@ -841,6 +841,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         U256::from(DEPOSIT_MICRO_USDC),
         true, // fresh buyer identity → issue the one-time max USDC approval
         None, // idle-reconcile sweep not under test here
+        Arc::new(MemoryPendingSettleStore::new()), // buyer pending-settle set (#988); unused with reconcile off
         Arc::new(Metrics::new()),
     )
     .await?;
@@ -1553,6 +1554,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         U256::from(DEPOSIT_MICRO_USDC),
         false,
         None, // idle-reconcile sweep not under test here
+        Arc::new(MemoryPendingSettleStore::new()),
         Arc::new(Metrics::new()),
     )
     .await?;
@@ -1611,6 +1613,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         U256::from(DEPOSIT_MICRO_USDC),
         false,
         None, // idle-reconcile sweep not under test here
+        Arc::new(MemoryPendingSettleStore::new()),
         Arc::new(Metrics::new()),
     )
     .await?;

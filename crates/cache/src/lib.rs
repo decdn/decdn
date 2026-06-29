@@ -21,7 +21,10 @@ pub mod retry;
 pub use circuit_breaker::{
     Admission, BreakerState, Clock, ManualClock, OriginBreaker, OriginOutcome, SystemClock,
 };
-pub use engine::{CacheEngine, CacheStats, EvictionCandidates, EvictionPreview, TeeOpen, TeeSink};
+pub use engine::{
+    CacheEngine, CacheStats, EvictionCandidates, EvictionPreview, RangePullOutcome, TeeOpen,
+    TeeSink,
+};
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
 /// The blob-store hash. `decdn_cache::Hash` continues to mean
 /// `iroh_blobs::Hash` (the BLAKE3 digest the iroh-blobs store keys on)

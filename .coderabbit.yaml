@@ -1,0 +1,122 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# deCDN — CodeRabbit configuration
+# Rust (iroh/QUIC, BLAKE3, off-chain USDC payment channels) + Solidity (Arbitrum, OZ Governor)
+# Validate against the live schema: https://docs.coderabbit.ai/reference/configuration
+
+language: "en-US"
+early_access: false
+
+reviews:
+  # Start on "chill": bugs/security/logic only, stays quiet on style.
+  # clippy + rustfmt + slither/aderyn/solhint already cover style in CI,
+  # so let CodeRabbit focus on what humans actually miss.
+  # Move to "assertive" after a couple weeks if you want more coverage.
+  profile: "chill"
+
+  request_changes_workflow: false
+  high_level_summary: true
+  changed_files_summary: true
+  sequence_diagrams: true        # handy for QUIC/payment-channel flow changes
+  review_status: true
+  collapse_walkthrough: false
+  poem: false
+
+  auto_review:
+    enabled: true
+    drafts: false                # don't burn free-tier reviews on WIP
+    # Skip release/dependency-bump churn; let humans eyeball dep MRs.
+    ignore_title_keywords:
+      - "chore(deps)"
+      - "Renovate"
+      - "release"
+
+  path_filters:
+    - "!**/*.lock"               # Cargo.lock, package-lock, etc.
+    - "!**/target/**"            # Rust build output
+    - "!**/node_modules/**"
+    - "!**/contracts/lib/**"     # vendored Foundry deps (OZ, solady, forge-std)
+    - "!**/*.min.js"
+    - "!**/dist/**"
+    - "!**/*.snap"               # snapshot test fixtures
+    - "!**/testdata/**"
+
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: >
+        Rust review focus. Flag: unwrap()/expect()/panic! on network- or
+        peer-facing paths (untrusted input must not panic the node); missing
+        error propagation; blocking calls inside async fns; tasks spawned
+        without lifecycle/cancellation handling; lock held across .await.
+        For iroh/QUIC code, check connection and stream teardown, backpressure,
+        and that NAT/endpoint state is cleaned up. For Kademlia/DHT code,
+        watch for unbounded growth and eclipse/sybil-friendly assumptions.
+        Verify BLAKE3 content addressing is verified before content is trusted
+        or served. Do not nitpick style covered by clippy/rustfmt.
+
+    - path: "**/crates/incentive/src/{bind_sig,probe_sig,stream_sig,sig_canon,eth_identity}.rs"
+      instructions: >
+        Cryptography-critical path — signature verification for probes,
+        payment vouchers, and stream binding. Confirm signatures are verified
+        before the signed payload is trusted, that the canonical signing form
+        (sig_canon) is applied identically on sign and verify, and that domain
+        separation prevents a signature from one context being replayed in
+        another. Prefer constant-time comparison for any secret-derived bytes.
+        Flag any private key, seed, or signing nonce that could be logged,
+        included in Debug/Display output, serialized, or sent over the wire.
+        Question any hand-rolled crypto or downgraded primitives.
+
+    - path: "**/crates/{incentive,client-pull}/**/*.rs"
+      instructions: >
+        Off-chain USDC payment-channel logic — funds at risk. Check signature
+        verification on channel updates, monotonic nonce/sequence handling to
+        prevent replay or stale-state submission, correct balance accounting
+        (no over-withdrawal, no integer over/underflow), and that the latest
+        signed state always wins. Flag any path where a malformed counterparty
+        message could corrupt local channel state.
+
+    - path: "**/*.sol"
+      instructions: >
+        Solidity review focus. Check reentrancy (CEI ordering / nonReentrant on
+        external calls moving value), access control on privileged functions,
+        unchecked external call return values, and unsafe delegatecall. For the
+        OZ Governor integration verify quorum/threshold/timelock wiring and that
+        proposal state transitions can't be griefed. For Permit2 paths scrutinize
+        the signature/allowance assumptions. Flag any use of tx.origin for auth
+        and any arithmetic that bypasses checked math. Confirm events are emitted
+        for state-changing ops. Style is handled by solhint — focus on
+        exploitable bugs.
+
+    - path: "**/{.github/workflows/**,*.yaml,*.yml}"
+      instructions: >
+        CI/infra review. Flag hardcoded secrets or tokens, secrets echoed into
+        logs, overly broad permissions, untrusted pipeline inputs used in shell,
+        and runner configs that expose the host. For any container manifests
+        check resource limits, image tag pinning, and exposed services.
+
+  # Pull intent from linked issues when available.
+  auto_title_placeholder: "@coderabbitai"
+
+  tools:
+    enabled: true
+    # Secret scanning — high value for a crypto/keys-heavy repo.
+    gitleaks:
+      enabled: true
+    # Rust lint signal surfaced inline (clippy must still gate in CI).
+    clippy:
+      enabled: true
+    # Solidity linting alongside your Slither/Aderyn/Solhint CI stage.
+    solhint:
+      enabled: true
+    yamllint:
+      enabled: true
+    # IaC scanning for k8s / infra manifests.
+    checkov:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  learnings:
+    scope: auto                  # let it learn your conventions from feedback
