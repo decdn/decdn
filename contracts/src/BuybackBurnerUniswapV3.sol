@@ -169,7 +169,12 @@ contract BuybackBurnerUniswapV3 is GuardedBuybackBurner {
             // price_raw = TOKEN_raw per USDC_raw = priceX96 / 2^96. TOKEN is 18
             // dec (TOKEN_raw == TOKEN_18); USDC_18 = USDC_raw * usdcTo18, so
             // spot = price_raw * 1e18 / usdcTo18 = priceX96 * 1e18 / (2^96 * usdcTo18).
-            return Math.mulDiv(priceX96, WAD, Q96 * usdcTo18);
+            uint256 spot = Math.mulDiv(priceX96, WAD, Q96 * usdcTo18);
+            // Guard the fail-closed invariant symmetrically with the inverted
+            // branch: a spot that floor-divides to 0 (an implausibly cheap TOKEN)
+            // would collapse the TWAP floor to 0 (fail-open) — revert instead.
+            if (spot == 0) revert PoolStateInvalid();
+            return spot;
         }
         if (t0 == address(token) && t1 == address(usdc)) {
             // price_raw = USDC_raw per TOKEN_raw = priceX96 / 2^96. Invert and

@@ -28,7 +28,7 @@ import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
 ///         calldata blobs governance schedules through the 48h Timelock:
 ///           1. `FeeRouter.setSharesAndDestinations([6000, 3000, 1000], …)`
 ///              (steady-state split, ADR 016 § Deployment Order).
-///           2. `BuybackBurnerBalancerV3.setKeeper(keeper)`.
+///           2. `GuardedBuybackBurner.setKeeper(keeper)`.
 ///         The script holds no privileged role and never touches FeeRouter, so
 ///         it cannot itself activate the bucket — the Timelock proposal does.
 ///

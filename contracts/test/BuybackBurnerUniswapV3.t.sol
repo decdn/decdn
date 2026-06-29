@@ -331,6 +331,55 @@ contract BuybackBurnerUniswapV3Test is Test {
     }
 
     // -----------------------------------------------------------------
+    // Per-epoch cap (Uniswap-specific `balanceOf(pool)` depth read)
+    // -----------------------------------------------------------------
+
+    function test_executeBuyback_revertsAboveEpochCap() public {
+        // Fresh burner against a low-depth pool so the per-epoch cap (10% of the
+        // pool's USDC `balanceOf`) binds within the band: depth 50_000e6 -> cap
+        // 5_000e6, exceeded by a band-valid 6_000e6 swap.
+        MockV3Pool lowPool = new MockV3Pool(SQRTP_ONE_DOLLAR, address(usdc), address(token), FEE);
+        BuybackBurnerUniswapV3 bb2 = _deploy(address(lowPool));
+        vm.startPrank(admin);
+        bb2.grantRole(bb2.KEEPER_ROLE(), keeper);
+        token.transfer(address(router), 1_000_000e18);
+        vm.stopPrank();
+        usdc.transfer(address(bb2), 1_000_000e6);
+        usdc.mint(address(lowPool), 50_000e6); // cap = 10% = 5_000e6
+
+        bb2.poke();
+        vm.warp(block.timestamp + TWAP_WINDOW);
+        bb2.poke();
+
+        uint256 amountIn = 6000e6; // in band [100e6, 10_000e6], over the 5_000e6 cap
+        uint256 floor = _expectedFloor(amountIn, 1e18);
+        router.setAmountOut(floor);
+
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.EpochCapExceeded.selector, amountIn, 5000e6));
+        bb2.executeBuyback(amountIn, floor);
+    }
+
+    function test_setPool_reSnapshotsDepthFromNewPool() public {
+        // After a rotation the per-epoch cap must re-snapshot depth from the NEW
+        // pool (the reset zeroes `epochStartUsdcDepth`), not carry the old one.
+        MockV3Pool p2 = new MockV3Pool(SQRTP_ONE_DOLLAR, address(usdc), address(token), FEE);
+        usdc.mint(address(p2), 500_000e6); // new-pool depth (setUp gave the old pool 1_000_000e6)
+        vm.prank(admin);
+        bb.setPool(address(p2)); // resets guard state
+
+        _matureTwap(); // re-mature against the new pool
+        uint256 amountIn = 1000e6;
+        uint256 floor = _expectedFloor(amountIn, 1e18);
+        router.setAmountOut(floor);
+        vm.prank(keeper);
+        bb.executeBuyback(amountIn, floor);
+
+        assertEq(bb.epochStartUsdcDepth(), 500_000e6, "depth re-snapshotted from new pool");
+        assertEq(bb.epochSwappedUsdc(), amountIn, "epoch accrual against new pool");
+    }
+
+    // -----------------------------------------------------------------
     // Wiring validation
     // -----------------------------------------------------------------
 
@@ -340,6 +389,16 @@ contract BuybackBurnerUniswapV3Test is Test {
         vm.prank(admin);
         vm.expectRevert(BuybackBurnerUniswapV3.PoolStateInvalid.selector);
         bb.setPool(address(bad));
+    }
+
+    function test_setPool_revertsWhenDirectSpotFloorsToZero() public {
+        // token0=USDC, token1=TOKEN with a degenerate sqrt price (priceX96 floors
+        // to 0): the direct-branch spot is 0 and must revert fail-closed, matching
+        // the inverted branch (regression guard for the zero-spot hardening).
+        MockV3Pool zeroSpot = new MockV3Pool(uint160(1), address(usdc), address(token), FEE);
+        vm.prank(admin);
+        vm.expectRevert(BuybackBurnerUniswapV3.PoolStateInvalid.selector);
+        bb.setPool(address(zeroSpot));
     }
 
     function test_setPool_acceptsZeroAsUnwire() public {
