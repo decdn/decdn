@@ -2868,7 +2868,7 @@ impl Drop for TeeSink {
 /// against the content hash. Mirrors [`BlobTooLargeMarker`]: wrapped in the
 /// import stream's `io::Error` so [`CacheEngine::import_and_verify_stream`]
 /// surfaces a corruption outcome ([`StreamCommitOutcome::HashMismatch`]) instead
-/// of collapsing it into a generic transport [`OriginError`] (#915, ADR 038).
+/// of collapsing it into a generic transport [`OriginPullError`] (#915, ADR 038).
 #[derive(Debug)]
 struct BaoVerifyMarker;
 
