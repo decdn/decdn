@@ -15,7 +15,7 @@ It is the blacklist-side analogue of the slash-appeal entry points on the `Slash
 
 This ADR does **not** re-litigate [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting).
 
-> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt`, lapse paths that currently burn the bond, and the standing-enforcement / synthetic-clawback machinery still deferred. The perjury denylist now ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field). #688 (sub-issues #1017, #1018) closes the remaining gap.
+> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt`, lapse paths that currently burn the bond, and the TokenHolder synthetic-standing clawback still deferred. Standing is now enforced at filing for all three paths (audit I-3); the perjury denylist also ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field). #688 (sub-issue #1018, the clawback) closes the remaining gap.
 
 ## Decision
 
@@ -38,9 +38,9 @@ enum AppealStatus {
 
 enum StandingPath {
     None,           // 0 — invalid sentinel
-    Publisher,      // 1 — PublisherRegistry.ownerOf(namespaceId) for the disputed hash's namespace
+    Publisher,      // 1 — publisherRegistry.ownerOf(namespaceId) == filer AND that namespace hasClaimed the hash
     Operator,       // 2 — operator with node.region matching entry.region
-    TokenHolder     // 3 — TOKEN balance ≥ APPEAL_FILER_TOKEN_THRESHOLD; subject to synthetic-standing clawback
+    TokenHolder     // 3 — TOKEN balance ≥ appealFilerTokenThreshold (governable); subject to synthetic-standing clawback
 }
 
 struct BlacklistAppeal {
@@ -104,6 +104,8 @@ uint256 public totalBondsEscrowed;
 
 **`TOKEN` reference** is the existing immutable `IERC20 public immutable TOKEN` already required by `ContentBlacklist` for the bond pull; no additional constructor argument.
 
+**`PublisherRegistry` reference** is an immutable `IPublisherRegistryStanding` constructor argument (audit I-3): the Publisher standing check needs `ownerOf` + `hasClaimed`, and a security-critical standing gate must not be left unset or re-pointed. The deployment builds `PublisherRegistry` (which needs only `admin`) before `ContentBlacklist`. The TokenHolder threshold is the governable `appealFilerTokenThreshold` (default 1,000 TOKEN; bounded `[1,000, 1,000,000] × 1e18`, tightening-only — floor equals the launch default).
+
 ### Function signatures and revert table
 
 The five entry points from `IContentBlacklist`, plus permissionless `cleanupExpiredBlacklistAppeal`, are pinned below with full revert conditions, state transitions, side effects, and emitted events.
@@ -113,7 +115,8 @@ function openBlacklistAppeal(
     bytes32 blake3Hash,
     string  calldata region,             // hot-path canonicalized to bytes2 internally; see ADR 011
     bytes32 evidenceBundleHash,
-    uint8   standingPath
+    uint8   standingPath,
+    uint256 namespaceId                  // Publisher path: the claiming namespace; ignored on other paths
 ) external returns (uint256 appealId);
 ```
 
@@ -123,7 +126,7 @@ function openBlacklistAppeal(
 | `EntryNotFound()` | No `BlacklistEntry` exists for `(blake3Hash, region)` |
 | `FilingWindowClosed()` | `block.timestamp ≥ entry.addedAt + BLACKLIST_APPEAL_FILING_WINDOW` |
 | `InvalidStandingPath()` | `standingPath` is not in `{Publisher, Operator, TokenHolder}` |
-| `StandingCheckFailed()` | The filer fails the declared `standingPath` check (e.g., not the namespace owner, region mismatch, balance below `APPEAL_FILER_TOKEN_THRESHOLD`) |
+| `StandingCheckFailed()` | The filer fails the declared `standingPath` check: **Publisher** — `publisherRegistry.ownerOf(namespaceId) != msg.sender` OR the namespace has not `hasClaimed` the hash; **Operator** — region mismatch; **TokenHolder** — `token.balanceOf(filer) < appealFilerTokenThreshold` (the governable threshold below). As-built, all three collapse to a single `UnauthorizedStanding(standingPath)` (Operator region mismatch additionally surfaces `OperatorRegionMismatch`). |
 | `FilerPerjuryDenylisted()` | `perjuryDenylistUntilAt[msg.sender] > block.timestamp` |
 | `FilerInRejectionCooldown()` | `filerRejections[msg.sender].cooldownUntilAt > block.timestamp` |
 | `EmptyEvidenceBundleHash()` | `evidenceBundleHash == bytes32(0)` |

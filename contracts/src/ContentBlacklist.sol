@@ -9,6 +9,7 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
+import { IPublisherRegistryStanding } from "./interfaces/IPublisherRegistryStanding.sol";
 import { RegionScopeLib } from "./RegionScopeLib.sol";
 
 /// @title ContentBlacklist
@@ -18,13 +19,14 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         token holders can post a TOKEN bond to challenge an entry; the
 ///         appeal flows through the same {open → fast-track → ratify/reverse}
 ///         lifecycle as `SlashAppeal` slashing appeals.
-/// @dev    Simplifications vs. ADR 031 carried for this revision:
-///           - Standing enforcement is partial: `StandingPath.Operator`
-///             filings require a current-region match (ADR 011 § Standing
-///             path 2, via ADR 030), but the `StandingPath.TokenHolder`
-///             synthetic-standing clawback (balance check at T and T+24h)
-///             is deferred — `Publisher`/`TokenHolder` are enum-range
-///             validated only at filing time.
+/// @dev    Standing is enforced at filing for all three paths (ADR 031 § 216,
+///         audit I-3): `StandingPath.Operator` requires a current-region match
+///         (ADR 011 § Standing path 2, via ADR 030); `StandingPath.Publisher`
+///         requires owning the declared namespace and that namespace having
+///         claimed the hash (via `PublisherRegistry`); `StandingPath.TokenHolder`
+///         requires a TOKEN balance ≥ `appealFilerTokenThreshold`. Simplification
+///         carried for this revision: the TokenHolder synthetic-standing clawback
+///         (balance re-check on an adverse outcome, ADR 031 § 216(c)) is deferred.
 ///         The interim-relief concurrent fast-track cap is two-tier: a
 ///         per-region ceiling (`REGION_CONCURRENT_RELIEF_CAP`) plus a
 ///         per-(filer, region) sub-cap (`FILER_CONCURRENT_RELIEF_CAP`) so no
@@ -88,6 +90,18 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // fixed constant with no governance setter.
     uint64 internal constant PERJURY_DENYLIST_DURATION = 365 days;
 
+    // ADR 031 § 216(c) — minimum TOKEN balance a `StandingPath.TokenHolder` filer
+    // must hold to open an appeal (audit I-3). A market-sensitive anti-Sybil gate,
+    // so unlike the fixed-constant caps it is governance-tunable via
+    // `setAppealFilerTokenThreshold` — but tightening-only: the floor equals the
+    // default, so governance can only raise it (up to the ceiling), never weaken
+    // the gate below the launch value. Deliberately LOW at launch so small
+    // holders retain standing; the bond + the ADR 031 § 216(c) synthetic-standing
+    // clawback are the primary Sybil deterrents.
+    uint256 internal constant APPEAL_FILER_TOKEN_THRESHOLD_DEFAULT = 1000e18;
+    uint256 internal constant APPEAL_FILER_TOKEN_THRESHOLD_FLOOR = 1000e18;
+    uint256 internal constant APPEAL_FILER_TOKEN_THRESHOLD_CEILING = 1_000_000e18;
+
     bytes32 internal constant GLOBAL_REGION = bytes32("GLOBAL");
 
     // -----------------------------------------------------------------
@@ -124,7 +138,19 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ERC20Burnable public immutable token;
 
+    /// @dev `PublisherRegistry`, for the ADR 031 Publisher standing check
+    ///      (`ownerOf` + `hasClaimed`). Immutable security-critical binding —
+    ///      cannot be left unset or re-pointed after deployment.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    IPublisherRegistryStanding public immutable publisherRegistry;
+
     uint256 public appealBond;
+
+    /// @notice Governance-tunable minimum TOKEN balance for `StandingPath.TokenHolder`
+    ///         filings (ADR 031 § 216(c)). Bounded to
+    ///         [APPEAL_FILER_TOKEN_THRESHOLD_FLOOR, APPEAL_FILER_TOKEN_THRESHOLD_CEILING];
+    ///         the floor equals the default, so the gate is tightening-only.
+    uint256 public appealFilerTokenThreshold;
 
     /// @notice Governance-tunable rolling window for the ADR 031 rejection
     ///         cooldown — serves as both the lookback over a filer's recent
@@ -245,6 +271,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     event AppealBondUpdated(uint256 oldValue, uint256 newValue);
     event RejectionCooldownWindowUpdated(uint64 oldValue, uint64 newValue);
+    event AppealFilerTokenThresholdUpdated(uint256 oldValue, uint256 newValue);
 
     // -----------------------------------------------------------------
     // Errors
@@ -280,16 +307,27 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // Constructor
     // -----------------------------------------------------------------
 
-    constructor(ICapacityBondEjector capacityBond_, ERC20Burnable token_, address admin, uint256 appealBond_) {
-        if (address(capacityBond_) == address(0) || address(token_) == address(0) || admin == address(0)) {
+    constructor(
+        ICapacityBondEjector capacityBond_,
+        ERC20Burnable token_,
+        IPublisherRegistryStanding publisherRegistry_,
+        address admin,
+        uint256 appealBond_
+    ) {
+        if (
+            address(capacityBond_) == address(0) || address(token_) == address(0)
+                || address(publisherRegistry_) == address(0) || admin == address(0)
+        ) {
             revert ZeroAddress();
         }
         _enforceAppealBondBounds(appealBond_);
         capacityBond = capacityBond_;
         capacityBondRegion = ICapacityBondRegionView(address(capacityBond_));
         token = token_;
+        publisherRegistry = publisherRegistry_;
         appealBond = appealBond_;
         rejectionCooldownWindow = REJECTION_COOLDOWN_WINDOW_DEFAULT;
+        appealFilerTokenThreshold = APPEAL_FILER_TOKEN_THRESHOLD_DEFAULT;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
     }
@@ -412,11 +450,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // slither attributes the `regionScopeData` tuple-destructuring unused-return
     // (path-2 standing check) to the enclosing function, so the directive sits here.
     // slither-disable-next-line unused-return
-    function openBlacklistAppeal(bytes32 hash, bytes32 region, bytes32 evidenceBundleHash, StandingPath standingPath)
-        external
-        nonReentrant
-        returns (uint256 appealId)
-    {
+    function openBlacklistAppeal(
+        bytes32 hash,
+        bytes32 region,
+        bytes32 evidenceBundleHash,
+        StandingPath standingPath,
+        uint256 namespaceId
+    ) external nonReentrant returns (uint256 appealId) {
         if (hash == bytes32(0)) revert ZeroHash();
         // SF-M1 fix: callers must pass GLOBAL_REGION explicitly. Silently
         // rewriting `bytes32(0)` to global would burn the bond + 90-day
@@ -458,25 +498,39 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(block-timestamp)
         if (cooldownUntilAt > block.timestamp) revert FilerInRejectionCooldown(cooldownUntilAt);
 
-        // Enum-range check first. Operator standing additionally gets the
-        // current-region match below (ADR 011 § Standing path 2); the
-        // TokenHolder synthetic-standing clawback (admissibility condition (c)
-        // per ADR 031 § 216 — `status == Open && standingPath == TokenHolder &&
-        // ...`) is still deferred per the contract header note. The field is
-        // persisted so the future on-chain clawback check can read it from
-        // the appeal record without re-deriving it from event history.
+        // Standing enforcement (ADR 031 § 216, audit I-3). Enum-range check
+        // first; then each of the three paths proves standing. All external
+        // reads below hit trusted immutable contracts and this function is
+        // `nonReentrant`, so the later appeal-state writes are not a reentrancy
+        // vector (aderyn reentrancy-state-change FP).
         if (uint8(standingPath) > uint8(StandingPath.TokenHolder)) revert UnauthorizedStanding(standingPath);
 
-        // ADR 011 § Standing path 2 (Operator): an operator only has standing on
-        // a regional entry whose region matches their current attested region.
-        // The ADR 030 ripening window is a SOFT norm here — in-window filings are
-        // "not auto-rejected … multisig discretion" — so we enforce only the hard
-        // current-region match, never a window revert. Global entries are appealable
-        // by an in-scope operator regardless of region.
-        if (standingPath == StandingPath.Operator && region != GLOBAL_REGION) {
-            // `regionScopeData` is a view on the trusted immutable `capacityBond`
-            // and this function is `nonReentrant`, so the later appeal-state writes
-            // are not a reentrancy vector (aderyn reentrancy-state-change FP).
+        if (standingPath == StandingPath.Publisher) {
+            // Publisher: must own the declared namespace AND that namespace must
+            // have claimed the disputed hash. `namespaceId` is a filing argument
+            // because a hash→namespace reverse lookup is ambiguous (many
+            // namespaces may claim one hash). `ownerOf` returns address(0) for
+            // unassigned ids, so a bogus `namespaceId` fails the owner check.
+            // Each read is cached on its own line so the aderyn directive is the
+            // immediate predecessor of the external call it suppresses.
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            address namespaceOwner = publisherRegistry.ownerOf(namespaceId);
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            bool claimedHash = publisherRegistry.hasClaimed(namespaceId, hash);
+            if (namespaceOwner != msg.sender || !claimedHash) revert UnauthorizedStanding(standingPath);
+        } else if (standingPath == StandingPath.TokenHolder) {
+            // TokenHolder: must hold at least the governable threshold balance.
+            // `namespaceId` is ignored on this path. The synthetic-standing
+            // clawback against this balance on an adverse outcome (ADR 031
+            // § 216(c)) is deferred to its own change.
+            if (token.balanceOf(msg.sender) < appealFilerTokenThreshold) revert UnauthorizedStanding(standingPath);
+        } else if (region != GLOBAL_REGION) {
+            // ADR 011 § Standing path 2 (Operator): an operator only has standing
+            // on a regional entry whose region matches their current attested
+            // region. The ADR 030 ripening window is a SOFT norm here — in-window
+            // filings are "not auto-rejected … multisig discretion" — so we
+            // enforce only the hard current-region match, never a window revert.
+            // Global entries are appealable by an in-scope operator regardless.
             // aderyn-ignore-next-line(reentrancy-state-change)
             (string memory filerRegion,,,,,) = capacityBondRegion.regionScopeData(msg.sender);
             bytes32 filerKey = RegionScopeLib.pack(filerRegion);
@@ -684,6 +738,18 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         emit RejectionCooldownWindowUpdated(old, newWindow);
     }
 
+    /// @notice Governance-tunable TOKEN-balance threshold for `StandingPath.TokenHolder`
+    ///         filings (ADR 031 § 216(c)). Bounded to
+    ///         [APPEAL_FILER_TOKEN_THRESHOLD_FLOOR, APPEAL_FILER_TOKEN_THRESHOLD_CEILING];
+    ///         the floor equals the launch default, so governance can only raise
+    ///         the gate (tightening-only), never weaken it below the launch value.
+    function setAppealFilerTokenThreshold(uint256 newThreshold) external onlyRole(GOVERNANCE_ROLE) {
+        _enforceAppealFilerTokenThresholdBounds(newThreshold);
+        uint256 old = appealFilerTokenThreshold;
+        appealFilerTokenThreshold = newThreshold;
+        emit AppealFilerTokenThresholdUpdated(old, newThreshold);
+    }
+
     /// @notice Convenience for the post-deployment role grant
     ///         "registerRegionalBody" (ADR 016 § Post-Deployment, step 8).
     function registerRegionalBody(address body) external onlyRole(GOVERNANCE_ROLE) {
@@ -732,6 +798,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     function _enforceRejectionCooldownWindowBounds(uint64 value) internal pure {
         if (value < REJECTION_COOLDOWN_WINDOW_FLOOR || value > REJECTION_COOLDOWN_WINDOW_CEILING) {
             revert ParamOutOfBounds(value, REJECTION_COOLDOWN_WINDOW_FLOOR, REJECTION_COOLDOWN_WINDOW_CEILING);
+        }
+    }
+
+    function _enforceAppealFilerTokenThresholdBounds(uint256 value) internal pure {
+        if (value < APPEAL_FILER_TOKEN_THRESHOLD_FLOOR || value > APPEAL_FILER_TOKEN_THRESHOLD_CEILING) {
+            revert ParamOutOfBounds(value, APPEAL_FILER_TOKEN_THRESHOLD_FLOOR, APPEAL_FILER_TOKEN_THRESHOLD_CEILING);
         }
     }
 
