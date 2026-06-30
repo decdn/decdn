@@ -25,13 +25,14 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///             synthetic-standing clawback (balance check at T and T+24h)
 ///             is deferred — `Publisher`/`TokenHolder` are enum-range
 ///             validated only at filing time.
-///           - Per-region concurrent-appeal cap (`BODY_CONCURRENT_APPEAL_CAP`)
-///             is enforced as a single hard ceiling per region, not by
-///             requesting body identity.
-///           - Perjury denylist (365-day suspension on a false sworn
-///             declaration) is deferred. The ADR 031 rejection cooldown
-///             (three rejections inside a rolling, governance-tunable window
-///             → a full-window lockout) is implemented via `filerRejections`.
+///         The interim-relief concurrent fast-track cap is two-tier: a
+///         per-region ceiling (`REGION_CONCURRENT_RELIEF_CAP`) plus a
+///         per-(filer, region) sub-cap (`FILER_CONCURRENT_RELIEF_CAP`) so no
+///         single filer can monopolize a region's relief slots. The rejection
+///         cooldown (`filerRejections`, three rejections inside a rolling,
+///         governance-tunable window → a full-window lockout) and the perjury
+///         denylist (`perjuryDenylistUntilAt`, a 365-day lockout set via
+///         `rejectAppealAsPerjury`) are both implemented.
 contract ContentBlacklist is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -51,7 +52,16 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     uint256 internal constant APPEAL_REVIEW_WINDOW = 14 days;
     uint256 internal constant APPEAL_RATIFICATION_WINDOW = 14 days;
     uint256 internal constant APPEAL_FREQUENCY_WINDOW = 90 days;
-    uint256 internal constant BODY_CONCURRENT_APPEAL_CAP = 3;
+    // Interim-relief concurrent fast-track cap, two-tier (ADR 031):
+    //   - `REGION_CONCURRENT_RELIEF_CAP` is the global per-region ceiling on
+    //     simultaneously-suspended entries (formerly `BODY_CONCURRENT_APPEAL_CAP`
+    //     — renamed because enforcement is per region, not per requesting body).
+    //   - `FILER_CONCURRENT_RELIEF_CAP` is a per-(filer, region) sub-cap so a
+    //     single adversarial filer cannot monopolize a region's relief slots.
+    //     Strictly below the region ceiling, so at least one slot is always
+    //     reachable by other filers. Both are fixed constants (no setter).
+    uint256 internal constant REGION_CONCURRENT_RELIEF_CAP = 3;
+    uint256 internal constant FILER_CONCURRENT_RELIEF_CAP = 2;
     // Deviation from ADR 011 § Bond and frequency caps (spec is
     // [100e18, 10_000e18]). Bounds halved to [50e18, 5000e18] for the
     // testnet phase so appeal-bond economics scale with the smaller TGE
@@ -167,6 +177,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     mapping(address filer => uint64 lastSuccessAt) public lastRatifiedSuccessAt;
     mapping(bytes32 region => uint256 active) public regionActiveReliefCount;
 
+    /// @notice Per-(region, filer) count of active interim-relief slots — the
+    ///         per-filer tier of the two-tier concurrent fast-track cap
+    ///         (`FILER_CONCURRENT_RELIEF_CAP`). Incremented alongside
+    ///         `regionActiveReliefCount` in `fastTrackBlacklistAppeal` and
+    ///         decremented at every exit from `FastTracked`. Public auto-getter
+    ///         `filerRegionActiveRelief(region, filer)`.
+    mapping(bytes32 region => mapping(address filer => uint256 active)) public filerRegionActiveRelief;
+
     /// @notice `true` when there is an Open or FastTracked appeal for the
     ///         given `(region, hash)`. Prevents concurrent appeals on the
     ///         same entry — without this guard, multiple fast-tracked
@@ -245,7 +263,10 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error AppealNotFastTracked(uint256 appealId);
     error ReviewWindowOpen(uint64 readyAt);
     error RatificationWindowOpen(uint64 readyAt);
+    /// @notice The per-region interim-relief ceiling (`REGION_CONCURRENT_RELIEF_CAP`) is full.
     error RegionalCapHit(bytes32 region, uint256 cap);
+    /// @notice The filer's per-(filer, region) interim-relief sub-cap (`FILER_CONCURRENT_RELIEF_CAP`) is full.
+    error FilerReliefCapHit(address filer, uint256 cap);
     error AppealAlreadyActive(bytes32 region, bytes32 hash);
     error HashHasActiveAppeal(bytes32 region, bytes32 hash);
     error FrequencyCapHit(uint64 nextAvailableAt);
@@ -486,17 +507,25 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     function fastTrackBlacklistAppeal(uint256 appealId) external nonReentrant onlyRole(EMERGENCY_MULTISIG_ROLE) {
         BlacklistAppeal storage a = _appeals[appealId];
         if (a.status != AppealStatus.Open) revert AppealNotOpen(appealId);
-        // The per-region concurrent cap counts only fast-tracked appeals — the
-        // ones actually holding interim relief (a suspended entry) — so it
-        // bounds simultaneous suspensions per region without letting un-acted
-        // Open filings consume the budget (M-1).
-        if (regionActiveReliefCount[a.region] >= BODY_CONCURRENT_APPEAL_CAP) {
-            revert RegionalCapHit(a.region, BODY_CONCURRENT_APPEAL_CAP);
+        // Cache the repeatedly-read fields to avoid redundant warm SLOADs.
+        bytes32 region = a.region;
+        address filer = a.filer;
+        // Both caps count only fast-tracked appeals — the ones actually holding
+        // interim relief (a suspended entry) — so they bound simultaneous
+        // suspensions without letting un-acted Open filings consume the budget
+        // (M-1). The per-region ceiling is the global backstop; the per-(filer,
+        // region) sub-cap stops one filer monopolizing a region's slots.
+        if (regionActiveReliefCount[region] >= REGION_CONCURRENT_RELIEF_CAP) {
+            revert RegionalCapHit(region, REGION_CONCURRENT_RELIEF_CAP);
+        }
+        if (filerRegionActiveRelief[region][filer] >= FILER_CONCURRENT_RELIEF_CAP) {
+            revert FilerReliefCapHit(filer, FILER_CONCURRENT_RELIEF_CAP);
         }
         a.fastTrackedAt = uint64(block.timestamp);
         a.status = AppealStatus.FastTracked;
-        regionActiveReliefCount[a.region] += 1;
-        _hashEntries[a.region][a.hash].suspended = true;
+        regionActiveReliefCount[region] += 1;
+        filerRegionActiveRelief[region][filer] += 1;
+        _hashEntries[region][a.hash].suspended = true;
         emit BlacklistAppealFastTracked(appealId);
     }
 
@@ -505,8 +534,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (a.status != AppealStatus.Open && a.status != AppealStatus.FastTracked) revert AppealNotOpen(appealId);
         if (a.status == AppealStatus.FastTracked) {
             _hashEntries[a.region][a.hash].suspended = false;
-            // Only fast-tracked appeals charge the relief cap (M-1).
+            // Only fast-tracked appeals charge the relief caps (M-1); release both tiers.
             if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+            if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
         }
         uint256 bondBurned = a.bond;
         a.bond = 0;
@@ -535,8 +565,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
         if (a.status == AppealStatus.FastTracked) {
             _hashEntries[a.region][a.hash].suspended = false;
-            // Only fast-tracked appeals charge the relief cap (M-1).
+            // Only fast-tracked appeals charge the relief caps (M-1); release both tiers.
             if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+            if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
         }
         uint256 bondBurned = a.bond;
         a.bond = 0;
@@ -560,6 +591,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         a.bond = 0;
         a.status = AppealStatus.Ratified;
         if (regionActiveReliefCount[region] != 0) regionActiveReliefCount[region] -= 1;
+        if (filerRegionActiveRelief[region][filer] != 0) filerRegionActiveRelief[region][filer] -= 1;
         hasActiveAppeal[region][hash] = false;
         lastRatifiedSuccessAt[filer] = uint64(block.timestamp);
 
@@ -577,6 +609,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         a.status = AppealStatus.Reversed;
         _hashEntries[a.region][a.hash].suspended = false;
         if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+        if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
         hasActiveAppeal[a.region][a.hash] = false;
         if (bondBurned != 0) token.burn(bondBurned);
         emit BlacklistAppealReversed(appealId, bondBurned);
@@ -606,6 +639,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             a.status = AppealStatus.Lapsed;
             _hashEntries[a.region][a.hash].suspended = false;
             if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+            if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
             hasActiveAppeal[a.region][a.hash] = false;
             if (bondBurned != 0) token.burn(bondBurned);
             emit BlacklistAppealLapsed(appealId, 2);
