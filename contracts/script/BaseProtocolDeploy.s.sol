@@ -492,6 +492,13 @@ abstract contract BaseProtocolDeploy is Script {
         if (boundBlacklist != address(d.blacklist)) {
             revert BindingNotWired(address(d.originAssignment), address(d.blacklist), boundBlacklist);
         }
+        // The Publisher standing check is security-critical and the binding is a
+        // constructor immutable — verify a constructor-arg mix-up didn't point it
+        // at the wrong registry.
+        address boundRegistry = address(d.blacklist.publisherRegistry());
+        if (boundRegistry != address(d.registry)) {
+            revert BindingNotWired(address(d.blacklist), address(d.registry), boundRegistry);
+        }
         address boundPool = d.slashAppeal.challengerIncentivePool();
         if (boundPool != cfg.challengerIncentivePool) {
             revert BindingNotWired(address(d.slashAppeal), cfg.challengerIncentivePool, boundPool);

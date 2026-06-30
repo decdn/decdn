@@ -302,6 +302,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error UnauthorizedStanding(StandingPath path);
     error OperatorRegionMismatch(bytes32 appealRegion, bytes32 filerRegion);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
+    /// @notice `appealFilerTokenThreshold` is monotonic non-decreasing — a setter
+    ///         call may not lower it below the current value (tightening-only).
+    error AppealFilerTokenThresholdNotIncreasing(uint256 current, uint256 attempted);
 
     // -----------------------------------------------------------------
     // Constructor
@@ -743,12 +746,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     /// @notice Governance-tunable TOKEN-balance threshold for `StandingPath.TokenHolder`
     ///         filings (ADR 031 § 216(c)). Bounded to
-    ///         [APPEAL_FILER_TOKEN_THRESHOLD_FLOOR, APPEAL_FILER_TOKEN_THRESHOLD_CEILING];
-    ///         the floor equals the launch default, so governance can only raise
-    ///         the gate (tightening-only), never weaken it below the launch value.
+    ///         [APPEAL_FILER_TOKEN_THRESHOLD_FLOOR, APPEAL_FILER_TOKEN_THRESHOLD_CEILING]
+    ///         and **monotonic non-decreasing**: a call may only raise the gate (or
+    ///         hold it), never lower it — so once tightened it stays tightened. The
+    ///         floor equals the launch default.
     function setAppealFilerTokenThreshold(uint256 newThreshold) external onlyRole(GOVERNANCE_ROLE) {
         _enforceAppealFilerTokenThresholdBounds(newThreshold);
         uint256 old = appealFilerTokenThreshold;
+        if (newThreshold < old) revert AppealFilerTokenThresholdNotIncreasing(old, newThreshold);
         appealFilerTokenThreshold = newThreshold;
         emit AppealFilerTokenThresholdUpdated(old, newThreshold);
     }

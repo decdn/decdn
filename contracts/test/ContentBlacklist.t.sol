@@ -1083,9 +1083,8 @@ contract ContentBlacklistTest is Test {
     function test_tokenHolderStanding_belowThreshold_reverts() public {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
-        // `filer` is funded with APPEAL_BOND*10 = 1000e18 in setUp, exactly the
-        // threshold; drop one wei below to fail the balance gate while keeping
-        // enough to attempt the bond pull.
+        // Fund a fresh holder with one wei below the threshold so the balance
+        // gate fails (it still has enough to attempt the bond pull afterwards).
         uint256 threshold = blacklist.appealFilerTokenThreshold();
         address poorHolder = address(0x9007);
         vm.prank(admin);
@@ -1108,6 +1107,21 @@ contract ContentBlacklistTest is Test {
     function test_setAppealFilerTokenThreshold_updatesValue() public {
         vm.prank(admin);
         blacklist.setAppealFilerTokenThreshold(5000e18);
+        assertEq(blacklist.appealFilerTokenThreshold(), 5000e18);
+    }
+
+    /// @notice Monotonic non-decrease: once raised, the threshold cannot be
+    ///         lowered again (tightening-only), even to a value within bounds.
+    function test_setAppealFilerTokenThreshold_cannotDecreaseAfterIncrease() public {
+        vm.prank(admin);
+        blacklist.setAppealFilerTokenThreshold(5000e18);
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ContentBlacklist.AppealFilerTokenThresholdNotIncreasing.selector, uint256(5000e18), uint256(1000e18)
+            )
+        );
+        blacklist.setAppealFilerTokenThreshold(1000e18);
         assertEq(blacklist.appealFilerTokenThreshold(), 5000e18);
     }
 
