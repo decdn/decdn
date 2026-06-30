@@ -24,7 +24,7 @@ use decdn_common::admin::AdminRpcClient;
 use decdn_common::identity;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
-use crate::chain::{CHAIN_ID, ChainFixture};
+use crate::chain::ChainFixture;
 
 /// Fixed keystore password for the daemon's eth signer (test-only).
 const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
@@ -233,9 +233,13 @@ struct RenderConfig<'a> {
 /// 500ms so chain watchers react quickly against the local anvil.
 fn render_config(c: &RenderConfig<'_>) -> String {
     let a = &c.chain.addrs;
+    // Path fields use single-quoted TOML *literal* strings so backslashes in a
+    // Windows path (or any stray escape) round-trip verbatim. The other string
+    // values are controlled (alpha-2 region, `http://127.0.0.1:port` RPC, hex
+    // addresses) and stay double-quoted.
     format!(
         r#"[identity]
-data_dir = "{data_dir}"
+data_dir = '{data_dir}'
 region = "{region}"
 
 [network]
@@ -243,7 +247,7 @@ bind_port = {bind_port}
 
 [blockchain]
 rpc_url = "{rpc_url}"
-eth_keystore = "{keystore}"
+eth_keystore = '{keystore}'
 chain_id = {chain_id}
 payment_channel_address = "{payment_channel}"
 capacity_bond_address = "{capacity_bond}"
@@ -254,12 +258,12 @@ event_poll_interval_ms = 500
 redeem_threshold_micro_usdc = 10
 
 [cache]
-cache_dir = "{cache_dir}"
+cache_dir = '{cache_dir}'
 cache_size_mb = 4096
 
 [cache.origin]
 kind = "fs"
-path = "{origin_dir}"
+path = '{origin_dir}'
 
 [payment]
 rate_per_mb = 10
@@ -276,7 +280,7 @@ metrics_bind = "127.0.0.1"
         bind_port = c.bind_port,
         rpc_url = c.rpc_url,
         keystore = c.keystore.display(),
-        chain_id = CHAIN_ID,
+        chain_id = c.chain.chain_id,
         payment_channel = a.payment_channel,
         capacity_bond = a.capacity_bond,
         slash_judge = a.slash_judge,

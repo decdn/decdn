@@ -22,7 +22,7 @@ use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 
 use crate::assert::{channel_id, client_channel_nonce};
 use crate::bindings::{Erc20, PaymentChannelOpen};
-use crate::chain::{CHAIN_ID, ChainFixture};
+use crate::chain::ChainFixture;
 use crate::node::NodeFixture;
 
 /// Default channel deposit: 10 USDC (≥ the contract `minDeposit`).
@@ -115,12 +115,12 @@ impl ClientFixture {
             token: chain.usdc,
             deposit,
             client_signer: Arc::clone(&self.signer),
-            voucher_domain: voucher_domain(CHAIN_ID, chain.addrs.payment_channel),
+            voucher_domain: voucher_domain(chain.chain_id, chain.addrs.payment_channel),
             prior_nonce: U256::ZERO,
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
         };
-        let slash_domain = slash_judge_domain(CHAIN_ID, chain.addrs.slash_judge);
+        let slash_domain = slash_judge_domain(chain.chain_id, chain.addrs.slash_judge);
         let target = EndpointAddr::new(node.node_id).with_ip_addr(SocketAddr::V4(
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port),
         ));

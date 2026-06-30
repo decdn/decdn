@@ -24,9 +24,13 @@ use decdn_incentive::{bind_node_id_domain, binding_signing_hash, node_register};
 
 use crate::bindings::{CapacityBond, Erc20, PublisherRegistry};
 
-/// Test-only chain id in the `deployments/3133769*.json` gitignore range so the
-/// forge-script manifest never collides with a real chain's committed manifest.
-pub const CHAIN_ID: u64 = 31_337_690;
+/// Base for the per-fixture chain id. Each `ChainFixture` derives a *unique*
+/// chain id `CHAIN_BASE + (port % 10_000)` so concurrent fixtures (and the node
+/// crate's `anvil_settlement_e2e.rs`) never share — and thus never race on —
+/// the `deployments/<chain_id>.json` manifest. The whole `31_337_69x_xxx` range
+/// matches the `deployments/3133769*.json` gitignore glob (`contracts/.gitignore`),
+/// so a crashed run's leftover manifest stays untracked.
+const CHAIN_BASE: u64 = 31_337_690_000;
 
 /// Anvil dev account #0 — funded at genesis, broadcasts the deploy script.
 const DEPLOYER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -85,6 +89,9 @@ pub struct ChainFixture {
     pub rpc_url: String,
     /// Parsed RPC URL for building providers.
     pub url: reqwest::Url,
+    /// Per-fixture chain id (anvil `--chain-id`); also the EIP-712 / ed25519
+    /// domain chain id every signature in this fixture is bound to.
+    pub chain_id: u64,
     /// Deployed contract addresses.
     pub addrs: ContractAddrs,
     /// Mock USDC (mintable) the settlement token points at.
@@ -104,18 +111,21 @@ impl ChainFixture {
         forge_build(&contracts).await?;
 
         let port = free_port()?;
+        // Unique per fixture so the deploy manifest path never collides with a
+        // concurrent fixture's (distinct ephemeral `port` => distinct id).
+        let chain_id = CHAIN_BASE + u64::from(port % 10_000);
         let rpc_url = format!("http://127.0.0.1:{port}");
         let child = Command::new("anvil")
             .args([
                 "--port",
                 &port.to_string(),
                 "--chain-id",
-                &CHAIN_ID.to_string(),
+                &chain_id.to_string(),
                 "--silent",
             ])
             .spawn()
             .context("spawn anvil (is foundry installed?)")?;
-        let manifest = contracts.join(format!("deployments/{CHAIN_ID}.json"));
+        let manifest = contracts.join(format!("deployments/{chain_id}.json"));
         let anvil = AnvilGuard {
             child,
             manifest: manifest.clone(),
@@ -148,6 +158,7 @@ impl ChainFixture {
             _anvil: anvil,
             rpc_url,
             url,
+            chain_id,
             addrs,
             usdc,
             admin,
@@ -254,7 +265,7 @@ impl ChainFixture {
             .await
             .context("read registrationNonce")?;
 
-        let domain = bind_node_id_domain(CHAIN_ID, self.addrs.capacity_bond);
+        let domain = bind_node_id_domain(self.chain_id, self.addrs.capacity_bond);
         let bind_hash = binding_signing_hash(node_id, binding_nonce, &domain);
         let binding_sig = operator
             .sign_hash_sync(&bind_hash)
@@ -262,8 +273,12 @@ impl ChainFixture {
             .as_bytes()
             .to_vec();
 
-        let digest =
-            node_register::ownership_message_digest(node_id, op_addr, CHAIN_ID, registration_nonce);
+        let digest = node_register::ownership_message_digest(
+            node_id,
+            op_addr,
+            self.chain_id,
+            registration_nonce,
+        );
         let ed_sig = node_secret.sign(digest.as_slice()).to_bytes().to_vec();
         let packed_multiaddrs =
             node_register::pack_multiaddrs(&[multiaddr.to_string()]).context("pack multiaddrs")?;

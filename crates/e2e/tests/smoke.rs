@@ -29,6 +29,7 @@
 use std::time::Duration;
 
 use alloy::primitives::U256;
+use anyhow::Context;
 use decdn_common::admin::AdminRpcClient;
 use decdn_e2e::assert as e2e_assert;
 use decdn_e2e::chain::ChainFixture;
@@ -47,7 +48,7 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
 async fn smoke_compose_fixtures() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
-        .expect("e2e smoke exceeded the overall timeout")
+        .context("e2e smoke exceeded the overall timeout")?
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -67,7 +68,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- Layer 1 (daemon): admin RPC is healthy.
     let admin = node.admin_client()?;
-    admin.health().await.expect("admin health");
+    admin.health().await.context("admin health")?;
 
     // ---- Layer 2 (chain): the operator is active (bonded + registered).
     assert!(
@@ -85,14 +86,13 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- Cross-layer: the daemon now reports the open channel over admin RPC.
+    // The poll closure propagates the real admin error rather than swallowing it
+    // into a generic timeout.
     let channels = poll(Duration::from_secs(30), || async {
-        admin
-            .channels()
-            .await
-            .ok()
-            .filter(|c| !c.channels.is_empty())
+        let c = admin.channels().await.context("admin channels")?;
+        Ok(if c.channels.is_empty() { None } else { Some(c) })
     })
-    .await;
+    .await?;
     assert!(
         channels.is_some(),
         "daemon admin RPC never reported the open channel"
@@ -101,13 +101,13 @@ async fn run() -> anyhow::Result<()> {
     // ---- Cross-layer: delivery landed on-chain — the seller redeemed the
     // voucher, so FeeRouter served-bytes for the operator advanced past zero.
     let served = poll(Duration::from_secs(90), || async {
-        chain
+        let b = chain
             .served_bytes(node.operator_addr)
             .await
-            .ok()
-            .filter(|b| *b > U256::ZERO)
+            .context("read served bytes")?;
+        Ok(if b > U256::ZERO { Some(b) } else { None })
     })
-    .await;
+    .await?;
     assert!(
         served.is_some(),
         "on-chain served-bytes never advanced (seller redeem did not land)"
@@ -120,19 +120,21 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Poll `f` until it yields `Some`, or `timeout` elapses.
-async fn poll<T, F, Fut>(timeout: Duration, mut f: F) -> Option<T>
+/// Poll `f` until it yields `Some`, or `timeout` elapses. A closure error aborts
+/// the poll immediately with that error (so a real RPC/contract failure surfaces
+/// instead of a generic timeout).
+async fn poll<T, F, Fut>(timeout: Duration, mut f: F) -> anyhow::Result<Option<T>>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<T>>,
+    Fut: std::future::Future<Output = anyhow::Result<Option<T>>>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(v) = f().await {
-            return Some(v);
+        if let Some(v) = f().await? {
+            return Ok(Some(v));
         }
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            return Ok(None);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
