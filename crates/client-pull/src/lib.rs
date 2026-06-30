@@ -707,14 +707,19 @@ fn decode_verified_range(
     } else {
         usize::try_from(byte_len)?
     };
-    if lead == 0 && want == plaintext.len() {
-        return Ok(Bytes::from(plaintext));
-    }
+    // Take ownership of the decoded buffer as `Bytes` once, then trim with a
+    // zero-copy `slice` view (no second allocation/copy). Guard the upper bound
+    // explicitly: `Bytes::slice` panics out of range, and a short decode must
+    // surface as a clean error (`lead <= end` always, since `want >= 0`).
     let end = lead.saturating_add(want);
-    let slice = plaintext
-        .get(lead..end)
-        .ok_or_else(|| anyhow::anyhow!("decoded range shorter than requested span"))?;
-    Ok(Bytes::copy_from_slice(slice))
+    let bytes = Bytes::from(plaintext);
+    if end > bytes.len() {
+        anyhow::bail!("decoded range shorter than requested span");
+    }
+    if lead == 0 && end == bytes.len() {
+        return Ok(bytes);
+    }
+    Ok(bytes.slice(lead..end))
 }
 
 /// Header fields from the upstream `StreamResponse`, surfaced by
