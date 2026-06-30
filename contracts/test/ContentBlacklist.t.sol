@@ -707,8 +707,15 @@ contract ContentBlacklistTest is Test {
     ///         finalizes the appeal as Rejected.
     function test_rejectAppealAsPerjury_denylistsBurnsAndFinalizes() public {
         uint256 appealId = _open(bytes32(uint256(1)));
+        uint64 expectedUntil = uint64(block.timestamp) + 365 days;
 
         uint256 supplyBefore = token.totalSupply();
+        // Both the perjury-specific event and the standard rejection event fire,
+        // in that order.
+        vm.expectEmit(true, true, false, true, address(blacklist));
+        emit ContentBlacklist.BlacklistAppealRejectedAsPerjury(appealId, filer, expectedUntil);
+        vm.expectEmit(true, false, false, true, address(blacklist));
+        emit ContentBlacklist.BlacklistAppealRejected(appealId, APPEAL_BOND);
         vm.prank(multisig);
         blacklist.rejectAppealAsPerjury(appealId);
 
@@ -719,7 +726,7 @@ contract ContentBlacklistTest is Test {
         assertEq(uint8(a.status), uint8(ContentBlacklist.AppealStatus.Rejected));
         assertEq(a.bond, 0);
         // Denylist set 365 days out.
-        assertEq(blacklist.perjuryDenylistUntilAt(filer), uint64(block.timestamp) + 365 days);
+        assertEq(blacklist.perjuryDenylistUntilAt(filer), expectedUntil);
         // Active-appeal flag cleared so the entry can be re-acted upon.
         assertFalse(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(1))));
     }
@@ -741,11 +748,21 @@ contract ContentBlacklistTest is Test {
             bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
         );
 
-        // Lifts after the window. Re-add to refresh the 14-day filing window,
-        // since the entry above aged out across the 365-day warp.
-        vm.warp(uint256(until) + 1);
+        // One second before expiry: still locked out. Re-add to refresh the
+        // 14-day filing window (the entry above ages out across the warp).
+        vm.warp(uint256(until) - 1);
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, bytes32(uint256(2)));
+        vm.prank(filer);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerPerjuryDenylisted.selector, until));
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+
+        // Exactly at `until` the lockout lifts — pins the exclusive
+        // `perjuryUntil > block.timestamp` boundary (a `>=` impl would still
+        // revert here). The entry from `until - 1` is still inside its filing window.
+        vm.warp(until);
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
             bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator

@@ -420,21 +420,22 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             if (block.timestamp < nextAvailable) revert FrequencyCapHit(nextAvailable);
         }
 
-        // ADR 031 § APPEAL_FILER_REJECTION_COOLDOWN (audit H-4): an abusive
-        // filer whose appeals keep getting rejected is locked out for the
-        // rolling window, independent of the success-path frequency cap above.
-        // Cheap single SLOAD, so it precedes the standing / external-call checks.
-        uint64 cooldownUntilAt = filerRejections[msg.sender].cooldownUntilAt;
-        // forge-lint: disable-next-line(block-timestamp)
-        if (cooldownUntilAt > block.timestamp) revert FilerInRejectionCooldown(cooldownUntilAt);
-
         // ADR 031 § Evidence perjury denylist: a filer adjudicated to have filed
         // a bad-faith / false-sworn-declaration appeal (via `rejectAppealAsPerjury`)
-        // is locked out for `PERJURY_DENYLIST_DURATION`, independent of the
-        // volume-based rejection cooldown above.
+        // is locked out for `PERJURY_DENYLIST_DURATION`. Checked BEFORE the
+        // volume-based cooldown so a filer who is both perjury-denylisted and in
+        // a rejection cooldown sees the more specific, more severe perjury ban.
         uint64 perjuryUntil = perjuryDenylistUntilAt[msg.sender];
         // forge-lint: disable-next-line(block-timestamp)
         if (perjuryUntil > block.timestamp) revert FilerPerjuryDenylisted(perjuryUntil);
+
+        // ADR 031 § APPEAL_FILER_REJECTION_COOLDOWN (audit H-4): an abusive
+        // filer whose appeals keep getting rejected is locked out for the
+        // rolling window, independent of the success-path frequency cap above.
+        // Both gates are cheap single SLOADs preceding the standing / external-call checks.
+        uint64 cooldownUntilAt = filerRejections[msg.sender].cooldownUntilAt;
+        // forge-lint: disable-next-line(block-timestamp)
+        if (cooldownUntilAt > block.timestamp) revert FilerInRejectionCooldown(cooldownUntilAt);
 
         // Enum-range check first. Operator standing additionally gets the
         // current-region match below (ADR 011 § Standing path 2); the
