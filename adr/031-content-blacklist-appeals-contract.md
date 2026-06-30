@@ -15,7 +15,7 @@ It is the blacklist-side analogue of the slash-appeal entry points on the `Slash
 
 This ADR does **not** re-litigate [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting).
 
-> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt`, lapse paths that currently burn the bond, and the standing-enforcement / synthetic-clawback / per-filer-cap machinery still deferred. The perjury denylist now ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field). #688 (sub-issues #1015, #1017, #1018) closes the remaining gap.
+> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt`, lapse paths that currently burn the bond, and the standing-enforcement / synthetic-clawback machinery still deferred. The perjury denylist now ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field). #688 (sub-issues #1017, #1018) closes the remaining gap.
 
 ## Decision
 
@@ -86,9 +86,15 @@ mapping(address => RejectionWindow) public filerRejections;
 // Perjury denylist — 365d per-address suspension from the appeal path (ADR 011 § Evidence)
 mapping(address => uint64) public perjuryDenylistUntilAt;
 
-// BODY_CONCURRENT_APPEAL_CAP — at most 3 active interim-relief slots per region (ADR 011)
-// One body per region (ADR 011 § Regional Governance Bodies), so keying on region is sufficient.
+// Interim-relief concurrent fast-track cap — two-tier (ADR 011):
+//   REGION_CONCURRENT_RELIEF_CAP (3) — per-region ceiling on active slots.
+//   FILER_CONCURRENT_RELIEF_CAP  (2) — per-(filer, region) sub-cap, strictly
+//   below the region ceiling, so no single filer can monopolize a region's
+//   slots. (The earlier per-region-only key assumed one body per region; the
+//   per-filer sub-cap drops that assumption and bounds an adversarial filer
+//   directly. The region ceiling is retained as a second backstop.)
 mapping(bytes2 => uint8) public regionActiveReliefCount;
+mapping(bytes2 => mapping(address => uint8)) public filerRegionActiveRelief;
 
 // Bond escrow accounting — TOKEN held by the contract for active appeals.
 // Public view; not used in cap arithmetic. Auxiliary to per-appeal `bond` field above
@@ -139,9 +145,10 @@ function fastTrackBlacklistAppeal(uint256 appealId) external onlyEmergencyMultis
 | `AppealNotFound()` | `appeals[appealId].status == None` |
 | `AppealNotEligibleForFastTrack()` | `status != Open` (the sole pre-fast-track state; see § State machine) |
 | `ReviewWindowExpired()` | `block.timestamp ≥ appeals[appealId].reviewWindowEndsAt` |
-| `BodyConcurrentCapReached()` | `regionActiveReliefCount[appeal.region] ≥ BODY_CONCURRENT_APPEAL_CAP` |
+| `RegionalCapHit(region, cap)` | `regionActiveReliefCount[appeal.region] ≥ REGION_CONCURRENT_RELIEF_CAP` |
+| `FilerReliefCapHit(filer, cap)` | `filerRegionActiveRelief[appeal.region][appeal.filer] ≥ FILER_CONCURRENT_RELIEF_CAP` |
 
-**State transitions:** `status = FastTracked`; `fastTrackedAt = block.timestamp`; `reviewWindowEndsAt = block.timestamp + BLACKLIST_RATIFICATION_WINDOW`; `regionActiveReliefCount[appeal.region]++`; on the parent entry, `entry.suspended = true`, `entry.suspendedAt = block.timestamp`. The `ContentBlacklist` views `isBlacklisted` / `isBlacklistedInRegion` immediately return false for the parent entry per [ADR 011 § Interaction with active slashes](011-content-takedown.md#interaction-with-active-slashes).
+**State transitions:** `status = FastTracked`; `fastTrackedAt = block.timestamp`; `reviewWindowEndsAt = block.timestamp + BLACKLIST_RATIFICATION_WINDOW`; `regionActiveReliefCount[appeal.region]++` **and** `filerRegionActiveRelief[appeal.region][appeal.filer]++`; on the parent entry, `entry.suspended = true`, `entry.suspendedAt = block.timestamp`. The `ContentBlacklist` views `isBlacklisted` / `isBlacklistedInRegion` immediately return false for the parent entry per [ADR 011 § Interaction with active slashes](011-content-takedown.md#interaction-with-active-slashes).
 
 **Emits:** `BlacklistAppealFastTracked(appealId)`.
 
@@ -246,7 +253,7 @@ stateDiagram-v2
 - **`entry.suspended` writes** happen only from `fastTrackBlacklistAppeal` (true), `reverseBlacklistAppeal` (false, preserving `suspendedAt`), `rejectBlacklistAppeal` / `rejectAppealAsPerjury` on a `FastTracked` appeal (false, preserving `suspendedAt`), and `cleanupExpiredBlacklistAppeal` cases (b) and (d) (false, preserving `suspendedAt`). No other path mutates `suspended`.
 - **`entry.suspendedAt` is monotonic per entry.** Once written by a fast-track, it is preserved across `reverseBlacklistAppeal` and `cleanupExpiredBlacklistAppeal` so [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) can compute evidence age against the historical suspension boundary. A subsequent fresh `fastTrackBlacklistAppeal` on the same entry overwrites with the new boundary; this is acceptable because each fast-track defines its own suspension epoch.
 - **`_removeHashRegional` internal call** from `ratifyBlacklistAppealRemoval` reuses the same body as the public `removeHashRegional` (which is `onlyGovernor` per [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). The internal variant skips the role check (caller is already `onlyGovernor` on `ratifyBlacklistAppealRemoval`) and emits `HashRemoved` exactly once.
-- **`regionActiveReliefCount` decrement points** are: `rejectBlacklistAppeal` / `rejectAppealAsPerjury` on a `FastTracked` appeal, `ratifyBlacklistAppealRemoval`, `reverseBlacklistAppeal`, and `cleanupExpiredBlacklistAppeal` cases (b) and (d) — every transition out of `FastTracked`. Increment is exclusive to `fastTrackBlacklistAppeal`.
+- **`regionActiveReliefCount` and `filerRegionActiveRelief` decrement points** are identical (both counters move together): `rejectBlacklistAppeal` / `rejectAppealAsPerjury` on a `FastTracked` appeal, `ratifyBlacklistAppealRemoval`, `reverseBlacklistAppeal`, and `cleanupExpiredBlacklistAppeal` cases (b) and (d) — every transition out of `FastTracked`. Increment of both is exclusive to `fastTrackBlacklistAppeal`.
 
 ### Multisig capability scope
 

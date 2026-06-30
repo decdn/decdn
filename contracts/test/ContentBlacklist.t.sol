@@ -244,26 +244,52 @@ contract ContentBlacklistTest is Test {
     ///         appeals (the ones holding interim relief), not Open ones. Open
     ///         filings no longer crowd out others, but simultaneous suspensions
     ///         per region stay bounded.
+    /// @notice Fund a second filer and attest it to REGION_US so it has
+    ///         StandingPath.Operator standing on US entries.
+    function _fundedFiler(address who) internal returns (address) {
+        vm.prank(admin);
+        token.transfer(who, APPEAL_BOND * 10);
+        vm.prank(who);
+        token.approve(address(blacklist), type(uint256).max);
+        bondMock.setRegion(who, "US", "", 0);
+        return who;
+    }
+
     function test_regionalCap_countsFastTrackedNotOpen() public {
+        // The per-filer sub-cap (2) is below the region ceiling (3), so filling a
+        // region now requires two filers — one filer alone tops out at the sub-cap.
+        address filerB = _fundedFiler(address(0xF2));
+
         // Seed 4 hashes in REGION_US.
         for (uint256 i = 0; i < 4; i++) {
             vm.prank(regionalBody);
             blacklist.addHashRegional(REGION_US, bytes32(i + 1));
         }
-        // Open 4 appeals — ALL succeed: Open appeals do not charge the cap.
+        // Open 4 appeals — ALL succeed (Open appeals do not charge the cap):
+        // filer takes 1,2; filerB takes 3,4.
         uint256[4] memory ids;
-        for (uint256 i = 0; i < 4; i++) {
+        for (uint256 i = 0; i < 2; i++) {
             vm.prank(filer);
             ids[i] = blacklist.openBlacklistAppeal(
                 bytes32(i + 1), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
             );
         }
-        // Fast-track 3 — each charges the per-region relief cap.
-        for (uint256 i = 0; i < 3; i++) {
-            vm.prank(multisig);
-            blacklist.fastTrackBlacklistAppeal(ids[i]);
+        for (uint256 i = 2; i < 4; i++) {
+            vm.prank(filerB);
+            ids[i] = blacklist.openBlacklistAppeal(
+                bytes32(i + 1), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            );
         }
-        // The 4th fast-track hits the cap.
+        // Fast-track 3 (filer: 2 — its sub-cap; filerB: 1) — each charges the
+        // per-region relief cap, filling the region (3).
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(ids[0]);
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(ids[1]);
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(ids[2]);
+        // The 4th fast-track (filerB's 2nd) hits the REGION ceiling — filerB is
+        // still under the per-filer sub-cap, so it is the region cap that blocks.
         vm.prank(multisig);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.RegionalCapHit.selector, REGION_US, uint256(3)));
         blacklist.fastTrackBlacklistAppeal(ids[3]);
@@ -830,5 +856,104 @@ contract ContentBlacklistTest is Test {
         vm.prank(multisig);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.AppealNotOpen.selector, appealId));
         blacklist.rejectAppealAsPerjury(appealId);
+    }
+
+    // -----------------------------------------------------------------
+    // ADR 031 — per-(filer, region) interim-relief sub-cap
+    // -----------------------------------------------------------------
+
+    /// @notice Fast-track `filer` to its per-(filer, region) sub-cap (2) in
+    ///         REGION_US, returning the two fast-tracked appeal ids.
+    function _filerAtReliefCap() internal returns (uint256 id1, uint256 id2) {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA1)));
+        vm.prank(filer);
+        id1 = blacklist.openBlacklistAppeal(
+            bytes32(uint256(0xA1)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(id1);
+
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA2)));
+        vm.prank(filer);
+        id2 = blacklist.openBlacklistAppeal(
+            bytes32(uint256(0xA2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(id2);
+
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 2);
+    }
+
+    /// @notice A single filer is blocked at its per-filer sub-cap even when the
+    ///         region ceiling still has a free slot.
+    function test_filerReliefCap_blocksWhileRegionHasHeadroom() public {
+        _filerAtReliefCap();
+        // Region has headroom: 2 of 3 slots used.
+        assertEq(blacklist.regionActiveReliefCount(REGION_US), 2);
+
+        // A 3rd fast-track for the SAME filer reverts on the per-filer sub-cap,
+        // not the region ceiling.
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA3)));
+        vm.prank(filer);
+        uint256 id3 = blacklist.openBlacklistAppeal(
+            bytes32(uint256(0xA3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        vm.prank(multisig);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerReliefCapHit.selector, filer, uint256(2)));
+        blacklist.fastTrackBlacklistAppeal(id3);
+        // Region count unchanged — the slot was never charged.
+        assertEq(blacklist.regionActiveReliefCount(REGION_US), 2);
+    }
+
+    function test_filerReliefCap_decrementsOnReject() public {
+        (uint256 id1,) = _filerAtReliefCap();
+        vm.prank(multisig);
+        blacklist.rejectBlacklistAppeal(id1);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 1);
+    }
+
+    function test_filerReliefCap_decrementsOnPerjury() public {
+        (uint256 id1,) = _filerAtReliefCap();
+        vm.prank(multisig);
+        blacklist.rejectAppealAsPerjury(id1);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 1);
+    }
+
+    function test_filerReliefCap_decrementsOnRatify() public {
+        (uint256 id1,) = _filerAtReliefCap();
+        vm.prank(admin);
+        blacklist.ratifyBlacklistAppealRemoval(id1);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 1);
+    }
+
+    function test_filerReliefCap_decrementsOnReverse() public {
+        (uint256 id1,) = _filerAtReliefCap();
+        vm.prank(admin);
+        blacklist.reverseBlacklistAppeal(id1);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 1);
+    }
+
+    /// @notice The cleanup exit path also releases the per-filer slot, and the
+    ///         freed filer can fast-track again (full exit-path symmetry).
+    function test_filerReliefCap_decrementsOnCleanup() public {
+        (uint256 id1,) = _filerAtReliefCap();
+        // Lapse the fast-tracked appeal past its ratification window.
+        vm.warp(block.timestamp + 14 days + 1);
+        blacklist.cleanupExpiredBlacklistAppeal(id1);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 1);
+
+        // Freed slot lets the filer fast-track a fresh appeal again.
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA3)));
+        vm.prank(filer);
+        uint256 id3 = blacklist.openBlacklistAppeal(
+            bytes32(uint256(0xA3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(id3);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 2);
     }
 }
