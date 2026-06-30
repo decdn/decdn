@@ -15,6 +15,12 @@ decdn-incentive = { workspace = true }
 # #578), so depending on it here does not regress the CLI's iroh-blobs-free
 # invariant — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
 decdn-common = { workspace = true }
+# Iroh-blobs-free bao verified-range helpers (alignment / encoded-size) shared
+# with the serve side, plus the bao codec for the receive-side verifying decoder
+# (#915, ADR 038). Both are pure `bao-tree`, so the CLI stays iroh-blobs-free
+# (#578) — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
+decdn-bao-range = { workspace = true }
+bao-tree = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }

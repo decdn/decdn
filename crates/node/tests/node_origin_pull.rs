@@ -1333,16 +1333,21 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
 
     // #852: the buyer persisted the channel's voucher watermark after the pull.
-    // 1.5 MiB at RATE 10/MiB over a 1-MiB interval ⇒ two vouchers: the closing
-    // one carries nonce 2, the full 1,572,864 bytes, and the cumulative amount 15
-    // (10 for the first MiB + 5 for the trailing half).
+    // Under ADR 038 the pull meters WIRE bytes (the bao stream: content +
+    // interleaved proof), so the closing watermark carries nonce 2, the
+    // bao-encoded size, and the cumulative amount rounded up per the rate.
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(total_bytes, &bao_tree::ChunkRanges::all());
+    let expected_amount = U256::from(expected_wire)
+        .saturating_mul(U256::from(RATE))
+        .div_ceil(U256::from(MB_BYTES));
     anyhow::ensure!(
         progress_log(&recorded)?
             == vec![(
                 a_eth.address(),
                 U256::from(2),
-                U256::from(total_bytes),
-                U256::from(15)
+                U256::from(expected_wire),
+                expected_amount
             )],
         "expected one persisted progress entry with the final voucher totals, got {:?}",
         progress_log(&recorded)?
@@ -2821,21 +2826,29 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
     );
 
     // The persisted watermark advanced monotonically across the two pulls rather
-    // than resetting: nonce 2 → 4, cumulative bytes 1.5 MiB → 3 MiB, amount 15 → 30.
+    // than resetting: nonce 2 → 4, with cumulative bytes and amount doubling.
+    // Under ADR 038 the pull meters WIRE bytes (bao: content + interleaved proof),
+    // so each fetch contributes its bao-encoded size and per-fetch amount, and the
+    // reused channel carries them forward (#852).
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(total_bytes, &bao_tree::ChunkRanges::all());
+    let expected_amount = U256::from(expected_wire)
+        .saturating_mul(U256::from(RATE))
+        .div_ceil(U256::from(MB_BYTES));
     let log = progress_log(&recorded)?;
     anyhow::ensure!(
         log == vec![
             (
                 a_eth.address(),
                 U256::from(2),
-                U256::from(total_bytes),
-                U256::from(15)
+                U256::from(expected_wire),
+                expected_amount
             ),
             (
                 a_eth.address(),
                 U256::from(4),
-                U256::from(2 * total_bytes),
-                U256::from(30),
+                U256::from(expected_wire).saturating_mul(U256::from(2)),
+                expected_amount.saturating_mul(U256::from(2)),
             ),
         ],
         "expected two monotonically-advancing progress entries, got {log:?}"
@@ -3005,11 +3018,35 @@ async fn write_client(send: &mut iroh::endpoint::SendStream, msg: &ClientMessage
     Ok(())
 }
 
+/// Decode the header-less bao verified-stream `wire` (ADR 038) for the whole
+/// blob back to plaintext, verifying every chunk group against `hash`. Returns
+/// `None` if the stream does not verify (corrupt / short / wrong root) — the
+/// same rejection a real client's decoder performs.
+fn decode_bao_whole(hash: Hash, total: u64, wire: &[u8]) -> Option<Vec<u8>> {
+    use bao_tree::io::BaoContentItem;
+    use bao_tree::io::sync::DecodeResponseIter;
+    use bao_tree::{BaoTree, ChunkRanges};
+
+    let tree = BaoTree::new(total, decdn_cache::range_pull::IROH_BLOCK_SIZE);
+    let ranges = ChunkRanges::all();
+    let reader = std::io::Cursor::new(wire);
+    let mut plaintext = Vec::with_capacity(usize::try_from(total).ok()?);
+    for item in DecodeResponseIter::new(hash.into(), tree, reader, ranges.as_ref()) {
+        match item.ok()? {
+            BaoContentItem::Leaf(leaf) => plaintext.extend_from_slice(&leaf.data),
+            BaoContentItem::Parent(_) => {}
+        }
+    }
+    Some(plaintext)
+}
+
 /// A leaf client that drives B's window-paced serve: it sends a bound
 /// `StreamRequest` (so B's `pull_authorized` passes), then pays one cumulative
 /// voucher per interval as bytes arrive. With `drop_after_acks = Some(n)` it
 /// closes the connection immediately after the n-th `VoucherAck` — the #856
-/// abandon shape.
+/// abandon shape. The wire carries the bao verified-stream (content + proof,
+/// ADR 038), so it paces on the bao-encoded WIRE size and decodes the buffer
+/// back to plaintext to verify the content hash.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn leaf_paced_pull(
     leaf_ep: &iroh::Endpoint,
@@ -3060,6 +3097,12 @@ async fn leaf_paced_pull(
     };
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
     let total = resp.body.total_bytes;
+    // B forwards + meters WIRE bytes (bao: content + interleaved proof), so the
+    // closing-voucher / completeness boundary is the bao-encoded size, not the
+    // content `total_bytes`. The per-interval boundary is unchanged — both sides
+    // count the same forwarded wire bytes into `interval_bytes`.
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(total, &bao_tree::ChunkRanges::all());
     let interval_bytes = resp
         .voucher_interval_mb
         .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
@@ -3077,7 +3120,7 @@ async fn leaf_paced_pull(
                 cumulative = cumulative.saturating_add(len);
                 unvouchered = unvouchered.saturating_add(len);
                 let boundary = unvouchered >= interval_bytes && interval_bytes > 0;
-                let closing = cumulative >= total && unvouchered > 0;
+                let closing = cumulative >= expected_wire && unvouchered > 0;
                 if boundary || closing {
                     acks += 1;
                     let amount = U256::from(cumulative)
@@ -3119,11 +3162,16 @@ async fn leaf_paced_pull(
         }
     }
     conn.close(0u32.into(), b"done");
+    // Decode the accumulated bao wire back to plaintext to verify the content
+    // hash; `received` reports the decoded CONTENT length (what the callers'
+    // `received == total_bytes` assertions expect), falling back to the raw wire
+    // count if the stream did not verify.
+    let decoded = decode_bao_whole(hash, total, &buf);
     Ok(LeafOutcome {
-        received: cumulative,
+        received: decoded.as_ref().map_or(cumulative, |p| p.len() as u64),
         acks,
         completed: true,
-        hash_ok: Hash::new(&buf) == hash,
+        hash_ok: decoded.is_some_and(|p| Hash::new(&p) == hash),
     })
 }
 
@@ -3401,14 +3449,22 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         "B must promote the teed blob on a complete delivery"
     );
     // B's buyer channel to A advanced to the full blob (one persisted watermark
-    // covering all bytes: nonce 2, 1.5 MiB, cumulative amount 15).
+    // covering all bytes, nonce 2). Under ADR 038 the node-to-node payment meters
+    // WIRE bytes (the bao stream: content + interleaved proof), so the watermark
+    // covers the bao-encoded size with the amount rounded up per the rate — not
+    // the content size.
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(total_bytes, &bao_tree::ChunkRanges::all());
+    let expected_amount = U256::from(expected_wire)
+        .saturating_mul(U256::from(RATE))
+        .div_ceil(U256::from(MB_BYTES));
     anyhow::ensure!(
         progress_log(&recorded)?
             == vec![(
                 a_eth.address(),
                 U256::from(2),
-                U256::from(total_bytes),
-                U256::from(15)
+                U256::from(expected_wire),
+                expected_amount
             )],
         "expected B's upstream watermark at the full blob, got {:?}",
         progress_log(&recorded)?

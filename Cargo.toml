@@ -4,6 +4,7 @@ members = [
     "crates/node",
     "crates/protocol",
     "crates/config-types",
+    "crates/bao-range",
     "crates/cache",
     "crates/incentive",
     "crates/reputation",
@@ -23,6 +24,7 @@ rust-version = "1.95"
 # Internal crates
 decdn-protocol = { path = "crates/protocol" }
 decdn-config-types = { path = "crates/config-types" }
+decdn-bao-range = { path = "crates/bao-range" }
 decdn-cache = { path = "crates/cache" }
 decdn-incentive = { path = "crates/incentive" }
 decdn-reputation = { path = "crates/reputation" }

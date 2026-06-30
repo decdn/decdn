@@ -343,6 +343,15 @@ pub struct NodeProgressivePull {
 }
 
 impl NodeProgressivePull {
+    /// The promised **wire** byte count of this pull — the bao-encoded size of
+    /// the blob (content plus interleaved proof, ADR 038), forwarded verbatim to
+    /// the downstream client. The window serve loop uses it as the pull budget
+    /// `total`, since the forwarded/metered quantities are wire bytes.
+    #[must_use]
+    pub const fn expected(&self) -> u64 {
+        self.pull.expected()
+    }
+
     /// Read and forward the next upstream chunk, paying the upstream per voucher
     /// interval. `Ok(None)` signals the upstream `StreamEnd`. Tracks delivered
     /// bytes for the success-path region/reputation accounting.

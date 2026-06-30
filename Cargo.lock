@@ -2581,6 +2581,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
+name = "decdn-bao-range"
+version = "0.1.0"
+dependencies = [
+ "bao-tree",
+ "bytes",
+ "positioned-io",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "decdn-cache"
 version = "0.1.0"
 dependencies = [
@@ -2597,6 +2607,7 @@ dependencies = [
  "bao-tree",
  "bytes",
  "chacha20poly1305",
+ "decdn-bao-range",
  "decdn-config-types",
  "decdn-protocol",
  "flate2",
@@ -2653,8 +2664,10 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "bao-tree",
  "blake3",
  "bytes",
+ "decdn-bao-range",
  "decdn-common",
  "decdn-incentive",
  "decdn-protocol",

@@ -227,9 +227,11 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
         "nonce: {}",
         only.last_nonce()
     );
+    // ADR 038: metered quantity is bao wire bytes
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
     anyhow::ensure!(
-        only.last_bytes_delivered() == U256::from(payload.len()),
-        "bytes_delivered: {}",
+        only.last_bytes_delivered() == U256::from(wire),
+        "bytes_delivered: {} (expected {wire})",
         only.last_bytes_delivered()
     );
     anyhow::ensure!(only.last_amount() > U256::ZERO, "amount must be non-zero");
@@ -521,11 +523,12 @@ async fn accepted_voucher_records_served_bytes_by_region() -> anyhow::Result<()>
         .iter()
         .find(|r| r.region == "DE")
         .ok_or_else(|| anyhow::anyhow!("expected a DE bucket, got {snap:?}"))?;
+    // ADR 038: metered quantity is bao wire bytes
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
     anyhow::ensure!(
-        de.bytes_out == payload.len() as u64,
-        "DE bytes_out = {}, expected {}",
-        de.bytes_out,
-        payload.len()
+        de.bytes_out == wire,
+        "DE bytes_out = {}, expected {wire}",
+        de.bytes_out
     );
     anyhow::ensure!(de.bytes_in == 0, "bytes_in must stay 0 (no pull path)");
     anyhow::ensure!(
@@ -617,10 +620,11 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
     let want_hash = hex_lower(hash.as_bytes());
     let want_node = hex_lower(client_node_id.as_bytes());
     let total: u64 = recorded.iter().map(DownloadReceipt::size).sum();
+    // ADR 038: metered quantity is bao wire bytes
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
     anyhow::ensure!(
-        total == payload.len() as u64,
-        "receipt sizes sum to {total}, expected {}",
-        payload.len()
+        total == wire,
+        "receipt sizes sum to {total}, expected {wire}"
     );
     for (i, r) in recorded.iter().enumerate() {
         anyhow::ensure!(
@@ -741,10 +745,11 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
         .map_err(|_| anyhow::anyhow!("receipt writer did not drain after release"))??;
     let recorded = blocking_log.snapshot();
     let total: u64 = recorded.iter().map(DownloadReceipt::size).sum();
+    // ADR 038: metered quantity is bao wire bytes
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
     anyhow::ensure!(
-        total == payload.len() as u64,
-        "drained receipt sizes sum to {total}, expected {} ({} receipts)",
-        payload.len(),
+        total == wire,
+        "drained receipt sizes sum to {total}, expected {wire} ({} receipts)",
         recorded.len()
     );
 
@@ -823,9 +828,11 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
     let only = persisted
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
+    // ADR 038: metered quantity is bao wire bytes
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
     anyhow::ensure!(
-        only.last_bytes_delivered() == U256::from(payload.len()),
-        "channel state must still advance: bytes_delivered={}",
+        only.last_bytes_delivered() == U256::from(wire),
+        "channel state must still advance: bytes_delivered={} (expected {wire})",
         only.last_bytes_delivered()
     );
 
@@ -1012,9 +1019,11 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
     let only = persisted
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
+    // ADR 038: metered quantity is bao wire bytes (serve aligns up to the 16 KiB group)
+    let wire = support::bao_wire_len(payload.len() as u64, offset, 0);
     anyhow::ensure!(
-        only.last_bytes_delivered() == U256::from(suffix.len()),
-        "bytes_delivered should be the suffix length, got {}",
+        only.last_bytes_delivered() == U256::from(wire),
+        "bytes_delivered should be the aligned bao wire size {wire}, got {}",
         only.last_bytes_delivered()
     );
 
