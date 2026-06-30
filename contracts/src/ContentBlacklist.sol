@@ -507,22 +507,25 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     function fastTrackBlacklistAppeal(uint256 appealId) external nonReentrant onlyRole(EMERGENCY_MULTISIG_ROLE) {
         BlacklistAppeal storage a = _appeals[appealId];
         if (a.status != AppealStatus.Open) revert AppealNotOpen(appealId);
+        // Cache the repeatedly-read fields to avoid redundant warm SLOADs.
+        bytes32 region = a.region;
+        address filer = a.filer;
         // Both caps count only fast-tracked appeals — the ones actually holding
         // interim relief (a suspended entry) — so they bound simultaneous
         // suspensions without letting un-acted Open filings consume the budget
         // (M-1). The per-region ceiling is the global backstop; the per-(filer,
         // region) sub-cap stops one filer monopolizing a region's slots.
-        if (regionActiveReliefCount[a.region] >= REGION_CONCURRENT_RELIEF_CAP) {
-            revert RegionalCapHit(a.region, REGION_CONCURRENT_RELIEF_CAP);
+        if (regionActiveReliefCount[region] >= REGION_CONCURRENT_RELIEF_CAP) {
+            revert RegionalCapHit(region, REGION_CONCURRENT_RELIEF_CAP);
         }
-        if (filerRegionActiveRelief[a.region][a.filer] >= FILER_CONCURRENT_RELIEF_CAP) {
-            revert FilerReliefCapHit(a.filer, FILER_CONCURRENT_RELIEF_CAP);
+        if (filerRegionActiveRelief[region][filer] >= FILER_CONCURRENT_RELIEF_CAP) {
+            revert FilerReliefCapHit(filer, FILER_CONCURRENT_RELIEF_CAP);
         }
         a.fastTrackedAt = uint64(block.timestamp);
         a.status = AppealStatus.FastTracked;
-        regionActiveReliefCount[a.region] += 1;
-        filerRegionActiveRelief[a.region][a.filer] += 1;
-        _hashEntries[a.region][a.hash].suspended = true;
+        regionActiveReliefCount[region] += 1;
+        filerRegionActiveRelief[region][filer] += 1;
+        _hashEntries[region][a.hash].suspended = true;
         emit BlacklistAppealFastTracked(appealId);
     }
 
