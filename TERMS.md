@@ -67,6 +67,17 @@ ejection — and you remain subject to enforcement by the authorities of your
 own jurisdiction. The on-chain record of your acceptance is evidence that you
 were on notice of these duties; it is not evidence that you performed them.
 
+## 6. Changes to these terms
+
+These terms may be revised through the network's canonical governance process.
+You agree to be bound by the version that governance has made canonical from
+time to time, not only the version you accepted when you registered. The
+network records the version you assented to at registration; a later
+governance-adopted revision applies to your continued operation of a node,
+whether or not you re-record your acceptance on-chain. If you do not wish to be
+bound by a revision, your remedy is to stop operating your node and exit under
+the unbonding process.
+
 ## Operator guidance (not part of these terms)
 
 Practical guidance for meeting these duties — for example, content hash-match
