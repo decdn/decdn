@@ -25,7 +25,7 @@ Disbursements require all of:
 1. An attested incident bundle (cryptographic evidence of the failure, identity of the harmed party, proposed payout amount).
 2. A governance proposal, or fast-track multisig approval (within hard caps per [ADR 009](009-governance.md#adr-009-governance-model)).
 3. A 48-hour appeal window during which the bundle is challengeable on-chain.
-4. **Post-incident reporting.** On payout settlement, `SafetyReserve` writes an immutable record to its public on-chain registry (see [ADR 009 § SafetyReserve Payout Authorization](009-governance.md#safetyreserve-payout-authorization) for the record fields and reporting obligations).
+4. **Post-incident reporting.** On payout settlement, `SafetyReserve` writes an immutable record to its public on-chain registry (see ADR 009 § SafetyReserve Payout Authorization for the record fields and reporting obligations — section retired with the `SafetyReserve` contract).
 
 No path exists for unattested payouts; the `payout(bundleHash, recipient, amount)` entry point checks all four gates.
 
