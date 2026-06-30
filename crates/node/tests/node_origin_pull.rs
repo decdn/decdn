@@ -751,24 +751,34 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
     );
     engine.try_acquire(hash_bytes);
 
-    // Await the background acquisition (bounded): the blob lands in B's cache.
+    // Await the background acquisition (bounded): wait for BOTH the blob to
+    // land in B's cache AND the prefetch tag to be recorded. The acquirer writes
+    // the tag strictly *after* the blob is resident (see
+    // `crates/node/src/prefetch/acquirer.rs`), so polling only on `has(hash)`
+    // races the tag. The cheap in-memory tag check is ordered first to
+    // short-circuit the async cache probe until the tag is recorded.
     // The poll budget (35s) deliberately exceeds the acquirer's configured
     // deadline (`acquisition_timeout_secs`, default 30s) so a slow-but-correct
     // pull on loaded CI is not declared a failure before the acquirer itself
     // would give up. The happy path breaks in well under 1s, so this budget is
     // only ever spent on a genuine hang.
-    let mut cached = false;
+    let mut ready = false;
     for _ in 0..350 {
-        if cache_b.has(hash).await? {
-            cached = true;
+        if engine.acquired().contains(&hash_bytes, 2) && cache_b.has(hash).await? {
+            ready = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    anyhow::ensure!(
-        cached,
-        "prefetch acquisition did not cache the blob in time"
-    );
+    if !ready {
+        // Report both legs so a CI timeout names the stuck step without a rerun.
+        let cached = cache_b.has(hash).await?;
+        let tagged = engine.acquired().contains(&hash_bytes, 2);
+        anyhow::bail!(
+            "prefetch acquisition did not cache and tag the blob in time \
+             (cached={cached}, tagged={tagged})"
+        );
+    }
 
     // The paid pull recorded non-zero spend into the prefetch ledger + metric.
     let spend = counter_value(&b_metrics, "prefetch_spend_usdc_total")?;
@@ -776,11 +786,6 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
     anyhow::ensure!(
         counter_value(&b_metrics, "prefetch_acquire_succeeded_total")? == 1,
         "expected one successful prefetch acquisition"
-    );
-    // The blob is tagged as prefetch content for the serve path's record_served.
-    anyhow::ensure!(
-        engine.acquired().contains(&hash_bytes, 2),
-        "acquired blob should be tagged as prefetch content"
     );
 
     ep_b.close().await;
@@ -1015,22 +1020,30 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
     );
     engine.try_acquire(hash_bytes);
 
-    let mut cached = false;
+    // Wait for BOTH the blob to land in the cache AND the acquisition's
+    // prefetch tag to be recorded in `engine.acquired()`. The acquirer writes
+    // the tag strictly *after* the blob is resident (`populate` then a `has`
+    // re-check, see `crates/node/src/prefetch/acquirer.rs`), so polling only on
+    // `has(hash)` races the tag (PR #1019 CI flake). The cheap in-memory tag
+    // check is ordered first so it short-circuits the async cache probe until
+    // the tag is recorded.
+    let mut ready = false;
     for _ in 0..350 {
-        if cache_b.has(hash).await? {
-            cached = true;
+        if engine.acquired().contains(&hash_bytes, 2) && cache_b.has(hash).await? {
+            ready = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    anyhow::ensure!(
-        cached,
-        "prefetch acquisition did not cache the blob in time"
-    );
-    anyhow::ensure!(
-        engine.acquired().contains(&hash_bytes, 2),
-        "acquired blob should be tagged as prefetch content"
-    );
+    if !ready {
+        // Report both legs so a CI timeout names the stuck step without a rerun.
+        let cached = cache_b.has(hash).await?;
+        let tagged = engine.acquired().contains(&hash_bytes, 2);
+        anyhow::bail!(
+            "prefetch acquisition did not cache and tag the blob in time \
+             (cached={cached}, tagged={tagged})"
+        );
+    }
 
     // Baseline: the acquisition seeded the demand-quality *denominator*, but
     // nothing has been served yet, so the ratio sits at zero. (`now = 0`: the
