@@ -15,7 +15,7 @@ It is the blacklist-side analogue of the slash-appeal entry points on the `Slash
 
 This ADR does **not** re-litigate [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting).
 
-> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt`, lapse paths that currently burn the bond, and the standing-enforcement / perjury-denylist / synthetic-clawback / per-filer-cap machinery still deferred. #688 (sub-issues #1015–#1018) closes the gap.
+> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt`, lapse paths that currently burn the bond, and the standing-enforcement / synthetic-clawback / per-filer-cap machinery still deferred. The perjury denylist now ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field). #688 (sub-issues #1015, #1017, #1018) closes the remaining gap.
 
 ## Decision
 
@@ -118,7 +118,7 @@ function openBlacklistAppeal(
 | `FilingWindowClosed()` | `block.timestamp ≥ entry.addedAt + BLACKLIST_APPEAL_FILING_WINDOW` |
 | `InvalidStandingPath()` | `standingPath` is not in `{Publisher, Operator, TokenHolder}` |
 | `StandingCheckFailed()` | The filer fails the declared `standingPath` check (e.g., not the namespace owner, region mismatch, balance below `APPEAL_FILER_TOKEN_THRESHOLD`) |
-| `FilerOnPerjuryDenylist()` | `perjuryDenylistUntilAt[msg.sender] > block.timestamp` |
+| `FilerPerjuryDenylisted()` | `perjuryDenylistUntilAt[msg.sender] > block.timestamp` |
 | `FilerInRejectionCooldown()` | `filerRejections[msg.sender].cooldownUntilAt > block.timestamp` |
 | `EmptyEvidenceBundleHash()` | `evidenceBundleHash == bytes32(0)` |
 | `BondTransferFailed()` | `TOKEN.transferFrom(msg.sender, address(this), BLACKLIST_APPEAL_BOND)` reverts or returns false |
@@ -152,7 +152,7 @@ function rejectBlacklistAppeal(uint256 appealId) external onlyEmergencyMultisig;
 function rejectAppealAsPerjury(uint256 appealId) external onlyEmergencyMultisig;
 ```
 
-`rejectAppealAsPerjury` is a sibling entry point for the [ADR 011 § Evidence](011-content-takedown.md#evidence) case where the sworn declaration was false. It does everything `rejectBlacklistAppeal` does, plus sets `appeals[appealId].perjuryFlagged = 1` and `perjuryDenylistUntilAt[appeal.filer] = block.timestamp + 365 days`. Multisig may call either against an `Open` or `FastTracked` appeal; on a `FastTracked` appeal the suspension is released as a side effect (clears `entry.suspended` and decrements `regionActiveReliefCount` before terminating).
+`rejectAppealAsPerjury` is a sibling entry point for the [ADR 011 § Evidence](011-content-takedown.md#evidence) case where the sworn declaration was false. It does everything `rejectBlacklistAppeal` does (burn the bond, record the rolling-window rejection), plus sets `perjuryDenylistUntilAt[appeal.filer] = block.timestamp + PERJURY_DENYLIST_DURATION` (365 days, a fixed constant with no governance setter). Multisig may call either against an `Open` or `FastTracked` appeal; on a `FastTracked` appeal the suspension is released as a side effect (clears `entry.suspended` and decrements `regionActiveReliefCount` before terminating).
 
 | Revert | Trigger |
 | --- | --- |
@@ -161,7 +161,7 @@ function rejectAppealAsPerjury(uint256 appealId) external onlyEmergencyMultisig;
 
 **State transitions (both functions):** `status = Rejected`; bond is burned via `TOKEN.burn(appeal.bond)` (`ContentBlacklist` holds and burns directly — TOKEN is `ERC20Burnable` per [ADR 026 § Burnability](026-tokenomics.md#burnability)); `totalBondsEscrowed -= appeal.bond`; record a new entry in `filerRejections[appeal.filer]` (rolling window); if the rolling window contains three rejections within the lookback, set `cooldownUntilAt`. If `status` was `FastTracked` at the moment of rejection: also clear `entry.suspended = false` and `regionActiveReliefCount[appeal.region]--` (preserving `entry.suspendedAt`).
 
-**Emits:** `BlacklistAppealRejected(appealId)`. Perjury-flagged rejections additionally emit `BlacklistAppealPerjuryRecorded(appealId, filer, perjuryDenylistUntilAt)`.
+**Emits:** `BlacklistAppealRejected(appealId)`. Perjury rejections additionally emit `BlacklistAppealRejectedAsPerjury(appealId, filer, until)`.
 
 ---
 
@@ -213,7 +213,7 @@ After cleanup, subsequent calls against the same `appealId` revert with `Blackli
 | `BlacklistAppealOpened` | `appealId` | `blake3Hash` | `filer` | `region` (bytes2), `evidenceBundleHash` (bytes32), `standingPath` (uint8) |
 | `BlacklistAppealFastTracked` | `appealId` | — | — | (none) |
 | `BlacklistAppealRejected` | `appealId` | — | — | (none) |
-| `BlacklistAppealPerjuryRecorded` | `appealId` | `filer` | — | `perjuryDenylistUntilAt` (uint64) |
+| `BlacklistAppealRejectedAsPerjury` | `appealId` | `filer` | — | `until` (uint64) |
 | `BlacklistAppealRatified` | `appealId` | — | — | (none) |
 | `BlacklistAppealReversed` | `appealId` | — | — | (none) |
 | `BlacklistAppealLapsed` | `appealId` | `reason` (uint8) | — | (none) |

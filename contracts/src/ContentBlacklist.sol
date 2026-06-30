@@ -69,6 +69,15 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     uint64 internal constant REJECTION_COOLDOWN_WINDOW_FLOOR = 1 days;
     uint64 internal constant REJECTION_COOLDOWN_WINDOW_CEILING = 365 days;
 
+    // ADR 031 § Evidence (perjury denylist) — a single adjudicated bad-faith /
+    // false-sworn-declaration appeal costs the filer the right to open new
+    // appeals for a fixed term. Distinct from the rejection cooldown, which
+    // throttles *volume* abuse (three rejections in a rolling window); this
+    // penalizes one egregious act. Multisig-gated via `rejectAppealAsPerjury`
+    // and tied to a concrete finalized appeal (auditable), so the duration is a
+    // fixed constant with no governance setter.
+    uint64 internal constant PERJURY_DENYLIST_DURATION = 365 days;
+
     bytes32 internal constant GLOBAL_REGION = bytes32("GLOBAL");
 
     // -----------------------------------------------------------------
@@ -182,6 +191,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         without this the only brake on rejected-appeal spam is the bond.
     mapping(address filer => RejectionWindow) public filerRejections;
 
+    /// @notice ADR 031 § Evidence perjury denylist. Non-zero `until` while the
+    ///         filer is locked out of `openBlacklistAppeal` for an adjudicated
+    ///         bad-faith appeal; set by `rejectAppealAsPerjury` to
+    ///         `block.timestamp + PERJURY_DENYLIST_DURATION`. Public auto-getter.
+    mapping(address filer => uint64 until) public perjuryDenylistUntilAt;
+
     // -----------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------
@@ -203,6 +218,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     );
     event BlacklistAppealFastTracked(uint256 indexed appealId);
     event BlacklistAppealRejected(uint256 indexed appealId, uint256 bondBurned);
+    /// @notice Emitted (in addition to `BlacklistAppealRejected`) when an appeal
+    ///         is rejected as perjury, recording the filer's denylist expiry.
+    event BlacklistAppealRejectedAsPerjury(uint256 indexed appealId, address indexed filer, uint64 until);
     event BlacklistAppealRatified(uint256 indexed appealId);
     event BlacklistAppealReversed(uint256 indexed appealId, uint256 bondBurned);
     event BlacklistAppealLapsed(uint256 indexed appealId, uint8 reason);
@@ -232,6 +250,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error HashHasActiveAppeal(bytes32 region, bytes32 hash);
     error FrequencyCapHit(uint64 nextAvailableAt);
     error FilerInRejectionCooldown(uint64 cooldownUntilAt);
+    error FilerPerjuryDenylisted(uint64 until);
     error UnauthorizedStanding(StandingPath path);
     error OperatorRegionMismatch(bytes32 appealRegion, bytes32 filerRegion);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
@@ -409,6 +428,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(block-timestamp)
         if (cooldownUntilAt > block.timestamp) revert FilerInRejectionCooldown(cooldownUntilAt);
 
+        // ADR 031 § Evidence perjury denylist: a filer adjudicated to have filed
+        // a bad-faith / false-sworn-declaration appeal (via `rejectAppealAsPerjury`)
+        // is locked out for `PERJURY_DENYLIST_DURATION`, independent of the
+        // volume-based rejection cooldown above.
+        uint64 perjuryUntil = perjuryDenylistUntilAt[msg.sender];
+        // forge-lint: disable-next-line(block-timestamp)
+        if (perjuryUntil > block.timestamp) revert FilerPerjuryDenylisted(perjuryUntil);
+
         // Enum-range check first. Operator standing additionally gets the
         // current-region match below (ADR 011 § Standing path 2); the
         // TokenHolder synthetic-standing clawback (admissibility condition (c)
@@ -485,6 +512,37 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         a.status = AppealStatus.Rejected;
         hasActiveAppeal[a.region][a.hash] = false;
         _recordRejection(a.filer);
+        if (bondBurned != 0) token.burn(bondBurned);
+        emit BlacklistAppealRejected(appealId, bondBurned);
+    }
+
+    /// @notice Reject an appeal as perjury (ADR 031 § Evidence): everything
+    ///         `rejectBlacklistAppeal` does — burn the bond, record the rolling-
+    ///         window rejection, release any fast-track suspension + relief slot —
+    ///         plus deny the filer the appeal path for `PERJURY_DENYLIST_DURATION`.
+    ///         Tied to a concrete finalized appeal so the denylist entry is
+    ///         auditable; gated to the same `EMERGENCY_MULTISIG_ROLE` as
+    ///         `fastTrackBlacklistAppeal` (ADR 009 capability 3 sub-mode, no new
+    ///         role). Off-chain adjudication criteria for "egregious bad faith /
+    ///         false sworn declaration" live in ADR prose, not contract logic.
+    function rejectAppealAsPerjury(uint256 appealId) external nonReentrant onlyRole(EMERGENCY_MULTISIG_ROLE) {
+        BlacklistAppeal storage a = _appeals[appealId];
+        if (a.status != AppealStatus.Open && a.status != AppealStatus.FastTracked) revert AppealNotOpen(appealId);
+
+        uint64 until = uint64(block.timestamp) + PERJURY_DENYLIST_DURATION;
+        perjuryDenylistUntilAt[a.filer] = until;
+
+        if (a.status == AppealStatus.FastTracked) {
+            _hashEntries[a.region][a.hash].suspended = false;
+            // Only fast-tracked appeals charge the relief cap (M-1).
+            if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
+        }
+        uint256 bondBurned = a.bond;
+        a.bond = 0;
+        a.status = AppealStatus.Rejected;
+        hasActiveAppeal[a.region][a.hash] = false;
+        _recordRejection(a.filer);
+        emit BlacklistAppealRejectedAsPerjury(appealId, a.filer, until);
         if (bondBurned != 0) token.burn(bondBurned);
         emit BlacklistAppealRejected(appealId, bondBurned);
     }
