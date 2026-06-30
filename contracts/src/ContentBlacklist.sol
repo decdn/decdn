@@ -522,8 +522,11 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             // TokenHolder: must hold at least the governable threshold balance.
             // `namespaceId` is ignored on this path. The synthetic-standing
             // clawback against this balance on an adverse outcome (ADR 031
-            // § 216(c)) is deferred to its own change.
-            if (token.balanceOf(msg.sender) < appealFilerTokenThreshold) revert UnauthorizedStanding(standingPath);
+            // § 216(c)) is deferred to its own change. Cached on its own line so
+            // the aderyn directive is the immediate predecessor of the call.
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            uint256 filerBalance = token.balanceOf(msg.sender);
+            if (filerBalance < appealFilerTokenThreshold) revert UnauthorizedStanding(standingPath);
         } else if (region != GLOBAL_REGION) {
             // ADR 011 § Standing path 2 (Operator): an operator only has standing
             // on a regional entry whose region matches their current attested
