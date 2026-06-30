@@ -106,7 +106,7 @@ ed25519Signature = ed25519 sign(nodePrivKey,
                     keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId])))
 ```
 
-Both signing operations are supported by the `decdn` CLI (`decdn node register` prints the required parameters, signs locally, submits the transaction). Registration also records the operator's acceptance of the current operator terms, carried in the same binding signature — see [§ Operator Safety Obligations](#operator-safety-obligations).
+Both signing operations are supported by the `decdn` CLI (`decdn node register` prints the required parameters, signs locally, submits the transaction). Registration also records the operator's acceptance of the current operator terms, carried in the same binding signature — see [§ Operator Safety Obligations](#operator-safety-obligations). The precise extension of the `BindNodeId` payload with `termsHash` and the `TermsAccepted` event are specified together with the contract change ([ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding)); the signature shapes and emitted events shown in this step are the pre-extension surface.
 
 **Gas:** ~$0.26–$0.46 (includes on-chain ed25519 verification via Solidity library; one-time per node lifetime).
 
@@ -243,6 +243,8 @@ Cache-and-serve operators handle third-party content the network does not inspec
 **Governance-canonical terms version.** `CapacityBond` holds the canonical `currentTermsHash` as a governance parameter, set by `DecdnGovernor` after timelock — the same control surface as the other tunable parameters, with no privileged owner path. Registration enforces the current version: `registerNode` reverts if the submitted `termsHash` does not equal `currentTermsHash`. A hash carries no `[floor, ceiling]` safety rail because it has no monotonic direction; the rail is instead a governance norm that every proposal setting `currentTermsHash` references the document text and its review record. Governance *adopts* the canonical version — it does not author or adjudicate the wording. A terms revision is therefore an ordinary parameter change: the network may launch with an initial version and adopt a reviewed successor later by bumping the hash, with no contract migration.
 
 Enforcement is evaluated **at registration only**. A later bump of `currentTermsHash` binds new registrants; operators already registered under a prior version keep their recorded acceptance, which continues to evidence notice and assent at the time they joined. Tooling may prompt existing operators to re-accept a new version, but the cache-serving role does not require it.
+
+Registration-time-only on-chain enforcement does not freeze an operator's obligations at their accepted version. The terms bind each operator to revisions adopted through the canonical governance process, so governance retains authority to act on a breach of the *current* terms — including ejection under the content-takedown rules ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) — regardless of which `termsHash` an operator's on-chain record carries. The recorded hash fixes the version a node *assented to*, not the ceiling of what governance may enforce.
 
 **Globally applicable terms.** The terms bind operators across jurisdictions without prescribing any single jurisdiction's mechanism. Three layers carry this:
 
