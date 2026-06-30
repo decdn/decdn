@@ -39,9 +39,11 @@ use futures_util::StreamExt as _;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 
-use super::discovery::{self, NodeCandidate};
+use super::chain_ctx;
 use super::fetch;
-use super::{chain_ctx, client_endpoint};
+use decdn_client_pull::discovery::{self, NodeCandidate};
+use decdn_client_pull::endpoint as client_endpoint;
+use decdn_client_pull::provider;
 
 /// Read-side bundle manifest (the write-side lives in [`super::bundle`]). `size`
 /// is optional on the wire (per `appendix-bundles.md`); it is informational for
@@ -140,7 +142,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     )?;
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
     let self_address = signer.address();
-    let rpc = chain_ctx::build_provider(&chain.rpc_url, &signer)?;
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
     let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);

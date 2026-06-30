@@ -1,16 +1,15 @@
 //! Shared plumbing for the on-chain `node` subcommands (`register`, `bond`).
 //!
 //! Resolves the blockchain coordinates (flag > `[blockchain]`/`[identity]`
-//! TOML config > default), loads the operator's keystore signer, and builds a
-//! wallet-filled HTTP provider. Both commands then construct their
-//! `CapacityBond` instance against that provider.
+//! TOML config > default) and loads the operator's keystore signer. Commands
+//! then build a wallet-filled provider with
+//! [`decdn_client_pull::provider::build_provider`] and construct their
+//! `CapacityBond` instance against it.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
-use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_common::cli;
@@ -159,27 +158,6 @@ pub async fn load_operator_signer(
         .await
         .context("keystore decryption task panicked")?
         .with_context(|| format!("failed to load keystore at {display}"))
-}
-
-/// Build a wallet-filled HTTP provider that signs and sends transactions as
-/// `signer`. The `Url` type is inferred from `connect_http`'s parameter;
-/// naming it explicitly would need `alloy::transports`, which is not exposed
-/// under this crate's alloy feature set.
-pub fn build_provider(
-    rpc_url: &str,
-    signer: &PrivateKeySigner,
-) -> anyhow::Result<impl Provider + Clone> {
-    Ok(ProviderBuilder::new()
-        .wallet(EthereumWallet::from(signer.clone()))
-        .connect_http(rpc_url.parse().with_context(|| {
-            // An rpc_url secret commonly lives in the path/query, which userinfo
-            // redaction wouldn't scrub — so hide the value entirely, matching
-            // `config validate`'s `<redacted> (N chars)`.
-            format!(
-                "rpc_url is not a valid URL (<redacted>, {} chars)",
-                rpc_url.len()
-            )
-        })?))
 }
 
 #[cfg(test)]
