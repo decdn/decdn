@@ -1015,21 +1015,21 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
     );
     engine.try_acquire(hash_bytes);
 
-    let mut cached = false;
+    // Wait for BOTH the blob to land in the cache AND the acquisition's
+    // prefetch tag to be recorded in `engine.acquired()`. These are written by
+    // distinct steps of the acquire path, so the blob can be present before the
+    // tag is — polling only on `has(hash)` races the tag (see PR #1019 CI flake).
+    let mut ready = false;
     for _ in 0..350 {
-        if cache_b.has(hash).await? {
-            cached = true;
+        if cache_b.has(hash).await? && engine.acquired().contains(&hash_bytes, 2) {
+            ready = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     anyhow::ensure!(
-        cached,
-        "prefetch acquisition did not cache the blob in time"
-    );
-    anyhow::ensure!(
-        engine.acquired().contains(&hash_bytes, 2),
-        "acquired blob should be tagged as prefetch content"
+        ready,
+        "prefetch acquisition did not cache and tag the blob in time"
     );
 
     // Baseline: the acquisition seeded the demand-quality *denominator*, but
