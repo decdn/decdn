@@ -1,15 +1,3 @@
-<!--
-  CANONICAL OPERATOR TERMS — single source of the in-binary terms constant.
-  The node software embeds this file's bytes verbatim; the registration
-  clickwrap displays them and records keccak256(bytes) as `termsHash`
-  on-chain (ADR 019 § Operator Safety Obligations).
-
-  Editing this file changes the hash. A new version becomes canonical only
-  when governance sets `currentTermsHash` to its hash (DecdnGovernor +
-  timelock). Do not paraphrase clauses in code or docs — reference by
-  version.
--->
-
 # deCDN Operator Terms
 
 **Version:** 1.0.0-draft
