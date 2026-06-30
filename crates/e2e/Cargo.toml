@@ -1,0 +1,50 @@
+[package]
+name = "decdn-e2e"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cross-layer Rust↔contract end-to-end test fixtures for deCDN (issue #1028)"
+publish = false
+
+# This crate is test-infrastructure only: it ships reusable fixtures (chain /
+# node / client / time-control / assertions) that compose a real anvil
+# deployment, in-process daemon(s), and the paid client path. The fixtures live
+# in the library; the only test target is the feature-gated smoke test that
+# proves they compose. See `crates/node/tests/anvil_settlement_e2e.rs` for the
+# monolith this generalizes.
+[lib]
+doctest = false
+
+[features]
+default = []
+# Opt-in gate for the live anvil-backed smoke test (`tests/smoke.rs`). Mirrors
+# `decdn-node`'s `anvil-e2e` feature: off by default so `cargo nextest run`
+# stays fast and needs no `anvil`/`forge` binaries. The fixtures themselves
+# always compile; only the test that actually drives a chain is gated.
+anvil-e2e = []
+
+[dependencies]
+decdn-node = { workspace = true }
+decdn-incentive = { workspace = true }
+decdn-cache = { workspace = true }
+decdn-common = { workspace = true }
+decdn-client-pull = { workspace = true }
+decdn-protocol = { workspace = true }
+decdn-config-types = { workspace = true }
+alloy = { workspace = true }
+iroh = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tempfile = { workspace = true }
+reqwest = { workspace = true }
+jsonrpsee = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
