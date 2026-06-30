@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 
 import { BuybackBurner } from "../src/BuybackBurner.sol";
+import { SunsettingPausable } from "../src/SunsettingPausable.sol";
 import { Token } from "../src/Token.sol";
 
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -208,6 +209,15 @@ contract BuybackBurnerTest is Test {
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(BuybackBurner.SwapReportMismatch.selector, TOKEN_OUT, TOKEN_OUT / 2));
         bb.executeBuyback(USDC_AMOUNT, 1);
+    }
+
+    // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
+    // `deployTimestamp + 365 days`; afterwards `pause()` reverts for everyone.
+    function test_pause_revertsAfterSunset() public {
+        vm.warp(block.timestamp + 366 days);
+        vm.prank(pauser);
+        vm.expectRevert(SunsettingPausable.PauseExpired.selector);
+        bb.pause();
     }
 
     function test_executeBuyback_revertsWhenPaused() public {

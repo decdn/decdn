@@ -7,6 +7,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { SlashJudge } from "../src/SlashJudge.sol";
+import { SunsettingPausable } from "../src/SunsettingPausable.sol";
 import { ISlashJudge } from "../src/interfaces/ISlashJudge.sol";
 import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol";
 import { ICapacityBondRegionView } from "../src/interfaces/ICapacityBondRegionView.sol";
@@ -688,6 +689,15 @@ contract SlashJudgeTest is Test {
         vm.prank(challenger);
         vm.expectRevert(SlashJudge.CommitmentExists.selector);
         judge.commitChallenge(commitment);
+    }
+
+    // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
+    // `deployTimestamp + 365 days`; afterwards `pause()` reverts for everyone.
+    function test_pause_revertsAfterSunset() public {
+        vm.warp(block.timestamp + 366 days);
+        vm.prank(pauser);
+        vm.expectRevert(SunsettingPausable.PauseExpired.selector);
+        judge.pause();
     }
 
     function test_commit_blockedWhilePaused() public {

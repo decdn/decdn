@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+import { SunsettingPausable } from "./SunsettingPausable.sol";
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -38,7 +38,7 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         `slashJudge` reference (wired post-deploy through
 ///         `CapacityBond.setSlashJudge`), so the paired invariant is now closed
 ///         on both contracts (#778).
-contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EIP712 {
+contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPausable, EIP712 {
     using SafeERC20 for IERC20;
 
     // -----------------------------------------------------------------
@@ -361,6 +361,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, Pausable, EI
     }
 
     function pause() external onlyRole(PAUSER_ROLE) {
+        _requirePauseWindowOpen();
         _pause();
     }
 

@@ -9,6 +9,7 @@ import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import { PaymentChannel } from "../src/PaymentChannel.sol";
+import { SunsettingPausable } from "../src/SunsettingPausable.sol";
 import { IFeeRouterSettlement } from "../src/interfaces/IFeeRouterSettlement.sol";
 import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.sol";
 
@@ -395,6 +396,15 @@ contract PaymentChannelTest is Test {
             abi.encodeWithSelector(PaymentChannel.DepositBelowMinimum.selector, uint256(1), uint256(1_000_000))
         );
         channel.openChannel(provider, 1);
+    }
+
+    // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
+    // `deployTimestamp + 365 days`; afterwards `pause()` reverts for everyone.
+    function test_pause_revertsAfterSunset() public {
+        vm.warp(block.timestamp + 366 days);
+        vm.prank(pauser);
+        vm.expectRevert(SunsettingPausable.PauseExpired.selector);
+        channel.pause();
     }
 
     function test_openChannel_revertsWhenPaused() public {

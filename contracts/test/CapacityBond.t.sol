@@ -5,6 +5,7 @@ import { Test } from "forge-std/Test.sol";
 import { Vm } from "forge-std/Vm.sol";
 
 import { CapacityBond } from "../src/CapacityBond.sol";
+import { SunsettingPausable } from "../src/SunsettingPausable.sol";
 import { SlashStatus, SlashRecord } from "../src/SlashEscrowLib.sol";
 import { BondMath } from "../src/BondMath.sol";
 import { Token } from "../src/Token.sol";
@@ -1251,6 +1252,20 @@ contract CapacityBondTest is Test {
     function test_pause_revertsWithoutRole() public {
         _expectMissingRole(operator, bond.PAUSER_ROLE());
         vm.prank(operator);
+        bond.pause();
+    }
+
+    // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
+    // `deployTimestamp + 365 days`; afterwards `pause()` reverts for every
+    // caller (progressive immutability).
+    function test_pause_revertsAfterSunset() public {
+        bytes32 pauserRole = bond.PAUSER_ROLE();
+        vm.prank(admin);
+        bond.grantRole(pauserRole, admin);
+
+        vm.warp(block.timestamp + 366 days);
+        vm.prank(admin);
+        vm.expectRevert(SunsettingPausable.PauseExpired.selector);
         bond.pause();
     }
 

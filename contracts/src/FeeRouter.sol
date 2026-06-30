@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+import { SunsettingPausable } from "./SunsettingPausable.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
@@ -30,7 +30,7 @@ import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
 ///         is 0; the operator share is bounded away from 0 by
 ///         `OPERATOR_BPS_FLOOR` and absorbs the rounding remainder so dust
 ///         never gets routed to an inactive bucket's `address(0)` sink.
-contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
+contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPausable {
     using SafeERC20 for IERC20;
     using Checkpoints for Checkpoints.Trace208;
     using SafeCast for uint256;
@@ -342,6 +342,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, Pausable {
     // -----------------------------------------------------------------
 
     function pause() external onlyRole(PAUSER_ROLE) {
+        _requirePauseWindowOpen();
         _pause();
     }
 
