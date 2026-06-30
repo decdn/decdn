@@ -9,8 +9,8 @@
 //! `rate_per_mb == 0` response) and the `slash_sig` verification obligation
 //! (ADR 014 §1).
 //!
-//! Mirrors `cli::commands::probe_client::probe_once` in spirit, but for the
-//! paid path: it signs vouchers (so it needs the incentive layer and a signer)
+//! Mirrors [`probe::probe_once`] in spirit, but for the paid path: it signs
+//! vouchers (so it needs the incentive layer and a signer)
 //! and, unlike probe, **never** attempts 0-RTT (ADR 015 forbids 0-RTT on
 //! `cdn/client/v1`).
 //!
@@ -29,7 +29,17 @@
 pub mod buyer_channel;
 /// Client-initiated cooperative close (#971), shared by the CLI and the node.
 pub mod cooperative_close;
+/// Client-side node discovery (#936): read + select the active node set from
+/// `CapacityBond.getActiveNodes`, then rank probed blob-holders.
+pub mod discovery;
+/// One-shot client `Endpoint` construction: relay + discovery resolution for
+/// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
+pub mod endpoint;
 mod ledger;
+/// Reusable `cdn/probe/v1` client with QUIC 0-RTT (ADR 015).
+pub mod probe;
+/// Wallet-filled HTTP provider builder for opening/settling payment channels.
+pub mod provider;
 
 pub use ledger::{ChannelLedger, Cumulative};
 

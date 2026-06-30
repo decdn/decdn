@@ -41,7 +41,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
         chain_ctx::parse_address(&resolved.capacity_bond_address, "capacity_bond_address")?;
 
     let signer = chain_ctx::load_operator_signer(&args.chain, &resolved.keystore).await?;
-    let provider = chain_ctx::build_provider(&resolved.rpc_url, &signer)?;
+    let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
 
     let outcome = submit_registration(
         &provider,

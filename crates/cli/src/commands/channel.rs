@@ -31,7 +31,9 @@ use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::voucher_domain;
 use iroh::{EndpointAddr, PublicKey};
 
-use super::{chain_ctx, client_endpoint};
+use super::chain_ctx;
+use decdn_client_pull::endpoint as client_endpoint;
+use decdn_client_pull::provider;
 
 /// Dispatch `decdn channel <subcommand>`.
 pub async fn channel_dispatch(
@@ -133,7 +135,7 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
         "eth keystore password",
     )?;
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-    let rpc = chain_ctx::build_provider(&chain.rpc_url, &signer)?;
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentChannel::new(chain.payment_channel, rpc);
     let domain = voucher_domain(chain.chain_id, chain.payment_channel);
 

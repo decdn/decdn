@@ -23,7 +23,7 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256, Signature};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
-use decdn_cli::commands::probe_client::{ProbeMetrics, probe_once};
+use decdn_client_pull::probe::{ProbeMetrics, probe_once};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::ProbeSlashData;
 use decdn_node::dispatch::ConnectionLimiter;

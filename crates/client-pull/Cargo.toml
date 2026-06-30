@@ -9,6 +9,12 @@ description = "Shared client-side paid-pull machinery used by both the node (nod
 [dependencies]
 decdn-protocol = { workspace = true }
 decdn-incentive = { workspace = true }
+# `endpoint` resolves relays + `[network.discovery]` from the shared config
+# schema and reuses the identity/redaction helpers. `decdn-common` is
+# iroh-blobs-free (config-vocabulary lives in the `decdn-config-types` leaf,
+# #578), so depending on it here does not regress the CLI's iroh-blobs-free
+# invariant — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
+decdn-common = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
@@ -16,6 +22,10 @@ bytes = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# `endpoint`'s relay-resolution tests write throwaway TOML config files.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
