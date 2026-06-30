@@ -3,7 +3,6 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
-import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { SunsettingPausable } from "../src/SunsettingPausable.sol";
