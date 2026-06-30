@@ -691,4 +691,144 @@ contract ContentBlacklistTest is Test {
         vm.prank(filer);
         blacklist.setRejectionCooldownWindow(30 days);
     }
+
+    // -----------------------------------------------------------------
+    // ADR 031 § Evidence — perjury denylist (rejectAppealAsPerjury)
+    // -----------------------------------------------------------------
+
+    function _open(bytes32 h) internal returns (uint256 appealId) {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, h);
+        vm.prank(filer);
+        appealId = blacklist.openBlacklistAppeal(h, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+    }
+
+    /// @notice Perjury-reject sets the 365-day denylist, burns the bond, and
+    ///         finalizes the appeal as Rejected.
+    function test_rejectAppealAsPerjury_denylistsBurnsAndFinalizes() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        uint64 expectedUntil = uint64(block.timestamp) + 365 days;
+
+        uint256 supplyBefore = token.totalSupply();
+        // Both the perjury-specific event and the standard rejection event fire,
+        // in that order.
+        vm.expectEmit(true, true, false, true, address(blacklist));
+        emit ContentBlacklist.BlacklistAppealRejectedAsPerjury(appealId, filer, expectedUntil);
+        vm.expectEmit(true, false, false, true, address(blacklist));
+        emit ContentBlacklist.BlacklistAppealRejected(appealId, APPEAL_BOND);
+        vm.prank(multisig);
+        blacklist.rejectAppealAsPerjury(appealId);
+
+        // Bond burned.
+        assertEq(supplyBefore - token.totalSupply(), APPEAL_BOND);
+        // Appeal finalized as Rejected, bond zeroed.
+        ContentBlacklist.BlacklistAppeal memory a = blacklist.getAppeal(appealId);
+        assertEq(uint8(a.status), uint8(ContentBlacklist.AppealStatus.Rejected));
+        assertEq(a.bond, 0);
+        // Denylist set 365 days out.
+        assertEq(blacklist.perjuryDenylistUntilAt(filer), expectedUntil);
+        // Active-appeal flag cleared so the entry can be re-acted upon.
+        assertFalse(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(1))));
+    }
+
+    /// @notice A denylisted filer is blocked from `openBlacklistAppeal` until the
+    ///         365-day window lapses, then can file again.
+    function test_rejectAppealAsPerjury_blocksFilerUntilWindowLapses() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        vm.prank(multisig);
+        blacklist.rejectAppealAsPerjury(appealId);
+        uint64 until = blacklist.perjuryDenylistUntilAt(filer);
+
+        // A fresh appeal on a distinct live entry reverts while denylisted.
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(2)));
+        vm.prank(filer);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerPerjuryDenylisted.selector, until));
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+
+        // One second before expiry: still locked out. Re-add to refresh the
+        // 14-day filing window (the entry above ages out across the warp).
+        vm.warp(uint256(until) - 1);
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(2)));
+        vm.prank(filer);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerPerjuryDenylisted.selector, until));
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+
+        // Exactly at `until` the lockout lifts — pins the exclusive
+        // `perjuryUntil > block.timestamp` boundary (a `>=` impl would still
+        // revert here). The entry from `until - 1` is still inside its filing window.
+        vm.warp(until);
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(2))));
+    }
+
+    /// @notice Only `EMERGENCY_MULTISIG_ROLE` may perjury-reject.
+    function test_rejectAppealAsPerjury_revertsWithoutMultisigRole() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        _expectMissingRole(filer, blacklist.EMERGENCY_MULTISIG_ROLE());
+        vm.prank(filer);
+        blacklist.rejectAppealAsPerjury(appealId);
+    }
+
+    /// @notice Perjury-rejecting a fast-tracked appeal also un-suspends the entry
+    ///         and releases the per-region relief slot (mirrors rejectBlacklistAppeal).
+    function test_rejectAppealAsPerjury_fastTracked_unsuspendsAndReleasesCap() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+        // Suspended → entry not live; relief slot charged.
+        assertFalse(blacklist.isHashBlacklistedInRegion(bytes32(uint256(1)), REGION_US));
+        assertEq(blacklist.regionActiveReliefCount(REGION_US), 1);
+
+        vm.prank(multisig);
+        blacklist.rejectAppealAsPerjury(appealId);
+
+        // Un-suspended → entry live again; relief slot released.
+        assertTrue(blacklist.isHashBlacklistedInRegion(bytes32(uint256(1)), REGION_US));
+        assertEq(blacklist.regionActiveReliefCount(REGION_US), 0);
+        assertEq(blacklist.perjuryDenylistUntilAt(filer), uint64(block.timestamp) + 365 days);
+    }
+
+    /// @notice One filer's perjury denylist does not affect another filer.
+    function test_rejectAppealAsPerjury_isolatedPerFiler() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        vm.prank(multisig);
+        blacklist.rejectAppealAsPerjury(appealId);
+
+        address filer2 = address(0xF2);
+        vm.prank(admin);
+        token.transfer(filer2, APPEAL_BOND);
+        vm.prank(filer2);
+        token.approve(address(blacklist), type(uint256).max);
+        bondMock.setRegion(filer2, "US", "", 0);
+
+        assertEq(blacklist.perjuryDenylistUntilAt(filer2), 0);
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(2)));
+        vm.prank(filer2);
+        blacklist.openBlacklistAppeal(
+            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+        );
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(2))));
+    }
+
+    /// @notice Perjury-reject requires an Open or FastTracked appeal — a
+    ///         terminal appeal reverts (reuses the rejectBlacklistAppeal guard).
+    function test_rejectAppealAsPerjury_revertsOnTerminalAppeal() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        vm.prank(multisig);
+        blacklist.rejectBlacklistAppeal(appealId);
+        // Already Rejected → revert.
+        vm.prank(multisig);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.AppealNotOpen.selector, appealId));
+        blacklist.rejectAppealAsPerjury(appealId);
+    }
 }
