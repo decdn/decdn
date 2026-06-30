@@ -1013,14 +1013,17 @@ impl UpstreamPull {
         }
     }
 
-    /// Finalize a completed pull: drain to `StreamEnd` if needed, enforce the
-    /// completeness check (resumes) and whole-blob hash (full fetches), close the
-    /// connection cleanly, and return the final acked watermark to persist.
+    /// Finalize a completed pull: drain to `StreamEnd` if needed, enforce
+    /// wire-byte completeness (the full promised bao wire size was received),
+    /// close the connection cleanly, and return the final acked watermark to
+    /// persist. Per ADR 038 this no longer re-hashes the whole blob — bao
+    /// verification is delegated to the tee's `import_bao` (cached copy) and the
+    /// downstream client's own decoder.
     ///
     /// # Errors
     ///
-    /// [`HashMismatch`] on a corrupt full-fetch delivery, or a short/over-long
-    /// delivery, mirroring [`stream_fetch`]'s completeness rules.
+    /// A short delivery (fewer wire bytes than promised before `StreamEnd`), or a
+    /// stream/protocol error while draining to the end of the stream.
     pub async fn finish(mut self) -> anyhow::Result<VoucherProgress> {
         while !self.ended {
             match read_client_message(&mut self.recv).await? {

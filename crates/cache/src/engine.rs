@@ -2985,9 +2985,14 @@ fn bao_decoded_source(
             let mut decoder = match state {
                 State::Header(mut reader) => {
                     let mut size = [0u8; 8];
-                    if reader.recv_exact(&mut size).await.is_err() {
-                        // Channel closed before the header — an aborted/empty fill.
-                        return None;
+                    if let Err(err) = reader.recv_exact(&mut size).await {
+                        // A short/missing 8-byte header is malformed input (a
+                        // truncated peer stream), not a clean end: surface it so the
+                        // import fails loudly rather than committing an empty
+                        // plaintext stream. The window producer always writes the
+                        // full header before any data, so a real fill never hits
+                        // this; the abandon path ignores the import result.
+                        return Some((Err(err), State::Done));
                     }
                     let size = u64::from_le_bytes(size);
                     let tree = BaoTree::new(size, crate::range_pull::IROH_BLOCK_SIZE);

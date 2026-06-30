@@ -4489,6 +4489,9 @@ async fn export_bao_range_whole_blob_offset_zero() -> anyhow::Result<()> {
         .import_bao_bytes(hash, aligned.chunk_ranges().clone(), Bytes::from(combined))
         .await?;
     let got = store.blobs().get_bytes(hash).await?;
-    anyhow::ensure!(got[..] == payload[..], "whole-blob bao decodes to original");
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "whole-blob bao decodes to original"
+    );
     Ok(())
 }
