@@ -685,7 +685,13 @@ fn decode_verified_range(
     let root = blake3::Hash::from_bytes(hash);
     let chunk_ranges = aligned.chunk_ranges();
     let reader = std::io::Cursor::new(bao_wire);
-    let mut plaintext = Vec::with_capacity(usize::try_from(aligned.fetch_len()).unwrap_or(0));
+    // Cap the capacity hint at the received wire length: decoded plaintext can
+    // never exceed the bytes actually received, so an untrusted `total_bytes`
+    // header (via `fetch_len`) can't drive an over-allocation / OOM.
+    let cap = usize::try_from(aligned.fetch_len())
+        .unwrap_or(0)
+        .min(bao_wire.len());
+    let mut plaintext = Vec::with_capacity(cap);
     for item in DecodeResponseIter::new(root, tree, reader, chunk_ranges.as_ref()) {
         match item {
             Ok(BaoContentItem::Leaf(leaf)) => plaintext.extend_from_slice(&leaf.data),
