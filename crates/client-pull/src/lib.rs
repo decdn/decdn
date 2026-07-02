@@ -1322,6 +1322,52 @@ mod tests {
         Ok(())
     }
 
+    /// ADR 038 AC#2 (early rejection at the offending group): a corrupt MIDDLE
+    /// group is rejected as `HashMismatch` even when everything AFTER it is
+    /// missing — detection needs no tail, so a streaming consumer can stop
+    /// paying at group *k* instead of buffering to the end.
+    #[test]
+    fn decode_verified_range_rejects_corrupt_middle_group_without_tail() -> anyhow::Result<()> {
+        let blob = make_blob(200 * 1024 + 777);
+        let (root, mut wire) = wire_for(&blob, 0, 0)?;
+        // Corrupt a byte ~55% in (inside a middle group's data), then TRUNCATE
+        // everything after ~70% — the decoder must fail on the corrupt group,
+        // never reaching (or needing) the missing tail.
+        let corrupt_at = wire.len() * 55 / 100;
+        let truncate_at = wire.len() * 70 / 100;
+        if let Some(b) = wire.get_mut(corrupt_at) {
+            *b ^= 0xff;
+        }
+        wire.truncate(truncate_at);
+        let err = decode_verified_range(root, u64::try_from(blob.len())?, 0, 0, &wire)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected corrupt middle group to be rejected"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<HashMismatch>().is_some(),
+            "corrupt middle group must surface HashMismatch (early rejection), got: {err}"
+        );
+        Ok(())
+    }
+
+    /// A truncated-but-clean stream is a transport-class failure, NOT
+    /// corruption: it must NOT downcast to `HashMismatch`, because callers use
+    /// that sentinel to score the provider `Corruption` (tarring a peer for a
+    /// dropped connection would misattribute blame — #915 review).
+    #[test]
+    fn decode_verified_range_truncation_is_not_hash_mismatch() -> anyhow::Result<()> {
+        let blob = make_blob(200 * 1024 + 777);
+        let (root, mut wire) = wire_for(&blob, 0, 0)?;
+        wire.truncate(wire.len() * 60 / 100);
+        let err = decode_verified_range(root, u64::try_from(blob.len())?, 0, 0, &wire)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected truncated stream to be rejected"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<HashMismatch>().is_none(),
+            "clean truncation must NOT be classified as corruption, got HashMismatch: {err}"
+        );
+        Ok(())
+    }
+
     /// Decoding an honest stream against the WRONG root fails closed (the range
     /// can't be re-anchored), so a source serving a different blob is rejected.
     #[test]

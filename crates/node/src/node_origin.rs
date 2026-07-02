@@ -20,9 +20,12 @@
 //!    upstreams this node pulled from (ADR 008 §Local Score / §Gossip Protocol).
 //!
 //! The cache engine verifies the returned bytes against the content hash and
-//! ingests them, and `stream_fetch` does its own whole-blob BLAKE3 check, so a
-//! dishonest provider is detected (and scored [`Outcome::Corruption`]) rather
-//! than surfaced to the caller.
+//! ingests them, and `stream_fetch` verifies every chunk group of the bao
+//! verified-stream against the content root (ADR 038), so a dishonest provider
+//! is detected (and scored [`Outcome::Corruption`]) rather than surfaced to the
+//! caller. On the window path the corruption detector is the cache TEE's
+//! verifying decoder; its verdict reaches the scorer via
+//! [`NodeProgressivePull::finish`]'s [`TeeVerdict`] / `abandon_corrupt` (#915).
 //!
 //! # Deferred initialisation
 //!
@@ -317,6 +320,23 @@ impl NodeOrigin {
     }
 }
 
+/// The cache tee's integrity verdict for a window pull-through fill (#915,
+/// ADR 038). Under bao streaming the TEE's verifying decoder — not the wire
+/// pull — is the corruption detector (`UpstreamPull::finish` checks only
+/// wire-byte completeness), so the serve handler settles the tee first and
+/// passes its verdict into [`NodeProgressivePull::finish`] for reputation
+/// scoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeeVerdict {
+    /// The teed bao stream verified against the content root — or failed only
+    /// for a local, non-integrity reason (store fault, size cap), which says
+    /// nothing bad about the upstream.
+    Verified,
+    /// The teed bao stream FAILED verification: the upstream served bytes that
+    /// do not hash to the requested root (`CacheError::HashMismatch`).
+    Corrupt,
+}
+
 /// A live window-paced node→node pull (#856) handed to the `cdn/client/v1`
 /// serve path. Wraps the [`UpstreamPull`] transport with the node-origin
 /// bookkeeping (buyer-watermark persistence #852, reputation scoring, region
@@ -368,15 +388,25 @@ impl NodeProgressivePull {
         Ok(chunk)
     }
 
-    /// Finalize a cleanly-completed pull: run the upstream completeness +
-    /// whole-blob hash check, persist the buyer watermark (#852), and score the
-    /// provider (`Delivered` + region on success, classified failure otherwise).
+    /// Finalize a cleanly-completed pull: run the upstream wire-byte
+    /// completeness check, persist the buyer watermark (#852), and score the
+    /// provider. Under ADR 038 the wire `finish` carries no content
+    /// verification — the CACHE TEE's bao decoder is the integrity detector —
+    /// so the caller passes the tee's verdict in and the score reflects it:
+    /// `Delivered` + region accounting for a verified fill, `Corruption` for a
+    /// wire-complete stream whose bytes failed bao verification (the
+    /// paid-but-corrupt case the old whole-blob hasher used to catch here).
     ///
     /// # Errors
     ///
-    /// [`HashMismatch`] (paid-but-corrupt) or a short delivery — the same set
-    /// [`UpstreamPull::finish`] surfaces. The watermark is persisted either way.
-    pub async fn finish(self) -> anyhow::Result<()> {
+    /// A short wire delivery or stream/protocol error from
+    /// [`UpstreamPull::finish`] (classified as a transport failure — a tee
+    /// `Corrupt` verdict cannot normally co-occur with a wire error, since a
+    /// truncated tee feed classifies as transport, not corruption). The
+    /// watermark is persisted either way. A `Corrupt` verdict on a complete
+    /// wire returns `Ok` — the caller already holds the tee error and decides
+    /// the wire-protocol consequence (no `StreamEnd`).
+    pub async fn finish(self, tee_verdict: TeeVerdict) -> anyhow::Result<()> {
         let Self {
             deps,
             pull,
@@ -413,17 +443,35 @@ impl NodeProgressivePull {
         );
         match verify {
             Ok(_) => {
-                record_outcome(
-                    deps,
-                    pk,
-                    &Outcome::Delivered {
-                        bytes: delivered,
-                        elapsed,
-                    },
-                );
-                deps.region_accountant
-                    .record_pulled(&node_id, delivered)
-                    .await;
+                match tee_verdict {
+                    TeeVerdict::Verified => {
+                        record_outcome(
+                            deps,
+                            pk,
+                            &Outcome::Delivered {
+                                bytes: delivered,
+                                elapsed,
+                            },
+                        );
+                        deps.region_accountant
+                            .record_pulled(&node_id, delivered)
+                            .await;
+                    }
+                    TeeVerdict::Corrupt => {
+                        // Paid-but-corrupt: the upstream delivered the promised
+                        // wire bytes but they failed bao verification. Score the
+                        // corruption against the PROVIDER (it is the party that
+                        // served the bytes) so the observation propagates via
+                        // gossip — without this, a lying upstream banks a
+                        // `Delivered` while the downstream client blames US for
+                        // the corrupt forward (#915 review).
+                        warn!(
+                            provider = %pk, %provider_addr, delivered,
+                            "window pull-through upstream served wire-complete but bao-corrupt bytes; scoring Corruption"
+                        );
+                        record_outcome(deps, pk, &Outcome::Corruption);
+                    }
+                }
                 Ok(())
             }
             Err(err) => {
@@ -431,6 +479,43 @@ impl NodeProgressivePull {
                 Err(err)
             }
         }
+    }
+
+    /// Abandon the pull because the teed bao stream failed verification
+    /// MID-fill (#915): the tee's import rejected a chunk group while the
+    /// forward loop was still writing, so the upstream was paid for bytes that
+    /// do not hash to the content root. Persists the watermark (#852), scores
+    /// the provider `Corruption`, and closes the upstream connection. The
+    /// mid-stream sibling of the `TeeVerdict::Corrupt` arm of [`Self::finish`].
+    pub fn abandon_corrupt(self) {
+        let Self {
+            deps,
+            pull,
+            pk,
+            provider_addr,
+            channel_id,
+            hash_bytes,
+            prior_amount,
+            prior_bytes_delivered,
+            ..
+        } = self;
+        let watermark = pull.abort();
+        let Some(deps) = deps.get() else {
+            return;
+        };
+        persist_buyer_progress(deps, provider_addr, channel_id, &watermark);
+        feed_acquisition_observer(
+            deps,
+            hash_bytes,
+            &watermark,
+            prior_amount,
+            prior_bytes_delivered,
+        );
+        warn!(
+            provider = %pk, %provider_addr,
+            "window pull-through upstream served bao-corrupt bytes mid-stream; scoring Corruption"
+        );
+        record_outcome(deps, pk, &Outcome::Corruption);
     }
 
     /// Abandon the pull (the downstream client dropped, underpaid, or a
@@ -813,7 +898,7 @@ fn classify_pull_failure(
         debug!(%provider_addr, %err, "node-origin: upstream rejected our voucher (our payment fault); not tarring upstream reputation");
         return;
     }
-    // A whole-blob hash mismatch (the typed `HashMismatch` sentinel, matched by
+    // A bao verification failure (the typed `HashMismatch` sentinel, matched by
     // `downcast_ref` — not a brittle message string) means the peer was reachable
     // and paid but served wrong bytes → Corruption; everything else is an
     // unreachable/transport failure. The one residual buyer-side error that still

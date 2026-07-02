@@ -62,7 +62,7 @@ use crate::dht::origin::OriginDirectory;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::leech_governor::LeechGovernor;
 use crate::metrics::Metrics;
-use crate::node_origin::{NodeOrigin, NodeProgressivePull};
+use crate::node_origin::{NodeOrigin, NodeProgressivePull, TeeVerdict};
 use crate::receipt_log::{DownloadReceipt, ReceiptSink};
 use crate::region_accounting::RegionAccountant;
 
@@ -1051,8 +1051,10 @@ impl ClientHandler {
                 // upstream cost before any downstream voucher), it fuses the
                 // upstream pull with downstream delivery so the per-request
                 // exposure is bounded to `pull_ahead_bytes`. It requires an
-                // offset-0 request (the incremental whole-blob hash is only valid
-                // from 0); a resumed miss falls back to the buffered path.
+                // offset-0 request (the tee imports the FULL-blob bao stream —
+                // its verifying decoder walks `ChunkRanges::all()` — and the
+                // window loop streams/bills the entire blob); a resumed miss
+                // falls back to the buffered path.
                 //
                 // It also requires `byte_len == 0` (a whole-blob/whole-tail
                 // request): the window loop streams and bills the entire blob, so
@@ -1523,14 +1525,32 @@ impl ClientHandler {
                         pulled = pulled.saturating_add(Bytes::new(len));
                         self.leech_record_pulled(&peer, len);
                         if let Err(e) = tee.write(&chunk).await {
-                            // A LOCAL store fault on already-paid bytes — distinct
-                            // from a downstream client drop (which goes through
-                            // `abandon_window_serve`). Meter it separately so an
-                            // operator can tell a failing `data_dir` from flaky
-                            // peers. `abandon` still persists the buyer watermark
-                            // (#852) for what we paid upstream.
-                            pull.abandon(None);
+                            // Classify by what actually killed the write (#915
+                            // review). `TeeSink::write` surfaces the ended import
+                            // task's own verdict: a `HashMismatch` means the tee's
+                            // bao decoder REJECTED a forwarded group mid-stream —
+                            // a corrupt/lying upstream, scored as such — while
+                            // anything else is a genuinely LOCAL store fault
+                            // (failing `data_dir`), metered separately so an
+                            // operator can tell the two apart. Either way the
+                            // abandon persists the buyer watermark (#852) for
+                            // what we paid upstream, and no `StreamEnd` is sent
+                            // (the returned error resets the stream; the
+                            // downstream's own decoder rejects the bytes).
                             tee.abandon();
+                            if matches!(e, CacheError::HashMismatch { .. }) {
+                                pull.abandon_corrupt();
+                                self.metrics.node_pull_through_upstream_verify_failed();
+                                tracing::warn!(
+                                    %hash, %channel_id, served_paid = served_paid.get(),
+                                    pulled = pulled.get(), error = %e,
+                                    "window pull-through upstream failed bao verification mid-stream; abandoning, not caching"
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "upstream bao verification failed mid-stream: {e}"
+                                ));
+                            }
+                            pull.abandon(None);
                             self.metrics.node_pull_through_local_tee_failed();
                             return Err(anyhow::anyhow!("cache tee write failed: {e}"));
                         }
@@ -1650,22 +1670,32 @@ impl ClientHandler {
         }
 
         // Finalize. Under ADR 038 the cached copy is verified by the tee's bao
-        // decoder against the content root, so `pull.finish()` only checks that the
-        // forwarded WIRE stream was complete; the integrity verdict comes from
-        // `tee.finish()`. Three outcomes:
-        //   - short upstream     → `pull.finish()` Err
-        //   - corrupt upstream   → `pull.finish()` Ok, `tee.finish()` HashMismatch
-        //   - local store fault  → `pull.finish()` Ok, `tee.finish()` other Err
-        match pull.finish().await {
-            Err(e) => {
-                // Short/incomplete upstream WIRE stream: do NOT promote. The
-                // protocol has no mid-stream delivery-fault code (only
+        // decoder against the content root, so `pull.finish(..)` only checks that
+        // the forwarded WIRE stream was complete; the integrity verdict comes from
+        // `tee.finish()`. Settle the TEE FIRST (all tee writes are done; a
+        // truncated fill cannot promote — decoder EOF and the temp-tag hash check
+        // both fail closed) and feed its verdict into `pull.finish(..)`, so a
+        // wire-complete-but-corrupt upstream is scored `Corruption` — not
+        // `Delivered` — before anything is gossiped (#915 review). Three outcomes:
+        //   - short upstream     → `pull.finish(..)` Err (tee refused to promote)
+        //   - corrupt upstream   → `pull.finish(..)` Ok, tee `HashMismatch`
+        //   - local store fault  → `pull.finish(..)` Ok, tee other Err
+        let tee_result = tee.finish().await;
+        let verdict = if matches!(tee_result, Err(CacheError::HashMismatch { .. })) {
+            TeeVerdict::Corrupt
+        } else {
+            TeeVerdict::Verified
+        };
+        match (pull.finish(verdict).await, tee_result) {
+            (Err(e), _) => {
+                // Short/incomplete upstream WIRE stream: do NOT promote (the tee
+                // result — an inevitable truncation error — was already refused
+                // above). The protocol has no mid-stream delivery-fault code (only
                 // `VoucherRejected` rides mid-stream; the delivery-side
                 // `StreamError` codes are initial-`StreamResponse`-only — ADR 005
                 // §domain split), so we do NOT emit a frame: closing the send side
                 // WITHOUT a `StreamEnd` sentinel is itself the signal, and the
                 // downstream's own bao decoder rejects the truncated bytes.
-                tee.abandon();
                 self.metrics.node_pull_through_upstream_verify_failed();
                 tracing::warn!(
                     %hash, %channel_id, served_paid = served_paid.get(), total_bytes, error = %e,
@@ -1674,50 +1704,50 @@ impl ClientHandler {
                 let _ = send.finish();
                 Ok(())
             }
-            Ok(()) => match tee.finish().await {
-                Ok(()) => {
-                    // Honest upstream, cached: the promote succeeded, so this node
-                    // is now a discoverable holder. Signal clean completion.
-                    self.write_message(send, &ClientMessage::StreamEnd).await?;
-                    // A failed `finish()` here means the clean `StreamEnd` may not
-                    // have reached the wire even though we counted the bytes as
-                    // served — log it rather than discard silently.
-                    if let Err(e) = send.finish() {
-                        tracing::debug!(%hash, error = %e, "window pull-through send.finish failed after StreamEnd");
-                    }
-                    Ok(())
+            (Ok(()), Ok(())) => {
+                // Honest upstream, cached: the promote succeeded, so this node
+                // is now a discoverable holder. Signal clean completion.
+                self.write_message(send, &ClientMessage::StreamEnd).await?;
+                // A failed `finish()` here means the clean `StreamEnd` may not
+                // have reached the wire even though we counted the bytes as
+                // served — log it rather than discard silently.
+                if let Err(e) = send.finish() {
+                    tracing::debug!(%hash, error = %e, "window pull-through send.finish failed after StreamEnd");
                 }
-                Err(CacheError::HashMismatch { .. }) => {
-                    // The teed bao failed verification against the content root: a
-                    // corrupt/lying upstream forwarded bytes that do not hash to
-                    // `hash` (ADR 038). The downstream's own decoder rejects them
-                    // too. Do NOT promote and do NOT send `StreamEnd` — closing
-                    // without the sentinel is the delivery-failure signal (as in
-                    // the short-upstream arm above).
-                    self.metrics.node_pull_through_upstream_verify_failed();
-                    tracing::warn!(
-                        %hash, %channel_id, served_paid = served_paid.get(), total_bytes,
-                        "window pull-through upstream served bytes that failed bao verification; not caching, no StreamEnd sent"
-                    );
-                    let _ = send.finish();
-                    Ok(())
+                Ok(())
+            }
+            (Ok(()), Err(CacheError::HashMismatch { .. })) => {
+                // The teed bao failed verification against the content root: a
+                // corrupt/lying upstream forwarded bytes that do not hash to
+                // `hash` (ADR 038). `pull.finish(Corrupt)` above already scored
+                // the provider `Corruption` (with its identity) in place of
+                // `Delivered`. The downstream's own decoder rejects the bytes
+                // too. Do NOT promote and do NOT send `StreamEnd` — closing
+                // without the sentinel is the delivery-failure signal (as in
+                // the short-upstream arm above).
+                self.metrics.node_pull_through_upstream_verify_failed();
+                tracing::warn!(
+                    %hash, %channel_id, served_paid = served_paid.get(), total_bytes,
+                    "window pull-through upstream served bytes that failed bao verification; not caching, no StreamEnd sent"
+                );
+                let _ = send.finish();
+                Ok(())
+            }
+            (Ok(()), Err(other)) => {
+                // Honest upstream (the forwarded bytes verified for the client),
+                // but a LOCAL store fault rejected the promote (cap breach,
+                // disk). The bytes were already served and paid, so delivery
+                // completes cleanly — only the warm-cache benefit is forfeit.
+                // Meter it so a node paying upstream egress but caching nothing
+                // is alertable.
+                self.metrics.node_pull_through_tee_finalize_failed();
+                tracing::warn!(%hash, error = %other, "window pull-through tee finalize failed; blob served but not cached");
+                self.write_message(send, &ClientMessage::StreamEnd).await?;
+                if let Err(e) = send.finish() {
+                    tracing::debug!(%hash, error = %e, "window pull-through send.finish failed after StreamEnd");
                 }
-                Err(other) => {
-                    // Honest upstream (the forwarded bytes verified for the client),
-                    // but a LOCAL store fault rejected the promote (cap breach,
-                    // disk). The bytes were already served and paid, so delivery
-                    // completes cleanly — only the warm-cache benefit is forfeit.
-                    // Meter it so a node paying upstream egress but caching nothing
-                    // is alertable.
-                    self.metrics.node_pull_through_tee_finalize_failed();
-                    tracing::warn!(%hash, error = %other, "window pull-through tee finalize failed; blob served but not cached");
-                    self.write_message(send, &ClientMessage::StreamEnd).await?;
-                    if let Err(e) = send.finish() {
-                        tracing::debug!(%hash, error = %e, "window pull-through send.finish failed after StreamEnd");
-                    }
-                    Ok(())
-                }
-            },
+                Ok(())
+            }
         }
     }
 
