@@ -24,19 +24,23 @@ use decdn_incentive::{bind_node_id_domain, binding_signing_hash, node_register};
 
 use crate::bindings::{CapacityBond, Erc20, PublisherRegistry};
 
-/// Base for the per-fixture chain id. Each `ChainFixture` derives a *unique*
-/// chain id `CHAIN_BASE + (port % 10_000)` so concurrent fixtures (and the node
-/// crate's `anvil_settlement_e2e.rs`) never share — and thus never race on —
-/// the `deployments/<chain_id>.json` manifest. The whole `31_337_69x_xxx` range
-/// matches the `deployments/3133769*.json` gitignore glob (`contracts/.gitignore`),
-/// so a crashed run's leftover manifest stays untracked.
+/// Base for the per-fixture chain id. Each `ChainFixture` derives its chain id
+/// as `CHAIN_BASE + port` (the full ephemeral port), so concurrent fixtures (and
+/// the node crate's `anvil_settlement_e2e.rs`) never share — and thus never race
+/// on — the `deployments/<chain_id>.json` manifest. Because the OS never hands
+/// the same port to two live listeners, a chain-id collision can only coincide
+/// with a port collision, which already fails the anvil bind; folding the port
+/// modulo a range (as an earlier revision did) instead *added* collisions. The
+/// resulting `31_337_691_024..=31_337_755_535` range matches the
+/// `deployments/31337[67]*.json` gitignore glob (`contracts/.gitignore`), so a
+/// crashed run's leftover manifest stays untracked.
 const CHAIN_BASE: u64 = 31_337_690_000;
 
 /// Anvil dev account #0 — funded at genesis, broadcasts the deploy script.
 const DEPLOYER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const DEPLOYER_ADDR: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
-/// Anvil dev account #1 — the in-process "admin" EOA: deploys the mock USDC,
-/// holds the initial TOKEN supply, mints/transfers, and impersonation targets.
+/// Anvil dev account #1 — the "admin" EOA: deploys the mock USDC, holds the
+/// initial TOKEN supply, and mints/transfers.
 /// Deliberately NOT account #0 (the forge-script broadcaster, whose nonce the
 /// script advances by ~25 — sharing it desyncs alloy's cached nonce).
 const ADMIN_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
@@ -110,10 +114,11 @@ impl ChainFixture {
         let contracts = contracts_dir()?;
         forge_build(&contracts).await?;
 
-        let port = free_port()?;
+        let port = crate::free_port()?;
         // Unique per fixture so the deploy manifest path never collides with a
-        // concurrent fixture's (distinct ephemeral `port` => distinct id).
-        let chain_id = CHAIN_BASE + u64::from(port % 10_000);
+        // concurrent fixture's: the full ephemeral port is unique across live
+        // listeners (see `CHAIN_BASE`).
+        let chain_id = CHAIN_BASE + u64::from(port);
         let rpc_url = format!("http://127.0.0.1:{port}");
         let child = Command::new("anvil")
             .args([
@@ -126,7 +131,7 @@ impl ChainFixture {
             .spawn()
             .context("spawn anvil (is foundry installed?)")?;
         let manifest = contracts.join(format!("deployments/{chain_id}.json"));
-        let anvil = AnvilGuard {
+        let mut anvil = AnvilGuard {
             child,
             manifest: manifest.clone(),
         };
@@ -140,12 +145,21 @@ impl ChainFixture {
             .connect_http(url.clone())
             .erased();
 
-        // Wait for the RPC to accept requests.
-        poll_until(Duration::from_secs(20), || async {
-            admin.get_chain_id().await.ok()
-        })
-        .await
-        .context("anvil RPC never came up")?;
+        // Wait for the RPC to accept requests, failing fast if anvil died at
+        // startup (bad args / port clash) rather than waiting out the timeout.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if admin.get_chain_id().await.is_ok() {
+                break;
+            }
+            if let Ok(Some(status)) = anvil.child.try_wait() {
+                anyhow::bail!("anvil exited prematurely before its RPC came up: {status}");
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("anvil RPC never came up within 20s");
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
 
         // Deploy mock USDC, then the protocol with the initial TOKEN supply held
         // by the admin EOA so it can distribute bond stake to N operators.
@@ -191,7 +205,7 @@ impl ChainFixture {
 
     /// Mint `amount` mock-USDC base units to `to` (admin is the minter).
     pub async fn mint_usdc(&self, to: Address, amount: U256) -> anyhow::Result<()> {
-        Erc20::new(self.usdc, &self.admin)
+        let receipt = Erc20::new(self.usdc, &self.admin)
             .mint(to, amount)
             .send()
             .await
@@ -199,12 +213,12 @@ impl ChainFixture {
             .get_receipt()
             .await
             .context("usdc.mint receipt")?;
-        Ok(())
+        crate::ensure_mined(&receipt, "usdc.mint")
     }
 
     /// Transfer `amount` TOKEN from the admin (initial holder) to `to`.
     pub async fn transfer_token(&self, to: Address, amount: U256) -> anyhow::Result<()> {
-        Erc20::new(self.addrs.token, &self.admin)
+        let receipt = Erc20::new(self.addrs.token, &self.admin)
             .transfer(to, amount)
             .send()
             .await
@@ -212,7 +226,7 @@ impl ChainFixture {
             .get_receipt()
             .await
             .context("token.transfer receipt")?;
-        Ok(())
+        crate::ensure_mined(&receipt, "token.transfer")
     }
 
     /// Take an operator from bare to on-chain `isActive`: fund gas, stake the
@@ -236,7 +250,7 @@ impl ChainFixture {
 
         let op_provider = self.provider_for(operator);
         let bond = CapacityBond::new(self.addrs.capacity_bond, &op_provider);
-        Erc20::new(self.addrs.token, &op_provider)
+        let approve_receipt = Erc20::new(self.addrs.token, &op_provider)
             .approve(self.addrs.capacity_bond, min_bond)
             .send()
             .await
@@ -244,13 +258,16 @@ impl ChainFixture {
             .get_receipt()
             .await
             .context("token.approve receipt")?;
-        bond.bond(min_bond)
+        crate::ensure_mined(&approve_receipt, "token.approve")?;
+        let bond_receipt = bond
+            .bond(min_bond)
             .send()
             .await
             .context("bond send")?
             .get_receipt()
             .await
             .context("bond receipt")?;
+        crate::ensure_mined(&bond_receipt, "bond")?;
 
         // Nonces feed both signature digests (fresh operator/nodeId → 0, but
         // read them so a re-onboard converges rather than signing a stale nonce).
@@ -283,19 +300,21 @@ impl ChainFixture {
         let packed_multiaddrs =
             node_register::pack_multiaddrs(&[multiaddr.to_string()]).context("pack multiaddrs")?;
 
-        bond.registerNode(
-            node_id,
-            Bytes::from(packed_multiaddrs),
-            region.to_string(),
-            Bytes::from(binding_sig),
-            Bytes::from(ed_sig),
-        )
-        .send()
-        .await
-        .context("registerNode send")?
-        .get_receipt()
-        .await
-        .context("registerNode receipt")?;
+        let register_receipt = bond
+            .registerNode(
+                node_id,
+                Bytes::from(packed_multiaddrs),
+                region.to_string(),
+                Bytes::from(binding_sig),
+                Bytes::from(ed_sig),
+            )
+            .send()
+            .await
+            .context("registerNode send")?
+            .get_receipt()
+            .await
+            .context("registerNode receipt")?;
+        crate::ensure_mined(&register_receipt, "registerNode")?;
 
         anyhow::ensure!(
             bond.isActive(op_addr)
@@ -319,7 +338,7 @@ impl ChainFixture {
             .call()
             .await
             .context("createNamespace call (static)")?;
-        registry
+        let receipt = registry
             .createNamespace()
             .send()
             .await
@@ -327,6 +346,9 @@ impl ChainFixture {
             .get_receipt()
             .await
             .context("createNamespace receipt")?;
+        // The static `call` above returns the id the `send` *would* mint; only
+        // trust it once the real transaction is confirmed non-reverted.
+        crate::ensure_mined(&receipt, "createNamespace")?;
         Ok(id)
     }
 
@@ -354,30 +376,6 @@ fn contracts_dir() -> anyhow::Result<PathBuf> {
         .join("../../contracts")
         .canonicalize()
         .context("resolve contracts dir")
-}
-
-/// Grab an ephemeral TCP port, then release it for anvil to claim.
-fn free_port() -> anyhow::Result<u16> {
-    let l = std::net::TcpListener::bind(("127.0.0.1", 0)).context("bind ephemeral port")?;
-    Ok(l.local_addr().context("local_addr")?.port())
-}
-
-/// Poll `f` until it yields `Some`, or `timeout` elapses.
-async fn poll_until<T, F, Fut>(timeout: Duration, mut f: F) -> Option<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<T>>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Some(v) = f().await {
-            return Some(v);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
 }
 
 /// Run a `forge` subprocess under a wall-clock `timeout`, SIGKILLing it on
@@ -530,4 +528,24 @@ fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {
         origin_assignment: get("OriginAssignment")?,
         content_blacklist: get("ContentBlacklist")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forge_body_completion_gates_on_the_success_marker() {
+        // A non-zero exit *after* forge prints this marker is a broadcast-phase
+        // hiccup (retryable, #883); its absence means a revert before the body
+        // ran (fail fast). The classifier keys purely off the marker string, so
+        // pin both branches — if forge changes the wording this test catches it.
+        assert!(forge_script_body_completed(
+            b"...\nScript ran successfully.\n== Logs ==\n"
+        ));
+        assert!(!forge_script_body_completed(
+            b"Error: script failed: revert: Ownable: caller is not the owner"
+        ));
+        assert!(!forge_script_body_completed(b""));
+    }
 }

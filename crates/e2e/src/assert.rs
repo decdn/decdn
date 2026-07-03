@@ -70,22 +70,20 @@ mod tests {
 
     #[test]
     fn channel_id_matches_packed_keccak() {
-        // `keccak256(client ‖ provider ‖ uint256(nonce))` — the same derivation
-        // `PaymentChannel.openChannel` uses. A fixed vector pins it so a refactor
-        // of the packing can't silently diverge from the contract.
+        // `keccak256(abi.encodePacked(client, provider, uint256(nonce)))` — the
+        // derivation `PaymentChannel.openChannel` uses. The expected hash is an
+        // independent fixed vector (produced with `cast keccak` over the packed
+        // bytes), so a wrong *original* packing — field order, endianness, nonce
+        // width — is caught, not just a later refactor.
         let client: Address = "0x0000000000000000000000000000000000000001"
             .parse()
             .unwrap();
         let provider: Address = "0x0000000000000000000000000000000000000002"
             .parse()
             .unwrap();
-        let mut packed = Vec::new();
-        packed.extend_from_slice(client.as_slice());
-        packed.extend_from_slice(provider.as_slice());
-        packed.extend_from_slice(&U256::from(7u64).to_be_bytes::<32>());
-        assert_eq!(
-            channel_id(client, provider, 7),
-            alloy::primitives::keccak256(&packed)
+        let expected = alloy::primitives::b256!(
+            "0xf8ca1ac6826b46e04989b1fb54c7e400ae0d611a635ab73fa7a95b28d5f46eda"
         );
+        assert_eq!(channel_id(client, provider, 7), expected);
     }
 }

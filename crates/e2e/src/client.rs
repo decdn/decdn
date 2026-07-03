@@ -63,7 +63,7 @@ impl ClientFixture {
 
         // One-time max-ish approval so repeated opens don't each re-approve.
         let provider = chain.provider_for(&signer);
-        Erc20::new(chain.usdc, &provider)
+        let approve_receipt = Erc20::new(chain.usdc, &provider)
             .approve(
                 chain.addrs.payment_channel,
                 U256::from(DEPOSIT_MICRO_USDC) * U256::from(100u64),
@@ -74,9 +74,17 @@ impl ClientFixture {
             .get_receipt()
             .await
             .context("client approve receipt")?;
+        crate::ensure_mined(&approve_receipt, "client approve")?;
 
         let endpoint = loopback_endpoint().await?;
         Ok(Self { signer, endpoint })
+    }
+
+    /// The buyer's Ethereum address (channel owner / voucher signer), for
+    /// journeys that assert on client-side `PaymentChannel` state.
+    #[must_use]
+    pub fn address(&self) -> alloy::primitives::Address {
+        self.signer.address()
     }
 
     /// Open a channel to `node`, then fetch `hash` over the paid path, retrying
@@ -97,13 +105,15 @@ impl ClientFixture {
             .await
             .context("read client channel nonce")?;
         let deposit = U256::from(DEPOSIT_MICRO_USDC);
-        pc.openChannel(node.operator_addr, deposit)
+        let open_receipt = pc
+            .openChannel(node.operator_addr, deposit)
             .send()
             .await
             .context("openChannel send")?
             .get_receipt()
             .await
             .context("openChannel receipt")?;
+        crate::ensure_mined(&open_receipt, "openChannel")?;
         let cid = channel_id(
             client_addr,
             node.operator_addr,

@@ -9,7 +9,7 @@ publish = false
 
 # This crate is test-infrastructure only: it ships reusable fixtures (chain /
 # node / client / time-control / assertions) that compose a real anvil
-# deployment, in-process daemon(s), and the paid client path. The fixtures live
+# deployment, subprocess daemon(s), and the paid client path. The fixtures live
 # in the library; the only test target is the feature-gated smoke test that
 # proves they compose. See `crates/node/tests/anvil_settlement_e2e.rs` for the
 # monolith this generalizes.

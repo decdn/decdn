@@ -52,7 +52,6 @@ alloy::sol! {
             bytes ed25519Signature
         ) external;
         function isActive(address operator) external view returns (bool);
-        function bondingNonce(address operator) external view returns (uint64);
         function bindingNonce(address operator) external view returns (uint64);
         function registrationNonce(bytes32 nodeId) external view returns (uint64);
     }
@@ -84,8 +83,9 @@ alloy::sol! {
     }
 
     /// `OriginAssignment` propose (publisher) + activate (governance) + reads
-    /// (ADR 011). Activation requires `GOVERNANCE_ROLE`; see
-    /// [`crate::chain::ChainFixture::activate_assignment_via_impersonation`].
+    /// (ADR 011). Activation requires `GOVERNANCE_ROLE`; a fixture helper to
+    /// drive it under role impersonation is not yet implemented (forward surface
+    /// for the origin-recognition journeys #1038/#1039).
     #[sol(rpc)]
     contract OriginAssignment {
         function proposeAssignment(uint256 namespaceId, address[] operators) external;

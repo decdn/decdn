@@ -1,5 +1,5 @@
-//! Node fixture: an in-process `decdn-node` daemon (spawned as a subprocess)
-//! wired to a [`crate::chain::ChainFixture`] deployment.
+//! Node fixture: a `decdn-node` daemon (spawned as a subprocess) wired to a
+//! [`crate::chain::ChainFixture`] deployment.
 //!
 //! The daemon is run as a real subprocess rather than via `runtime::run`
 //! in-process because the runtime installs **process-global** SIGHUP/SIGTERM
@@ -110,9 +110,9 @@ impl NodeFixture {
         let hash = Hash::new(serve_blob);
         write_fs_origin_blob(origin_dir.path(), &hash, serve_blob)?;
 
-        let bind_port = free_port()?;
-        let admin_port = free_port()?;
-        let metrics_port = free_port()?;
+        let bind_port = crate::free_port()?;
+        let admin_port = crate::free_port()?;
+        let metrics_port = crate::free_port()?;
         let multiaddr = format!("/ip4/127.0.0.1/udp/{bind_port}/quic-v1");
 
         chain
@@ -205,11 +205,17 @@ impl NodeFixture {
     /// port clash) rather than waiting out the full timeout.
     pub async fn wait_healthy(&self, timeout: Duration) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
+        // Remember the last probe error so a persistent-but-alive failure mode
+        // surfaces its cause instead of a bare "not healthy" timeout. Always
+        // written before the deadline read below, so it starts uninitialized.
+        let mut last_err: Option<String>;
         loop {
-            if let Ok(client) = self.admin_client()
-                && client.health().await.is_ok()
-            {
-                return Ok(());
+            match self.admin_client() {
+                Ok(client) => match client.health().await {
+                    Ok(_) => return Ok(()),
+                    Err(e) => last_err = Some(e.to_string()),
+                },
+                Err(e) => last_err = Some(e.to_string()),
             }
             // Detect a daemon that died at startup. Scope the lock so the guard
             // is dropped before the `sleep().await` (never hold a std `Mutex`
@@ -227,8 +233,11 @@ impl NodeFixture {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
+                let cause = last_err
+                    .map(|e| format!(" (last probe error: {e})"))
+                    .unwrap_or_default();
                 anyhow::bail!(
-                    "admin RPC at {} not healthy within {timeout:?}",
+                    "admin RPC at {} not healthy within {timeout:?}{cause}",
                     self.admin_url
                 );
             }
@@ -292,7 +301,7 @@ path = '{origin_dir}'
 rate_per_mb = 10
 
 [observability]
-log_level = "info"
+log_level = "warn"
 log_format = "pretty"
 admin_port = {admin_port}
 metrics_port = {metrics_port}
@@ -350,10 +359,4 @@ fn decdn_node_bin() -> anyhow::Result<PathBuf> {
         bin.display()
     );
     Ok(bin)
-}
-
-/// Grab an ephemeral TCP port, then release it for the daemon to claim.
-fn free_port() -> anyhow::Result<u16> {
-    let l = std::net::TcpListener::bind(("127.0.0.1", 0)).context("bind ephemeral port")?;
-    Ok(l.local_addr().context("local_addr")?.port())
 }
