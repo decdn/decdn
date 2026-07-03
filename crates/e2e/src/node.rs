@@ -30,14 +30,20 @@ use crate::chain::ChainFixture;
 const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
 
 /// Kills the spawned `decdn-node` on drop so a panicking assertion never leaks
-/// the daemon process.
+/// the daemon process. The `Child` is behind a `Mutex` so [`NodeFixture::wait_healthy`]
+/// can `try_wait` it through a shared `&self` reference.
 #[derive(Debug)]
-struct NodeGuard(Child);
+struct NodeGuard(std::sync::Mutex<Child>);
 
 impl Drop for NodeGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // Poison-tolerant: run cleanup even if a panic poisoned the lock.
+        let mut child = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -45,7 +51,7 @@ impl Drop for NodeGuard {
 /// pre-seeded blob via a filesystem pull-through origin.
 #[derive(Debug)]
 pub struct NodeFixture {
-    _child: NodeGuard,
+    child: NodeGuard,
     // TempDirs kept alive for the daemon's lifetime.
     _data_dir: tempfile::TempDir,
     _origin_dir: tempfile::TempDir,
@@ -170,7 +176,7 @@ impl NodeFixture {
             .context("spawn decdn-node")?;
 
         let fixture = Self {
-            _child: NodeGuard(child),
+            child: NodeGuard(std::sync::Mutex::new(child)),
             _data_dir: data_dir,
             _origin_dir: origin_dir,
             operator,
@@ -194,7 +200,9 @@ impl NodeFixture {
             .with_context(|| format!("build admin client for {}", self.admin_url))
     }
 
-    /// Poll `admin_v1_health` until it succeeds or `timeout` elapses.
+    /// Poll `admin_v1_health` until it succeeds or `timeout` elapses. Fails fast
+    /// if the daemon process exits before becoming healthy (e.g. bad config /
+    /// port clash) rather than waiting out the full timeout.
     pub async fn wait_healthy(&self, timeout: Duration) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -202,6 +210,21 @@ impl NodeFixture {
                 && client.health().await.is_ok()
             {
                 return Ok(());
+            }
+            // Detect a daemon that died at startup. Scope the lock so the guard
+            // is dropped before the `sleep().await` (never hold a std `Mutex`
+            // across an await point).
+            {
+                let mut child = self
+                    .child
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Ok(Some(status)) = child.try_wait() {
+                    anyhow::bail!(
+                        "decdn-node exited prematurely before becoming healthy: {status}"
+                    );
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!(

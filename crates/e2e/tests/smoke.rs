@@ -48,7 +48,8 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
 async fn smoke_compose_fixtures() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
-        .context("e2e smoke exceeded the overall timeout")?
+        .context("e2e smoke exceeded the overall timeout")??;
+    Ok(())
 }
 
 async fn run() -> anyhow::Result<()> {
