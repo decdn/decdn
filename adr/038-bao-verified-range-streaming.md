@@ -1,7 +1,7 @@
 # ADR 038: Bao Verified-Range Streaming on `cdn/client/v1`
 
 **Date:** 2026-06-15
-**Status:** Accepted
+**Status:** Draft
 
 ## Context
 
