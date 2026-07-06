@@ -3121,8 +3121,9 @@ impl RecvStream for ChannelRecvStream {
 /// pull-through fill: drive a bao [`ResponseDecoder`] over the feeder channel,
 /// yielding each verified chunk-group's plaintext (proof `Parent` nodes are
 /// skipped). `content_size` — the signed whole-blob size passed to
-/// [`CacheEngine::open_tee_sink`] — frames the bao tree, so the fed wire is the
-/// header-less interleaved stream (no in-band 8-byte size header). The error
+/// [`TeeReservation::begin`] once the upstream header is known — frames the bao
+/// tree, so the fed wire is the header-less interleaved stream (no in-band 8-byte
+/// size header). The error
 /// taxonomy matches the client-side decoder (ADR 038): a genuine group/parent
 /// hash mismatch surfaces as an `io::Error` wrapping [`BaoVerifyMarker`] (then
 /// the stream ends), so the import reports a CORRUPTION outcome; a truncated
