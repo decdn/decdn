@@ -22,7 +22,12 @@ pub enum CacheError {
     HashMismatch {
         /// The hash the caller asked for.
         expected: Hash,
-        /// The hash the origin's bytes actually produced.
+        /// The hash the origin's bytes actually produced. On the tee-fill path
+        /// a bao chunk-group verify failure has no meaningful whole-blob
+        /// "actual" (the failure is at an interior group), so this carries the
+        /// `Hash::EMPTY` sentinel — beware that it renders as the legitimate
+        /// hash of the zero-byte blob (#915; a dedicated variant is a tracked
+        /// follow-up).
         actual: Hash,
     },
 

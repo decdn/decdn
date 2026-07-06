@@ -5,7 +5,7 @@
 
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use decdn_cache::range_pull::{
-    IROH_BLOCK_SIZE, RangeVerifyError, align_range, encode_verified_range,
+    IROH_BLOCK_SIZE, RangeVerifyError, align_range, bao_encoded_size, encode_verified_range,
 };
 
 // Bytes per chunk group, derived from the upstream block size (not hard-coded)
@@ -327,5 +327,54 @@ async fn non_group_aligned_blob_tail_roundtrips() -> anyhow::Result<()> {
         exported == sub(&blob, req_start, blob_size)?,
         "tail sub-range mismatch"
     );
+    Ok(())
+}
+
+// --- bao_encoded_size (#915, ADR 038 §Payment metering) ----------------------
+
+/// `bao_encoded_size` must equal the byte length the serve side actually emits.
+/// `encode_verified_range` produces the *combined* encoding (an 8-byte LE size
+/// header followed by the interleaved proof+data stream); the `cdn/client/v1`
+/// wire carries the *header-less* form, so the wire length is `encoded.len() - 8`.
+/// Cross-check `bao_encoded_size` against that for ranges that exercise the
+/// distinct code paths: whole blob, an interior multi-group span, a single chunk
+/// group, and a tail that lands in the partial final group.
+fn assert_encoded_size_matches(blob_len: usize, offset: u64, len: u64) -> anyhow::Result<()> {
+    let blob = make_blob(blob_len);
+    let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+    let root = *ob.root.as_bytes();
+    let blob_size = u64::try_from(blob.len())?;
+
+    let aligned = align_range(offset, len, blob_size)?;
+    let data = sub(&blob, aligned.fetch_start(), aligned.fetch_end())?;
+    let combined = encode_verified_range(root, blob_size, &aligned, &data, ob.data.clone().into())?;
+
+    // Header-less wire length = combined length minus the 8-byte size header.
+    let wire_len = u64::try_from(combined.len())?
+        .checked_sub(8)
+        .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its 8-byte header"))?;
+    let predicted = bao_encoded_size(blob_size, aligned.chunk_ranges());
+    anyhow::ensure!(
+        predicted == wire_len,
+        "bao_encoded_size {predicted} != actual wire length {wire_len} \
+         (blob {blob_len}, offset {offset}, len {len})"
+    );
+    // Sanity: proof overhead means the wire carries strictly more than the data.
+    anyhow::ensure!(predicted >= aligned.fetch_len(), "wire must cover the data");
+    Ok(())
+}
+
+#[test]
+fn bao_encoded_size_matches_actual_wire_length() -> anyhow::Result<()> {
+    // Whole blob (offset 0, len 0 == to-end).
+    assert_encoded_size_matches(200 * 1024, 0, 0)?;
+    // Interior multi-group span.
+    assert_encoded_size_matches(200 * 1024, 64 * 1024, 32 * 1024)?;
+    // A single 16 KiB chunk group.
+    assert_encoded_size_matches(200 * 1024, 32 * 1024, 16 * 1024)?;
+    // Tail inside the partial final group of a non-multiple blob.
+    assert_encoded_size_matches(200 * 1024 + 1234, 196 * 1024, 0)?;
+    // A blob smaller than one chunk group (single-leaf tree, no interior nodes).
+    assert_encoded_size_matches(500, 0, 0)?;
     Ok(())
 }

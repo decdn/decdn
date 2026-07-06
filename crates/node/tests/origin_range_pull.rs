@@ -199,16 +199,15 @@ async fn ranged_paid_pull(
         other => anyhow::bail!("expected StreamResponse, got {other:?}"),
     };
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
-    // The advertised size is the *whole* blob; the range delivers `byte_len`,
-    // or the whole tail (`total_bytes - byte_offset`) when `byte_len == 0`.
-    // Reject an impossible advertised total rather than saturating to zero — a
-    // server that signed an out-of-range `total_bytes` is a bug the test must
-    // surface, not mask behind an `expected == 0`.
-    let expected = if byte_len == 0 {
+    // The advertised size is the *whole* blob; the range delivers `byte_len`, or
+    // the whole tail when `byte_len == 0`. Reject an impossible advertised total
+    // rather than masking a server bug: a signed `total_bytes` before the offset
+    // or shorter than the requested range end is surfaced here.
+    if byte_len == 0 {
         resp.body
             .total_bytes
             .checked_sub(byte_offset)
-            .ok_or_else(|| anyhow::anyhow!("response total_bytes is before byte_offset"))?
+            .ok_or_else(|| anyhow::anyhow!("response total_bytes is before byte_offset"))?;
     } else {
         let end = byte_offset
             .checked_add(byte_len)
@@ -217,8 +216,15 @@ async fn ranged_paid_pull(
             end <= resp.body.total_bytes,
             "response total_bytes is smaller than the requested range end"
         );
-        byte_len
-    };
+    }
+    // ADR 038: the wire carries the bao verified-stream (content + interleaved
+    // proof) for the group-aligned superset of the request, so the paid/closing
+    // boundary is the bao-encoded WIRE size, not the requested content length.
+    let aligned =
+        decdn_cache::range_pull::align_range(byte_offset, byte_len, resp.body.total_bytes)
+            .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(resp.body.total_bytes, aligned.chunk_ranges());
     let interval_bytes = resp
         .voucher_interval_mb
         .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
@@ -236,7 +242,7 @@ async fn ranged_paid_pull(
                 cumulative = cumulative.saturating_add(len);
                 unvouchered = unvouchered.saturating_add(len);
                 let boundary = interval_bytes > 0 && unvouchered >= interval_bytes;
-                let closing = cumulative >= expected && unvouchered > 0;
+                let closing = cumulative >= expected_wire && unvouchered > 0;
                 if boundary || closing {
                     nonce += 1;
                     let amount = U256::from(cumulative)
@@ -272,7 +278,50 @@ async fn ranged_paid_pull(
         }
     }
     conn.close(0u32.into(), b"done");
-    Ok(buf.to_vec())
+    // The wire is the header-less bao verified-stream for the aligned superset;
+    // decode + verify it against the root and trim to the requested span (ADR
+    // 038), so callers compare against the exact range content as before.
+    decode_bao_range(hash, resp.body.total_bytes, byte_offset, byte_len, &buf)
+}
+
+/// Decode the header-less bao verified-stream `wire` for `[byte_offset,
+/// byte_offset+byte_len)` (`byte_len == 0` ⇒ to end), verifying every chunk
+/// group against `hash`, and trim the group-aligned superset back to the exact
+/// requested span. Mirrors the production receiver (`client-pull`).
+fn decode_bao_range(
+    hash: Hash,
+    total_bytes: u64,
+    byte_offset: u64,
+    byte_len: u64,
+    wire: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    use bao_tree::BaoTree;
+    use bao_tree::io::BaoContentItem;
+    use bao_tree::io::sync::DecodeResponseIter;
+
+    let aligned = decdn_cache::range_pull::align_range(byte_offset, byte_len, total_bytes)
+        .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
+    let tree = BaoTree::new(total_bytes, decdn_cache::range_pull::IROH_BLOCK_SIZE);
+    let reader = std::io::Cursor::new(wire);
+    let mut plaintext = Vec::new();
+    for item in DecodeResponseIter::new(hash.into(), tree, reader, aligned.chunk_ranges().as_ref())
+    {
+        match item.map_err(|e| anyhow::anyhow!("bao decode: {e}"))? {
+            BaoContentItem::Leaf(leaf) => plaintext.extend_from_slice(&leaf.data),
+            BaoContentItem::Parent(_) => {}
+        }
+    }
+    let lead = usize::try_from(byte_offset.saturating_sub(aligned.fetch_start()))?;
+    let want = if byte_len == 0 {
+        plaintext.len().saturating_sub(lead)
+    } else {
+        usize::try_from(byte_len)?
+    };
+    let end = lead.saturating_add(want);
+    let slice = plaintext
+        .get(lead..end)
+        .ok_or_else(|| anyhow::anyhow!("decoded range shorter than requested span"))?;
+    Ok(slice.to_vec())
 }
 
 async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result<()> {

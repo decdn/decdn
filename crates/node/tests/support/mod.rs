@@ -38,6 +38,29 @@ pub fn fresh_key() -> SecretKey {
     SecretKey::generate()
 }
 
+/// The bao verified-stream WIRE size (content + interleaved proof, ADR 038) for a
+/// `[byte_offset, byte_offset + byte_len)` request — the quantity the paid
+/// `cdn/client/v1` delivery now meters, vouchers, and records. `byte_len == 0`
+/// means "to end". The serve side aligns the request up to 16 KiB chunk groups
+/// and emits the whole aligned superset, so the metered/paid amount is this, not
+/// the requested content length. Callers that used `payload.len()` for a
+/// bytes-delivered / receipt / region assertion now use this.
+#[must_use]
+pub fn bao_wire_len(total: u64, byte_offset: u64, byte_len: u64) -> u64 {
+    match decdn_cache::range_pull::align_range(byte_offset, byte_len, total) {
+        Ok(aligned) => decdn_cache::range_pull::bao_encoded_size(total, aligned.chunk_ranges()),
+        // align_range only rejects an offset past the blob; tests pass valid
+        // offsets, so the content size is a safe (never-hit) fallback.
+        Err(_) => total,
+    }
+}
+
+/// Whole-blob convenience for [`bao_wire_len`].
+#[must_use]
+pub fn bao_wire_len_whole(total: u64) -> u64 {
+    bao_wire_len(total, 0, 0)
+}
+
 /// Open an empty cache (no origins) in a fresh temp dir.
 pub async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
