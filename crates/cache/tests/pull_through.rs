@@ -4392,3 +4392,106 @@ async fn fs_size_returns_on_disk_length() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `export_bao_range` (#915, ADR 038 §Serve side) must emit the header-less bao
+/// interleaved encoding that verifies against the content root. Round-trip: cache
+/// a multi-group blob via pull-through, export an interior range as bao, then
+/// reconstruct the combined encoding (prepend the 8-byte size header) and import
+/// it into a fresh store — `import_bao_bytes` verifies every group against the
+/// root, so a clean import proves the export is honest bao for `hash`, and the
+/// decoded content equals the original aligned span byte-for-byte.
+#[tokio::test]
+async fn export_bao_range_round_trips_and_verifies_against_root() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use decdn_cache::range_pull::align_range;
+    use iroh_blobs::store::mem::MemStore;
+
+    // Deterministic pseudo-random blob spanning several 16 KiB groups, with a
+    // partial final group (not a group multiple) to exercise the right edge.
+    let mut payload = vec![0u8; 200 * 1024 + 1234];
+    let mut x: u32 = 0x1234_5678;
+    for b in &mut payload {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    let hash = Hash::new(&payload);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    // Cache the blob (iroh-blobs materializes the outboard at import).
+    engine.get(hash).await?;
+
+    let blob_size = u64::try_from(payload.len())?;
+    let offset = 64 * 1024u64;
+    let len = 32 * 1024u64;
+    let wire = engine
+        .export_bao_range(hash, offset, len, blob_size)
+        .await?;
+    anyhow::ensure!(!wire.is_empty(), "bao export must be non-empty");
+
+    let aligned = align_range(offset, len, blob_size)?;
+    let mut combined = blob_size.to_le_bytes().to_vec();
+    combined.extend_from_slice(&wire);
+    let store = MemStore::new();
+    store
+        .blobs()
+        .import_bao_bytes(hash, aligned.chunk_ranges().clone(), Bytes::from(combined))
+        .await?;
+
+    let got = store
+        .blobs()
+        .export_ranges(hash, aligned.fetch_start()..aligned.fetch_end())
+        .concatenate()
+        .await?;
+    let start = usize::try_from(aligned.fetch_start())?;
+    let end = usize::try_from(aligned.fetch_end())?;
+    let want = payload
+        .get(start..end)
+        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?;
+    anyhow::ensure!(got == want, "exported bao decodes to the wrong bytes");
+    Ok(())
+}
+
+/// A whole-blob `export_bao_range(hash, 0, 0)` (the offset-0 client serve, which
+/// is now always bao — ADR 038 AC#4) must cover the entire blob and verify.
+#[tokio::test]
+async fn export_bao_range_whole_blob_offset_zero() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use decdn_cache::range_pull::align_range;
+    use iroh_blobs::store::mem::MemStore;
+
+    let payload = b"the whole blob, served bao from offset zero with no raw path".to_vec();
+    let hash = Hash::new(&payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    engine.get(hash).await?;
+
+    let blob_size = u64::try_from(payload.len())?;
+    let wire = engine.export_bao_range(hash, 0, 0, blob_size).await?;
+    let aligned = align_range(0, 0, blob_size)?;
+    let mut combined = blob_size.to_le_bytes().to_vec();
+    combined.extend_from_slice(&wire);
+    let store = MemStore::new();
+    store
+        .blobs()
+        .import_bao_bytes(hash, aligned.chunk_ranges().clone(), Bytes::from(combined))
+        .await?;
+    let got = store.blobs().get_bytes(hash).await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "whole-blob bao decodes to original"
+    );
+    Ok(())
+}

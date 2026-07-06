@@ -66,11 +66,22 @@ const RATE_A: u64 = 10;
 const RATE_B: u64 = 13;
 
 /// Cumulative voucher amount the requester pays for a `PAYLOAD_LEN` blob at
-/// `rate` per MiB: one full-interval voucher (`rate`) plus a closing voucher for
-/// the trailing 0.5 MiB (`ceil(rate/2)`). Matches the requester's per-voucher
+/// `rate` per MiB. ADR 038: vouchers meter the bao **wire** byte stream (content
+/// plus interleaved Merkle proof), so the amount is computed over the whole-blob
+/// wire size, not the content length. The stream pays `rate` per fully crossed
+/// 1-MiB interval plus a closing voucher of `ceil(remainder * rate / MiB)` for
+/// the trailing wire bytes, mirroring the requester's per-voucher
 /// `ceil(bytes_delta * rate / MiB)` arithmetic in `client_requester::self_pay`.
 fn expected_amount(rate: u64) -> U256 {
-    U256::from(rate + rate.div_ceil(2))
+    const MIB: u64 = 1024 * 1024;
+    let wire = support::bao_wire_len_whole(PAYLOAD_LEN as u64);
+    let full_intervals = wire / MIB;
+    let remainder = wire % MIB;
+    let mut amount = full_intervals.saturating_mul(rate);
+    if remainder > 0 {
+        amount = amount.saturating_add(remainder.saturating_mul(rate).div_ceil(MIB));
+    }
+    U256::from(amount)
 }
 
 const fn slash_verifying() -> Address {
@@ -134,9 +145,13 @@ fn assert_channel_advanced(
         "{hop}: nonce {}",
         only.last_nonce()
     );
+    // ADR 038: metered quantity is bao wire bytes (content + interleaved Merkle
+    // proof), not the content length, so the recorded watermark is the whole-blob
+    // wire size — same for every hop, each metered in wire bytes.
+    let wire_bytes = support::bao_wire_len_whole(PAYLOAD_LEN as u64);
     anyhow::ensure!(
-        only.last_bytes_delivered() == U256::from(PAYLOAD_LEN),
-        "{hop}: bytes_delivered {}",
+        only.last_bytes_delivered() == U256::from(wire_bytes),
+        "{hop}: bytes_delivered {} != expected wire {wire_bytes}",
         only.last_bytes_delivered()
     );
     anyhow::ensure!(

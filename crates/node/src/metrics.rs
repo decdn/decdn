@@ -680,18 +680,22 @@ pub struct DecdnMetrics {
     pub node_pull_through_client_abandoned: Counter,
     /// `decdn_node_pull_through_tee_finalize_failed_total` (#856): a window-paced
     /// serve delivered (and was paid for) the full blob, but promoting the teed
-    /// bytes into the local cache failed (store fault, tee-layer hash mismatch, or
-    /// import-task join failure). The client got correct bytes; the node forfeits
-    /// the warm-cache benefit and does NOT become a holder. A sustained rate means
-    /// the node is paying upstream egress on every pull-through and caching none of
-    /// it — investigate the store / `data_dir`. Field has no `_total` suffix
-    /// because the `OpenMetrics` encoder appends it.
+    /// bytes into the local cache failed for a LOCAL, non-integrity reason (store
+    /// fault, size-cap breach, or import-task join failure — a tee bao-verify
+    /// failure routes to `upstream_verify_failed` instead, ADR 038). The client
+    /// got correct bytes; the node forfeits the warm-cache benefit and does NOT
+    /// become a holder. A sustained rate means the node is paying upstream egress
+    /// on every pull-through and caching none of it — investigate the store /
+    /// `data_dir`. Field has no `_total` suffix because the `OpenMetrics` encoder
+    /// appends it.
     pub node_pull_through_tee_finalize_failed: Counter,
-    /// `decdn_node_pull_through_upstream_verify_failed_total` (#856): a window-paced
-    /// serve forwarded an upstream stream that then failed its whole-blob hash
-    /// check at finalization (a corrupt or short upstream — the bait-and-switch
-    /// case). The teed blob is dropped (never cached) and the client's own
-    /// end-to-end hash check rejects the truncated stream. Distinct from
+    /// `decdn_node_pull_through_upstream_verify_failed_total` (#856/#915): a
+    /// window-paced serve forwarded an upstream stream that was short of the
+    /// promised wire bytes, or whose teed bao stream failed verification against
+    /// the content root (ADR 038) — at finalization or mid-stream (the
+    /// bait-and-switch case). The teed blob is dropped (never cached), the
+    /// upstream is scored `Corruption` on the verify-failure arms, and the
+    /// client's own bao decoder rejects the forwarded bytes. Distinct from
     /// `node_pull_corruption` (the buffered orchestration's own check) — this is
     /// the fused serve path. A sustained rate means clients are being served
     /// corrupt-upstream bytes through this node. Field has no `_total` suffix
@@ -699,12 +703,14 @@ pub struct DecdnMetrics {
     pub node_pull_through_upstream_verify_failed: Counter,
     /// `decdn_node_pull_through_local_tee_failed_total` (#856): a window-paced
     /// serve aborted mid-pull because writing an already-paid upstream chunk into
-    /// the local cache tee failed (a store/`data_dir` fault) — distinct from
+    /// the local cache tee failed for a genuinely LOCAL reason (a
+    /// store/`data_dir` fault) — a mid-stream bao-verify rejection routes to
+    /// `upstream_verify_failed` instead (#915). Distinct from
     /// `node_pull_through_client_abandoned`, which counts the downstream client
-    /// dropping or underpaying. Splitting the two lets an operator tell a failing
-    /// local store from flaky/abusive downstreams: a sustained rate here points at
-    /// disk, not peers. Field has no `_total` suffix because the `OpenMetrics`
-    /// encoder appends it.
+    /// dropping or underpaying. Splitting the three lets an operator tell a
+    /// failing local store from a lying upstream from flaky/abusive downstreams:
+    /// a sustained rate HERE points at disk, not peers. Field has no `_total`
+    /// suffix because the `OpenMetrics` encoder appends it.
     pub node_pull_through_local_tee_failed: Counter,
     /// `decdn_node_pull_delta_overflow_total` (#820): per-pull prefetch-ledger
     /// spend/byte deltas that exceeded `u64` when narrowed from `U256` and were

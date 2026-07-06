@@ -15,7 +15,7 @@ It is the blacklist-side analogue of the slash-appeal entry points on the `Slash
 
 This ADR does **not** re-litigate [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting).
 
-> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt`, lapse paths that currently burn the bond, and the TokenHolder synthetic-standing clawback still deferred. Standing is now enforced at filing for all three paths (audit I-3); the perjury denylist also ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field). #688 (sub-issue #1018, the clawback) closes the remaining gap.
+> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt` and enforced only on the permissionless cleanup path (see § Deadline enforcement is permissionless-only — a deliberate design point, not a gap), lapse paths that currently burn the bond, and the TokenHolder synthetic-standing clawback still deferred. Standing is now enforced at filing for all three paths (audit I-3); the perjury denylist also ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field). #688 (sub-issue #1018, the clawback) closes the remaining gap.
 
 ## Decision
 
@@ -147,9 +147,10 @@ function fastTrackBlacklistAppeal(uint256 appealId) external onlyEmergencyMultis
 | --- | --- |
 | `AppealNotFound()` | `appeals[appealId].status == None` |
 | `AppealNotEligibleForFastTrack()` | `status != Open` (the sole pre-fast-track state; see § State machine) |
-| `ReviewWindowExpired()` | `block.timestamp ≥ appeals[appealId].reviewWindowEndsAt` |
 | `RegionalCapHit(region, cap)` | `regionActiveReliefCount[appeal.region] ≥ REGION_CONCURRENT_RELIEF_CAP` |
 | `FilerReliefCapHit(filer, cap)` | `filerRegionActiveRelief[appeal.region][appeal.filer] ≥ FILER_CONCURRENT_RELIEF_CAP` |
+
+There is no upper-deadline revert on this path: the multisig may fast-track an `Open` appeal at any time, with the permissionless cleanup-lapse as the only window-driven settlement (see § Deadline enforcement is permissionless-only).
 
 **State transitions:** `status = FastTracked`; `fastTrackedAt = block.timestamp`; `reviewWindowEndsAt = block.timestamp + BLACKLIST_RATIFICATION_WINDOW`; `regionActiveReliefCount[appeal.region]++` **and** `filerRegionActiveRelief[appeal.region][appeal.filer]++`; on the parent entry, `entry.suspended = true`, `entry.suspendedAt = block.timestamp`. The `ContentBlacklist` views `isBlacklisted` / `isBlacklistedInRegion` immediately return false for the parent entry per [ADR 011 § Interaction with active slashes](011-content-takedown.md#interaction-with-active-slashes).
 
@@ -180,7 +181,7 @@ function ratifyBlacklistAppealRemoval(uint256 appealId) external onlyGovernor;
 function reverseBlacklistAppeal(uint256 appealId) external onlyGovernor;
 ```
 
-Both require `status == FastTracked` and `block.timestamp < reviewWindowEndsAt`. Both terminate.
+Both require `status == FastTracked`; neither carries an upper deadline — the governor may ratify or reverse a `FastTracked` appeal at any time, with the permissionless cleanup-lapse as the only window-driven settlement (see § Deadline enforcement is permissionless-only). Both terminate.
 
 `ratifyBlacklistAppealRemoval`:
 
@@ -215,6 +216,14 @@ Permissionless. Reverts unless one of the four admissibility conditions from [AD
 **Emits:** `BlacklistAppealLapsed(appealId, reason)` where `reason` is a `u8` enum (`MultisigTimeout = 1, RatificationTimeout = 2, StandingClawback = 3, GlobalOverride = 4`) mapping 1:1 to the four conditions above.
 
 After cleanup, subsequent calls against the same `appealId` revert with `BlacklistAppealAlreadyClosed()`.
+
+### Deadline enforcement is permissionless-only
+
+The `BLACKLIST_MULTISIG_REVIEW_WINDOW` and `BLACKLIST_RATIFICATION_WINDOW` deadlines are enforced **only** on the permissionless `cleanupExpiredBlacklistAppeal` path, which lapses an appeal once its window has elapsed. The privileged transitions — `fastTrackBlacklistAppeal` (multisig), `ratifyBlacklistAppealRemoval` / `reverseBlacklistAppeal` (governor) — carry **no upper deadline**: a trusted role may act for as long as the appeal stays in an actionable state (`Open` for fast-track, `FastTracked` for ratify/reverse).
+
+The windows therefore bound trusted-role latency only as a *fallback*. If a trusted role goes silent past its window, any caller invokes `cleanupExpiredBlacklistAppeal` to lapse the appeal, release any interim-relief slot, and settle the bond per the matched cleanup condition. There is no separate hard-deadline revert on the trusted paths, and the `reviewWindowEndsAt` field exists only as the cleanup path's stored deadline (per-window, recomputed at each transition).
+
+This is intentional. The trusted roles are the appeal's adjudicators, not adversaries to be time-boxed; a stale-but-correct adjudication is preferable to a forced lapse, and a single deadline source — the cleanup path — avoids a redundant timing branch in every privileged transition. The one consequence is a race: once a window has elapsed, both the trusted transition and `cleanupExpiredBlacklistAppeal` are admissible, and whichever lands first wins. Each reaches a coherent terminal state (`Ratified` / `Reversed` / `Rejected` vs. `Lapsed`), so the interleaving is immaterial to invariant safety only — the settlement outcome (the bond disposition, plus whether the hash ends up removed or the blacklist entry re-activated) differs by which path resolves first, and both outcomes are valid for an appeal whose window has run.
 
 ### Event topic ordering
 
