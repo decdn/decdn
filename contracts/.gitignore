@@ -6,11 +6,12 @@ aderyn-report.sarif
 lcov.info
 baseline/
 
-# Test-only deploy manifests. DeployProtocolScriptTest writes
-# deployments/3133769*.json (test-only chain ids); a failed/interrupted run can
-# leave one on disk before _cleanupManifest runs. Real-chain manifests use other
-# ids and can still be committed with `git add -f`.
-deployments/3133769*.json
+# Test-only deploy manifests. DeployProtocolScriptTest and the crates/e2e
+# ChainFixture write deployments/31337[67]*.json (test-only chain ids in the
+# 3133769xxxx..3133775xxxx band); a failed/interrupted run can leave one on disk
+# before cleanup runs. Real-chain manifests use other ids and can still be
+# committed with `git add -f`.
+deployments/31337[67]*.json
 
 # Local Anvil dev manifest written by dev-deploy.sh (chain id 31337).
 deployments/31337.json

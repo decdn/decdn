@@ -39,9 +39,11 @@ use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{slash_judge_domain, voucher_domain};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
-use super::discovery::{self, NodeCandidate};
-use super::probe_client::probe_once;
-use super::{chain_ctx, client_endpoint};
+use super::chain_ctx;
+use decdn_client_pull::discovery::{self, NodeCandidate};
+use decdn_client_pull::endpoint as client_endpoint;
+use decdn_client_pull::probe::probe_once;
+use decdn_client_pull::provider;
 
 /// Default deposit when opening a new channel: 10 USDC (ADR 003 § Deposit
 /// Economics recommended minimum). Clamped up to the on-chain `minDeposit`.
@@ -437,7 +439,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let signer = Arc::new(load_signer(&chain.keystore, &password)?);
     let self_address = signer.address();
 
-    let rpc = chain_ctx::build_provider(&chain.rpc_url, &signer)?;
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
     let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);

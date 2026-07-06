@@ -1,6 +1,6 @@
 //! Reusable `cdn/probe/v1` client with QUIC 0-RTT (ADR 015).
 //!
-//! [`probe_once`] performs one probe round trip against a remote node,
+//! [`probe_once`](crate::probe::probe_once) performs one probe round trip against a remote node,
 //! attempting 0-RTT early data when the endpoint already holds a TLS
 //! session ticket for the peer and falling back transparently to 1-RTT
 //! otherwise. The 0-RTT plumbing lives here rather than inline in the
@@ -11,7 +11,7 @@
 //! reach the client's (iroh/rustls-owned) session cache. The reused
 //! mechanism is **transport-only**: echoed-field correlation (ADR 005) and
 //! `slash_sig` validation (ADR 014 §1) are the caller's responsibility, not
-//! performed here — see [`probe_once`].
+//! performed here — see [`probe_once`](crate::probe::probe_once).
 //!
 //! Session-ticket storage is **not** managed here: iroh wires an LRU
 //! `rustls::client::ClientSessionMemoryCache` into every endpoint, sized

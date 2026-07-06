@@ -106,7 +106,7 @@ ed25519Signature = ed25519 sign(nodePrivKey,
                     keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId])))
 ```
 
-Both signing operations are supported by the `decdn` CLI (`decdn node register` prints the required parameters, signs locally, submits the transaction).
+Both signing operations are supported by the `decdn` CLI (`decdn node register` prints the required parameters, signs locally, submits the transaction). Registration also records the operator's acceptance of the current operator terms, carried in the same binding signature — see [§ Operator Safety Obligations](#operator-safety-obligations). The precise extension of the `BindNodeId` payload with `termsHash` and the `TermsAccepted` event are specified together with the contract change ([ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding)); the signature shapes and emitted events shown in this step are the pre-extension surface.
 
 **Gas:** ~$0.26–$0.46 (includes on-chain ed25519 verification via Solidity library; one-time per node lifetime).
 
@@ -234,6 +234,33 @@ A node that voluntarily deregistered or was auto-ejected (bond dropped below 50%
 
 If the node's iroh identity was replaced (key rotation), use `CapacityBond.bindNodeId()` after re-registration to associate the new `nodeId` with the same `ethAddress` — see [ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding). The old `nodeId` mapping is cleared.
 
+### Operator Safety Obligations
+
+Cache-and-serve operators handle third-party content the network does not inspect. The protocol is content-agnostic by design: it defines no on-chain content gate and no protocol offense for failing to run any particular content-screening pipeline, because there is no on-chain ground truth for whether an off-chain pipeline runs — the same reason region attestation rejects an oracle ([ADR 030 § Self-attestation is canonical](030-node-region-self-attestation.md#self-attestation-is-canonical)). Leaving safety duties wholly discretionary is nonetheless a hazard: an operator that runs no screening is more exposed to the criminal-content statutes that copyright safe harbors do not reach, and one operator's incident damages the whole network's standing. Onboarding therefore records an **acknowledged operator duty** rather than a silent discretion, without adding any content primitive to the protocol.
+
+**Acceptance at registration.** Accepting the network's operator terms is a precondition of registration. The terms ship as text embedded in the node software; `decdn node register` (and `decdn setup`) displays them and requires an explicit affirmative acknowledgement before proceeding — registration does not continue without it. Acceptance is carried in the EIP-712 registration signature the operator already produces at [Step 2.3](#step-23--register-node): the signed payload covers `termsHash = keccak256(termsText)` (extending the `BindNodeId` payload in [ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding)), and the contract emits `TermsAccepted(nodeId, termsHash, timestamp)`. The displayed text is the exact preimage of the hash, so the operator assents to precisely the bytes recorded on-chain — there is no external document to fetch or substitute.
+
+**Governance-canonical terms version.** `CapacityBond` holds the canonical `currentTermsHash` as a governance parameter, set by `DecdnGovernor` after timelock — the same control surface as the other tunable parameters, with no privileged owner path. Registration enforces the current version: `registerNode` reverts if the submitted `termsHash` does not equal `currentTermsHash`. A hash carries no `[floor, ceiling]` safety rail because it has no monotonic direction; the rail is instead a governance norm that every proposal setting `currentTermsHash` references the document text and its review record. Governance *adopts* the canonical version — it does not author or adjudicate the wording. A terms revision is therefore an ordinary parameter change: the network may launch with an initial version and adopt a reviewed successor later by bumping the hash, with no contract migration.
+
+Enforcement is evaluated **at registration only**. A later bump of `currentTermsHash` binds new registrants; operators already registered under a prior version keep their recorded acceptance, which continues to evidence notice and assent at the time they joined. Tooling may prompt existing operators to re-accept a new version, but the cache-serving role does not require it.
+
+Registration-time-only on-chain enforcement does not freeze an operator's obligations at their accepted version. The terms bind each operator to revisions adopted through the canonical governance process, so governance retains authority to act on a breach of the *current* terms — including ejection under the content-takedown rules ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) — regardless of which `termsHash` an operator's on-chain record carries. The recorded hash fixes the version a node *assented to*, not the ceiling of what governance may enforce.
+
+**Globally applicable terms.** The terms bind operators across jurisdictions without prescribing any single jurisdiction's mechanism. Three layers carry this:
+
+1. **Acknowledgement of applicable law.** The operator represents awareness of, and commitment to comply with, the content laws applicable to them, including any mandatory reporting obligations for illegal content in their jurisdiction. This incorporates each operator's own law by reference rather than naming one regime, so the same text is valid everywhere.
+2. **Region-routed obligations.** Jurisdiction-specific duties attach through the operator's declared `regionHint` ([ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)) and the corresponding regional governance body ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)). The region declaration is the routing key; the universal text stays generic.
+3. **Universal knowledge-triggered floor.** The operator commits that, on actual knowledge that specific content is illegal, they will cease serving it and report it where their law requires. The floor is knowledge-triggered, not a mandate to run proactive scanning — proactive scanning is lawful in some jurisdictions and constrained in others, so it is not imposed in the universal text.
+
+Mechanism-specific guidance — particular hash-match databases, reporting endpoints such as national CSAM hotlines — is region-scoped operator documentation, deliberately kept out of the hashed terms so the canonical text and its hash stay stable across jurisdictions. Every clause is phrased as an operator duty ("the operator will…"), never as a network guarantee; the network does not represent that any content is screened.
+
+**Two compliance paths.** The duty is universal, but operators meet it through different postures:
+
+- **Cache operators** accept the terms and additionally MAY restrict the reactive path to DAO-authorized origins by enabling `pull_through_require_authorized_origin` ([ADR 037 § Seed-leech caps](037-regional-proxy-warming.md#seed-leech-caps)). With the gate set, the node initiates fresh pulls only for content backed by an authorized origin, narrowing the surface through which unvetted content enters its cache. The gate restricts pull *initiation*, not already-held content — eviction of held content stays [`ContentBlacklist`](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)'s role — so it reduces rather than eliminates exposure.
+- **Authorized origins** are onboarded by the DAO through [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority); the network can condition that authorization on continued acceptance of the current terms, concentrating the heavier ongoing duty on the smaller, accountable origin set rather than on every cache operator.
+
+**What the record is and is not.** The on-chain `TermsAccepted` record is evidence of notice and assent and a basis for governance to act on a breach. It is not proof that any screening runs — the protocol cannot verify off-chain behavior and deliberately does not try. Its value is to foreclose the unaware-operator posture and give the network a documented operator-duty floor, while substantive enforcement remains with the operator's own jurisdiction.
+
 ## Consequences
 
 ### Positive
@@ -242,12 +269,16 @@ If the node's iroh identity was replaced (key rotation), use `CapacityBond.bindN
 - All startup prerequisites (rate bounds, blacklist, registry) are explicitly ordered, eliminating the previously identified silent-failure class.
 - The acceptance criteria table (Phase 5) provides a machine-checkable health signal for readiness probes and operational monitoring.
 - Re-onboarding (post-ejection) is explicitly covered, preventing nonce confusion.
+- Onboarding records an explicit operator-duty floor, foreclosing the unaware-operator posture without adding any on-chain content gate.
+- Terms versioning is an ordinary governance parameter (`currentTermsHash`), so the network can launch with an initial version and adopt a reviewed successor by a hash bump, with no contract migration.
 
 ### Negative
 
 - Phase 2 requires three ordered on-chain transactions (`approve`, `stake`, `registerNode`), each confirmed before the node can start. Sub-second L2 block times keep this fast, but operator tooling must handle nonce management across them.
 - Multiaddr registration before iroh starts requires either a static IP/port (suitable for most VPS deployments) or a two-step workflow (start node, observe addresses, then register or update).
 - Cold-start reputation (0.5, a 4× score penalty vs. a reputable node) means new nodes must price aggressively or wait out the 7-day bootstrap period to compete for traffic. This is a known and accepted property of [ADR 008](008-reputation.md#adr-008-reputation-system).
+- The `TermsAccepted` record evidences assent, not compliance; substantive screening remains unverifiable on-chain and is enforced only by the operator's jurisdiction.
+- Enforcing the current terms hash at registration means an un-upgraded CLI carrying a stale `termsHash` cannot register until it updates to the current terms text.
 
 ## Deferred & Open
 

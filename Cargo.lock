@@ -2655,9 +2655,11 @@ dependencies = [
  "anyhow",
  "blake3",
  "bytes",
+ "decdn-common",
  "decdn-incentive",
  "decdn-protocol",
  "iroh",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -2692,6 +2694,30 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
+]
+
+[[package]]
+name = "decdn-e2e"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "decdn-cache",
+ "decdn-client-pull",
+ "decdn-common",
+ "decdn-config-types",
+ "decdn-incentive",
+ "decdn-node",
+ "decdn-protocol",
+ "iroh",
+ "jsonrpsee",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2750,7 +2776,6 @@ dependencies = [
  "bytes",
  "clap",
  "decdn-cache",
- "decdn-cli",
  "decdn-client-pull",
  "decdn-common",
  "decdn-gossip",
