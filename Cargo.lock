@@ -2697,6 +2697,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "decdn-e2e"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "decdn-cache",
+ "decdn-client-pull",
+ "decdn-common",
+ "decdn-config-types",
+ "decdn-incentive",
+ "decdn-node",
+ "decdn-protocol",
+ "iroh",
+ "jsonrpsee",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "decdn-gossip"
 version = "0.1.0"
 dependencies = [

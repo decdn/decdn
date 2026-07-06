@@ -11,6 +11,7 @@ members = [
     "crates/common",
     "crates/client-pull",
     "crates/cli",
+    "crates/e2e",
 ]
 exclude = ["contracts"]
 
