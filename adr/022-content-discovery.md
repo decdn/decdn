@@ -252,7 +252,7 @@ Three asymptotic regimes inform protocol-level optimizations:
 
 ### Popularity Signals and Market Dynamics
 
-Content discovery in an incentive-driven network lets nodes learn what content is in demand. Speculative prefetch is driven by a single non-suppressible signal — DHT FIND_VALUE query frequency — through which a keyspace-positioned node can pre-acquire globally-hot content to monetize its routing position. Realized *local* demand is not a speculative prefetch input: a node serves a cache miss reactively by chunk-paced pull-through, warming its cache as a paid, loss-bounded side effect of delivery ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)), which supersedes any local cache-miss prefetch trigger.
+Content discovery in an incentive-driven network lets nodes learn what content is in demand. Speculative prefetch is driven by a single non-suppressible signal — DHT FIND_VALUE query frequency — through which a keyspace-positioned node can pre-acquire globally-hot content to monetize its routing position. Realized *local* demand is not a speculative prefetch input: a node serves a cache miss reactively by window-paced pull-through, warming its cache as a paid, loss-bounded side effect of delivery ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)), which supersedes any local cache-miss prefetch trigger.
 
 #### Prefetch Demand Signal: DHT FIND_VALUE Query Frequency (Non-Suppressible)
 
@@ -320,7 +320,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 | `cdn/probe/v1` | Unchanged. DHT provides candidates; `cdn/probe/v1` confirms live availability and measures latency. Probe cache (15s TTL, [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) still prevents redundant probes for recently confirmed providers. |
 | `cdn/client/v1` | Unchanged. All delivery is paid; DHT affects only how providers are discovered. |
 | `NodeAnnounce` gossip | Unchanged. Carries node-level metadata only (region, load); the prefetch demand signal derives from DHT FIND_VALUE traffic, and local cache-miss demand is served reactively (see Proxy warming row). No new gossip message types. |
-| Proxy warming ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)) | Reactive chunk-paced pull-through warms a regional copy on real paid demand, superseding the local cache-miss prefetch trigger. STORE-on-commit makes a completed warmed copy discoverable through the normal FIND_VALUE path. |
+| Proxy warming ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)) | Reactive window-paced pull-through warms a regional copy on real paid demand, superseding the local cache-miss prefetch trigger. STORE-on-commit makes a completed warmed copy discoverable through the normal FIND_VALUE path. |
 | Reputation system ([ADR 008](008-reputation.md#adr-008-reputation-system)) | A node publishing a false STORE record fails at probe time → reputation penalty → fewer clients selected. No new slash condition needed. |
 | Eviction hold ([ADR 005](005-protocol.md#adr-005-wire-protocol)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
 | Client discovery ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. The on-chain origin-directory fallback applies equally. |
