@@ -211,7 +211,7 @@ impl VoucherProgress {
 /// The upstream delivered bytes that failed bao verification against the
 /// requested content root — a paid-but-corrupt delivery (the content-addressing
 /// invariant, ADR 014/038). Under ADR 038 the verifier is the per-chunk-group
-/// `bao-tree` decoder ([`decode_verified_range`]), not a whole-blob re-hash, so
+/// `bao-tree` decoder (`decode_verified_range`), not a whole-blob re-hash, so
 /// this fires the moment any group's proof mismatches. Returned (via `anyhow`)
 /// by [`stream_fetch`] so callers can `downcast_ref` to classify corruption
 /// (e.g. a reputation `Corruption` outcome) without matching on the error
