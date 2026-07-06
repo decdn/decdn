@@ -368,8 +368,8 @@ impl NodeProgressivePull {
     /// the downstream client. The window serve loop uses it as the pull budget
     /// `total`, since the forwarded/metered quantities are wire bytes.
     #[must_use]
-    pub const fn expected(&self) -> u64 {
-        self.pull.expected()
+    pub const fn expected_wire_bytes(&self) -> u64 {
+        self.pull.expected_wire_bytes()
     }
 
     /// Read and forward the next upstream chunk, paying the upstream per voucher

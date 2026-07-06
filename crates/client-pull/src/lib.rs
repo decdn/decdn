@@ -58,7 +58,7 @@ use bao_tree::BaoTree;
 use bao_tree::io::sync::DecodeResponseIter;
 use bao_tree::io::{BaoContentItem, DecodeError};
 use bytes::{Bytes, BytesMut};
-use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, bao_encoded_size};
+use decdn_bao_range::{IROH_BLOCK_SIZE, align_range};
 use decdn_incentive::{BuyerChannelState, StreamSlashData, Voucher, signed_to_wire_voucher};
 use decdn_protocol::client::{
     ClientMessage, StreamError, StreamRequest, StreamResponse, VoucherRejectReason,
@@ -550,12 +550,12 @@ async fn fetch_inner(
     // nodes (ADR 038 §Payment metering) — so the receive bound is the bao-encoded
     // size of the chunk-group-aligned range, NOT the content-byte remainder. The
     // server widens `byte_offset` to enclosing 16 KiB groups; the shared
-    // `align_range` / `bao_encoded_size` reproduce that exactly, so this equals
-    // the bytes the server emits.
+    // `align_range` / `AlignedRange::wire_len` reproduce that exactly, so this
+    // equals the bytes the server emits.
     let total_bytes = resp.body.total_bytes;
     let aligned = align_range(byte_offset, 0, total_bytes)
         .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
-    let expected_wire = bao_encoded_size(total_bytes, aligned.chunk_ranges());
+    let expected_wire = aligned.wire_len();
 
     let (buf, cumulative) = receive_and_pay(
         &mut send,
@@ -595,11 +595,12 @@ async fn fetch_inner(
 }
 
 /// Drive the buffered receive loop: read `ChunkData` into a buffer, paying one
-/// voucher per `interval_bytes` boundary (and a closing voucher once all `expected`
-/// bytes have arrived) through the shared `ledger`, until `StreamEnd`. Returns the
-/// assembled buffer and the cumulative byte count for the caller's completeness +
-/// hash checks. Enforces the chunk-size ceiling and the `cumulative <= expected`
-/// overrun guard (ADR 005 §`cdn/client/v1`).
+/// voucher per `interval_bytes` boundary (and a closing voucher once all
+/// `expected_wire_bytes` have arrived) through the shared `ledger`, until
+/// `StreamEnd`. Returns the assembled buffer and the cumulative byte count for
+/// the caller's completeness check (integrity is verified per bao chunk group by
+/// the decoder, not here). Enforces the chunk-size ceiling and the
+/// `cumulative <= expected_wire_bytes` overrun guard (ADR 005 §`cdn/client/v1`).
 async fn receive_and_pay(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -607,7 +608,7 @@ async fn receive_and_pay(
     ledger: &ChannelLedger,
     rate_per_mb: u64,
     interval_bytes: u64,
-    expected: u64,
+    expected_wire_bytes: u64,
 ) -> anyhow::Result<(BytesMut, u64)> {
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
@@ -627,9 +628,9 @@ async fn receive_and_pay(
                     anyhow::bail!("chunk of {} bytes exceeds CHUNK_SIZE", chunk.bytes.len());
                 }
                 cumulative = cumulative.saturating_add(chunk.bytes.len() as u64);
-                if cumulative > expected {
+                if cumulative > expected_wire_bytes {
                     anyhow::bail!(
-                        "server sent {cumulative} bytes, more than the {expected} promised"
+                        "server sent {cumulative} bytes, more than the {expected_wire_bytes} promised"
                     );
                 }
                 buf.extend_from_slice(&chunk.bytes);
@@ -637,7 +638,7 @@ async fn receive_and_pay(
                 // Pay at each interval boundary, and a closing voucher once all
                 // expected bytes have arrived — matching the node's pacing.
                 let boundary = bytes_since_voucher >= interval_bytes && interval_bytes > 0;
-                let closing = cumulative >= expected && bytes_since_voucher > 0;
+                let closing = cumulative >= expected_wire_bytes && bytes_since_voucher > 0;
                 if boundary || closing {
                     self_pay(send, recv, ctx, ledger, rate_per_mb, bytes_since_voucher).await?;
                     bytes_since_voucher = 0;
@@ -665,7 +666,8 @@ async fn receive_and_pay(
 /// `byte_offset` here — the serve side never trims (trimming would break the
 /// proof). `bao_wire` must be exactly the header-less response stream the server
 /// emitted for `align_range(byte_offset, byte_len, total_bytes)`; the shared
-/// [`align_range`]/[`bao_encoded_size`] keep encoder and decoder in lock-step.
+/// [`align_range`]/[`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
+/// keep encoder and decoder in lock-step.
 ///
 /// # Errors
 ///
@@ -784,7 +786,7 @@ pub struct UpstreamPull {
     /// Promised **wire** bytes for this stream: the bao-encoded size of the
     /// chunk-group-aligned range (content plus interleaved proof, ADR 038), not
     /// the content-byte remainder. Bounds the receive loop and the closing voucher.
-    expected: u64,
+    expected_wire_bytes: u64,
     /// Wire bytes received so far on this stream.
     cumulative: u64,
     /// Wire bytes received since the last voucher.
@@ -798,7 +800,7 @@ impl std::fmt::Debug for UpstreamPull {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamPull")
             .field("hash", &blake3::Hash::from_bytes(self.hash))
-            .field("expected", &self.expected)
+            .field("expected_wire_bytes", &self.expected_wire_bytes)
             .field("cumulative", &self.cumulative)
             .field("ended", &self.ended)
             .finish_non_exhaustive()
@@ -901,7 +903,7 @@ pub async fn open_progressive_pull(
     let total_bytes = resp.body.total_bytes;
     let aligned = align_range(byte_offset, 0, total_bytes)
         .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
-    let expected = bao_encoded_size(total_bytes, aligned.chunk_ranges());
+    let expected_wire_bytes = aligned.wire_len();
     let header = UpstreamPullHeader {
         total_bytes,
         rate_per_mb,
@@ -916,7 +918,7 @@ pub async fn open_progressive_pull(
         hash,
         rate_per_mb,
         interval_bytes,
-        expected,
+        expected_wire_bytes,
         cumulative: 0,
         unvouchered: 0,
         ended: false,
@@ -930,8 +932,8 @@ impl UpstreamPull {
     /// window serve loop uses it as the pull budget `total` — it must be wire
     /// bytes, since `pulled`/`served_paid` count forwarded wire bytes.
     #[must_use]
-    pub const fn expected(&self) -> u64 {
-        self.expected
+    pub const fn expected_wire_bytes(&self) -> u64 {
+        self.expected_wire_bytes
     }
 
     /// The current acked voucher watermark — read it on any exit (including an
@@ -989,11 +991,11 @@ impl UpstreamPull {
                     anyhow::bail!("chunk of {} bytes exceeds CHUNK_SIZE", chunk.bytes.len());
                 }
                 self.cumulative = self.cumulative.saturating_add(chunk.bytes.len() as u64);
-                if self.cumulative > self.expected {
+                if self.cumulative > self.expected_wire_bytes {
                     anyhow::bail!(
                         "server sent {} bytes, more than the {} promised",
                         self.cumulative,
-                        self.expected
+                        self.expected_wire_bytes
                     );
                 }
                 // No per-chunk hashing here: this stream's bytes are bao wire
@@ -1002,7 +1004,7 @@ impl UpstreamPull {
                 // downstream client verifies its own copy with its decoder.
                 self.unvouchered = self.unvouchered.saturating_add(chunk.bytes.len() as u64);
                 let boundary = self.unvouchered >= self.interval_bytes && self.interval_bytes > 0;
-                let closing = self.cumulative >= self.expected && self.unvouchered > 0;
+                let closing = self.cumulative >= self.expected_wire_bytes && self.unvouchered > 0;
                 if boundary || closing {
                     let delta = self.unvouchered;
                     self.pay_one(delta).await?;
@@ -1048,12 +1050,12 @@ impl UpstreamPull {
         // client's own decoder, so `finish` no longer re-hashes the whole blob. A
         // truncated stream (fewer wire bytes than promised) can't be decoded, so
         // require the full promised wire size as the completeness signal.
-        if self.cumulative < self.expected {
+        if self.cumulative < self.expected_wire_bytes {
             self.conn.close(0u32.into(), b"short-delivery");
             anyhow::bail!(
                 "server sent {} of {} promised wire bytes before StreamEnd",
                 self.cumulative,
-                self.expected
+                self.expected_wire_bytes
             );
         }
         self.conn.close(0u32.into(), b"done");
@@ -1247,8 +1249,7 @@ mod tests {
         let blob_size = u64::try_from(blob.len())?;
         let aligned = align_range(byte_offset, byte_len, blob_size)?;
         let data = sub(blob, aligned.fetch_start(), aligned.fetch_end())?;
-        let combined =
-            encode_verified_range(root, blob_size, &aligned, &data, ob.data.clone().into())?;
+        let combined = encode_verified_range(root, &aligned, &data, ob.data.clone().into())?;
         let wire = combined
             .get(8..)
             .ok_or_else(|| anyhow::anyhow!("combined shorter than 8-byte header"))?

@@ -36,7 +36,9 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{Bytes, CacheEngine, CacheError, Hash, RangePullOutcome, TeeOpen, TeeSink};
+use decdn_cache::{
+    Bytes, CacheEngine, CacheError, Hash, RangePullOutcome, TeeOpen, TeeReservation, TeeSink,
+};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
@@ -1293,7 +1295,7 @@ impl ClientHandler {
         hash: Hash,
         client_node_id: B256,
         origin: Arc<NodeOrigin>,
-        tee: TeeSink,
+        tee: TeeReservation,
     ) -> anyhow::Result<()> {
         // Resolve the owning channel (existence + ownership already proven by
         // `pull_authorized`) — needed for the deposit guard and the downstream
@@ -1405,6 +1407,12 @@ impl ClientHandler {
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
+        // Frame the tee's verifying decoder now that the whole-blob content size
+        // is known from the upstream header (ADR 038) — the forwarded wire is
+        // header-less. `total_bytes` is the CONTENT size; the tee decodes the
+        // interleaved bao back to that many plaintext bytes.
+        let tee = tee.begin(total_bytes);
+
         // (6) Fused window-paced loop. Boxed to keep the large loop future off
         // this frame (clippy::large_futures).
         Box::pin(self.window_forward_loop(
@@ -1473,20 +1481,11 @@ impl ClientHandler {
         // The forwarded/metered quantities are WIRE bytes (the bao verified-stream:
         // content plus interleaved proof, ADR 038), so the pull budget is the
         // bao-encoded size, not the content `total_bytes`.
-        let total = Bytes::new(pull.expected());
+        let total = Bytes::new(pull.expected_wire_bytes());
 
-        // The tee imports the forwarded bao via a verifying decoder that needs the
-        // content size up front (ADR 038): write the 8-byte LE content-size header
-        // before any forwarded chunk. The header goes ONLY to the tee — the
-        // downstream client receives the header-less wire and builds its own tree
-        // from the signed `total_bytes`. A failure here is a local store fault,
-        // handled exactly like an in-loop `tee.write` fault below.
-        if let Err(e) = tee.write(&total_bytes.to_le_bytes()).await {
-            pull.abandon(None);
-            tee.abandon();
-            self.metrics.node_pull_through_local_tee_failed();
-            return Err(anyhow::anyhow!("cache tee header write failed: {e}"));
-        }
+        // The tee's verifying decoder was framed with the content size at
+        // `TeeReservation::begin` (ADR 038), so the forwarded wire is header-less:
+        // every `tee.write` below is pure bao interleaved bytes.
 
         let mut pulled = Bytes::default();
         let mut served_paid = Bytes::default();
@@ -1527,7 +1526,7 @@ impl ClientHandler {
                         if let Err(e) = tee.write(&chunk).await {
                             // Classify by what actually killed the write (#915
                             // review). `TeeSink::write` surfaces the ended import
-                            // task's own verdict: a `HashMismatch` means the tee's
+                            // task's own verdict: a `VerifyFailed` means the tee's
                             // bao decoder REJECTED a forwarded group mid-stream —
                             // a corrupt/lying upstream, scored as such — while
                             // anything else is a genuinely LOCAL store fault
@@ -1538,7 +1537,7 @@ impl ClientHandler {
                             // (the returned error resets the stream; the
                             // downstream's own decoder rejects the bytes).
                             tee.abandon();
-                            if matches!(e, CacheError::HashMismatch { .. }) {
+                            if matches!(e, CacheError::VerifyFailed { .. }) {
                                 pull.abandon_corrupt();
                                 self.metrics.node_pull_through_upstream_verify_failed();
                                 tracing::warn!(
@@ -1678,10 +1677,10 @@ impl ClientHandler {
         // wire-complete-but-corrupt upstream is scored `Corruption` — not
         // `Delivered` — before anything is gossiped (#915 review). Three outcomes:
         //   - short upstream     → `pull.finish(..)` Err (tee refused to promote)
-        //   - corrupt upstream   → `pull.finish(..)` Ok, tee `HashMismatch`
+        //   - corrupt upstream   → `pull.finish(..)` Ok, tee `VerifyFailed`
         //   - local store fault  → `pull.finish(..)` Ok, tee other Err
         let tee_result = tee.finish().await;
-        let verdict = if matches!(tee_result, Err(CacheError::HashMismatch { .. })) {
+        let verdict = if matches!(tee_result, Err(CacheError::VerifyFailed { .. })) {
             TeeVerdict::Corrupt
         } else {
             TeeVerdict::Verified
@@ -1716,7 +1715,7 @@ impl ClientHandler {
                 }
                 Ok(())
             }
-            (Ok(()), Err(CacheError::HashMismatch { .. })) => {
+            (Ok(()), Err(CacheError::VerifyFailed { .. })) => {
                 // The teed bao failed verification against the content root: a
                 // corrupt/lying upstream forwarded bytes that do not hash to
                 // `hash` (ADR 038). `pull.finish(Corrupt)` above already scored
