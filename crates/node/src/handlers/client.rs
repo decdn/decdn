@@ -1319,6 +1319,13 @@ impl ClientHandler {
         // deposit protection and let a near-empty channel trigger an unbounded
         // speculative pull (#856). The window is `pull_ahead_bytes` floored at one
         // voucher interval, matching `window_forward_loop`.
+        //
+        // `guard_bytes` is a CONTENT-byte ceiling while billing is in bao WIRE
+        // bytes (~0.4% higher for the proof overhead, ADR 038), so the guard is a
+        // hair loose. Benign: it only under-reserves by the proof fraction, and a
+        // channel that exhausts mid-stream is bounded to one window of upstream
+        // spend by the window loop regardless. Not widened to keep the ceiling
+        // legible as "the blob size cap".
         let guard_bytes = if self.max_blob_size_bytes > 0 {
             self.max_blob_size_bytes
         } else {

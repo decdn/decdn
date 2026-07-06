@@ -2537,7 +2537,11 @@ impl CacheEngine {
     /// `count_and_cap_stream` enforces `max_blob_bytes` and bumps the
     /// origin-egress metric per chunk, so a tee fill is metered as the upstream
     /// egress it genuinely is (those bytes left an origin) without touching the
-    /// `get`-caller hit/returned counters.
+    /// `get`-caller hit/returned counters. On the tee path `stream` is the
+    /// DECODED plaintext (`bao_decoded_source` strips the interleaved proof), so
+    /// `pull_through_bytes` here meters content bytes — slightly under the bao
+    /// wire that actually left the upstream (the proof overhead the buyer paid for
+    /// is counted on the receive side, not here).
     async fn import_and_verify_stream<S>(
         &self,
         hash: Hash,
@@ -3074,6 +3078,10 @@ impl RecvStream for ChannelRecvStream {
         {
             self.buf.extend_from_slice(&b);
         }
+        // A drained-and-closed channel yields a zero-length `Bytes`, which the
+        // `bao-tree` reader reads as clean EOF (not an error) — the correct signal
+        // for a fill that ended (`finish`/`abandon` dropped all senders). A
+        // truncated feed instead surfaces via `recv_exact`'s explicit `eof()`.
         let take = self.buf.len().min(len);
         Ok(self.buf.split_to(take).freeze())
     }
@@ -3096,6 +3104,10 @@ impl RecvStream for ChannelRecvStream {
         Ok(())
     }
 
+    // `stop`/`id` are inert by design: this reader is backed by an in-process
+    // mpsc channel, not a real QUIC stream. There is no peer to send a STOP_SENDING
+    // frame to (the producer ends the fill by dropping its sender), and there is no
+    // wire stream id — `0` is a stable placeholder the decoder never keys on.
     fn stop(&mut self, _code: iroh::endpoint::VarInt) -> std::io::Result<()> {
         Ok(())
     }

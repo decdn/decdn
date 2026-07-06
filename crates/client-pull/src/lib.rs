@@ -27,7 +27,8 @@
 //!   any `byte_offset > 0` self-verifies (a corrupt tail is rejected) with no
 //!   dependency on earlier bytes — closing the old resume gap. The progressive
 //!   (window pull-through) path forwards the bao stream verbatim and tees it into
-//!   `import_bao`, which verifies the cached copy against the same root.
+//!   the cache's verifying decoder (`import_and_verify_stream`), which checks the
+//!   cached copy against the same root.
 
 /// Buyer-side `PaymentChannel` open kernel (#940), shared by the node service
 /// and the CLI.
@@ -207,12 +208,15 @@ impl VoucherProgress {
     }
 }
 
-/// The upstream delivered bytes whose whole-blob BLAKE3 hash did not match the
-/// requested content hash — a paid-but-corrupt delivery (the content-addressing
-/// invariant, ADR 014). Returned (via `anyhow`) by [`stream_fetch`] so callers
-/// can `downcast_ref` to classify corruption (e.g. a reputation `Corruption`
-/// outcome) without matching on the error message string. The `Display` text is
-/// kept stable for logs and the existing requester tests.
+/// The upstream delivered bytes that failed bao verification against the
+/// requested content root — a paid-but-corrupt delivery (the content-addressing
+/// invariant, ADR 014/038). Under ADR 038 the verifier is the per-chunk-group
+/// `bao-tree` decoder ([`decode_verified_range`]), not a whole-blob re-hash, so
+/// this fires the moment any group's proof mismatches. Returned (via `anyhow`)
+/// by [`stream_fetch`] so callers can `downcast_ref` to classify corruption
+/// (e.g. a reputation `Corruption` outcome) without matching on the error
+/// message string. The `Display` text is kept stable for logs and the existing
+/// requester tests.
 #[derive(Debug)]
 pub struct HashMismatch;
 
@@ -525,14 +529,13 @@ async fn fetch_inner(
             ceiling: max_blob_size_bytes,
         }));
     }
-    // A `total_bytes` below `byte_offset` would underflow `expected` to `0`
+    // A `total_bytes` below `byte_offset` would underflow the wire bound to `0`
     // (saturating), so the loop ends on the first `StreamEnd` and returns an
-    // empty buffer. On a resumed fetch (`byte_offset > 0`) the whole-blob hash
-    // check is skipped, so that empty buffer would surface as success — a silent
-    // verification bypass. A legitimate server always claims
-    // `total_bytes >= byte_offset`; reject anything less before the loop. (A
-    // non-empty but *short* delivery is caught by the completeness check after
-    // the loop.)
+    // empty buffer. An empty range decodes trivially (no chunk group to verify),
+    // so that empty buffer would surface as success — a silent verification
+    // bypass. A legitimate server always claims `total_bytes >= byte_offset`;
+    // reject anything less before the loop. (A non-empty but *short* delivery is
+    // caught by the completeness check after the loop.)
     if resp.body.total_bytes < byte_offset {
         anyhow::bail!(
             "server claimed total_bytes ({}) below the requested byte_offset ({})",
@@ -750,8 +753,10 @@ pub struct UpstreamPullHeader {
 /// A live, progressive `cdn/client/v1` pull (#856), the streaming counterpart of
 /// the buffered [`stream_fetch`]. Opened by [`open_progressive_pull`] (which has
 /// already done the handshake and verified the response), driven chunk-by-chunk
-/// via [`Self::next_chunk`], and closed by [`Self::finish`] (completeness +
-/// whole-blob hash) or [`Self::abort`].
+/// via [`Self::next_chunk`], and closed by [`Self::finish`] (a wire-completeness
+/// check — integrity is verified per bao chunk group by the tee's decoder and the
+/// downstream client's own decoder, not by a whole-blob re-hash) or
+/// [`Self::abort`].
 ///
 /// It pays the upstream per voucher interval *inside* `next_chunk` — identical
 /// pacing to `stream_fetch` — but yields each chunk to the caller (which
@@ -999,9 +1004,10 @@ impl UpstreamPull {
                     );
                 }
                 // No per-chunk hashing here: this stream's bytes are bao wire
-                // bytes forwarded verbatim downstream and teed into `import_bao`,
-                // which verifies the cached copy against the root (ADR 038); the
-                // downstream client verifies its own copy with its decoder.
+                // bytes forwarded verbatim downstream and teed into the cache's
+                // verifying decoder (`import_and_verify_stream`), which checks the
+                // cached copy against the root (ADR 038); the downstream client
+                // verifies its own copy with its decoder.
                 self.unvouchered = self.unvouchered.saturating_add(chunk.bytes.len() as u64);
                 let boundary = self.unvouchered >= self.interval_bytes && self.interval_bytes > 0;
                 let closing = self.cumulative >= self.expected_wire_bytes && self.unvouchered > 0;
@@ -1025,8 +1031,8 @@ impl UpstreamPull {
     /// wire-byte completeness (the full promised bao wire size was received),
     /// close the connection cleanly, and return the final acked watermark to
     /// persist. Per ADR 038 this no longer re-hashes the whole blob — bao
-    /// verification is delegated to the tee's `import_bao` (cached copy) and the
-    /// downstream client's own decoder.
+    /// verification is delegated to the tee's verifying decoder (cached copy) and
+    /// the downstream client's own decoder.
     ///
     /// # Errors
     ///
@@ -1046,8 +1052,9 @@ impl UpstreamPull {
             }
         }
         // Completeness for every fetch (full and resumed): bao verification is
-        // delegated to the tee's `import_bao` (cached copy) and the downstream
-        // client's own decoder, so `finish` no longer re-hashes the whole blob. A
+        // delegated to the tee's verifying decoder (cached copy) and the
+        // downstream client's own decoder, so `finish` no longer re-hashes the
+        // whole blob. A
         // truncated stream (fewer wire bytes than promised) can't be decoded, so
         // require the full promised wire size as the completeness signal.
         if self.cumulative < self.expected_wire_bytes {
