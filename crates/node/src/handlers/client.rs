@@ -1321,11 +1321,13 @@ impl ClientHandler {
         // voucher interval, matching `window_forward_loop`.
         //
         // `guard_bytes` is a CONTENT-byte ceiling while billing is in bao WIRE
-        // bytes (~0.4% higher for the proof overhead, ADR 038), so the guard is a
-        // hair loose. Benign: it only under-reserves by the proof fraction, and a
-        // channel that exhausts mid-stream is bounded to one window of upstream
-        // spend by the window loop regardless. Not widened to keep the ceiling
-        // legible as "the blob size cap".
+        // bytes (the proof overhead makes wire slightly higher — a fraction that
+        // shrinks with blob size, well under 1% past a few groups, ADR 038), so the
+        // guard is a hair loose. Benign: it only under-reserves by that proof
+        // fraction, and a channel that exhausts mid-stream is bounded to one window
+        // of upstream spend by the window loop regardless; the true wire ceiling is
+        // enforced downstream by the `cumulative <= expected_wire_bytes` overrun
+        // check. Not widened to keep the ceiling legible as "the blob size cap".
         let guard_bytes = if self.max_blob_size_bytes > 0 {
             self.max_blob_size_bytes
         } else {
@@ -1533,18 +1535,24 @@ impl ClientHandler {
                         if let Err(e) = tee.write(&chunk).await {
                             // Classify by what actually killed the write (#915
                             // review). `TeeSink::write` surfaces the ended import
-                            // task's own verdict: a `VerifyFailed` means the tee's
-                            // bao decoder REJECTED a forwarded group mid-stream —
-                            // a corrupt/lying upstream, scored as such — while
-                            // anything else is a genuinely LOCAL store fault
-                            // (failing `data_dir`), metered separately so an
-                            // operator can tell the two apart. Either way the
-                            // abandon persists the buyer watermark (#852) for
-                            // what we paid upstream, and no `StreamEnd` is sent
-                            // (the returned error resets the stream; the
+                            // task's own verdict: a `VerifyFailed` (or a whole-blob
+                            // `HashMismatch`) means the tee's bao decoder REJECTED
+                            // forwarded bytes — a corrupt/lying upstream, scored as
+                            // such — while anything else is a genuinely LOCAL store
+                            // fault (failing `data_dir`), metered separately so an
+                            // operator can tell the two apart. (`HashMismatch` can't
+                            // arise on a fully-decoded tee stream today, but routing
+                            // it as corruption keeps a future decoder change from
+                            // silently landing it in the local-fault arm below.)
+                            // Either way the abandon persists the buyer watermark
+                            // (#852) for what we paid upstream, and no `StreamEnd` is
+                            // sent (the returned error resets the stream; the
                             // downstream's own decoder rejects the bytes).
                             tee.abandon();
-                            if matches!(e, CacheError::VerifyFailed { .. }) {
+                            if matches!(
+                                e,
+                                CacheError::VerifyFailed { .. } | CacheError::HashMismatch { .. }
+                            ) {
                                 pull.abandon_corrupt();
                                 self.metrics.node_pull_through_upstream_verify_failed();
                                 tracing::warn!(
@@ -1685,9 +1693,15 @@ impl ClientHandler {
         // `Delivered` — before anything is gossiped (#915 review). Three outcomes:
         //   - short upstream     → `pull.finish(..)` Err (tee refused to promote)
         //   - corrupt upstream   → `pull.finish(..)` Ok, tee `VerifyFailed`
+        //     (or a whole-blob `HashMismatch` — unreachable on a fully-decoded tee
+        //     stream today, but scored as corruption defensively so a future
+        //     decoder change can't reclassify it as a benign local fault)
         //   - local store fault  → `pull.finish(..)` Ok, tee other Err
         let tee_result = tee.finish().await;
-        let verdict = if matches!(tee_result, Err(CacheError::VerifyFailed { .. })) {
+        let verdict = if matches!(
+            tee_result,
+            Err(CacheError::VerifyFailed { .. } | CacheError::HashMismatch { .. })
+        ) {
             TeeVerdict::Corrupt
         } else {
             TeeVerdict::Verified
@@ -1722,7 +1736,7 @@ impl ClientHandler {
                 }
                 Ok(())
             }
-            (Ok(()), Err(CacheError::VerifyFailed { .. })) => {
+            (Ok(()), Err(CacheError::VerifyFailed { .. } | CacheError::HashMismatch { .. })) => {
                 // The teed bao failed verification against the content root: a
                 // corrupt/lying upstream forwarded bytes that do not hash to
                 // `hash` (ADR 038). `pull.finish(Corrupt)` above already scored

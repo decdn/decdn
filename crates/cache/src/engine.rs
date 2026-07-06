@@ -3080,8 +3080,11 @@ impl RecvStream for ChannelRecvStream {
         }
         // A drained-and-closed channel yields a zero-length `Bytes`, which the
         // `bao-tree` reader reads as clean EOF (not an error) — the correct signal
-        // for a fill that ended (`finish`/`abandon` dropped all senders). A
-        // truncated feed instead surfaces via `recv_exact`'s explicit `eof()`.
+        // for a fill that ended (`finish`/`abandon` dropped all senders). A feed
+        // that ends mid-tree surfaces as this same short read to the decoder, which
+        // then fails with `ParentNotFound`/`LeafNotFound` — the transport-class
+        // `bao stream truncated mid-tree` path in `bao_decoded_source`, distinct
+        // from a genuine group hash mismatch.
         let take = self.buf.len().min(len);
         Ok(self.buf.split_to(take).freeze())
     }

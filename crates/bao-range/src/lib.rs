@@ -265,8 +265,8 @@ impl ReadAt for OffsetReadAt<'_> {
 ///
 /// # Errors
 ///
-/// - [`RangeVerifyError::OutboardSize`] if `outboard` is the wrong length for a
-///   `blob_size`-byte blob.
+/// - [`RangeVerifyError::OutboardSize`] if `outboard` is the wrong length for the
+///   aligned range's blob size (`aligned.blob_size()`).
 /// - [`RangeVerifyError::Verification`] if the range/outboard do not verify
 ///   against `root`.
 pub fn encode_verified_range(
