@@ -44,6 +44,14 @@ fn err_of<T, E>(r: Result<T, E>) -> anyhow::Result<E> {
     }
 }
 
+/// The header-less wire length of a `combined` (8-byte LE size header +
+/// interleaved proof/data) encoding — what travels on `cdn/client/v1`.
+fn strip_size_header(combined: &[u8]) -> anyhow::Result<u64> {
+    u64::try_from(combined.len())?
+        .checked_sub(8)
+        .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its 8-byte header"))
+}
+
 #[test]
 fn align_range_snaps_to_chunk_group_boundaries() -> anyhow::Result<()> {
     // A request for [20 KiB, 40 KiB) of a 200 KiB blob must widen to the
@@ -341,9 +349,7 @@ fn assert_encoded_size_matches(blob_len: usize, offset: u64, len: u64) -> anyhow
     let combined = encode_verified_range(root, &aligned, &data, ob.data.clone().into())?;
 
     // Header-less wire length = combined length minus the 8-byte size header.
-    let wire_len = u64::try_from(combined.len())?
-        .checked_sub(8)
-        .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its 8-byte header"))?;
+    let wire_len = strip_size_header(&combined)?;
     let predicted = bao_encoded_size(blob_size, aligned.chunk_ranges());
     anyhow::ensure!(
         predicted == wire_len,
@@ -400,9 +406,7 @@ fn bao_encoded_size_whole_blob_1_5_mib_is_golden() -> anyhow::Result<()> {
     let root = *ob.root.as_bytes();
     let data = sub(&blob, aligned.fetch_start(), aligned.fetch_end())?;
     let combined = encode_verified_range(root, &aligned, &data, ob.data.clone().into())?;
-    let actual_wire = u64::try_from(combined.len())?
-        .checked_sub(8)
-        .ok_or_else(|| anyhow::anyhow!("combined shorter than its 8-byte header"))?;
+    let actual_wire = strip_size_header(&combined)?;
     anyhow::ensure!(
         actual_wire == GOLDEN_WIRE,
         "actual emitted wire {actual_wire} != golden {GOLDEN_WIRE}"

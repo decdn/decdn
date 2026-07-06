@@ -550,15 +550,9 @@ async fn fetch_inner(
         .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
         .saturating_mul(MB_BYTES);
     // Paid/received bytes are **wire** bytes — content plus interleaved bao proof
-    // nodes (ADR 038 §Payment metering) — so the receive bound is the bao-encoded
-    // size of the chunk-group-aligned range, NOT the content-byte remainder. The
-    // server widens `byte_offset` to enclosing 16 KiB groups; the shared
-    // `align_range` / `AlignedRange::wire_len` reproduce that exactly, so this
-    // equals the bytes the server emits.
+    // nodes (ADR 038 §Payment metering) — not the content-byte remainder.
     let total_bytes = resp.body.total_bytes;
-    let aligned = align_range(byte_offset, 0, total_bytes)
-        .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
-    let expected_wire = aligned.wire_len();
+    let expected_wire = aligned_wire_len(byte_offset, total_bytes)?;
 
     let (buf, cumulative) = receive_and_pay(
         &mut send,
@@ -595,6 +589,20 @@ async fn fetch_inner(
     };
     conn.close(0u32.into(), b"done");
     Ok(blob)
+}
+
+/// The wire-byte bound for a resume at `byte_offset` of a `total_bytes` blob:
+/// the bao-encoded size of the chunk-group-aligned range (content plus
+/// interleaved proof, ADR 038 §Payment metering), exactly the byte count the
+/// server emits. The server widens `byte_offset` to enclosing 16 KiB groups;
+/// [`align_range`] / [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
+/// reproduce that, keeping encoder and receiver in lock-step. Shared by the
+/// buffered [`fetch_inner`] and progressive [`open_progressive_pull`] paths so
+/// the two can't drift.
+fn aligned_wire_len(byte_offset: u64, total_bytes: u64) -> anyhow::Result<u64> {
+    let aligned = align_range(byte_offset, 0, total_bytes)
+        .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
+    Ok(aligned.wire_len())
 }
 
 /// Drive the buffered receive loop: read `ChunkData` into a buffer, paying one
@@ -904,11 +912,9 @@ pub async fn open_progressive_pull(
         .saturating_mul(MB_BYTES);
     // Wire-byte bound (bao-encoded size of the aligned range), not content bytes —
     // the window path forwards this stream verbatim and pays the upstream in wire
-    // bytes (ADR 038 §Payment metering). Mirrors `fetch_inner`.
+    // bytes (ADR 038 §Payment metering). Same derivation as `fetch_inner`.
     let total_bytes = resp.body.total_bytes;
-    let aligned = align_range(byte_offset, 0, total_bytes)
-        .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
-    let expected_wire_bytes = aligned.wire_len();
+    let expected_wire_bytes = aligned_wire_len(byte_offset, total_bytes)?;
     let header = UpstreamPullHeader {
         total_bytes,
         rate_per_mb,
