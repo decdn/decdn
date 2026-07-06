@@ -350,7 +350,8 @@ fn assert_encoded_size_matches(blob_len: usize, offset: u64, len: u64) -> anyhow
         "bao_encoded_size {predicted} != actual wire length {wire_len} \
          (blob {blob_len}, offset {offset}, len {len})"
     );
-    // Sanity: proof overhead means the wire carries strictly more than the data.
+    // Sanity: the wire carries at least as much as the data (equal only for a
+    // single-leaf tree, which has no proof parents; strictly more otherwise).
     anyhow::ensure!(predicted >= aligned.fetch_len(), "wire must cover the data");
     Ok(())
 }
@@ -367,5 +368,44 @@ fn bao_encoded_size_matches_actual_wire_length() -> anyhow::Result<()> {
     assert_encoded_size_matches(200 * 1024 + 1234, 196 * 1024, 0)?;
     // A blob smaller than one chunk group (single-leaf tree, no interior nodes).
     assert_encoded_size_matches(500, 0, 0)?;
+    Ok(())
+}
+
+/// Golden wire number (#1060, ADR 038 §Risks): a hard-coded byte count so a
+/// `bao-tree` bump that changes the encoding SHAPE fails here instead of passing
+/// silently. Every other wire expectation in the suite is computed with the same
+/// helper production uses, so none would catch a cross-version encoding change
+/// that both sides compute identically-but-differently.
+///
+/// A 1.5 MiB blob is exactly 96 × 16 KiB chunk groups. A full binary tree over 96
+/// leaves has 95 interior parent nodes; the whole-blob response emits every leaf
+/// (1,572,864 content bytes) plus 95 × 64-byte parents (6,080 bytes) =
+/// 1,578,944 header-less wire bytes.
+#[test]
+fn bao_encoded_size_whole_blob_1_5_mib_is_golden() -> anyhow::Result<()> {
+    const BLOB_SIZE: u64 = 1_572_864; // 1.5 MiB, exactly 96 chunk groups
+    const GOLDEN_WIRE: u64 = 1_578_944; // 1,572,864 content + 95 parents × 64
+
+    let aligned = align_range(0, 0, BLOB_SIZE)?;
+    let predicted = bao_encoded_size(BLOB_SIZE, aligned.chunk_ranges());
+    anyhow::ensure!(
+        predicted == GOLDEN_WIRE,
+        "1.5 MiB whole-blob wire size changed: got {predicted}, expected {GOLDEN_WIRE} \
+         (a bao-tree encoding-shape change — see ADR 038 §Risks)"
+    );
+    // Keep the golden coupled to the real encoding: it must equal what
+    // encode_verified_range actually emits (header-less), not just a constant.
+    let blob = make_blob(usize::try_from(BLOB_SIZE)?);
+    let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+    let root = *ob.root.as_bytes();
+    let data = sub(&blob, aligned.fetch_start(), aligned.fetch_end())?;
+    let combined = encode_verified_range(root, &aligned, &data, ob.data.clone().into())?;
+    let actual_wire = u64::try_from(combined.len())?
+        .checked_sub(8)
+        .ok_or_else(|| anyhow::anyhow!("combined shorter than its 8-byte header"))?;
+    anyhow::ensure!(
+        actual_wire == GOLDEN_WIRE,
+        "actual emitted wire {actual_wire} != golden {GOLDEN_WIRE}"
+    );
     Ok(())
 }

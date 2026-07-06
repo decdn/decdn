@@ -953,6 +953,99 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resume with a NON-EMPTY proof spine (#1060): a ~200 KiB blob spans many 16 KiB
+/// chunk groups, so the offset resume exercises the production
+/// `export_bao_range` ↔ `decode_verified_range` pair over real proof PARENT
+/// nodes — not the degenerate single-leaf tree `client_byte_offset_returns_suffix`
+/// covers. The non-group-aligned offset (70 KiB) also verifies the decoder trims
+/// the leading bytes of the widened [64 KiB, 200 KiB) fetch back to the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_byte_offset_returns_suffix_multi_group() -> anyhow::Result<()> {
+    let payload: Vec<u8> = (0..204_800u32).map(|i| (i % 251) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(Arc::clone(&client_signer), deposit);
+
+    // 70 KiB: past the first four 16 KiB groups and NOT group-aligned, so the
+    // serve widens down to the 64 KiB boundary and the decoder trims 6 KiB.
+    let offset = 70 * 1024u64;
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        offset,
+        0xfeed,
+        Duration::from_secs(15),
+    )
+    .await?;
+
+    let off = usize::try_from(offset)?;
+    let suffix = payload
+        .get(off..)
+        .ok_or_else(|| anyhow::anyhow!("offset past payload"))?;
+    anyhow::ensure!(
+        got.as_ref() == suffix,
+        "multi-group offset fetch must return the trimmed suffix"
+    );
+    let persisted = store.load_all()?;
+    let only = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
+    // ADR 038: metered quantity is the bao WIRE size of the widened, aligned range
+    // — here strictly larger than the content suffix, because the proof spine
+    // carries interior parent nodes (the single-leaf sibling has none).
+    let wire = support::bao_wire_len(payload.len() as u64, offset, 0);
+    let content_suffix = payload.len() as u64 - offset;
+    anyhow::ensure!(
+        wire > content_suffix,
+        "a multi-group range must carry proof parents (wire {wire} > content {content_suffix})"
+    );
+    anyhow::ensure!(
+        only.last_bytes_delivered() == U256::from(wire),
+        "bytes_delivered should be the aligned bao wire size {wire}, got {}",
+        only.last_bytes_delivered()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// `byte_offset` resumes from a partial position: the requester receives only
 /// the suffix and the node prices only the delivered bytes.
 #[tokio::test(flavor = "multi_thread")]
