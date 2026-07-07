@@ -28,7 +28,7 @@ use decdn_incentive::Erc20;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::eth_identity;
 
-use crate::commands::{bond, chain_ctx, key_gen, register};
+use crate::commands::{bond, chain_ctx, key_gen, register, terms};
 
 /// ADR 019 Phase 1 step 2 (Synchronize clock): the local clock should be within
 /// 10 s of UTC before onboarding. Gossip messages are silently rejected by
@@ -292,6 +292,18 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     );
     let already_registered = bound.nodeId == local_node_id;
 
+    // ---- ADR 019 § Terms Acceptance — accept the current operator terms
+    //      *before* any transaction, so a refusal / stale-client abort happens
+    //      before the bond is spent. `Some(hash)` means "a fresh registration is
+    //      due and the operator accepted"; `None` means already registered. ----
+    let terms_hash = accept_terms_if_registering(
+        &bond_contract,
+        cb_addr,
+        already_registered,
+        args.accept_terms,
+    )
+    .await?;
+
     // ---- Confirm the bond before submitting (unless --yes). ----
     if !args.yes
         && !confirm(plan.shortfall, plan.target, args.mbps)
@@ -321,14 +333,9 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             .context("failed to write bond result")?;
     }
 
-    // ---- Phase 2.3: register (skipped only when *this* key is already bound). ----
-    let register_outcome = if already_registered {
-        hline(
-            json,
-            "register: skipped (this node key already registered on-chain)",
-        );
-        None
-    } else {
+    // ---- Phase 2.3: register (skipped only when *this* key is already bound;
+    //      `terms_hash` is `Some` iff a fresh registration is due + accepted). ----
+    let register_outcome = if let Some(terms_hash) = terms_hash {
         if !json {
             println!("register:");
         }
@@ -340,6 +347,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             resolved.chain_id,
             &args.region,
             &args.multiaddrs,
+            terms_hash,
             false,
         )
         .await?;
@@ -349,6 +357,12 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 .context("failed to write register result")?;
         }
         Some(outcome)
+    } else {
+        hline(
+            json,
+            "register: skipped (this node key already registered on-chain)",
+        );
+        None
     };
 
     // ---- Phase 5: readiness summary (read back on-chain state). ----
@@ -403,6 +417,32 @@ fn precheck_keys(
         keystore.display(),
     );
     Ok(KeyAction::Generate)
+}
+
+/// ADR 019 § Terms Acceptance for `setup`: when a fresh registration is due,
+/// read the network's current terms hash and require the operator to accept it
+/// *before* any transaction (so a refusal / stale-client abort happens before
+/// the bond is spent). Returns `Some(hash)` to feed registration, or `None` when
+/// this key is already registered (acceptance was recorded at its own
+/// registration).
+async fn accept_terms_if_registering<P: Provider + Clone>(
+    bond_contract: &CapacityBond::CapacityBondInstance<P>,
+    cb_addr: Address,
+    already_registered: bool,
+    accept_flag: bool,
+) -> anyhow::Result<Option<B256>> {
+    if already_registered {
+        return Ok(None);
+    }
+    let hash = bond_contract
+        .currentTermsHash()
+        .call()
+        .await
+        .with_context(|| {
+            format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
+        })?;
+    terms::ensure_accepted_async(hash, accept_flag).await?;
+    Ok(Some(hash))
 }
 
 /// On-chain registration state, read back for the readiness summary.

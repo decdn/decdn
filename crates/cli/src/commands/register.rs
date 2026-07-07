@@ -30,7 +30,7 @@ use decdn_common::identity;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::{bind_sig, node_register};
 
-use crate::commands::chain_ctx;
+use crate::commands::{chain_ctx, terms};
 
 /// Entry point for `decdn node register`.
 pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
@@ -43,6 +43,20 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     let signer = chain_ctx::load_operator_signer(&args.chain, &resolved.keystore).await?;
     let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
 
+    // ADR 019 § Terms Acceptance — read the network's current terms hash, then
+    // require the operator to accept the matching embedded terms before we sign.
+    // Enforced on `--dry-run` too: a dry run still produces a real, submit-able
+    // signature that commits to `termsHash`, so it must not be generated over
+    // terms the operator hasn't seen / a stale client's hash.
+    let terms_hash = CapacityBond::new(cb_addr, &provider)
+        .currentTermsHash()
+        .call()
+        .await
+        .with_context(|| {
+            format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
+        })?;
+    terms::ensure_accepted_async(terms_hash, args.accept_terms).await?;
+
     let outcome = submit_registration(
         &provider,
         &signer,
@@ -51,6 +65,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
         resolved.chain_id,
         &args.region,
         &args.multiaddrs,
+        terms_hash,
         args.chain.dry_run,
     )
     .await?;
@@ -96,6 +111,7 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
     chain_id: u64,
     region: &str,
     multiaddrs: &[String],
+    terms_hash: B256,
     dry_run: bool,
 ) -> anyhow::Result<RegisterOutcome> {
     // Load the iroh node key. Require it to already exist — `load_or_generate`
@@ -128,14 +144,10 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
                 format!("failed to read registrationNonce from CapacityBond at {cb_addr}")
             })?;
 
-    // ADR 019 § Terms Acceptance — the registration binding signature commits
-    // to the governance-canonical `currentTermsHash`, so submitting `registerNode`
-    // records the operator's acceptance of the current operator terms. The
-    // operator-facing display + explicit acknowledgement is tracked in #1077;
-    // the on-chain contract already enforces `termsHash == currentTermsHash`.
-    let terms_hash: B256 = bond.currentTermsHash().call().await.with_context(|| {
-        format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
-    })?;
+    // ADR 019 § Terms Acceptance — `terms_hash` is the accepted (and staleness-
+    // checked) `currentTermsHash` the caller obtained via `terms::ensure_accepted`
+    // before we sign. The binding signature commits to it, and the on-chain
+    // contract enforces `termsHash == currentTermsHash`.
 
     // EIP-712 RegisterNode signature (Ethereum key). `sign_hash_sync` yields a
     // low-s, 27/28-`v` 65-byte signature accepted by the on-chain OZ
