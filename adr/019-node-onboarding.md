@@ -82,14 +82,15 @@ The bond locks immediately and is slashable from this point forward, including d
 
 #### Step 2.3 — Register node
 
-Call `CapacityBond.registerNode(nodeId, multiaddrs, regionHint, bindingSignature, ed25519Signature)`.
+Call `CapacityBond.registerNode(nodeId, multiaddrs, regionHint, termsHash, bindingSignature, ed25519Signature)`.
 
 This single transaction atomically:
 
-- Verifies the EIP-712 `bindingSignature` over `BindNodeId(nodeId, bindingNonce[ethAddress])`, establishing the `nodeId → ethAddress` mapping for slash evidence and payment attribution.
+- Requires `termsHash == currentTermsHash` and verifies the EIP-712 `bindingSignature` over `RegisterNode(nodeId, bindingNonce[ethAddress], termsHash)`, establishing the `nodeId → ethAddress` mapping for slash evidence and payment attribution and recording the operator's terms acceptance ([§ Operator Safety Obligations](#operator-safety-obligations)).
 - Verifies the `ed25519Signature` over `keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId]))`, proving the operator controls the iroh private key (prevents NodeId squatting). (`ethAddress` is `msg.sender` and `chainId` is `block.chainid` on-chain; this ADR uses operator-perspective names for consistency with the signing pseudo-code below.)
 - Records `NodeInfo` (including `firstBondedAt` if this is the node's first-ever registration — used for cold-start bootstrap eligibility in [ADR 008](008-reputation.md#cold-start-bootstrap)).
 - Sets `active = true` in the registry.
+- Emits `TermsAccepted(nodeId, termsHash, timestamp)`.
 
 **Constructing `multiaddrs`:** The iroh `Endpoint` is not yet bound in Phase 2, so hole-punched addresses are unavailable at registration time:
 
