@@ -1,14 +1,12 @@
 [advisories]
 version = 2
-# Transitive advisories suppressed with justification. The first four are RUSTSEC
+# Transitive advisories suppressed with justification. All four are RUSTSEC
 # "unmaintained" informational notices (not memory-safety / soundness
 # vulnerabilities), each a build-time-only proc-macro or a platform-conditional
-# dep with no runtime exposure in our binaries. The last two (quick-xml) are DoS
-# vulnerabilities that are unreachable in our shipped binaries because the crate
-# is a macOS/iOS-only transitive dep — see their per-entry note. None has a
-# reachable patched release. Each entry records the affected crate, why it is safe
-# to suppress, and what to watch for so a future audit knows when the ignore can
-# be dropped. Status as of 2026-07.
+# dep with no runtime exposure in our binaries. None has a reachable patched
+# release. Each entry records the affected crate, why it is safe to suppress, and
+# what to watch for so a future audit knows when the ignore can be dropped.
+# Status as of 2026-07.
 # The `crate -> dep -> dep` chains below are reverse-dependency paths as produced
 # by `cargo tree -i`: read left-to-right as "is depended on by" (the leftmost
 # crate is the flagged one; each `->` points to a crate that pulls in the prior).
@@ -37,22 +35,12 @@ ignore = [
     # no runtime code. Transitive via alloy-sol-macro -> alloy-sol-types -> alloy.
     # No fixed release exists. Re-evaluate when alloy-sol-macro drops it.
     "RUSTSEC-2026-0173",
-    # quick-xml v0.38.x: two DoS vulnerabilities in XML parsing — RUSTSEC-2026-0194
-    # (O(N^2) duplicate-attribute check, CPU exhaustion) and RUSTSEC-2026-0195
-    # (unbounded namespace-declaration allocation in NsReader, OOM). Both need
-    # quick-xml >= 0.41.0. quick-xml reaches us ONLY via `plist`, which netdev
-    # declares as a macOS/iOS-only dependency (netdev's
-    # `[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.plist]`;
-    # chain quick-xml -> plist -> netdev -> netwatch -> iroh), so it is NOT compiled
-    # into our Linux/musl deployment binaries; cargo-deny flags it only because it
-    # audits the whole cross-platform graph. Even on macOS, netdev feeds plist only
-    # local, trusted system network data — never attacker-controlled XML / NsReader
-    # input. No reachable fix: the newest plist (1.9) still pulls quick-xml 0.39
-    # (< 0.41), and iroh 1.0 / netwatch 0.19 / netdev 0.44 version-pin the chain.
-    # Re-evaluate when that chain reaches quick-xml >= 0.41, or if macOS/iOS becomes
-    # a shipped target — tracked in #1056.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    # NOTE: the quick-xml DoS ignores (RUSTSEC-2026-0194 O(N^2) duplicate-attribute
+    # check + RUSTSEC-2026-0195 unbounded NsReader namespace allocation) were dropped
+    # (#1056) when `plist 1.10` pulled the fixed `quick-xml 0.41.0` — netdev's
+    # `plist ^1.8` requirement (macOS/iOS-only) accepts 1.10, bringing the chain
+    # quick-xml -> plist -> netdev -> netwatch -> iroh to 0.41.
+    # `cargo deny check advisories` flags either ID as "advisory-not-detected" if re-added.
     # NOTE: the hickory-proto / hickory-net DNS DoS ignores
     # (RUSTSEC-2026-0119 + 0120) were dropped when iroh 1.0 pulled the
     # fixed hickory 0.26.1 (iroh 0.98 had exact-pinned the vulnerable
