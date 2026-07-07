@@ -53,7 +53,7 @@ contract CapacityBondRegionE2ETest is Test {
 
     // ===================================================================
     // AUTO-GENERATED — do not edit by hand.
-    // Source: contracts/test/ed25519-vectors  (cargo run)
+    // Source: contracts/test/ed25519-vectors  (cargo run -- --write)
     // Reference: ed25519-dalek 2.2.0 / curve25519-dalek 4.1.3
     // ===================================================================
 
@@ -63,9 +63,9 @@ contract CapacityBondRegionE2ETest is Test {
     address internal constant REG_OPERATOR = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
     uint256 internal constant REG_OP_PK = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
     uint256 internal constant REG_CHAIN_ID = 31_337;
-    // Real ed25519 signature over the digest above; never hand-edit. Regenerate
-    // the whole block with `cargo run` (see README) — a tweaked value fails
-    // verify_strict, so registerNode would revert InvalidEd25519Signature.
+    // Real ed25519 signature over the digest above; never hand-edit.
+    // Regenerate with `cargo run -- --write` (see README) — a tweaked value
+    // fails verify_strict, so registerNode would revert InvalidEd25519Signature.
     bytes internal constant REG_ED25519_SIG =
         hex"2d1b1805fe880782cc1b60bc49f7d1e27445870c01e1de195980970a65f4e0c7fa9ea30347bb876c4b1ce64174fd8d6a2b90520d7ed4dea12d805d401ea5e405";
 

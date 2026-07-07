@@ -32,6 +32,9 @@ postcard = { workspace = true, optional = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 tempfile = { workspace = true }
+# Cargo.lock parsing for the ed25519 dalek pin-parity test
+# (tests/ed25519_pin_parity.rs).
+toml = { workspace = true }
 # Property-based tests for EIP-712 voucher round-trips (`src/voucher.rs`,
 # `src/client_bridge.rs`): the full-U256 nonce/amount keyspace with boundary
 # values (0, u64::MAX, U256::MAX) heavily over-sampled, exercising sign/recover
