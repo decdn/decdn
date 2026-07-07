@@ -58,6 +58,23 @@ mod sol_types {
             /// not an active bonded node.
             function proposeAssignment(uint256 namespaceId, address[] operators) external;
 
+            /// A pending assignment was proposed. `readyAt` is the unix time the
+            /// timelock elapses (earliest governance activation).
+            event AssignmentProposed(
+                uint256 indexed namespaceId,
+                address indexed proposer,
+                address[] operators,
+                uint256 readyAt
+            );
+
+            /// A pending proposal was cleared. `autoCleared == true` means a new
+            /// `proposeAssignment` silently replaced a prior pending proposal.
+            event AssignmentProposalCancelled(
+                uint256 indexed namespaceId,
+                address indexed proposer,
+                bool autoCleared
+            );
+
             // -----------------------------------------------------------------
             // Per-namespace assignment events
             // -----------------------------------------------------------------

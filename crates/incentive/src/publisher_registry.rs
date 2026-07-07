@@ -39,7 +39,7 @@ mod sol_types {
             function namespaceOf(bytes32 blake3Hash) external view returns (uint256[] memory);
 
             /// Mint a fresh namespace owned by the caller. Returns its id
-            /// (>= 1; 0 is the default-open allow-list). Emits `NamespaceCreated`.
+            /// (namespace ids start at 1; 0 is reserved). Emits `NamespaceCreated`.
             function createNamespace() external returns (uint256 namespaceId);
 
             /// Claim `blake3Hash` into `namespaceId` (owner-only, append-only,

@@ -2,15 +2,17 @@
 //!
 //! Submits the `PublisherRegistry` / `OriginAssignment` writes that map
 //! content to namespaces and propose authorized origins. Mirrors the
-//! on-chain-write pattern of `super::register`: resolve chain coordinates,
-//! load the keystore signer, build a wallet-filled provider, submit, and
-//! print a JSON or `key=value` receipt. `--dry-run` prints the resolved
-//! parameters without sending.
+//! on-chain-write pattern of `super::register`: resolve chain coordinates and
+//! parse the target contract address, then — on the submit path only — load
+//! the keystore signer, build a wallet-filled provider, submit, and print a
+//! JSON or `key=value` receipt. `--dry-run` stops after resolution: it loads
+//! no keystore and sends no transaction, printing just the resolved parameters.
 
 use std::io;
 use std::path::Path;
 
 use alloy::primitives::{Address, B256, U256};
+use alloy::sol_types::SolEvent;
 use anyhow::Context;
 use decdn_common::cli;
 use decdn_incentive::origin_assignment::OriginAssignment;
@@ -170,17 +172,26 @@ async fn namespace_create(
             .context("createNamespace sent but the receipt could not be fetched")?;
         let tx = receipt.transaction_hash;
         anyhow::ensure!(receipt.status(), "createNamespace reverted (tx {tx})");
-        // The new id is authoritative from the emitted event: the return value
-        // is not available from a receipt, and a static pre-call would race a
-        // concurrent create (`_nextNamespaceId` is global across publishers).
-        let namespace_id = receipt
+        // The new id comes from the emitted event: the return value is not in a
+        // receipt, and a static pre-call would race a concurrent create
+        // (`_nextNamespaceId` is global across publishers). Match the log by
+        // event signature first, then decode — so an ABI drift surfaces as a
+        // decode error rather than a misleading "missing event".
+        let created = receipt
             .inner
             .logs()
             .iter()
-            .find_map(|log| log.log_decode::<PublisherRegistry::NamespaceCreated>().ok())
-            .map(|decoded| decoded.inner.data.namespaceId)
-            .context("createNamespace receipt missing NamespaceCreated event")?;
-        let id_u64 = u64::try_from(namespace_id)
+            .find(|log| log.topic0() == Some(&PublisherRegistry::NamespaceCreated::SIGNATURE_HASH))
+            .context(
+                "createNamespace succeeded on-chain but its receipt carried no NamespaceCreated \
+                 log (the namespace id could not be recovered; check the tx on a block explorer)",
+            )?
+            .log_decode::<PublisherRegistry::NamespaceCreated>()
+            .context(
+                "createNamespace emitted a NamespaceCreated log that failed to decode (ABI \
+                 mismatch between this CLI and the deployed PublisherRegistry?)",
+            )?;
+        let id_u64 = u64::try_from(created.inner.data.namespaceId)
             .context("namespace id exceeds u64 (unexpected on this chain)")?;
         outcome.namespace_id = Some(id_u64);
         outcome.tx = Some(tx);
@@ -291,6 +302,12 @@ pub(crate) struct AssignOutcome {
     pub(crate) namespace_id: u64,
     pub(crate) operators: Vec<Address>,
     pub(crate) tx: Option<B256>,
+    /// Unix time the assignment timelock elapses (earliest DAO activation),
+    /// from the `AssignmentProposed` event. `None` on a dry run.
+    pub(crate) ready_at: Option<u64>,
+    /// True when this proposal silently replaced a prior pending one on-chain
+    /// (`AssignmentProposalCancelled { autoCleared: true }`).
+    pub(crate) replaced_prior: bool,
 }
 
 pub(crate) fn write_assign_outcome(
@@ -307,6 +324,8 @@ pub(crate) fn write_assign_outcome(
             "namespace_id": o.namespace_id,
             "operators": o.operators.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>(),
             "status": if o.tx.is_some() { "proposed_pending_dao" } else { "dry_run" },
+            "ready_at": o.ready_at,
+            "replaced_prior": o.replaced_prior,
         });
         return writeln!(w, "{value}");
     }
@@ -318,6 +337,12 @@ pub(crate) fn write_assign_outcome(
     writeln!(w, "operators={}", o.operators.len())?;
     for a in &o.operators {
         writeln!(w, "  operator={a:#x}")?;
+    }
+    if let Some(ready_at) = o.ready_at {
+        writeln!(w, "ready_at={ready_at}")?;
+    }
+    if o.replaced_prior {
+        writeln!(w, "warning=replaced_existing_pending_proposal")?;
     }
     match o.tx {
         // Propose-only: activation is a separate governance action.
@@ -355,6 +380,8 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         namespace_id: args.namespace,
         operators: operators.clone(),
         tx: None,
+        ready_at: None,
+        replaced_prior: false,
     };
 
     if !args.chain.dry_run {
@@ -386,6 +413,42 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
              or duplicate operator, or the set exceeds maxOriginsPerNamespace",
         );
         outcome.tx = Some(tx);
+
+        // Surface the timelock deadline (`readyAt`), matching the honest
+        // decode in `namespace_create`: match by signature, then decode.
+        let proposed = receipt
+            .inner
+            .logs()
+            .iter()
+            .find(|log| log.topic0() == Some(&OriginAssignment::AssignmentProposed::SIGNATURE_HASH))
+            .context(
+                "proposeAssignment succeeded but its receipt carried no AssignmentProposed log \
+                 (the timelock deadline could not be recovered; check the tx on a block explorer)",
+            )?
+            .log_decode::<OriginAssignment::AssignmentProposed>()
+            .context(
+                "proposeAssignment emitted an AssignmentProposed log that failed to decode (ABI \
+                 mismatch between this CLI and the deployed OriginAssignment?)",
+            )?;
+        outcome.ready_at = Some(
+            u64::try_from(proposed.inner.data.readyAt)
+                .context("assignment readyAt exceeds u64 (unexpected on this chain)")?,
+        );
+
+        // If a prior pending proposal was silently replaced, the contract emits
+        // `AssignmentProposalCancelled { autoCleared: true }` in the same tx.
+        outcome.replaced_prior = receipt
+            .inner
+            .logs()
+            .iter()
+            .filter(|log| {
+                log.topic0() == Some(&OriginAssignment::AssignmentProposalCancelled::SIGNATURE_HASH)
+            })
+            .filter_map(|log| {
+                log.log_decode::<OriginAssignment::AssignmentProposalCancelled>()
+                    .ok()
+            })
+            .any(|c| c.inner.data.autoCleared);
     }
 
     let mut out = io::stdout().lock();
@@ -395,7 +458,7 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -453,6 +516,8 @@ mod tests {
             namespace_id: 7,
             operators: vec![Address::repeat_byte(0x11), Address::repeat_byte(0x22)],
             tx: Some(B256::repeat_byte(0x55)),
+            ready_at: Some(1_700_000_000),
+            replaced_prior: true,
         };
         let mut buf = Vec::new();
         write_assign_outcome(&mut buf, &o, false).unwrap();
@@ -460,6 +525,108 @@ mod tests {
         assert!(s.contains("operators=2"), "{s}");
         assert!(s.contains("status=proposed_pending_dao"), "{s}");
         assert!(s.contains("tx=0x5555"), "{s}");
+        assert!(s.contains("ready_at=1700000000"), "{s}");
+        assert!(
+            s.contains("warning=replaced_existing_pending_proposal"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn assign_dry_run_omits_operator_readyat_and_warning() {
+        let o = AssignOutcome {
+            operator: None,
+            origin_assignment: Address::repeat_byte(0x02),
+            namespace_id: 7,
+            operators: vec![Address::repeat_byte(0x11)],
+            tx: None,
+            ready_at: None,
+            replaced_prior: false,
+        };
+        let mut buf = Vec::new();
+        write_assign_outcome(&mut buf, &o, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("status=dry_run submitted=false"), "{s}");
+        // The signer `operator=` line sits at column 0; the operator-set lines
+        // are indented (`  operator=`). Only the signer line must be absent.
+        assert!(!s.lines().any(|l| l.starts_with("operator=")), "{s}");
+        assert!(!s.contains("ready_at="), "{s}");
+        assert!(!s.contains("warning="), "{s}");
+    }
+
+    // JSON writers are the machine-consumable contract — round-trip each so a
+    // renamed key or wrong-shaped value fails loudly.
+    #[test]
+    fn namespace_json_round_trips() {
+        let dry = NamespaceOutcome {
+            operator: None,
+            registry: Address::repeat_byte(0x01),
+            namespace_id: None,
+            tx: None,
+        };
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &dry, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["submitted"], serde_json::json!(false));
+        assert!(v["tx"].is_null(), "{v}");
+        assert!(v["operator"].is_null(), "{v}");
+        assert!(v["namespace_id"].is_null(), "{v}");
+
+        let done = NamespaceOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            registry: Address::repeat_byte(0x01),
+            namespace_id: Some(9),
+            tx: Some(B256::repeat_byte(0x55)),
+        };
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &done, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["submitted"], serde_json::json!(true));
+        assert_eq!(v["namespace_id"], serde_json::json!(9)); // number, not string
+        assert_eq!(
+            v["operator"],
+            serde_json::json!(format!("{:#x}", done.operator.unwrap()))
+        );
+    }
+
+    #[test]
+    fn claim_json_round_trips() {
+        let o = ClaimOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            registry: Address::repeat_byte(0x01),
+            namespace_id: 7,
+            hash: [0xAB; 32],
+            tx: Some(B256::repeat_byte(0x55)),
+        };
+        let mut buf = Vec::new();
+        write_claim_outcome(&mut buf, &o, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["submitted"], serde_json::json!(true));
+        assert_eq!(v["namespace_id"], serde_json::json!(7));
+        assert_eq!(
+            v["hash"],
+            serde_json::json!(format!("0x{}", "ab".repeat(32)))
+        );
+    }
+
+    #[test]
+    fn assign_json_round_trips() {
+        let o = AssignOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            origin_assignment: Address::repeat_byte(0x02),
+            namespace_id: 7,
+            operators: vec![Address::repeat_byte(0x11), Address::repeat_byte(0x22)],
+            tx: Some(B256::repeat_byte(0x55)),
+            ready_at: Some(1_700_000_000),
+            replaced_prior: true,
+        };
+        let mut buf = Vec::new();
+        write_assign_outcome(&mut buf, &o, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("proposed_pending_dao"));
+        assert_eq!(v["operators"].as_array().unwrap().len(), 2);
+        assert_eq!(v["ready_at"], serde_json::json!(1_700_000_000));
+        assert_eq!(v["replaced_prior"], serde_json::json!(true));
     }
 
     #[test]
