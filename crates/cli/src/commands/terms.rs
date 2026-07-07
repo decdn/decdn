@@ -80,12 +80,12 @@ pub fn decide(accept_flag: bool, is_tty: bool, local: B256, chain: B256) -> Deci
 /// - The operator answered no at the interactive prompt.
 pub fn ensure_accepted(chain_terms_hash: B256, accept_flag: bool) -> anyhow::Result<()> {
     let local = terms_hash();
-    match decide(
-        accept_flag,
-        io::stdin().is_terminal(),
-        local,
-        chain_terms_hash,
-    ) {
+    // Interactive only when BOTH streams are terminals: the terms + prompt go to
+    // stderr and the answer is read from stdin, so if either is redirected the
+    // operator can't see the prompt — fall back to requiring `--accept-terms`
+    // rather than blocking on invisible input.
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    match decide(accept_flag, interactive, local, chain_terms_hash) {
         Decision::StaleClient => anyhow::bail!(
             "operator terms mismatch: this build ships terms {} ({:#x}) but the network's \
              current terms are {:#x}. Update `decdn` to a build whose terms match the network \
