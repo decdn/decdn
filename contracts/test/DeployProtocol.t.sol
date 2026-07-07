@@ -63,6 +63,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
+            currentTermsHash: bytes32(0),
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],

@@ -182,6 +182,15 @@ contract CapacityBond is
 
     bytes32 public constant BIND_NODE_TYPEHASH = keccak256("BindNodeId(bytes32 nodeId,uint64 nonce)");
 
+    // ADR 019 § Terms Acceptance — `registerNode` carries the operator's
+    // acceptance of the current operator terms inside the binding signature.
+    // Registration signs this distinct payload (not `BIND_NODE_TYPEHASH`): the
+    // acceptance is bound to the exact `termsHash`, and rebinding via
+    // `bindNodeId` (key rotation) stays on `BIND_NODE_TYPEHASH` with no terms
+    // re-acceptance, per ADR 019 § "enforcement at registration only".
+    bytes32 public constant REGISTER_NODE_TYPEHASH =
+        keccak256("RegisterNode(bytes32 nodeId,uint64 nonce,bytes32 termsHash)");
+
     // -----------------------------------------------------------------
     // Immutable wiring
     // -----------------------------------------------------------------
@@ -384,6 +393,13 @@ contract CapacityBond is
     uint256 public multiaddrUpdateCooldown;
     uint256 public maxMultiaddrSize;
 
+    // ADR 019 § Governance-canonical terms version — the operator-terms hash
+    // new registrants must accept at `registerNode`. Governance-swappable via
+    // `setCurrentTermsHash` (no `[floor, ceiling]` rail: a hash has no
+    // monotonic direction). Already-registered operators keep their recorded
+    // acceptance; a bump binds only new registrants.
+    bytes32 public currentTermsHash;
+
     // -----------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------
@@ -424,6 +440,13 @@ contract CapacityBond is
     );
     event NodeIdBound(address indexed ethAddress, bytes32 indexed nodeId, uint64 bindingNonce);
     event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
+
+    // ADR 019 § Terms Acceptance — operator recorded acceptance of the current
+    // operator terms (`termsHash`) at registration; evidence of notice + assent.
+    event TermsAccepted(bytes32 indexed nodeId, bytes32 indexed termsHash, uint256 timestamp);
+    // ADR 019 § Governance-canonical terms version — governor swapped the
+    // canonical operator-terms hash new registrants must accept.
+    event CurrentTermsHashUpdated(bytes32 oldHash, bytes32 newHash);
     event NodeDeregistered(bytes32 indexed nodeId);
     event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingBond);
     event NodeIdReclaimed(bytes32 indexed nodeId, address indexed previousOwner);
@@ -464,6 +487,9 @@ contract CapacityBond is
     error AddressAlreadyBound(bytes32 currentNodeId);
     error InvalidBindingSignature();
     error InvalidEd25519Signature();
+    // ADR 019 § 243 — submitted `termsHash` did not match the
+    // governance-canonical `currentTermsHash` (stale terms / un-upgraded CLI).
+    error TermsHashMismatch(bytes32 provided, bytes32 expected);
     error MultiaddrsTooLarge(uint256 size, uint256 ceiling);
     error MultiaddrCooldownActive(uint256 readyAt);
     error NodeNotActive();
@@ -501,6 +527,11 @@ contract CapacityBond is
     /// @param maxMultiaddrSize_         Initial multiaddrs byte-length cap.
     /// @param regionStabilityWindow_    Initial region-update cooldown (default
     ///                                  7 days; bounded `[3d, 30d]`).
+    /// @param currentTermsHash_         Genesis operator-terms hash new
+    ///                                  registrants must accept (ADR 019 §
+    ///                                  Terms Acceptance). Governance-swappable
+    ///                                  via `setCurrentTermsHash`; unbounded
+    ///                                  (a hash has no monotonic direction).
     constructor(
         ERC20Burnable token_,
         IEd25519Verifier ed25519Verifier_,
@@ -509,7 +540,8 @@ contract CapacityBond is
         uint256 unbondingPeriod_,
         uint256 multiaddrUpdateCooldown_,
         uint256 maxMultiaddrSize_,
-        uint256 regionStabilityWindow_
+        uint256 regionStabilityWindow_,
+        bytes32 currentTermsHash_
     ) EIP712("CapacityBond", "1") {
         if (address(token_) == address(0) || address(ed25519Verifier_) == address(0) || admin == address(0)) {
             revert ZeroAddress();
@@ -527,6 +559,7 @@ contract CapacityBond is
         multiaddrUpdateCooldown = multiaddrUpdateCooldown_;
         maxMultiaddrSize = maxMultiaddrSize_;
         regionStabilityWindow = regionStabilityWindow_;
+        currentTermsHash = currentTermsHash_;
         // ADR 030 § Region-stability window: fresh deploy == gate activation
         // (non-upgradeable, so no migration cohort to stay conservative for).
         // forge-lint: disable-next-line(block-timestamp)
@@ -688,16 +721,24 @@ contract CapacityBond is
     // Node registry (ADR 003 § Node Registry)
     // -----------------------------------------------------------------
 
+    /// @param termsHash Operator-terms hash the caller accepts. MUST equal the
+    ///        governance-canonical `currentTermsHash` (ADR 019 § Terms
+    ///        Acceptance) and is covered by `bindingSignature` (over
+    ///        `REGISTER_NODE_TYPEHASH`), so assent binds to the exact bytes.
     function registerNode(
         bytes32 nodeId,
         bytes calldata multiaddrs,
         string calldata regionHint,
+        bytes32 termsHash,
         bytes calldata bindingSignature,
         bytes calldata ed25519Signature
     ) external nonReentrant whenNotPaused {
+        if (termsHash != currentTermsHash) {
+            revert TermsHashMismatch(termsHash, currentTermsHash);
+        }
         _checkRegistrationPreconditions(nodeId, multiaddrs.length, bytes(regionHint).length);
         _checkBindingOneToOne(nodeId);
-        uint64 usedBindingNonce = _verifyBindingSignature(nodeId, bindingSignature);
+        uint64 usedBindingNonce = _verifyRegistrationSignature(nodeId, termsHash, bindingSignature);
         uint64 usedRegistrationNonce = _verifyEd25519OwnershipSignature(nodeId, ed25519Signature);
 
         nodeIdToAddress[nodeId] = msg.sender;
@@ -708,6 +749,8 @@ contract CapacityBond is
 
         emit NodeRegistered(nodeId, msg.sender, multiaddrs, regionHint, usedBindingNonce, usedRegistrationNonce);
         emit NodeIdBound(msg.sender, nodeId, usedBindingNonce);
+        // forge-lint: disable-next-line(block-timestamp)
+        emit TermsAccepted(nodeId, termsHash, block.timestamp);
     }
 
     function _checkRegistrationPreconditions(bytes32 nodeId, uint256 multiaddrsLength, uint256 regionHintLength)
@@ -751,6 +794,21 @@ contract CapacityBond is
     function _verifyBindingSignature(bytes32 nodeId, bytes calldata sig) internal view returns (uint64 nonce) {
         nonce = bindingNonce[msg.sender];
         bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(BIND_NODE_TYPEHASH, nodeId, nonce)));
+        if (!SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)) {
+            revert InvalidBindingSignature();
+        }
+    }
+
+    /// @dev Registration binding signature covers `termsHash` (ADR 019 § Terms
+    ///      Acceptance) over `REGISTER_NODE_TYPEHASH`, sharing the per-address
+    ///      `bindingNonce` with `bindNodeId` for cross-path replay protection.
+    function _verifyRegistrationSignature(bytes32 nodeId, bytes32 termsHash, bytes calldata sig)
+        internal
+        view
+        returns (uint64 nonce)
+    {
+        nonce = bindingNonce[msg.sender];
+        bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(REGISTER_NODE_TYPEHASH, nodeId, nonce, termsHash)));
         if (!SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)) {
             revert InvalidBindingSignature();
         }
@@ -1077,6 +1135,19 @@ contract CapacityBond is
         uint256 oldMinBond = minBond;
         minBond = newMinBond;
         emit MinBondUpdated(oldMinBond, newMinBond);
+    }
+
+    /// @notice Swap the governance-canonical operator-terms hash (ADR 019 §
+    ///         Governance-canonical terms version). New registrants must accept
+    ///         `newHash`; already-registered operators keep their recorded
+    ///         acceptance. Deliberately has no `[floor, ceiling]` rail — a hash
+    ///         has no monotonic direction; the guard rail is instead the
+    ///         governance norm that every proposal setting `currentTermsHash`
+    ///         references the terms text and its review record.
+    function setCurrentTermsHash(bytes32 newHash) external onlyRole(GOVERNANCE_ROLE) {
+        bytes32 oldHash = currentTermsHash;
+        currentTermsHash = newHash;
+        emit CurrentTermsHashUpdated(oldHash, newHash);
     }
 
     /// @notice Set the capacity-bond curve constant `k` in TOKEN-wei (ADR 026

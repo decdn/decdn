@@ -47,7 +47,8 @@ contract SlashAppealTest is Test {
             unbondingPeriod_: 7 days,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: 7 days
+            regionStabilityWindow_: 7 days,
+            currentTermsHash_: bytes32(0)
         });
 
         appeal = new SlashAppeal({

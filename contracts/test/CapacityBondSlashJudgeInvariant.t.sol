@@ -53,7 +53,8 @@ contract CapacityBondSlashJudgeInvariantTest is Test {
             unbondingPeriod_: 30 days,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: 7 days
+            regionStabilityWindow_: 7 days,
+            currentTermsHash_: bytes32(0)
         });
 
         // Real SlashJudge pointed at the real bond. 20d < 30d so its constructor
