@@ -13,9 +13,9 @@ This ADR is that contract-implementation ADR. It pins the per-appeal storage lay
 
 It is the blacklist-side analogue of the slash-appeal entry points on the `SlashAppeal` contract pinned in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface).
 
-This ADR does **not** re-litigate [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, the synthetic-standing clawback, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting).
+This ADR does **not** re-litigate most [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting). The one departure: the synthetic-standing clawback it specifies is **dropped** here — `StandingPath.TokenHolder` standing is the escrowed appeal bond itself (no balance threshold), and an escrowed bond cannot be flash-loaned, so there is nothing for a clawback to defend against.
 
-> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt` and enforced only on the permissionless cleanup path (see § Deadline enforcement is permissionless-only — a deliberate design point, not a gap), lapse paths that currently burn the bond, and the TokenHolder synthetic-standing clawback still deferred. Standing is now enforced at filing for all three paths (audit I-3); the perjury denylist also ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field). #688 (sub-issue #1018, the clawback) closes the remaining gap.
+> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt` and enforced only on the permissionless cleanup path (see § Deadline enforcement is permissionless-only — a deliberate design point, not a gap), and lapse paths that currently burn the bond. Standing is enforced at filing for all three paths (audit I-3): Publisher and Operator each prove a credential, while TokenHolder standing is the escrowed appeal bond itself — there is no `appealFilerTokenThreshold` balance gate and no synthetic-standing clawback. The clawback is **dropped, not deferred**: an escrowed bond cannot be flash-loaned, so there is nothing to fake, and a balance gate would protect nothing the bond + `hasActiveAppeal` + rejection cooldown + perjury denylist do not already protect. The perjury denylist also ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field).
 
 ## Decision
 
@@ -33,14 +33,14 @@ enum AppealStatus {
     Ratified,       // 3 — terminal: _removeHashRegional executed; bond refunded
     Reversed,       // 4 — terminal: entry.suspended cleared; bond burned
     Rejected,       // 5 — terminal: rejected at intake or after fast-track; bond burned
-    Lapsed          // 6 — terminal: cleanupExpiredBlacklistAppeal fired; bond refunded except for the synthetic-standing clawback case which burns (see § cleanupExpiredBlacklistAppeal)
+    Lapsed          // 6 — terminal: cleanupExpiredBlacklistAppeal fired; bond refunded (all lapse conditions refund; see § cleanupExpiredBlacklistAppeal)
 }
 
 enum StandingPath {
     None,           // 0 — invalid sentinel
     Publisher,      // 1 — publisherRegistry.ownerOf(namespaceId) == filer AND that namespace hasClaimed the hash
     Operator,       // 2 — operator with node.region matching entry.region
-    TokenHolder     // 3 — TOKEN balance ≥ appealFilerTokenThreshold (governable); subject to synthetic-standing clawback
+    TokenHolder     // 3 — no extra credential: the escrowed appeal bond is the standing (no balance threshold, no synthetic-standing clawback)
 }
 
 struct BlacklistAppeal {
@@ -104,7 +104,7 @@ uint256 public totalBondsEscrowed;
 
 **`TOKEN` reference** is the existing immutable `IERC20 public immutable TOKEN` already required by `ContentBlacklist` for the bond pull; no additional constructor argument.
 
-**`PublisherRegistry` reference** is an immutable `IPublisherRegistryStanding` constructor argument (audit I-3): the Publisher standing check needs `ownerOf` + `hasClaimed`, and a security-critical standing gate must not be left unset or re-pointed. The deployment builds `PublisherRegistry` (which needs only `admin`) before `ContentBlacklist`. The TokenHolder threshold is the governable `appealFilerTokenThreshold` (default 1,000 TOKEN; bounded `[1,000, 1,000,000] × 1e18`, tightening-only — floor equals the launch default).
+**`PublisherRegistry` reference** is an immutable `IPublisherRegistryStanding` constructor argument (audit I-3): the Publisher standing check needs `ownerOf` + `hasClaimed`, and a security-critical standing gate must not be left unset or re-pointed. The deployment builds `PublisherRegistry` (which needs only `admin`) before `ContentBlacklist`. The TokenHolder path carries no threshold parameter: standing is the escrowed appeal bond, so there is no `appealFilerTokenThreshold` to configure or govern.
 
 ### Function signatures and revert table
 
@@ -126,14 +126,14 @@ function openBlacklistAppeal(
 | `EntryNotFound()` | No `BlacklistEntry` exists for `(blake3Hash, region)` |
 | `FilingWindowClosed()` | `block.timestamp ≥ entry.addedAt + BLACKLIST_APPEAL_FILING_WINDOW` |
 | `InvalidStandingPath()` | `standingPath` is not in `{Publisher, Operator, TokenHolder}` |
-| `StandingCheckFailed()` | The filer fails the declared `standingPath` check: **Publisher** — `publisherRegistry.ownerOf(namespaceId) != msg.sender` OR the namespace has not `hasClaimed` the hash; **Operator** — region mismatch; **TokenHolder** — `token.balanceOf(filer) < appealFilerTokenThreshold` (the governable threshold below). As-built, all three collapse to a single `UnauthorizedStanding(standingPath)` (Operator region mismatch additionally surfaces `OperatorRegionMismatch`). |
+| `StandingCheckFailed()` | The filer fails the declared `standingPath` check: **Publisher** — `publisherRegistry.ownerOf(namespaceId) != msg.sender` OR the namespace has not `hasClaimed` the hash; **Operator** — region mismatch; **TokenHolder** — never fails a standing check (the escrowed appeal bond is the standing, so the only gate is the bond `safeTransferFrom` itself). As-built, Publisher/Operator failures collapse to a single `UnauthorizedStanding(standingPath)` (Operator region mismatch additionally surfaces `OperatorRegionMismatch`). |
 | `FilerPerjuryDenylisted()` | `perjuryDenylistUntilAt[msg.sender] > block.timestamp` |
 | `FilerInRejectionCooldown()` | `filerRejections[msg.sender].cooldownUntilAt > block.timestamp` |
 | `EmptyEvidenceBundleHash()` | `evidenceBundleHash == bytes32(0)` |
 | `BondTransferFailed()` | `TOKEN.transferFrom(msg.sender, address(this), BLACKLIST_APPEAL_BOND)` reverts or returns false |
 | `AppealPathNotYetActive()` | Optional: first regional body not yet registered per [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) bootstrap-window degradation note |
 
-**State transitions:** `appealCounter` increments; `appeals[appealCounter] = BlacklistAppeal{status: Open, openedAt: block.timestamp, reviewWindowEndsAt: block.timestamp + BLACKLIST_MULTISIG_REVIEW_WINDOW, ...}`; `totalBondsEscrowed += BLACKLIST_APPEAL_BOND`. The synthetic-standing clawback check for `standingPath == TokenHolder` schedules a second checkpoint at `openedAt + STANDING_LOOKBACK_SECONDS` — the on-chain second-check fires through `cleanupExpiredBlacklistAppeal` admissibility condition (c) once the lookback elapses; the contract does not auto-schedule.
+**State transitions:** `appealCounter` increments; `appeals[appealCounter] = BlacklistAppeal{status: Open, openedAt: block.timestamp, reviewWindowEndsAt: block.timestamp + BLACKLIST_MULTISIG_REVIEW_WINDOW, ...}`; `totalBondsEscrowed += BLACKLIST_APPEAL_BOND`. `standingPath == TokenHolder` requires no post-filing checkpoint: standing is the escrowed bond itself, so there is no balance re-check to schedule.
 
 **Emits:** `BlacklistAppealOpened(appealId, blake3Hash, region, filer, evidenceBundleHash, standingPath)`.
 
@@ -202,18 +202,19 @@ Both require `status == FastTracked`; neither carries an upper deadline — the 
 function cleanupExpiredBlacklistAppeal(uint256 appealId) external;
 ```
 
-Permissionless. Reverts unless one of the four admissibility conditions from [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist) cleanup interface holds:
+Permissionless. Reverts unless one of the three admissibility conditions from [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist) cleanup interface holds:
 
 | Condition | Test | Bond outcome |
 | --- | --- | --- |
 | (a) multisig silent past `BLACKLIST_MULTISIG_REVIEW_WINDOW` | `status == Open && block.timestamp ≥ reviewWindowEndsAt` | refund |
 | (b) governance silent past `BLACKLIST_RATIFICATION_WINDOW` | `status == FastTracked && block.timestamp ≥ reviewWindowEndsAt` | refund |
-| (c) synthetic-standing clawback fired | `status == Open && standingPath == TokenHolder && block.timestamp ≥ openedAt + STANDING_LOOKBACK_SECONDS && TOKEN.balanceOf(filer) < APPEAL_FILER_TOKEN_THRESHOLD` | **burn** (100%) |
-| (d) global override fired | `status ∈ {Open, FastTracked} && _entryExists(appeal.blake3Hash, appeal.region) == false` | refund (per [ADR 011 § Global Override](011-content-takedown.md#global-override)) |
+| (c) global override fired | `status ∈ {Open, FastTracked} && _entryExists(appeal.blake3Hash, appeal.region) == false` | refund (per [ADR 011 § Global Override](011-content-takedown.md#global-override)) |
 
-**State transitions:** `status = Lapsed` for all four conditions — the terminal-status set is intentionally minimal. The bond outcome (refund for a, b, d; burn for c) is determined by the matched condition per the table above, surfaced through the `LapseReason` indexed sub-field on `BlacklistAppealLapsed` (see § Event topic ordering) so off-chain consumers can distinguish refund-vs-burn cases without parsing follow-on `Transfer` events. If `status` was `FastTracked` when cleanup fires: `regionActiveReliefCount[appeal.region]--`; `entry.suspended = false`; `entry.suspendedAt` preserved. `totalBondsEscrowed -= appeal.bond`.
+The synthetic-standing clawback is intentionally absent — `StandingPath.TokenHolder` standing is the escrowed bond, so there is no post-filing balance re-check and no burn-on-clawback lapse condition.
 
-**Emits:** `BlacklistAppealLapsed(appealId, reason)` where `reason` is a `u8` enum (`MultisigTimeout = 1, RatificationTimeout = 2, StandingClawback = 3, GlobalOverride = 4`) mapping 1:1 to the four conditions above.
+**State transitions:** `status = Lapsed` for all three conditions — the terminal-status set is intentionally minimal. Every lapse condition refunds the bond; the matched condition is surfaced through the `LapseReason` indexed sub-field on `BlacklistAppealLapsed` (see § Event topic ordering) so off-chain consumers can attribute the lapse without parsing follow-on `Transfer` events. If `status` was `FastTracked` when cleanup fires: `regionActiveReliefCount[appeal.region]--`; `entry.suspended = false`; `entry.suspendedAt` preserved. `totalBondsEscrowed -= appeal.bond`.
+
+**Emits:** `BlacklistAppealLapsed(appealId, reason)` where `reason` is a `u8` enum (`MultisigTimeout = 1, RatificationTimeout = 2, GlobalOverride = 3`) mapping 1:1 to the three conditions above.
 
 After cleanup, subsequent calls against the same `appealId` revert with `BlacklistAppealAlreadyClosed()`.
 
@@ -247,13 +248,12 @@ stateDiagram-v2
     Open --> FastTracked: fastTrackBlacklistAppeal (multisig)
     Open --> Rejected: rejectBlacklistAppeal / rejectAppealAsPerjury (multisig)
     Open --> Lapsed: cleanupExpiredBlacklistAppeal (a) MultisigTimeout
-    Open --> Lapsed: cleanupExpiredBlacklistAppeal (c) StandingClawback
-    Open --> Lapsed: cleanupExpiredBlacklistAppeal (d) GlobalOverride
+    Open --> Lapsed: cleanupExpiredBlacklistAppeal (c) GlobalOverride
     FastTracked --> Ratified: ratifyBlacklistAppealRemoval (governor)
     FastTracked --> Reversed: reverseBlacklistAppeal (governor)
     FastTracked --> Rejected: rejectBlacklistAppeal / rejectAppealAsPerjury (multisig)
     FastTracked --> Lapsed: cleanupExpiredBlacklistAppeal (b) RatificationTimeout
-    FastTracked --> Lapsed: cleanupExpiredBlacklistAppeal (d) GlobalOverride
+    FastTracked --> Lapsed: cleanupExpiredBlacklistAppeal (c) GlobalOverride
     Ratified --> [*]
     Reversed --> [*]
     Rejected --> [*]
@@ -262,10 +262,10 @@ stateDiagram-v2
 
 ### Integration with ContentBlacklist core
 
-- **`entry.suspended` writes** happen only from `fastTrackBlacklistAppeal` (true), `reverseBlacklistAppeal` (false, preserving `suspendedAt`), `rejectBlacklistAppeal` / `rejectAppealAsPerjury` on a `FastTracked` appeal (false, preserving `suspendedAt`), and `cleanupExpiredBlacklistAppeal` cases (b) and (d) (false, preserving `suspendedAt`). No other path mutates `suspended`.
+- **`entry.suspended` writes** happen only from `fastTrackBlacklistAppeal` (true), `reverseBlacklistAppeal` (false, preserving `suspendedAt`), `rejectBlacklistAppeal` / `rejectAppealAsPerjury` on a `FastTracked` appeal (false, preserving `suspendedAt`), and `cleanupExpiredBlacklistAppeal` cases (b) and (c) (false, preserving `suspendedAt`). No other path mutates `suspended`.
 - **`entry.suspendedAt` is monotonic per entry.** Once written by a fast-track, it is preserved across `reverseBlacklistAppeal` and `cleanupExpiredBlacklistAppeal` so [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) can compute evidence age against the historical suspension boundary. A subsequent fresh `fastTrackBlacklistAppeal` on the same entry overwrites with the new boundary; this is acceptable because each fast-track defines its own suspension epoch.
 - **`_removeHashRegional` internal call** from `ratifyBlacklistAppealRemoval` reuses the same body as the public `removeHashRegional` (which is `onlyGovernor` per [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). The internal variant skips the role check (caller is already `onlyGovernor` on `ratifyBlacklistAppealRemoval`) and emits `HashRemoved` exactly once.
-- **`regionActiveReliefCount` and `filerRegionActiveRelief` decrement points** are identical (both counters move together): `rejectBlacklistAppeal` / `rejectAppealAsPerjury` on a `FastTracked` appeal, `ratifyBlacklistAppealRemoval`, `reverseBlacklistAppeal`, and `cleanupExpiredBlacklistAppeal` cases (b) and (d) — every transition out of `FastTracked`. Increment of both is exclusive to `fastTrackBlacklistAppeal`.
+- **`regionActiveReliefCount` and `filerRegionActiveRelief` decrement points** are identical (both counters move together): `rejectBlacklistAppeal` / `rejectAppealAsPerjury` on a `FastTracked` appeal, `ratifyBlacklistAppealRemoval`, `reverseBlacklistAppeal`, and `cleanupExpiredBlacklistAppeal` cases (b) and (c) — every transition out of `FastTracked`. Increment of both is exclusive to `fastTrackBlacklistAppeal`.
 
 ### Multisig capability scope
 
@@ -284,7 +284,7 @@ stateDiagram-v2
 
 - Pins storage layout and event schema as a single source of truth, removing the cross-derivation cost between [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)'s narrative form and the eventual Solidity.
 - Parallel structure to [ADR 032](_history/032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface) keeps both appeal-contract surfaces — slashing and blacklist — auditable under one pattern.
-- Permissionless `cleanupExpiredBlacklistAppeal` plus the four admissibility conditions removes any contract dependency on a privileged scheduler; bond settlement and slot release are eventually consistent through any caller.
+- Permissionless `cleanupExpiredBlacklistAppeal` plus the three admissibility conditions removes any contract dependency on a privileged scheduler; bond settlement and slot release are eventually consistent through any caller.
 
 ### Negative
 

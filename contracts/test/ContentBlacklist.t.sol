@@ -1061,97 +1061,33 @@ contract ContentBlacklistTest is Test {
 
     // --- TokenHolder path ---
 
-    function test_tokenHolderStanding_atThreshold_succeeds() public {
+    /// @notice TokenHolder standing IS the escrowed bond: a filer holding only the
+    ///         bond — no threshold balance, no namespace — gets standing, and the
+    ///         bond is actually pulled into escrow. Proves there is no extra
+    ///         credential gate (so nothing for a flash loan to fake).
+    function test_tokenHolderStanding_bondIsStanding_succeedsAndEscrows() public {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
-        // tokenHolder holds exactly the default threshold (1000e18) + the bond.
-        // Cache the threshold before pranking: a nested external call inside the
-        // pranked statement would otherwise consume the prank.
-        uint256 threshold = blacklist.appealFilerTokenThreshold();
-        address tokenHolder = address(0x70CE);
+        // Fund a fresh holder with exactly the bond and nothing more — far below
+        // any prior threshold — so success can only come from the bond itself.
+        address smallHolder = address(0x5A11);
         vm.prank(admin);
-        token.transfer(tokenHolder, threshold + APPEAL_BOND);
-        vm.prank(tokenHolder);
-        token.approve(address(blacklist), type(uint256).max);
-        vm.prank(tokenHolder);
-        blacklist.openBlacklistAppeal(
+        token.transfer(smallHolder, APPEAL_BOND);
+        vm.prank(smallHolder);
+        token.approve(address(blacklist), APPEAL_BOND);
+
+        uint256 escrowedBefore = token.balanceOf(address(blacklist));
+        vm.prank(smallHolder);
+        uint256 appealId = blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.TokenHolder, 0
         );
+
         assertTrue(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
-    }
-
-    function test_tokenHolderStanding_belowThreshold_reverts() public {
-        vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
-        // Fund a fresh holder with one wei below the threshold so the balance
-        // gate fails (it still has enough to attempt the bond pull afterwards).
-        uint256 threshold = blacklist.appealFilerTokenThreshold();
-        address poorHolder = address(0x9007);
-        vm.prank(admin);
-        token.transfer(poorHolder, threshold - 1);
-        vm.prank(poorHolder);
-        token.approve(address(blacklist), type(uint256).max);
-        vm.prank(poorHolder);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                ContentBlacklist.UnauthorizedStanding.selector, ContentBlacklist.StandingPath.TokenHolder
-            )
-        );
-        blacklist.openBlacklistAppeal(
-            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.TokenHolder, 0
-        );
-    }
-
-    // --- threshold setter ---
-
-    function test_setAppealFilerTokenThreshold_updatesValue() public {
-        vm.prank(admin);
-        blacklist.setAppealFilerTokenThreshold(5000e18);
-        assertEq(blacklist.appealFilerTokenThreshold(), 5000e18);
-    }
-
-    /// @notice Monotonic non-decrease: once raised, the threshold cannot be
-    ///         lowered again (tightening-only), even to a value within bounds.
-    function test_setAppealFilerTokenThreshold_cannotDecreaseAfterIncrease() public {
-        vm.prank(admin);
-        blacklist.setAppealFilerTokenThreshold(5000e18);
-        vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                ContentBlacklist.AppealFilerTokenThresholdNotIncreasing.selector, uint256(5000e18), uint256(1000e18)
-            )
-        );
-        blacklist.setAppealFilerTokenThreshold(1000e18);
-        assertEq(blacklist.appealFilerTokenThreshold(), 5000e18);
-    }
-
-    function test_setAppealFilerTokenThreshold_revertsBelowFloor() public {
-        // Floor == launch default (1000e18); tightening-only, so going below reverts.
-        vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                ContentBlacklist.ParamOutOfBounds.selector, uint256(999e18), uint256(1000e18), uint256(1_000_000e18)
-            )
-        );
-        blacklist.setAppealFilerTokenThreshold(999e18);
-    }
-
-    function test_setAppealFilerTokenThreshold_revertsAboveCeiling() public {
-        vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                ContentBlacklist.ParamOutOfBounds.selector,
-                uint256(1_000_001e18),
-                uint256(1000e18),
-                uint256(1_000_000e18)
-            )
-        );
-        blacklist.setAppealFilerTokenThreshold(1_000_001e18);
-    }
-
-    function test_setAppealFilerTokenThreshold_revertsWithoutGovernanceRole() public {
-        _expectMissingRole(filer, blacklist.GOVERNANCE_ROLE());
-        vm.prank(filer);
-        blacklist.setAppealFilerTokenThreshold(5000e18);
+        // Bond escrowed: contract balance rose by exactly the bond; holder drained.
+        assertEq(token.balanceOf(address(blacklist)), escrowedBefore + APPEAL_BOND);
+        assertEq(token.balanceOf(smallHolder), 0);
+        ContentBlacklist.BlacklistAppeal memory a = blacklist.getAppeal(appealId);
+        assertEq(a.bond, APPEAL_BOND);
+        assertEq(uint8(a.standingPath), uint8(ContentBlacklist.StandingPath.TokenHolder));
     }
 }
