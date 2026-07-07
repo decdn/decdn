@@ -1409,6 +1409,27 @@ contract CapacityBondTest is Test {
         bond.setCurrentTermsHash(keccak256("v2"));
     }
 
+    function test_setCurrentTermsHash_revertsOnZero() public {
+        vm.prank(admin);
+        vm.expectRevert(CapacityBond.ZeroTermsHash.selector);
+        bond.setCurrentTermsHash(bytes32(0));
+    }
+
+    function test_constructor_revertsOnZeroTermsHash() public {
+        vm.expectRevert(CapacityBond.ZeroTermsHash.selector);
+        new CapacityBond({
+            token_: token,
+            ed25519Verifier_: ed25519,
+            admin: admin,
+            minBond_: MIN_BOND,
+            unbondingPeriod_: UNBONDING,
+            multiaddrUpdateCooldown_: 0,
+            maxMultiaddrSize_: 1024,
+            regionStabilityWindow_: 7 days,
+            currentTermsHash_: bytes32(0)
+        });
+    }
+
     function test_setCurrentTermsHash_emitsAndSwaps() public {
         bytes32 next = keccak256("decdn operator terms v2");
         vm.expectEmit(false, false, false, true, address(bond));
@@ -1463,7 +1484,7 @@ contract CapacityBondTest is Test {
         assertEq(bond.addressToNodeId(opAddr), newNodeId);
     }
 
-    /// @dev Construct the EIP-712 `BindNode(bytes32 nodeId, uint64 nonce)`
+    /// @dev Construct the EIP-712 `BindNodeId(bytes32 nodeId, uint64 nonce)`
     ///      digest used by `_verifyBindingSignature` and ECDSA-sign it with
     ///      `opPk`. Reads the current nonce off the contract so the helper
     ///      works for both the initial bind and any subsequent rebind.

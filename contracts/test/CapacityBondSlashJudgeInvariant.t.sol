@@ -54,7 +54,7 @@ contract CapacityBondSlashJudgeInvariantTest is Test {
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
             regionStabilityWindow_: 7 days,
-            currentTermsHash_: bytes32(0)
+            currentTermsHash_: keccak256("decdn operator terms v1")
         });
 
         // Real SlashJudge pointed at the real bond. 20d < 30d so its constructor

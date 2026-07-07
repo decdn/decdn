@@ -48,11 +48,16 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     uint256 internal constant CHAIN_ID_OVERWRITE = 31_337_696;
     uint256 internal constant CHAIN_ID_RUN_GUARD = 31_337_697;
 
+    // ADR 019 § Terms Acceptance — non-zero genesis terms hash the script
+    // requires (CapacityBond rejects the zero sentinel).
+    bytes32 internal constant TEST_TERMS_HASH = keccak256("decdn operator terms v1");
+
     function setUp() public {
         vm.setEnv("USDC_ADDRESS", vm.toString(TEST_USDC));
         vm.setEnv("EMERGENCY_MULTISIG", vm.toString(TEST_MULTISIG));
         vm.setEnv("INITIAL_TOKEN_HOLDER", vm.toString(TEST_INITIAL_HOLDER));
         vm.setEnv("CHALLENGER_INCENTIVE_POOL", vm.toString(TEST_CHALLENGER_POOL));
+        vm.setEnv("CURRENT_TERMS_HASH", vm.toString(TEST_TERMS_HASH));
         vm.setEnv("FORCE_OVERWRITE_MANIFEST", "false");
     }
 

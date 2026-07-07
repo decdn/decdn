@@ -490,6 +490,11 @@ contract CapacityBond is
     // ADR 019 § 243 — submitted `termsHash` did not match the
     // governance-canonical `currentTermsHash` (stale terms / un-upgraded CLI).
     error TermsHashMismatch(bytes32 provided, bytes32 expected);
+    // ADR 019 § Terms Acceptance — `currentTermsHash` must never be the zero
+    // sentinel: genesis commits to a real (possibly draft) terms version and
+    // governance may only swap to another non-zero version. Forbidding zero
+    // keeps registration from silently degrading to a no-terms bootstrap.
+    error ZeroTermsHash();
     error MultiaddrsTooLarge(uint256 size, uint256 ceiling);
     error MultiaddrCooldownActive(uint256 readyAt);
     error NodeNotActive();
@@ -559,6 +564,7 @@ contract CapacityBond is
         multiaddrUpdateCooldown = multiaddrUpdateCooldown_;
         maxMultiaddrSize = maxMultiaddrSize_;
         regionStabilityWindow = regionStabilityWindow_;
+        if (currentTermsHash_ == bytes32(0)) revert ZeroTermsHash();
         currentTermsHash = currentTermsHash_;
         // ADR 030 § Region-stability window: fresh deploy == gate activation
         // (non-upgradeable, so no migration cohort to stay conservative for).
@@ -1145,6 +1151,7 @@ contract CapacityBond is
     ///         governance norm that every proposal setting `currentTermsHash`
     ///         references the terms text and its review record.
     function setCurrentTermsHash(bytes32 newHash) external onlyRole(GOVERNANCE_ROLE) {
+        if (newHash == bytes32(0)) revert ZeroTermsHash();
         bytes32 oldHash = currentTermsHash;
         currentTermsHash = newHash;
         emit CurrentTermsHashUpdated(oldHash, newHash);

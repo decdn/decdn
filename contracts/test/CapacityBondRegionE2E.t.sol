@@ -63,6 +63,9 @@ contract CapacityBondRegionE2ETest is Test {
     address internal constant REG_OPERATOR = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
     uint256 internal constant REG_OP_PK = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
     uint256 internal constant REG_CHAIN_ID = 31_337;
+    // ADR 019 § Terms Acceptance — non-zero genesis terms hash (CapacityBond
+    // rejects the zero sentinel).
+    bytes32 internal constant REG_TERMS_HASH = keccak256("decdn operator terms v1");
     // Real ed25519 signature over the digest above; never hand-edit. Regenerate
     // the whole block with `cargo run` (see README) — a tweaked value fails
     // verify_strict, so registerNode would revert InvalidEd25519Signature.
@@ -95,7 +98,7 @@ contract CapacityBondRegionE2ETest is Test {
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
             regionStabilityWindow_: REGION_WINDOW,
-            currentTermsHash_: bytes32(0)
+            currentTermsHash_: REG_TERMS_HASH
         });
 
         vm.prank(admin);
@@ -126,7 +129,7 @@ contract CapacityBondRegionE2ETest is Test {
     function test_registerNode_corruptEd25519Signature_reverts() public {
         vm.prank(REG_OPERATOR);
         bond.bond(MIN_BOND);
-        bytes memory bindingSig = _signRegisterNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID, bytes32(0));
+        bytes memory bindingSig = _signRegisterNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID, REG_TERMS_HASH);
 
         // Flip one byte of the otherwise-valid signature.
         bytes memory badSig = bytes.concat(REG_ED25519_SIG);
@@ -134,7 +137,7 @@ contract CapacityBondRegionE2ETest is Test {
 
         vm.prank(REG_OPERATOR);
         vm.expectRevert(CapacityBond.InvalidEd25519Signature.selector);
-        bond.registerNode(REG_NODE_ID, hex"", "us-east", bytes32(0), bindingSig, badSig);
+        bond.registerNode(REG_NODE_ID, hex"", "us-east", REG_TERMS_HASH, bindingSig, badSig);
     }
 
     // ----------------------------------------------------------------------
@@ -200,10 +203,10 @@ contract CapacityBondRegionE2ETest is Test {
         // deregister), so re-sign with the live nonce to clear the binding
         // check; the ed25519 signature is replayed verbatim and is now stale
         // (it was signed over registration nonce 0).
-        bytes memory bindingSig = _signRegisterNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID, bytes32(0));
+        bytes memory bindingSig = _signRegisterNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID, REG_TERMS_HASH);
         vm.prank(REG_OPERATOR);
         vm.expectRevert(CapacityBond.InvalidEd25519Signature.selector);
-        bond.registerNode(REG_NODE_ID, hex"", "us-east", bytes32(0), bindingSig, REG_ED25519_SIG);
+        bond.registerNode(REG_NODE_ID, hex"", "us-east", REG_TERMS_HASH, bindingSig, REG_ED25519_SIG);
     }
 
     // ----------------------------------------------------------------------
@@ -428,9 +431,9 @@ contract CapacityBondRegionE2ETest is Test {
     function _bondAndRegister() internal {
         vm.prank(REG_OPERATOR);
         bond.bond(MIN_BOND);
-        bytes memory bindingSig = _signRegisterNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID, bytes32(0));
+        bytes memory bindingSig = _signRegisterNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID, REG_TERMS_HASH);
         vm.prank(REG_OPERATOR);
-        bond.registerNode(REG_NODE_ID, hex"", "us-east", bytes32(0), bindingSig, REG_ED25519_SIG);
+        bond.registerNode(REG_NODE_ID, hex"", "us-east", REG_TERMS_HASH, bindingSig, REG_ED25519_SIG);
     }
 
     /// @dev Construct the EIP-712 `RegisterNode(bytes32 nodeId, uint64 nonce,

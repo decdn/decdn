@@ -119,7 +119,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
-            currentTermsHash: bytes32(0),
+            currentTermsHash: keccak256("decdn operator terms v1"),
             feeRouterEpochLength: EPOCH,
             feeRouterWindowEpochs: WINDOW_EPOCHS,
             // Steady-state shares (60/30/10 from ADR 026 § FeeRouter split) so

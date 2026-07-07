@@ -51,6 +51,9 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     bytes32 internal constant NODE_ID = bytes32(uint256(0xD0DE));
     bytes32 internal constant REGISTER_NODE_TYPEHASH =
         keccak256("RegisterNode(bytes32 nodeId,uint64 nonce,bytes32 termsHash)");
+    // ADR 019 § Terms Acceptance — non-zero genesis terms hash (CapacityBond
+    // rejects the zero sentinel).
+    bytes32 internal constant TERMS_HASH = keccak256("decdn operator terms v1");
     bytes32 internal constant VOUCHER_TYPEHASH =
         keccak256("Voucher(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)");
 
@@ -72,7 +75,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
-            currentTermsHash: bytes32(0),
+            currentTermsHash: TERMS_HASH,
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
@@ -205,8 +208,8 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         vm.startPrank(operator);
         d.token.approve(address(d.bond), type(uint256).max);
         d.bond.bond(MIN_BOND);
-        bytes memory bindingSig = _registrationSig(NODE_ID, 0, bytes32(0));
-        d.bond.registerNode(NODE_ID, hex"01", "US", bytes32(0), bindingSig, hex"00");
+        bytes memory bindingSig = _registrationSig(NODE_ID, 0, TERMS_HASH);
+        d.bond.registerNode(NODE_ID, hex"01", "US", TERMS_HASH, bindingSig, hex"00");
         vm.stopPrank();
     }
 

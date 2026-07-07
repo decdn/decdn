@@ -165,9 +165,11 @@ contract DeployProtocol is BaseProtocolDeploy {
         cfg.maxMultiaddrSize = vm.envOr("MAX_MULTIADDR_SIZE", DEFAULT_MAX_MULTIADDR_SIZE);
         cfg.regionStabilityWindow = vm.envOr("REGION_STABILITY_WINDOW", DEFAULT_REGION_STABILITY_WINDOW);
         // ADR 019 § Terms Acceptance — genesis operator-terms hash
-        // (keccak256 of the shipped TERMS.md). Defaults to zero (no terms) when
-        // unset; governance can adopt a reviewed version post-deploy.
-        cfg.currentTermsHash = vm.envOr("CURRENT_TERMS_HASH", bytes32(0));
+        // (keccak256 of the shipped TERMS.md). REQUIRED, no default: genesis
+        // must commit to a real (possibly draft) terms version, and
+        // `CapacityBond`'s constructor rejects the zero sentinel. This forbids
+        // an accidental terms-disabled deployment.
+        cfg.currentTermsHash = vm.envBytes32("CURRENT_TERMS_HASH");
 
         // Epoch length is fixed (see FEE_ROUTER_EPOCH_LENGTH) rather than a
         // "tunable" env var that could only ever be 7 days.

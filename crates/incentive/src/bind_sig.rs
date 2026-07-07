@@ -62,10 +62,21 @@ mod sol_types {
             bytes32 nodeId;
             uint64 nonce;
         }
+        // ADR 019 § Terms Acceptance — the registration binding signature
+        // additionally commits to the accepted `termsHash`. Distinct typehash
+        // from `BindNodeId`: rebinding (key rotation) stays on `BindNodeId` and
+        // does not re-accept terms.
+        #[allow(non_snake_case, missing_debug_implementations)]
+        struct RegisterNode {
+            bytes32 nodeId;
+            uint64 nonce;
+            bytes32 termsHash;
+        }
     }
 }
 
 use sol_types::BindNodeId as BindNodeIdSol;
+use sol_types::RegisterNode as RegisterNodeSol;
 
 /// Construct the EIP-712 domain used to verify `BindNodeId` signatures for a
 /// given `CapacityBond` deployment.
@@ -80,11 +91,34 @@ pub fn bind_node_id_domain(chain_id: u64, verifying_contract: Address) -> Eip712
 }
 
 /// EIP-712 signing hash for a `BindNodeId(nodeId, nonce)` under `domain`.
+///
+/// Used for the ephemeral client binding (ADR 003 §Off-Chain Ephemeral Binding)
+/// and on-chain rebinding (`bindNodeId`, key rotation). Initial node
+/// registration signs [`register_node_signing_hash`] instead.
 #[must_use]
 pub fn binding_signing_hash(node_id: B256, nonce: u64, domain: &Eip712Domain) -> B256 {
     BindNodeIdSol {
         nodeId: node_id,
         nonce,
+    }
+    .eip712_signing_hash(domain)
+}
+
+/// EIP-712 signing hash for a `RegisterNode(nodeId, nonce, termsHash)` under
+/// `domain` — the initial on-chain node registration binding (ADR 019 § Terms
+/// Acceptance). `terms_hash` MUST equal the contract's `currentTermsHash`, and
+/// the signature cryptographically binds the operator's acceptance to it.
+#[must_use]
+pub fn register_node_signing_hash(
+    node_id: B256,
+    nonce: u64,
+    terms_hash: B256,
+    domain: &Eip712Domain,
+) -> B256 {
+    RegisterNodeSol {
+        nodeId: node_id,
+        nonce,
+        termsHash: terms_hash,
     }
     .eip712_signing_hash(domain)
 }
@@ -175,6 +209,21 @@ mod tests {
         let recovered = verify_binding(node_id, EPHEMERAL_BINDING_NONCE, &sig, &domain)?;
         anyhow::ensure!(recovered == signer.address(), "recovered {recovered}");
         Ok(())
+    }
+
+    /// Lock the `RegisterNode` EIP-712 type hash to the contract's
+    /// `REGISTER_NODE_TYPEHASH` (ADR 019 § Terms Acceptance / ADR 003 § Binding
+    /// Message Format). A drift here means the off-chain registration signature
+    /// no longer verifies on-chain.
+    #[test]
+    fn register_node_type_hash_matches_contract() {
+        use alloy::primitives::keccak256;
+        let canonical: &[u8] = b"RegisterNode(bytes32 nodeId,uint64 nonce,bytes32 termsHash)";
+        assert_eq!(
+            keccak256(RegisterNodeSol::eip712_root_type().as_bytes()),
+            keccak256(canonical),
+            "RegisterNode type hash drifted from CapacityBond.REGISTER_NODE_TYPEHASH"
+        );
     }
 
     #[test]
