@@ -28,7 +28,7 @@ use decdn_incentive::Erc20;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::eth_identity;
 
-use crate::commands::{bond, chain_ctx, key_gen, register};
+use crate::commands::{bond, chain_ctx, key_gen, register, terms};
 
 /// ADR 019 Phase 1 step 2 (Synchronize clock): the local clock should be within
 /// 10 s of UTC before onboarding. Gossip messages are silently rejected by
@@ -332,6 +332,17 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         if !json {
             println!("register:");
         }
+        // ADR 019 § Terms Acceptance — accept the network's current operator
+        // terms before signing registration (interactive prompt, or
+        // `--accept-terms` in automation).
+        let terms_hash = bond_contract
+            .currentTermsHash()
+            .call()
+            .await
+            .with_context(|| {
+                format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
+            })?;
+        terms::ensure_accepted(terms_hash, args.accept_terms)?;
         let outcome = register::submit_registration(
             &provider,
             &signer,
@@ -340,6 +351,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             resolved.chain_id,
             &args.region,
             &args.multiaddrs,
+            terms_hash,
             false,
         )
         .await?;
