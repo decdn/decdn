@@ -584,7 +584,13 @@ jobs:
       needs.changes.outputs.rust == 'true' || needs.changes.outputs.solidity == 'true' ||
       github.event_name != 'pull_request'
     steps:
+      # This job only checks out to regenerate + diff vectors locally; it never
+      # pushes, and releases are not automated from CI (no auto-release), so the
+      # GITHUB_TOKEN need not persist in .git/config. Dropping it satisfies
+      # zizmor's `artipacked` check and keeps the token off disk for later steps.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
