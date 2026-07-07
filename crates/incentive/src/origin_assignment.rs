@@ -48,6 +48,17 @@ mod sol_types {
             function getOrigins(uint256 namespaceId) external view returns (address[] memory);
 
             // -----------------------------------------------------------------
+            // Write functions (publisher control plane, issue #1029)
+            // -----------------------------------------------------------------
+
+            /// Namespace owner proposes an authorized-origin operator set.
+            /// Enters a pending state until governance activates it after the
+            /// assignment timelock. Reverts if the caller is not the namespace
+            /// owner, the set is empty/duplicated/over-cap, or an operator is
+            /// not an active bonded node.
+            function proposeAssignment(uint256 namespaceId, address[] operators) external;
+
+            // -----------------------------------------------------------------
             // Per-namespace assignment events
             // -----------------------------------------------------------------
 
