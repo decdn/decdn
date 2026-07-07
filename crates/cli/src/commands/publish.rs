@@ -475,8 +475,8 @@ mod tests {
 
     #[test]
     fn chain_id_guard_matches_and_mismatches() {
-        assert!(chain_id_guard(421614, 421614).is_ok());
-        let err = chain_id_guard(421614, 31337).unwrap_err().to_string();
+        assert!(chain_id_guard(421_614, 421_614).is_ok());
+        let err = chain_id_guard(421_614, 31_337).unwrap_err().to_string();
         assert!(err.contains("421614"), "{err}");
         assert!(err.contains("31337"), "{err}");
     }
