@@ -81,7 +81,7 @@ use anyhow::Context;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
     BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, MemoryPendingSettleStore,
-    PendingSettleStore, WatcherCheckpointStore, bind_node_id_domain, binding_signing_hash,
+    PendingSettleStore, WatcherCheckpointStore, bind_node_id_domain, register_node_signing_hash,
     slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerChannelService;
@@ -280,10 +280,12 @@ alloy::sol! {
     #[sol(rpc)]
     contract CapacityBondWrite {
         function bond(uint256 amount) external;
+        function currentTermsHash() external view returns (bytes32);
         function registerNode(
             bytes32 nodeId,
             bytes multiaddrs,
             string regionHint,
+            bytes32 termsHash,
             bytes bindingSignature,
             bytes ed25519Signature
         ) external;
@@ -448,10 +450,19 @@ async fn run_e2e() -> anyhow::Result<()> {
         .await?;
     bond.bond(min_bond).send().await?.get_receipt().await?;
 
-    // Binding signature: eth key over EIP-712 BindNodeId(nodeId, nonce=0).
+    // Binding signature: eth key over EIP-712
+    // RegisterNode(nodeId, nonce=0, termsHash) (ADR 019 § Terms Acceptance).
+    // `termsHash` is read from the deployed contract so the signature matches
+    // whatever genesis terms the deploy script committed.
+    let terms_hash = bond.currentTermsHash().call().await?;
     let bind_domain = bind_node_id_domain(CHAIN_ID, capacity_bond);
     let binding_sig = node_signer
-        .sign_hash_sync(&binding_signing_hash(node_id, 0, &bind_domain))?
+        .sign_hash_sync(&register_node_signing_hash(
+            node_id,
+            0,
+            terms_hash,
+            &bind_domain,
+        ))?
         .as_bytes()
         .to_vec();
     // Ed25519 ownership proof: iroh key over
@@ -471,6 +482,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         node_id,
         Bytes::from_static(b"/ip4/127.0.0.1/udp/4242/quic-v1"),
         "us-east-1".to_string(),
+        terms_hash,
         Bytes::from(binding_sig),
         Bytes::from(ed_sig),
     )
@@ -1796,6 +1808,13 @@ async fn run_deploy_script(
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
             .env("CHALLENGER_INCENTIVE_POOL", DEPLOYER_ADDR)
+            // ADR 019 § Terms Acceptance — DeployProtocol.s.sol requires a
+            // non-zero genesis terms hash (CapacityBond rejects the zero
+            // sentinel). The registration path reads it back from the contract.
+            .env(
+                "CURRENT_TERMS_HASH",
+                "0x0000000000000000000000000000000000000000000000000000000000000001",
+            )
             .env("FORCE_OVERWRITE_MANIFEST", "true");
         // A spawn failure (`forge` missing) is deterministic — `?` fails fast
         // rather than masquerading as a stall and burning a retry.

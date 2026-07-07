@@ -141,6 +141,10 @@ abstract contract BaseProtocolDeploy is Script {
         uint256 multiaddrUpdateCooldown;
         uint256 maxMultiaddrSize;
         uint256 regionStabilityWindow;
+        // ADR 019 § Terms Acceptance — genesis operator-terms hash
+        // (keccak256 of the shipped TERMS.md). Governance-swappable post-deploy
+        // via CapacityBond.setCurrentTermsHash.
+        bytes32 currentTermsHash;
         // FeeRouter params (ADR 016 / ADR 026). `buybackBurner` may be
         // `address(0)` iff `feeRouterShares[1] == 0` (launch-mode dormancy
         // per ADR 016 § Tunable Economics). The cross-validation is enforced
@@ -251,7 +255,8 @@ abstract contract BaseProtocolDeploy is Script {
             unbondingPeriod_: cfg.unbondingPeriod,
             multiaddrUpdateCooldown_: cfg.multiaddrUpdateCooldown,
             maxMultiaddrSize_: cfg.maxMultiaddrSize,
-            regionStabilityWindow_: cfg.regionStabilityWindow
+            regionStabilityWindow_: cfg.regionStabilityWindow,
+            currentTermsHash_: cfg.currentTermsHash
         });
 
         d.slashAppeal = new SlashAppeal({

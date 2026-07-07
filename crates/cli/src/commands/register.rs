@@ -128,11 +128,21 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
                 format!("failed to read registrationNonce from CapacityBond at {cb_addr}")
             })?;
 
-    // EIP-712 BindNodeId signature (Ethereum key). `sign_hash_sync` yields a
+    // ADR 019 § Terms Acceptance — the registration binding signature commits
+    // to the governance-canonical `currentTermsHash`, so submitting `registerNode`
+    // records the operator's acceptance of the current operator terms. The
+    // operator-facing display + explicit acknowledgement is tracked in #1077;
+    // the on-chain contract already enforces `termsHash == currentTermsHash`.
+    let terms_hash: B256 = bond.currentTermsHash().call().await.with_context(|| {
+        format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
+    })?;
+
+    // EIP-712 RegisterNode signature (Ethereum key). `sign_hash_sync` yields a
     // low-s, 27/28-`v` 65-byte signature accepted by the on-chain OZ
     // `SignatureChecker` (same path as `decdn_incentive::bind_sig`).
     let domain = bind_sig::bind_node_id_domain(chain_id, cb_addr);
-    let bind_hash = bind_sig::binding_signing_hash(node_id, binding_nonce, &domain);
+    let bind_hash =
+        bind_sig::register_node_signing_hash(node_id, binding_nonce, terms_hash, &domain);
     let binding_sig = signer.sign_hash_sync(&bind_hash)?.as_bytes().to_vec();
 
     // ed25519 ownership signature (iroh node key) over the contract's
@@ -166,6 +176,7 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
             node_id,
             Bytes::from(packed_multiaddrs),
             region.to_string(),
+            terms_hash,
             Bytes::from(binding_sig),
             Bytes::from(ed25519_sig),
         )
