@@ -37,9 +37,9 @@ ignore = [
     "RUSTSEC-2026-0173",
     # NOTE: the quick-xml DoS ignores (RUSTSEC-2026-0194 O(N^2) duplicate-attribute
     # check + RUSTSEC-2026-0195 unbounded NsReader namespace allocation) were dropped
-    # (#1056) once `plist 1.10` pulled the fixed `quick-xml 0.41.0` — netdev's
-    # `plist ^1.8` requirement (macOS/iOS-only) accepts 1.10, so `cargo update -p plist`
-    # brings the chain quick-xml -> plist -> netdev -> netwatch -> iroh to 0.41.
+    # (#1056) when `plist 1.10` pulled the fixed `quick-xml 0.41.0` — netdev's
+    # `plist ^1.8` requirement (macOS/iOS-only) accepts 1.10, bringing the chain
+    # quick-xml -> plist -> netdev -> netwatch -> iroh to 0.41.
     # `cargo deny check advisories` flags either ID as "advisory-not-detected" if re-added.
     # NOTE: the hickory-proto / hickory-net DNS DoS ignores
     # (RUSTSEC-2026-0119 + 0120) were dropped when iroh 1.0 pulled the
