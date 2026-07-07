@@ -13,6 +13,7 @@
 use std::io::{self, IsTerminal, Write};
 
 use alloy::primitives::{B256, keccak256};
+use anyhow::Context;
 
 /// The canonical operator terms, embedded from the repo-root `TERMS.md` so the
 /// displayed text is the exact preimage of the recorded hash — there is no
@@ -122,6 +123,23 @@ pub fn ensure_accepted(chain_terms_hash: B256, accept_flag: bool) -> anyhow::Res
             }
         }
     }
+}
+
+/// Async wrapper over [`ensure_accepted`]. The interactive branch does blocking
+/// `stdin`/`stderr` IO, so run the whole gate on a blocking thread rather than
+/// parking a tokio runtime worker while it waits for the operator.
+///
+/// # Errors
+///
+/// Propagates [`ensure_accepted`]'s errors; also errors if the blocking task
+/// panics.
+pub async fn ensure_accepted_async(
+    chain_terms_hash: B256,
+    accept_flag: bool,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || ensure_accepted(chain_terms_hash, accept_flag))
+        .await
+        .context("terms acceptance task panicked")?
 }
 
 /// Render the full terms + version + hash to stderr (stdout stays reserved for

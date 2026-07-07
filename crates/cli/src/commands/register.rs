@@ -45,7 +45,9 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
 
     // ADR 019 § Terms Acceptance — read the network's current terms hash, then
     // require the operator to accept the matching embedded terms before we sign.
-    // Skipped on `--dry-run`, which only previews signatures and never submits.
+    // Enforced on `--dry-run` too: a dry run still produces a real, submit-able
+    // signature that commits to `termsHash`, so it must not be generated over
+    // terms the operator hasn't seen / a stale client's hash.
     let terms_hash = CapacityBond::new(cb_addr, &provider)
         .currentTermsHash()
         .call()
@@ -53,9 +55,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
         .with_context(|| {
             format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
         })?;
-    if !args.chain.dry_run {
-        terms::ensure_accepted(terms_hash, args.accept_terms)?;
-    }
+    terms::ensure_accepted_async(terms_hash, args.accept_terms).await?;
 
     let outcome = submit_registration(
         &provider,
