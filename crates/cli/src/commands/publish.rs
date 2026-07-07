@@ -61,6 +61,43 @@ fn registry_ctx(
     Ok((resolved, registry))
 }
 
+/// Reject duplicate operator addresses before submitting — the contract
+/// reverts `DuplicateOperator` (`OriginAssignment.proposeAssignment`), so
+/// failing fast on the client saves the gas of a doomed transaction.
+fn ensure_unique_operators(ops: &[Address]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::with_capacity(ops.len());
+    for op in ops {
+        if !seen.insert(*op) {
+            anyhow::bail!("duplicate operator address: {op:#x}");
+        }
+    }
+    Ok(())
+}
+
+/// Fail if the RPC reports a different chain id than the resolved one, so a
+/// mis-pointed `--rpc-url` cannot submit to the wrong network. Pure so it is
+/// unit-testable; [`ensure_rpc_chain_id`] does the single network read.
+fn chain_id_guard(expected: u64, rpc: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        expected == rpc,
+        "chain id mismatch: --chain-id/config expects {expected} but the RPC reports {rpc} \
+         (check --rpc-url points at the right network, or pass --chain-id {rpc})",
+    );
+    Ok(())
+}
+
+/// Read the RPC's chain id and enforce it matches `expected` before submitting.
+async fn ensure_rpc_chain_id<P: alloy::providers::Provider>(
+    provider: &P,
+    expected: u64,
+) -> anyhow::Result<()> {
+    let rpc = provider
+        .get_chain_id()
+        .await
+        .context("failed to read chainId from the RPC (is --rpc-url reachable?)")?;
+    chain_id_guard(expected, rpc)
+}
+
 // -------------------------------------------------------------------------
 // namespace create
 // -------------------------------------------------------------------------
@@ -121,6 +158,7 @@ async fn namespace_create(
         .await?;
         let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
         outcome.operator = Some(signer.address());
+        ensure_rpc_chain_id(&provider, resolved.chain_id).await?;
         let contract = PublisherRegistry::new(registry, &provider);
         let pending =
             contract.createNamespace().send().await.context(
@@ -214,6 +252,7 @@ async fn claim(args: &cli::ClaimArgs, global_config: Option<&Path>) -> anyhow::R
         .await?;
         let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
         outcome.operator = Some(signer.address());
+        ensure_rpc_chain_id(&provider, resolved.chain_id).await?;
         let contract = PublisherRegistry::new(registry, &provider);
         let pending = contract
             .claimContent(U256::from(args.namespace), B256::from(hash))
@@ -308,6 +347,7 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         .iter()
         .map(|s| chain_ctx::parse_address(s, "operator"))
         .collect::<anyhow::Result<Vec<Address>>>()?;
+    ensure_unique_operators(&operators)?;
 
     let mut outcome = AssignOutcome {
         operator: None,
@@ -325,6 +365,7 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         .await?;
         let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
         outcome.operator = Some(signer.address());
+        ensure_rpc_chain_id(&provider, resolved.chain_id).await?;
         let contract = OriginAssignment::new(oa_addr, &provider);
         let pending = contract
             .proposeAssignment(U256::from(args.namespace), operators)
@@ -419,5 +460,24 @@ mod tests {
         assert!(s.contains("operators=2"), "{s}");
         assert!(s.contains("status=proposed_pending_dao"), "{s}");
         assert!(s.contains("tx=0x5555"), "{s}");
+    }
+
+    #[test]
+    fn unique_operators_accepts_distinct_rejects_dupes() {
+        let a = Address::repeat_byte(0x11);
+        let b = Address::repeat_byte(0x22);
+        assert!(ensure_unique_operators(&[a, b]).is_ok());
+        // Same address, however the user spelled it, parses to one `Address`.
+        let err = ensure_unique_operators(&[a, b, a]).unwrap_err().to_string();
+        assert!(err.contains("duplicate operator address"), "{err}");
+        assert!(err.contains(&format!("{a:#x}")), "{err}");
+    }
+
+    #[test]
+    fn chain_id_guard_matches_and_mismatches() {
+        assert!(chain_id_guard(421614, 421614).is_ok());
+        let err = chain_id_guard(421614, 31337).unwrap_err().to_string();
+        assert!(err.contains("421614"), "{err}");
+        assert!(err.contains("31337"), "{err}");
     }
 }

@@ -95,7 +95,8 @@ pub struct PublishChainArgs {
     #[arg(long, value_name = "URL")]
     pub rpc_url: Option<String>,
 
-    /// EIP-712 `chainId`. Overrides `blockchain.chain_id`.
+    /// Expected chain id of `--rpc-url`; the submit fails if the RPC reports a
+    /// different one. Overrides `blockchain.chain_id`; default Arbitrum Sepolia.
     #[arg(long, value_name = "ID")]
     pub chain_id: Option<u64>,
 
