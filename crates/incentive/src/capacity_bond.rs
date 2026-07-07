@@ -133,22 +133,29 @@ mod sol_types {
             /// re-onboarding. `0` for a never-registered nodeId.
             function registrationNonce(bytes32 nodeId) external view returns (uint64);
 
+            /// Governance-canonical operator-terms hash new registrants must
+            /// accept (ADR 019 § Terms Acceptance). `registerNode` requires the
+            /// submitted `termsHash` to equal this value.
+            function currentTermsHash() external view returns (bytes32);
+
             // -----------------------------------------------------------------
             // Node registry write path (ADR 019 § Step 2.3)
             // -----------------------------------------------------------------
 
             /// Atomically bind `nodeId` ↔ `msg.sender` and activate the node.
             /// Verifies the EIP-712 `bindingSignature` over
-            /// `BindNodeId(nodeId, bindingNonce[msg.sender])` and the ed25519
-            /// `ed25519Signature` over the ownership digest
+            /// `RegisterNode(nodeId, bindingNonce[msg.sender], termsHash)` and
+            /// the ed25519 `ed25519Signature` over the ownership digest
             /// (`decdn_incentive::node_register::ownership_message_digest`).
-            /// Reverts if the operator's bond is below `minBond` / the
-            /// declared-capacity curve — Phase 2.1/2.2 (`bond` / `declareMbps`)
-            /// are a precondition.
+            /// `termsHash` must equal `currentTermsHash` (ADR 019 § Terms
+            /// Acceptance). Reverts if the operator's bond is below `minBond` /
+            /// the declared-capacity curve — Phase 2.1/2.2 (`bond` /
+            /// `declareMbps`) are a precondition.
             function registerNode(
                 bytes32 nodeId,
                 bytes multiaddrs,
                 string regionHint,
+                bytes32 termsHash,
                 bytes bindingSignature,
                 bytes ed25519Signature
             ) external;

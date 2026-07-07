@@ -20,7 +20,7 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
-use decdn_incentive::{bind_node_id_domain, binding_signing_hash, node_register};
+use decdn_incentive::{bind_node_id_domain, node_register, register_node_signing_hash};
 
 use crate::bindings::{CapacityBond, Erc20, PublisherRegistry};
 
@@ -282,8 +282,16 @@ impl ChainFixture {
             .await
             .context("read registrationNonce")?;
 
+        // ADR 019 § Terms Acceptance — the registration signature commits to
+        // the on-chain `currentTermsHash`; read it back so this matches whatever
+        // genesis terms the deploy committed.
+        let terms_hash = bond
+            .currentTermsHash()
+            .call()
+            .await
+            .context("read currentTermsHash")?;
         let domain = bind_node_id_domain(self.chain_id, self.addrs.capacity_bond);
-        let bind_hash = binding_signing_hash(node_id, binding_nonce, &domain);
+        let bind_hash = register_node_signing_hash(node_id, binding_nonce, terms_hash, &domain);
         let binding_sig = operator
             .sign_hash_sync(&bind_hash)
             .context("sign binding hash")?
@@ -305,6 +313,7 @@ impl ChainFixture {
                 node_id,
                 Bytes::from(packed_multiaddrs),
                 region.to_string(),
+                terms_hash,
                 Bytes::from(binding_sig),
                 Bytes::from(ed_sig),
             )
@@ -467,6 +476,13 @@ async fn run_deploy_script(
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
             .env("CHALLENGER_INCENTIVE_POOL", DEPLOYER_ADDR)
+            // ADR 019 § Terms Acceptance — DeployProtocol.s.sol requires a
+            // non-zero genesis terms hash (CapacityBond rejects the zero
+            // sentinel); registration reads it back from the contract.
+            .env(
+                "CURRENT_TERMS_HASH",
+                "0x0000000000000000000000000000000000000000000000000000000000000001",
+            )
             .env("FORCE_OVERWRITE_MANIFEST", "true");
         match forge_output(cmd, DEPLOY_TIMEOUT, "forge script DeployProtocol").await? {
             Ok(out) if out.status.success() => return Ok(()),

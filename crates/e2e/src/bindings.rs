@@ -44,10 +44,12 @@ alloy::sol! {
     #[sol(rpc)]
     contract CapacityBond {
         function bond(uint256 amount) external;
+        function currentTermsHash() external view returns (bytes32);
         function registerNode(
             bytes32 nodeId,
             bytes multiaddrs,
             string regionHint,
+            bytes32 termsHash,
             bytes bindingSignature,
             bytes ed25519Signature
         ) external;

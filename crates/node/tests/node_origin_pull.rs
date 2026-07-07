@@ -4344,7 +4344,6 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
     let aligned = decdn_cache::range_pull::align_range(0, 0, total_bytes)?;
     let combined = decdn_cache::range_pull::encode_verified_range(
         *hash.as_bytes(),
-        total_bytes,
         &aligned,
         &payload,
         bytes::Bytes::from(ob.data),

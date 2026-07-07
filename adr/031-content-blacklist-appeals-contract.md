@@ -283,7 +283,7 @@ stateDiagram-v2
 ### Positive
 
 - Pins storage layout and event schema as a single source of truth, removing the cross-derivation cost between [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)'s narrative form and the eventual Solidity.
-- Parallel structure to [ADR 032](032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface) keeps both appeal-contract surfaces — slashing and blacklist — auditable under one pattern.
+- Parallel structure to [ADR 032](_history/032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface) keeps both appeal-contract surfaces — slashing and blacklist — auditable under one pattern.
 - Permissionless `cleanupExpiredBlacklistAppeal` plus the four admissibility conditions removes any contract dependency on a privileged scheduler; bond settlement and slot release are eventually consistent through any caller.
 
 ### Negative

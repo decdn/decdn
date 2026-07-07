@@ -7,7 +7,7 @@
 
 ## Context
 
-The 7% delegator bucket of the `FeeRouter` six-bucket split ([ADR 026 § FeeRouter split (40/40/7/5/5/3)](026-tokenomics.md#feerouter-split-40407553)) flows through a USDC→TOKEN buy-and-distribute pipeline (the `DelegatorBuyer` contract) rather than direct USDC distribution. This ADR specifies that pipeline: its distinction from buyback-and-burn, why it is TOKEN-denominated, MEV/slippage handling, and the `DelegatorBuyer` interface. The economic-model umbrella is [ADR 026](026-tokenomics.md#adr-026-tokenomics).
+The 7% delegator bucket of the `FeeRouter` six-bucket split ([ADR 026 § FeeRouter split](../026-tokenomics.md#feerouter-split)) flows through a USDC→TOKEN buy-and-distribute pipeline (the `DelegatorBuyer` contract) rather than direct USDC distribution. This ADR specifies that pipeline: its distinction from buyback-and-burn, why it is TOKEN-denominated, MEV/slippage handling, and the `DelegatorBuyer` interface. The economic-model umbrella is [ADR 026](../026-tokenomics.md#adr-026-tokenomics).
 
 ## Decision
 
@@ -16,7 +16,7 @@ The 7% delegator bucket of the `FeeRouter` six-bucket split ([ADR 026 § FeeRout
 The 7% delegator bucket flows through a USDC→TOKEN buy-and-distribute pipeline rather than direct USDC distribution.
 
 1. `FeeRouter` accumulates 7% of routed USDC into the delegator-pool epoch bucket per epoch.
-2. At epoch rollover (or via keeper trigger within the epoch), the bucket's USDC is swapped for TOKEN against the Balancer V3 80/20 pool ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) under the same TWAP + minOut + per-epoch liquidity-cap protections as `BuybackBurner`. Implementation is a parallel `DelegatorBuyer` contract per [ADR 016 § Shared swap helper](016-contract-interactions.md#shared-swap-helper-buybackburner--delegatorbuyer); the two contracts share the swap execution path through an internal `BalancerV3SwapHelper` abstract contract while preserving distinct downstream destinations and governance setters.
+2. At epoch rollover (or via keeper trigger within the epoch), the bucket's USDC is swapped for TOKEN against the Balancer V3 80/20 pool ([ADR 018](../018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) under the same TWAP + minOut + per-epoch liquidity-cap protections as `BuybackBurner`. Implementation is a parallel `DelegatorBuyer` contract per [ADR 016 § BuybackBurner](../016-contract-interactions.md#buybackburner); the two contracts share the swap execution path through an internal `BalancerV3SwapHelper` abstract contract while preserving distinct downstream destinations and governance setters.
 3. The acquired TOKEN is held in the delegator-pool epoch bucket as TOKEN.
 4. Delegators / ve-lockers call `FeeRouter.claimDelegator(epochs[])`. Payout per locker = `ve_i / total_ve_at_epoch_boundary × token_in_delegator_bucket[epoch]`.
 
@@ -30,7 +30,7 @@ Routes acquired TOKEN to the participants with the longest commitment horizon an
 
 #### MEV / slippage
 
-TWAP windows + per-epoch liquidity caps + private-RPC routing (Flashbots-style bundles) for the swap. Same defenses as the [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) buyback flow; per-epoch liquidity caps are a hard requirement on this path, not optional.
+TWAP windows + per-epoch liquidity caps + private-RPC routing (Flashbots-style bundles) for the swap. Same defenses as the [ADR 018](../018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) buyback flow; per-epoch liquidity caps are a hard requirement on this path, not optional.
 
 #### Contract: DelegatorBuyer
 
@@ -43,7 +43,7 @@ interface IDelegatorBuyer {
     // at least `minOut` TOKEN against the configured Balancer V3 pool,
     // then deposits the TOKEN back via
     // `IFeeRouter.depositDelegatorTokens(epoch, amount)` — see
-    // [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter).
+    // [ADR 016 § Contract: FeeRouter](../016-contract-interactions.md#contract-feerouter).
     // Same Vault-scoped self-approval pattern as `BuybackBurner`.
     function swapDelegatorBucket(
         uint64 epochId,
@@ -81,6 +81,6 @@ interface IDelegatorBuyer {
 
 **Notes:**
 
-- **Parallel contract to `BuybackBurner`** per [ADR 016 § Shared swap helper](016-contract-interactions.md#shared-swap-helper-buybackburner--delegatorbuyer). The two contracts share the Balancer V3 swap execution path through an internal `BalancerV3SwapHelper` abstract contract while keeping separate addresses, separate governance setters on `FeeRouter`, and divergent downstream value flows (burn vs deposit-back).
+- **Parallel contract to `BuybackBurner`** per [ADR 016 § BuybackBurner](../016-contract-interactions.md#buybackburner). The two contracts share the Balancer V3 swap execution path through an internal `BalancerV3SwapHelper` abstract contract while keeping separate addresses, separate governance setters on `FeeRouter`, and divergent downstream value flows (burn vs deposit-back).
 - **`msg.sender == feeRouter` as the sole auth check.** No `KEEPER_ROLE` on `DelegatorBuyer` because there are no other legitimate callers — keepers trigger swaps via `FeeRouter.executeDelegatorSwap(epoch, minOut)` (which holds `KEEPER_ROLE` on `FeeRouter`), and `FeeRouter` then calls `swapDelegatorBucket` here. Single trust boundary; one role grant fewer post-deploy.
-- **`setFeeRouter` carve-out** matches the [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns) carve-out for non-signing helper addresses: `DelegatorBuyer` has no domain-separator-bound state, so re-pointing the configured `FeeRouter` is safe under the standard 48h timelock.
+- **`setFeeRouter` carve-out** matches the [ADR 016 § No proxy deployment patterns](../016-contract-interactions.md#no-proxy-deployment-patterns) carve-out for non-signing helper addresses: `DelegatorBuyer` has no domain-separator-bound state, so re-pointing the configured `FeeRouter` is safe under the standard 48h timelock.

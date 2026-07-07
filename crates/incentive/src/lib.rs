@@ -46,7 +46,7 @@ pub mod voucher_activity;
 
 pub use bind_sig::{
     BindError, CAPACITY_BOND_DOMAIN_NAME, CAPACITY_BOND_DOMAIN_VERSION, EPHEMERAL_BINDING_NONCE,
-    bind_node_id_domain, binding_signing_hash, verify_binding,
+    bind_node_id_domain, binding_signing_hash, register_node_signing_hash, verify_binding,
 };
 pub use buyer_channel::{
     AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerProgressError, DepositOutcome,

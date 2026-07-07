@@ -32,7 +32,7 @@ use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest};
 use crate::probe_hold::ProbeHoldOutcome;
-use crate::range_pull::{AlignedRange, align_range, bao_encoded_size, encode_verified_range};
+use crate::range_pull::{AlignedRange, align_range, encode_verified_range};
 use crate::retry::{
     TerminalFailure, classify_io_error, drain_to_bytes, run_with_retry_classified, should_buffer,
 };
@@ -1658,7 +1658,7 @@ impl CacheEngine {
         // (which re-verifies whole-blob against `H`) rather than erroring, so
         // a single misbehaving origin can't deny the range entirely. A
         // wrong-length outboard is the same degrade.
-        let encoded = match encode_verified_range(root, blob_size, aligned, &data, outboard) {
+        let encoded = match encode_verified_range(root, aligned, &data, outboard) {
             Ok(bytes) => bytes,
             Err(err) => {
                 tracing::warn!(
@@ -1767,30 +1767,19 @@ impl CacheEngine {
         guard.insert(hash, Arc::clone(&notify));
         drop(guard);
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(TEE_SINK_CHANNEL_CAP);
-        // The producer pushes the bao verified-stream it forwards from the upstream
-        // (preceded by the 8-byte LE content-size header — ADR 038); decode +
-        // verify it into plaintext, which the existing commit path imports. This
-        // keeps the cap (`count_and_cap_stream`) and the `StreamCommitOutcome`
-        // taxonomy intact while verifying the cached copy against the root. The
-        // channel closing (all senders dropped) ends the stream — that is how
-        // `finish` / `abandon` signal end-of-blob.
-        let source: Pin<
-            Box<dyn futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync>,
-        > = Box::pin(bao_decoded_source(hash, rx));
-        let engine = self.clone();
-        let max_blob_bytes = self.inner.max_blob_bytes;
-        let import = tokio::spawn(async move {
-            engine
-                .import_and_verify_stream(hash, source, max_blob_bytes)
-                .await
-        });
-        TeeOpen::Owner(TeeSink {
+        // The in-flight claim is taken now (coalescing #305), but the verifying
+        // decoder can only be framed once the whole-blob size is known — the
+        // caller learns it from the upstream's signed `total_bytes` AFTER this
+        // point. So opening yields a [`TeeReservation`] holding the claim; the
+        // caller calls [`TeeReservation::begin`] with the content size to spawn
+        // the import task and get the writable [`TeeSink`]. Dropping the
+        // reservation (an upstream that failed before the size was known)
+        // releases the claim.
+        TeeOpen::Owner(TeeReservation {
             engine: self.clone(),
             hash,
             notify,
-            tx: Some(tx),
-            import: Some(import),
+            active: true,
         })
     }
 
@@ -2097,9 +2086,8 @@ impl CacheEngine {
         })?;
 
         // Pre-size to the exact wire length (proof + data) so the buffer never
-        // reallocates; `bao_encoded_size` walks the same node set the export
-        // stream emits.
-        let cap = usize::try_from(bao_encoded_size(blob_size, aligned.chunk_ranges())).unwrap_or(0);
+        // reallocates; `wire_len` walks the same node set the export stream emits.
+        let cap = usize::try_from(aligned.wire_len()).unwrap_or(0);
         let mut out = Vec::with_capacity(cap);
         let mut stream = self
             .inner
@@ -2523,6 +2511,13 @@ impl CacheEngine {
             StreamCommitOutcome::HashMismatch { actual } => {
                 Ok(PullThroughOutcome::HashMismatch { actual })
             }
+            // `VerifyFailed` is emitted only by the tee's bao-decoding source
+            // (`bao_decoded_source`); the origin pull-through feeds raw bytes, so
+            // it can never fire here. Map defensively to `Store` — if it ever does,
+            // that is a logic regression worth surfacing, not silent success.
+            StreamCommitOutcome::VerifyFailed => Ok(PullThroughOutcome::Store(anyhow::Error::msg(
+                "import_and_verify_stream returned VerifyFailed on the non-tee origin path",
+            ))),
             StreamCommitOutcome::BlobTooLarge => Ok(PullThroughOutcome::BlobTooLarge),
             StreamCommitOutcome::Store(err) => Ok(PullThroughOutcome::Store(err)),
         }
@@ -2542,7 +2537,11 @@ impl CacheEngine {
     /// `count_and_cap_stream` enforces `max_blob_bytes` and bumps the
     /// origin-egress metric per chunk, so a tee fill is metered as the upstream
     /// egress it genuinely is (those bytes left an origin) without touching the
-    /// `get`-caller hit/returned counters.
+    /// `get`-caller hit/returned counters. On the tee path `stream` is the
+    /// DECODED plaintext (`bao_decoded_source` strips the interleaved proof), so
+    /// `pull_through_bytes` here meters content bytes — slightly under the bao
+    /// wire that actually left the upstream (the proof overhead the buyer paid for
+    /// is counted on the receive side, not here).
     async fn import_and_verify_stream<S>(
         &self,
         hash: Hash,
@@ -2588,15 +2587,12 @@ impl CacheEngine {
             }
             // A bao verify failure (#915): the teed verified-stream did not check
             // out against the content root — a corrupt/lying upstream. Surface it
-            // as the corruption outcome so the window serve path scores it as an
-            // upstream-verify failure rather than a generic transport error. There
-            // is no meaningful whole-blob "actual" hash for a failed bao decode
-            // (the failure is at an interior group), so report the empty-hash
-            // sentinel; the value is only logged.
+            // as the dedicated verify-failure outcome so the window serve path
+            // scores it as an upstream-verify failure rather than a generic
+            // transport error. The failure is at an interior chunk group, so there
+            // is no meaningful whole-blob "actual" hash to report.
             if is_bao_verify_marker(&upstream) {
-                return Ok(StreamCommitOutcome::HashMismatch {
-                    actual: Hash::EMPTY,
-                });
+                return Ok(StreamCommitOutcome::VerifyFailed);
             }
             // Otherwise classify via the shared body-phase classifier: typed
             // `OriginError::*` inners surface as Permanent (decompression
@@ -2723,12 +2719,20 @@ enum PullThroughOutcome {
 /// Outcome of [`CacheEngine::import_and_verify_stream`] — the commit-and-verify
 /// tail shared by origin pull-through and the tee sink (#856). Mirrors
 /// [`PullThroughOutcome`] minus the `Bytes`/`NotFound` arms: a stream import
-/// either commits, hashes wrong, overruns the cap, or hits a store fault.
+/// either commits, fails bao verification, hashes wrong, overruns the cap, or
+/// hits a store fault.
 #[derive(Debug)]
 enum StreamCommitOutcome {
     Committed,
     BlobTooLarge,
-    HashMismatch { actual: Hash },
+    /// The teed bao verified-stream failed to decode against the content root —
+    /// a corrupt/lying upstream (#915). Distinct from [`Self::HashMismatch`]:
+    /// the failure is at an interior chunk group, so there is no meaningful
+    /// whole-blob "actual" hash to report.
+    VerifyFailed,
+    HashMismatch {
+        actual: Hash,
+    },
     Store(anyhow::Error),
 }
 
@@ -2742,21 +2746,100 @@ const TEE_SINK_CHANNEL_CAP: usize = 8;
 /// Result of [`CacheEngine::open_tee_sink`] (#856).
 #[derive(Debug)]
 pub enum TeeOpen {
-    /// This caller owns the fill: drive it via the [`TeeSink`].
-    Owner(TeeSink),
+    /// This caller owns the fill: name the content size via
+    /// [`TeeReservation::begin`] to get the writable [`TeeSink`].
+    Owner(TeeReservation),
     /// Another task is already filling this hash (coalescing, #305). The caller
     /// MUST NOT open a competing upstream pull — wait on the existing fill via
     /// [`CacheEngine::populate`] / [`CacheEngine::get`] and serve from the store.
     InFlight,
 }
 
+/// The in-flight claim for a tee fill, held between [`CacheEngine::open_tee_sink`]
+/// (which takes the claim for coalescing #305) and [`Self::begin`] (which frames
+/// the verifying decoder once the whole-blob size is known from the upstream's
+/// signed `total_bytes`). Dropping it without calling `begin` — an upstream that
+/// failed before the size was known — releases the claim and wakes waiters.
+#[derive(Debug)]
+pub struct TeeReservation {
+    engine: CacheEngine,
+    hash: Hash,
+    notify: Arc<Notify>,
+    /// Cleared by [`Self::begin`] so the produced [`TeeSink`] owns the claim and
+    /// this reservation's `Drop` becomes a no-op (no double release).
+    active: bool,
+}
+
+impl TeeReservation {
+    /// Frame the verifying decoder with `content_size` (the signed whole-blob
+    /// size) and spawn the store-import task, handing back the writable
+    /// [`TeeSink`]. The content size is passed here, at open, rather than as an
+    /// in-band header — the wire the caller forwards is the header-less bao
+    /// interleaved stream (ADR 038).
+    #[must_use]
+    pub fn begin(mut self, content_size: u64) -> TeeSink {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(TEE_SINK_CHANNEL_CAP);
+        // Decode + verify the forwarded header-less bao stream into plaintext,
+        // which the existing commit path imports — keeping the cap
+        // (`count_and_cap_stream`) and the `StreamCommitOutcome` taxonomy intact
+        // while verifying the cached copy against the root. The channel closing
+        // (all senders dropped) ends the stream — that is how `finish` / `abandon`
+        // signal end-of-blob.
+        let source: Pin<
+            Box<dyn futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync>,
+        > = Box::pin(bao_decoded_source(self.hash, content_size, rx));
+        let engine = self.engine.clone();
+        let hash = self.hash;
+        let max_blob_bytes = engine.inner.max_blob_bytes;
+        let import = tokio::spawn(async move {
+            engine
+                .import_and_verify_stream(hash, source, max_blob_bytes)
+                .await
+        });
+        // Transfer the in-flight claim to the sink; this reservation's Drop is now
+        // a no-op.
+        self.active = false;
+        TeeSink {
+            engine: self.engine.clone(),
+            hash: self.hash,
+            notify: Arc::clone(&self.notify),
+            tx: Some(tx),
+            import: Some(import),
+        }
+    }
+
+    /// Release the claim without ever framing a decoder (e.g. the upstream pull
+    /// failed before the size was known). Equivalent to dropping the reservation;
+    /// named for symmetry with [`TeeSink::abandon`] at the call sites.
+    pub fn abandon(self) {
+        drop(self);
+    }
+}
+
+impl Drop for TeeReservation {
+    fn drop(&mut self) {
+        // Only release if `begin` never consumed the claim; otherwise the
+        // produced `TeeSink` owns it and will release on its own drop.
+        if !self.active {
+            return;
+        }
+        self.engine
+            .inner
+            .inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.hash);
+        self.notify.notify_waiters();
+    }
+}
+
 /// A caller-driven tee fill of one blob into the cache (#856). The owner pushes
-/// the bao verified-stream via [`Self::write`] as it arrives from an upstream
-/// node→node pull (size header first, then interleaved bao — ADR 038); the
-/// engine decodes + verifies it against the content root and streams the
-/// plaintext into the store concurrently. [`Self::finish`] promotes the blob
-/// when every chunk group verified (making it a discoverable holder), and
-/// surfaces a [`CacheError::HashMismatch`] when the forwarded bao failed
+/// the header-less bao verified-stream via [`Self::write`] as it arrives from an
+/// upstream node→node pull (the content size was named at [`TeeReservation::begin`]
+/// — ADR 038); the engine decodes + verifies it against the content root and
+/// streams the plaintext into the store concurrently. [`Self::finish`] promotes
+/// the blob when every chunk group verified (making it a discoverable holder),
+/// and surfaces a [`CacheError::VerifyFailed`] when the forwarded bao failed
 /// verification (a corrupt/lying upstream); [`Self::abandon`] drops a partial
 /// fill (e.g. the downstream client disconnected). Either way — or on an early
 /// drop from any error path — the in-flight claim is released and waiters woken.
@@ -2783,7 +2866,7 @@ impl TeeSink {
     ///
     /// # Errors
     ///
-    /// - [`CacheError::HashMismatch`] — the import ended because the tee's bao
+    /// - [`CacheError::VerifyFailed`] — the import ended because the tee's bao
     ///   decoder REJECTED a chunk group: the bytes being forwarded are corrupt
     ///   (a lying upstream), not a local fault. Callers route this to their
     ///   corruption handling, not their store-fault handling (#915).
@@ -2803,7 +2886,7 @@ impl TeeSink {
         // The import task ended before this write landed — its outcome IS the
         // reason the send failed, so surface it instead of a generic "store
         // fault" (#915 review): a bao verify rejection mid-stream must classify
-        // as CORRUPTION (`CacheError::HashMismatch`), not as a failing local
+        // as CORRUPTION (`CacheError::VerifyFailed`), not as a failing local
         // disk, or the caller meters/scores the wrong party. After this the
         // sink is spent; the caller should [`Self::abandon`] (a no-op then).
         self.tx = None;
@@ -2828,10 +2911,13 @@ impl TeeSink {
     /// Map a finished import task's outcome to what the caller sees. Shared by
     /// [`Self::finish`] (the normal verdict point) and [`Self::write`]'s
     /// task-ended-early path, so a mid-stream bao rejection surfaces as the same
-    /// [`CacheError::HashMismatch`] from either.
+    /// [`CacheError::VerifyFailed`] from either.
     fn verdict(&self, outcome: Result<StreamCommitOutcome, OriginPullError>) -> CacheResult<()> {
         match outcome {
             Ok(StreamCommitOutcome::Committed) => Ok(()),
+            Ok(StreamCommitOutcome::VerifyFailed) => Err(CacheError::VerifyFailed {
+                expected: self.hash,
+            }),
             Ok(StreamCommitOutcome::HashMismatch { actual }) => Err(CacheError::HashMismatch {
                 expected: self.hash,
                 actual,
@@ -2854,8 +2940,8 @@ impl TeeSink {
     ///
     /// # Errors
     ///
-    /// - [`CacheError::HashMismatch`] — the assembled bytes did not hash to
-    ///   `hash` (corrupt upstream); the blob is NOT promoted.
+    /// - [`CacheError::VerifyFailed`] — a forwarded chunk group did not verify
+    ///   against the content root (corrupt upstream); the blob is NOT promoted.
     /// - [`CacheError::BlobTooLarge`] — the fill exceeded `max_blob_bytes`.
     /// - [`CacheError::Store`] — store-write or import-task-join fault.
     /// - [`CacheError::OriginError`] — a mid-stream transport error was captured.
@@ -2919,7 +3005,7 @@ impl Drop for TeeSink {
 /// parent/leaf failed (the first question in a corruption postmortem), mirroring
 /// [`BlobTooLargeMarker`]'s payload-carrying shape. Wrapped in the import
 /// stream's `io::Error` so [`CacheEngine::import_and_verify_stream`] surfaces a
-/// corruption outcome ([`StreamCommitOutcome::HashMismatch`]) instead of
+/// corruption outcome ([`StreamCommitOutcome::VerifyFailed`]) instead of
 /// collapsing it into a generic transport [`OriginPullError`] (#915, ADR 038).
 /// Only genuine hash mismatches carry this marker — a truncated feed (EOF,
 /// `*NotFound`) stays a transport-class error; see [`bao_decoded_source`].
@@ -2950,10 +3036,10 @@ fn is_bao_verify_marker(e: &std::io::Error) -> bool {
 }
 
 /// A [`RecvStream`] backed by the [`TeeSink`] feeder channel. The window
-/// pull-through producer writes the 8-byte LE content-size header first, then the
-/// bao interleaved stream it forwards from the upstream; this adapter hands those
-/// bytes to a [`ResponseDecoder`] so the tee verifies + decodes them to plaintext
-/// for the store import (#915, ADR 038 §Serve side).
+/// pull-through producer writes the header-less bao interleaved stream it
+/// forwards from the upstream (the content size is passed at open, not in-band);
+/// this adapter hands those bytes to a [`ResponseDecoder`] so the tee verifies +
+/// decodes them to plaintext for the store import (#915, ADR 038 §Serve side).
 struct ChannelRecvStream {
     rx: tokio::sync::mpsc::Receiver<Bytes>,
     buf: BytesMut,
@@ -2992,6 +3078,13 @@ impl RecvStream for ChannelRecvStream {
         {
             self.buf.extend_from_slice(&b);
         }
+        // A drained-and-closed channel yields a zero-length `Bytes`, which the
+        // `bao-tree` reader reads as clean EOF (not an error) — the correct signal
+        // for a fill that ended (`finish`/`abandon` dropped all senders). A feed
+        // that ends mid-tree surfaces as this same short read to the decoder, which
+        // then fails with `ParentNotFound`/`LeafNotFound` — the transport-class
+        // `bao stream truncated mid-tree` path in `bao_decoded_source`, distinct
+        // from a genuine group hash mismatch.
         let take = self.buf.len().min(len);
         Ok(self.buf.split_to(take).freeze())
     }
@@ -3014,6 +3107,10 @@ impl RecvStream for ChannelRecvStream {
         Ok(())
     }
 
+    // `stop`/`id` are inert by design: this reader is backed by an in-process
+    // mpsc channel, not a real QUIC stream. There is no peer to send a STOP_SENDING
+    // frame to (the producer ends the fill by dropping its sender), and there is no
+    // wire stream id — `0` is a stable placeholder the decoder never keys on.
     fn stop(&mut self, _code: iroh::endpoint::VarInt) -> std::io::Result<()> {
         Ok(())
     }
@@ -3024,96 +3121,83 @@ impl RecvStream for ChannelRecvStream {
 }
 
 /// Build the plaintext byte stream a [`TeeSink`] imports from a window
-/// pull-through fill: read the 8-byte LE content-size header the producer wrote,
-/// then drive a bao [`ResponseDecoder`] over the feeder channel, yielding each
-/// verified chunk-group's plaintext (proof `Parent` nodes are skipped). The
-/// error taxonomy matches the client-side decoder (ADR 038): a genuine
-/// group/parent hash mismatch surfaces as an `io::Error` wrapping
-/// [`BaoVerifyMarker`] (then the stream ends), so the import reports a
-/// CORRUPTION outcome; a truncated feed — in the header phase or mid-tree
-/// (`ParentNotFound`/`LeafNotFound`) — or a reader fault surfaces as a
-/// transport-class `io::Error` (`UnexpectedEof`/`Io`), which must NOT be
-/// blamed on the upstream as corruption. Feeding plaintext through the
-/// existing `import_and_verify_stream` keeps the `count_and_cap_stream` cap and
-/// the structured `StreamCommitOutcome` taxonomy intact (#915, ADR 038).
+/// pull-through fill: drive a bao [`ResponseDecoder`] over the feeder channel,
+/// yielding each verified chunk-group's plaintext (proof `Parent` nodes are
+/// skipped). `content_size` — the signed whole-blob size passed to
+/// [`TeeReservation::begin`] once the upstream header is known — frames the bao
+/// tree, so the fed wire is the header-less interleaved stream (no in-band 8-byte
+/// size header). The error
+/// taxonomy matches the client-side decoder (ADR 038): a genuine group/parent
+/// hash mismatch surfaces as an `io::Error` wrapping [`BaoVerifyMarker`] (then
+/// the stream ends), so the import reports a CORRUPTION outcome; a truncated
+/// feed mid-tree (`ParentNotFound`/`LeafNotFound`) or a reader fault surfaces as
+/// a transport-class `io::Error` (`UnexpectedEof`/`Io`), which must NOT be
+/// blamed on the upstream as corruption. Feeding plaintext through the existing
+/// `import_and_verify_stream` keeps the `count_and_cap_stream` cap and the
+/// structured `StreamCommitOutcome` taxonomy intact (#915, ADR 038).
 fn bao_decoded_source(
     hash: Hash,
+    content_size: u64,
     rx: tokio::sync::mpsc::Receiver<Bytes>,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync {
     enum State {
-        Header(ChannelRecvStream),
         Decoding(ResponseDecoder<RecvStreamAsyncStreamReader<ChannelRecvStream>>),
         Done,
     }
-    futures_util::stream::unfold(
-        State::Header(ChannelRecvStream::new(rx)),
-        move |state| async move {
-            let mut decoder = match state {
-                State::Header(mut reader) => {
-                    let mut size = [0u8; 8];
-                    if let Err(err) = reader.recv_exact(&mut size).await {
-                        // A short/missing 8-byte header is malformed input (a
-                        // truncated peer stream), not a clean end: surface it so the
-                        // import fails loudly rather than committing an empty
-                        // plaintext stream. The window producer always writes the
-                        // full header before any data, so a real fill never hits
-                        // this; the abandon path ignores the import result.
-                        return Some((Err(err), State::Done));
-                    }
-                    let size = u64::from_le_bytes(size);
-                    let tree = BaoTree::new(size, crate::range_pull::IROH_BLOCK_SIZE);
-                    ResponseDecoder::new(
-                        hash.into(),
-                        ChunkRanges::all(),
-                        tree,
-                        RecvStreamAsyncStreamReader::new(reader),
-                    )
+    let tree = BaoTree::new(content_size, crate::range_pull::IROH_BLOCK_SIZE);
+    let decoder = ResponseDecoder::new(
+        hash.into(),
+        ChunkRanges::all(),
+        tree,
+        RecvStreamAsyncStreamReader::new(ChannelRecvStream::new(rx)),
+    );
+    futures_util::stream::unfold(State::Decoding(decoder), move |state| async move {
+        let mut decoder = match state {
+            State::Decoding(d) => d,
+            State::Done => return None,
+        };
+        // Advance to the next leaf (yield its plaintext), a decode failure
+        // (yield a classified error, then end), or the end of the stream.
+        loop {
+            match decoder.next().await {
+                ResponseDecoderNext::More((rest, Ok(BaoContentItem::Leaf(leaf)))) => {
+                    return Some((Ok(leaf.data), State::Decoding(rest)));
                 }
-                State::Decoding(d) => d,
-                State::Done => return None,
-            };
-            // Advance to the next leaf (yield its plaintext), a decode failure
-            // (yield a classified error, then end), or the end of the stream.
-            loop {
-                match decoder.next().await {
-                    ResponseDecoderNext::More((rest, Ok(BaoContentItem::Leaf(leaf)))) => {
-                        return Some((Ok(leaf.data), State::Decoding(rest)));
-                    }
-                    ResponseDecoderNext::More((rest, Ok(BaoContentItem::Parent(_)))) => {
-                        decoder = rest;
-                    }
-                    ResponseDecoderNext::More((_rest, Err(decode_err))) => {
-                        // Split the taxonomy exactly as the client-side decoder
-                        // does (decdn-client-pull `decode_verified_range`): only a
-                        // genuine hash mismatch is CORRUPTION (the marker →
-                        // `StreamCommitOutcome::HashMismatch` → the upstream is
-                        // scored); an EOF mid-tree (`*NotFound`) or reader fault
-                        // (`Io`) is a TRUNCATED/faulted feed — transport-class, not
-                        // provably corruption — and must not tar the upstream as a
-                        // liar.
-                        use bao_tree::io::DecodeError;
-                        let err = match decode_err {
-                            DecodeError::ParentHashMismatch(_)
-                            | DecodeError::LeafHashMismatch(_) => std::io::Error::new(
+                ResponseDecoderNext::More((rest, Ok(BaoContentItem::Parent(_)))) => {
+                    decoder = rest;
+                }
+                ResponseDecoderNext::More((_rest, Err(decode_err))) => {
+                    // Split the taxonomy exactly as the client-side decoder
+                    // does (decdn-client-pull `decode_verified_range`): only a
+                    // genuine hash mismatch is CORRUPTION (the marker →
+                    // `StreamCommitOutcome::VerifyFailed` → the upstream is
+                    // scored); an EOF mid-tree (`*NotFound`) or reader fault
+                    // (`Io`) is a TRUNCATED/faulted feed — transport-class, not
+                    // provably corruption — and must not tar the upstream as a
+                    // liar.
+                    use bao_tree::io::DecodeError;
+                    let err = match decode_err {
+                        DecodeError::ParentHashMismatch(_) | DecodeError::LeafHashMismatch(_) => {
+                            std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
                                 BaoVerifyMarker {
                                     detail: decode_err.to_string(),
                                 },
-                            ),
-                            DecodeError::Io(io_err) => io_err,
-                            not_found @ (DecodeError::ParentNotFound(_)
-                            | DecodeError::LeafNotFound(_)) => std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                format!("bao stream truncated mid-tree: {not_found}"),
-                            ),
-                        };
-                        return Some((Err(err), State::Done));
-                    }
-                    ResponseDecoderNext::Done(_reader) => return None,
+                            )
+                        }
+                        DecodeError::Io(io_err) => io_err,
+                        not_found @ (DecodeError::ParentNotFound(_)
+                        | DecodeError::LeafNotFound(_)) => std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("bao stream truncated mid-tree: {not_found}"),
+                        ),
+                    };
+                    return Some((Err(err), State::Done));
                 }
+                ResponseDecoderNext::Done(_reader) => return None,
             }
-        },
-    )
+        }
+    })
 }
 
 /// True when the body-phase `io::Error` wraps a typed
@@ -3442,11 +3526,20 @@ mod tests {
     }
 
     /// Unwrap a [`TeeOpen::Owner`], failing the test on `InFlight`.
-    fn owner(open: TeeOpen) -> anyhow::Result<TeeSink> {
+    fn owner(open: TeeOpen) -> anyhow::Result<TeeReservation> {
         match open {
-            TeeOpen::Owner(sink) => Ok(sink),
+            TeeOpen::Owner(res) => Ok(res),
             TeeOpen::InFlight => Err(anyhow::anyhow!("expected Owner, got InFlight")),
         }
+    }
+
+    /// Strip the 8-byte LE size header `encode_verified_range` prepends, leaving
+    /// the header-less bao wire the window pull-through forwards (and the tee now
+    /// consumes, since the content size is passed at `begin`).
+    fn header_less(combined: &[u8]) -> anyhow::Result<&[u8]> {
+        combined
+            .get(8..)
+            .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its 8-byte header"))
     }
 
     #[tokio::test]
@@ -3462,9 +3555,10 @@ mod tests {
         let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
         let mut rx = engine.subscribe_inserts();
 
-        // The tee now imports the bao verified-stream (ADR 038), so feed it the
-        // combined encoding (8-byte LE size header + interleaved proof/data) that
-        // `window_forward_loop` writes — not the raw payload.
+        // The tee imports the header-less bao verified-stream (ADR 038): the
+        // content size is passed at `begin`, so feed the interleaved proof/data
+        // without the 8-byte size header — the shape `window_forward_loop`
+        // forwards, not the raw payload.
         let blob_size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         let aligned = crate::range_pull::align_range(0, 0, blob_size)
             .map_err(|e| anyhow::anyhow!("align: {e}"))?;
@@ -3474,15 +3568,14 @@ mod tests {
         );
         let combined = crate::range_pull::encode_verified_range(
             *hash.as_bytes(),
-            blob_size,
             &aligned,
             &payload,
             Bytes::from(ob.data),
         )
         .map_err(|e| anyhow::anyhow!("encode bao: {e}"))?;
 
-        let mut sink = owner(engine.open_tee_sink(hash))?;
-        for chunk in combined.as_ref().chunks(64 * 1024) {
+        let mut sink = owner(engine.open_tee_sink(hash))?.begin(blob_size);
+        for chunk in header_less(combined.as_ref())?.chunks(64 * 1024) {
             sink.write(chunk).await?;
         }
         sink.finish().await?;
@@ -3506,13 +3599,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tee_sink_hash_mismatch_does_not_promote() -> anyhow::Result<()> {
+    async fn tee_sink_verify_failure_does_not_promote() -> anyhow::Result<()> {
         // Corrupt upstream (#853/#915): a WELL-FORMED bao stream of the WRONG
         // content — a valid encoding, but of different bytes than the requested
         // hash names — must fail the tee's verifying decoder with a genuine
-        // group hash mismatch, surface `CacheError::HashMismatch` from `finish`,
-        // and never be promoted. (Malformed/garbage input is a different
-        // failure class — see `tee_sink_garbage_is_rejected_but_not_corruption`.)
+        // group hash mismatch, surface `CacheError::VerifyFailed` from `finish`,
+        // and never be promoted. (A truncated feed is a different failure class —
+        // see `tee_sink_truncated_feed_is_not_corruption`.)
         let tmp = tempfile::tempdir()?;
         let genuine: Vec<u8> = (0..200_000u32)
             .map(|i| u8::try_from(i % 256).unwrap_or(0))
@@ -3532,7 +3625,6 @@ mod tests {
         );
         let combined = crate::range_pull::encode_verified_range(
             *Hash::new(&wrong).as_bytes(),
-            blob_size,
             &aligned,
             &wrong,
             Bytes::from(ob.data),
@@ -3540,13 +3632,13 @@ mod tests {
         .map_err(|e| anyhow::anyhow!("encode bao: {e}"))?;
 
         let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
-        let mut sink = owner(engine.open_tee_sink(wanted))?;
+        let mut sink = owner(engine.open_tee_sink(wanted))?.begin(blob_size);
         let mut write_err = None;
-        for chunk in combined.as_ref().chunks(64 * 1024) {
+        for chunk in header_less(combined.as_ref())?.chunks(64 * 1024) {
             if let Err(e) = sink.write(chunk).await {
                 // The decoder may reject mid-feed (the import ends and a later
                 // write fails) — that surfaced verdict must be the same
-                // HashMismatch `finish` would report.
+                // VerifyFailed `finish` would report.
                 write_err = Some(e);
                 break;
             }
@@ -3560,11 +3652,11 @@ mod tests {
                 .finish()
                 .await
                 .err()
-                .ok_or_else(|| anyhow::anyhow!("expected HashMismatch, got Ok"))?,
+                .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?,
         };
         anyhow::ensure!(
-            matches!(err, CacheError::HashMismatch { expected, .. } if expected == wanted),
-            "expected HashMismatch for {wanted}, got {err:?}"
+            matches!(err, CacheError::VerifyFailed { expected } if expected == wanted),
+            "expected VerifyFailed for {wanted}, got {err:?}"
         );
         anyhow::ensure!(
             !engine.has(wanted).await?,
@@ -3574,20 +3666,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tee_sink_garbage_is_rejected_but_not_corruption() -> anyhow::Result<()> {
-        // Raw garbage (not a bao stream at all): the first 8 bytes parse as an
-        // absurd size header and the decoder starves — a MALFORMED/truncated
-        // feed, which must be rejected but NOT branded a content hash mismatch
-        // (`HashMismatch` is reserved for provable corruption; a garbage feed is
-        // transport-class — #915 review).
+    async fn tee_sink_truncated_feed_is_not_corruption() -> anyhow::Result<()> {
+        // A short feed: the decoder is framed (at `begin`) for a large blob but
+        // the stream ends mid-tree. This must FAIL (not commit a partial blob)
+        // and must NOT be branded a verify failure — `VerifyFailed` is reserved
+        // for a group that provably hashes wrong; a truncated feed is
+        // transport-class (EOF mid-tree), which must not tar the upstream as a
+        // liar (#915 review).
         let tmp = tempfile::tempdir()?;
-        let wanted = Hash::new(b"the genuine content");
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|i| u8::try_from(i % 256).unwrap_or(0))
+            .collect();
+        let wanted = Hash::new(&payload);
+        let content_size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
 
-        let mut sink = owner(engine.open_tee_sink(wanted))?;
-        // Feed errors mid-way (import task dies on the malformed stream) are
-        // fine — the verdict is asserted below either way.
-        let write_result = sink.write(b"not the genuine content at all").await;
+        // Frame for a 200 KB blob, then feed only a few bytes and stop: the bao
+        // decoder starves mid-tree.
+        let mut sink = owner(engine.open_tee_sink(wanted))?.begin(content_size);
+        let write_result = sink
+            .write(b"only a few bytes, nowhere near a full tree")
+            .await;
         let err = match write_result {
             Err(e) => {
                 sink.abandon();
@@ -3597,38 +3696,11 @@ mod tests {
                 .finish()
                 .await
                 .err()
-                .ok_or_else(|| anyhow::anyhow!("expected garbage to be rejected, got Ok"))?,
+                .ok_or_else(|| anyhow::anyhow!("expected a truncated feed to fail, got Ok"))?,
         };
         anyhow::ensure!(
-            !matches!(err, CacheError::HashMismatch { .. }),
-            "garbage/truncated input must not classify as corruption, got {err:?}"
-        );
-        anyhow::ensure!(
-            !engine.has(wanted).await?,
-            "garbage bytes must not be promoted"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tee_sink_truncated_header_fails_loudly() -> anyhow::Result<()> {
-        // Fewer than 8 header bytes then EOF: the fill must FAIL (not commit an
-        // empty plaintext stream) and must not classify as corruption (#915
-        // review — the truncated-header propagation fix).
-        let tmp = tempfile::tempdir()?;
-        let wanted = Hash::new(b"the genuine content");
-        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
-
-        let mut sink = owner(engine.open_tee_sink(wanted))?;
-        sink.write(b"abc").await?;
-        let err = sink
-            .finish()
-            .await
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected truncated header to fail, got Ok"))?;
-        anyhow::ensure!(
-            !matches!(err, CacheError::HashMismatch { .. }),
-            "a truncated header is transport-class, got {err:?}"
+            !matches!(err, CacheError::VerifyFailed { .. }),
+            "a truncated feed must not classify as corruption, got {err:?}"
         );
         anyhow::ensure!(
             !engine.has(wanted).await?,
