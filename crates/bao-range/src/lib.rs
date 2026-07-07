@@ -126,9 +126,32 @@ pub struct AlignedRange {
     fetch_start: u64,
     fetch_end: u64,
     chunk_ranges: ChunkRanges,
+    blob_size: u64,
 }
 
 impl AlignedRange {
+    /// Whole-blob size this range was aligned against — the signed `total_bytes`
+    /// [`align_range`] was given. Held so [`wire_len`](Self::wire_len) and
+    /// [`encode_verified_range`] cannot be handed a `blob_size` that disagrees
+    /// with the `chunk_ranges`.
+    #[must_use]
+    pub const fn blob_size(&self) -> u64 {
+        self.blob_size
+    }
+
+    /// Exact header-less bao **wire** byte count for this range (content **plus**
+    /// interleaved proof, ADR 038) — the paid quantity, and the receiver's
+    /// voucher-cadence / overrun / short-delivery bound.
+    ///
+    /// This is [`bao_encoded_size`] applied to this range's own `blob_size` and
+    /// `chunk_ranges`, so the two can never drift: a mismatched `(total, ranges)`
+    /// pair would otherwise silently yield a plausible-but-wrong payment bound
+    /// with no runtime backstop — the one misuse seam the crypto never sees.
+    #[must_use]
+    pub fn wire_len(&self) -> u64 {
+        bao_encoded_size(self.blob_size, &self.chunk_ranges)
+    }
+
     /// First byte to fetch (the requested offset floored to a group boundary).
     #[must_use]
     pub const fn fetch_start(&self) -> u64 {
@@ -199,6 +222,7 @@ pub fn align_range(
         fetch_start,
         fetch_end,
         chunk_ranges,
+        blob_size,
     })
 }
 
@@ -241,17 +265,17 @@ impl ReadAt for OffsetReadAt<'_> {
 ///
 /// # Errors
 ///
-/// - [`RangeVerifyError::OutboardSize`] if `outboard` is the wrong length for a
-///   `blob_size`-byte blob.
+/// - [`RangeVerifyError::OutboardSize`] if `outboard` is the wrong length for the
+///   aligned range's blob size (`aligned.blob_size()`).
 /// - [`RangeVerifyError::Verification`] if the range/outboard do not verify
 ///   against `root`.
 pub fn encode_verified_range(
     root: [u8; 32],
-    blob_size: u64,
     aligned: &AlignedRange,
     range_data: &[u8],
     outboard: Bytes,
 ) -> Result<Bytes, RangeVerifyError> {
+    let blob_size = aligned.blob_size();
     let tree = BaoTree::new(blob_size, IROH_BLOCK_SIZE);
     let expected = usize::try_from(tree.outboard_size()).unwrap_or(usize::MAX);
     if outboard.len() != expected {

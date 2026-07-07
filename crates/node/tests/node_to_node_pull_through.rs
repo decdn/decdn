@@ -591,9 +591,10 @@ async fn lying_upstream(
     write_client_msg(&mut send, &ClientMessage::StreamEnd).await?;
     let _ = send.finish();
     // Hold the connection open until the requester has read `StreamEnd` and
-    // closed (it closes with `hash-mismatch` once its integrity check fails).
-    // Returning here would drop `conn` and abort the still-in-flight `StreamEnd`
-    // before it lands, surfacing a spurious "connection lost" instead.
+    // closed (it closes with `verify-failed` once a bao chunk group fails to
+    // verify against the content root). Returning here would drop `conn` and
+    // abort the still-in-flight `StreamEnd` before it lands, surfacing a spurious
+    // "connection lost" instead.
     conn.closed().await;
     Ok(())
 }
@@ -601,9 +602,10 @@ async fn lying_upstream(
 /// Sad path: the upstream returns bytes that don't match the requested hash
 /// (#746).
 ///
-/// Content is BLAKE3-addressed and the requester verifies the whole-blob hash on
-/// a full fetch — but that defense had no node-to-node test. Here a malicious /
-/// buggy upstream plays the protocol perfectly (valid signed response, a paid and
+/// Content is BLAKE3-addressed and the requester verifies every bao chunk group
+/// against the content root (ADR 038) — but that defense had no node-to-node
+/// test. Here a malicious / buggy upstream plays the protocol perfectly (valid
+/// signed response, a paid and
 /// ack'd voucher, a clean `StreamEnd`) while serving content that hashes to the
 /// wrong value. The downstream requester MUST reject the delivery and return an
 /// `Err`, never surfacing the corrupt bytes to its caller. This guards the
@@ -655,9 +657,9 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
     )
     .await;
 
-    let err = result
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("a hash-mismatched delivery must be rejected"))?;
+    let err = result.err().ok_or_else(|| {
+        anyhow::anyhow!("a delivery that fails bao verification must be rejected")
+    })?;
     anyhow::ensure!(
         err.to_string().contains("do not match requested hash"),
         "error should be the integrity check, got: {err}"

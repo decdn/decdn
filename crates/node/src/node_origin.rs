@@ -112,7 +112,9 @@ fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, er
 pub trait AcquisitionObserver: Send + Sync + std::fmt::Debug {
     /// `micro_usdc` and `bytes` are the deltas for *this* pull (the channel
     /// watermark minus its prior cumulative), not the channel running totals.
-    /// One pull is one blob/stream, so `bytes` is this pull's delivered length.
+    /// One pull is one blob/stream, so `bytes` is this pull's delivered length —
+    /// bao WIRE bytes (content plus interleaved proof, ADR 038), the same unit the
+    /// voucher watermark advances in, since it is derived from that watermark.
     fn on_pull(&self, hash: [u8; 32], micro_usdc: u64, bytes: u64);
 }
 
@@ -368,8 +370,8 @@ impl NodeProgressivePull {
     /// the downstream client. The window serve loop uses it as the pull budget
     /// `total`, since the forwarded/metered quantities are wire bytes.
     #[must_use]
-    pub const fn expected(&self) -> u64 {
-        self.pull.expected()
+    pub const fn expected_wire_bytes(&self) -> u64 {
+        self.pull.expected_wire_bytes()
     }
 
     /// Read and forward the next upstream chunk, paying the upstream per voucher
@@ -815,12 +817,14 @@ async fn pull_from_candidate(
                 },
             );
             // Inbound counterpart of the serve path's `record_served` (#858).
-            // Payment is incremental — one voucher per interval — but the
-            // whole-blob hash check upstream guarantees the returned buffer
-            // equals the paid cumulative on a full `Ok` delivery, so `bytes.len()`
-            // is the per-pull byte count to attribute by region. Note this tracks
-            // *delivered* bytes, not *spent*: a partially-paid failed pull (the
-            // `Err` arm) still persists its voucher watermark above (#852) but is
+            // `bytes` is the DECODED content buffer (`decode_verified_range` trims
+            // the bao proof and the pre-`byte_offset` bytes, ADR 038), so
+            // `bytes.len()` is CONTENT bytes — slightly under the WIRE bytes the
+            // voucher watermark advanced in (the proof overhead the buyer paid).
+            // Region accounting attributes the delivered content, which is the
+            // right unit for a locality signal. Note this tracks *delivered*
+            // bytes, not *spent*: a partially-paid failed pull (the `Err` arm)
+            // still persists its voucher watermark above (#852) but is
             // intentionally not region-counted, so `bytes_in` diverges from
             // on-chain spend on failed pulls by design.
             deps.region_accountant
