@@ -14,6 +14,7 @@ pub mod fetch;
 pub mod key_gen;
 pub mod node;
 pub mod probe;
+pub mod publish;
 pub mod run;
 pub mod setup;
 
@@ -29,6 +30,10 @@ pub use node::{
     TopArgs,
 };
 pub use probe::ProbeArgs;
+pub use publish::{
+    AssignArgs, ClaimArgs, NamespaceArgs, NamespaceCommand, NamespaceCreateArgs, PublishArgs,
+    PublishChainArgs, PublishCommand,
+};
 pub use run::RunArgs;
 pub use setup::SetupArgs;
 
@@ -91,4 +96,7 @@ pub enum Command {
     Bundle(BundleArgs),
     /// Client-side payment-channel lifecycle (`coop-close`).
     Channel(ChannelArgs),
+    /// Publisher control plane: create namespaces, claim content hashes, and
+    /// propose authorized-origin operator sets on-chain (issue #1029).
+    Publish(PublishArgs),
 }

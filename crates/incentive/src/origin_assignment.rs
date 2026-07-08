@@ -48,6 +48,34 @@ mod sol_types {
             function getOrigins(uint256 namespaceId) external view returns (address[] memory);
 
             // -----------------------------------------------------------------
+            // Write functions (publisher control plane, issue #1029)
+            // -----------------------------------------------------------------
+
+            /// Namespace owner proposes an authorized-origin operator set.
+            /// Enters a pending state until governance activates it after the
+            /// assignment timelock. Reverts if the caller is not the namespace
+            /// owner, the set is empty/duplicated/over-cap, or an operator is
+            /// not an active bonded node.
+            function proposeAssignment(uint256 namespaceId, address[] operators) external;
+
+            /// A pending assignment was proposed. `readyAt` is the unix time the
+            /// timelock elapses (earliest governance activation).
+            event AssignmentProposed(
+                uint256 indexed namespaceId,
+                address indexed proposer,
+                address[] operators,
+                uint256 readyAt
+            );
+
+            /// A pending proposal was cleared. `autoCleared == true` means a new
+            /// `proposeAssignment` silently replaced a prior pending proposal.
+            event AssignmentProposalCancelled(
+                uint256 indexed namespaceId,
+                address indexed proposer,
+                bool autoCleared
+            );
+
+            // -----------------------------------------------------------------
             // Per-namespace assignment events
             // -----------------------------------------------------------------
 

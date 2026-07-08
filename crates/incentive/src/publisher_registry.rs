@@ -38,6 +38,21 @@ mod sol_types {
             /// unions the operator sets across all of them.
             function namespaceOf(bytes32 blake3Hash) external view returns (uint256[] memory);
 
+            /// Mint a fresh namespace owned by the caller. Returns its id
+            /// (namespace ids start at 1; 0 is reserved). Emits `NamespaceCreated`.
+            function createNamespace() external returns (uint256 namespaceId);
+
+            /// Claim `blake3Hash` into `namespaceId` (owner-only, append-only;
+            /// re-claiming the same hash into the same namespace reverts).
+            /// Emits `ContentClaimed`.
+            function claimContent(uint256 namespaceId, bytes32 blake3Hash) external;
+
+            /// Current owner of `namespaceId` (address(0) if never created).
+            function ownerOf(uint256 namespaceId) external view returns (address);
+
+            /// A fresh `namespaceId` was created and owned by `owner`.
+            event NamespaceCreated(uint256 indexed namespaceId, address indexed owner);
+
             /// A `blake3Hash` was claimed into `namespaceId` by `claimant`.
             /// The sole hash → namespace write path.
             event ContentClaimed(

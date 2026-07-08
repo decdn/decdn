@@ -16,6 +16,7 @@ pub mod key_gen;
 pub mod node;
 pub mod node_top;
 pub mod probe;
+pub mod publish;
 pub mod register;
 pub mod setup;
 pub mod terms;

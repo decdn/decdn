@@ -34,6 +34,8 @@ struct FileBlockchain {
     chain_id: Option<u64>,
     capacity_bond_address: Option<String>,
     eth_keystore: Option<PathBuf>,
+    publisher_registry_address: Option<String>,
+    origin_assignment_address: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -146,8 +148,20 @@ pub async fn load_operator_signer(
     chain: &cli::ChainArgs,
     keystore: &Path,
 ) -> anyhow::Result<PrivateKeySigner> {
+    load_signer_with_password_file(chain.keystore_password_file.as_deref(), keystore).await
+}
+
+/// Load an Ethereum keystore signer, sourcing the password from the
+/// `DECDN_KEYSTORE_PASSWORD` env var, then `password_file`, then an interactive
+/// prompt. The scrypt KDF is offloaded to `spawn_blocking` so it doesn't stall
+/// the async executor. Shared by the `node` commands (via
+/// [`load_operator_signer`]) and the `publish` commands.
+pub async fn load_signer_with_password_file(
+    password_file: Option<&Path>,
+    keystore: &Path,
+) -> anyhow::Result<PrivateKeySigner> {
     let mut sources = vec![PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV)];
-    if let Some(path) = chain.keystore_password_file.as_deref().map(expand_tilde) {
+    if let Some(path) = password_file.map(expand_tilde) {
         sources.push(PasswordSource::File(path));
     }
     sources.push(PasswordSource::Prompt { confirm: false });
@@ -158,6 +172,71 @@ pub async fn load_operator_signer(
         .await
         .context("keystore decryption task panicked")?
         .with_context(|| format!("failed to load keystore at {display}"))
+}
+
+/// Publisher-command coordinates resolved from flags > config > defaults.
+/// The two contract addresses are optional here; each subcommand requires
+/// only the one it targets and errors with a specific message if it is unset.
+#[derive(Debug)]
+pub struct ResolvedPublish {
+    pub rpc_url: String,
+    pub chain_id: u64,
+    pub publisher_registry_address: Option<String>,
+    pub origin_assignment_address: Option<String>,
+    pub keystore: PathBuf,
+    pub data_dir: PathBuf,
+}
+
+/// Resolve publisher-command coordinates. Pure so precedence is unit-testable.
+pub fn resolve_publish(
+    args: &cli::PublishChainArgs,
+    file: &FileConfig,
+) -> anyhow::Result<ResolvedPublish> {
+    let bc = file.blockchain.as_ref();
+    let rpc_url = args
+        .rpc_url
+        .clone()
+        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("rpc_url not set (pass --rpc-url or set blockchain.rpc_url)")
+        })?;
+    let chain_id = args
+        .chain_id
+        .or_else(|| bc.and_then(|b| b.chain_id))
+        .unwrap_or(DEFAULT_CHAIN_ID);
+    let publisher_registry_address = args
+        .publisher_registry_address
+        .clone()
+        .or_else(|| bc.and_then(|b| b.publisher_registry_address.clone()));
+    let origin_assignment_address = args
+        .origin_assignment_address
+        .clone()
+        .or_else(|| bc.and_then(|b| b.origin_assignment_address.clone()));
+    let data_dir = args
+        .data_dir
+        .clone()
+        .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
+        .map(|p| expand_tilde(&p))
+        .or_else(cli::default_data_dir)
+        .ok_or_else(|| {
+            anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
+        })?;
+    let keystore = args
+        .keystore
+        .clone()
+        .or_else(|| bc.and_then(|b| b.eth_keystore.clone()))
+        .map_or_else(
+            || eth_identity::keystore_path(&data_dir),
+            |p| expand_tilde(&p),
+        );
+    Ok(ResolvedPublish {
+        rpc_url,
+        chain_id,
+        publisher_registry_address,
+        origin_assignment_address,
+        keystore,
+        data_dir,
+    })
 }
 
 #[cfg(test)]
@@ -197,6 +276,8 @@ mod tests {
             chain_id: Some(1),
             capacity_bond_address: Some("0xCONFIG".to_string()),
             eth_keystore: None,
+            publisher_registry_address: None,
+            origin_assignment_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");
@@ -212,6 +293,8 @@ mod tests {
             chain_id: None,
             capacity_bond_address: Some("0xCONFIG".to_string()),
             eth_keystore: Some(PathBuf::from("/keys/ks.json")),
+            publisher_registry_address: None,
+            origin_assignment_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://config:8545");
@@ -229,6 +312,8 @@ mod tests {
             chain_id: None,
             capacity_bond_address: Some("0xY".to_string()),
             eth_keystore: None,
+            publisher_registry_address: None,
+            origin_assignment_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.keystore, PathBuf::from("/tmp/decdn-test/keystore.json"));
@@ -239,5 +324,35 @@ mod tests {
         let chain = empty_chain();
         let err = resolve(&chain, &FileConfig::default()).unwrap_err();
         assert!(err.to_string().contains("rpc_url not set"), "{err}");
+    }
+
+    #[test]
+    fn resolve_publish_flag_beats_config() {
+        let args = cli::PublishChainArgs {
+            config: None,
+            rpc_url: Some("http://flag:8545".to_string()),
+            chain_id: Some(42),
+            publisher_registry_address: Some("0xFLAG".to_string()),
+            origin_assignment_address: None,
+            keystore: None,
+            data_dir: Some(PathBuf::from("/tmp/decdn-test")),
+            keystore_password_file: None,
+            dry_run: true,
+            json: false,
+        };
+        let file = file_with(FileBlockchain {
+            rpc_url: Some("http://config:8545".to_string()),
+            chain_id: Some(1),
+            capacity_bond_address: None,
+            eth_keystore: None,
+            publisher_registry_address: Some("0xCONFIG".to_string()),
+            origin_assignment_address: Some("0xOA".to_string()),
+        });
+        let r = resolve_publish(&args, &file).unwrap();
+        assert_eq!(r.rpc_url, "http://flag:8545");
+        assert_eq!(r.chain_id, 42);
+        assert_eq!(r.publisher_registry_address.as_deref(), Some("0xFLAG"));
+        // unset flag falls through to config
+        assert_eq!(r.origin_assignment_address.as_deref(), Some("0xOA"));
     }
 }
