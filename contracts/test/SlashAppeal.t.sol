@@ -5,6 +5,7 @@ import { Test } from "forge-std/Test.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { SlashAppeal } from "../src/SlashAppeal.sol";
+import { SunsettingPausable } from "../src/SunsettingPausable.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { SlashStatus, SlashRecord } from "../src/SlashEscrowLib.sol";
 import { Token } from "../src/Token.sol";
@@ -404,6 +405,19 @@ contract SlashAppealTest is Test {
     // -----------------------------------------------------------------
     // ADR 028 §5 — pause extends the filing window by the paused duration
     // -----------------------------------------------------------------
+
+    // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
+    // each contract's own construction time + 365 days; afterwards `pause()` reverts for everyone.
+    function test_pause_revertsAfterSunset() public {
+        bytes32 pauserRole = appeal.PAUSER_ROLE();
+        vm.prank(admin);
+        appeal.grantRole(pauserRole, admin);
+
+        vm.warp(block.timestamp + 366 days);
+        vm.prank(admin);
+        vm.expectRevert(SunsettingPausable.PauseExpired.selector);
+        appeal.pause();
+    }
 
     function test_pause_extendsFilingWindow() public {
         bytes32 pauserRole = bond.PAUSER_ROLE();

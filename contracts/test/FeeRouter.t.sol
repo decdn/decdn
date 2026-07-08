@@ -6,6 +6,7 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { FeeRouter } from "../src/FeeRouter.sol";
+import { SunsettingPausable } from "../src/SunsettingPausable.sol";
 import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
 
 contract MockUSDC is ERC20 {
@@ -231,6 +232,19 @@ contract FeeRouterTest is Test {
         _expectMissingRole(operator, router.GOVERNANCE_ROLE());
         vm.prank(operator);
         router.setWindowEpochs(20);
+    }
+
+    // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
+    // each contract's own construction time + 365 days; afterwards `pause()` reverts for everyone.
+    function test_pause_revertsAfterSunset() public {
+        bytes32 pauserRole = router.PAUSER_ROLE();
+        vm.prank(admin);
+        router.grantRole(pauserRole, admin);
+
+        vm.warp(block.timestamp + 366 days);
+        vm.prank(admin);
+        vm.expectRevert(SunsettingPausable.PauseExpired.selector);
+        router.pause();
     }
 
     function test_pause_revertsWithoutRole() public {

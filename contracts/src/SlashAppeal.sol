@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+import { SunsettingPausable } from "./SunsettingPausable.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
@@ -33,7 +33,7 @@ import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.
 ///         `upholdAppeal` == slash stands (the old `reverseAppeal`-as-failure
 ///         path). The token flows are the inverse of the old USDC-restitution
 ///         `ratifyAppeal`; this contract never moves USDC.
-contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
+contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, SunsettingPausable {
     using SafeERC20 for IERC20;
 
     // -----------------------------------------------------------------
@@ -392,6 +392,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Pausable {
     }
 
     function pause() external onlyRole(PAUSER_ROLE) {
+        _requirePauseWindowOpen();
         _pause();
     }
 
