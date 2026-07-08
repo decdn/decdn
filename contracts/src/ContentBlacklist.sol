@@ -33,6 +33,28 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         governance-tunable window → a full-window lockout) and the perjury
 ///         denylist (`perjuryDenylistUntilAt`, a 365-day lockout set via
 ///         `rejectAppealAsPerjury`) are both implemented.
+/// @dev    Appeal-deadline enforcement is permissionless-only by design. The
+///         `APPEAL_REVIEW_WINDOW` / `APPEAL_RATIFICATION_WINDOW` deadlines are
+///         enforced solely on `cleanupExpiredBlacklistAppeal`, which any caller
+///         may invoke to lapse an appeal once its window has elapsed. The
+///         privileged transitions — `fastTrackBlacklistAppeal` (multisig),
+///         `ratifyBlacklistAppealRemoval` / `reverseBlacklistAppeal` (governor)
+///         — deliberately carry no upper deadline: the trusted roles are the
+///         appeal's adjudicators, not adversaries to be time-boxed, so they may
+///         act for as long as the appeal stays in an actionable state (`Open`
+///         for fast-track, `FastTracked` for ratify/reverse). The windows bound
+///         trusted-role latency only as a fallback — if a trusted role goes
+///         silent past its window, the permissionless cleanup-lapse settles the
+///         bond and releases any interim-relief slot. The one consequence is a
+///         race: once a window has elapsed both the trusted transition and
+///         `cleanupExpiredBlacklistAppeal` are admissible, and whichever lands
+///         first wins. Each path reaches a coherent terminal state, so the
+///         ordering is immaterial to invariant safety only — the settlement
+///         outcome differs by which path resolves first (e.g. a late ratify
+///         refunds the bond and removes the hash, while a cleanup-lapse burns
+///         the bond and re-activates the entry), and both outcomes are valid
+///         for an appeal whose window has run. See ADR 031 § Deadline
+///         enforcement is permissionless-only.
 contract ContentBlacklist is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 

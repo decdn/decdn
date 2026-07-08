@@ -66,11 +66,22 @@ const RATE_A: u64 = 10;
 const RATE_B: u64 = 13;
 
 /// Cumulative voucher amount the requester pays for a `PAYLOAD_LEN` blob at
-/// `rate` per MiB: one full-interval voucher (`rate`) plus a closing voucher for
-/// the trailing 0.5 MiB (`ceil(rate/2)`). Matches the requester's per-voucher
+/// `rate` per MiB. ADR 038: vouchers meter the bao **wire** byte stream (content
+/// plus interleaved Merkle proof), so the amount is computed over the whole-blob
+/// wire size, not the content length. The stream pays `rate` per fully crossed
+/// 1-MiB interval plus a closing voucher of `ceil(remainder * rate / MiB)` for
+/// the trailing wire bytes, mirroring the requester's per-voucher
 /// `ceil(bytes_delta * rate / MiB)` arithmetic in `client_requester::self_pay`.
 fn expected_amount(rate: u64) -> U256 {
-    U256::from(rate + rate.div_ceil(2))
+    const MIB: u64 = 1024 * 1024;
+    let wire = support::bao_wire_len_whole(PAYLOAD_LEN as u64);
+    let full_intervals = wire / MIB;
+    let remainder = wire % MIB;
+    let mut amount = full_intervals.saturating_mul(rate);
+    if remainder > 0 {
+        amount = amount.saturating_add(remainder.saturating_mul(rate).div_ceil(MIB));
+    }
+    U256::from(amount)
 }
 
 const fn slash_verifying() -> Address {
@@ -134,9 +145,13 @@ fn assert_channel_advanced(
         "{hop}: nonce {}",
         only.last_nonce()
     );
+    // ADR 038: metered quantity is bao wire bytes (content + interleaved Merkle
+    // proof), not the content length, so the recorded watermark is the whole-blob
+    // wire size — same for every hop, each metered in wire bytes.
+    let wire_bytes = support::bao_wire_len_whole(PAYLOAD_LEN as u64);
     anyhow::ensure!(
-        only.last_bytes_delivered() == U256::from(PAYLOAD_LEN),
-        "{hop}: bytes_delivered {}",
+        only.last_bytes_delivered() == U256::from(wire_bytes),
+        "{hop}: bytes_delivered {} != expected wire {wire_bytes}",
         only.last_bytes_delivered()
     );
     anyhow::ensure!(
@@ -576,9 +591,10 @@ async fn lying_upstream(
     write_client_msg(&mut send, &ClientMessage::StreamEnd).await?;
     let _ = send.finish();
     // Hold the connection open until the requester has read `StreamEnd` and
-    // closed (it closes with `hash-mismatch` once its integrity check fails).
-    // Returning here would drop `conn` and abort the still-in-flight `StreamEnd`
-    // before it lands, surfacing a spurious "connection lost" instead.
+    // closed (it closes with `verify-failed` once a bao chunk group fails to
+    // verify against the content root). Returning here would drop `conn` and
+    // abort the still-in-flight `StreamEnd` before it lands, surfacing a spurious
+    // "connection lost" instead.
     conn.closed().await;
     Ok(())
 }
@@ -586,9 +602,10 @@ async fn lying_upstream(
 /// Sad path: the upstream returns bytes that don't match the requested hash
 /// (#746).
 ///
-/// Content is BLAKE3-addressed and the requester verifies the whole-blob hash on
-/// a full fetch — but that defense had no node-to-node test. Here a malicious /
-/// buggy upstream plays the protocol perfectly (valid signed response, a paid and
+/// Content is BLAKE3-addressed and the requester verifies every bao chunk group
+/// against the content root (ADR 038) — but that defense had no node-to-node
+/// test. Here a malicious / buggy upstream plays the protocol perfectly (valid
+/// signed response, a paid and
 /// ack'd voucher, a clean `StreamEnd`) while serving content that hashes to the
 /// wrong value. The downstream requester MUST reject the delivery and return an
 /// `Err`, never surfacing the corrupt bytes to its caller. This guards the
@@ -640,9 +657,9 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
     )
     .await;
 
-    let err = result
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("a hash-mismatched delivery must be rejected"))?;
+    let err = result.err().ok_or_else(|| {
+        anyhow::anyhow!("a delivery that fails bao verification must be rejected")
+    })?;
     anyhow::ensure!(
         err.to_string().contains("do not match requested hash"),
         "error should be the integrity check, got: {err}"

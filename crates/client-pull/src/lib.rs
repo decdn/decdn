@@ -20,9 +20,15 @@
 //!   followed: resolving a redirect `NodeId` to a dialable address needs the
 //!   provider-discovery layer (ADR 001 / 022), which is out of scope. A #317
 //!   server always sends `redirect: None`.
-//! - **Whole-blob BLAKE3 verification** runs only for a full fetch
-//!   (`byte_offset == 0`); a resumed fetch cannot recompute the whole-blob hash
-//!   from a suffix (bao tree-hash verification is out of scope).
+//! - **Bao verified-range decoding** (ADR 038): the `ChunkData` payload is bao's
+//!   interleaved verified-stream encoding, not raw bytes. The buffered path feeds
+//!   the reassembled stream to a `bao-tree` verifying decoder that checks every
+//!   chunk group against the requested content-hash root, so a range fetched at
+//!   any `byte_offset > 0` self-verifies (a corrupt tail is rejected) with no
+//!   dependency on earlier bytes — closing the old resume gap. The progressive
+//!   (window pull-through) path forwards the bao stream verbatim and tees it into
+//!   the cache's verifying decoder (`import_and_verify_stream`), which checks the
+//!   cached copy against the same root.
 
 /// Buyer-side `PaymentChannel` open kernel (#940), shared by the node service
 /// and the CLI.
@@ -49,7 +55,11 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::signers::local::PrivateKeySigner;
+use bao_tree::BaoTree;
+use bao_tree::io::sync::DecodeResponseIter;
+use bao_tree::io::{BaoContentItem, DecodeError};
 use bytes::{Bytes, BytesMut};
+use decdn_bao_range::{IROH_BLOCK_SIZE, align_range};
 use decdn_incentive::{BuyerChannelState, StreamSlashData, Voucher, signed_to_wire_voucher};
 use decdn_protocol::client::{
     ClientMessage, StreamError, StreamRequest, StreamResponse, VoucherRejectReason,
@@ -198,12 +208,15 @@ impl VoucherProgress {
     }
 }
 
-/// The upstream delivered bytes whose whole-blob BLAKE3 hash did not match the
-/// requested content hash — a paid-but-corrupt delivery (the content-addressing
-/// invariant, ADR 014). Returned (via `anyhow`) by [`stream_fetch`] so callers
-/// can `downcast_ref` to classify corruption (e.g. a reputation `Corruption`
-/// outcome) without matching on the error message string. The `Display` text is
-/// kept stable for logs and the existing requester tests.
+/// The upstream delivered bytes that failed bao verification against the
+/// requested content root — a paid-but-corrupt delivery (the content-addressing
+/// invariant, ADR 014/038). Under ADR 038 the verifier is the per-chunk-group
+/// `bao-tree` decoder (`decode_verified_range`), not a whole-blob re-hash, so
+/// this fires the moment any group's proof mismatches. Returned (via `anyhow`)
+/// by [`stream_fetch`] so callers can `downcast_ref` to classify corruption
+/// (e.g. a reputation `Corruption` outcome) without matching on the error
+/// message string. The `Display` text is kept stable for logs and the existing
+/// requester tests.
 #[derive(Debug)]
 pub struct HashMismatch;
 
@@ -516,14 +529,13 @@ async fn fetch_inner(
             ceiling: max_blob_size_bytes,
         }));
     }
-    // A `total_bytes` below `byte_offset` would underflow `expected` to `0`
+    // A `total_bytes` below `byte_offset` would underflow the wire bound to `0`
     // (saturating), so the loop ends on the first `StreamEnd` and returns an
-    // empty buffer. On a resumed fetch (`byte_offset > 0`) the whole-blob hash
-    // check is skipped, so that empty buffer would surface as success — a silent
-    // verification bypass. A legitimate server always claims
-    // `total_bytes >= byte_offset`; reject anything less before the loop. (A
-    // non-empty but *short* delivery is caught by the completeness check after
-    // the loop.)
+    // empty buffer. An empty range decodes trivially (no chunk group to verify),
+    // so that empty buffer would surface as success — a silent verification
+    // bypass. A legitimate server always claims `total_bytes >= byte_offset`;
+    // reject anything less before the loop. (A non-empty but *short* delivery is
+    // caught by the completeness check after the loop.)
     if resp.body.total_bytes < byte_offset {
         anyhow::bail!(
             "server claimed total_bytes ({}) below the requested byte_offset ({})",
@@ -537,7 +549,10 @@ async fn fetch_inner(
         .voucher_interval_mb
         .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
         .saturating_mul(MB_BYTES);
-    let expected = resp.body.total_bytes.saturating_sub(byte_offset);
+    // Paid/received bytes are **wire** bytes — content plus interleaved bao proof
+    // nodes (ADR 038 §Payment metering) — not the content-byte remainder.
+    let total_bytes = resp.body.total_bytes;
+    let expected_wire = aligned_wire_len(byte_offset, total_bytes)?;
 
     let (buf, cumulative) = receive_and_pay(
         &mut send,
@@ -546,42 +561,57 @@ async fn fetch_inner(
         ledger,
         rate_per_mb,
         interval_bytes,
-        expected,
+        expected_wire,
     )
     .await?;
 
-    let blob = buf.freeze();
-    // On a resumed fetch (`byte_offset > 0`) the whole-blob hash check below is
-    // skipped, so a truncated delivery — fewer than `expected` bytes before
-    // `StreamEnd` — would otherwise surface as a successful short read. The
-    // server's `total_bytes` is the only completeness signal without the hash,
-    // so require the full promised remainder. A full fetch (`byte_offset == 0`)
-    // is covered by the hash check and may legitimately be shorter than an
-    // over-claimed `total_bytes` as long as the bytes hash correctly, so this
-    // is scoped to resumes only (#840).
-    if byte_offset > 0 && cumulative < expected {
+    // A truncated stream (fewer wire bytes than the aligned range needs) cannot
+    // decode; reject cleanly before the decoder hits an EOF mid-proof. There is no
+    // whole-blob-hash fallback anymore, so this bound applies to every fetch
+    // (full and resumed) rather than only resumes.
+    if cumulative < expected_wire {
         conn.close(0u32.into(), b"short-delivery");
-        anyhow::bail!("server sent {cumulative} of {expected} promised bytes before StreamEnd");
+        anyhow::bail!(
+            "server sent {cumulative} of {expected_wire} promised wire bytes before StreamEnd"
+        );
     }
-    // Whole-blob integrity check on a full fetch (see module docs for the
-    // resume caveat). `blake3::hash` is exactly what iroh-blobs content-
-    // addresses with, so this is the same check the node performs.
-    if byte_offset == 0 && blake3::hash(&blob) != blake3::Hash::from_bytes(hash) {
-        conn.close(0u32.into(), b"hash-mismatch");
-        // Typed sentinel (not a bare string) so callers can `downcast_ref` to
-        // classify a paid-but-corrupt delivery; `Display` keeps the same text.
-        return Err(anyhow::Error::new(HashMismatch));
-    }
+    // Decode the bao interleaved stream, verifying every chunk group against the
+    // content-hash root, and trim to the requested span. A corrupt group at ANY
+    // offset (including a resumed tail) yields `HashMismatch` — the resume gap is
+    // closed. `HashMismatch` stays the typed sentinel so callers `downcast_ref` to
+    // classify a paid-but-corrupt delivery.
+    let blob = match decode_verified_range(hash, total_bytes, byte_offset, 0, buf.as_ref()) {
+        Ok(blob) => blob,
+        Err(e) => {
+            conn.close(0u32.into(), b"verify-failed");
+            return Err(e);
+        }
+    };
     conn.close(0u32.into(), b"done");
     Ok(blob)
 }
 
+/// The wire-byte bound for a resume at `byte_offset` of a `total_bytes` blob:
+/// the bao-encoded size of the chunk-group-aligned range (content plus
+/// interleaved proof, ADR 038 §Payment metering), exactly the byte count the
+/// server emits. The server widens `byte_offset` to enclosing 16 KiB groups;
+/// [`align_range`] / [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
+/// reproduce that, keeping encoder and receiver in lock-step. Shared by the
+/// buffered [`fetch_inner`] and progressive [`open_progressive_pull`] paths so
+/// the two can't drift.
+fn aligned_wire_len(byte_offset: u64, total_bytes: u64) -> anyhow::Result<u64> {
+    let aligned = align_range(byte_offset, 0, total_bytes)
+        .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
+    Ok(aligned.wire_len())
+}
+
 /// Drive the buffered receive loop: read `ChunkData` into a buffer, paying one
-/// voucher per `interval_bytes` boundary (and a closing voucher once all `expected`
-/// bytes have arrived) through the shared `ledger`, until `StreamEnd`. Returns the
-/// assembled buffer and the cumulative byte count for the caller's completeness +
-/// hash checks. Enforces the chunk-size ceiling and the `cumulative <= expected`
-/// overrun guard (ADR 005 §`cdn/client/v1`).
+/// voucher per `interval_bytes` boundary (and a closing voucher once all
+/// `expected_wire_bytes` have arrived) through the shared `ledger`, until
+/// `StreamEnd`. Returns the assembled buffer and the cumulative byte count for
+/// the caller's completeness check (integrity is verified per bao chunk group by
+/// the decoder, not here). Enforces the chunk-size ceiling and the
+/// `cumulative <= expected_wire_bytes` overrun guard (ADR 005 §`cdn/client/v1`).
 async fn receive_and_pay(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -589,7 +619,7 @@ async fn receive_and_pay(
     ledger: &ChannelLedger,
     rate_per_mb: u64,
     interval_bytes: u64,
-    expected: u64,
+    expected_wire_bytes: u64,
 ) -> anyhow::Result<(BytesMut, u64)> {
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
@@ -609,9 +639,9 @@ async fn receive_and_pay(
                     anyhow::bail!("chunk of {} bytes exceeds CHUNK_SIZE", chunk.bytes.len());
                 }
                 cumulative = cumulative.saturating_add(chunk.bytes.len() as u64);
-                if cumulative > expected {
+                if cumulative > expected_wire_bytes {
                     anyhow::bail!(
-                        "server sent {cumulative} bytes, more than the {expected} promised"
+                        "server sent {cumulative} bytes, more than the {expected_wire_bytes} promised"
                     );
                 }
                 buf.extend_from_slice(&chunk.bytes);
@@ -619,7 +649,7 @@ async fn receive_and_pay(
                 // Pay at each interval boundary, and a closing voucher once all
                 // expected bytes have arrived — matching the node's pacing.
                 let boundary = bytes_since_voucher >= interval_bytes && interval_bytes > 0;
-                let closing = cumulative >= expected && bytes_since_voucher > 0;
+                let closing = cumulative >= expected_wire_bytes && bytes_since_voucher > 0;
                 if boundary || closing {
                     self_pay(send, recv, ctx, ledger, rate_per_mb, bytes_since_voucher).await?;
                     bytes_since_voucher = 0;
@@ -632,6 +662,83 @@ async fn receive_and_pay(
     }
 
     Ok((buf, cumulative))
+}
+
+/// Decode and verify the reassembled bao interleaved stream `bao_wire` against the
+/// content-hash root `hash`, returning the requested plaintext span
+/// `[byte_offset, byte_offset + byte_len)` (`byte_len == 0` ⇒ to end). Every chunk
+/// group is checked against the root as it is decoded, so a corrupt group — at any
+/// offset, including a resumed tail — is rejected without needing earlier bytes
+/// (ADR 038 §Receive side; closes the old `byte_offset > 0` gap).
+///
+/// The server serves the chunk-group-aligned **superset** of the request (a bao
+/// proof anchors whole 16 KiB groups), so the decoder yields
+/// `[align.fetch_start, align.fetch_end)` and we trim the leading bytes before
+/// `byte_offset` here — the serve side never trims (trimming would break the
+/// proof). `bao_wire` must be exactly the header-less response stream the server
+/// emitted for `align_range(byte_offset, byte_len, total_bytes)`; the shared
+/// [`align_range`]/[`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
+/// keep encoder and decoder in lock-step.
+///
+/// # Errors
+///
+/// [`HashMismatch`] if any chunk group or the root fails verification (a
+/// paid-but-corrupt delivery); a decode/`Io` error (e.g. truncated stream) or an
+/// out-of-range trim otherwise.
+fn decode_verified_range(
+    hash: [u8; 32],
+    total_bytes: u64,
+    byte_offset: u64,
+    byte_len: u64,
+    bao_wire: &[u8],
+) -> anyhow::Result<Bytes> {
+    let aligned = align_range(byte_offset, byte_len, total_bytes)
+        .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
+    let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
+    let root = blake3::Hash::from_bytes(hash);
+    let chunk_ranges = aligned.chunk_ranges();
+    let reader = std::io::Cursor::new(bao_wire);
+    // Cap the capacity hint at the received wire length: decoded plaintext can
+    // never exceed the bytes actually received, so an untrusted `total_bytes`
+    // header (via `fetch_len`) can't drive an over-allocation / OOM.
+    let cap = usize::try_from(aligned.fetch_len())
+        .unwrap_or(0)
+        .min(bao_wire.len());
+    let mut plaintext = Vec::with_capacity(cap);
+    for item in DecodeResponseIter::new(root, tree, reader, chunk_ranges.as_ref()) {
+        match item {
+            Ok(BaoContentItem::Leaf(leaf)) => plaintext.extend_from_slice(&leaf.data),
+            Ok(BaoContentItem::Parent(_)) => {}
+            // A group/leaf/root hash mismatch is the content-addressing violation
+            // (ADR 014); surface the typed sentinel so callers classify corruption.
+            Err(DecodeError::ParentHashMismatch(_) | DecodeError::LeafHashMismatch(_)) => {
+                return Err(anyhow::Error::new(HashMismatch));
+            }
+            // A short/truncated stream or other IO fault — not provably corruption.
+            Err(e) => anyhow::bail!("bao decode failed: {e}"),
+        }
+    }
+    // The decoded buffer spans the aligned superset `[fetch_start, fetch_end)`;
+    // trim back to the caller's requested span.
+    let lead = usize::try_from(byte_offset.saturating_sub(aligned.fetch_start()))?;
+    let want = if byte_len == 0 {
+        plaintext.len().saturating_sub(lead)
+    } else {
+        usize::try_from(byte_len)?
+    };
+    // Take ownership of the decoded buffer as `Bytes` once, then trim with a
+    // zero-copy `slice` view (no second allocation/copy). Guard the upper bound
+    // explicitly: `Bytes::slice` panics out of range, and a short decode must
+    // surface as a clean error (`lead <= end` always, since `want >= 0`).
+    let end = lead.saturating_add(want);
+    let bytes = Bytes::from(plaintext);
+    if end > bytes.len() {
+        anyhow::bail!("decoded range shorter than requested span");
+    }
+    if lead == 0 && end == bytes.len() {
+        return Ok(bytes);
+    }
+    Ok(bytes.slice(lead..end))
 }
 
 /// Header fields from the upstream `StreamResponse`, surfaced by
@@ -654,8 +761,10 @@ pub struct UpstreamPullHeader {
 /// A live, progressive `cdn/client/v1` pull (#856), the streaming counterpart of
 /// the buffered [`stream_fetch`]. Opened by [`open_progressive_pull`] (which has
 /// already done the handshake and verified the response), driven chunk-by-chunk
-/// via [`Self::next_chunk`], and closed by [`Self::finish`] (completeness +
-/// whole-blob hash) or [`Self::abort`].
+/// via [`Self::next_chunk`], and closed by [`Self::finish`] (a wire-completeness
+/// check — integrity is verified per bao chunk group by the tee's decoder and the
+/// downstream client's own decoder, not by a whole-blob re-hash) or
+/// [`Self::abort`].
 ///
 /// It pays the upstream per voucher interval *inside* `next_chunk` — identical
 /// pacing to `stream_fetch` — but yields each chunk to the caller (which
@@ -685,19 +794,16 @@ pub struct UpstreamPull {
     ctx: ChannelContext,
     progress: VoucherProgress,
     hash: [u8; 32],
-    byte_offset: u64,
     rate_per_mb: u64,
     interval_bytes: u64,
-    /// Promised remaining bytes (`total_bytes - byte_offset`).
-    expected: u64,
-    /// Bytes received so far on this stream.
+    /// Promised **wire** bytes for this stream: the bao-encoded size of the
+    /// chunk-group-aligned range (content plus interleaved proof, ADR 038), not
+    /// the content-byte remainder. Bounds the receive loop and the closing voucher.
+    expected_wire_bytes: u64,
+    /// Wire bytes received so far on this stream.
     cumulative: u64,
-    /// Bytes received since the last voucher.
+    /// Wire bytes received since the last voucher.
     unvouchered: u64,
-    /// Incremental whole-blob BLAKE3 (only fed/checked for a full fetch,
-    /// `byte_offset == 0`) — hashes chunks as they stream so we never buffer the
-    /// blob just to verify it.
-    hasher: blake3::Hasher,
     /// `StreamEnd` seen — `next_chunk` returns `None` and `finish` skips the
     /// drain.
     ended: bool,
@@ -707,7 +813,7 @@ impl std::fmt::Debug for UpstreamPull {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamPull")
             .field("hash", &blake3::Hash::from_bytes(self.hash))
-            .field("expected", &self.expected)
+            .field("expected_wire_bytes", &self.expected_wire_bytes)
             .field("cumulative", &self.cumulative)
             .field("ended", &self.ended)
             .finish_non_exhaustive()
@@ -804,9 +910,13 @@ pub async fn open_progressive_pull(
         .voucher_interval_mb
         .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
         .saturating_mul(MB_BYTES);
-    let expected = resp.body.total_bytes.saturating_sub(byte_offset);
+    // Wire-byte bound (bao-encoded size of the aligned range), not content bytes —
+    // the window path forwards this stream verbatim and pays the upstream in wire
+    // bytes (ADR 038 §Payment metering). Same derivation as `fetch_inner`.
+    let total_bytes = resp.body.total_bytes;
+    let expected_wire_bytes = aligned_wire_len(byte_offset, total_bytes)?;
     let header = UpstreamPullHeader {
-        total_bytes: resp.body.total_bytes,
+        total_bytes,
         rate_per_mb,
         interval_bytes,
     };
@@ -817,25 +927,24 @@ pub async fn open_progressive_pull(
         ctx: ctx.clone(),
         progress: VoucherProgress::seed(ctx),
         hash,
-        byte_offset,
         rate_per_mb,
         interval_bytes,
-        expected,
+        expected_wire_bytes,
         cumulative: 0,
         unvouchered: 0,
-        hasher: blake3::Hasher::new(),
         ended: false,
     };
     Ok((header, pull))
 }
 
 impl UpstreamPull {
-    /// Bytes this stream will deliver: the upstream's promised `total_bytes`
-    /// minus the requested `byte_offset` (the full `total_bytes` for a fresh
-    /// fetch, the remaining suffix for a resumed one).
+    /// Wire bytes this stream will deliver: the bao-encoded size of the
+    /// chunk-group-aligned range (content plus interleaved proof, ADR 038). The
+    /// window serve loop uses it as the pull budget `total` — it must be wire
+    /// bytes, since `pulled`/`served_paid` count forwarded wire bytes.
     #[must_use]
-    pub const fn expected(&self) -> u64 {
-        self.expected
+    pub const fn expected_wire_bytes(&self) -> u64 {
+        self.expected_wire_bytes
     }
 
     /// The current acked voucher watermark — read it on any exit (including an
@@ -893,21 +1002,21 @@ impl UpstreamPull {
                     anyhow::bail!("chunk of {} bytes exceeds CHUNK_SIZE", chunk.bytes.len());
                 }
                 self.cumulative = self.cumulative.saturating_add(chunk.bytes.len() as u64);
-                if self.cumulative > self.expected {
+                if self.cumulative > self.expected_wire_bytes {
                     anyhow::bail!(
                         "server sent {} bytes, more than the {} promised",
                         self.cumulative,
-                        self.expected
+                        self.expected_wire_bytes
                     );
                 }
-                // Feed the incremental hash only for a full fetch — a resumed
-                // fetch cannot recompute the whole-blob hash from a suffix.
-                if self.byte_offset == 0 {
-                    self.hasher.update(&chunk.bytes);
-                }
+                // No per-chunk hashing here: this stream's bytes are bao wire
+                // bytes forwarded verbatim downstream and teed into the cache's
+                // verifying decoder (`import_and_verify_stream`), which checks the
+                // cached copy against the root (ADR 038); the downstream client
+                // verifies its own copy with its decoder.
                 self.unvouchered = self.unvouchered.saturating_add(chunk.bytes.len() as u64);
                 let boundary = self.unvouchered >= self.interval_bytes && self.interval_bytes > 0;
-                let closing = self.cumulative >= self.expected && self.unvouchered > 0;
+                let closing = self.cumulative >= self.expected_wire_bytes && self.unvouchered > 0;
                 if boundary || closing {
                     let delta = self.unvouchered;
                     self.pay_one(delta).await?;
@@ -924,14 +1033,17 @@ impl UpstreamPull {
         }
     }
 
-    /// Finalize a completed pull: drain to `StreamEnd` if needed, enforce the
-    /// completeness check (resumes) and whole-blob hash (full fetches), close the
-    /// connection cleanly, and return the final acked watermark to persist.
+    /// Finalize a completed pull: drain to `StreamEnd` if needed, enforce
+    /// wire-byte completeness (the full promised bao wire size was received),
+    /// close the connection cleanly, and return the final acked watermark to
+    /// persist. Per ADR 038 this no longer re-hashes the whole blob — bao
+    /// verification is delegated to the tee's verifying decoder (cached copy) and
+    /// the downstream client's own decoder.
     ///
     /// # Errors
     ///
-    /// [`HashMismatch`] on a corrupt full-fetch delivery, or a short/over-long
-    /// delivery, mirroring [`stream_fetch`]'s completeness rules.
+    /// A short delivery (fewer wire bytes than promised before `StreamEnd`), or a
+    /// stream/protocol error while draining to the end of the stream.
     pub async fn finish(mut self) -> anyhow::Result<VoucherProgress> {
         while !self.ended {
             match read_client_message(&mut self.recv).await? {
@@ -945,25 +1057,19 @@ impl UpstreamPull {
                 }
             }
         }
-        // Resume completeness (see `fetch_inner` for the rationale): a resumed
-        // fetch has no whole-blob hash, so the promised remainder is the only
-        // completeness signal.
-        if self.byte_offset > 0 && self.cumulative < self.expected {
+        // Completeness for every fetch (full and resumed): bao verification is
+        // delegated to the tee's verifying decoder (cached copy) and the
+        // downstream client's own decoder, so `finish` no longer re-hashes the
+        // whole blob. A
+        // truncated stream (fewer wire bytes than promised) can't be decoded, so
+        // require the full promised wire size as the completeness signal.
+        if self.cumulative < self.expected_wire_bytes {
             self.conn.close(0u32.into(), b"short-delivery");
             anyhow::bail!(
-                "server sent {} of {} promised bytes before StreamEnd",
+                "server sent {} of {} promised wire bytes before StreamEnd",
                 self.cumulative,
-                self.expected
+                self.expected_wire_bytes
             );
-        }
-        // Whole-blob integrity on a full fetch — the incremental hash over the
-        // forwarded chunks must equal the requested content hash.
-        if self.byte_offset == 0 {
-            let digest = self.hasher.finalize();
-            if digest != blake3::Hash::from_bytes(self.hash) {
-                self.conn.close(0u32.into(), b"hash-mismatch");
-                return Err(anyhow::Error::new(HashMismatch));
-            }
         }
         self.conn.close(0u32.into(), b"done");
         Ok(self.progress)
@@ -1116,28 +1222,180 @@ const fn variant_name(msg: &ClientMessage) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    /// The progressive pull verifies integrity with an INCREMENTAL BLAKE3 over
-    /// the forwarded chunks (`UpstreamPull::finish`) instead of `blake3::hash`
-    /// over a buffered blob (`fetch_inner`). This pins the equivalence the swap
-    /// relies on: feeding a hasher chunk-by-chunk yields the same content hash
-    /// iroh-blobs addresses with, for any chunk split.
-    #[test]
-    fn incremental_blake3_matches_whole_blob_hash() {
-        let payload: Vec<u8> = (0..300_000u32)
-            .map(|i| u8::try_from(i % 256).unwrap_or(0))
-            .collect();
-        let whole = blake3::hash(&payload);
+    use bao_tree::io::outboard::PreOrderMemOutboard;
+    use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 
-        for chunk_len in [1usize, 7, 1024, 65_536, payload.len()] {
-            let mut hasher = blake3::Hasher::new();
-            for chunk in payload.chunks(chunk_len) {
-                hasher.update(chunk);
-            }
-            let incremental = hasher.finalize();
-            assert_eq!(
-                incremental, whole,
-                "incremental hash with chunk_len={chunk_len} must equal blake3::hash"
-            );
+    use super::{HashMismatch, decode_verified_range};
+
+    /// Deterministic pseudo-random blob spanning several 16 KiB chunk groups.
+    fn make_blob(len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        let mut x: u32 = 0x9e37_79b9;
+        for b in &mut v {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x.to_le_bytes().first().copied().unwrap_or(0);
         }
+        v
+    }
+
+    fn sub(data: &[u8], start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
+        let s = usize::try_from(start)?;
+        let e = usize::try_from(end)?;
+        data.get(s..e)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| anyhow::anyhow!("range [{start}, {end}) out of bounds"))
+    }
+
+    /// Produce the **header-less** bao wire stream a server emits for
+    /// `[byte_offset, byte_offset + byte_len)` of `blob` (`byte_len == 0` ⇒ to
+    /// end), plus the content root. `encode_verified_range` yields the combined
+    /// form (8-byte size header + interleaved stream); the wire drops the header.
+    fn wire_for(
+        blob: &[u8],
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> anyhow::Result<([u8; 32], Vec<u8>)> {
+        let ob = PreOrderMemOutboard::create(blob, IROH_BLOCK_SIZE);
+        let root = *ob.root.as_bytes();
+        let blob_size = u64::try_from(blob.len())?;
+        let aligned = align_range(byte_offset, byte_len, blob_size)?;
+        let data = sub(blob, aligned.fetch_start(), aligned.fetch_end())?;
+        let combined = encode_verified_range(root, &aligned, &data, ob.data.clone().into())?;
+        let wire = combined
+            .get(8..)
+            .ok_or_else(|| anyhow::anyhow!("combined shorter than 8-byte header"))?
+            .to_vec();
+        Ok((root, wire))
+    }
+
+    #[test]
+    fn decode_verified_range_round_trips_whole_blob() -> anyhow::Result<()> {
+        let blob = make_blob(200 * 1024 + 777);
+        let (root, wire) = wire_for(&blob, 0, 0)?;
+        let out = decode_verified_range(root, u64::try_from(blob.len())?, 0, 0, &wire)?;
+        anyhow::ensure!(out.as_ref() == blob.as_slice(), "whole-blob round-trip");
+        Ok(())
+    }
+
+    /// A resumed fetch at a group-aligned offset self-verifies against the root —
+    /// no dependency on the bytes before the offset (the old gap is closed).
+    #[test]
+    fn decode_verified_range_resumed_group_aligned_offset() -> anyhow::Result<()> {
+        let blob = make_blob(200 * 1024 + 777);
+        let off = 64 * 1024; // 16 KiB-group aligned
+        let (root, wire) = wire_for(&blob, off, 0)?;
+        let out = decode_verified_range(root, u64::try_from(blob.len())?, off, 0, &wire)?;
+        let want = sub(&blob, off, u64::try_from(blob.len())?)?;
+        anyhow::ensure!(
+            out.as_ref() == want.as_slice(),
+            "resumed tail self-verifies"
+        );
+        Ok(())
+    }
+
+    /// A non-group-aligned resume offset: the server serves the aligned superset
+    /// and the receiver trims the leading bytes back to the exact requested span.
+    #[test]
+    fn decode_verified_range_trims_non_aligned_offset() -> anyhow::Result<()> {
+        let blob = make_blob(200 * 1024 + 777);
+        let off = 70 * 1024; // inside a group, not on a boundary
+        let (root, wire) = wire_for(&blob, off, 0)?;
+        let out = decode_verified_range(root, u64::try_from(blob.len())?, off, 0, &wire)?;
+        let want = sub(&blob, off, u64::try_from(blob.len())?)?;
+        anyhow::ensure!(
+            out.as_ref() == want.as_slice(),
+            "trimmed to requested offset"
+        );
+        Ok(())
+    }
+
+    /// A corrupt tail byte is rejected at its chunk group with the typed
+    /// `HashMismatch` — even on a resumed fetch with no earlier bytes (ADR 038 #1).
+    #[test]
+    fn decode_verified_range_rejects_corrupt_tail() -> anyhow::Result<()> {
+        let blob = make_blob(200 * 1024 + 777);
+        let off = 64 * 1024;
+        let (root, mut wire) = wire_for(&blob, off, 0)?;
+        // Flip a byte near the end of the stream — inside the final leaf's data.
+        let last = wire
+            .len()
+            .checked_sub(8)
+            .ok_or_else(|| anyhow::anyhow!("wire too short"))?;
+        if let Some(b) = wire.get_mut(last) {
+            *b ^= 0xff;
+        }
+        let err = decode_verified_range(root, u64::try_from(blob.len())?, off, 0, &wire)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected corrupt tail to be rejected"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<HashMismatch>().is_some(),
+            "corrupt tail must surface HashMismatch, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// ADR 038 AC#2 (early rejection at the offending group): a corrupt MIDDLE
+    /// group is rejected as `HashMismatch` even when everything AFTER it is
+    /// missing — detection needs no tail, so a streaming consumer can stop
+    /// paying at group *k* instead of buffering to the end.
+    #[test]
+    fn decode_verified_range_rejects_corrupt_middle_group_without_tail() -> anyhow::Result<()> {
+        let blob = make_blob(200 * 1024 + 777);
+        let (root, mut wire) = wire_for(&blob, 0, 0)?;
+        // Corrupt a byte ~55% in (inside a middle group's data), then TRUNCATE
+        // everything after ~70% — the decoder must fail on the corrupt group,
+        // never reaching (or needing) the missing tail.
+        let corrupt_at = wire.len() * 55 / 100;
+        let truncate_at = wire.len() * 70 / 100;
+        if let Some(b) = wire.get_mut(corrupt_at) {
+            *b ^= 0xff;
+        }
+        wire.truncate(truncate_at);
+        let err = decode_verified_range(root, u64::try_from(blob.len())?, 0, 0, &wire)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected corrupt middle group to be rejected"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<HashMismatch>().is_some(),
+            "corrupt middle group must surface HashMismatch (early rejection), got: {err}"
+        );
+        Ok(())
+    }
+
+    /// A truncated-but-clean stream is a transport-class failure, NOT
+    /// corruption: it must NOT downcast to `HashMismatch`, because callers use
+    /// that sentinel to score the provider `Corruption` (tarring a peer for a
+    /// dropped connection would misattribute blame — #915 review).
+    #[test]
+    fn decode_verified_range_truncation_is_not_hash_mismatch() -> anyhow::Result<()> {
+        let blob = make_blob(200 * 1024 + 777);
+        let (root, mut wire) = wire_for(&blob, 0, 0)?;
+        wire.truncate(wire.len() * 60 / 100);
+        let err = decode_verified_range(root, u64::try_from(blob.len())?, 0, 0, &wire)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected truncated stream to be rejected"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<HashMismatch>().is_none(),
+            "clean truncation must NOT be classified as corruption, got HashMismatch: {err}"
+        );
+        Ok(())
+    }
+
+    /// Decoding an honest stream against the WRONG root fails closed (the range
+    /// can't be re-anchored), so a source serving a different blob is rejected.
+    #[test]
+    fn decode_verified_range_rejects_wrong_root() -> anyhow::Result<()> {
+        let blob = make_blob(200 * 1024 + 777);
+        let (_root, wire) = wire_for(&blob, 0, 0)?;
+        let wrong = [0xABu8; 32];
+        let err = decode_verified_range(wrong, u64::try_from(blob.len())?, 0, 0, &wire)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected wrong-root rejection"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<HashMismatch>().is_some(),
+            "wrong root must surface HashMismatch, got: {err}"
+        );
+        Ok(())
     }
 }

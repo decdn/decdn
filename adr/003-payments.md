@@ -811,9 +811,13 @@ The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public 
 
 ### Binding Message Format
 
-The binding uses EIP-712 typed structured data, signed by the Ethereum private key:
+The binding uses EIP-712 typed structured data, signed by the Ethereum private key. Two typed structs share the per-address `nonce` counter: initial registration signs `RegisterNode`, which additionally binds the operator's acceptance of the current operator terms ([ADR 019 § Terms Acceptance](019-node-onboarding.md#operator-safety-obligations)); rebinding (key rotation) signs the narrower `BindNodeId`.
 
 ```solidity
+bytes32 constant REGISTER_NODE_TYPEHASH = keccak256(
+    "RegisterNode(bytes32 nodeId,uint64 nonce,bytes32 termsHash)"
+);
+
 bytes32 constant BIND_NODE_TYPEHASH = keccak256(
     "BindNodeId(bytes32 nodeId,uint64 nonce)"
 );
@@ -823,12 +827,13 @@ Where:
 
 - `nodeId`: the 32-byte ed25519 public key (iroh `NodeId`)
 - `nonce`: a monotonic counter per Ethereum address, preventing replay of revoked bindings
+- `termsHash`: the operator-terms hash the caller accepts, which must equal the governance-canonical `currentTermsHash` (registration only; see [ADR 019 § Terms Acceptance](019-node-onboarding.md#operator-safety-obligations))
 
-The EIP-712 domain separator is the same as the `CapacityBond` contract deployment (chain ID + contract address), preventing cross-chain and cross-contract replay.
+The EIP-712 domain separator is the same as the `CapacityBond` contract deployment (chain ID + contract address), preventing cross-chain and cross-contract replay. Terms acceptance is enforced at registration only, so rotating a NodeId through `bindNodeId` neither carries nor re-checks `termsHash`.
 
 ### On-Chain Registration
 
-Node registration and NodeId binding are atomic. `CapacityBond.registerNode()` ([§ Node Registry](#node-registry)) accepts a `bindingSignature` parameter — an EIP-712 signature over `BindNodeId(nodeId, bindingNonce[msg.sender])` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [§ NodeId Ownership Verification](#nodeid-ownership-verification)). It verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, giving replay protection across both paths. This eliminates the window in which a node could be active but not slashable.
+Node registration and NodeId binding are atomic. `CapacityBond.registerNode()` ([§ Node Registry](#node-registry)) accepts a `termsHash` parameter, a `bindingSignature` parameter — an EIP-712 signature over `RegisterNode(nodeId, bindingNonce[msg.sender], termsHash)` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [§ NodeId Ownership Verification](#nodeid-ownership-verification)). It requires `termsHash == currentTermsHash`, verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, emits `TermsAccepted(nodeId, termsHash, timestamp)`, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, giving replay protection across both paths; the distinct typehash keeps a registration signature from being replayed as a bare rebind. This eliminates the window in which a node could be active but not slashable.
 
 The standalone `CapacityBond.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is no longer needed at initial registration time.
 

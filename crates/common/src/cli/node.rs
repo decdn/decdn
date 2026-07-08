@@ -567,6 +567,13 @@ pub struct RegisterArgs {
     #[arg(long = "multiaddr", value_name = "MA")]
     pub multiaddrs: Vec<String>,
 
+    /// Accept the network's current operator terms non-interactively (ADR 019
+    /// § Terms Acceptance). On a terminal the terms are shown and confirmed
+    /// interactively; in automation/headless contexts this flag records the
+    /// operator's acceptance (registration will not proceed without it).
+    #[arg(long = "accept-terms")]
+    pub accept_terms: bool,
+
     #[command(flatten)]
     pub chain: ChainArgs,
 }

@@ -18,12 +18,28 @@ pub enum CacheError {
 
     /// The origin returned bytes whose BLAKE3 hash did not match what was
     /// requested. The bytes are rejected and are *not* inserted into the store.
+    /// A whole-stream failure: the assembled bytes hashed to `actual`, not the
+    /// requested `expected`. A mid-stream bao chunk-group verify failure surfaces
+    /// as [`Self::VerifyFailed`] instead, so `actual` here is always a real hash.
     #[error("origin returned blob {actual} when {expected} was requested")]
     HashMismatch {
         /// The hash the caller asked for.
         expected: Hash,
         /// The hash the origin's bytes actually produced.
         actual: Hash,
+    },
+
+    /// A teed bao verified-stream (#856, ADR 038) failed to decode against the
+    /// content root: an interior chunk group did not verify — a corrupt or lying
+    /// upstream. Distinct from [`Self::HashMismatch`], which is a whole-stream
+    /// hash mismatch; here the failure is at an interior group, so there is no
+    /// meaningful whole-blob "actual" hash to report (#915). The bytes are
+    /// rejected and are *not* inserted into the store.
+    #[error("origin bytes failed bao verification against {expected}")]
+    VerifyFailed {
+        /// The hash the caller asked for (the content root the stream failed
+        /// to verify against).
+        expected: Hash,
     },
 
     /// The origin returned a blob larger than the configured

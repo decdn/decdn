@@ -87,10 +87,14 @@ log "USDC = $USDC"
 
 # --- Deploy protocol ---------------------------------------------------------
 log "deploying protocol suite (DeployProtocol)"
+# ADR 019 § Terms Acceptance — DeployProtocol requires a non-zero genesis
+# operator-terms hash (CapacityBond rejects the zero sentinel). For local dev
+# any non-zero placeholder is fine; production supplies keccak256(TERMS.md).
 USDC_ADDRESS="$USDC" \
 EMERGENCY_MULTISIG="$ACC1_ADDR" \
 INITIAL_TOKEN_HOLDER="$ACC0_ADDR" \
 CHALLENGER_INCENTIVE_POOL="$ACC2_ADDR" \
+CURRENT_TERMS_HASH="${CURRENT_TERMS_HASH:-0x0000000000000000000000000000000000000000000000000000000000000001}" \
 forge script script/DeployProtocol.s.sol:DeployProtocol \
   --rpc-url "$RPC_URL" --sender "$ACC0_ADDR" --private-key "$ACC0_KEY" --broadcast
 

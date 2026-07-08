@@ -1333,16 +1333,21 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
 
     // #852: the buyer persisted the channel's voucher watermark after the pull.
-    // 1.5 MiB at RATE 10/MiB over a 1-MiB interval ⇒ two vouchers: the closing
-    // one carries nonce 2, the full 1,572,864 bytes, and the cumulative amount 15
-    // (10 for the first MiB + 5 for the trailing half).
+    // Under ADR 038 the pull meters WIRE bytes (the bao stream: content +
+    // interleaved proof), so the closing watermark carries nonce 2, the
+    // bao-encoded size, and the cumulative amount rounded up per the rate.
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(total_bytes, &bao_tree::ChunkRanges::all());
+    let expected_amount = U256::from(expected_wire)
+        .saturating_mul(U256::from(RATE))
+        .div_ceil(U256::from(MB_BYTES));
     anyhow::ensure!(
         progress_log(&recorded)?
             == vec![(
                 a_eth.address(),
                 U256::from(2),
-                U256::from(total_bytes),
-                U256::from(15)
+                U256::from(expected_wire),
+                expected_amount
             )],
         "expected one persisted progress entry with the final voucher totals, got {:?}",
         progress_log(&recorded)?
@@ -2821,21 +2826,29 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
     );
 
     // The persisted watermark advanced monotonically across the two pulls rather
-    // than resetting: nonce 2 → 4, cumulative bytes 1.5 MiB → 3 MiB, amount 15 → 30.
+    // than resetting: nonce 2 → 4, with cumulative bytes and amount doubling.
+    // Under ADR 038 the pull meters WIRE bytes (bao: content + interleaved proof),
+    // so each fetch contributes its bao-encoded size and per-fetch amount, and the
+    // reused channel carries them forward (#852).
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(total_bytes, &bao_tree::ChunkRanges::all());
+    let expected_amount = U256::from(expected_wire)
+        .saturating_mul(U256::from(RATE))
+        .div_ceil(U256::from(MB_BYTES));
     let log = progress_log(&recorded)?;
     anyhow::ensure!(
         log == vec![
             (
                 a_eth.address(),
                 U256::from(2),
-                U256::from(total_bytes),
-                U256::from(15)
+                U256::from(expected_wire),
+                expected_amount
             ),
             (
                 a_eth.address(),
                 U256::from(4),
-                U256::from(2 * total_bytes),
-                U256::from(30),
+                U256::from(expected_wire).saturating_mul(U256::from(2)),
+                expected_amount.saturating_mul(U256::from(2)),
             ),
         ],
         "expected two monotonically-advancing progress entries, got {log:?}"
@@ -3005,11 +3018,35 @@ async fn write_client(send: &mut iroh::endpoint::SendStream, msg: &ClientMessage
     Ok(())
 }
 
+/// Decode the header-less bao verified-stream `wire` (ADR 038) for the whole
+/// blob back to plaintext, verifying every chunk group against `hash`. Returns
+/// `None` if the stream does not verify (corrupt / short / wrong root) — the
+/// same rejection a real client's decoder performs.
+fn decode_bao_whole(hash: Hash, total: u64, wire: &[u8]) -> Option<Vec<u8>> {
+    use bao_tree::io::BaoContentItem;
+    use bao_tree::io::sync::DecodeResponseIter;
+    use bao_tree::{BaoTree, ChunkRanges};
+
+    let tree = BaoTree::new(total, decdn_cache::range_pull::IROH_BLOCK_SIZE);
+    let ranges = ChunkRanges::all();
+    let reader = std::io::Cursor::new(wire);
+    let mut plaintext = Vec::with_capacity(usize::try_from(total).ok()?);
+    for item in DecodeResponseIter::new(hash.into(), tree, reader, ranges.as_ref()) {
+        match item.ok()? {
+            BaoContentItem::Leaf(leaf) => plaintext.extend_from_slice(&leaf.data),
+            BaoContentItem::Parent(_) => {}
+        }
+    }
+    Some(plaintext)
+}
+
 /// A leaf client that drives B's window-paced serve: it sends a bound
 /// `StreamRequest` (so B's `pull_authorized` passes), then pays one cumulative
 /// voucher per interval as bytes arrive. With `drop_after_acks = Some(n)` it
 /// closes the connection immediately after the n-th `VoucherAck` — the #856
-/// abandon shape.
+/// abandon shape. The wire carries the bao verified-stream (content + proof,
+/// ADR 038), so it paces on the bao-encoded WIRE size and decodes the buffer
+/// back to plaintext to verify the content hash.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn leaf_paced_pull(
     leaf_ep: &iroh::Endpoint,
@@ -3060,6 +3097,12 @@ async fn leaf_paced_pull(
     };
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
     let total = resp.body.total_bytes;
+    // B forwards + meters WIRE bytes (bao: content + interleaved proof), so the
+    // closing-voucher / completeness boundary is the bao-encoded size, not the
+    // content `total_bytes`. The per-interval boundary is unchanged — both sides
+    // count the same forwarded wire bytes into `interval_bytes`.
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(total, &bao_tree::ChunkRanges::all());
     let interval_bytes = resp
         .voucher_interval_mb
         .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
@@ -3077,7 +3120,7 @@ async fn leaf_paced_pull(
                 cumulative = cumulative.saturating_add(len);
                 unvouchered = unvouchered.saturating_add(len);
                 let boundary = unvouchered >= interval_bytes && interval_bytes > 0;
-                let closing = cumulative >= total && unvouchered > 0;
+                let closing = cumulative >= expected_wire && unvouchered > 0;
                 if boundary || closing {
                     acks += 1;
                     let amount = U256::from(cumulative)
@@ -3119,11 +3162,16 @@ async fn leaf_paced_pull(
         }
     }
     conn.close(0u32.into(), b"done");
+    // Decode the accumulated bao wire back to plaintext to verify the content
+    // hash; `received` reports the decoded CONTENT length (what the callers'
+    // `received == total_bytes` assertions expect), falling back to the raw wire
+    // count if the stream did not verify.
+    let decoded = decode_bao_whole(hash, total, &buf);
     Ok(LeafOutcome {
-        received: cumulative,
+        received: decoded.as_ref().map_or(cumulative, |p| p.len() as u64),
         acks,
         completed: true,
-        hash_ok: Hash::new(&buf) == hash,
+        hash_ok: decoded.is_some_and(|p| Hash::new(&p) == hash),
     })
 }
 
@@ -3149,6 +3197,7 @@ async fn build_node_b(
     Arc<Mutex<Vec<ProgressEntry>>>,
     decdn_cache::CacheEngine,
     Arc<Metrics>,
+    Arc<LocalReputation>,
 )> {
     build_node_b_with_leaves(
         a_id,
@@ -3193,6 +3242,7 @@ async fn build_node_b_with_leaves(
     Arc<Mutex<Vec<ProgressEntry>>>,
     decdn_cache::CacheEngine,
     Arc<Metrics>,
+    Arc<LocalReputation>,
 )> {
     let b_sk = fresh_key();
     let b_id = b_sk.public();
@@ -3272,7 +3322,15 @@ async fn build_node_b_with_leaves(
     );
 
     let target = EndpointAddr::new(b_id).with_ip_addr(addr_b);
-    Ok((handler_b, target, ep_b, recorded, cache_handle, b_metrics))
+    Ok((
+        handler_b,
+        target,
+        ep_b,
+        recorded,
+        cache_handle,
+        b_metrics,
+        local_rep,
+    ))
 }
 
 /// Spin up A (holds the blob, serves probe + client). Returns the pieces the
@@ -3348,7 +3406,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x1F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -3401,14 +3459,22 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         "B must promote the teed blob on a complete delivery"
     );
     // B's buyer channel to A advanced to the full blob (one persisted watermark
-    // covering all bytes: nonce 2, 1.5 MiB, cumulative amount 15).
+    // covering all bytes, nonce 2). Under ADR 038 the node-to-node payment meters
+    // WIRE bytes (the bao stream: content + interleaved proof), so the watermark
+    // covers the bao-encoded size with the amount rounded up per the rate — not
+    // the content size.
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(total_bytes, &bao_tree::ChunkRanges::all());
+    let expected_amount = U256::from(expected_wire)
+        .saturating_mul(U256::from(RATE))
+        .div_ceil(U256::from(MB_BYTES));
     anyhow::ensure!(
         progress_log(&recorded)?
             == vec![(
                 a_eth.address(),
                 U256::from(2),
-                U256::from(total_bytes),
-                U256::from(15)
+                U256::from(expected_wire),
+                expected_amount
             )],
         "expected B's upstream watermark at the full blob, got {:?}",
         progress_log(&recorded)?
@@ -3458,29 +3524,30 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     let leaf2_eth = Arc::new(PrivateKeySigner::random());
     let leaf1_channel_id = B256::repeat_byte(0x81);
     let leaf2_channel_id = B256::repeat_byte(0x82);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b_with_leaves(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        &[
-            (
-                leaf1_channel_id,
-                leaf1_eth.address(),
-                U256::from(DEPOSIT_MICRO_USDC),
-            ),
-            (
-                leaf2_channel_id,
-                leaf2_eth.address(),
-                U256::from(DEPOSIT_MICRO_USDC),
-            ),
-        ],
-        0,
-        64,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) =
+        build_node_b_with_leaves(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            &[
+                (
+                    leaf1_channel_id,
+                    leaf1_eth.address(),
+                    U256::from(DEPOSIT_MICRO_USDC),
+                ),
+                (
+                    leaf2_channel_id,
+                    leaf2_eth.address(),
+                    U256::from(DEPOSIT_MICRO_USDC),
+                ),
+            ],
+            0,
+            64,
+        )
+        .await?;
     let task_b = spawn_server_concurrent(ep_b.clone(), handler_b);
 
     // Leaf 1: the owner pull. Spawn it, then wait for A to confirm B's single
@@ -3614,7 +3681,7 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x7F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -3730,7 +3797,7 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x2F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -3821,7 +3888,7 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
     // µUSDC; the leaf's deposit of 1 µUSDC cannot cover it. The blob itself is
     // well under 64 MiB, so this is the deposit guard firing, not the size gate.
     let max_blob_size_bytes = 64 * 1024 * 1024;
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -3900,7 +3967,7 @@ async fn window_pull_through_leech_stall_refuses_without_spinning() -> Result<()
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x4F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -4002,13 +4069,167 @@ async fn spawn_lying_node_a(
     Ok((a_id, addr_a, a_eth, ep_a, task_a))
 }
 
+/// Read one frame, require it to be a `Voucher`, and ack it — the per-interval
+/// exchange [`serve_wire_paced`] performs at each 1 MiB boundary.
+async fn read_voucher_write_ack(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<()> {
+    let frame = read_frame(recv)
+        .await
+        .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
+    let (msg, _) =
+        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    let ClientMessage::Voucher(_) = msg else {
+        anyhow::bail!("paced upstream: expected a Voucher");
+    };
+    write_frame(send, &encode_message(&ClientMessage::VoucherAck)?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write ack: {e}"))?;
+    Ok(())
+}
+
+/// Like [`serve_wrong_bytes`], but serves `wire` (a bao verified-stream,
+/// possibly corrupted mid-way) with the REAL per-interval voucher pacing:
+/// `total_bytes` (the CONTENT size) is advertised separately from the wire
+/// length, and a voucher is read + acked at every 1 MiB interval boundary of
+/// wire bytes, matching the buyer's cadence — so a multi-interval serve never
+/// deadlocks on an unacked mid-stream voucher. When the buyer aborts (e.g. its
+/// tee rejects a corrupt group, #915), the next write/read here errors and the
+/// spawner ignores it.
+async fn serve_wire_paced(
+    conn: Connection,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    wire: &[u8],
+    total_bytes: u64,
+    rate: u64,
+) -> Result<()> {
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
+    let req_msg = {
+        let frame = read_frame(&mut recv)
+            .await
+            .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
+        decode_message::<ClientMessage>(&frame)
+            .map_err(|e| anyhow::anyhow!("decode request: {e}"))?
+            .0
+    };
+    let ClientMessage::StreamRequest(req) = req_msg else {
+        anyhow::bail!("paced upstream: expected a StreamRequest");
+    };
+    let body = StreamResponseBody {
+        hash: req.hash,
+        ok: true,
+        rate_per_mb: rate,
+        total_bytes,
+        channel_id: req.channel_id,
+        timestamp_us: req.timestamp_us,
+        redirect: None,
+    };
+    let slash_sig = StreamSlashData::from_response_body(&body)
+        .sign(eth.as_ref(), slash)
+        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+        .as_bytes()
+        .to_vec();
+    let resp = StreamResponse {
+        body,
+        error: None,
+        voucher_interval_mb: Some(1),
+        slash_sig,
+    };
+    write_frame(
+        &mut send,
+        &encode_message(&ClientMessage::StreamResponse(resp))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    let interval_bytes = MB_BYTES;
+    let mut unvouchered: u64 = 0;
+    for chunk in wire.chunks(CHUNK_SIZE) {
+        write_frame(
+            &mut send,
+            &encode_message(&ClientMessage::ChunkData(ChunkData {
+                bytes: chunk.to_vec(),
+            }))?,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
+        unvouchered = unvouchered.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if unvouchered >= interval_bytes {
+            read_voucher_write_ack(&mut send, &mut recv).await?;
+            unvouchered = 0;
+        }
+    }
+    if unvouchered > 0 {
+        read_voucher_write_ack(&mut send, &mut recv).await?;
+    }
+    write_frame(&mut send, &encode_message(&ClientMessage::StreamEnd)?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write end: {e}"))?;
+    let _ = send.finish();
+    conn.closed().await;
+    Ok(())
+}
+
+/// [`spawn_lying_node_a`] variant whose client-path serve is the interval-paced
+/// [`serve_wire_paced`] (bao wire + separate advertised content size), for
+/// multi-interval corrupt-serve tests (#915).
+async fn spawn_paced_lying_node_a(
+    wire: Vec<u8>,
+    total_bytes: u64,
+) -> Result<(
+    iroh::PublicKey,
+    std::net::SocketAddr,
+    Arc<PrivateKeySigner>,
+    iroh::Endpoint,
+    tokio::task::JoinHandle<()>,
+)> {
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let slash = slash_domain();
+    let eth = Arc::clone(&a_eth);
+    let accept_ep = ep_a.clone();
+    let task_a = tokio::spawn(async move {
+        while let Some(incoming) = accept_ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let eth = Arc::clone(&eth);
+            let dom = slash.clone();
+            let wire = wire.clone();
+            if conn.alpn() == ALPN_PROBE {
+                tokio::spawn(async move {
+                    let _ = answer_probe(conn, &eth, &dom, RATE, total_bytes).await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    let _ = serve_wire_paced(conn, &eth, &dom, &wire, total_bytes, RATE).await;
+                });
+            }
+        }
+    });
+    Ok((a_id, addr_a, a_eth, ep_a, task_a))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
-    // #856: when the fused serve path forwards an upstream that then fails its
-    // whole-blob hash check at finalization (a bait-and-switch upstream), B must
-    // NOT promote the corrupt blob, the leaf's own hash check rejects it, and the
-    // `upstream_verify_failed` counter fires. A small (single-interval) blob keeps
-    // the buyer↔upstream voucher exchange to one closing voucher.
+    // #856/#915: a bait-and-switch upstream serves a wire-COMPLETE stream whose
+    // bytes fail bao verification against the requested root. `pull.finish(..)`
+    // is Ok (the promised wire byte count arrived) — the corruption is caught by
+    // the TEE's bao decoder and surfaces at `tee.finish()`. B must NOT promote
+    // the corrupt blob, the leaf's own bao decoder rejects the forward, the
+    // `upstream_verify_failed` counter fires (and the local-fault counters do
+    // NOT — the arms are mutually exclusive), and A is scored `Corruption` (not
+    // `Delivered`) in B's local reputation. A small (single-interval,
+    // single-leaf: wire == content for ≤16 KiB) blob keeps the buyer↔upstream
+    // voucher exchange to one closing voucher.
     let honest = vec![0x77u8; 4096];
     let hash = Hash::new(&honest);
     let served_wrong = vec![0x88u8; 4096];
@@ -4022,7 +4243,7 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x6F);
-    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -4036,6 +4257,10 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
     )
     .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
+    // A's reputation before the pull: the corrupt serve must LOWER it (#915 —
+    // pre-fix, a wire-complete corrupt upstream banked a `Delivered` and the
+    // score went UP).
+    let a_score_before = local_rep.score(a_id);
 
     let leaf_sk = fresh_key();
     let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
@@ -4070,6 +4295,133 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
         "node_pull_through_upstream_verify_failed_total",
         1,
     )?;
+    // Mutually exclusive with the local-fault arms: a lying upstream must NOT
+    // read as a failing local disk (#915 review).
+    assert_counter(&b_metrics, "node_pull_through_local_tee_failed_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_through_tee_finalize_failed_total", 0)?;
+    // The tee verdict reached the scorer: A recorded a `Corruption` observation,
+    // so its local score dropped below the pre-pull baseline (#915).
+    let a_score_after = local_rep.score(a_id);
+    anyhow::ensure!(
+        a_score_after < a_score_before,
+        "a wire-complete corrupt upstream must be scored Corruption (score {a_score_before} -> {a_score_after})"
+    );
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -> Result<()> {
+    // #915 review: a corrupt group MID-stream — past the first voucher interval,
+    // with plenty of wire still to come — kills the tee's verifying decoder while
+    // the forward loop is still writing, so the failure surfaces as a `tee.write`
+    // error, NOT at finalization. This is the dominant real-world corruption
+    // shape (the finalize arm only fires when the whole remaining wire fits in
+    // the tee channel slack, i.e. tiny blobs like the sibling test above).
+    // Pre-fix this arm was misclassified as a LOCAL store fault:
+    // `local_tee_failed` (the operator's failing-disk alarm) fired, no reputation
+    // outcome was recorded, and the corrupt upstream kept its score. It must
+    // instead: abandon the pull early (bounded spend), not promote, fire
+    // `upstream_verify_failed` (and NOT `local_tee_failed`), and score A
+    // `Corruption`.
+    //
+    // Construction: the HONEST whole-blob bao wire for a 1.5 MiB payload
+    // (multi-interval, so one voucher exchange completes before the corruption),
+    // with a single byte flipped ~1.1 MiB in — every group before it verifies,
+    // the containing group fails.
+    let payload = vec![0xB7u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+    let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+        &payload,
+        decdn_cache::range_pull::IROH_BLOCK_SIZE,
+    );
+    let aligned = decdn_cache::range_pull::align_range(0, 0, total_bytes)?;
+    let combined = decdn_cache::range_pull::encode_verified_range(
+        *hash.as_bytes(),
+        &aligned,
+        &payload,
+        bytes::Bytes::from(ob.data),
+    )?;
+    // Strip the 8-byte LE size header (the wire is header-less) and corrupt one
+    // byte past the first 1 MiB voucher interval.
+    let mut wire = combined
+        .get(8..)
+        .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its header"))?
+        .to_vec();
+    let corrupt_at = 1_150_000usize;
+    let byte = wire
+        .get_mut(corrupt_at)
+        .ok_or_else(|| anyhow::anyhow!("corruption offset outside the wire"))?;
+    *byte ^= 0xFF;
+
+    let ab_channel_id = B256::repeat_byte(0xA7);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) = spawn_paced_lying_node_a(wire, total_bytes).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x7A);
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, local_rep) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+    let a_score_before = local_rep.score(a_id);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    // B aborts mid-forward once the tee rejects, so the leaf sees a reset (or a
+    // truncated stream at best) — never a verified blob.
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await;
+    if let Ok(o) = &outcome {
+        anyhow::ensure!(
+            !o.hash_ok,
+            "a mid-stream-corrupt serve must never deliver a verified blob"
+        );
+    }
+
+    anyhow::ensure!(
+        !cache_b.has(hash).await?,
+        "B must not promote a blob whose tee rejected a group mid-stream"
+    );
+    assert_counter(
+        &b_metrics,
+        "node_pull_through_upstream_verify_failed_total",
+        1,
+    )?;
+    // The whole point of the fix: mid-stream corruption is the UPSTREAM's fault,
+    // not a local disk fault.
+    assert_counter(&b_metrics, "node_pull_through_local_tee_failed_total", 0)?;
+    let a_score_after = local_rep.score(a_id);
+    anyhow::ensure!(
+        a_score_after < a_score_before,
+        "mid-stream corruption must be scored Corruption (score {a_score_before} -> {a_score_after})"
+    );
 
     leaf_ep.close().await;
     ep_b.close().await;
@@ -4082,28 +4434,28 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_tee_finalize_failure_serves_but_does_not_cache() -> Result<()> {
     // #896: the sibling of `window_pull_through_lying_upstream_is_not_cached`. Here
-    // the upstream is HONEST (whole-blob hash verifies, so `pull.finish()` is Ok),
-    // but B's cache-engine store rejects the promote at `tee.finish()`. The bytes
-    // were already forwarded and paid, so delivery MUST still complete (the leaf
-    // gets every byte plus `StreamEnd`); only the warm-cache benefit is forfeited.
-    // This is the alertable "served but not cached" path: the
+    // the upstream is HONEST (the promised wire byte count arrives and the bytes
+    // verify, so `pull.finish(..)` is Ok and the tee verdict is not a hash
+    // mismatch), but B's cache-engine store rejects the promote at
+    // `tee.finish()` for a LOCAL reason. The bytes were already forwarded and
+    // paid, so delivery MUST still complete (the leaf gets every byte plus
+    // `StreamEnd`); only the warm-cache benefit is forfeited. This is the
+    // alertable "served but not cached" path: the
     // `node_pull_through_tee_finalize_failed` counter fires while the
-    // `upstream_verify_failed` counter does not. We hit the `BlobTooLarge` (warn)
-    // arm of that branch; the sibling `HashMismatch` (error) arm — a forwarded-vs-
-    // teed stream divergence — is deliberately NOT covered here. It differs only in
-    // log level (same metric, same served-anyway control flow) and would require an
-    // engine-internal fault injector that the node-level harness cannot supply.
+    // `upstream_verify_failed` counter does not. (A tee HashMismatch is NOT this
+    // arm — it routes to `upstream_verify_failed` with no `StreamEnd`, covered by
+    // the lying-upstream and mid-stream-corruption siblings, #915.)
     //
     // Deterministic store-fault injection without a mock: B's engine cap
     // (`engine_max_blob_mb = 1` → 1 MiB) sits exactly one byte below the blob
-    // (1 MiB + 1). The cap is enforced mid-stream by `count_and_cap_stream`, so a
-    // breach that lands before the final chunk would generally surface as an
-    // in-loop `tee.write` failure (the `node_pull_through_local_tee_failed` path)
-    // instead. Sizing the blob to
-    // exactly `cap + 1` byte guarantees the breach lands on the FINAL chunk: every
-    // `tee.write` has already succeeded and there is no further write, so the
-    // overrun surfaces only at `tee.finish()` — the branch under test. The handler
-    // cap stays `0` (unlimited) so the serve is never rejected up front.
+    // (1 MiB + 1). The cap is enforced by `count_and_cap_stream` over the
+    // DECODED plaintext the tee's bao decoder emits, so a breach mid-fill would
+    // generally kill the import task and surface as a later in-loop `tee.write`
+    // failure instead. Sizing the blob to exactly `cap + 1` CONTENT bytes lands
+    // the breach on the FINAL decoded leaf: every `tee.write` of the wire has
+    // already succeeded and there is no further write, so the overrun surfaces
+    // only at `tee.finish()` — the branch under test. The handler cap stays `0`
+    // (unlimited) so the serve is never rejected up front.
     let payload = vec![0xC9u8; 1024 * 1024 + 1];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
@@ -4115,22 +4467,23 @@ async fn window_pull_through_tee_finalize_failure_serves_but_does_not_cache() ->
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x9C);
-    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics) = build_node_b_with_leaves(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        &[(
-            leaf_channel_id,
-            leaf_eth.address(),
-            U256::from(DEPOSIT_MICRO_USDC),
-        )],
-        0, // handler cap: unlimited, so the serve proceeds and `pull.finish()` is Ok
-        1, // engine cap: 1 MiB = total - 1, so `tee.finish()` rejects the promote
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, _local_rep) =
+        build_node_b_with_leaves(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            &[(
+                leaf_channel_id,
+                leaf_eth.address(),
+                U256::from(DEPOSIT_MICRO_USDC),
+            )],
+            0, // handler cap: unlimited, so the serve proceeds and `pull.finish()` is Ok
+            1, // engine cap: 1 MiB = total - 1, so `tee.finish()` rejects the promote
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -4303,7 +4656,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x7F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -4374,7 +4727,7 @@ async fn window_pull_through_global_budget_exhausted_refuses_admission() -> Resu
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x5F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -4468,7 +4821,7 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
     // deposit guard (ceiling = min_payment(1 MiB, RATE) = 10 µUSDC) passes against
     // the funded leaf, so we exercise step (4), not the step (1) deposit guard.
     let max_blob_size_bytes = 1024 * 1024;
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
@@ -4564,7 +4917,7 @@ async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x8F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics) = build_node_b(
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
         a_id,
         a_addr,
         a_eth.address(),
