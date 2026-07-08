@@ -27,7 +27,7 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         needs no extra credential — the escrowed appeal bond IS the standing,
 ///         with no separate balance threshold. Because the bond is escrowed by
 ///         the appeal it cannot be flash-loaned, so the synthetic-standing
-///         clawback (ADR 031 § 216(c), formerly #1018) is omitted by design, not
+///         clawback (ADR 031 § 216) is omitted by design, not
 ///         deferred: there is nothing to fake. This is safe only because standing
 ///         alone grants no automatic outcome (an `Open` appeal has zero interim
 ///         relief and every consequential transition is multisig/governor-gated);
@@ -515,10 +515,16 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
         if (standingPath == StandingPath.Publisher) {
             // Publisher: must own the declared namespace AND that namespace must
-            // have claimed the disputed hash. `namespaceId` is a filing argument
-            // because a hash→namespace reverse lookup is ambiguous (many
-            // namespaces may claim one hash). `ownerOf` returns address(0) for
-            // unassigned ids, so a bogus `namespaceId` fails the owner check.
+            // have claimed the disputed hash. This proves the filer controls a
+            // namespace that claimed the hash — NOT authorship: `claimContent` is
+            // a permissionless self-assertion, so anyone can create a namespace and
+            // claim any hash. That is acceptable because the Publisher path confers
+            // no more than TokenHolder does (any bond-poster already has standing)
+            // and standing alone grants no automatic outcome (see the TokenHolder
+            // branch). `namespaceId` is a filing argument because a hash→namespace
+            // reverse lookup is ambiguous (many namespaces may claim one hash).
+            // `ownerOf` returns address(0) for unassigned ids, so a bogus
+            // `namespaceId` fails the owner check.
             // Each read is cached on its own line so the aderyn directive is the
             // immediate predecessor of the external call it suppresses.
             // aderyn-ignore-next-line(reentrancy-state-change)
@@ -533,7 +539,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             // the `filerRejections` cooldown + the perjury denylist, so a balance
             // threshold would protect nothing that isn't already protected. And
             // because the bond is escrowed by the appeal it can't be flash-loaned,
-            // so the synthetic-standing clawback (ADR 031 § 216(c)) is omitted by
+            // so the synthetic-standing clawback (ADR 031 § 216) is omitted by
             // design, not deferred: there is nothing to fake.
             //
             // SAFE ONLY because standing alone grants no automatic outcome: an
