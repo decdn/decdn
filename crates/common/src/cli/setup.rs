@@ -41,6 +41,13 @@ pub struct SetupArgs {
     #[arg(long)]
     pub yes: bool,
 
+    /// Accept the network's current operator terms non-interactively (ADR 019
+    /// § Terms Acceptance). Separate from `--yes` (which only skips the bond
+    /// confirmation): terms acceptance is always its own explicit act. On a
+    /// terminal the terms are shown and confirmed interactively instead.
+    #[arg(long = "accept-terms")]
+    pub accept_terms: bool,
+
     #[command(flatten)]
     pub chain: ChainArgs,
 }

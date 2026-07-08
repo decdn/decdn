@@ -73,6 +73,12 @@ contract CapacityBondRegionE2ETest is Test {
     // END AUTO-GENERATED
     // ===================================================================
 
+    // ADR 019 § Terms Acceptance — non-zero genesis terms hash (CapacityBond
+    // rejects the zero sentinel). Not part of the auto-generated ed25519 vector:
+    // the ownership digest is keccak256(nodeId ‖ operator ‖ chainId ‖ nonce), so
+    // termsHash never feeds `REG_ED25519_SIG`.
+    bytes32 internal constant REG_TERMS_HASH = keccak256("decdn operator terms v1");
+
     function setUp() public {
         // The ed25519 digest commits to block.chainid; pin it to the value the
         // vector was generated against so a Foundry default change can't silently
@@ -94,7 +100,8 @@ contract CapacityBondRegionE2ETest is Test {
             unbondingPeriod_: UNBONDING,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: REGION_WINDOW
+            regionStabilityWindow_: REGION_WINDOW,
+            currentTermsHash_: REG_TERMS_HASH
         });
 
         vm.prank(admin);
@@ -125,7 +132,7 @@ contract CapacityBondRegionE2ETest is Test {
     function test_registerNode_corruptEd25519Signature_reverts() public {
         vm.prank(REG_OPERATOR);
         bond.bond(MIN_BOND);
-        bytes memory bindingSig = _signBindNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID);
+        bytes memory bindingSig = _signRegisterNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID, REG_TERMS_HASH);
 
         // Flip one byte of the otherwise-valid signature.
         bytes memory badSig = bytes.concat(REG_ED25519_SIG);
@@ -133,7 +140,7 @@ contract CapacityBondRegionE2ETest is Test {
 
         vm.prank(REG_OPERATOR);
         vm.expectRevert(CapacityBond.InvalidEd25519Signature.selector);
-        bond.registerNode(REG_NODE_ID, hex"", "us-east", bindingSig, badSig);
+        bond.registerNode(REG_NODE_ID, hex"", "us-east", REG_TERMS_HASH, bindingSig, badSig);
     }
 
     // ----------------------------------------------------------------------
@@ -199,10 +206,10 @@ contract CapacityBondRegionE2ETest is Test {
         // deregister), so re-sign with the live nonce to clear the binding
         // check; the ed25519 signature is replayed verbatim and is now stale
         // (it was signed over registration nonce 0).
-        bytes memory bindingSig = _signBindNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID);
+        bytes memory bindingSig = _signRegisterNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID, REG_TERMS_HASH);
         vm.prank(REG_OPERATOR);
         vm.expectRevert(CapacityBond.InvalidEd25519Signature.selector);
-        bond.registerNode(REG_NODE_ID, hex"", "us-east", bindingSig, REG_ED25519_SIG);
+        bond.registerNode(REG_NODE_ID, hex"", "us-east", REG_TERMS_HASH, bindingSig, REG_ED25519_SIG);
     }
 
     // ----------------------------------------------------------------------
@@ -427,18 +434,22 @@ contract CapacityBondRegionE2ETest is Test {
     function _bondAndRegister() internal {
         vm.prank(REG_OPERATOR);
         bond.bond(MIN_BOND);
-        bytes memory bindingSig = _signBindNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID);
+        bytes memory bindingSig = _signRegisterNode(REG_OP_PK, REG_OPERATOR, REG_NODE_ID, REG_TERMS_HASH);
         vm.prank(REG_OPERATOR);
-        bond.registerNode(REG_NODE_ID, hex"", "us-east", bindingSig, REG_ED25519_SIG);
+        bond.registerNode(REG_NODE_ID, hex"", "us-east", REG_TERMS_HASH, bindingSig, REG_ED25519_SIG);
     }
 
-    /// @dev Construct the EIP-712 `BindNodeId(bytes32 nodeId, uint64 nonce)`
-    ///      digest used by `_verifyBindingSignature` and ECDSA-sign it with
-    ///      `opPk`. Reads the current nonce off the contract so the helper works
-    ///      for both the initial bind and any subsequent rebind.
-    function _signBindNode(uint256 opPk, address opAddr, bytes32 nodeId) internal view returns (bytes memory) {
+    /// @dev Construct the EIP-712 `RegisterNode(bytes32 nodeId, uint64 nonce,
+    ///      bytes32 termsHash)` digest used by `_verifyRegistrationSignature`
+    ///      (ADR 019 § Terms Acceptance) and ECDSA-sign it with `opPk`. Reads
+    ///      the current nonce off the contract.
+    function _signRegisterNode(uint256 opPk, address opAddr, bytes32 nodeId, bytes32 termsHash)
+        internal
+        view
+        returns (bytes memory)
+    {
         uint64 nonce = bond.bindingNonce(opAddr);
-        bytes32 structHash = keccak256(abi.encode(bond.BIND_NODE_TYPEHASH(), nodeId, nonce));
+        bytes32 structHash = keccak256(abi.encode(bond.REGISTER_NODE_TYPEHASH(), nodeId, nonce, termsHash));
         bytes32 domainSeparator = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
