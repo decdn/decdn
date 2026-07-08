@@ -239,20 +239,24 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
      serving again.
 
 3. **If you believe the entry is wrong, appeal it — don't just keep serving.**
-   `openBlacklistAppeal(hash, region, evidenceBundleHash, standingPath)` opens an
-   appeal against an `appealBond` deposit (governance-set; testnet deploy default
-   **100 TOKEN**, bounds `[50, 5000]`) within a 14-day filing window from
+   `openBlacklistAppeal(hash, region, evidenceBundleHash, standingPath, namespaceId)`
+   opens an appeal against an `appealBond` deposit (governance-set; testnet deploy
+   default **100 TOKEN**, bounds `[50, 5000]`) within a 14-day filing window from
    `addedAt`. The emergency multisig (`EMERGENCY_MULTISIG_ROLE`) fast-tracks —
    suspending the entry for interim relief — or rejects; DecdnGovernor
    (`GOVERNANCE_ROLE`) then ratifies the removal or reverses. Bond outcomes in
    the deployed contract: **refunded only on ratification**; **burned on
-   rejection, reversal, and lapse** (`cleanupExpiredBlacklistAppeal`). PoC
-   caveats vs. the ADR 011/031 design: any non-zero `region` is appealable
-   (global included — the regional-only restriction is not enforced), and the
-   declared `standingPath` (`Publisher`/`Operator`/`TokenHolder`) is **recorded
-   but not verified** — standing enforcement and the synthetic-standing clawback
-   are deferred. Global entries also remain removable via the slow-path
-   DecdnGovernor `removeHashGlobal` override. Design intent:
+   rejection, reversal, and lapse** (`cleanupExpiredBlacklistAppeal`). The
+   declared `standingPath` is **verified at filing** (audit I-3): **`Publisher`**
+   requires that `namespaceId` is a namespace you own which has claimed the hash
+   (ignored on the other paths); **`Operator`** requires your current attested
+   region to match the entry's region; **`TokenHolder`** needs no extra
+   credential — the escrowed appeal bond is the standing, so there is no balance
+   threshold and no synthetic-standing clawback. PoC caveat vs. the ADR 011/031
+   design: any non-zero `region` is appealable (global included — the
+   regional-only restriction is not enforced). Global entries also remain
+   removable via the slow-path DecdnGovernor `removeHashGlobal` override. Design
+   intent:
    [ADR 011 § Blacklist Entry Appeals](../adr/011-content-takedown.md#blacklist-entry-appeals),
    [ADR 031](../adr/031-content-blacklist-appeals-contract.md).
 

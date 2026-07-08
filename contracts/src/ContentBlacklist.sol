@@ -9,6 +9,7 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
+import { IPublisherRegistryStanding } from "./interfaces/IPublisherRegistryStanding.sol";
 import { RegionScopeLib } from "./RegionScopeLib.sol";
 
 /// @title ContentBlacklist
@@ -18,13 +19,19 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         token holders can post a TOKEN bond to challenge an entry; the
 ///         appeal flows through the same {open → fast-track → ratify/reverse}
 ///         lifecycle as `SlashAppeal` slashing appeals.
-/// @dev    Simplifications vs. ADR 031 carried for this revision:
-///           - Standing enforcement is partial: `StandingPath.Operator`
-///             filings require a current-region match (ADR 011 § Standing
-///             path 2, via ADR 030), but the `StandingPath.TokenHolder`
-///             synthetic-standing clawback (balance check at T and T+24h)
-///             is deferred — `Publisher`/`TokenHolder` are enum-range
-///             validated only at filing time.
+/// @dev    Standing is enforced at filing for all three paths (ADR 031 § 216,
+///         audit I-3): `StandingPath.Operator` requires a current-region match
+///         (ADR 011 § Standing path 2, via ADR 030); `StandingPath.Publisher`
+///         requires owning the declared namespace and that namespace having
+///         claimed the hash (via `PublisherRegistry`); `StandingPath.TokenHolder`
+///         needs no extra credential — the escrowed appeal bond IS the standing,
+///         with no separate balance threshold. Because the bond is escrowed by
+///         the appeal it cannot be flash-loaned, so the synthetic-standing
+///         clawback (ADR 031 § 216) is omitted by design, not
+///         deferred: there is nothing to fake. This is safe only because standing
+///         alone grants no automatic outcome (an `Open` appeal has zero interim
+///         relief and every consequential transition is multisig/governor-gated);
+///         revisit if that ever changes.
 ///         The interim-relief concurrent fast-track cap is two-tier: a
 ///         per-region ceiling (`REGION_CONCURRENT_RELIEF_CAP`) plus a
 ///         per-(filer, region) sub-cap (`FILER_CONCURRENT_RELIEF_CAP`) so no
@@ -145,6 +152,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ERC20Burnable public immutable token;
+
+    /// @dev `PublisherRegistry`, for the ADR 031 Publisher standing check
+    ///      (`ownerOf` + `hasClaimed`). Immutable security-critical binding —
+    ///      cannot be left unset or re-pointed after deployment.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    IPublisherRegistryStanding public immutable publisherRegistry;
 
     uint256 public appealBond;
 
@@ -302,14 +315,24 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // Constructor
     // -----------------------------------------------------------------
 
-    constructor(ICapacityBondEjector capacityBond_, ERC20Burnable token_, address admin, uint256 appealBond_) {
-        if (address(capacityBond_) == address(0) || address(token_) == address(0) || admin == address(0)) {
+    constructor(
+        ICapacityBondEjector capacityBond_,
+        ERC20Burnable token_,
+        IPublisherRegistryStanding publisherRegistry_,
+        address admin,
+        uint256 appealBond_
+    ) {
+        if (
+            address(capacityBond_) == address(0) || address(token_) == address(0)
+                || address(publisherRegistry_) == address(0) || admin == address(0)
+        ) {
             revert ZeroAddress();
         }
         _enforceAppealBondBounds(appealBond_);
         capacityBond = capacityBond_;
         capacityBondRegion = ICapacityBondRegionView(address(capacityBond_));
         token = token_;
+        publisherRegistry = publisherRegistry_;
         appealBond = appealBond_;
         rejectionCooldownWindow = REJECTION_COOLDOWN_WINDOW_DEFAULT;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -434,11 +457,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // slither attributes the `regionScopeData` tuple-destructuring unused-return
     // (path-2 standing check) to the enclosing function, so the directive sits here.
     // slither-disable-next-line unused-return
-    function openBlacklistAppeal(bytes32 hash, bytes32 region, bytes32 evidenceBundleHash, StandingPath standingPath)
-        external
-        nonReentrant
-        returns (uint256 appealId)
-    {
+    function openBlacklistAppeal(
+        bytes32 hash,
+        bytes32 region,
+        bytes32 evidenceBundleHash,
+        StandingPath standingPath,
+        uint256 namespaceId
+    ) external nonReentrant returns (uint256 appealId) {
         if (hash == bytes32(0)) revert ZeroHash();
         // SF-M1 fix: callers must pass GLOBAL_REGION explicitly. Silently
         // rewriting `bytes32(0)` to global would burn the bond + 90-day
@@ -480,25 +505,55 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(block-timestamp)
         if (cooldownUntilAt > block.timestamp) revert FilerInRejectionCooldown(cooldownUntilAt);
 
-        // Enum-range check first. Operator standing additionally gets the
-        // current-region match below (ADR 011 § Standing path 2); the
-        // TokenHolder synthetic-standing clawback (admissibility condition (c)
-        // per ADR 031 § 216 — `status == Open && standingPath == TokenHolder &&
-        // ...`) is still deferred per the contract header note. The field is
-        // persisted so the future on-chain clawback check can read it from
-        // the appeal record without re-deriving it from event history.
+        // Standing enforcement (ADR 031 § 216, audit I-3). Enum-range check
+        // first; then Publisher and Operator each prove standing with a credential
+        // check, while TokenHolder standing is the escrowed bond itself (see its
+        // branch). All external reads below hit trusted immutable contracts and
+        // this function is `nonReentrant`, so the later appeal-state writes are not
+        // a reentrancy vector (aderyn reentrancy-state-change FP).
         if (uint8(standingPath) > uint8(StandingPath.TokenHolder)) revert UnauthorizedStanding(standingPath);
 
-        // ADR 011 § Standing path 2 (Operator): an operator only has standing on
-        // a regional entry whose region matches their current attested region.
-        // The ADR 030 ripening window is a SOFT norm here — in-window filings are
-        // "not auto-rejected … multisig discretion" — so we enforce only the hard
-        // current-region match, never a window revert. Global entries are appealable
-        // by an in-scope operator regardless of region.
-        if (standingPath == StandingPath.Operator && region != GLOBAL_REGION) {
-            // `regionScopeData` is a view on the trusted immutable `capacityBond`
-            // and this function is `nonReentrant`, so the later appeal-state writes
-            // are not a reentrancy vector (aderyn reentrancy-state-change FP).
+        if (standingPath == StandingPath.Publisher) {
+            // Publisher: must own the declared namespace AND that namespace must
+            // have claimed the disputed hash. This proves the filer controls a
+            // namespace that claimed the hash — NOT authorship: `claimContent` is
+            // a permissionless self-assertion, so anyone can create a namespace and
+            // claim any hash. That is acceptable because the Publisher path confers
+            // no more than TokenHolder does (any bond-poster already has standing)
+            // and standing alone grants no automatic outcome (see the TokenHolder
+            // branch). `namespaceId` is a filing argument because a hash→namespace
+            // reverse lookup is ambiguous (many namespaces may claim one hash).
+            // `ownerOf` returns address(0) for unassigned ids, so a bogus
+            // `namespaceId` fails the owner check.
+            // Each read is cached on its own line so the aderyn directive is the
+            // immediate predecessor of the external call it suppresses.
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            address namespaceOwner = publisherRegistry.ownerOf(namespaceId);
+            // aderyn-ignore-next-line(reentrancy-state-change)
+            bool claimedHash = publisherRegistry.hasClaimed(namespaceId, hash);
+            if (namespaceOwner != msg.sender || !claimedHash) revert UnauthorizedStanding(standingPath);
+        } else if (standingPath == StandingPath.TokenHolder) {
+            // TokenHolder: standing IS the escrowed appeal bond pulled below —
+            // there is no separate balance gate. `namespaceId` is ignored on this
+            // path. Spam is already bounded by that bond + `hasActiveAppeal` +
+            // the `filerRejections` cooldown + the perjury denylist, so a balance
+            // threshold would protect nothing that isn't already protected. And
+            // because the bond is escrowed by the appeal it can't be flash-loaned,
+            // so the synthetic-standing clawback (ADR 031 § 216) is omitted by
+            // design, not deferred: there is nothing to fake.
+            //
+            // SAFE ONLY because standing alone grants no automatic outcome: an
+            // `Open` appeal has zero interim relief and every consequential
+            // transition (`fastTrackBlacklistAppeal`) is `EMERGENCY_MULTISIG_ROLE`-
+            // gated. If any future change lets standing auto-fast-track or gain
+            // relief without a trusted role, reinstate a credential gate here.
+        } else if (region != GLOBAL_REGION) {
+            // ADR 011 § Standing path 2 (Operator): an operator only has standing
+            // on a regional entry whose region matches their current attested
+            // region. The ADR 030 ripening window is a SOFT norm here — in-window
+            // filings are "not auto-rejected … multisig discretion" — so we
+            // enforce only the hard current-region match, never a window revert.
+            // Global entries are appealable by an in-scope operator regardless.
             // aderyn-ignore-next-line(reentrancy-state-change)
             (string memory filerRegion,,,,,) = capacityBondRegion.regionScopeData(msg.sender);
             bytes32 filerKey = RegionScopeLib.pack(filerRegion);

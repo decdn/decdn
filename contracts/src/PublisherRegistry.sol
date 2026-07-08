@@ -206,6 +206,15 @@ contract PublisherRegistry is AccessControl {
         return _claimingNamespaces[blake3Hash];
     }
 
+    /// @notice True iff `namespaceId` has claimed `blake3Hash`. Exposes the
+    ///         internal `_hasClaimed` map for the ADR 031 Publisher-standing
+    ///         check in `ContentBlacklist` (a hash→namespace reverse lookup is
+    ///         unusable because many namespaces may claim the same hash, so the
+    ///         caller passes the namespace explicitly and this confirms the claim).
+    function hasClaimed(uint256 namespaceId, bytes32 blake3Hash) external view returns (bool) {
+        return _hasClaimed[namespaceId][blake3Hash];
+    }
+
     // -----------------------------------------------------------------
     // Governable setters
     // -----------------------------------------------------------------
