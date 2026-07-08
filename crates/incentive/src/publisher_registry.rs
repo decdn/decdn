@@ -42,8 +42,9 @@ mod sol_types {
             /// (namespace ids start at 1; 0 is reserved). Emits `NamespaceCreated`.
             function createNamespace() external returns (uint256 namespaceId);
 
-            /// Claim `blake3Hash` into `namespaceId` (owner-only, append-only,
-            /// idempotent per namespace). Emits `ContentClaimed`.
+            /// Claim `blake3Hash` into `namespaceId` (owner-only, append-only;
+            /// re-claiming the same hash into the same namespace reverts).
+            /// Emits `ContentClaimed`.
             function claimContent(uint256 namespaceId, bytes32 blake3Hash) external;
 
             /// Current owner of `namespaceId` (address(0) if never created).

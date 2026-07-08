@@ -8,6 +8,21 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+/// Parse a namespace id, rejecting the reserved `0`. Namespace ids start at 1
+/// (`PublisherRegistry` pre-increments from 0, and id 0 is the governance-only
+/// default-open list), so `0` can never be owned by a publisher — failing fast
+/// here saves the gas of a guaranteed-revert `claimContent` / `proposeAssignment`
+/// transaction, matching the client-side duplicate-operator guard.
+fn parse_namespace_id(s: &str) -> Result<u64, String> {
+    let id: u64 = s
+        .parse()
+        .map_err(|_| format!("invalid namespace id {s:?}: expected a non-negative integer"))?;
+    if id == 0 {
+        return Err("namespace id must be >= 1 (0 is reserved)".to_string());
+    }
+    Ok(id)
+}
+
 /// `decdn publish <subcommand>`.
 #[derive(Args, Debug)]
 pub struct PublishArgs {
@@ -59,7 +74,7 @@ pub struct ClaimArgs {
     pub hash: String,
 
     /// Namespace id to claim into. Must be owned by the signer.
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", value_parser = parse_namespace_id)]
     pub namespace: u64,
 
     #[command(flatten)]
@@ -70,7 +85,7 @@ pub struct ClaimArgs {
 #[derive(Args, Debug)]
 pub struct AssignArgs {
     /// Namespace id whose authorized-origin set is being proposed.
-    #[arg(value_name = "NAMESPACE")]
+    #[arg(value_name = "NAMESPACE", value_parser = parse_namespace_id)]
     pub namespace: u64,
 
     /// Operator Ethereum addresses to authorize. Each must be an active
@@ -158,5 +173,21 @@ mod tests {
     fn assign_needs_at_least_one_operator() {
         let err = Cli::try_parse_from(["decdn", "publish", "assign", "7"]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn claim_rejects_reserved_namespace_zero() {
+        let err = Cli::try_parse_from(["decdn", "publish", "claim", "0xdead", "--namespace", "0"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0 is reserved"), "{err}");
+    }
+
+    #[test]
+    fn assign_rejects_reserved_namespace_zero() {
+        let err = Cli::try_parse_from(["decdn", "publish", "assign", "0", "0xabc"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0 is reserved"), "{err}");
     }
 }

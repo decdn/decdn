@@ -12,6 +12,7 @@ use std::io;
 use std::path::Path;
 
 use alloy::primitives::{Address, B256, U256};
+use alloy::providers::ProviderBuilder;
 use alloy::sol_types::SolEvent;
 use anyhow::Context;
 use decdn_common::cli;
@@ -100,6 +101,21 @@ async fn ensure_rpc_chain_id<P: alloy::providers::Provider>(
     chain_id_guard(expected, rpc)
 }
 
+/// Verify the RPC network matches `expected` using a read-only (wallet-less)
+/// provider, *before* any keystore decryption — so a mis-pointed `--rpc-url`
+/// fails fast without an interactive password prompt or the scrypt KDF. The
+/// `rpc_url` value is never echoed into the parse error (it commonly carries an
+/// API key), matching [`decdn_client_pull::provider::build_provider`].
+async fn preflight_chain_id(rpc_url: &str, expected: u64) -> anyhow::Result<()> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().with_context(|| {
+        format!(
+            "rpc_url is not a valid URL (<redacted>, {} chars)",
+            rpc_url.len()
+        )
+    })?);
+    ensure_rpc_chain_id(&provider, expected).await
+}
+
 // -------------------------------------------------------------------------
 // namespace create
 // -------------------------------------------------------------------------
@@ -151,6 +167,9 @@ async fn namespace_create(
     };
 
     if !args.chain.dry_run {
+        // Verify the network before touching secrets — a wrong --rpc-url fails
+        // here, not after an interactive password prompt + scrypt KDF.
+        preflight_chain_id(&resolved.rpc_url, resolved.chain_id).await?;
         // The keystore is decrypted only when actually submitting — a dry run
         // needs no secrets.
         let signer = chain_ctx::load_signer_with_password_file(
@@ -160,7 +179,6 @@ async fn namespace_create(
         .await?;
         let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
         outcome.operator = Some(signer.address());
-        ensure_rpc_chain_id(&provider, resolved.chain_id).await?;
         let contract = PublisherRegistry::new(registry, &provider);
         let pending =
             contract.createNamespace().send().await.context(
@@ -256,6 +274,7 @@ async fn claim(args: &cli::ClaimArgs, global_config: Option<&Path>) -> anyhow::R
     };
 
     if !args.chain.dry_run {
+        preflight_chain_id(&resolved.rpc_url, resolved.chain_id).await?;
         let signer = chain_ctx::load_signer_with_password_file(
             args.chain.keystore_password_file.as_deref(),
             &resolved.keystore,
@@ -263,7 +282,6 @@ async fn claim(args: &cli::ClaimArgs, global_config: Option<&Path>) -> anyhow::R
         .await?;
         let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
         outcome.operator = Some(signer.address());
-        ensure_rpc_chain_id(&provider, resolved.chain_id).await?;
         let contract = PublisherRegistry::new(registry, &provider);
         let pending = contract
             .claimContent(U256::from(args.namespace), B256::from(hash))
@@ -281,7 +299,8 @@ async fn claim(args: &cli::ClaimArgs, global_config: Option<&Path>) -> anyhow::R
         anyhow::ensure!(
             receipt.status(),
             "claimContent reverted (tx {tx}); likely not the namespace owner, or this \
-             namespace already claimed this hash (claims are append-only + idempotent)",
+             namespace already claimed this hash (claims are append-only; re-claiming the \
+             same hash reverts)",
         );
         outcome.tx = Some(tx);
     }
@@ -378,13 +397,16 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         operator: None,
         origin_assignment: oa_addr,
         namespace_id: args.namespace,
-        operators: operators.clone(),
+        // Moved in (not cloned): the dry-run path never submits, so it does no
+        // extra allocation; the submit path clones exactly once below.
+        operators,
         tx: None,
         ready_at: None,
         replaced_prior: false,
     };
 
     if !args.chain.dry_run {
+        preflight_chain_id(&resolved.rpc_url, resolved.chain_id).await?;
         let signer = chain_ctx::load_signer_with_password_file(
             args.chain.keystore_password_file.as_deref(),
             &resolved.keystore,
@@ -392,10 +414,9 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         .await?;
         let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
         outcome.operator = Some(signer.address());
-        ensure_rpc_chain_id(&provider, resolved.chain_id).await?;
         let contract = OriginAssignment::new(oa_addr, &provider);
         let pending = contract
-            .proposeAssignment(U256::from(args.namespace), operators)
+            .proposeAssignment(U256::from(args.namespace), outcome.operators.clone())
             .send()
             .await
             .context(
@@ -437,18 +458,25 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
 
         // If a prior pending proposal was silently replaced, the contract emits
         // `AssignmentProposalCancelled { autoCleared: true }` in the same tx.
-        outcome.replaced_prior = receipt
-            .inner
-            .logs()
-            .iter()
-            .filter(|log| {
-                log.topic0() == Some(&OriginAssignment::AssignmentProposalCancelled::SIGNATURE_HASH)
-            })
-            .filter_map(|log| {
-                log.log_decode::<OriginAssignment::AssignmentProposalCancelled>()
-                    .ok()
-            })
-            .any(|c| c.inner.data.autoCleared);
+        // No such log is the normal case (nothing was replaced); but a log whose
+        // topic matches the signature yet fails to decode is ABI drift, surfaced
+        // loudly — matching the honest decode of the two events above rather than
+        // silently dropping it and under-reporting the overwrite.
+        for log in receipt.inner.logs() {
+            if log.topic0() != Some(&OriginAssignment::AssignmentProposalCancelled::SIGNATURE_HASH)
+            {
+                continue;
+            }
+            let cancelled = log
+                .log_decode::<OriginAssignment::AssignmentProposalCancelled>()
+                .context(
+                    "proposeAssignment emitted an AssignmentProposalCancelled log that failed to \
+                     decode (ABI mismatch between this CLI and the deployed OriginAssignment?)",
+                )?;
+            if cancelled.inner.data.autoCleared {
+                outcome.replaced_prior = true;
+            }
+        }
     }
 
     let mut out = io::stdout().lock();
