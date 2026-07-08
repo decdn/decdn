@@ -235,7 +235,7 @@ contract FeeRouterTest is Test {
     }
 
     // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
-    // `deployTimestamp + 365 days`; afterwards `pause()` reverts for everyone.
+    // each contract's own construction time + 365 days; afterwards `pause()` reverts for everyone.
     function test_pause_revertsAfterSunset() public {
         bytes32 pauserRole = router.PAUSER_ROLE();
         vm.prank(admin);

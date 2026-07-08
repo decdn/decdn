@@ -612,7 +612,7 @@ The three FeeRouter shares (with bounds 40–90 / 5–50 / 0–30 and defaults 6
 - Can add emergency blacklist entries (hashes and origins)
 - Can suspend regional governance bodies
 - **Cannot** withdraw treasury funds, modify fee parameters, or grant roles
-- **Capability-split sunset:** the protocol-wide `pause()` reverts after `block.timestamp > deployTimestamp + 365 days` (hardcoded, immutable). The narrow unlawful-content-removal functions — `emergencyAdd()`, `emergencyAddOrigin()`, and `suspendRegionalBody()` — do **not** sunset, because they discharge a permanent, time-critical legal duty and touch no economic, treasury, or governance lever ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig))
+- **Capability-split sunset:** the protocol-wide `pause()` reverts after each contract's own `pauseDeadline`, fixed at construction as `block.timestamp + 365 days` (immutable, per-contract, via the shared `SunsettingPausable` base). The narrow unlawful-content-removal functions — `emergencyAdd()`, `emergencyAddOrigin()`, and `suspendRegionalBody()` — do **not** sunset, because they discharge a permanent, time-critical legal duty and touch no economic, treasury, or governance lever ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig))
 - Emergency blacklist entries expire after 14 days unless ratified by governance
 
 ### Reentrancy Analysis

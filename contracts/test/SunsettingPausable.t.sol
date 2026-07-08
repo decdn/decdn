@@ -32,8 +32,8 @@ contract SunsettingPausableTest is Test {
 
     address internal admin = address(0xA11CE);
     // A second pauser standing in for a governance/timelock holder, to prove
-    // the sunset is role-agnostic (ADR 009 Option A — even the DAO cannot
-    // pause after the deadline).
+    // the sunset is role-agnostic (ADR 009 § Emergency Multisig — even the DAO
+    // cannot pause after the deadline).
     address internal governance = address(0x9ED);
 
     uint256 internal constant SUNSET_PERIOD = 365 days;
@@ -77,9 +77,9 @@ contract SunsettingPausableTest is Test {
         harness.pause();
     }
 
-    /// @dev Option A: the sunset removes the capability, not just one role's
-    ///      access. A governance-class pauser is equally blocked after the
-    ///      deadline.
+    /// @dev The sunset removes the capability, not just one role's access:
+    ///      a governance-class pauser is equally blocked after the deadline
+    ///      (the no-role-carve-out decision).
     function test_pause_revertsAfterDeadline_forGovernanceCaller() public {
         vm.warp(harness.pauseDeadline() + 1);
         vm.prank(governance);

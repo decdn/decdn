@@ -1256,7 +1256,7 @@ contract CapacityBondTest is Test {
     }
 
     // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
-    // `deployTimestamp + 365 days`; afterwards `pause()` reverts for every
+    // each contract's own construction time + 365 days; afterwards `pause()` reverts for every
     // caller (progressive immutability).
     function test_pause_revertsAfterSunset() public {
         bytes32 pauserRole = bond.PAUSER_ROLE();
