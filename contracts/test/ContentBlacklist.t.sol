@@ -8,6 +8,8 @@ import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.so
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondRegionView } from "../src/interfaces/ICapacityBondRegionView.sol";
+import { IPublisherRegistryStanding } from "../src/interfaces/IPublisherRegistryStanding.sol";
+import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { Token } from "../src/Token.sol";
 
 /// @dev Doubles as the `ejectNode` sink and the ADR 030 region-scope read source
@@ -79,6 +81,7 @@ contract MockEjector is ICapacityBondEjector, ICapacityBondRegionView {
 contract ContentBlacklistTest is Test {
     Token internal token;
     MockEjector internal bondMock;
+    PublisherRegistry internal registry;
     ContentBlacklist internal blacklist;
 
     address internal admin = address(0xA11CE);
@@ -94,7 +97,14 @@ contract ContentBlacklistTest is Test {
     function setUp() public {
         token = new Token(admin);
         bondMock = new MockEjector();
-        blacklist = new ContentBlacklist(ICapacityBondEjector(address(bondMock)), token, admin, APPEAL_BOND);
+        registry = new PublisherRegistry(admin);
+        blacklist = new ContentBlacklist(
+            ICapacityBondEjector(address(bondMock)),
+            token,
+            IPublisherRegistryStanding(address(registry)),
+            admin,
+            APPEAL_BOND
+        );
 
         // Fund filer for appeal bonds.
         vm.prank(admin);
@@ -173,13 +183,13 @@ contract ContentBlacklistTest is Test {
         // SF-M1 fix: must pass region explicitly.
         vm.prank(filer);
         vm.expectRevert();
-        blacklist.openBlacklistAppeal(SAMPLE_HASH, bytes32(0), bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, bytes32(0), bytes32("e"), ContentBlacklist.StandingPath.Operator, 0);
     }
 
     function test_openBlacklistAppeal_revertsOnEntryNotBlacklisted() public {
         vm.prank(filer);
         vm.expectRevert();
-        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0);
     }
 
     function test_fullAppealFlow_ratifyRemovesHash() public {
@@ -190,7 +200,7 @@ contract ContentBlacklistTest is Test {
         // Filer opens appeal.
         vm.prank(filer);
         uint256 appealId = blacklist.openBlacklistAppeal(
-            SAMPLE_HASH, REGION_US, bytes32("evidence"), ContentBlacklist.StandingPath.Operator
+            SAMPLE_HASH, REGION_US, bytes32("evidence"), ContentBlacklist.StandingPath.Operator, 0
         );
 
         // Multisig fast-tracks (entry.suspended = true).
@@ -212,8 +222,9 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId =
-            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
+        );
 
         uint256 supplyBefore = token.totalSupply();
         vm.prank(multisig);
@@ -225,8 +236,9 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId =
-            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
+        );
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(appealId);
         // Suspended → not enforced.
@@ -271,13 +283,13 @@ contract ContentBlacklistTest is Test {
         for (uint256 i = 0; i < 2; i++) {
             vm.prank(filer);
             ids[i] = blacklist.openBlacklistAppeal(
-                bytes32(i + 1), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+                bytes32(i + 1), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
             );
         }
         for (uint256 i = 2; i < 4; i++) {
             vm.prank(filerB);
             ids[i] = blacklist.openBlacklistAppeal(
-                bytes32(i + 1), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+                bytes32(i + 1), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
             );
         }
         // Fast-track 3 (filer: 2 — its sub-cap; filerB: 1) — each charges the
@@ -302,8 +314,9 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId =
-            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
+        );
         assertTrue(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
 
         // Re-add blocked while the appeal is live.
@@ -325,7 +338,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
 
         vm.prank(filer);
-        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e1"), ContentBlacklist.StandingPath.Operator);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e1"), ContentBlacklist.StandingPath.Operator, 0);
 
         // Fund a second filer; even with a different filer, same (region, hash)
         // can't have a second active appeal.
@@ -337,7 +350,7 @@ contract ContentBlacklistTest is Test {
 
         vm.prank(filer2);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.AppealAlreadyActive.selector, REGION_US, SAMPLE_HASH));
-        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e2"), ContentBlacklist.StandingPath.Operator);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e2"), ContentBlacklist.StandingPath.Operator, 0);
 
         assertTrue(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
     }
@@ -348,8 +361,9 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId =
-            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
+        );
         vm.prank(multisig);
         blacklist.rejectBlacklistAppeal(appealId);
 
@@ -358,7 +372,7 @@ contract ContentBlacklistTest is Test {
         // A follow-up open should succeed (freq cap doesn't apply since the
         // prior appeal was rejected, not ratified).
         vm.prank(filer);
-        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e2"), ContentBlacklist.StandingPath.Operator);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e2"), ContentBlacklist.StandingPath.Operator, 0);
         assertTrue(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
     }
 
@@ -367,8 +381,9 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId =
-            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
+        );
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(appealId);
         vm.prank(admin);
@@ -434,8 +449,9 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId =
-            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
+        );
         vm.warp(block.timestamp + 15 days);
         blacklist.cleanupExpiredBlacklistAppeal(appealId);
         assertFalse(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
@@ -454,7 +470,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_EU, SAMPLE_HASH);
         vm.prank(filer);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.OperatorRegionMismatch.selector, REGION_EU, REGION_US));
-        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0);
     }
 
     function test_openBlacklistAppeal_inWindowFiling_notAutoRejected() public {
@@ -466,8 +482,9 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_EU, SAMPLE_HASH);
         vm.prank(filer);
-        uint256 appealId =
-            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
+        );
         assertTrue(blacklist.hasActiveAppeal(REGION_EU, SAMPLE_HASH));
         assertEq(appealId, 0);
     }
@@ -480,7 +497,9 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashGlobal(SAMPLE_HASH);
         bytes32 globalRegion = bytes32("GLOBAL");
         vm.prank(filer);
-        blacklist.openBlacklistAppeal(SAMPLE_HASH, globalRegion, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, globalRegion, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
+        );
         assertTrue(blacklist.hasActiveAppeal(globalRegion, SAMPLE_HASH));
     }
 
@@ -488,8 +507,15 @@ contract ContentBlacklistTest is Test {
         // Publisher standing is not region-gated even on a mismatched region.
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_EU, SAMPLE_HASH); // filer region is "US"
+        // Establish Publisher standing: filer owns a namespace that claimed the hash.
         vm.prank(filer);
-        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Publisher);
+        uint256 nsId = registry.createNamespace();
+        vm.prank(filer);
+        registry.claimContent(nsId, SAMPLE_HASH);
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Publisher, nsId
+        );
         assertTrue(blacklist.hasActiveAppeal(REGION_EU, SAMPLE_HASH));
     }
 
@@ -521,8 +547,9 @@ contract ContentBlacklistTest is Test {
         assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
         // Fast-tracking an appeal suspends the entry → lifts it from scope.
         vm.prank(filer); // filer region "US" (setUp) satisfies path-2 standing
-        uint256 appealId =
-            blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
+        );
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(appealId);
         assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
@@ -572,7 +599,8 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, h);
         vm.prank(filer);
-        uint256 id = blacklist.openBlacklistAppeal(h, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        uint256 id =
+            blacklist.openBlacklistAppeal(h, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0);
         vm.prank(multisig);
         blacklist.rejectBlacklistAppeal(id);
     }
@@ -596,7 +624,7 @@ contract ContentBlacklistTest is Test {
         vm.prank(filer);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerInRejectionCooldown.selector, cooldownUntil));
         blacklist.openBlacklistAppeal(
-            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
     }
 
@@ -611,7 +639,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, bytes32(uint256(3)));
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
-            bytes32(uint256(3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(3))));
     }
@@ -630,7 +658,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
-            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(4))));
     }
@@ -650,7 +678,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
-            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(4))));
     }
@@ -674,7 +702,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
         vm.prank(filer2);
         blacklist.openBlacklistAppeal(
-            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(4))));
         assertEq(blacklist.getFilerRejectionWindow(filer2).cooldownUntilAt, 0);
@@ -726,7 +754,7 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, h);
         vm.prank(filer);
-        appealId = blacklist.openBlacklistAppeal(h, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator);
+        appealId = blacklist.openBlacklistAppeal(h, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0);
     }
 
     /// @notice Perjury-reject sets the 365-day denylist, burns the bond, and
@@ -771,7 +799,7 @@ contract ContentBlacklistTest is Test {
         vm.prank(filer);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerPerjuryDenylisted.selector, until));
         blacklist.openBlacklistAppeal(
-            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
 
         // One second before expiry: still locked out. Re-add to refresh the
@@ -782,7 +810,7 @@ contract ContentBlacklistTest is Test {
         vm.prank(filer);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerPerjuryDenylisted.selector, until));
         blacklist.openBlacklistAppeal(
-            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
 
         // Exactly at `until` the lockout lifts — pins the exclusive
@@ -791,7 +819,7 @@ contract ContentBlacklistTest is Test {
         vm.warp(until);
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
-            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(2))));
     }
@@ -841,7 +869,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, bytes32(uint256(2)));
         vm.prank(filer2);
         blacklist.openBlacklistAppeal(
-            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(2))));
     }
@@ -869,7 +897,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA1)));
         vm.prank(filer);
         id1 = blacklist.openBlacklistAppeal(
-            bytes32(uint256(0xA1)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(0xA1)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(id1);
@@ -878,7 +906,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA2)));
         vm.prank(filer);
         id2 = blacklist.openBlacklistAppeal(
-            bytes32(uint256(0xA2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(0xA2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(id2);
@@ -899,7 +927,7 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA3)));
         vm.prank(filer);
         uint256 id3 = blacklist.openBlacklistAppeal(
-            bytes32(uint256(0xA3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(0xA3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         vm.prank(multisig);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerReliefCapHit.selector, filer, uint256(2)));
@@ -950,10 +978,116 @@ contract ContentBlacklistTest is Test {
         blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA3)));
         vm.prank(filer);
         uint256 id3 = blacklist.openBlacklistAppeal(
-            bytes32(uint256(0xA3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator
+            bytes32(uint256(0xA3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
         );
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(id3);
         assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // ADR 031 § 216 — standing enforcement at filing (audit I-3)
+    // -----------------------------------------------------------------
+
+    /// @dev Give `who` a namespace that has claimed `hash`, returning the id.
+    function _publisherStanding(address who, bytes32 hash) internal returns (uint256 nsId) {
+        vm.prank(who);
+        nsId = registry.createNamespace();
+        vm.prank(who);
+        registry.claimContent(nsId, hash);
+    }
+
+    // --- Publisher path ---
+
+    function test_publisherStanding_ownerOfClaimingNamespace_succeeds() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        uint256 nsId = _publisherStanding(filer, SAMPLE_HASH);
+        vm.prank(filer);
+        blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Publisher, nsId
+        );
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+    }
+
+    function test_publisherStanding_nonOwner_reverts() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        // Namespace owned by someone else (admin), even though it claimed the hash.
+        uint256 nsId = _publisherStanding(admin, SAMPLE_HASH);
+        vm.prank(filer);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ContentBlacklist.UnauthorizedStanding.selector, ContentBlacklist.StandingPath.Publisher
+            )
+        );
+        blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Publisher, nsId
+        );
+    }
+
+    function test_publisherStanding_ownerButHashNotClaimed_reverts() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        // Filer owns a namespace, but it never claimed SAMPLE_HASH.
+        vm.prank(filer);
+        uint256 nsId = registry.createNamespace();
+        vm.prank(filer);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ContentBlacklist.UnauthorizedStanding.selector, ContentBlacklist.StandingPath.Publisher
+            )
+        );
+        blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Publisher, nsId
+        );
+    }
+
+    function test_publisherStanding_wrongNamespaceId_reverts() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        _publisherStanding(filer, SAMPLE_HASH);
+        // A namespaceId the filer does not own (unassigned id 999 → ownerOf == 0).
+        vm.prank(filer);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ContentBlacklist.UnauthorizedStanding.selector, ContentBlacklist.StandingPath.Publisher
+            )
+        );
+        blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Publisher, 999
+        );
+    }
+
+    // --- TokenHolder path ---
+
+    /// @notice TokenHolder standing IS the escrowed bond: a filer holding only the
+    ///         bond — no threshold balance, no namespace — gets standing, and the
+    ///         bond is actually pulled into escrow. Proves there is no extra
+    ///         credential gate (so nothing for a flash loan to fake).
+    function test_tokenHolderStanding_bondIsStanding_succeedsAndEscrows() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        // Fund a fresh holder with exactly the bond and nothing more — far below
+        // any prior threshold — so success can only come from the bond itself.
+        address smallHolder = address(0x5A11);
+        vm.prank(admin);
+        token.transfer(smallHolder, APPEAL_BOND);
+        vm.prank(smallHolder);
+        token.approve(address(blacklist), APPEAL_BOND);
+
+        uint256 escrowedBefore = token.balanceOf(address(blacklist));
+        vm.prank(smallHolder);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.TokenHolder, 0
+        );
+
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
+        // Bond escrowed: contract balance rose by exactly the bond; holder drained.
+        assertEq(token.balanceOf(address(blacklist)), escrowedBefore + APPEAL_BOND);
+        assertEq(token.balanceOf(smallHolder), 0);
+        ContentBlacklist.BlacklistAppeal memory a = blacklist.getAppeal(appealId);
+        assertEq(a.bond, APPEAL_BOND);
+        assertEq(uint8(a.standingPath), uint8(ContentBlacklist.StandingPath.TokenHolder));
     }
 }

@@ -25,6 +25,7 @@ import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.s
 import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol";
 import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
 import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistryOwnership.sol";
+import { IPublisherRegistryStanding } from "../src/interfaces/IPublisherRegistryStanding.sol";
 
 /// @title BaseProtocolDeploy
 /// @notice Abstract deploy primitive for the v3 contract surface. Performs the
@@ -278,14 +279,19 @@ abstract contract BaseProtocolDeploy is Script {
             buybackBurner_: cfg.buybackBurner
         });
 
+        // PublisherRegistry deploys BEFORE ContentBlacklist: the blacklist binds
+        // it as a constructor immutable for the ADR 031 Publisher standing check
+        // (security-critical, cannot be left unset). The registry needs only
+        // `admin`, so the ordering is free.
+        d.registry = new PublisherRegistry({ admin: cfg.deployer });
+
         d.blacklist = new ContentBlacklist({
             capacityBond_: ICapacityBondEjector(address(d.bond)),
             token_: d.token,
+            publisherRegistry_: IPublisherRegistryStanding(address(d.registry)),
             admin: cfg.deployer,
             appealBond_: cfg.blacklistAppealBond
         });
-
-        d.registry = new PublisherRegistry({ admin: cfg.deployer });
 
         // PaymentChannel (ADR 003): USDC settlement gateway. `feeRouter` must be
         // a deployed contract (constructor checks code size) — `d.router` above.
@@ -490,6 +496,13 @@ abstract contract BaseProtocolDeploy is Script {
         address boundBlacklist = d.originAssignment.contentBlacklist();
         if (boundBlacklist != address(d.blacklist)) {
             revert BindingNotWired(address(d.originAssignment), address(d.blacklist), boundBlacklist);
+        }
+        // The Publisher standing check is security-critical and the binding is a
+        // constructor immutable — verify a constructor-arg mix-up didn't point it
+        // at the wrong registry.
+        address boundRegistry = address(d.blacklist.publisherRegistry());
+        if (boundRegistry != address(d.registry)) {
+            revert BindingNotWired(address(d.blacklist), address(d.registry), boundRegistry);
         }
         address boundPool = d.slashAppeal.challengerIncentivePool();
         if (boundPool != cfg.challengerIncentivePool) {
