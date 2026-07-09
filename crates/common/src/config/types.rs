@@ -162,9 +162,10 @@ pub struct BlockchainConfig {
     /// than defaulting.
     pub slash_judge_address: Option<String>,
     /// `SlashAppeal` contract address — the target for `decdn appeal slash`
-    /// (ADR 028). Optional: only the appeal CLI requires it, so an unset value
-    /// does not block the daemon (like the origin-directory addresses). When
-    /// set it must not be the zero address.
+    /// (ADR 028). Consumed **only** by that CLI (via `chain_ctx::resolve_appeal`,
+    /// which validates it); the daemon accepts the key here — `[blockchain]`
+    /// denies unknown fields and a node's `node.toml` is shared with the CLI —
+    /// but does not resolve or use it.
     pub slash_appeal_address: Option<String>,
     /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
     /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial

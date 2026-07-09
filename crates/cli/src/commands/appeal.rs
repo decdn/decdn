@@ -46,10 +46,7 @@ pub async fn run(args: &cli::AppealSlashArgs, global_config: Option<&Path>) -> a
         return Ok(());
     }
 
-    let outcome = execute(
-        &appeal, &provider, &plan, operator, sa_addr, slash_id, evidence,
-    )
-    .await?;
+    let outcome = execute(&appeal, &provider, &plan, operator, sa_addr).await?;
 
     let mut out = io::stdout().lock();
     write_plan(&mut out, &plan, args.chain.json, &outcome, false)
@@ -111,8 +108,6 @@ pub(crate) async fn execute<P: Provider + Clone>(
     plan: &Plan,
     operator: Address,
     sa_addr: Address,
-    slash_id: U256,
-    evidence: B256,
 ) -> anyhow::Result<Outcome> {
     let mut outcome = Outcome::default();
 
@@ -149,7 +144,7 @@ pub(crate) async fn execute<P: Provider + Clone>(
     }
 
     let pending = appeal
-        .openSlashAppeal(slash_id, evidence)
+        .openSlashAppeal(plan.slash_id, plan.evidence)
         .send()
         .await
         .context("openSlashAppeal transaction failed to send")?;

@@ -461,9 +461,12 @@ pub struct SlashRecordDto {
     /// still pending when observed (rare; live logs carry a block number).
     #[serde(default)]
     pub block_number: Option<u64>,
-    /// Unix timestamp (seconds) after which the 30-day appeal filing window
-    /// closes, derived from the `CapacityBond` slash record, or `None` if the
-    /// record read failed. Past this, `openSlashAppeal` reverts.
+    /// **Nominal** appeal-window close (Unix seconds): the `Slashed` block
+    /// timestamp + 30 days, or `None` if the block read failed. This is a cheap
+    /// client-side hint, NOT read from the `CapacityBond` slash record, and it
+    /// ignores protocol-pause extensions — which only ever move the real
+    /// deadline *later* (`markAppealOpen` adds `pausedTotal`). Safe to file
+    /// before this; a keeper must not treat a just-past value as final.
     #[serde(default)]
     pub appeal_window_close: Option<u64>,
 }

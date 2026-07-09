@@ -846,7 +846,7 @@ impl AdminRpcServer for AdminRpcImpl {
         let Some(handles) = self.state.slash_detection.as_ref() else {
             return Err(ErrorObjectOwned::owned(
                 SLASH_DETECTION_UNAVAILABLE_CODE,
-                "slash detection not wired on this node (no slash_judge_address configured)",
+                "slash detection is not wired on this node",
                 None::<()>,
             ));
         };

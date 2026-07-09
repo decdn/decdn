@@ -38,7 +38,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, B256, U256};
+use alloy::providers::DynProvider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_common::admin::AdminRpcClient;
@@ -121,9 +122,14 @@ async fn run() -> anyhow::Result<()> {
     .await?;
     assert!(surfaced.is_some(), "A's daemon never surfaced the slash");
 
-    // ---- Negative: a non-operator (B) cannot file A's appeal.
+    // ---- Negative: a non-operator (B) cannot file A's appeal. Fund + approve
+    // B's bond first so a zero-allowance `transferFrom` can't be the revert
+    // reason — with the bond payable, only the `CallerNotOperator` guard can
+    // reject it (if the guard were removed the call would succeed).
     let evidence = B256::repeat_byte(0xEE);
     let b_provider = chain.provider_for(&node_b.operator);
+    let bond = chain.appeal_bond().await?;
+    fund_and_approve_bond(&chain, &b_provider, node_b.operator_addr, bond).await?;
     let appeal_as_b = SlashAppeal::new(chain.addrs.slash_appeal, &b_provider)
         .openSlashAppeal(slash_id, evidence)
         .send()
@@ -136,7 +142,6 @@ async fn run() -> anyhow::Result<()> {
     // ---- File the appeal through the `decdn appeal slash` CLI (posts the bond).
     // The operator's stake is locked in `CapacityBond`, so fund its wallet with
     // the appeal bond first — the CLI approves + posts it.
-    let bond = chain.appeal_bond().await?;
     chain.transfer_token(node_a.operator_addr, bond).await?;
     let balance_before = chain.token_balance(node_a.operator_addr).await?;
     run_appeal_cli(&node_a.config_path, slash_id, evidence)?;
@@ -182,11 +187,13 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- Negative: a second appeal within 365 days is frequency-capped. A is
-    // slashed again; its own openSlashAppeal must revert (FrequencyCapHit).
+    // slashed again; fund + approve so the guard (`FrequencyCapHit`), not a
+    // zero-allowance `transferFrom`, is what rejects A's own openSlashAppeal.
     let slash_id2 = chain
         .slash_operator_via_judge(&challenger, &node_a.operator, node_a_id, blob_hash)
         .await?;
     let a_provider = chain.provider_for(&node_a.operator);
+    fund_and_approve_bond(&chain, &a_provider, node_a.operator_addr, bond).await?;
     let second_appeal = SlashAppeal::new(chain.addrs.slash_appeal, &a_provider)
         .openSlashAppeal(slash_id2, evidence)
         .send()
@@ -204,14 +211,7 @@ async fn run() -> anyhow::Result<()> {
     let slash_id3 = chain
         .slash_operator_via_judge(&challenger, &node_b.operator, node_b_id, blob_hash)
         .await?;
-    chain.transfer_token(node_b.operator_addr, bond).await?;
-    let approve = decdn_e2e::bindings::Erc20::new(chain.addrs.token, &b_provider)
-        .approve(chain.addrs.slash_appeal, bond)
-        .send()
-        .await?
-        .get_receipt()
-        .await?;
-    assert!(approve.status(), "B bond approve must mine");
+    fund_and_approve_bond(&chain, &b_provider, node_b.operator_addr, bond).await?;
     time::increase_time(&chain.admin, 31 * DAY).await?;
     let late_appeal = SlashAppeal::new(chain.addrs.slash_appeal, &b_provider)
         .openSlashAppeal(slash_id3, evidence)
@@ -222,6 +222,28 @@ async fn run() -> anyhow::Result<()> {
         "an appeal after the 30-day filing window must be rejected (FilingWindowClosed)"
     );
 
+    Ok(())
+}
+
+/// Fund `who`'s wallet with `bond` TOKEN and approve it to `SlashAppeal`, so a
+/// negative test's `openSlashAppeal` revert can only be the on-chain guard
+/// (`CallerNotOperator` / `FrequencyCapHit` / `FilingWindowClosed`) and never a
+/// zero-allowance `transferFrom` — otherwise the test would pass even if the
+/// guard were deleted.
+async fn fund_and_approve_bond(
+    chain: &ChainFixture,
+    provider: &DynProvider,
+    who: Address,
+    bond: U256,
+) -> anyhow::Result<()> {
+    chain.transfer_token(who, bond).await?;
+    let receipt = decdn_e2e::bindings::Erc20::new(chain.addrs.token, provider)
+        .approve(chain.addrs.slash_appeal, bond)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    anyhow::ensure!(receipt.status(), "bond approve must mine");
     Ok(())
 }
 

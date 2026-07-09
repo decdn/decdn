@@ -791,7 +791,6 @@ impl RuntimeReloadState {
                 settlement_auto_threshold_micro_usdc: None,
                 settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
-                slash_appeal_address: None,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: ResolvedCache {
@@ -1300,7 +1299,6 @@ mod tests {
                 settlement_auto_threshold_micro_usdc: None,
                 settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
-                slash_appeal_address: None,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: ResolvedCache {

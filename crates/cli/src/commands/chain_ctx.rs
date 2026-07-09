@@ -77,16 +77,23 @@ pub fn load_optional_config(config_path: Option<&Path>) -> anyhow::Result<FileCo
     }
 }
 
-/// Resolve the `chain_id` / `data_dir` / `keystore` triple shared by every
-/// on-chain command with the same flag > config > default precedence. Kept
-/// separate so [`resolve`] and [`resolve_appeal`] can't drift on this chain.
-/// `expand_tilde` is applied to whichever explicit value wins (flag OR config);
-/// the `default_data_dir` fallback is already absolute.
+/// Resolve the `rpc_url` / `chain_id` / `data_dir` / `keystore` fields shared by
+/// every on-chain command with the same flag > config > default precedence.
+/// Kept separate so [`resolve`] and [`resolve_appeal`] can't drift on this
+/// chain. `expand_tilde` is applied to whichever explicit path wins (flag OR
+/// config); the `default_data_dir` fallback is already absolute.
 fn resolve_common(
     chain: &cli::ChainArgs,
     file: &FileConfig,
-) -> anyhow::Result<(u64, PathBuf, PathBuf)> {
+) -> anyhow::Result<(String, u64, PathBuf, PathBuf)> {
     let bc = file.blockchain.as_ref();
+    let rpc_url = chain
+        .rpc_url
+        .clone()
+        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("rpc_url not set (pass --rpc-url or set blockchain.rpc_url)")
+        })?;
     let chain_id = chain
         .chain_id
         .or_else(|| bc.and_then(|b| b.chain_id))
@@ -108,20 +115,16 @@ fn resolve_common(
             || eth_identity::keystore_path(&data_dir),
             |p| expand_tilde(&p),
         );
-    Ok((chain_id, data_dir, keystore))
+    Ok((rpc_url, chain_id, data_dir, keystore))
 }
 
 /// Resolve the chain coordinates with flag > config > default precedence.
 /// Pure so the precedence is unit-testable.
 pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Resolved> {
     let bc = file.blockchain.as_ref();
-    let rpc_url = chain
-        .rpc_url
-        .clone()
-        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("rpc_url not set (pass --rpc-url or set blockchain.rpc_url)")
-        })?;
+    // `resolve_common` first so `rpc_url` is the first missing-field reported
+    // (preserves the original error priority before the shared extraction).
+    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
     let capacity_bond_address = chain
         .capacity_bond_address
         .clone()
@@ -132,7 +135,6 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
                  blockchain.capacity_bond_address)"
             )
         })?;
-    let (chain_id, data_dir, keystore) = resolve_common(chain, file)?;
     Ok(Resolved {
         rpc_url,
         chain_id,
@@ -163,13 +165,6 @@ pub fn resolve_appeal(
     file: &FileConfig,
 ) -> anyhow::Result<ResolvedAppeal> {
     let bc = file.blockchain.as_ref();
-    let rpc_url = chain
-        .rpc_url
-        .clone()
-        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("rpc_url not set (pass --rpc-url or set blockchain.rpc_url)")
-        })?;
     let slash_appeal_address = slash_appeal_flag
         .map(str::to_string)
         .or_else(|| bc.and_then(|b| b.slash_appeal_address.clone()))
@@ -179,7 +174,18 @@ pub fn resolve_appeal(
                  blockchain.slash_appeal_address)"
             )
         })?;
-    let (chain_id, data_dir, keystore) = resolve_common(chain, file)?;
+    // Guard the *consumer*: a zero address parses fine but is never a real
+    // deployment (it would surface only as an opaque on-chain revert at appeal
+    // time). This is the sole validation site for the appeal address.
+    anyhow::ensure!(
+        slash_appeal_address
+            .trim_start_matches("0x")
+            .bytes()
+            .any(|b| b != b'0'),
+        "slash_appeal_address must not be the zero address — \
+         set it to the deployed SlashAppeal contract (ADR 028)"
+    );
+    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
     Ok(ResolvedAppeal {
         rpc_url,
         chain_id,

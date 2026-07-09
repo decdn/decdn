@@ -1060,32 +1060,10 @@ fn resolve_blockchain_into(
         );
     }
 
-    // Optional: only `decdn appeal slash` (ADR 028) needs the `SlashAppeal`
-    // address, so an unset value must not block the daemon. When present it is
-    // validated like the other addresses (parse + non-zero) so a typo surfaces
-    // at load rather than at appeal time.
-    let slash_appeal_raw = cli
-        .slash_appeal_address
-        .clone()
-        .or_else(|| file.and_then(|b| b.slash_appeal_address.clone()))
-        .filter(|s| !s.is_empty());
-    let slash_appeal_address = slash_appeal_raw.and_then(|v| {
-        bag.try_with(
-            "blockchain.slash_appeal_address",
-            parse_contract_address("slash_appeal_address", &v),
-        )
-    });
-    // Zero-address check runs only after the parse succeeds — mirrors the
-    // `slash_judge_address` cascade-suppression above so a malformed all-zero
-    // value doesn't get both a parse error and a "zero address" error.
-    if let Some(addr) = slash_appeal_address.as_deref() {
-        bag.check(
-            addr.trim_start_matches("0x").bytes().any(|b| b != b'0'),
-            "blockchain.slash_appeal_address",
-            "blockchain.slash_appeal_address must not be the zero address — \
-             set it to the deployed SlashAppeal contract (ADR 028)",
-        );
-    }
+    // `blockchain.slash_appeal_address` is accepted in the file (see
+    // `BlockchainConfig`) but consumed only by the `decdn appeal slash` CLI
+    // (via `chain_ctx::resolve_appeal`, which validates it) — the daemon does
+    // not resolve or use it, so there is nothing to resolve here.
 
     let chain_id = cli
         .chain_id
@@ -1217,7 +1195,6 @@ fn resolve_blockchain_into(
         publisher_registry_address,
         origin_directory_from_block,
         slash_judge_address,
-        slash_appeal_address,
         chain_id,
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
@@ -6938,7 +6915,6 @@ mod tests {
                 "DECDN_PUBLISHER_REGISTRY_ADDRESS",
             ),
             ("slash_judge_address", "DECDN_SLASH_JUDGE_ADDRESS"),
-            ("slash_appeal_address", "DECDN_SLASH_APPEAL_ADDRESS"),
             ("chain_id", "DECDN_CHAIN_ID"),
             ("cache_dir", "DECDN_CACHE_DIR"),
             ("cache_size_mb", "DECDN_CACHE_SIZE_MB"),
@@ -7008,7 +6984,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some("0xNOTHEX".to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
@@ -7038,7 +7013,6 @@ mod tests {
             payment_channel_address: Some("0xNOTHEX".to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
@@ -7071,7 +7045,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
@@ -7092,7 +7065,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
@@ -7116,7 +7088,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
@@ -7146,7 +7117,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
@@ -7173,7 +7143,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -7204,7 +7173,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -7234,7 +7202,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -7275,7 +7242,6 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         }
     }
@@ -8013,7 +7979,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8093,7 +8058,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -8119,7 +8083,6 @@ mod tests {
             payment_channel_address: None,
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -8145,7 +8108,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -8171,7 +8133,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: None,
-            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -8197,7 +8158,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some("0x0000000000000000000000000000000000000000".to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -8223,7 +8183,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: Some(0),
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -8252,7 +8211,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
@@ -8278,7 +8236,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8324,7 +8281,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8369,7 +8325,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8414,7 +8369,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8461,7 +8415,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
@@ -8482,7 +8435,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8526,7 +8478,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8565,7 +8516,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8611,7 +8561,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
@@ -8636,7 +8585,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8671,7 +8619,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
@@ -8699,7 +8646,6 @@ mod tests {
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
             chain_id: None,
         };
         let at_min = types::BlockchainConfig {

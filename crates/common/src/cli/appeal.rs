@@ -42,8 +42,10 @@ pub struct AppealSlashArgs {
     pub evidence_bundle_hash: String,
 
     /// `SlashAppeal` contract address. Overrides
-    /// `blockchain.slash_appeal_address`.
-    #[arg(long, value_name = "ADDR")]
+    /// `blockchain.slash_appeal_address`. The config-file value is read as
+    /// plain TOML (no `${VAR}` expansion); use this flag or the env var for
+    /// substitution.
+    #[arg(long, value_name = "ADDR", env = "DECDN_SLASH_APPEAL_ADDRESS")]
     pub slash_appeal_address: Option<String>,
 
     /// Shared chain coordinates (rpc, keystore, chain id, `--dry-run`,
