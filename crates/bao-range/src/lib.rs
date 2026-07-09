@@ -67,6 +67,12 @@ pub fn bao_encoded_size(total_bytes: u64, chunk_ranges: &ChunkRanges) -> u64 {
     // partial groups, so it must NOT be used here.) `align_range`'s ranges are
     // already clamped to the blob, so the encoder's `truncate_ranges` step is a
     // no-op and is not reachable here (its module is private upstream).
+    // An empty range set (the whole-blob view of a 0-byte blob, #1054) has no
+    // proof and no data — zero wire bytes. `bao-tree`'s pre-order chunk iterator
+    // asserts `!ranges.is_empty()`, so short-circuit before walking it.
+    if chunk_ranges.is_empty() {
+        return 0;
+    }
     let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
     tree.ranges_pre_order_chunks_iter_ref(chunk_ranges.as_ref(), 0)
         .map(|chunk| u64::try_from(chunk.without_ranges().size()).unwrap_or(u64::MAX))
@@ -183,10 +189,18 @@ impl AlignedRange {
 /// Compute the chunk-group-aligned fetch span for a `[byte_offset, +byte_len)`
 /// request against a `blob_size`-byte blob. `byte_len == 0` means "to end".
 ///
+/// The empty (0-byte) blob is addressable only as the whole blob — `(0, 0)` —
+/// and aligns to an empty [`AlignedRange`] (`fetch_start == fetch_end == 0`,
+/// empty `chunk_ranges`, zero [`wire_len`](AlignedRange::wire_len)). This
+/// preserves the pre-bao empty-bytes delivery on the bao path (#1054); the empty
+/// stream is still proven against the empty root `blake3::hash(&[])` by the
+/// receiver, never accepted for an arbitrary root.
+///
 /// # Errors
 ///
 /// [`RangeVerifyError::RangeOutOfBounds`] if the offset is past the blob end, or
-/// the explicit end overflows / exceeds the blob size.
+/// the explicit end overflows / exceeds the blob size. For a 0-byte blob, any
+/// positive offset or explicit positive length is out of bounds.
 pub fn align_range(
     byte_offset: u64,
     byte_len: u64,
@@ -197,9 +211,14 @@ pub fn align_range(
         len: byte_len,
         blob_size,
     };
-    // An offset at or past the end has nothing to serve (the empty blob has no
-    // byte 0 either).
-    if byte_offset >= blob_size {
+    // The empty blob is served only as its whole (empty) self: offset 0, "to
+    // end". The construction below then yields an empty range. A non-empty blob
+    // still rejects any offset at or past the end (reject, never clamp — ADR 005).
+    if blob_size == 0 {
+        if byte_offset != 0 || byte_len != 0 {
+            return Err(oob());
+        }
+    } else if byte_offset >= blob_size {
         return Err(oob());
     }
     let end = if byte_len == 0 {

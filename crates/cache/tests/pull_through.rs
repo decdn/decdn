@@ -4495,3 +4495,42 @@ async fn export_bao_range_whole_blob_offset_zero() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A 0-byte blob served whole (`export_bao_range(hash, 0, 0, 0)`) must emit an
+/// empty header-less wire form, and re-importing it round-trips to empty bytes
+/// under the same content hash — the pre-bao empty delivery, preserved on the
+/// bao path (#1054). The empty root is `Hash::new(&[])`.
+#[tokio::test]
+async fn export_bao_range_empty_blob_round_trips() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use decdn_cache::range_pull::align_range;
+    use iroh_blobs::store::mem::MemStore;
+
+    let payload: Vec<u8> = Vec::new();
+    let hash = Hash::new(&payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    // Pull-through caches a 0-byte blob (BlobStatus::Complete { size: 0 }).
+    engine.get(hash).await?;
+
+    let wire = engine.export_bao_range(hash, 0, 0, 0).await?;
+    anyhow::ensure!(wire.is_empty(), "0-byte blob has an empty bao wire form");
+
+    let aligned = align_range(0, 0, 0)?;
+    // The combined encoding is the 8-byte LE size header (0) plus the (empty) wire.
+    let mut combined = 0u64.to_le_bytes().to_vec();
+    combined.extend_from_slice(&wire);
+    let store = MemStore::new();
+    store
+        .blobs()
+        .import_bao_bytes(hash, aligned.chunk_ranges().clone(), Bytes::from(combined))
+        .await?;
+    let got = store.blobs().get_bytes(hash).await?;
+    anyhow::ensure!(got.as_ref().is_empty(), "empty blob decodes to empty bytes");
+    Ok(())
+}

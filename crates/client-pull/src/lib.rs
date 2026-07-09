@@ -694,6 +694,17 @@ fn decode_verified_range(
 ) -> anyhow::Result<Bytes> {
     let aligned = align_range(byte_offset, byte_len, total_bytes)
         .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
+    // A 0-byte blob (#1054) aligns to an empty range: the decoder below has no
+    // chunk group to anchor and would accept the empty stream for ANY root — the
+    // silent verification bypass `fetch_inner` warns about. Prove the empty
+    // stream against the empty root explicitly; a non-empty requested hash is a
+    // paid-but-wrong delivery, so surface the typed `HashMismatch`.
+    if total_bytes == 0 {
+        if hash != *blake3::hash(&[]).as_bytes() {
+            return Err(anyhow::Error::new(HashMismatch));
+        }
+        return Ok(Bytes::new());
+    }
     let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
     let root = blake3::Hash::from_bytes(hash);
     let chunk_ranges = aligned.chunk_ranges();
@@ -1378,6 +1389,35 @@ mod tests {
         anyhow::ensure!(
             err.downcast_ref::<HashMismatch>().is_none(),
             "clean truncation must NOT be classified as corruption, got HashMismatch: {err}"
+        );
+        Ok(())
+    }
+
+    /// A 0-byte blob (#1054) delivers an empty stream that is proven against the
+    /// empty root `blake3::hash(&[])`, decoding to empty bytes.
+    #[test]
+    fn decode_verified_range_empty_blob_accepts_empty_root() -> anyhow::Result<()> {
+        let root = *blake3::hash(&[]).as_bytes();
+        let out = decode_verified_range(root, 0, 0, 0, &[])?;
+        anyhow::ensure!(out.is_empty(), "empty blob decodes to empty bytes");
+        Ok(())
+    }
+
+    /// A server claiming `total_bytes == 0` for a NON-empty requested hash must be
+    /// rejected: the empty stream must be proven against the empty root, never
+    /// accepted for an arbitrary root. Without the explicit check the empty range
+    /// decodes trivially (no chunk group to verify) and the bypass would surface
+    /// as success — the exact hole `fetch_inner` warns about (#1054).
+    #[test]
+    fn decode_verified_range_empty_claim_rejects_wrong_root() -> anyhow::Result<()> {
+        let blob = make_blob(4096);
+        let root = *blake3::hash(&blob).as_bytes();
+        let err = decode_verified_range(root, 0, 0, 0, &[])
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected wrong-root rejection for empty claim"))?;
+        anyhow::ensure!(
+            err.downcast_ref::<HashMismatch>().is_some(),
+            "empty claim for a non-empty root must surface HashMismatch, got: {err}"
         );
         Ok(())
     }
