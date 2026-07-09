@@ -73,8 +73,11 @@ fn dep_version(lock: &toml::Table, pkg: &toml::Value, name: &str) -> String {
                 pkg_field(pkg, "name").unwrap_or("<?>")
             )
         });
+    // A qualified edge is `"name version"` or `"name version (source)"` when a
+    // git/path override coexists with the registry copy; take just the version
+    // token so a source suffix can't leak in and cause a spurious mismatch.
     match entry.split_once(' ') {
-        Some((_, version)) => version.to_owned(),
+        Some((_, rest)) => rest.split_whitespace().next().unwrap_or(rest).to_owned(),
         None => sole_version(lock, name),
     }
 }

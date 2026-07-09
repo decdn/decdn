@@ -329,14 +329,26 @@ fn splice(path: &str, block: &str) {
         .iter()
         .position(|l| l.trim() == end_marker)
         .unwrap_or_else(|| panic!("{path}: closing `{end_marker}` not found"));
-    // The `// ===` frame line sits immediately outside each marker.
+    // The `// ===` frame line sits immediately outside each marker. Verify it
+    // is actually a frame before consuming it, so a hand-edited file that lost a
+    // frame line fails loudly instead of silently splicing over real code.
     let start = ai
         .checked_sub(1)
         .unwrap_or_else(|| panic!("{path}: opening marker has no frame line above it"));
     let end = bi + 1;
+    assert!(start < bi, "{path}: markers out of order");
+    let is_frame = |i: usize| {
+        lines
+            .get(i)
+            .is_some_and(|l| l.trim_start().starts_with("// =="))
+    };
     assert!(
-        start < bi && end < lines.len(),
-        "{path}: markers out of order"
+        is_frame(start),
+        "{path}: line above `{start_marker}` is not a `// ===` frame"
+    );
+    assert!(
+        is_frame(end),
+        "{path}: line below `{end_marker}` is not a `// ===` frame"
     );
 
     let mut out = String::new();
