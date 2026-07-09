@@ -89,19 +89,20 @@ pub struct ResolvedSwap {
     pub venue: String,
     /// Router contract address (hex string, unparsed).
     pub router: String,
-    /// Quoter contract address (hex string, unparsed).
-    pub quoter: String,
+    /// Quoter contract address (hex string, unparsed). Uniswap-only:
+    /// `"uniswap-v3"` requires it (its separate `QuoterV2`), while
+    /// `"balancer-v3"` quotes through the Router itself and leaves this `None`.
+    pub quoter: Option<String>,
     /// USDC token address (hex string, unparsed).
     pub usdc: String,
     /// Uniswap V3 fee tier (e.g. `3000` for 0.3%); required for
     /// `"uniswap-v3"`.
     pub uniswap_fee_tier: Option<u32>,
     /// Balancer V3 pool contract address (hex string, unparsed); required for
-    /// `"balancer-v3"`. Despite the field name, this is parsed as an
-    /// `Address`, not a bytes32: unlike Balancer V2, V3 pools are addressed
-    /// directly (no `poolId` indirection through the Vault) — see
-    /// `IBalancerV3Router.sol`'s `pool` parameter.
-    pub balancer_pool_id: Option<String>,
+    /// `"balancer-v3"`. Balancer V3 addresses pools directly, not by bytes32
+    /// id — unlike Balancer V2, there is no `poolId` indirection through the
+    /// Vault (see `IBalancerV3Router.sol`'s `pool` parameter).
+    pub balancer_pool_address: Option<String>,
     /// Uniswap V3 pool address (hex string, unparsed) for the TOKEN/USDC
     /// pair. Optional: when `Some`, lights up the advisory price-impact gate
     /// via `slot0`; when `None`, the gate stays inert (see [`from_config`] and
@@ -129,11 +130,11 @@ pub fn from_config<P: Provider + Clone + 'static>(
                     resolved.router
                 )
             })?;
-            let quoter: Address = resolved.quoter.parse().map_err(|e| {
-                anyhow::anyhow!(
-                    "swap_quoter_address {:?} is not a valid address: {e}",
-                    resolved.quoter
-                )
+            let quoter_str = resolved.quoter.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("swap_quoter_address required for --swap-venue uniswap-v3")
+            })?;
+            let quoter: Address = quoter_str.parse().map_err(|e| {
+                anyhow::anyhow!("swap_quoter_address {quoter_str:?} is not a valid address: {e}")
             })?;
             let usdc: Address = resolved.usdc.parse().map_err(|e| {
                 anyhow::anyhow!(
@@ -167,11 +168,11 @@ pub fn from_config<P: Provider + Clone + 'static>(
                     resolved.usdc
                 )
             })?;
-            let pool_str = resolved.balancer_pool_id.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("balancer_pool_id required for --swap-venue balancer-v3")
+            let pool_str = resolved.balancer_pool_address.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("swap_balancer_pool required for --swap-venue balancer-v3")
             })?;
             let pool: Address = pool_str.parse().map_err(|e| {
-                anyhow::anyhow!("balancer_pool_id {pool_str:?} is not a valid address: {e}")
+                anyhow::anyhow!("swap_balancer_pool {pool_str:?} is not a valid address: {e}")
             })?;
             Ok(SwapVenue::BalancerV3(BalancerV3Venue::new(
                 provider, router, pool, usdc, token, payer,
@@ -251,10 +252,10 @@ mod tests {
         let resolved = ResolvedSwap {
             venue: "uniswap-v3".to_string(),
             router: addr_hex(0x11),
-            quoter: addr_hex(0x22),
+            quoter: Some(addr_hex(0x22)),
             usdc: addr_hex(0x33),
             uniswap_fee_tier: Some(3000),
-            balancer_pool_id: None,
+            balancer_pool_address: None,
             pool: None,
         };
         let venue = from_config(
@@ -272,10 +273,10 @@ mod tests {
         let resolved = ResolvedSwap {
             venue: "uniswap-v3".to_string(),
             router: addr_hex(0x11),
-            quoter: addr_hex(0x22),
+            quoter: Some(addr_hex(0x22)),
             usdc: addr_hex(0x33),
             uniswap_fee_tier: None,
-            balancer_pool_id: None,
+            balancer_pool_address: None,
             pool: None,
         };
         let err = from_config(
@@ -289,14 +290,35 @@ mod tests {
     }
 
     #[test]
+    fn from_config_requires_quoter_for_uniswap_v3() {
+        let resolved = ResolvedSwap {
+            venue: "uniswap-v3".to_string(),
+            router: addr_hex(0x11),
+            quoter: None,
+            usdc: addr_hex(0x33),
+            uniswap_fee_tier: Some(3000),
+            balancer_pool_address: None,
+            pool: None,
+        };
+        let err = from_config(
+            unconnected_provider(),
+            &resolved,
+            Address::ZERO,
+            Address::ZERO,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("swap_quoter_address"), "{err}");
+    }
+
+    #[test]
     fn from_config_rejects_unknown_venue() {
         let resolved = ResolvedSwap {
             venue: "curve".to_string(),
             router: String::new(),
-            quoter: String::new(),
+            quoter: None,
             usdc: String::new(),
             uniswap_fee_tier: None,
-            balancer_pool_id: None,
+            balancer_pool_address: None,
             pool: None,
         };
         let err = from_config(
@@ -317,10 +339,10 @@ mod tests {
         let resolved = ResolvedSwap {
             venue: "balancer-v3".to_string(),
             router: addr_hex(0x11),
-            quoter: String::new(),
+            quoter: None,
             usdc: addr_hex(0x33),
             uniswap_fee_tier: None,
-            balancer_pool_id: None,
+            balancer_pool_address: None,
             pool: None,
         };
         let err = from_config(
@@ -330,7 +352,7 @@ mod tests {
             Address::ZERO,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("balancer_pool_id"), "{err}");
+        assert!(err.to_string().contains("swap_balancer_pool"), "{err}");
     }
 
     #[test]
@@ -338,10 +360,10 @@ mod tests {
         let resolved = ResolvedSwap {
             venue: "balancer-v3".to_string(),
             router: addr_hex(0x11),
-            quoter: String::new(),
+            quoter: None,
             usdc: addr_hex(0x33),
             uniswap_fee_tier: None,
-            balancer_pool_id: Some(addr_hex(0x55)),
+            balancer_pool_address: Some(addr_hex(0x55)),
             pool: None,
         };
         let venue = from_config(
@@ -355,14 +377,14 @@ mod tests {
     }
 
     #[test]
-    fn from_config_rejects_malformed_balancer_pool_id() {
+    fn from_config_rejects_malformed_balancer_pool_address() {
         let resolved = ResolvedSwap {
             venue: "balancer-v3".to_string(),
             router: addr_hex(0x11),
-            quoter: String::new(),
+            quoter: None,
             usdc: addr_hex(0x33),
             uniswap_fee_tier: None,
-            balancer_pool_id: Some("not-an-address".to_string()),
+            balancer_pool_address: Some("not-an-address".to_string()),
             pool: None,
         };
         let err = from_config(
@@ -372,7 +394,7 @@ mod tests {
             Address::ZERO,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("balancer_pool_id"), "{err}");
+        assert!(err.to_string().contains("swap_balancer_pool"), "{err}");
     }
 
     #[test]
@@ -380,10 +402,10 @@ mod tests {
         let resolved = ResolvedSwap {
             venue: "uniswap-v3".to_string(),
             router: "not-an-address".to_string(),
-            quoter: addr_hex(0x22),
+            quoter: Some(addr_hex(0x22)),
             usdc: addr_hex(0x33),
             uniswap_fee_tier: Some(3000),
-            balancer_pool_id: None,
+            balancer_pool_address: None,
             pool: None,
         };
         let err = from_config(

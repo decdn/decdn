@@ -42,7 +42,7 @@ struct FileBlockchain {
     swap_quoter_address: Option<String>,
     usdc_address: Option<String>,
     swap_fee_tier: Option<u32>,
-    swap_pool_id: Option<String>,
+    swap_balancer_pool: Option<String>,
     swap_pool_address: Option<String>,
 }
 
@@ -248,8 +248,10 @@ pub fn resolve_publish(
 }
 
 /// Resolve swap coordinates with flag > config precedence. Returns `None` when
-/// no venue is configured (token-mode). When a venue *is* named, the router,
-/// quoter, and usdc address are required and their absence errors here.
+/// no venue is configured (token-mode). When a venue *is* named, the router and
+/// usdc address are required and their absence errors here. The quoter is
+/// passed through as `Option` — only the Uniswap venue needs it (Balancer
+/// quotes through its router), so `from_config` enforces it per-venue.
 pub fn resolve_swap(
     chain: &cli::ChainArgs,
     file: &FileConfig,
@@ -266,8 +268,7 @@ pub fn resolve_swap(
     .ok_or_else(|| anyhow::anyhow!("swap_router_address required for --swap-venue {venue}"))?;
     let quoter = pick(&chain.swap_quoter_address, |b| {
         b.swap_quoter_address.clone()
-    })
-    .ok_or_else(|| anyhow::anyhow!("swap_quoter_address required for --swap-venue {venue}"))?;
+    });
     let usdc = pick(&chain.usdc_address, |b| b.usdc_address.clone())
         .ok_or_else(|| anyhow::anyhow!("usdc_address required for --swap-venue {venue}"))?;
     Ok(Some(ResolvedSwap {
@@ -278,10 +279,10 @@ pub fn resolve_swap(
         uniswap_fee_tier: chain
             .swap_fee_tier
             .or_else(|| bc.and_then(|b| b.swap_fee_tier)),
-        balancer_pool_id: chain
-            .swap_pool_id
+        balancer_pool_address: chain
+            .swap_balancer_pool
             .clone()
-            .or_else(|| bc.and_then(|b| b.swap_pool_id.clone())),
+            .or_else(|| bc.and_then(|b| b.swap_balancer_pool.clone())),
         pool: pick(&chain.swap_pool_address, |b| b.swap_pool_address.clone()),
     }))
 }
@@ -307,7 +308,7 @@ mod tests {
             swap_quoter_address: None,
             usdc_address: None,
             swap_fee_tier: None,
-            swap_pool_id: None,
+            swap_balancer_pool: None,
             swap_pool_address: None,
         }
     }
@@ -337,7 +338,7 @@ mod tests {
             swap_quoter_address: None,
             usdc_address: None,
             swap_fee_tier: None,
-            swap_pool_id: None,
+            swap_balancer_pool: None,
             swap_pool_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
@@ -361,7 +362,7 @@ mod tests {
             swap_quoter_address: None,
             usdc_address: None,
             swap_fee_tier: None,
-            swap_pool_id: None,
+            swap_balancer_pool: None,
             swap_pool_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
@@ -387,7 +388,7 @@ mod tests {
             swap_quoter_address: None,
             usdc_address: None,
             swap_fee_tier: None,
-            swap_pool_id: None,
+            swap_balancer_pool: None,
             swap_pool_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
@@ -427,7 +428,7 @@ mod tests {
             swap_quoter_address: None,
             usdc_address: None,
             swap_fee_tier: None,
-            swap_pool_id: None,
+            swap_balancer_pool: None,
             swap_pool_address: None,
         });
         let r = resolve_publish(&args, &file).unwrap();
@@ -465,6 +466,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_swap_balancer_needs_no_quoter() {
+        // Balancer quotes through its router, so a quoter is not required —
+        // `resolve_swap` must succeed with `quoter: None` and carry the pool.
+        let mut chain = empty_chain();
+        chain.swap_venue = Some("balancer-v3".into());
+        chain.swap_router_address = Some("0xROUTER".into());
+        chain.usdc_address = Some("0xUSDC".into());
+        chain.swap_balancer_pool = Some("0xBALPOOL".into());
+        let s = resolve_swap(&chain, &FileConfig::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.venue, "balancer-v3");
+        assert!(s.quoter.is_none());
+        assert_eq!(s.balancer_pool_address.as_deref(), Some("0xBALPOOL"));
+    }
+
+    #[test]
     fn resolve_swap_carries_pool_flag_beats_config() {
         let mut chain = empty_chain();
         chain.swap_venue = Some("uniswap-v3".into());
@@ -484,7 +502,7 @@ mod tests {
             swap_quoter_address: None,
             usdc_address: None,
             swap_fee_tier: None,
-            swap_pool_id: None,
+            swap_balancer_pool: None,
             swap_pool_address: Some("0xPOOLCONFIG".to_string()),
         });
         let s = resolve_swap(&chain, &file).unwrap().unwrap();
@@ -511,7 +529,7 @@ mod tests {
             swap_quoter_address: None,
             usdc_address: None,
             swap_fee_tier: None,
-            swap_pool_id: None,
+            swap_balancer_pool: None,
             swap_pool_address: Some("0xPOOLCONFIG".to_string()),
         });
         let s = resolve_swap(&chain, &file).unwrap().unwrap();

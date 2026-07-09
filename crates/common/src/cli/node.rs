@@ -568,12 +568,14 @@ pub struct ChainArgs {
     #[arg(long = "swap-fee-tier", value_name = "FEE")]
     pub swap_fee_tier: Option<u32>,
 
-    /// Balancer V3 pool id (bytes32 hex). Balancer venue only.
-    #[arg(long = "swap-pool-id", value_name = "POOLID")]
-    pub swap_pool_id: Option<String>,
+    /// Balancer V3 pool address (Balancer V3 addresses pools directly, not by
+    /// bytes32 id). Balancer venue only.
+    #[arg(long = "swap-balancer-pool", value_name = "ADDR")]
+    pub swap_balancer_pool: Option<String>,
 
-    /// Uniswap V3 pool address for the TOKEN/USDC pair; enables the
-    /// price-impact warning. Uniswap venue only.
+    /// Uniswap V3 TOKEN/USDC pool address, used for the price-impact `slot0`
+    /// read that enables the advisory price-impact warning. Uniswap venue only
+    /// (distinct from `--swap-balancer-pool`).
     #[arg(long = "swap-pool-address", value_name = "ADDR")]
     pub swap_pool_address: Option<String>,
 }
