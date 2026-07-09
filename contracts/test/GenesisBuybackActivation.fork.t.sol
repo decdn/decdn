@@ -97,8 +97,8 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
         act.uniSwapRouter = SWAP_ROUTER;
         act.uniPositionManager = POSITION_MANAGER;
         act.uniPoolFee = FEE;
-        act.uniUsdcSeed = USDC_SEED;
-        act.uniTokenSeed = TOKEN_SEED;
+        act.usdcSeed = USDC_SEED;
+        act.tokenSeed = TOKEN_SEED;
     }
 
     /// @notice The headline acceptance: flag ON + Uniswap venue lands the

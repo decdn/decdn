@@ -169,8 +169,8 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         act.uniSwapRouter = swapRouter;
         act.uniPositionManager = positionManager;
         act.uniPoolFee = 10_000;
-        act.uniUsdcSeed = USDC_SEED;
-        act.uniTokenSeed = TOKEN_SEED;
+        act.usdcSeed = USDC_SEED;
+        act.tokenSeed = TOKEN_SEED;
     }
 
     // External wrapper so `vm.expectRevert` catches reverts at the call boundary.
@@ -277,13 +277,10 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(cfg, _uniswapActivation(address(npm)));
     }
 
-    function test_balancer_revertsWhenPoolNotProvided() public {
-        BuybackActivation memory act;
-        act.activate = true;
-        act.venue = BuybackVenue.BALANCER;
-        act.keeper = keeper;
-        // balPool left zero — the genesis script does not seed Balancer POL.
-        vm.expectRevert(BaseProtocolDeploy.BalancerPoolNotProvided.selector);
-        this.externalRunFullDeploy(_config(), act);
-    }
+    // The Balancer venue creates + seeds its pool through the live Balancer V3
+    // factory/router (Permit2), so its full-bundle coverage is the gated Ethereum
+    // Sepolia fork suite `GenesisBuybackActivationBalancer.fork.t.sol` — the
+    // factory/vault/router stack is impractical to mock in-process. The keeper
+    // guard here (`test_revertsWhenKeeperMissing`) is venue-agnostic and fires
+    // before any venue-specific work, so it covers the Balancer path too.
 }

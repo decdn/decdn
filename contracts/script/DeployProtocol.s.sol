@@ -209,19 +209,25 @@ contract DeployProtocol is BaseProtocolDeploy {
     //     - `MIN_BUYBACK_AMOUNT`         (default 100e6 USDC)
     //     - `SLIPPAGE_BPS`               (default 200)
     //     - `EPOCH_CAP_FRACTION_BPS`     (default 1000 = 10%)
-    //   Uniswap venue (pool created + seeded in-script; deployer must hold the seed
-    //   TOKEN + USDC — set `INITIAL_TOKEN_HOLDER` to the deployer or fund it):
+    //   Both venues create + seed the pool in-script, so the deployer must hold the
+    //   seed TOKEN + USDC (set `INITIAL_TOKEN_HOLDER` to the deployer or fund it).
+    //   Uniswap venue:
     //     - `UNISWAP_SWAP_ROUTER`        — SwapRouter02 (required)
     //     - `UNISWAP_POSITION_MANAGER`   — NonfungiblePositionManager (required)
     //     - `UNISWAP_POOL_FEE`           (default 10000 = 1%)
     //     - `BUYBACK_USDC_SEED`          (default 10_000e6)
     //     - `BUYBACK_TOKEN_SEED`         (default 1_000_000e18; 1M TOKEN pairs the
     //                                      10k USDC seed at the $0.01 anchor)
-    //   Balancer venue (pool seeded off-script per ADR 018 § POL mechanics):
-    //     - `BALANCER_ROUTER`, `BALANCER_VAULT`, `BALANCER_POOL` (required)
+    //   Balancer venue (80/20 TOKEN/USDC weighted pool):
+    //     - `BALANCER_WEIGHTED_POOL_FACTORY` — WeightedPoolFactory (required)
+    //     - `BALANCER_ROUTER`, `BALANCER_VAULT` (required)
     //     - `PERMIT2_ADDRESS`            (default canonical Permit2)
+    //     - `BALANCER_SWAP_FEE`          (default 1e16 = 1%)
     //     - `SUB_SWAP_COUNT`             (default 4)
     //     - `SUB_SWAP_MIN_BLOCK_GAP`     (default 10)
+    //     - `BUYBACK_USDC_SEED`          (default 250_000e6)
+    //     - `BUYBACK_TOKEN_SEED`         (default 100_000_000e18; 100M TOKEN pairs
+    //                                      the 250k USDC seed at the $0.01 anchor)
     error UnknownBuybackVenue(string venue);
     error PoolFeeOutOfRange(uint256 fee);
 
@@ -246,15 +252,20 @@ contract DeployProtocol is BaseProtocolDeploy {
             uint256 fee = vm.envOr("UNISWAP_POOL_FEE", uint256(10_000));
             if (fee > type(uint24).max) revert PoolFeeOutOfRange(fee);
             act.uniPoolFee = uint24(fee);
-            act.uniUsdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(10_000e6));
-            act.uniTokenSeed = vm.envOr("BUYBACK_TOKEN_SEED", uint256(1_000_000e18));
+            // Constant-product full range: 10k USDC pairs 1M TOKEN at the $0.01 anchor.
+            act.usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(10_000e6));
+            act.tokenSeed = vm.envOr("BUYBACK_TOKEN_SEED", uint256(1_000_000e18));
         } else {
+            act.balFactory = vm.envAddress("BALANCER_WEIGHTED_POOL_FACTORY");
             act.balRouter = vm.envAddress("BALANCER_ROUTER");
             act.balVault = vm.envAddress("BALANCER_VAULT");
-            act.balPool = vm.envAddress("BALANCER_POOL");
             act.permit2 = vm.envOr("PERMIT2_ADDRESS", CANONICAL_PERMIT2);
+            act.balSwapFee = vm.envOr("BALANCER_SWAP_FEE", uint256(1e16)); // 1% (ADR 018 pool fee)
             act.balSubSwapCount = vm.envOr("SUB_SWAP_COUNT", uint256(4));
             act.balSubSwapMinBlockGap = vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10));
+            // 80/20 weighted: 250k USDC pairs 100M TOKEN at the $0.01 anchor.
+            act.usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(250_000e6));
+            act.tokenSeed = vm.envOr("BUYBACK_TOKEN_SEED", uint256(100_000_000e18));
         }
     }
 

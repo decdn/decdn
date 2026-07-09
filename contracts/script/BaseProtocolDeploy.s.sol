@@ -24,7 +24,9 @@ import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
 import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
 import { IUniswapV3SwapRouter } from "../src/interfaces/IUniswapV3SwapRouter.sol";
 import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
+import { IPermit2 } from "../src/interfaces/IPermit2.sol";
 import { INonfungiblePositionManager } from "./interfaces/IUniswapV3PoolCreation.sol";
+import { IBalancerV3RouterInit, IBalancerV3WeightedPoolFactory } from "./interfaces/IBalancerV3PoolCreation.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
@@ -174,17 +176,22 @@ abstract contract BaseProtocolDeploy is Script {
         uint256 minBuybackAmount;
         uint256 slippageBps;
         uint256 epochLiquidityCapFraction;
+        // Pool seed amounts (raw). Both venues create + seed the pool in-script;
+        // the venue-appropriate defaults differ (the 80/20 Balancer pool needs a
+        // different TOKEN:USDC ratio than the constant-product Uniswap pool to hit
+        // the same anchor price), so the reader defaults these per venue.
+        uint256 usdcSeed; // USDC seed (raw, 6-dec)
+        uint256 tokenSeed; // TOKEN seed (raw, 18-dec)
         // --- Uniswap venue (pool created + seeded in-script) ---
         address uniSwapRouter; // SwapRouter02 (swap + token-pull target)
         address uniPositionManager; // NonfungiblePositionManager (create + seed)
         uint24 uniPoolFee; // fee tier (e.g. 10000 = 1%)
-        uint256 uniUsdcSeed; // USDC seed (raw, 6-dec)
-        uint256 uniTokenSeed; // TOKEN seed (raw, 18-dec)
-        // --- Balancer venue (pool pre-seeded off-script) ---
-        address balRouter; // Balancer V3 Router
+        // --- Balancer venue (pool created + seeded in-script) ---
+        address balFactory; // WeightedPoolFactory (create the 80/20 pool)
+        address balRouter; // Balancer V3 Router (seed via Permit2 + swap target)
         address balVault; // Balancer V3 Vault (reads + approvals)
-        address balPool; // seeded 80/20 TOKEN/USDC weighted pool
         address permit2; // canonical Permit2 the V3 Router pulls through
+        uint256 balSwapFee; // pool swap fee (WAD; 1e16 = 1%)
         uint256 balSubSwapCount; // keeper TWAP sub-swap count (immutable on the burner)
         uint256 balSubSwapMinBlockGap; // keeper TWAP sub-swap block gap
     }
@@ -288,13 +295,10 @@ abstract contract BaseProtocolDeploy is Script {
     ///         `KEEPER_ROLE` holder can never `executeBuyback`, silently queueing
     ///         USDC in the burner forever.
     error MissingBuybackKeeper();
-    /// @notice The Uniswap seed left the pool with no USDC depth — the per-epoch
+    /// @notice The venue seed left the pool with no USDC depth — the per-epoch
     ///         cap denominator (`usdc.balanceOf(pool)`) would be zero, so the
     ///         "seed the pool before wiring" guard fails the deploy loudly.
     error PoolNotSeeded(address pool);
-    /// @notice `BUYBACK_VENUE=balancer` activation with no pre-seeded pool address;
-    ///         the genesis script does not seed Balancer POL (ADR 018 § POL mechanics).
-    error BalancerPoolNotProvided();
     /// @notice The deployer lacks the TOKEN/USDC balance the venue seed pulls.
     error InsufficientSeedBalance(address token, uint256 have, uint256 need);
     /// @notice Fee tier has no known Uniswap V3 tick spacing.
@@ -754,22 +758,25 @@ abstract contract BaseProtocolDeploy is Script {
         );
     }
 
-    /// @dev Balancer venue: wire an already-seeded 80/20 pool. The genesis script
-    ///      does not seed Balancer POL — that is a treasury/Permit2 act per ADR 018
-    ///      § POL mechanics — so the pool address is a required input and the
-    ///      burner constructor fail-fasts if it is not a live USDC/TOKEN pair.
+    /// @dev Balancer venue: create + seed the 80/20 TOKEN/USDC weighted pool
+    ///      in-script via the `WeightedPoolFactory` + Router (Permit2), then deploy
+    ///      the concrete burner bound to it, the Vault, and the Router. The burner
+    ///      constructor fail-fasts if the pool is not a live, registered USDC/TOKEN
+    ///      pair (the seed above makes it one), which is the "seed before wire"
+    ///      guard for this venue — the Vault custodies reserves, so there is no
+    ///      pool-held USDC balance to check as there is for Uniswap.
     function _activateBalancer(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d)
         internal
         returns (GuardedBuybackBurner)
     {
-        if (act.balPool == address(0)) revert BalancerPoolNotProvided();
+        address pool = _createAndSeedBalancerPool(cfg, act, d);
         return new BuybackBurnerBalancerV3(
             cfg.usdc,
             ERC20Burnable(address(d.token)),
             cfg.deployer,
             BuybackBurnerBalancerV3.Config({
                 swapRouter_: IBalancerV3Router(act.balRouter),
-                pool_: act.balPool,
+                pool_: pool,
                 vault_: act.balVault,
                 permit2_: act.permit2,
                 subSwapCount_: act.balSubSwapCount,
@@ -781,6 +788,83 @@ abstract contract BaseProtocolDeploy is Script {
                 epochLiquidityCapFraction_: act.epochLiquidityCapFraction
             })
         );
+    }
+
+    /// @dev Create the 80/20 TOKEN/USDC weighted pool through the live
+    ///      `WeightedPoolFactory` and seed it through the Router (Permit2). Tokens
+    ///      are sorted ascending (Vault `registerPool` invariant); the weights and
+    ///      seed amounts track the sorted order so TOKEN keeps 80% and USDC 20%.
+    ///      Pulls both legs from the deployer, so the deployer MUST hold the seed
+    ///      TOKEN + USDC (set `INITIAL_TOKEN_HOLDER` to the deployer, or fund it).
+    function _createAndSeedBalancerPool(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d)
+        internal
+        returns (address pool)
+    {
+        IERC20 usdc = cfg.usdc;
+        IERC20 token = IERC20(address(d.token));
+        _requireSeedBalance(usdc, cfg.deployer, act.usdcSeed);
+        _requireSeedBalance(token, cfg.deployer, act.tokenSeed);
+
+        bool usdcFirst = address(usdc) < address(token);
+        IBalancerV3WeightedPoolFactory.TokenConfig[] memory tokens = new IBalancerV3WeightedPoolFactory.TokenConfig[](2);
+        uint256[] memory weights = new uint256[](2);
+        {
+            IBalancerV3WeightedPoolFactory.TokenConfig memory usdcCfg = IBalancerV3WeightedPoolFactory.TokenConfig({
+                token: usdc,
+                tokenType: IBalancerV3WeightedPoolFactory.TokenType.STANDARD,
+                rateProvider: address(0),
+                paysYieldFees: false
+            });
+            IBalancerV3WeightedPoolFactory.TokenConfig memory tokenCfg = IBalancerV3WeightedPoolFactory.TokenConfig({
+                token: token,
+                tokenType: IBalancerV3WeightedPoolFactory.TokenType.STANDARD,
+                rateProvider: address(0),
+                paysYieldFees: false
+            });
+            tokens[0] = usdcFirst ? usdcCfg : tokenCfg;
+            tokens[1] = usdcFirst ? tokenCfg : usdcCfg;
+            weights[0] = usdcFirst ? 0.2e18 : 0.8e18;
+            weights[1] = usdcFirst ? 0.8e18 : 0.2e18;
+        }
+
+        IBalancerV3WeightedPoolFactory.PoolRoleAccounts memory roles = IBalancerV3WeightedPoolFactory.PoolRoleAccounts({
+            pauseManager: address(0), swapFeeManager: address(0), poolCreator: address(0)
+        });
+
+        pool = IBalancerV3WeightedPoolFactory(act.balFactory)
+            .create(
+                "deCDN 80TOKEN-20USDC",
+                "dcdn-8020",
+                tokens,
+                weights,
+                roles,
+                act.balSwapFee,
+                address(0), // no hooks
+                false, // enableDonation
+                false, // disableUnbalancedLiquidity
+                keccak256(abi.encodePacked(address(token), address(usdc))) // salt (unique per fresh TOKEN)
+            );
+
+        IERC20[] memory initTokens = new IERC20[](2);
+        uint256[] memory initAmounts = new uint256[](2);
+        initTokens[0] = tokens[0].token;
+        initTokens[1] = tokens[1].token;
+        initAmounts[0] = usdcFirst ? act.usdcSeed : act.tokenSeed;
+        initAmounts[1] = usdcFirst ? act.tokenSeed : act.usdcSeed;
+
+        _permit2Approve(usdc, act, act.usdcSeed);
+        _permit2Approve(token, act, act.tokenSeed);
+
+        // slither-disable-next-line unused-return
+        IBalancerV3RouterInit(act.balRouter).initialize(pool, initTokens, initAmounts, 0, false, "");
+    }
+
+    /// @dev The two-step Permit2 grant the V3 Router requires to pull `amount` of
+    ///      `erc20` from the deployer: ERC20-approve Permit2, then set the Permit2
+    ///      allowance for the Router.
+    function _permit2Approve(IERC20 erc20, BuybackActivation memory act, uint256 amount) internal {
+        erc20.forceApprove(act.permit2, type(uint256).max);
+        IPermit2(act.permit2).approve(address(erc20), act.balRouter, uint160(amount), uint48(block.timestamp + 1 days));
     }
 
     /// @dev Create the TOKEN/USDC Uniswap V3 pool (idempotent) at the seed-implied
@@ -798,11 +882,11 @@ abstract contract BaseProtocolDeploy is Script {
         // encodes token1-per-token0 in raw units, matching the seed ratio, so a
         // full-range position deploys both legs without a residual.
         (address token0, address token1, uint256 amount0, uint256 amount1) = address(usdc) < address(token)
-            ? (address(usdc), address(token), act.uniUsdcSeed, act.uniTokenSeed)
-            : (address(token), address(usdc), act.uniTokenSeed, act.uniUsdcSeed);
+            ? (address(usdc), address(token), act.usdcSeed, act.tokenSeed)
+            : (address(token), address(usdc), act.tokenSeed, act.usdcSeed);
 
-        _requireSeedBalance(usdc, cfg.deployer, act.uniUsdcSeed);
-        _requireSeedBalance(token, cfg.deployer, act.uniTokenSeed);
+        _requireSeedBalance(usdc, cfg.deployer, act.usdcSeed);
+        _requireSeedBalance(token, cfg.deployer, act.tokenSeed);
 
         uint160 sqrtPriceX96 = _sqrtPriceX96(amount1, amount0);
 
