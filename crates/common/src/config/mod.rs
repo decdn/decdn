@@ -168,6 +168,10 @@ pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 /// `appendix-poc-production-seams.md` §Seam 8).
 pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 
+/// Default seconds between the blacklist watcher's periodic replay + re-scope
+/// pass (ADR 011 §Polling's 10-minute `getBlacklistVersion` cadence).
+pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
+
 /// Default maximum concurrently held (eviction-exempt) blobs for the
 /// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
 /// peers probing one hash share a single slot. Re-exported from the
@@ -1094,6 +1098,9 @@ fn resolve_blockchain_into(
     let content_blacklist_from_block = file
         .and_then(|b| b.content_blacklist_from_block)
         .unwrap_or(0);
+    let content_blacklist_poll_interval_sec = file
+        .and_then(|b| b.content_blacklist_poll_interval_sec)
+        .unwrap_or(DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC);
 
     let chain_id = cli
         .chain_id
@@ -1227,6 +1234,7 @@ fn resolve_blockchain_into(
         slash_judge_address,
         content_blacklist_address,
         content_blacklist_from_block,
+        content_blacklist_poll_interval_sec,
         chain_id,
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
@@ -8031,6 +8039,7 @@ mod tests {
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
             content_blacklist_from_block: None,
+            content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: Some("https://file-loses.example/rpc".to_string()),
@@ -8067,6 +8076,7 @@ mod tests {
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
             content_blacklist_from_block: None,
+            content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: Some("https://file-only.example/rpc".to_string()),
@@ -8298,6 +8308,7 @@ mod tests {
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
             content_blacklist_from_block: None,
+            content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8345,6 +8356,7 @@ mod tests {
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
             content_blacklist_from_block: None,
+            content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8391,6 +8403,7 @@ mod tests {
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
             content_blacklist_from_block: None,
+            content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8437,6 +8450,7 @@ mod tests {
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
             content_blacklist_from_block: None,
+            content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8506,6 +8520,7 @@ mod tests {
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
             content_blacklist_from_block: None,
+            content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8551,6 +8566,7 @@ mod tests {
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
             content_blacklist_from_block: None,
+            content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8591,6 +8607,7 @@ mod tests {
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
             content_blacklist_from_block: None,
+            content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,

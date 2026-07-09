@@ -1290,7 +1290,7 @@ pub async fn run(
     // cascades to DHT-announce suppression (the republisher's `is_evicted`
     // gate), probe `has_blob:false`, and delivery refusal — the node's only
     // local protection against the slash for serving blacklisted content.
-    let blacklist_watcher_stop_tx = match (
+    let blacklist_watcher_shutdown = match (
         cfg.blockchain.content_blacklist_address.as_deref(),
         blacklist_rpc_url,
     ) {
@@ -1298,7 +1298,7 @@ pub async fn run(
             let content_blacklist_addr: Address = addr.parse().with_context(|| {
                 format!("blockchain.content_blacklist_address {addr:?} is not a valid address")
             })?;
-            let (stop_tx, stop_rx) = oneshot::channel::<()>();
+            let shutdown = CancellationToken::new();
             tasks.spawn(crate::blacklist_watcher::run(
                 with_poll_interval(
                     ProviderBuilder::new().connect_http(url),
@@ -1308,9 +1308,10 @@ pub async fn run(
                 eth_signer.address(),
                 cache.clone(),
                 cfg.blockchain.content_blacklist_from_block,
-                stop_rx,
+                Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
+                shutdown.clone(),
             ));
-            Some(stop_tx)
+            Some(shutdown)
         }
         _ => None,
     };
@@ -1823,8 +1824,8 @@ pub async fn run(
     let _ = probe_rate_limit_gc_stop_tx.send(());
     let _ = republish_stop_tx.send(());
     let _ = bucket_refresh_stop_tx.send(());
-    if let Some(tx) = blacklist_watcher_stop_tx {
-        let _ = tx.send(());
+    if let Some(token) = blacklist_watcher_shutdown {
+        token.cancel();
     }
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
@@ -2984,6 +2985,7 @@ mod tests {
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_from_block: 0,
+                content_blacklist_poll_interval_sec: 600,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: decdn_common::config::ResolvedCache {

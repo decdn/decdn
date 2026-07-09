@@ -174,6 +174,13 @@ pub struct BlockchainConfig {
     /// on an established L2). Only consulted when `content_blacklist_address` is
     /// set. Mirrors `origin_directory_from_block`.
     pub content_blacklist_from_block: Option<u64>,
+    /// Seconds between the blacklist watcher's periodic replay + re-scope pass
+    /// (ADR 011 §Polling cadence). This backstop is what catches scope changes
+    /// with no `ContentBlacklist` event — an operator region/ripening transition
+    /// or an appeal reversal/lapse re-enabling a suspended entry. Absent =>
+    /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (600s). Only
+    /// consulted when `content_blacklist_address` is set.
+    pub content_blacklist_poll_interval_sec: Option<u64>,
     /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
     /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
     /// network target — matches the chain id bound on the runtime signer).

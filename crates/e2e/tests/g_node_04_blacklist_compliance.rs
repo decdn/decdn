@@ -16,6 +16,11 @@
 //!   ignored by the DE node. A global sentinel blob (held only by DE, blacklisted
 //!   *after* the regional entry) is the ordering barrier: DE evicting it proves
 //!   its watcher processed past the regional entry before we assert non-eviction.
+//! - **Scope transition (`regional_scope_transition`):** a US-regional entry is
+//!   retained-but-not-evicted by a DE operator, then evicted after the operator
+//!   `updateRegion`s to US — a scope change that emits no `ContentBlacklist`
+//!   event, so only the watcher's periodic re-scope of its retained deny-set
+//!   catches it.
 //!
 //! **Coverage.** The journey exercises all three serving seams end-to-end
 //! against the daemon — delivery refusal (matched to `EvictedSinceProbe`), the
@@ -85,6 +90,14 @@ async fn regional_blacklist_scope() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_regional()))
         .await
         .context("regional blacklist e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn regional_scope_transition() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_scope_transition()))
+        .await
+        .context("scope-transition e2e exceeded the overall timeout")??;
     Ok(())
 }
 
@@ -243,6 +256,50 @@ async fn run_regional() -> anyhow::Result<()> {
     assert_eq!(
         outcome.bytes, payload,
         "out-of-region node must keep delivering the blob"
+    );
+
+    Ok(())
+}
+
+/// A blacklist entry that is out of scope when first seen must still be evicted
+/// once a later transition brings it into scope — even though that transition
+/// (here `updateRegion`) emits no `ContentBlacklist` event, so it is only caught
+/// by the watcher's periodic re-scope of its retained deny-set.
+async fn run_scope_transition() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let chain = ChainFixture::launch().await?;
+    let payload = vec![0xE7u8; 2 * MIB];
+    // The operator self-attests region DE and holds H.
+    let (node, hash) = NodeFixture::launch(&chain, "DE", &payload).await?;
+    let admin = node.admin_client()?;
+    assert!(evict_was_present(&admin, hash).await?, "node must hold H");
+
+    // Blacklist H regionally for US — out of scope for the DE operator. The
+    // watcher retains it in its deny-set but must NOT evict.
+    chain
+        .add_hash_regional(region_key("US"), to_b256(hash))
+        .await?;
+    // Several 2s poll cycles to confirm the out-of-scope entry is not evicted.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(
+        evict_was_present(&admin, hash).await?,
+        "out-of-region entry must NOT be evicted before the region changes"
+    );
+
+    // Operator moves to US (no ContentBlacklist event fires) — H is now in scope.
+    chain.update_region(&node.operator, "US").await?;
+
+    // The periodic re-scope of the retained deny-set now finds H in scope and evicts.
+    let evicted = poll(Duration::from_secs(60), || async {
+        Ok((!evict_was_present(&admin, hash).await?).then_some(()))
+    })
+    .await?;
+    assert!(
+        evicted.is_some(),
+        "node must evict once the region transition brings H into scope"
     );
 
     Ok(())

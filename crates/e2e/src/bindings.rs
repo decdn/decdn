@@ -59,6 +59,7 @@ alloy::sol! {
         function isActive(address operator) external view returns (bool);
         function bindingNonce(address operator) external view returns (uint64);
         function registrationNonce(bytes32 nodeId) external view returns (uint64);
+        function updateRegion(string newRegion) external;
     }
 
     /// Buyer-side `openChannel` (omitted by the seller-only production binding)

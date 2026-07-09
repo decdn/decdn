@@ -793,6 +793,7 @@ impl RuntimeReloadState {
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_from_block: 0,
+                content_blacklist_poll_interval_sec: 600,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: ResolvedCache {
@@ -1303,6 +1304,7 @@ mod tests {
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_from_block: 0,
+                content_blacklist_poll_interval_sec: 600,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: ResolvedCache {

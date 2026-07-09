@@ -7,16 +7,17 @@
 //! `isHashBlacklistedForOperator` view, so region packing and the ADR 030
 //! ripening math never leave the chain.
 //!
-//! **Event-sourced deny-set.** The set of blacklisted hashes is learned from
-//! `HashBlacklisted` logs replayed from a checkpoint block (the configured
-//! deployment block on first pass), plus a live event subscription for the fast
-//! path. `ContentBlacklist` exposes no enumeration view, so events are the only
-//! source of truth. Replaying from a checkpoint — rather than scanning the
-//! currently-held blobs — is what lets the watcher pre-block a hash that was
-//! blacklisted while the node was offline and is *not yet held*: `cache.evict`
-//! is sticky and works on absent hashes, so the pull-through admission gate
-//! (`handlers/client.rs`, `is_evicted`) refuses a later origin fill. It also
-//! makes each pass O(blacklist) rather than O(held).
+//! **Event-sourced, re-scoped deny-set.** The set of blacklisted hashes is
+//! learned from `HashBlacklisted` logs replayed from a checkpoint block (the
+//! configured deployment block on first pass) plus a live subscription.
+//! `ContentBlacklist` exposes no enumeration view, so events are the only
+//! source. Every seen-but-not-yet-evicted hash is retained in `known` —
+//! *including* ones currently out of scope (wrong region) or fast-track
+//! suspended — and re-scoped on every periodic pass. This is essential: a hash
+//! can become live + in scope with **no** `HashBlacklisted` event — an operator
+//! region/ripening change (`CapacityBond.updateRegion`) or an appeal
+//! reversal/lapse that clears `suspended` — and the advanced checkpoint means
+//! the original log is never replayed. Re-scoping `known` is what catches those.
 //!
 //! Eviction is the single lever, and it cascades to every serving surface:
 //! [`decdn_cache::CacheEngine::evict`] durably records the takedown (survives
@@ -24,33 +25,32 @@
 //! tick (its `is_evicted` gate), the probe handler stops signing
 //! `has_blob: true` once the blob leaves the store, and the client handler
 //! refuses delivery with `EvictedSinceProbe` while never re-pull-filling it.
+//! `evict` is sticky and works on absent hashes, so a hash blacklisted while the
+//! node was offline (and not yet held) is still pre-blocked.
 //!
-//! **Resilience.** The replay/reconcile runs every cycle *regardless of the
-//! subscription* (it uses `eth_getLogs`, so an endpoint whose filter API is
-//! broken still enforces), the subscribe await is bounded and raced against
-//! shutdown, a per-hash scope check that errors is queued for retry on the next
-//! periodic tick, and clean stream-ends are throttled so a filter that expires
-//! on the first poll can't spin. Serving a blacklisted hash is slashable
-//! (`SlashJudge.submitBlacklistChallenge`), so prompt eviction is the node's
-//! only local protection.
-//!
-//! `HashRemoved` / appeal-driven un-eviction is intentionally NOT handled here:
-//! eviction is sticky by design, and the resume-after-appeal path is a separate
-//! follow-up (ADR 011 § resumption).
+//! **Resilience.** Replay/re-scope runs every cycle regardless of the
+//! subscription (`eth_getLogs`/`eth_call` work even when the filter API is
+//! broken); every RPC read is bounded by a per-call timeout; the whole
+//! reconcile is interruptible by shutdown (checked between windows/hashes) so a
+//! large backlog cannot overrun the runtime shutdown deadline; the subscribe is
+//! shutdown-raced; and clean stream-ends are throttled. Serving a blacklisted
+//! hash is slashable (`SlashJudge.submitBlacklistChallenge`), so prompt eviction
+//! is the node's only local protection.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
+use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use decdn_cache::{CacheEngine, Hash};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::content_blacklist::ContentBlacklist;
 use decdn_incentive::content_blacklist::ContentBlacklist::{HashBlacklisted, HashRemoved};
 use futures_util::StreamExt;
-use tokio::sync::oneshot;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::watch_contract_events;
@@ -59,9 +59,6 @@ use crate::chain_events::watch_contract_events;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Backoff ceiling — matches the other on-chain watchers.
 const MAX_BACKOFF: Duration = Duration::from_mins(1);
-/// Cadence of the periodic replay + scope-retry that backstops the live event
-/// stream. Matches ADR 011 §Polling's 10-minute `getBlacklistVersion` cadence.
-const RECONCILE_INTERVAL: Duration = Duration::from_mins(10);
 /// Per-call ceiling on RPC reads (scope view, subscribe, log query, head) so a
 /// stalled provider — which has no request timeout configured — cannot wedge the
 /// watcher.
@@ -76,10 +73,10 @@ const MIN_STREAM_SURVIVAL: Duration = Duration::from_secs(30);
 
 /// Outcome of one subscribe → follow cycle.
 enum Cycle {
-    /// `shutdown` fired — exit the watcher.
+    /// Shutdown fired — exit the watcher.
     Shutdown,
     /// Subscription failed or the stream ended — re-subscribe (the next cycle
-    /// replays again first, so no enforcement gap depends on the subscription).
+    /// reconciles again first, so no enforcement gap depends on the subscription).
     Resubscribe,
 }
 
@@ -89,28 +86,30 @@ enum Follow {
     StreamEnded,
 }
 
-/// Mutable watcher state carried across cycles: the next block to replay from,
-/// and hashes whose scope check errored and must be retried.
+/// Mutable watcher state carried across cycles.
 struct WatcherState {
     /// Next block the `HashBlacklisted` replay resumes from (advances per
     /// successfully-queried window).
     checkpoint: u64,
-    /// Hashes seen in an event/replay whose scope check hit a transient RPC
-    /// error — retried on each periodic tick until resolved (bounded by the
-    /// blacklist size, since already-evicted hashes are short-circuited).
-    pending: HashSet<Hash>,
+    /// Every blacklisted hash seen and not yet locally evicted — including
+    /// out-of-scope and suspended entries — re-scoped on each reconcile so a
+    /// later region/ripening or appeal transition (which emits no
+    /// `HashBlacklisted`) still leads to eviction.
+    known: HashSet<Hash>,
 }
 
-/// Run the blacklist compliance watcher until `shutdown` fires. `from_block` is
-/// where the first `HashBlacklisted` replay starts (the `ContentBlacklist`
-/// deployment block; `0` scans all history).
+/// Run the blacklist compliance watcher until `shutdown` is cancelled.
+/// `from_block` is where the first `HashBlacklisted` replay starts (the
+/// `ContentBlacklist` deployment block; `0` scans all history);
+/// `poll_interval` is the periodic replay + re-scope cadence.
 pub(crate) async fn run<P>(
     provider: P,
     contract_addr: Address,
     operator: Address,
     cache: CacheEngine,
     from_block: u64,
-    mut shutdown: oneshot::Receiver<()>,
+    poll_interval: Duration,
+    shutdown: CancellationToken,
 ) where
     P: Provider + Clone,
 {
@@ -119,7 +118,7 @@ pub(crate) async fn run<P>(
 
     let mut state = WatcherState {
         checkpoint: from_block,
-        pending: HashSet::new(),
+        known: HashSet::new(),
     };
     let mut backoff = INITIAL_BACKOFF;
     loop {
@@ -128,7 +127,8 @@ pub(crate) async fn run<P>(
             operator,
             &cache,
             &mut state,
-            &mut shutdown,
+            poll_interval,
+            &shutdown,
             &mut backoff,
         )
         .await
@@ -139,24 +139,26 @@ pub(crate) async fn run<P>(
     }
 }
 
-/// One cycle: replay+retry regardless of subscription health (#compliance under
-/// a broken filter API), then subscribe (bounded + shutdown-raced), then follow
-/// the live stream with a periodic replay/retry backstop.
+/// One cycle: reconcile (regardless of subscription health), then subscribe
+/// (bounded + shutdown-raced), then follow the live stream with a periodic
+/// reconcile backstop.
+#[allow(clippy::too_many_arguments)]
 async fn run_cycle<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
-    shutdown: &mut oneshot::Receiver<()>,
+    poll_interval: Duration,
+    shutdown: &CancellationToken,
     backoff: &mut Duration,
 ) -> Cycle
 where
     P: Provider + Clone,
 {
-    // Enforce first, independent of the subscription: replay new blacklist logs
-    // and retry any queued scope checks. `eth_getLogs` works even when the
-    // filter API used by the subscription does not.
-    reconcile(contract, operator, cache, state).await;
+    reconcile(contract, operator, cache, state, shutdown).await;
+    if shutdown.is_cancelled() {
+        return Cycle::Shutdown;
+    }
 
     // Subscribe, bounded by RPC_CALL_TIMEOUT and raced against shutdown so a hung
     // `eth_newFilter` cannot wedge the watcher or block graceful shutdown.
@@ -166,7 +168,7 @@ where
         [HashBlacklisted::SIGNATURE_HASH, HashRemoved::SIGNATURE_HASH],
     );
     let subscribed = tokio::select! {
-        _ = &mut *shutdown => return Cycle::Shutdown,
+        () = shutdown.cancelled() => return Cycle::Shutdown,
         r = tokio::time::timeout(RPC_CALL_TIMEOUT, attempt) => r,
     };
     let mut stream = match subscribed {
@@ -190,18 +192,35 @@ where
     *backoff = INITIAL_BACKOFF;
 
     let started = Instant::now();
-    let outcome = follow_stream(&mut stream, contract, operator, cache, state, shutdown).await;
+    let outcome = follow_stream(
+        &mut stream,
+        contract,
+        operator,
+        cache,
+        state,
+        poll_interval,
+        shutdown,
+    )
+    .await;
     after_follow(outcome, started, backoff, shutdown).await
 }
 
-/// Map a [`Follow`] outcome to the next [`Cycle`]. A stream that ended before
-/// [`MIN_STREAM_SURVIVAL`] is throttled (a filter that expires on the first poll
-/// must not spin); a longer-lived one resubscribes immediately.
+/// Sleep `*backoff` (shutdown-raced), grow it, and ask for a resubscribe.
+async fn backoff_then_resubscribe(backoff: &mut Duration, shutdown: &CancellationToken) -> Cycle {
+    if sleep_or_cancel(*backoff, shutdown).await {
+        return Cycle::Shutdown;
+    }
+    *backoff = (*backoff * 2).min(MAX_BACKOFF);
+    Cycle::Resubscribe
+}
+
+/// Map a [`Follow`] outcome to the next [`Cycle`], throttling a stream that ended
+/// before [`MIN_STREAM_SURVIVAL`] so a first-poll filter expiry cannot spin.
 async fn after_follow(
     outcome: Follow,
     started: Instant,
     backoff: &mut Duration,
-    shutdown: &mut oneshot::Receiver<()>,
+    shutdown: &CancellationToken,
 ) -> Cycle {
     match outcome {
         Follow::Shutdown => Cycle::Shutdown,
@@ -212,44 +231,32 @@ async fn after_follow(
     }
 }
 
-/// Sleep `*backoff` (shutdown-raced), grow it, and ask for a resubscribe. Returns
-/// `Cycle::Shutdown` if shutdown fired during the sleep.
-async fn backoff_then_resubscribe(
-    backoff: &mut Duration,
-    shutdown: &mut oneshot::Receiver<()>,
-) -> Cycle {
-    if sleep_or_shutdown(*backoff, shutdown).await {
-        return Cycle::Shutdown;
-    }
-    *backoff = (*backoff * 2).min(MAX_BACKOFF);
-    Cycle::Resubscribe
-}
-
 /// Consume the live stream, evicting on each `HashBlacklisted`, and run a
-/// periodic replay + scope-retry on the side. Returns when shutdown fires or the
-/// stream ends.
+/// periodic reconcile (replay + re-scope) on the side.
+#[allow(clippy::too_many_arguments)]
 async fn follow_stream<P, S>(
     stream: &mut S,
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
-    shutdown: &mut oneshot::Receiver<()>,
+    poll_interval: Duration,
+    shutdown: &CancellationToken,
 ) -> Follow
 where
     P: Provider + Clone,
-    S: futures_util::Stream<Item = alloy::rpc::types::Log> + Unpin,
+    S: futures_util::Stream<Item = Log> + Unpin,
 {
     // First tick one interval out — the cycle already reconciled before us.
-    let mut tick = interval_at(Instant::now() + RECONCILE_INTERVAL, RECONCILE_INTERVAL);
+    let mut tick = interval_at(Instant::now() + poll_interval, poll_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = &mut *shutdown => {
+            () = shutdown.cancelled() => {
                 debug!("blacklist watcher shutting down");
                 return Follow::Shutdown;
             }
-            _ = tick.tick() => reconcile(contract, operator, cache, state).await,
+            _ = tick.tick() => reconcile(contract, operator, cache, state, shutdown).await,
             maybe_log = stream.next() => {
                 match maybe_log {
                     Some(log) => handle_log(contract, operator, cache, state, log).await,
@@ -260,61 +267,148 @@ where
     }
 }
 
-/// Replay `HashBlacklisted` logs from the checkpoint to head (advancing the
-/// checkpoint per queried window) and retry any pending scope checks.
+/// Replay new `HashBlacklisted` logs into `known`, then re-scope the whole
+/// `known` set, evicting any now in scope. Interruptible by shutdown.
 async fn reconcile<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
+    shutdown: &CancellationToken,
 ) where
     P: Provider + Clone,
 {
-    replay(contract, operator, cache, state).await;
-    drain_pending(contract, operator, cache, state).await;
+    replay(contract, cache, state, shutdown).await;
+    rescan(contract, operator, cache, state, shutdown).await;
 }
 
 /// Windowed `eth_getLogs` replay of `HashBlacklisted` from `state.checkpoint` to
-/// head. On any query error the pass stops with the checkpoint at the last
-/// successful window (retried next tick); per-hash scope errors are queued.
+/// head, inserting each not-yet-evicted hash into `known`. Advances the
+/// checkpoint per queried window; stops on any query error (retried next tick)
+/// or shutdown.
 async fn replay<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
-    operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
+    shutdown: &CancellationToken,
 ) where
     P: Provider + Clone,
 {
     let Some(head) = head_block(contract).await else {
         return;
     };
-    let mut evicted = 0usize;
     while state.checkpoint <= head {
+        if shutdown.is_cancelled() {
+            return;
+        }
         let from = state.checkpoint;
         let to = from.saturating_add(REPLAY_WINDOW_BLOCKS - 1).min(head);
         let Some(logs) = query_window(contract, from, to).await else {
             return; // checkpoint stays at `from`; retried next tick
         };
         for (event, _log) in logs {
-            if evict_scoped(
-                contract,
-                operator,
-                cache,
-                Hash::from_bytes(event.hash.0),
-                state,
-            )
-            .await
-            {
-                evicted = evicted.saturating_add(1);
+            let hash = Hash::from_bytes(event.hash.0);
+            if !cache.is_evicted(hash) {
+                state.known.insert(hash);
             }
         }
         state.checkpoint = to.saturating_add(1);
     }
+}
+
+/// Re-scope every hash in `known` and evict those now in scope. Interruptible by
+/// shutdown between hashes.
+async fn rescan<P>(
+    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
+    operator: Address,
+    cache: &CacheEngine,
+    state: &mut WatcherState,
+    shutdown: &CancellationToken,
+) where
+    P: Provider + Clone,
+{
+    let snapshot: Vec<Hash> = state.known.iter().copied().collect();
+    let mut evicted = 0usize;
+    for hash in snapshot {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        if recheck(contract, operator, cache, state, hash).await {
+            evicted = evicted.saturating_add(1);
+        }
+    }
     if evicted > 0 {
-        info!(
-            evicted,
-            "blacklist watcher replay evicted blacklisted blobs"
-        );
+        info!(evicted, "blacklist watcher evicted blacklisted blobs");
+    }
+}
+
+/// Handle one live log: `HashBlacklisted` re-checks the hash; `HashRemoved`
+/// drops it from `known` (hygiene — eviction stays sticky).
+async fn handle_log<P>(
+    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
+    operator: Address,
+    cache: &CacheEngine,
+    state: &mut WatcherState,
+    log: Log,
+) where
+    P: Provider + Clone,
+{
+    match log.topic0() {
+        Some(topic) if *topic == HashBlacklisted::SIGNATURE_HASH => {
+            match HashBlacklisted::decode_log_data(&log.inner.data) {
+                Ok(event) => {
+                    recheck(
+                        contract,
+                        operator,
+                        cache,
+                        state,
+                        Hash::from_bytes(event.hash.0),
+                    )
+                    .await;
+                }
+                Err(err) => warn!(err = %err, "blacklist watcher: undecodable HashBlacklisted log"),
+            }
+        }
+        Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => {
+            if let Ok(event) = HashRemoved::decode_log_data(&log.inner.data) {
+                let hash = Hash::from_bytes(event.hash.0);
+                state.known.remove(&hash);
+                debug!(%hash, "blacklist entry removed on-chain (local eviction stays sticky)");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Retain `hash` in `known` and evict it if in scope. Returns `true` iff an
+/// eviction was performed. Out-of-scope/suspended (`Some(false)`) and RPC-error
+/// (`None`) hashes stay in `known` for the next re-scope; already-evicted hashes
+/// are dropped from `known`.
+async fn recheck<P>(
+    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
+    operator: Address,
+    cache: &CacheEngine,
+    state: &mut WatcherState,
+    hash: Hash,
+) -> bool
+where
+    P: Provider + Clone,
+{
+    if cache.is_evicted(hash) {
+        state.known.remove(&hash);
+        return false;
+    }
+    state.known.insert(hash);
+    match scope_check(contract, operator, hash).await {
+        Some(true) => {
+            if evict(cache, hash).await {
+                state.known.remove(&hash);
+                true
+            } else {
+                false
+            }
+        }
+        Some(false) | None => false,
     }
 }
 
@@ -342,7 +436,7 @@ async fn query_window<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     from: u64,
     to: u64,
-) -> Option<Vec<(HashBlacklisted, alloy::rpc::types::Log)>>
+) -> Option<Vec<(HashBlacklisted, Log)>>
 where
     P: Provider + Clone,
 {
@@ -375,105 +469,9 @@ where
     }
 }
 
-/// Retry the queued scope checks via [`evict_scoped`], which already removes a
-/// hash once resolved (evicted or out-of-scope) and keeps it on a repeated error.
-async fn drain_pending<P>(
-    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
-    operator: Address,
-    cache: &CacheEngine,
-    state: &mut WatcherState,
-) where
-    P: Provider + Clone,
-{
-    if state.pending.is_empty() {
-        return;
-    }
-    let retry: Vec<Hash> = state.pending.iter().copied().collect();
-    for hash in retry {
-        evict_scoped(contract, operator, cache, hash, state).await;
-    }
-}
-
-/// Handle one live log: `HashBlacklisted` evicts in-scope; `HashRemoved` logs.
-async fn handle_log<P>(
-    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
-    operator: Address,
-    cache: &CacheEngine,
-    state: &mut WatcherState,
-    log: alloy::rpc::types::Log,
-) where
-    P: Provider + Clone,
-{
-    match log.topic0() {
-        Some(topic) if *topic == HashBlacklisted::SIGNATURE_HASH => {
-            match HashBlacklisted::decode_log_data(&log.inner.data) {
-                Ok(event) => {
-                    evict_scoped(
-                        contract,
-                        operator,
-                        cache,
-                        Hash::from_bytes(event.hash.0),
-                        state,
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    warn!(err = %err, "blacklist watcher: undecodable HashBlacklisted log");
-                }
-            }
-        }
-        Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => {
-            if let Ok(event) = HashRemoved::decode_log_data(&log.inner.data) {
-                debug!(
-                    hash = %Hash::from_bytes(event.hash.0),
-                    "blacklist entry removed on-chain (local eviction stays sticky)"
-                );
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Evict `hash` if it is blacklisted in scope for `operator`. Short-circuits
-/// already-evicted hashes (free), queues the hash for retry on a scope-check
-/// error, and returns `true` iff an eviction was performed.
-async fn evict_scoped<P>(
-    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
-    operator: Address,
-    cache: &CacheEngine,
-    hash: Hash,
-    state: &mut WatcherState,
-) -> bool
-where
-    P: Provider + Clone,
-{
-    if cache.is_evicted(hash) {
-        state.pending.remove(&hash);
-        return false;
-    }
-    match scope_check(contract, operator, hash).await {
-        Some(true) => {
-            let done = evict(cache, hash).await;
-            if done {
-                state.pending.remove(&hash);
-            } else {
-                state.pending.insert(hash);
-            }
-            done
-        }
-        Some(false) => {
-            state.pending.remove(&hash);
-            false
-        }
-        None => {
-            state.pending.insert(hash);
-            false
-        }
-    }
-}
-
 /// `isHashBlacklistedForOperator` bounded by [`RPC_CALL_TIMEOUT`]. `None` on
-/// timeout or RPC error (caller queues for retry), `Some(bool)` otherwise.
+/// timeout or RPC error (caller keeps the hash in `known` for the next re-scope),
+/// `Some(bool)` otherwise.
 async fn scope_check<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
@@ -496,7 +494,7 @@ where
             warn!(
                 %hash,
                 err = %sanitize_rpc_display(&err),
-                "blacklist watcher: isHashBlacklistedForOperator failed; queued for retry"
+                "blacklist watcher: isHashBlacklistedForOperator failed; keeping for re-scope"
             );
             None
         }
@@ -504,7 +502,7 @@ where
             warn!(
                 %hash,
                 timeout_secs = RPC_CALL_TIMEOUT.as_secs(),
-                "blacklist watcher: isHashBlacklistedForOperator timed out; queued for retry"
+                "blacklist watcher: isHashBlacklistedForOperator timed out; keeping for re-scope"
             );
             None
         }
@@ -525,10 +523,10 @@ async fn evict(cache: &CacheEngine, hash: Hash) -> bool {
     }
 }
 
-/// Sleep for `dur`, returning `true` if `shutdown` fired first.
-async fn sleep_or_shutdown(dur: Duration, shutdown: &mut oneshot::Receiver<()>) -> bool {
+/// Wait `dur`, returning `true` if `shutdown` was cancelled first.
+async fn sleep_or_cancel(dur: Duration, shutdown: &CancellationToken) -> bool {
     tokio::select! {
-        _ = &mut *shutdown => true,
+        () = shutdown.cancelled() => true,
         () = tokio::time::sleep(dur) => false,
     }
 }

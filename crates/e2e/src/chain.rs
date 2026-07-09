@@ -464,6 +464,27 @@ impl ChainFixture {
         crate::ensure_mined(&receipt, "addHashRegional")
     }
 
+    /// Change an operator's self-attested region via `CapacityBond.updateRegion`
+    /// (ADR 030). Sent by the operator itself. The first change has no cooldown
+    /// (`regionLastChanged` is 0 until the first update). Used to exercise a
+    /// scope transition that emits no `ContentBlacklist` event.
+    pub async fn update_region(
+        &self,
+        operator: &PrivateKeySigner,
+        new_region: &str,
+    ) -> anyhow::Result<()> {
+        let provider = self.provider_for(operator);
+        let receipt = CapacityBond::new(self.addrs.capacity_bond, &provider)
+            .updateRegion(new_region.to_string())
+            .send()
+            .await
+            .context("updateRegion send")?
+            .get_receipt()
+            .await
+            .context("updateRegion receipt")?;
+        crate::ensure_mined(&receipt, "updateRegion")
+    }
+
     /// Read the `addedAt` second-timestamp of the `(region, hash)` entry (`0`
     /// means not blacklisted). Serving a response timestamped after this is
     /// slashable while the entry is live.

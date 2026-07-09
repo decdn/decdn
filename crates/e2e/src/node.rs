@@ -322,6 +322,9 @@ payment_channel_address = "{payment_channel}"
 capacity_bond_address = "{capacity_bond}"
 slash_judge_address = "{slash_judge}"
 content_blacklist_address = "{content_blacklist}"
+# Small so a scope transition with no on-chain event (region/ripening, appeal
+# reversal) is re-scoped within the test budget rather than the 10-min default.
+content_blacklist_poll_interval_sec = 2
 publisher_registry_address = "{publisher_registry}"
 origin_assignment_address = "{origin_assignment}"
 event_poll_interval_ms = 500
