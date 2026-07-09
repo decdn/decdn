@@ -4537,10 +4537,13 @@ async fn export_bao_range_empty_blob_round_trips() -> anyhow::Result<()> {
 
 /// `export_bao_range` on a 0-byte blob must honor a logical eviction (#279):
 /// after `evict`, the empty early-return must surface a `Store` error rather
-/// than keep serving an empty body — matching the non-empty path, whose store
-/// export stops serving an evicted hash (#1054 review). (The empty blob is
-/// otherwise trivially "present" in the store, so eviction — not absence — is
-/// the state that must stop the empty serve.)
+/// than keep serving an empty body (#1054 review). The empty blob is trivially
+/// "present" in the store, so — unlike a non-empty blob, which can be genuinely
+/// absent — eviction (not absence) is the only state that stops the empty serve,
+/// and only the added `has()` check (which honors the logical-eviction set)
+/// enforces it here. (On the non-empty path, `export_bao_range` itself has no
+/// eviction check: `export_bao` faults on a genuinely absent hash, and callers
+/// gate eviction before invoking it — see `handlers/client.rs`.)
 #[tokio::test]
 async fn export_bao_range_empty_blob_evicted_errors() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;

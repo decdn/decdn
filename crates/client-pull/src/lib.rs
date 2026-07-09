@@ -695,10 +695,12 @@ fn decode_verified_range(
     let aligned = align_range(byte_offset, byte_len, total_bytes)
         .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
     // A 0-byte blob (#1054) aligns to an empty range: the decoder below has no
-    // chunk group to anchor and would accept the empty stream for ANY root — the
-    // silent verification bypass `fetch_inner` warns about. Prove the empty
-    // stream against the empty root explicitly; a non-empty requested hash is a
-    // paid-but-wrong delivery, so surface the typed `HashMismatch`.
+    // chunk group to anchor and would accept the empty stream for ANY root. This
+    // is the same trivial-empty-range bypass `fetch_inner` guards against for the
+    // `total_bytes < byte_offset` underflow (a different trigger, same root
+    // cause). Prove the empty stream against the empty root explicitly; a
+    // non-empty requested hash is a paid-but-wrong delivery, so surface the typed
+    // `HashMismatch`.
     if total_bytes == 0 {
         if hash != *blake3::hash(&[]).as_bytes() {
             return Err(anyhow::Error::new(HashMismatch));

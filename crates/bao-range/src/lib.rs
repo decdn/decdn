@@ -67,10 +67,13 @@ pub fn bao_encoded_size(total_bytes: u64, chunk_ranges: &ChunkRanges) -> u64 {
     // partial groups, so it must NOT be used here.) `align_range`'s ranges are
     // already clamped to the blob, so the encoder's `truncate_ranges` step is a
     // no-op and is not reachable here (its module is private upstream).
-    // An empty range set (the whole-blob view of a 0-byte blob, #1054) has no
-    // proof and no data — zero wire bytes. `bao-tree`'s pre-order chunk iterator
-    // asserts `!ranges.is_empty()`, so short-circuit before walking it.
-    if chunk_ranges.is_empty() {
+    // A 0-byte blob (#1054) has no proof and no data — zero wire bytes for ANY
+    // requested range. An empty range set likewise encodes to nothing. Short-
+    // circuit both before walking the tree: `bao-tree`'s pre-order chunk iterator
+    // `debug_assert!`s `!ranges.is_empty()` (and would otherwise mis-walk an empty
+    // set in release), and a 0-byte `BaoTree` walked over a non-empty range like
+    // `ChunkRanges::all()` is a degenerate the callers never intend to bill for.
+    if total_bytes == 0 || chunk_ranges.is_empty() {
         return 0;
     }
     let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);

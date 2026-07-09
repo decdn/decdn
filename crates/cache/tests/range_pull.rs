@@ -448,3 +448,24 @@ fn bao_encoded_size_whole_blob_1_5_mib_is_golden() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn bao_encoded_size_zero_blob_or_empty_ranges_is_zero() -> anyhow::Result<()> {
+    // A 0-byte blob (#1054) has no wire bytes for ANY requested range — including
+    // the universal `ChunkRanges::all()` the window-path helpers pass — and an
+    // empty range set encodes to nothing regardless of blob size. Both must
+    // short-circuit to 0 without walking (or mis-walking) a degenerate tree.
+    anyhow::ensure!(
+        bao_encoded_size(0, &bao_tree::ChunkRanges::all()) == 0,
+        "0-byte blob over all() ranges is 0 wire bytes"
+    );
+    anyhow::ensure!(
+        bao_encoded_size(0, &bao_tree::ChunkRanges::empty()) == 0,
+        "0-byte blob over empty ranges is 0 wire bytes"
+    );
+    anyhow::ensure!(
+        bao_encoded_size(200 * 1024, &bao_tree::ChunkRanges::empty()) == 0,
+        "empty range set over a non-empty blob is 0 wire bytes"
+    );
+    Ok(())
+}

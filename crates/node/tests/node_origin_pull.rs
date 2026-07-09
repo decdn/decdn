@@ -3488,6 +3488,85 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     Ok(())
 }
 
+/// #1054: an empty (0-byte) blob served via the fused window pull-through path.
+/// This exercises the progressive/tee triangle — `open_progressive_pull` →
+/// `UpstreamPull::finish` → tee promote → downstream `leaf_paced_pull` verify —
+/// which never calls `decode_verified_range`, so the buffered-path e2e
+/// (`client_delivers_empty_blob`) does not cover it. For 0 wire bytes the window
+/// never pauses, B pays A no voucher, and B still promotes the empty blob against
+/// the empty root `Hash::new(&[])`.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
+    let payload: Vec<u8> = Vec::new();
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA1);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep) = build_node_b(
+        a_id,
+        a_addr,
+        a_eth.address(),
+        hash,
+        ab_channel_id,
+        &b_buyer,
+        leaf_channel_id,
+        leaf_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+    )
+    .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let outcome = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await?;
+
+    anyhow::ensure!(outcome.completed, "leaf delivery did not complete");
+    anyhow::ensure!(
+        outcome.hash_ok,
+        "leaf received bytes failed the empty-root check"
+    );
+    anyhow::ensure!(
+        outcome.received == 0,
+        "leaf received {} bytes, want 0",
+        outcome.received
+    );
+    // B promotes the (verified) empty blob — it is now a discoverable holder.
+    anyhow::ensure!(
+        cache_b.has(hash).await?,
+        "B must promote the teed empty blob"
+    );
+    // Zero wire bytes → B never pays A a voucher; the upstream watermark log is empty.
+    anyhow::ensure!(
+        progress_log(&recorded)?.is_empty(),
+        "no upstream voucher for a 0-byte blob, got {:?}",
+        progress_log(&recorded)?
+    );
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
 /// #895 (#305 no-double-spend): two concurrent same-hash leaf requests against a
 /// node B with an empty cache must open exactly ONE upstream pull. The first
 /// request owns the tee sink and pulls from A; the second hits `TeeOpen::InFlight`
