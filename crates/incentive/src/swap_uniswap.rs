@@ -63,7 +63,7 @@ mod sol_types {
 pub use sol_types::{QuoterV2, SwapRouter02, UniswapV3Pool};
 
 use alloy::primitives::aliases::U24;
-use alloy::primitives::{Address, B256, Bytes, U160, U256};
+use alloy::primitives::{Address, B256, Bytes, U160, U256, U512};
 use alloy::providers::{DynProvider, Provider};
 use alloy::sol_types::SolCall;
 use anyhow::Context;
@@ -104,11 +104,14 @@ pub(crate) fn build_exact_output_params(
 /// units.
 ///
 /// This feeds only the advisory price-impact warning (see module docs) —
-/// never the actual bounded spend — so saturating arithmetic on the
-/// `sqrtPriceX96` squaring (which can in principle overflow `U256` near
-/// Uniswap's `MAX_SQRT_RATIO`, ~2^160) is an acceptable simplification: a
-/// saturated result yields an imprecise-but-harmless advisory number, not a
-/// panic or a wrong bound on real spend.
+/// never the actual bounded spend. The intermediate products (`sqrtPriceX96^2`
+/// and `amount_out << 192`) overflow `U256` for realistic inputs — a Uniswap
+/// `sqrtPriceX96` runs up to ~2^160 (its square up to ~2^320) and a real bond
+/// (`795_000 TOKEN ≈ 2^80` base units) shifted left by 192 exceeds `U256::MAX`
+/// — so the math runs in `U512` and narrows only at the end. Narrowing
+/// saturates in the astronomically-unlikely case the advisory number exceeds
+/// `U256::MAX`, which keeps the function total (no panic) while never fabricating
+/// a wrong bound on real spend.
 pub(crate) fn spot_in_from_sqrt(
     sqrt_price_x96: U256,
     amount_out: U256,
@@ -117,18 +120,25 @@ pub(crate) fn spot_in_from_sqrt(
     if sqrt_price_x96.is_zero() {
         return U256::ZERO;
     }
-    let price_x192 = sqrt_price_x96.saturating_mul(sqrt_price_x96);
+    // `sqrt_price_x96 < 2^160`, so the square is `< 2^320` and fits `U512`.
+    // `saturating_mul` keeps this total (no overflow panic) even for the
+    // unreachable type-max inputs, mirroring the old fully-saturating path —
+    // this is an advisory-only spot estimate.
+    let sqrt = U512::from(sqrt_price_x96);
+    let price_x192 = sqrt.saturating_mul(sqrt);
     if price_x192.is_zero() {
         return U256::ZERO;
     }
-    let one_q192 = U256::from(1u8) << 192;
-    if usdc_is_token0 {
+    let spot: U512 = if usdc_is_token0 {
         // price = TOKEN per USDC; USDC_in = amount_out(TOKEN) / price.
-        amount_out.saturating_mul(one_q192) / price_x192
+        (U512::from(amount_out) << 192) / price_x192
     } else {
         // price = USDC per TOKEN; USDC_in = amount_out(TOKEN) * price.
-        amount_out.saturating_mul(price_x192) >> 192
-    }
+        U512::from(amount_out).saturating_mul(price_x192) >> 192
+    };
+    // Narrow back to U256; saturate to `U256::MAX` rather than panic in the
+    // unreachable type-max case (see the doc comment).
+    spot.saturating_to::<U256>()
 }
 
 /// A configured Uniswap V3 exact-out venue: `SwapRouter02` for the swap,
@@ -235,6 +245,13 @@ impl UniswapV3Venue {
     /// through the router's `multicall(uint256 deadline, bytes[] data)`, which
     /// reverts if the transaction can't land before `deadline` — the same
     /// expiry guarantee the Balancer venue gets natively.
+    ///
+    /// After the swap attempt — on **every** path (success, on-chain revert, or
+    /// send failure) — the router allowance is reset to `0` best-effort, so no
+    /// standing USDC approval survives: neither the unused `max_in − actual_in`
+    /// remainder after a successful exact-out swap nor the full `max_in` after a
+    /// failed one. The reset is captured separately from the swap's own result
+    /// and a reset failure is logged, never masking the swap error.
     pub async fn swap_exact_out(
         &self,
         amount_out: U256,
@@ -276,21 +293,67 @@ impl UniswapV3Venue {
         // batch if it can't execute before `deadline`, giving the swap the same
         // expiry guarantee the Balancer venue has natively.
         let inner = SwapRouter02::exactOutputSingleCall { params }.abi_encode();
-        let pending = router
-            .multicall(deadline, vec![Bytes::from(inner)])
-            .send()
-            .await
-            .context("exactOutputSingle (via multicall) transaction failed to send")?;
-        let receipt = pending
-            .get_receipt()
-            .await
-            .context("exactOutputSingle sent but the receipt could not be fetched")?;
-        anyhow::ensure!(
-            receipt.status(),
-            "exactOutputSingle reverted (tx {})",
-            receipt.transaction_hash
-        );
-        Ok(receipt.transaction_hash)
+        // Run the swap but DO NOT early-return on failure: the allowance reset
+        // below must run on every path so no standing USDC allowance survives —
+        // neither the `max_in − actual_in` remainder after a successful swap nor
+        // the full `max_in` after a reverted/failed one.
+        let swap_result = async {
+            let pending = router
+                .multicall(deadline, vec![Bytes::from(inner)])
+                .send()
+                .await
+                .context("exactOutputSingle (via multicall) transaction failed to send")?;
+            let receipt = pending
+                .get_receipt()
+                .await
+                .context("exactOutputSingle sent but the receipt could not be fetched")?;
+            anyhow::ensure!(
+                receipt.status(),
+                "exactOutputSingle reverted (tx {})",
+                receipt.transaction_hash
+            );
+            anyhow::Ok(receipt.transaction_hash)
+        }
+        .await;
+
+        // Always reset the router allowance to zero (best-effort), regardless of
+        // swap outcome. A reset failure is logged and swallowed so it never
+        // masks the swap's own error.
+        self.reset_router_allowance().await;
+
+        swap_result
+    }
+
+    /// Best-effort reset of the router's USDC allowance to zero. Warns and
+    /// returns on any failure — clearing the leftover allowance must never mask
+    /// the swap's own outcome, so this runs after the swap on every path (see
+    /// `swap_exact_out`).
+    async fn reset_router_allowance(&self) {
+        let usdc = Erc20::new(self.usdc, &self.provider);
+        let outcome = async {
+            let pending = usdc
+                .approve(self.router, U256::ZERO)
+                .send()
+                .await
+                .context("failed to send")?;
+            let receipt = pending
+                .get_receipt()
+                .await
+                .context("sent but the receipt could not be fetched")?;
+            anyhow::ensure!(
+                receipt.status(),
+                "reverted (tx {})",
+                receipt.transaction_hash
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(e) = outcome {
+            tracing::warn!(
+                error = %e,
+                "USDC router allowance reset failed; a stale router allowance may survive"
+            );
+        }
     }
 }
 
@@ -302,6 +365,16 @@ mod tests {
     const USDC: Address = Address::repeat_byte(0xA1);
     const TOKEN: Address = Address::repeat_byte(0xB2);
     const RECIPIENT: Address = Address::repeat_byte(0xC3);
+    const ROUTER: Address = Address::repeat_byte(0xD4);
+    const QUOTER: Address = Address::repeat_byte(0xE5);
+    const PAYER: Address = Address::repeat_byte(0xF6);
+
+    /// A provider that never dials out (`127.0.0.1:1` refuses immediately), so
+    /// every RPC send fails. Used to exercise the best-effort reset helper's
+    /// swallow-and-continue path without any on-chain infra.
+    fn unconnected_provider() -> impl Provider + Clone + 'static {
+        alloy::providers::ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap())
+    }
 
     #[test]
     fn exact_output_params_are_usdc_in_token_out() {
@@ -373,5 +446,73 @@ mod tests {
             spot_in_from_sqrt(sqrt_price_2x, U256::from(400u64), false),
             U256::from(1600u64)
         );
+    }
+
+    /// A realistic ~10 Gbps-tier bond quantity (`795_000` TOKEN, 18 decimals).
+    /// The old `saturating_mul` path overflowed `U256` here and returned a
+    /// fabricated value (`U256::MAX / price` on the token0 side, or
+    /// `U256::MAX >> 192` on the token1 side); the `U512` path returns the
+    /// mathematically correct spot. Both token-ordering branches are covered.
+    fn ten_gbps_bond() -> U256 {
+        // 795_000 * 10^18.
+        U256::from(795_000u64) * U256::from(10u64).pow(U256::from(18u64))
+    }
+
+    #[test]
+    fn spot_in_large_bond_usdc_token0_is_sane_not_saturated() {
+        // sqrtPriceX96 = 2 * 2^96 -> price_x192 = 4 * 2^192 (price = 4 TOKEN
+        // per USDC). Buying `amount_out` TOKEN costs `amount_out / 4` USDC.
+        let sqrt_price_2x = U256::from(2u8) << 96;
+        let amount_out = ten_gbps_bond();
+        let expected = amount_out / U256::from(4u64); // 198_750 * 10^18
+        let got = spot_in_from_sqrt(sqrt_price_2x, amount_out, true);
+        assert_eq!(got, expected, "token0 spot must be amount_out / price");
+        assert_ne!(got, U256::MAX, "must not saturate to U256::MAX");
+        // Sanity: the correct answer is ~1.9875e23, far below U256::MAX and far
+        // above the fabricated ~2^62 the old saturating path produced.
+        assert!(got > U256::from(10u64).pow(U256::from(23u64)));
+    }
+
+    #[test]
+    fn spot_in_large_bond_usdc_token1_is_sane_not_saturated() {
+        // Same pool, opposite ordering: price = 4 USDC per TOKEN. Buying
+        // `amount_out` TOKEN costs `amount_out * 4` USDC.
+        let sqrt_price_2x = U256::from(2u8) << 96;
+        let amount_out = ten_gbps_bond();
+        let expected = amount_out * U256::from(4u64); // 3_180_000 * 10^18
+        let got = spot_in_from_sqrt(sqrt_price_2x, amount_out, false);
+        assert_eq!(got, expected, "token1 spot must be amount_out * price");
+        assert_ne!(got, U256::MAX, "must not saturate to U256::MAX");
+        // Correct answer ~3.18e24; the old saturating path produced ~2^64.
+        assert!(got > U256::from(10u64).pow(U256::from(24u64)));
+    }
+
+    // Issue-1 cleanup coverage note (#991): the load-bearing safety property of
+    // running the allowance reset on every path is that the reset is
+    // *best-effort* — a failed reset must never panic, abort onboarding, or mask
+    // the swap's own error. That property is unit-tested below against an
+    // unconnected provider (the reset's send fails and is swallowed). A true
+    // end-to-end test — approve succeeds, the swap *reverts on-chain*, and a
+    // follow-up reset call is then observed — needs an anvil / mock-transport
+    // harness, which this crate does not have (no anvil dev-dep, and this alloy
+    // build ships no `Asserter`/`MockProvider`). Deferred rather than faked.
+
+    #[tokio::test]
+    async fn reset_router_allowance_swallows_send_failure() {
+        // On an unconnected provider the reset transaction can't send; the
+        // helper must warn-and-continue (return `()`), never panic — otherwise
+        // running it on the swap-failure path would turn a swap error into a
+        // panic. Reaching the `.await` completion is the assertion.
+        let venue = UniswapV3Venue::new(
+            unconnected_provider(),
+            ROUTER,
+            QUOTER,
+            None,
+            USDC,
+            TOKEN,
+            3000,
+            PAYER,
+        );
+        venue.reset_router_allowance().await;
     }
 }

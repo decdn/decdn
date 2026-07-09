@@ -297,76 +297,92 @@ impl BalancerV3Venue {
             );
         }
 
-        // Leg 2: grant the Router a Permit2 allowance, scoped to `deadline`
-        // (see module docs — deviates from the reference's `block.timestamp`
-        // expiration, which is only safe because its two calls are atomic).
-        // `max_in`/`deadline` truncation to uint160/uint48 mirrors the
-        // reference's `uint160(amountIn)` cast: USDC's 6-decimal total supply
-        // and Unix timestamps are both many orders of magnitude below the
-        // truncation ceiling, so saturation is unreachable in practice; this
-        // keeps the conversion infallible rather than threading a `Result`
-        // through what is effectively dead-code error handling.
-        let max_in_u160 = U160::saturating_from(max_in);
-        let expiration_u48 = U48::saturating_from(deadline);
-        let permit2_approve_pending = permit2
-            .approve(self.usdc, self.router, max_in_u160, expiration_u48)
-            .send()
-            .await
-            .context("Permit2 approve transaction failed to send")?;
-        let permit2_approve_receipt = permit2_approve_pending
-            .get_receipt()
-            .await
-            .context("Permit2 approve sent but the receipt could not be fetched")?;
-        anyhow::ensure!(
-            permit2_approve_receipt.status(),
-            "Permit2 approve reverted (tx {})",
-            permit2_approve_receipt.transaction_hash
-        );
+        // Legs 2+3 (Permit2→Router approve, then the swap) run inside a single
+        // captured `Result` that DELIBERATELY does not early-return. Once Leg 1's
+        // USDC→Permit2 approval stands — whether freshly set just above OR
+        // already covering `max_in` via the idempotent skip — ANY failure from
+        // here on (the Permit2→Router approve, the swap send, or an on-chain
+        // revert) must still fall through to the two best-effort resets below, so
+        // neither leg leaves a standing approval on the between-legs failure path.
+        // The captured result is returned unchanged after the resets run.
+        let swap_result = async {
+            // Leg 2: grant the Router a Permit2 allowance, scoped to `deadline`
+            // (see module docs — deviates from the reference's `block.timestamp`
+            // expiration, which is only safe because its two calls are atomic).
+            // `max_in`/`deadline` truncation to uint160/uint48 mirrors the
+            // reference's `uint160(amountIn)` cast: USDC's 6-decimal total supply
+            // and Unix timestamps are both many orders of magnitude below the
+            // truncation ceiling, so saturation is unreachable in practice; this
+            // keeps the conversion infallible rather than threading a `Result`
+            // through what is effectively dead-code error handling.
+            let max_in_u160 = U160::saturating_from(max_in);
+            let expiration_u48 = U48::saturating_from(deadline);
+            let permit2_approve_pending = permit2
+                .approve(self.usdc, self.router, max_in_u160, expiration_u48)
+                .send()
+                .await
+                .context("Permit2 approve transaction failed to send")?;
+            let permit2_approve_receipt = permit2_approve_pending
+                .get_receipt()
+                .await
+                .context("Permit2 approve sent but the receipt could not be fetched")?;
+            anyhow::ensure!(
+                permit2_approve_receipt.status(),
+                "Permit2 approve reverted (tx {})",
+                permit2_approve_receipt.transaction_hash
+            );
 
-        let args = build_exact_out_swap_args(
-            self.pool, self.usdc, self.token, amount_out, max_in, deadline,
-        );
-        let pending = router
-            .swapSingleTokenExactOut(
-                args.pool,
-                args.token_in,
-                args.token_out,
-                args.exact_amount_out,
-                args.max_amount_in,
-                args.deadline,
-                args.weth_is_eth,
-                args.user_data,
-            )
-            .send()
-            .await
-            .context("swapSingleTokenExactOut transaction failed to send")?;
-        let receipt = pending
-            .get_receipt()
-            .await
-            .context("swapSingleTokenExactOut sent but the receipt could not be fetched")?;
-        anyhow::ensure!(
-            receipt.status(),
-            "swapSingleTokenExactOut reverted (tx {})",
-            receipt.transaction_hash
-        );
-        let tx_hash = receipt.transaction_hash;
+            // Leg 3: the swap itself.
+            let args = build_exact_out_swap_args(
+                self.pool, self.usdc, self.token, amount_out, max_in, deadline,
+            );
+            let pending = router
+                .swapSingleTokenExactOut(
+                    args.pool,
+                    args.token_in,
+                    args.token_out,
+                    args.exact_amount_out,
+                    args.max_amount_in,
+                    args.deadline,
+                    args.weth_is_eth,
+                    args.user_data,
+                )
+                .send()
+                .await
+                .context("swapSingleTokenExactOut transaction failed to send")?;
+            let receipt = pending
+                .get_receipt()
+                .await
+                .context("swapSingleTokenExactOut sent but the receipt could not be fetched")?;
+            anyhow::ensure!(
+                receipt.status(),
+                "swapSingleTokenExactOut reverted (tx {})",
+                receipt.transaction_hash
+            );
+            anyhow::Ok(receipt.transaction_hash)
+        }
+        .await;
 
         // Reset both legs — mirrors the reference's unconditional post-swap
-        // reset so no standing allowance survives. Best-effort: the swap has
-        // already succeeded (the operator now holds TOKEN), so a failed reset
-        // must NOT abort onboarding or be misreported as a swap failure. Each
-        // helper warns and continues, so the successful swap tx hash is returned
-        // regardless (see module docs for why the non-atomic, multi-transaction
-        // error path can't mirror the reference's automatic on-revert rollback).
+        // reset so no standing allowance survives. Runs on EVERY path once Leg 1
+        // stood: success, a reverted/failed-to-send Permit2→Router approve, or a
+        // reverted/failed swap. Best-effort: each helper warns and continues so a
+        // failed reset never aborts onboarding or masks the swap's own error. The
+        // captured `swap_result` is then returned unchanged, so a successful swap
+        // yields its tx hash and a failed one propagates its error — after the
+        // resets have already run (see module docs for why the non-atomic,
+        // multi-transaction error path can't mirror the reference's automatic
+        // on-revert rollback).
         self.reset_permit2_allowance().await;
         self.reset_usdc_approval().await;
 
-        Ok(tx_hash)
+        swap_result
     }
 
     /// Best-effort reset of the Router's Permit2 allowance to zero. Warns and
-    /// returns on any failure — the swap has already succeeded, so a stale
-    /// Router allowance must not abort onboarding (see `swap_exact_out`).
+    /// returns on any failure — it runs after the swap on every path, so a
+    /// failed reset must never abort onboarding or mask the swap's own outcome
+    /// (see `swap_exact_out`).
     async fn reset_permit2_allowance(&self) {
         let permit2 = Permit2::new(self.permit2, &self.provider);
         let outcome = async {
@@ -397,8 +413,9 @@ impl BalancerV3Venue {
     }
 
     /// Best-effort reset of the USDC→Permit2 ERC20 approval to zero. Warns and
-    /// returns on any failure — the swap has already succeeded, so a stale
-    /// Permit2 approval must not abort onboarding (see `swap_exact_out`).
+    /// returns on any failure — it runs after the swap on every path, so a
+    /// failed reset must never abort onboarding or mask the swap's own outcome
+    /// (see `swap_exact_out`).
     async fn reset_usdc_approval(&self) {
         let usdc = Erc20::new(self.usdc, &self.provider);
         let outcome = async {
@@ -480,6 +497,43 @@ mod tests {
         assert_eq!(args.deadline, U256::from(9_999_999u64));
         assert!(!args.weth_is_eth);
         assert!(args.user_data.is_empty());
+    }
+
+    // Issue-1 cleanup coverage note (#991): once Leg 1's USDC→Permit2 approval
+    // stands, both legs' resets now run on every subsequent path — success, a
+    // failed Leg-2 Permit2→Router approve (the between-legs path the human
+    // reviewer flagged), or a reverted/failed swap. The load-bearing property is
+    // that they are *best-effort* — a failed reset must never panic, abort
+    // onboarding, or mask the swap error. That is unit-tested below against an
+    // unconnected provider. A true end-to-end test — Leg 1 succeeds, Leg 2 or the
+    // swap *reverts on-chain*, and the two follow-up resets are then observed —
+    // needs an anvil / mock-transport harness this crate does not have (no anvil
+    // dev-dep, and this alloy build ships no `Asserter`/`MockProvider`).
+    // Deferred rather than faked.
+
+    #[tokio::test]
+    async fn reset_helpers_swallow_send_failure() {
+        // On an unconnected provider both resets' sends fail; each helper must
+        // warn-and-continue (return `()`), never panic — otherwise running them
+        // on the swap-failure path would turn a swap error into a panic.
+        let payer = Address::repeat_byte(0x11);
+        let venue = BalancerV3Venue::new(unconnected_provider(), ROUTER, POOL, USDC, TOKEN, payer);
+        venue.reset_permit2_allowance().await;
+        venue.reset_usdc_approval().await;
+    }
+
+    #[tokio::test]
+    async fn swap_exact_out_error_propagates_after_cleanup_runs() {
+        // recipient == payer clears the up-front guard, so the flow reaches the
+        // allowance read → fails on the unconnected provider → the captured
+        // error is returned only *after* the (best-effort, swallowed) resets
+        // run. The assertion is that we get an `Err` back without panicking.
+        let payer = Address::repeat_byte(0x11);
+        let venue = BalancerV3Venue::new(unconnected_provider(), ROUTER, POOL, USDC, TOKEN, payer);
+        let res = venue
+            .swap_exact_out(U256::from(1u64), U256::from(1u64), payer, U256::from(0u64))
+            .await;
+        assert!(res.is_err(), "unconnected provider must yield an error");
     }
 
     #[test]
