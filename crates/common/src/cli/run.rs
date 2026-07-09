@@ -111,6 +111,11 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "ADDR", env = "DECDN_SLASH_JUDGE_ADDRESS")]
     pub slash_judge_address: Option<String>,
 
+    /// `SlashAppeal` contract address (0x-prefixed hex) — target for
+    /// `decdn appeal slash` (ADR 028). Optional; not required by the daemon.
+    #[arg(long, value_name = "ADDR", env = "DECDN_SLASH_APPEAL_ADDRESS")]
+    pub slash_appeal_address: Option<String>,
+
     /// EIP-712 chain id for the `slash_sig` domain [default: 421614].
     #[arg(long, value_name = "ID", env = "DECDN_CHAIN_ID")]
     pub chain_id: Option<u64>,

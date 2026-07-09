@@ -104,6 +104,10 @@ pub struct ResolvedBlockchain {
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `slash_sig` signatures (ADR 014). Required (no default).
     pub slash_judge_address: String,
+    /// `SlashAppeal` contract address — the target for `decdn appeal slash`
+    /// (ADR 028). `Some` only when configured; the daemon does not require it,
+    /// so `None` is valid. When present it is a non-zero address.
+    pub slash_appeal_address: Option<String>,
     /// EIP-712 `chainId` for the `slash_sig` domain separator. Defaults to
     /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia) when unset.
     pub chain_id: u64,

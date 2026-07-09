@@ -161,6 +161,11 @@ pub struct BlockchainConfig {
     /// verifier accepts, so resolution fails fast when it is missing rather
     /// than defaulting.
     pub slash_judge_address: Option<String>,
+    /// `SlashAppeal` contract address — the target for `decdn appeal slash`
+    /// (ADR 028). Optional: only the appeal CLI requires it, so an unset value
+    /// does not block the daemon (like the origin-directory addresses). When
+    /// set it must not be the zero address.
+    pub slash_appeal_address: Option<String>,
     /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
     /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
     /// network target — matches the chain id bound on the runtime signer).
