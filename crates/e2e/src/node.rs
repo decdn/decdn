@@ -26,8 +26,10 @@ use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
 use crate::chain::ChainFixture;
 
-/// Fixed keystore password for the daemon's eth signer (test-only).
-const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
+/// Fixed keystore password for the daemon's eth signer (test-only). Public so a
+/// journey that drives the `decdn` CLI against this node's keystore can pass it
+/// via `DECDN_KEYSTORE_PASSWORD` (#1032).
+pub const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
 
 /// Kills the spawned `decdn-node` on drop so a panicking assertion never leaks
 /// the daemon process. The `Child` is behind a `Mutex` so [`NodeFixture::wait_healthy`]
@@ -65,6 +67,9 @@ pub struct NodeFixture {
     pub bind_port: u16,
     /// Loopback admin RPC base URL.
     pub admin_url: String,
+    /// Path to the rendered `node.toml`, so a journey can point the `decdn` CLI
+    /// at the same `[blockchain]` coordinates + keystore the daemon uses (#1032).
+    pub config_path: PathBuf,
 }
 
 impl NodeFixture {
@@ -184,6 +189,7 @@ impl NodeFixture {
             node_id,
             bind_port,
             admin_url: format!("http://127.0.0.1:{admin_port}"),
+            config_path,
         };
         fixture
             .wait_healthy(Duration::from_secs(30))
@@ -284,6 +290,7 @@ chain_id = {chain_id}
 payment_channel_address = "{payment_channel}"
 capacity_bond_address = "{capacity_bond}"
 slash_judge_address = "{slash_judge}"
+slash_appeal_address = "{slash_appeal}"
 publisher_registry_address = "{publisher_registry}"
 origin_assignment_address = "{origin_assignment}"
 event_poll_interval_ms = 500
@@ -316,6 +323,7 @@ metrics_bind = "127.0.0.1"
         payment_channel = a.payment_channel,
         capacity_bond = a.capacity_bond,
         slash_judge = a.slash_judge,
+        slash_appeal = a.slash_appeal,
         publisher_registry = a.publisher_registry,
         origin_assignment = a.origin_assignment,
         cache_dir = c.cache_dir.display(),

@@ -129,6 +129,14 @@ impl StreamSlashData {
         (*self).to_sol().eip712_signing_hash(domain)
     }
 
+    /// EIP-712 struct hash (`keccak256(abi.encode(STREAM_RESPONSE_TYPEHASH,
+    /// fields...))`), independent of any domain — the per-message hash
+    /// `SlashJudge` folds into its `evidenceHash` commit (#1032, G-NODE-05).
+    #[must_use]
+    pub fn struct_hash(&self) -> B256 {
+        (*self).to_sol().eip712_hash_struct()
+    }
+
     /// Sign the stream response with `signer` for the given EIP-712 `domain`,
     /// returning the 65-byte (`r‖s‖v`) signature for the wire `slash_sig`.
     ///
