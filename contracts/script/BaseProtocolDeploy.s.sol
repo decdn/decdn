@@ -153,6 +153,13 @@ abstract contract BaseProtocolDeploy is Script {
     ///      range clamped to the fee tier's tick spacing (constant-product depth).
     int24 internal constant UNIV3_MAX_TICK = 887_272;
 
+    /// @dev Uniswap V3 valid `sqrtPriceX96` bounds (`TickMath.MIN/MAX_SQRT_RATIO`).
+    ///      A seed price outside these makes the pool `initialize` revert with an
+    ///      opaque error deep inside the NonfungiblePositionManager, so the seed
+    ///      helper fail-fasts against them instead.
+    uint160 internal constant UNIV3_MIN_SQRT_RATIO = 4_295_128_739;
+    uint160 internal constant UNIV3_MAX_SQRT_RATIO = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
+
     /// @notice Venue the genesis buyback activation targets. `UNISWAP` creates and
     ///         seeds the TOKEN/USDC V3 pool in-script (the only venue live on the
     ///         Arbitrum Sepolia initial network). `BALANCER` wires an already-seeded
@@ -303,9 +310,11 @@ abstract contract BaseProtocolDeploy is Script {
     error InsufficientSeedBalance(address token, uint256 have, uint256 need);
     /// @notice Fee tier has no known Uniswap V3 tick spacing.
     error UnsupportedFeeTier(uint24 fee);
-    /// @notice The derived `sqrtPriceX96` exceeds `uint160` — seed amounts imply a
-    ///         price outside Uniswap's representable range.
-    error SqrtPriceOverflow(uint256 value);
+    /// @notice The derived `sqrtPriceX96` falls outside Uniswap V3's valid
+    ///         `[MIN_SQRT_RATIO, MAX_SQRT_RATIO]` range — seed amounts imply a price
+    ///         the pool cannot represent. Caught here so the deploy fails with a
+    ///         clear error instead of an opaque revert inside pool `initialize`.
+    error SqrtPriceOutOfRange(uint256 value);
     /// @notice Post-activation invariant — the FeeRouter split is not the expected
     ///         steady-state `[6000, 3000, 1000]` after `setSharesAndDestinations`.
     error BuybackSharesNotActivated(uint256 operator, uint256 buyback, uint256 treasury);
@@ -929,11 +938,13 @@ abstract contract BaseProtocolDeploy is Script {
 
     /// @dev `sqrtPriceX96 = sqrt(amount1 / amount0) * 2**96`, computed with
     ///      `mulDiv` (512-bit intermediate) so `amount1 * 2**192` cannot overflow
-    ///      before the division. Reverts if the price is outside `uint160`.
+    ///      before the division. Reverts if the price falls outside Uniswap V3's
+    ///      valid `[MIN_SQRT_RATIO, MAX_SQRT_RATIO]` band — a fail-fast in place of
+    ///      the opaque revert the pool `initialize` would otherwise throw.
     function _sqrtPriceX96(uint256 amount1, uint256 amount0) internal pure returns (uint160) {
         uint256 ratioX192 = Math.mulDiv(amount1, uint256(1) << 192, amount0);
         uint256 s = Math.sqrt(ratioX192);
-        if (s > type(uint160).max) revert SqrtPriceOverflow(s);
+        if (s < UNIV3_MIN_SQRT_RATIO || s > UNIV3_MAX_SQRT_RATIO) revert SqrtPriceOutOfRange(s);
         return uint160(s);
     }
 

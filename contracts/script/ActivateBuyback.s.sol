@@ -35,7 +35,8 @@ import { IUniswapV3SwapRouter } from "../src/interfaces/IUniswapV3SwapRouter.sol
 ///         it cannot itself activate the bucket — the Timelock proposal does.
 ///
 ///         The venue is selected via `BUYBACK_VENUE` (`balancer` | `uniswap`,
-///         default `balancer`). The burner is venue-neutral behind
+///         default `uniswap` — consistent with `DeployProtocol`; set it explicitly
+///         to match the pool actually deployed). The burner is venue-neutral behind
 ///         `GuardedBuybackBurner`; both concrete subclasses take the same roles
 ///         and produce the same two calldata blobs. This script assumes the pool
 ///         already exists and is seeded — for the deploy-time genesis convenience
@@ -87,7 +88,7 @@ contract ActivateBuyback is Script {
         address feeRouter = vm.envAddress("FEE_ROUTER");
         address keeper = vm.envAddress("BUYBACK_KEEPER");
 
-        string memory venue = vm.envOr("BUYBACK_VENUE", string("balancer"));
+        string memory venue = vm.envOr("BUYBACK_VENUE", string("uniswap"));
         bytes32 h = keccak256(bytes(venue));
 
         vm.startBroadcast();

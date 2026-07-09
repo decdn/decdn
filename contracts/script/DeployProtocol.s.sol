@@ -249,8 +249,11 @@ contract DeployProtocol is BaseProtocolDeploy {
         if (act.venue == BuybackVenue.UNISWAP) {
             act.uniSwapRouter = vm.envAddress("UNISWAP_SWAP_ROUTER");
             act.uniPositionManager = vm.envAddress("UNISWAP_POSITION_MANAGER");
+            // Validate the fee against the supported Uniswap V3 tiers here, before
+            // `vm.startBroadcast`, so an unsupported tier aborts with no gas spent
+            // rather than reverting `UnsupportedFeeTier` mid-deploy.
             uint256 fee = vm.envOr("UNISWAP_POOL_FEE", uint256(10_000));
-            if (fee > type(uint24).max) revert PoolFeeOutOfRange(fee);
+            if (fee != 100 && fee != 500 && fee != 3000 && fee != 10_000) revert PoolFeeOutOfRange(fee);
             act.uniPoolFee = uint24(fee);
             // Constant-product full range: 10k USDC pairs 1M TOKEN at the $0.01 anchor.
             act.usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(10_000e6));

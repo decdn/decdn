@@ -8,7 +8,6 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { INonfungiblePositionManager } from "../script/interfaces/IUniswapV3PoolCreation.sol";
 import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
-import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 
 // -----------------------------------------------------------------
