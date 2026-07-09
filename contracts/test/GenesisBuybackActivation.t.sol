@@ -262,7 +262,8 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         MockPositionManager npm = new MockPositionManager(false);
         usdc.approve(address(npm), type(uint256).max);
         BuybackActivation memory act = _uniswapActivation(address(npm));
-        vm.expectRevert(); // PoolNotSeeded(pool) — pool address is runtime-computed
+        // Selector-only: PoolNotSeeded(pool)'s arg is the runtime-computed pool.
+        vm.expectPartialRevert(BaseProtocolDeploy.PoolNotSeeded.selector);
         this.externalRunFullDeploy(_config(), act);
     }
 
@@ -272,7 +273,8 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         DeployConfig memory cfg = _config();
         // Route TOKEN to a different holder so the deployer cannot fund the seed.
         cfg.initialTokenHolder = address(0xBEEF);
-        vm.expectRevert(); // InsufficientSeedBalance(token, 0, TOKEN_SEED)
+        // Selector-only: InsufficientSeedBalance(token, have, need) carries runtime args.
+        vm.expectPartialRevert(BaseProtocolDeploy.InsufficientSeedBalance.selector);
         this.externalRunFullDeploy(cfg, _uniswapActivation(address(npm)));
     }
 

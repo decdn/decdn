@@ -309,14 +309,13 @@ contract DeployProtocol is BaseProtocolDeploy {
         _assertManifestWritable();
         string memory path = _manifestPath();
         // BuybackBurner is `address(0)` when the launch is dormant (the default);
-        // when genesis activation ran it is the wired concrete burner. Derive the
-        // recorded FeeRouter split the same way, so the manifest reflects the actual
-        // on-chain state without reading `getShares()` (keeps the writer callable on
-        // stub deployments in the script tests).
+        // when genesis activation ran it is the wired concrete burner. The activated
+        // branch only occurs after a real `_activateBuyback` against a real
+        // `FeeRouter`, so read the split straight from it (single source of truth);
+        // the dormant branch — the only one the stub-deployment script tests hit —
+        // falls back to the launch config so the writer stays stub-safe.
         address bb = address(d.buybackBurner);
-        uint256[3] memory liveShares = bb == address(0)
-            ? cfg.feeRouterShares
-            : [STEADY_OPERATOR_SHARE, STEADY_BUYBACK_SHARE, STEADY_TREASURY_SHARE];
+        uint256[3] memory liveShares = bb == address(0) ? cfg.feeRouterShares : d.router.getShares();
 
         string memory contracts = "contracts";
         vm.serializeAddress(contracts, "BuybackBurner", bb);
