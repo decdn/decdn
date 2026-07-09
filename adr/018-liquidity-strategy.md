@@ -55,6 +55,14 @@ The first three rows dominate the decision for a TOKEN-rich, USDC-poor treasury 
 
 **Fee tier rationale.** 1% suits a long-tail asset with limited trading activity. Lower tiers (0.3%, 0.05%) assume volume sufficient to compensate LPs, which TOKEN will not have at PoC scale.
 
+### Venue-neutral burner selection
+
+Balancer V3 80/20 is the canonical POL venue, but the on-chain `BuybackBurner` is venue-neutral. An abstract `GuardedBuybackBurner` holds the shared MEV-defense stack — the self-maintained TWAP floor, the `slippageBps` / `minBuybackAmount` / `maxBuybackAmount` band, and the per-epoch USDC liquidity cap — and defers the venue to a concrete subclass: `BuybackBurnerBalancerV3` (Balancer V3 Vault + Router) or `BuybackBurnerUniswapV3` (Uniswap V3 `SwapRouter02` + a single V3 pool). Both subclasses take the same constructor shape, the same roles, and the same `FeeRouter` wiring, so the venue is a deploy-time choice and `FeeRouter.buybackBurner` is swappable in a single governance call with no `FeeRouter` change.
+
+The Uniswap subclass sources its `minOut` floor from the same hand-rolled cumulative-price accumulator as the Balancer subclass (not the pool's native `observe()` oracle), so a freshly-seeded pool whose observation cardinality is still 1 prices the floor; it reads the pool's `slot0` marginal spot, its fee tier, and its in-pool USDC balance for the shared guards. The two subclasses therefore share one TWAP implementation and differ only in the venue read and the swap call.
+
+The venue is selected at deploy time to match the target network. On the Arbitrum Sepolia initial network Uniswap V3 is deployed and Balancer V3 is not, so Uniswap V3 is the runnable venue there; the Balancer path targets networks where Balancer V3 is live. Because the burner is swappable, a network may launch on one venue and migrate to the other later through the standard `setBuybackBurner` governance call under the 48-hour timelock.
+
 ### Protocol-Owned Liquidity mechanics
 
 - **Source:** The 10pp Protocol-Owned Liquidity allocation (100M TOKEN per [ADR 026 § Allocation](026-tokenomics.md#allocation)) funds the TOKEN side. The USDC side is sized to the **~$250K** needed to pair the full 100M TOKEN at the $0.01 anchor in the 80/20 pool (100M × $0.01 = $1M TOKEN value = 80% of pool depth ⇒ ~$250K USDC for the remaining 20%; the venue-comparison figure above), down ~⅓ from the ~$375K required under the prior 15pp / 150M POL. It is funded from the pre-seed USDC bootstrap POL-seed bucket — ~20% of the raise per [ADR 026 § Bootstrap](026-tokenomics.md#bootstrap-mechanism--pre-seed-usdc) — which spans ~$200K at the $1M floor to ~$600K at the $3M target, covering the ~$250K requirement at any raise above ~$1.25M.
@@ -161,6 +169,21 @@ Buyback execution should be enabled by governance vote only when all of the foll
 8. **(If CoW routing is used as an add-on)** The operator has verified via CoW's `/api/v1/quote` endpoint that CoW solvers route through the deployed Balancer V3 pool and that quoted prices are within `slippageBps` of the Router-direct path. If this fails, disable CoW routing and fall back to direct Router + TWAP + private-RPC; this does not block activation.
 
 Criteria 1–4 are quantitative; governance voters verify them off-chain before enabling execution. Criterion 2 is a one-time deployment check. Criteria 6 and 7 are hard structural requirements; criterion 8 is venue-integration health.
+
+### Deploy-time genesis activation
+
+The Activation Criteria above gate the production path: activation is a deliberate event scheduled through the 48-hour timelock. At genesis that path is unbootstrappable. Voting weight is served-bytes-derived (per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)) and a network that has served no bytes has no weight, so no proposal reaches quorum; and the deploy leaves the deployer with no privileged role on exit. Activating the buyback bucket at genesis therefore happens in-script, while the deployer still holds `GOVERNANCE_ROLE`, before the handoff — it is genesis configuration, not a contract bootstrap mechanism, and it adds no contract surface.
+
+The deploy script carries an off-by-default genesis-activation option for this. When it is off, the launch is dormant as described in [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics): `FeeRouter.buybackBurner` is the zero address and the split is `[9000, 0, 1000]`. When it is on, the script runs the same coherent bundle a governance activation would, in dependency order, before the role handoff:
+
+1. Create and seed the venue's TOKEN/USDC pool as protocol-owned liquidity, custodied by the Timelock. For Uniswap V3 the script creates and seeds the pool directly (a permissionless pool). For Balancer V3 the pool is seeded off-script as the treasury/Permit2 act described in [§ Protocol-Owned Liquidity mechanics](#protocol-owned-liquidity-mechanics), and the script wires the already-seeded pool.
+2. Deploy the concrete burner with its `GOVERNANCE_ROLE` / `DEFAULT_ADMIN_ROLE` held by the Timelock and the emergency multisig holding `PAUSER_ROLE`.
+3. Set the steady-state split and destinations atomically — `setSharesAndDestinations([6000, 3000, 1000], {buybackBurner, treasury})` — with the buyback destination set before its non-zero share, satisfying the cross-validation invariant.
+4. Grant the keeper `KEEPER_ROLE`.
+
+The pool must be seeded before it is wired, and a keeper is required: an activated bucket with no keeper accrues USDC that can never be swapped.
+
+Deploy-time genesis activation is a testnet and genesis convenience, distinct from the production Activation Criteria. It does not wait on a matured private-RPC keeper, a per-epoch cap calibrated against measured depth, or a governance vote. Mainnet leaves the option off and activates through the governance-gated criteria above once those conditions hold. One consequence carries over regardless of path: the TWAP accumulator is fail-closed until it spans `twapMinWindow` (default 1800 seconds), so buybacks revert `TwapNotReady` on a freshly-seeded pool until the window matures. The keeper warms the accumulator via `poke()` before the first buyback.
 
 ## Consequences
 

@@ -16,13 +16,19 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///         `_assertNoBackDoors` reverts the run if any step left a back door
 ///         open.
 ///
-/// @dev    BuybackBurner is NOT deployed here. The contract is abstract pending
-///         a concrete Balancer V3 Vault subclass; until that ships, the deploy
-///         leaves `FeeRouter.buybackBurner == address(0)` and the burn share
-///         at 0 (`feeRouterShares[1] == 0`). Governance later activates the
-///         bucket via `FeeRouter.setSharesAndDestinations` once a concrete
-///         subclass is deployed — that path runs through the 48h Timelock and
-///         is fully observable in advance.
+/// @dev    BuybackBurner is dormant by default: the deploy leaves
+///         `FeeRouter.buybackBurner == address(0)` and the burn share at 0
+///         (`feeRouterShares[1] == 0`). Mainnet activates the bucket later via
+///         `FeeRouter.setSharesAndDestinations` through the 48h Timelock (ADR 018
+///         § Activation Criteria) — fully observable in advance.
+///
+///         `ACTIVATE_BUYBACK=true` opts into an OFF-by-default deploy-time genesis
+///         activation instead (a testnet / genesis convenience): the script seeds
+///         the venue pool, deploys the concrete burner, and flips the FeeRouter to
+///         the steady-state `[6000, 3000, 1000]` split in-script — before the
+///         governance handoff, because at genesis the served-bytes voting weight
+///         that gates the governance path is zero (ADR 036). Venue is selected via
+///         `BUYBACK_VENUE`; see `_readBuybackActivation`.
 ///
 /// @dev    The production `Ed25519Verifier` (issue #669) is deployed in-script
 ///         as the first broadcast step — no operator-supplied address. It wraps
@@ -120,6 +126,7 @@ contract DeployProtocol is BaseProtocolDeploy {
 
     function run() external returns (Deployment memory d) {
         DeployConfig memory cfg = _readConfig();
+        BuybackActivation memory act = _readBuybackActivation();
         if (cfg.deployer == FORGE_DEFAULT_SENDER) revert DeployerIsForgeDefaultSender(cfg.deployer);
         // Fail BEFORE spending gas: a stale manifest with no FORCE_OVERWRITE_MANIFEST
         // must abort here, not after `_runFullDeploy` has already broadcast the
@@ -134,7 +141,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         // inject a mock by populating `cfg.ed25519Verifier` and calling
         // `_runFullDeploy` directly, bypassing this path).
         cfg.ed25519Verifier = new Ed25519Verifier();
-        d = _runFullDeploy(cfg);
+        d = _runFullDeploy(cfg, act);
         vm.stopBroadcast();
 
         _writeManifest(cfg, d);
@@ -185,11 +192,87 @@ contract DeployProtocol is BaseProtocolDeploy {
     }
 
     // -----------------------------------------------------------------
+    // Optional genesis buyback activation (OFF by default).
+    //
+    // Left unset (`ACTIVATE_BUYBACK` unset/false), the launch is byte-for-byte the
+    // dormant deploy: `_readBuybackActivation` returns an all-off struct and
+    // `_runFullDeploy` skips the whole path. This is a testnet / genesis
+    // convenience; mainnet activates through the ADR 018 governance-gated path.
+    //
+    //   Required when ON:
+    //     - `BUYBACK_KEEPER`             — EOA/bot granted KEEPER_ROLE
+    //   Optional (defaults from ADR 018 § Parameter Table):
+    //     - `BUYBACK_VENUE`              — uniswap|balancer (default uniswap; the
+    //                                      only venue live on Arbitrum Sepolia)
+    //     - `TWAP_MIN_WINDOW_SECS`       (default 1800)
+    //     - `MAX_BUYBACK_AMOUNT`         (default 10_000e6 USDC)
+    //     - `MIN_BUYBACK_AMOUNT`         (default 100e6 USDC)
+    //     - `SLIPPAGE_BPS`               (default 200)
+    //     - `EPOCH_CAP_FRACTION_BPS`     (default 1000 = 10%)
+    //   Uniswap venue (pool created + seeded in-script; deployer must hold the seed
+    //   TOKEN + USDC — set `INITIAL_TOKEN_HOLDER` to the deployer or fund it):
+    //     - `UNISWAP_SWAP_ROUTER`        — SwapRouter02 (required)
+    //     - `UNISWAP_POSITION_MANAGER`   — NonfungiblePositionManager (required)
+    //     - `UNISWAP_POOL_FEE`           (default 10000 = 1%)
+    //     - `BUYBACK_USDC_SEED`          (default 10_000e6)
+    //     - `BUYBACK_TOKEN_SEED`         (default 1_000_000e18; 1M TOKEN pairs the
+    //                                      10k USDC seed at the $0.01 anchor)
+    //   Balancer venue (pool seeded off-script per ADR 018 § POL mechanics):
+    //     - `BALANCER_ROUTER`, `BALANCER_VAULT`, `BALANCER_POOL` (required)
+    //     - `PERMIT2_ADDRESS`            (default canonical Permit2)
+    //     - `SUB_SWAP_COUNT`             (default 4)
+    //     - `SUB_SWAP_MIN_BLOCK_GAP`     (default 10)
+    error UnknownBuybackVenue(string venue);
+    error PoolFeeOutOfRange(uint256 fee);
+
+    /// @dev Canonical Uniswap Permit2 (same CREATE2 address on every chain).
+    address internal constant CANONICAL_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
+    function _readBuybackActivation() internal view returns (BuybackActivation memory act) {
+        act.activate = vm.envOr("ACTIVATE_BUYBACK", false);
+        if (!act.activate) return act; // all-off; every other field is ignored.
+
+        act.venue = _readVenue();
+        act.keeper = vm.envAddress("BUYBACK_KEEPER"); // required — enforced in _activateBuyback too
+        act.twapMinWindow = vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800));
+        act.maxBuybackAmount = vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6));
+        act.minBuybackAmount = vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6));
+        act.slippageBps = vm.envOr("SLIPPAGE_BPS", uint256(200));
+        act.epochLiquidityCapFraction = vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000));
+
+        if (act.venue == BuybackVenue.UNISWAP) {
+            act.uniSwapRouter = vm.envAddress("UNISWAP_SWAP_ROUTER");
+            act.uniPositionManager = vm.envAddress("UNISWAP_POSITION_MANAGER");
+            uint256 fee = vm.envOr("UNISWAP_POOL_FEE", uint256(10_000));
+            if (fee > type(uint24).max) revert PoolFeeOutOfRange(fee);
+            act.uniPoolFee = uint24(fee);
+            act.uniUsdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(10_000e6));
+            act.uniTokenSeed = vm.envOr("BUYBACK_TOKEN_SEED", uint256(1_000_000e18));
+        } else {
+            act.balRouter = vm.envAddress("BALANCER_ROUTER");
+            act.balVault = vm.envAddress("BALANCER_VAULT");
+            act.balPool = vm.envAddress("BALANCER_POOL");
+            act.permit2 = vm.envOr("PERMIT2_ADDRESS", CANONICAL_PERMIT2);
+            act.balSubSwapCount = vm.envOr("SUB_SWAP_COUNT", uint256(4));
+            act.balSubSwapMinBlockGap = vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10));
+        }
+    }
+
+    function _readVenue() internal view returns (BuybackVenue) {
+        string memory v = vm.envOr("BUYBACK_VENUE", string("uniswap"));
+        bytes32 h = keccak256(bytes(v));
+        if (h == keccak256("uniswap")) return BuybackVenue.UNISWAP;
+        if (h == keccak256("balancer")) return BuybackVenue.BALANCER;
+        revert UnknownBuybackVenue(v);
+    }
+
+    // -----------------------------------------------------------------
     // Manifest — `deployments/<chainId>.json`.
     //
     // Schema is intentionally flat with stable, deterministic keys so downstream
     // tooling can read it without needing a Solidity-side type. `BuybackBurner`
-    // is recorded as `address(0)` to signal "unwired at launch" (see header).
+    // is `address(0)` for a dormant launch, or the wired concrete burner when
+    // genesis activation ran (see header / `_readBuybackActivation`).
 
     /// @dev Manifest path for the active chain. Single source of truth shared by
     ///      the early writability check (`run`) and the writer.
@@ -211,8 +294,18 @@ contract DeployProtocol is BaseProtocolDeploy {
     function _writeManifest(DeployConfig memory cfg, Deployment memory d) internal {
         _assertManifestWritable();
         string memory path = _manifestPath();
+        // BuybackBurner is `address(0)` when the launch is dormant (the default);
+        // when genesis activation ran it is the wired concrete burner. Derive the
+        // recorded FeeRouter split the same way, so the manifest reflects the actual
+        // on-chain state without reading `getShares()` (keeps the writer callable on
+        // stub deployments in the script tests).
+        address bb = address(d.buybackBurner);
+        uint256[3] memory liveShares = bb == address(0)
+            ? cfg.feeRouterShares
+            : [STEADY_OPERATOR_SHARE, STEADY_BUYBACK_SHARE, STEADY_TREASURY_SHARE];
+
         string memory contracts = "contracts";
-        vm.serializeAddress(contracts, "BuybackBurner", address(0));
+        vm.serializeAddress(contracts, "BuybackBurner", bb);
         vm.serializeAddress(contracts, "CapacityBond", address(d.bond));
         vm.serializeAddress(contracts, "ContentBlacklist", address(d.blacklist));
         vm.serializeAddress(contracts, "DecdnGovernor", address(d.governor));
@@ -238,9 +331,9 @@ contract DeployProtocol is BaseProtocolDeploy {
         vm.serializeUint(params, "feeRouterEpochLength", cfg.feeRouterEpochLength);
         vm.serializeUint(params, "feeRouterWindowEpochs", cfg.feeRouterWindowEpochs);
         uint256[] memory sharesArr = new uint256[](3);
-        sharesArr[0] = cfg.feeRouterShares[0];
-        sharesArr[1] = cfg.feeRouterShares[1];
-        sharesArr[2] = cfg.feeRouterShares[2];
+        sharesArr[0] = liveShares[0];
+        sharesArr[1] = liveShares[1];
+        sharesArr[2] = liveShares[2];
         vm.serializeUint(params, "feeRouterShares", sharesArr);
         vm.serializeUint(params, "minBond", cfg.minBond);
         string memory paramsJson = vm.serializeUint(params, "timelockDelay", cfg.timelockDelay);
