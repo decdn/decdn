@@ -27,6 +27,9 @@
 
 // Reuse the production seller-path binding for the `Channel` struct + reads.
 pub use decdn_incentive::payment_channel::PaymentChannel;
+// Reuse the node-side ContentBlacklist binding (read view + membership events +
+// governance add/remove writes) — same ABI the runtime watcher decodes.
+pub use decdn_incentive::content_blacklist::ContentBlacklist;
 
 alloy::sol! {
     /// Mintable ERC-20 surface (mock USDC + the staking TOKEN). `mint` exists
@@ -94,5 +97,42 @@ alloy::sol! {
         function activateAssignment(uint256 namespaceId) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
+    }
+
+    /// `SlashJudge.submitBlacklistChallenge` — the blacklist-violation slash
+    /// entry point (ADR 014 §Blacklist violation). The G-NODE-04 negative case
+    /// drives it with a signed post-window `ProbeResponse` to prove the on-chain
+    /// slashability of serving blacklisted content.
+    /// `ProbeResponse` fields SlashJudge `abi.decode`s from `responseData` (the
+    /// EIP-712 `ProbeResponse` type). Mirrors `decdn_incentive::ProbeSlashData`.
+    struct ProbeMsg {
+        bytes32 hash;
+        bool hasBlob;
+        uint64 ratePerMb;
+        uint64 timestampUs;
+    }
+
+    #[sol(rpc)]
+    contract SlashJudge {
+        function commitChallenge(bytes32 commitment) external;
+        function submitBlacklistChallenge(
+            address challengedNode,
+            bytes32 nodeId,
+            bytes32 blobHash,
+            bytes responseData,
+            bytes slashSig,
+            bool isStreamResponse,
+            bytes32 salt
+        ) external;
+        function challengeBond() external view returns (uint256);
+    }
+
+    /// OpenZeppelin `AccessControl` surface, bound at a governed contract's
+    /// address so the fixture can grant `REGIONAL_BODY_ROLE` (impersonating the
+    /// role admin) for the regional-blacklist journey.
+    #[sol(rpc)]
+    contract AccessControl {
+        function grantRole(bytes32 role, address account) external;
+        function hasRole(bytes32 role, address account) external view returns (bool);
     }
 }

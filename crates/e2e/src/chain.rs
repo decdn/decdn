@@ -14,7 +14,7 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use alloy::network::{EthereumWallet, TransactionBuilder};
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::SignerSync;
@@ -22,7 +22,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_incentive::{bind_node_id_domain, node_register, register_node_signing_hash};
 
-use crate::bindings::{CapacityBond, Erc20, PublisherRegistry};
+use crate::bindings::{AccessControl, CapacityBond, ContentBlacklist, Erc20, PublisherRegistry};
 
 /// Base for the per-fixture chain id. Each `ChainFixture` derives its chain id
 /// as `CHAIN_BASE + port` (the full ephemeral port), so concurrent fixtures (and
@@ -67,6 +67,11 @@ pub struct ContractAddrs {
     pub publisher_registry: Address,
     pub origin_assignment: Address,
     pub content_blacklist: Address,
+    /// `TimelockController` — holds `GOVERNANCE_ROLE` + `DEFAULT_ADMIN_ROLE` on
+    /// the governed contracts after the `DeployProtocol` handoff. The e2e drives
+    /// governance actions by impersonating it (anvil), since the deployer keeps
+    /// no privileged roles.
+    pub timelock: Address,
 }
 
 /// Kills the spawned `anvil` on drop and removes the (gitignored) manifest so
@@ -377,6 +382,99 @@ impl ChainFixture {
             .await
             .context("read bytesPerEpoch")
     }
+
+    /// Current chain head timestamp in seconds. Used to stamp slash evidence
+    /// strictly after a blacklist entry's `addedAt`.
+    pub async fn block_timestamp(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .admin
+            .get_block(alloy::eips::BlockId::latest())
+            .await
+            .context("get latest block")?
+            .ok_or_else(|| anyhow::anyhow!("no latest block"))?
+            .header
+            .timestamp)
+    }
+
+    /// Anvil-impersonate `who` and fund it for gas, so `from = who` transactions
+    /// are signed by anvil (used to act as the governance Timelock, which holds
+    /// the privileged roles after the `DeployProtocol` handoff).
+    async fn impersonate(&self, who: Address) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .admin
+            .raw_request("anvil_impersonateAccount".into(), (who,))
+            .await
+            .context("anvil_impersonateAccount")?;
+        self.fund_eth(who, 100).await
+    }
+
+    /// A wallet-less provider whose `eth_sendTransaction`s are signed by anvil
+    /// for the request's `from` address (only valid while that account is
+    /// impersonated).
+    fn raw_provider(&self) -> DynProvider {
+        ProviderBuilder::new()
+            .connect_http(self.url.clone())
+            .erased()
+    }
+
+    /// Add `hash` to the GLOBAL blacklist as governance. Impersonates the
+    /// Timelock (which holds `GOVERNANCE_ROLE` after handoff) and blocks until
+    /// mined. Emits `HashBlacklisted(GLOBAL, hash)`.
+    pub async fn add_hash_global(&self, hash: B256) -> anyhow::Result<()> {
+        self.impersonate(self.addrs.timelock).await?;
+        let raw = self.raw_provider();
+        let receipt = ContentBlacklist::new(self.addrs.content_blacklist, &raw)
+            .addHashGlobal(hash)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("addHashGlobal send")?
+            .get_receipt()
+            .await
+            .context("addHashGlobal receipt")?;
+        crate::ensure_mined(&receipt, "addHashGlobal")
+    }
+
+    /// Add `hash` to `region`'s blacklist as governance. The Timelock holds
+    /// `DEFAULT_ADMIN_ROLE`, so it grants itself `REGIONAL_BODY_ROLE` first (a
+    /// no-op on repeat), then adds the entry. `region` is the packed key from
+    /// [`region_key`]. Emits `HashBlacklisted(region, hash)`.
+    pub async fn add_hash_regional(&self, region: B256, hash: B256) -> anyhow::Result<()> {
+        self.impersonate(self.addrs.timelock).await?;
+        let raw = self.raw_provider();
+        let grant = AccessControl::new(self.addrs.content_blacklist, &raw)
+            .grantRole(regional_body_role(), self.addrs.timelock)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("grantRole REGIONAL_BODY_ROLE send")?
+            .get_receipt()
+            .await
+            .context("grantRole receipt")?;
+        crate::ensure_mined(&grant, "grantRole")?;
+        let receipt = ContentBlacklist::new(self.addrs.content_blacklist, &raw)
+            .addHashRegional(region, hash)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("addHashRegional send")?
+            .get_receipt()
+            .await
+            .context("addHashRegional receipt")?;
+        crate::ensure_mined(&receipt, "addHashRegional")
+    }
+
+    /// Read the `addedAt` second-timestamp of the `(region, hash)` entry (`0`
+    /// means not blacklisted). Serving a response timestamped after this is
+    /// slashable while the entry is live.
+    pub async fn blacklist_added_at(&self, region: B256, hash: B256) -> anyhow::Result<u64> {
+        let entry = ContentBlacklist::new(self.addrs.content_blacklist, &self.admin)
+            .getHashEntry(region, hash)
+            .call()
+            .await
+            .context("getHashEntry")?;
+        Ok(entry.addedAt)
+    }
 }
 
 /// `crates/e2e/ → ../../contracts`.
@@ -521,6 +619,25 @@ async fn run_deploy_script(
 }
 
 /// Read the protocol contract addresses from the deploy manifest.
+/// The global-scope region key: `bytes32("GLOBAL")`.
+#[must_use]
+pub fn global_region() -> B256 {
+    B256::right_padding_from(b"GLOBAL")
+}
+
+/// Pack a region string (ISO 3166-1 alpha-2, or any ≤32-byte label) into the
+/// left-aligned, zero-padded `bytes32` key `ContentBlacklist` and
+/// `RegionScopeLib` use — matching Solidity's `bytes32("literal")`.
+#[must_use]
+pub fn region_key(region: &str) -> B256 {
+    B256::right_padding_from(region.as_bytes())
+}
+
+/// `keccak256("REGIONAL_BODY_ROLE")` — the role `addHashRegional` requires.
+fn regional_body_role() -> B256 {
+    keccak256(b"REGIONAL_BODY_ROLE")
+}
+
 fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let contracts = json
@@ -543,6 +660,7 @@ fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {
         publisher_registry: get("PublisherRegistry")?,
         origin_assignment: get("OriginAssignment")?,
         content_blacklist: get("ContentBlacklist")?,
+        timelock: get("TimelockController")?,
     })
 }
 

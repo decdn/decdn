@@ -65,6 +65,9 @@ pub struct NodeFixture {
     pub bind_port: u16,
     /// Loopback admin RPC base URL.
     pub admin_url: String,
+    /// Path to the daemon's config file (in the data dir), used to respawn the
+    /// daemon on [`NodeFixture::restart`] against the same state.
+    config_path: PathBuf,
 }
 
 impl NodeFixture {
@@ -162,18 +165,7 @@ impl NodeFixture {
             warm.shutdown().await.context("flush warm cache")?;
         }
 
-        let child = std::process::Command::new(decdn_node_bin()?)
-            .arg("--config")
-            .arg(&config_path)
-            .arg("run")
-            .env("DECDN_KEYSTORE_PASSWORD", KEYSTORE_PASSWORD)
-            // Quiet by default; flip to `info`/`debug` when debugging a failure.
-            .env(
-                "RUST_LOG",
-                std::env::var("DECDN_NODE_LOG").unwrap_or_else(|_| "warn".into()),
-            )
-            .spawn()
-            .context("spawn decdn-node")?;
+        let child = spawn_daemon(&config_path)?;
 
         let fixture = Self {
             child: NodeGuard(std::sync::Mutex::new(child)),
@@ -184,12 +176,33 @@ impl NodeFixture {
             node_id,
             bind_port,
             admin_url: format!("http://127.0.0.1:{admin_port}"),
+            config_path,
         };
         fixture
             .wait_healthy(Duration::from_secs(30))
             .await
             .context("node never became healthy")?;
         Ok((fixture, hash))
+    }
+
+    /// Kill the daemon and respawn it against the same data dir + config, then
+    /// wait until healthy. Proves persisted state (e.g. durable blacklist
+    /// eviction via `evicted.log`) survives a restart. Uses `&self`: the child
+    /// handle lives behind a `Mutex`, so the swap needs no exclusive borrow.
+    pub async fn restart(&self) -> anyhow::Result<()> {
+        {
+            let mut child = self
+                .child
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = child.kill();
+            let _ = child.wait();
+            *child = spawn_daemon(&self.config_path)?;
+        }
+        self.wait_healthy(Duration::from_secs(30))
+            .await
+            .context("node never became healthy after restart")
     }
 
     /// Build a loopback admin JSON-RPC client for this node.
@@ -284,6 +297,7 @@ chain_id = {chain_id}
 payment_channel_address = "{payment_channel}"
 capacity_bond_address = "{capacity_bond}"
 slash_judge_address = "{slash_judge}"
+content_blacklist_address = "{content_blacklist}"
 publisher_registry_address = "{publisher_registry}"
 origin_assignment_address = "{origin_assignment}"
 event_poll_interval_ms = 500
@@ -316,6 +330,7 @@ metrics_bind = "127.0.0.1"
         payment_channel = a.payment_channel,
         capacity_bond = a.capacity_bond,
         slash_judge = a.slash_judge,
+        content_blacklist = a.content_blacklist,
         publisher_registry = a.publisher_registry,
         origin_assignment = a.origin_assignment,
         cache_dir = c.cache_dir.display(),
@@ -359,4 +374,22 @@ fn decdn_node_bin() -> anyhow::Result<PathBuf> {
         bin.display()
     );
     Ok(bin)
+}
+
+/// Spawn `decdn-node run --config <config_path>` with the fixture's test
+/// keystore password and log level. Shared by [`NodeFixture::launch`] and
+/// [`NodeFixture::restart`].
+fn spawn_daemon(config_path: &std::path::Path) -> anyhow::Result<Child> {
+    std::process::Command::new(decdn_node_bin()?)
+        .arg("--config")
+        .arg(config_path)
+        .arg("run")
+        .env("DECDN_KEYSTORE_PASSWORD", KEYSTORE_PASSWORD)
+        // Quiet by default; flip to `info`/`debug` when debugging a failure.
+        .env(
+            "RUST_LOG",
+            std::env::var("DECDN_NODE_LOG").unwrap_or_else(|_| "warn".into()),
+        )
+        .spawn()
+        .context("spawn decdn-node")
 }

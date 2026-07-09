@@ -104,6 +104,10 @@ pub struct ResolvedBlockchain {
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `slash_sig` signatures (ADR 014). Required (no default).
     pub slash_judge_address: String,
+    /// `ContentBlacklist` contract address. `Some` only when the operator opts
+    /// into the blacklist compliance watcher (ADR 011/031); `None` => no
+    /// watcher, so blacklisted content is not locally evicted.
+    pub content_blacklist_address: Option<String>,
     /// EIP-712 `chainId` for the `slash_sig` domain separator. Defaults to
     /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia) when unset.
     pub chain_id: u64,

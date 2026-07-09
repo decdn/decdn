@@ -161,6 +161,13 @@ pub struct BlockchainConfig {
     /// verifier accepts, so resolution fails fast when it is missing rather
     /// than defaulting.
     pub slash_judge_address: Option<String>,
+    /// `ContentBlacklist` contract address. Optional: when set, the node runs
+    /// the blacklist compliance watcher (ADR 011/031) — it evicts held blobs
+    /// whose hash is blacklisted in scope for this operator (global ∪ region),
+    /// which cascades to DHT-announce suppression, probe `has_blob:false`, and
+    /// delivery refusal. Unset => no watcher (serving a blacklisted hash after
+    /// its compliance window is then slashable with no local protection).
+    pub content_blacklist_address: Option<String>,
     /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
     /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
     /// network target — matches the chain id bound on the runtime signer).

@@ -685,6 +685,14 @@ pub async fn run(
     // Reserved for the settlement indexer's read-only provider (#326); cloned
     // here before `rpc_url` is moved into the wallet providers below.
     let reputation_rpc_url = rpc_url.clone();
+    // Cloned here for the same reason: the blacklist compliance watcher (#1031)
+    // builds its own read-only provider at its spawn site, well after `rpc_url`
+    // is moved below. `None` when the watcher is unconfigured.
+    let blacklist_rpc_url = cfg
+        .blockchain
+        .content_blacklist_address
+        .as_deref()
+        .map(|_| rpc_url.clone());
     // Explicit filter poll interval for every chain-event provider (#1011),
     // overriding alloy's 250 ms localhost default that floods a dev anvil.
     let event_poll_interval = Duration::from_millis(cfg.blockchain.event_poll_interval_ms);
@@ -1276,6 +1284,36 @@ pub async fn run(
         PROBE_RATE_LIMIT_GC_INTERVAL,
     ));
 
+    // Blacklist compliance watcher (ADR 011/031, issue #1031). Runs only when
+    // the operator configures a `ContentBlacklist` address. It evicts held
+    // blobs whose hash is blacklisted in scope for this operator, which
+    // cascades to DHT-announce suppression (the republisher's `is_evicted`
+    // gate), probe `has_blob:false`, and delivery refusal — the node's only
+    // local protection against the slash for serving blacklisted content.
+    let blacklist_watcher_stop_tx = match (
+        cfg.blockchain.content_blacklist_address.as_deref(),
+        blacklist_rpc_url,
+    ) {
+        (Some(addr), Some(url)) => {
+            let content_blacklist_addr: Address = addr.parse().with_context(|| {
+                format!("blockchain.content_blacklist_address {addr:?} is not a valid address")
+            })?;
+            let (stop_tx, stop_rx) = oneshot::channel::<()>();
+            tasks.spawn(crate::blacklist_watcher::run(
+                with_poll_interval(
+                    ProviderBuilder::new().connect_http(url),
+                    event_poll_interval,
+                ),
+                content_blacklist_addr,
+                eth_signer.address(),
+                cache.clone(),
+                stop_rx,
+            ));
+            Some(stop_tx)
+        }
+        _ => None,
+    };
+
     // DHT republish scheduler (ADR 022 §STORE Flow). The subscribe
     // handle is taken before the cold-start seed so a commit racing
     // with seed-time lands in the channel backlog rather than the
@@ -1784,6 +1822,9 @@ pub async fn run(
     let _ = probe_rate_limit_gc_stop_tx.send(());
     let _ = republish_stop_tx.send(());
     let _ = bucket_refresh_stop_tx.send(());
+    if let Some(tx) = blacklist_watcher_stop_tx {
+        let _ = tx.send(());
+    }
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain
@@ -2939,6 +2980,7 @@ mod tests {
                 settlement_auto_threshold_micro_usdc: None,
                 settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
+                content_blacklist_address: None,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: decdn_common::config::ResolvedCache {

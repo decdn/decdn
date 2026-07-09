@@ -499,7 +499,9 @@ jobs:
     # Bound the job so a stalled in-test `forge script --broadcast` (issue #785)
     # fails red quickly instead of squatting the runner until GitHub's 6-hour
     # default — or masquerading as "cancelled" when a later push pre-empts it.
-    timeout-minutes: 15
+    # Raised from 15m when the cross-layer `decdn-e2e` journeys (#1031) joined
+    # the settlement e2e in this job.
+    timeout-minutes: 20
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||
@@ -542,6 +544,13 @@ jobs:
           tool: cargo-nextest
       - name: Run on-chain settlement e2e
         run: cargo nextest run -p decdn-node --features anvil-e2e --test anvil_settlement_e2e
+      # The cross-layer `decdn-e2e` fixtures spawn the built `decdn-node`
+      # binary, so it must exist on disk before the journeys run.
+      - name: Build daemon for cross-layer fixtures
+        run: cargo build -p decdn-node
+      # Cross-layer journeys (smoke + G-NODE-04 blacklist compliance, #1031).
+      - name: Run cross-layer e2e journeys
+        run: cargo nextest run -p decdn-e2e --features anvil-e2e
 
   # ----- Solidity contracts ----------------------------------------------
   # The contracts pipeline mirrors the Rust split (one concern per job).
