@@ -400,6 +400,12 @@ pub struct DecdnMetrics {
     /// resubscribe), but a non-zero rate flags a struggling channel store or RPC.
     /// Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
+    /// Slashes detected against this node's operator by the slash watcher
+    /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
+    /// bring-up backfill and the live stream (#1032). A non-zero value means the
+    /// operator was slashed and should consider `decdn appeal slash` within the
+    /// 30-day window. Operator-visible name: `decdn_slashes_detected_total`.
+    pub slashes_detected: Counter,
     /// Channels the seller path proactively `closeChannel`d because an
     /// operator-configured auto-settlement trigger fired — the un-redeemed
     /// value or voucher count crossed its threshold (#742). Each close starts
@@ -1307,6 +1313,12 @@ impl Metrics {
     /// #751). Pairs with the per-site `warn!` in `run_watcher_once`.
     pub fn watcher_persist_failure(&self) {
         self.decdn.watcher_persist_failures.inc();
+    }
+
+    /// A distinct slash against this node's operator was detected by the slash
+    /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).
+    pub fn slash_detected(&self) {
+        self.decdn.slashes_detected.inc();
     }
 
     /// The staker-set watcher's event stream terminated with an error and the

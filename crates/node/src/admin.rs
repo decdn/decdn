@@ -24,7 +24,8 @@ use decdn_common::admin::{
     HealthResponse, INVALID_PARAMS_CODE, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse,
     RELOAD_ERROR_CODE, REPUTATION_UNAVAILABLE_CODE, RecordStoreHealth, RegionStatsResponse,
     ReloadResponse, RepublishHealth, ReputationCoverage, ReputationRequest, ReputationResponse,
-    RoutingHealth, StatusResponse, parse_hash_arg,
+    RoutingHealth, SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse,
+    StatusResponse, parse_hash_arg,
 };
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use decdn_incentive::{ChannelState, ChannelStateStore, VoucherActivity};
@@ -131,6 +132,10 @@ pub struct AdminState {
     /// attached via [`AdminState::with_reputation`]. `None` (no reputation
     /// wired / unit tests) → `reputation` returns [`REPUTATION_UNAVAILABLE_CODE`].
     reputation: Option<ReputationStatusHandles>,
+    /// Slash-detection handles backing `admin_v1_slashes` (#1032), attached via
+    /// [`AdminState::with_slash_detection`]. `None` (no `slash_judge_address`
+    /// wired / unit tests) → `slashes` returns [`SLASH_DETECTION_UNAVAILABLE_CODE`].
+    slash_detection: Option<SlashStatusHandles>,
 }
 
 /// Read-only payment-channel handles the `admin_v1_channels` handler
@@ -168,6 +173,18 @@ impl std::fmt::Debug for ChannelStatusHandles {
             )
             .finish_non_exhaustive()
     }
+}
+
+/// Read-only slash-detection handle the `admin_v1_slashes` handler snapshots
+/// (#1032). The shared in-memory store is populated by the slash watcher; the
+/// admin surface only reads it. Bundled into a struct so the
+/// `with_slash_detection` builder stays a single argument (and to leave room
+/// for future fields without churning the signature).
+#[derive(Debug, Clone)]
+pub struct SlashStatusHandles {
+    /// Detected slashes against this node's operator, appended in detection
+    /// order (deduped by `slashId`). Same handle the watcher writes to.
+    pub store: crate::slash_watcher::SlashStore,
 }
 
 /// Read-only DHT subsystem handles the `admin_v1_status` handler snapshots
@@ -348,6 +365,7 @@ impl AdminState {
             channels: None,
             region_accountant: None,
             reputation: None,
+            slash_detection: None,
         }
     }
 
@@ -387,6 +405,16 @@ impl AdminState {
     #[must_use]
     pub fn with_reputation(mut self, reputation: ReputationStatusHandles) -> Self {
         self.reputation = Some(reputation);
+        self
+    }
+
+    /// Attach slash-detection handles so `admin_v1_slashes` can report slashes
+    /// against this node's operator (#1032). The production runtime calls this
+    /// once after `new` when a `slash_judge_address` is configured; without it,
+    /// `slashes` returns [`SLASH_DETECTION_UNAVAILABLE_CODE`].
+    #[must_use]
+    pub fn with_slash_detection(mut self, slash_detection: SlashStatusHandles) -> Self {
+        self.slash_detection = Some(slash_detection);
         self
     }
 }
@@ -813,6 +841,36 @@ impl AdminRpcServer for AdminRpcImpl {
             regions,
         })
     }
+
+    async fn slashes(&self) -> RpcResult<SlashesResponse> {
+        let Some(handles) = self.state.slash_detection.as_ref() else {
+            return Err(ErrorObjectOwned::owned(
+                SLASH_DETECTION_UNAVAILABLE_CODE,
+                "slash detection not wired on this node (no slash_judge_address configured)",
+                None::<()>,
+            ));
+        };
+        // Short read of an in-memory Vec — no await held. Poison-tolerant: a
+        // panicked writer must not wedge the read-only admin surface.
+        let guard = handles
+            .store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Newest-first: the watcher appends in detection order.
+        let slashes = guard
+            .iter()
+            .rev()
+            .map(|s| SlashRecordDto {
+                slash_id: s.slash_id.to_string(),
+                offense_type: s.offense_type,
+                amount: s.amount.to_string(),
+                evidence_hash: format!("{:#x}", s.evidence_hash),
+                block_number: s.block_number,
+                appeal_window_close: s.appeal_window_close,
+            })
+            .collect();
+        Ok(SlashesResponse { slashes })
+    }
 }
 
 /// Parse a 64-hex `NodeId` request argument into an `iroh::PublicKey`. Tolerates
@@ -1110,6 +1168,50 @@ mod tests {
         assert!(!resp.scored, "an unseen peer is unscored");
         assert!((resp.network_score - 0.5).abs() < 1e-9, "neutral default");
         assert!(resp.regions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slashes_unavailable_without_handle() {
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state);
+        let err = rpc.slashes().await.expect_err("no slash handle wired");
+        assert_eq!(err.code(), SLASH_DETECTION_UNAVAILABLE_CODE);
+    }
+
+    #[tokio::test]
+    async fn slashes_reports_detected_records_newest_first() {
+        use alloy::primitives::{B256, U256};
+        let store: crate::slash_watcher::SlashStore = Arc::new(std::sync::RwLock::new(vec![
+            crate::slash_watcher::DetectedSlash {
+                slash_id: U256::from(1u64),
+                offense_type: 0,
+                amount: U256::from(100u64),
+                evidence_hash: B256::repeat_byte(0x11),
+                block_number: Some(10),
+                appeal_window_close: Some(999),
+            },
+            crate::slash_watcher::DetectedSlash {
+                slash_id: U256::from(2u64),
+                offense_type: 2,
+                amount: U256::from(200u64),
+                evidence_hash: B256::repeat_byte(0x22),
+                block_number: Some(20),
+                appeal_window_close: None,
+            },
+        ]));
+        let (state, _tmp) = state_with(vec![]).await;
+        let rpc = AdminRpcImpl::new(state.with_slash_detection(SlashStatusHandles { store }));
+        let resp = rpc.slashes().await.expect("slashes ok");
+        assert_eq!(resp.slashes.len(), 2);
+        // Newest-first: the watcher appends in detection order, the method reverses.
+        let first = resp.slashes.first().expect("first slash");
+        assert_eq!(first.slash_id, "2");
+        assert_eq!(first.offense_type, 2);
+        assert_eq!(first.amount, "200");
+        assert_eq!(first.appeal_window_close, None);
+        let second = resp.slashes.get(1).expect("second slash");
+        assert_eq!(second.slash_id, "1");
+        assert_eq!(second.appeal_window_close, Some(999));
     }
 
     #[tokio::test]
