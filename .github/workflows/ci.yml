@@ -177,6 +177,10 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              # The ed25519-vector generator is a standalone workspace; its lock
+              # is the parity target for crates/incentive/tests/ed25519_pin_parity.rs
+              # (run by the `test` job), so a lock-only bump must trigger rust.
+              - 'contracts/test/ed25519-vectors/Cargo.lock'
               - 'rust-toolchain.toml'
               - 'rustfmt.toml'
               - 'deny.toml'
@@ -559,6 +563,61 @@ jobs:
         with:
           version: v1.7.1
       - run: forge fmt --check
+
+  # Ed25519 differential-vector freshness guard (issue #1008). The on-chain
+  # Ed25519Verifier must stay at least as strict as the ed25519-dalek
+  # verify_strict the node runs off-chain (#669); committed test vectors pin
+  # that parity. This job catches a stale vector: the generator or its pin
+  # changed without re-pasting. The complementary *version-parity* guard — the
+  # generator's isolated dalek pin must match the version decdn-incentive
+  # resolves — is a Rust test (crates/incentive/tests/ed25519_pin_parity.rs) run
+  # by the `test` job, not here.
+  ed25519-vectors:
+    name: ed25519 vectors
+    runs-on: ubuntu-latest
+    needs: changes
+    # Drift is triggered by a Rust dependency bump (the node's dalek, via
+    # Cargo.lock / a workspace Cargo.toml — `rust` filter) or by a change to the
+    # generator or the consuming contracts (both under contracts/ — `solidity`
+    # filter). Gate on both so either re-runs the check.
+    if: >-
+      needs.changes.outputs.rust == 'true' || needs.changes.outputs.solidity == 'true' ||
+      github.event_name != 'pull_request'
+    steps:
+      # This job only checks out to regenerate + diff vectors locally; it never
+      # pushes, and releases are not automated from CI (no auto-release), so the
+      # GITHUB_TOKEN need not persist in .git/config. Dropping it satisfies
+      # zizmor's `artipacked` check and keeps the token off disk for later steps.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The generator is a standalone workspace, isolated from the root one.
+          workspaces: contracts/test/ed25519-vectors
+          shared-key: ed25519-vectors
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # forge fmt normalises the regenerated Solidity; no solc/build needed, so
+      # the bare toolchain (not ./.github/actions/foundry-setup) is enough.
+      - uses: foundry-rs/foundry-toolchain@v1.8.0
+        with:
+          version: v1.7.1
+      # Freshness: regenerating must reproduce the committed vectors.
+      - name: Regenerate vectors
+        run: cargo run --locked --manifest-path contracts/test/ed25519-vectors/Cargo.toml -- --write
+      - name: Format regenerated vectors
+        working-directory: contracts
+        run: forge fmt test/Ed25519Verifier.t.sol test/CapacityBondRegionE2E.t.sol
+      - name: Fail if vectors are stale
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- \
+            contracts/test/Ed25519Verifier.t.sol \
+            contracts/test/CapacityBondRegionE2E.t.sol; then
+            echo "::error::Ed25519 differential vectors are stale vs a fresh dalek run. Regenerate with 'cargo run -- --write' in contracts/test/ed25519-vectors, run 'forge fmt', and commit the result."
+            exit 1
+          fi
 
   solidity-build-test:
     name: solidity build+test
@@ -1038,7 +1097,7 @@ jobs:
     needs: [fmt, clippy, changes, test, doctest, deny, doc, public-api, markdownlint, adr-book-list,
             pr-title, anvil-e2e,
             solidity-fmt, solidity-build-test, solidity-coverage,
-            solidity-solhint, solidity-slither, solidity-aderyn]
+            solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors]
     steps:
       - uses: re-actors/alls-green@release/v1
         with:
@@ -1053,4 +1112,4 @@ jobs:
           allowed-skips: fmt, clippy, test, doctest, deny, doc, public-api, adr-book-list,
                          pr-title, markdownlint, anvil-e2e,
                          solidity-fmt, solidity-build-test, solidity-coverage,
-                         solidity-solhint, solidity-slither, solidity-aderyn
+                         solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors
