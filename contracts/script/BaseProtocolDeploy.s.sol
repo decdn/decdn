@@ -787,6 +787,10 @@ abstract contract BaseProtocolDeploy is Script {
         returns (GuardedBuybackBurner)
     {
         address pool = _createAndSeedBalancerPool(cfg, act, d);
+        // The Router minted the pool BPT (protocol-owned liquidity) to the
+        // broadcasting deployer; hand it to the Timelock and clear the Permit2
+        // approvals so the deployer keeps no custody — mirroring the Uniswap path.
+        _finalizeBalancerSeed(cfg.usdc, IERC20(address(d.token)), pool, act.permit2, cfg.deployer, address(d.timelock));
         return new BuybackBurnerBalancerV3(
             cfg.usdc,
             ERC20Burnable(address(d.token)),
@@ -878,6 +882,24 @@ abstract contract BaseProtocolDeploy is Script {
 
         // slither-disable-next-line unused-return
         IBalancerV3RouterInit(act.balRouter).initialize(pool, initTokens, initAmounts, 0, false, "");
+    }
+
+    /// @dev Post-seed cleanup for the Balancer venue: move the freshly-minted
+    ///      pool BPT (protocol-owned liquidity) to the Timelock and drop the
+    ///      standing Permit2 ERC20 allowances, so the deployer retains no
+    ///      custody or approval. Extracted to keep `_createAndSeedBalancerPool`
+    ///      under the stack-depth limit.
+    function _finalizeBalancerSeed(
+        IERC20 usdc,
+        IERC20 token,
+        address pool,
+        address permit2,
+        address deployer,
+        address timelock
+    ) internal {
+        IERC20(pool).safeTransfer(timelock, IERC20(pool).balanceOf(deployer));
+        usdc.forceApprove(permit2, 0);
+        token.forceApprove(permit2, 0);
     }
 
     /// @dev The two-step Permit2 grant the V3 Router requires to pull `amount` of

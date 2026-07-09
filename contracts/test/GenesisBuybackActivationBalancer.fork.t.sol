@@ -159,6 +159,14 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
         assertTrue(d.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, tl), "burner admin to timelock");
         assertFalse(d.buybackBurner.hasRole(GOVERNANCE_ROLE, address(this)), "no deployer gov back door");
         assertFalse(d.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, address(this)), "no deployer admin back door");
+
+        // Protocol-owned liquidity (the pool BPT) is custodied by the Timelock,
+        // not left with the deployer; and no standing Permit2 approval dangles.
+        address pool = BuybackBurnerBalancerV3(address(d.buybackBurner)).balancerPool();
+        assertEq(IERC20(pool).balanceOf(address(this)), 0, "deployer holds no BPT");
+        assertGt(IERC20(pool).balanceOf(tl), 0, "timelock custodies the BPT");
+        assertEq(usdc.allowance(address(this), PERMIT2), 0, "usdc permit2 approval cleared");
+        assertEq(IERC20(address(d.token)).allowance(address(this), PERMIT2), 0, "token permit2 approval cleared");
     }
 
     /// @notice The burner reads a real, non-zero TWAP spot off the freshly-seeded
