@@ -4365,6 +4365,37 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn blockchain_swap_fields_parse_under_deny_unknown_fields() -> anyhow::Result<()> {
+        // #991: `decdn setup --pay-bond-with usdc` reads the swap knobs from
+        // `[blockchain]`. `BlockchainConfig` has `deny_unknown_fields`, so a
+        // config that drives `setup` must also parse here (and via
+        // `decdn config validate`) — otherwise the schema forks. Assert all
+        // seven swap fields deserialize without an "unknown field" error.
+        let toml = "\
+[blockchain]
+swap_venue = \"uniswap-v3\"
+swap_router_address = \"0xRouter\"
+swap_quoter_address = \"0xQuoter\"
+usdc_address = \"0xUsdc\"
+swap_fee_tier = 3000
+swap_balancer_pool = \"0xBalPool\"
+swap_pool_address = \"0xPool\"
+";
+        let file: crate::config::FileConfig = ::toml::from_str(toml)?;
+        let bc = file
+            .blockchain
+            .ok_or_else(|| anyhow::anyhow!("missing [blockchain] section"))?;
+        anyhow::ensure!(bc.swap_venue.as_deref() == Some("uniswap-v3"));
+        anyhow::ensure!(bc.swap_router_address.as_deref() == Some("0xRouter"));
+        anyhow::ensure!(bc.swap_quoter_address.as_deref() == Some("0xQuoter"));
+        anyhow::ensure!(bc.usdc_address.as_deref() == Some("0xUsdc"));
+        anyhow::ensure!(bc.swap_fee_tier == Some(3000));
+        anyhow::ensure!(bc.swap_balancer_pool.as_deref() == Some("0xBalPool"));
+        anyhow::ensure!(bc.swap_pool_address.as_deref() == Some("0xPool"));
+        Ok(())
+    }
+
     // -------------------------------------------------------------------
     // Multi-origin fallback config validation (#284)
     //
@@ -7988,6 +8019,7 @@ mod tests {
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
+            ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         // url::Url normalisation appends a trailing path on bare-host URLs;
@@ -8022,6 +8054,7 @@ mod tests {
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
+            ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         assert!(
@@ -8243,6 +8276,7 @@ mod tests {
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
+            ..Default::default()
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
             anyhow::bail!("expected error when watchdog interval is below the minimum");
@@ -8287,6 +8321,7 @@ mod tests {
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
+            ..Default::default()
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
             anyhow::bail!("expected error when redeem threshold is 0");
@@ -8330,6 +8365,7 @@ mod tests {
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
+            ..Default::default()
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
             anyhow::bail!("expected error when auto-settlement value threshold is 0");
@@ -8373,6 +8409,7 @@ mod tests {
             settlement_auto_by_voucher_nonce_span: Some(0),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
+            ..Default::default()
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
             anyhow::bail!("expected error when auto-settlement voucher nonce span is 0");
@@ -8438,6 +8475,7 @@ mod tests {
             settlement_auto_by_voucher_nonce_span: Some(1_000),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
+            ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         assert_eq!(
@@ -8480,6 +8518,7 @@ mod tests {
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
+            ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         assert_eq!(resolved.rpc_watchdog_interval_sec, 0);
@@ -8517,6 +8556,7 @@ mod tests {
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
+            ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         assert_eq!(
