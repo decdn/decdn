@@ -36,6 +36,12 @@ struct FileBlockchain {
     eth_keystore: Option<PathBuf>,
     publisher_registry_address: Option<String>,
     origin_assignment_address: Option<String>,
+    swap_venue: Option<String>,
+    swap_router_address: Option<String>,
+    swap_quoter_address: Option<String>,
+    usdc_address: Option<String>,
+    swap_fee_tier: Option<u32>,
+    swap_pool_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -239,6 +245,55 @@ pub fn resolve_publish(
     })
 }
 
+/// Resolved swap-venue coordinates (present only when a venue is configured).
+#[derive(Debug, Clone)]
+pub struct ResolvedSwap {
+    pub venue: String,
+    pub router: String,
+    pub quoter: String,
+    pub usdc: String,
+    pub uniswap_fee_tier: Option<u32>,
+    pub balancer_pool_id: Option<String>,
+}
+
+/// Resolve swap coordinates with flag > config precedence. Returns `None` when
+/// no venue is configured (token-mode). When a venue *is* named, the router,
+/// quoter, and usdc address are required and their absence errors here.
+pub fn resolve_swap(
+    chain: &cli::ChainArgs,
+    file: &FileConfig,
+) -> anyhow::Result<Option<ResolvedSwap>> {
+    let bc = file.blockchain.as_ref();
+    let pick = |flag: &Option<String>, cfg: fn(&FileBlockchain) -> Option<String>| {
+        flag.clone().or_else(|| bc.and_then(cfg))
+    };
+    let venue = pick(&chain.swap_venue, |b| b.swap_venue.clone());
+    let Some(venue) = venue else { return Ok(None) };
+    let router = pick(&chain.swap_router_address, |b| {
+        b.swap_router_address.clone()
+    })
+    .ok_or_else(|| anyhow::anyhow!("swap_router_address required for --swap-venue {venue}"))?;
+    let quoter = pick(&chain.swap_quoter_address, |b| {
+        b.swap_quoter_address.clone()
+    })
+    .ok_or_else(|| anyhow::anyhow!("swap_quoter_address required for --swap-venue {venue}"))?;
+    let usdc = pick(&chain.usdc_address, |b| b.usdc_address.clone())
+        .ok_or_else(|| anyhow::anyhow!("usdc_address required for --swap-venue {venue}"))?;
+    Ok(Some(ResolvedSwap {
+        venue,
+        router,
+        quoter,
+        usdc,
+        uniswap_fee_tier: chain
+            .swap_fee_tier
+            .or_else(|| bc.and_then(|b| b.swap_fee_tier)),
+        balancer_pool_id: chain
+            .swap_pool_id
+            .clone()
+            .or_else(|| bc.and_then(|b| b.swap_pool_id.clone())),
+    }))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -255,6 +310,12 @@ mod tests {
             keystore_password_file: None,
             dry_run: true,
             json: false,
+            swap_venue: None,
+            swap_router_address: None,
+            swap_quoter_address: None,
+            usdc_address: None,
+            swap_fee_tier: None,
+            swap_pool_id: None,
         }
     }
 
@@ -278,6 +339,12 @@ mod tests {
             eth_keystore: None,
             publisher_registry_address: None,
             origin_assignment_address: None,
+            swap_venue: None,
+            swap_router_address: None,
+            swap_quoter_address: None,
+            usdc_address: None,
+            swap_fee_tier: None,
+            swap_pool_id: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");
@@ -295,6 +362,12 @@ mod tests {
             eth_keystore: Some(PathBuf::from("/keys/ks.json")),
             publisher_registry_address: None,
             origin_assignment_address: None,
+            swap_venue: None,
+            swap_router_address: None,
+            swap_quoter_address: None,
+            usdc_address: None,
+            swap_fee_tier: None,
+            swap_pool_id: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://config:8545");
@@ -314,6 +387,12 @@ mod tests {
             eth_keystore: None,
             publisher_registry_address: None,
             origin_assignment_address: None,
+            swap_venue: None,
+            swap_router_address: None,
+            swap_quoter_address: None,
+            usdc_address: None,
+            swap_fee_tier: None,
+            swap_pool_id: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.keystore, PathBuf::from("/tmp/decdn-test/keystore.json"));
@@ -347,6 +426,12 @@ mod tests {
             eth_keystore: None,
             publisher_registry_address: Some("0xCONFIG".to_string()),
             origin_assignment_address: Some("0xOA".to_string()),
+            swap_venue: None,
+            swap_router_address: None,
+            swap_quoter_address: None,
+            usdc_address: None,
+            swap_fee_tier: None,
+            swap_pool_id: None,
         });
         let r = resolve_publish(&args, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");
@@ -354,5 +439,31 @@ mod tests {
         assert_eq!(r.publisher_registry_address.as_deref(), Some("0xFLAG"));
         // unset flag falls through to config
         assert_eq!(r.origin_assignment_address.as_deref(), Some("0xOA"));
+    }
+
+    #[test]
+    fn resolve_swap_none_when_unset() {
+        let chain = empty_chain();
+        assert!(
+            resolve_swap(&chain, &FileConfig::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_swap_flag_beats_config() {
+        let mut chain = empty_chain();
+        chain.swap_venue = Some("uniswap-v3".into());
+        chain.swap_router_address = Some("0xROUTER".into());
+        chain.swap_quoter_address = Some("0xQUOTER".into());
+        chain.usdc_address = Some("0xUSDC".into());
+        chain.swap_fee_tier = Some(3000);
+        let s = resolve_swap(&chain, &FileConfig::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.venue, "uniswap-v3");
+        assert_eq!(s.router, "0xROUTER");
+        assert_eq!(s.uniswap_fee_tier, Some(3000));
     }
 }

@@ -547,6 +547,30 @@ pub struct ChainArgs {
     /// Emit the result as JSON instead of human-readable `key=value` lines.
     #[arg(long)]
     pub json: bool,
+
+    /// DEX venue for `--pay-bond-with usdc`: `uniswap-v3` or `balancer-v3`.
+    #[arg(long = "swap-venue", value_name = "VENUE")]
+    pub swap_venue: Option<String>,
+
+    /// Exact-out swap router address (Uniswap `SwapRouter02` / Balancer `Router`).
+    #[arg(long = "swap-router-address", value_name = "ADDR")]
+    pub swap_router_address: Option<String>,
+
+    /// Quoter address (Uniswap `QuoterV2`; Balancer uses the router's query).
+    #[arg(long = "swap-quoter-address", value_name = "ADDR")]
+    pub swap_quoter_address: Option<String>,
+
+    /// USDC token address to spend on the swap.
+    #[arg(long = "usdc-address", value_name = "ADDR")]
+    pub usdc_address: Option<String>,
+
+    /// Uniswap V3 pool fee tier (e.g. 3000 = 0.3%). Uniswap venue only.
+    #[arg(long = "swap-fee-tier", value_name = "FEE")]
+    pub swap_fee_tier: Option<u32>,
+
+    /// Balancer V3 pool id (bytes32 hex). Balancer venue only.
+    #[arg(long = "swap-pool-id", value_name = "POOLID")]
+    pub swap_pool_id: Option<String>,
 }
 
 /// `decdn node register` — submit `CapacityBond.registerNode` (ADR 019

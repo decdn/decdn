@@ -35,7 +35,7 @@ pub use publish::{
     PublishChainArgs, PublishCommand,
 };
 pub use run::RunArgs;
-pub use setup::SetupArgs;
+pub use setup::{PayBondWith, SetupArgs};
 
 use std::path::PathBuf;
 
