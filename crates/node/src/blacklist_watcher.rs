@@ -44,23 +44,33 @@ use crate::chain_events::watch_contract_events;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Backoff ceiling — matches the other on-chain watchers.
 const MAX_BACKOFF: Duration = Duration::from_mins(1);
+/// Cadence of the periodic re-reconcile that backstops the event stream. Matches
+/// ADR 011 §Polling's 10-minute `getBlacklistVersion` cadence: it retries hashes
+/// whose scope check hit a transient RPC error and is defense-in-depth for any
+/// event the stream could still miss.
+const RECONCILE_INTERVAL: Duration = Duration::from_mins(10);
+/// Per-call ceiling on the `isHashBlacklistedForOperator` view so a stalled RPC
+/// provider cannot hang a reconcile scan (the provider has no request timeout).
+const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Outcome of following one event subscription to its end.
-enum Follow {
-    /// `shutdown` fired — the watcher must exit.
+/// Outcome of one subscribe → follow cycle.
+enum Cycle {
+    /// `shutdown` fired — exit the watcher.
     Shutdown,
-    /// The stream ended (provider drop / server filter expiry) — re-reconcile
-    /// the gap and re-subscribe.
-    StreamEnded,
+    /// Subscription failed, or the stream ended after running — re-subscribe
+    /// (the next cycle reconciles again right after the filter is installed).
+    Resubscribe,
 }
 
 /// Run the blacklist compliance watcher until `shutdown` fires.
 ///
-/// Reconciles the full held set once at startup (catching entries added while
-/// the node was offline), then follows `HashBlacklisted` events. After any
-/// stream gap (provider drop / server filter expiry / transport error) it
-/// re-reconciles the full held set before re-subscribing, so a lost event can
-/// never leave blacklisted content served.
+/// Each cycle establishes the event subscription first, then reconciles the full
+/// held set, then follows the stream. Reconciling *after* the server-side filter
+/// is installed (which buffers from that moment) closes the race where an event
+/// emitted between a reconcile and a later subscribe would be lost — covering
+/// startup, stream gaps, and repeated subscription failures uniformly. While
+/// following, a periodic re-reconcile retries any hash whose scope check hit a
+/// transient RPC error.
 pub(crate) async fn run<P>(
     provider: P,
     contract_addr: Address,
@@ -72,11 +82,6 @@ pub(crate) async fn run<P>(
 {
     let contract = ContentBlacklist::new(contract_addr, provider.clone());
     info!(%contract_addr, %operator, "blacklist compliance watcher starting");
-
-    // Startup reconcile: evict anything already blacklisted in scope (covers
-    // entries added while offline, and re-asserts durability independent of
-    // `evicted.log`).
-    reconcile_all(&contract, operator, &cache).await;
 
     let mut backoff = INITIAL_BACKOFF;
     loop {
@@ -93,27 +98,13 @@ pub(crate) async fn run<P>(
         {
             Cycle::Shutdown => return,
             Cycle::Resubscribe => {}
-            Cycle::Reconcile => {
-                debug!("blacklist watcher stream ended; reconciling gap before re-subscribe");
-                reconcile_all(&contract, operator, &cache).await;
-            }
         }
     }
 }
 
-/// Outcome of one subscribe → follow cycle.
-enum Cycle {
-    /// `shutdown` fired — exit the watcher.
-    Shutdown,
-    /// Subscription failed and the backoff already elapsed — retry without a
-    /// reconcile (no events were consumed).
-    Resubscribe,
-    /// The stream ended after running — reconcile the gap, then retry.
-    Reconcile,
-}
-
-/// Subscribe to the membership events and follow them until the stream ends,
-/// shutdown fires, or the subscription itself fails (backing off in place).
+/// Subscribe to the membership events, reconcile the held set once the filter is
+/// installed, then follow the stream — until it ends, shutdown fires, or the
+/// subscription itself fails (backing off in place).
 #[allow(clippy::too_many_arguments)]
 async fn run_cycle<P>(
     provider: &P,
@@ -149,35 +140,47 @@ where
         }
     };
     *backoff = INITIAL_BACKOFF;
-    match follow_stream(&mut stream, contract, operator, cache, shutdown).await {
-        Follow::Shutdown => Cycle::Shutdown,
-        Follow::StreamEnded => Cycle::Reconcile,
-    }
+
+    // Reconcile only after the filter is installed (and thus buffering): any
+    // event emitted during the reconcile lands in `stream` rather than a gap.
+    reconcile_all(contract, operator, cache).await;
+
+    follow_stream(&mut stream, contract, operator, cache, shutdown).await
 }
 
 /// Consume `stream` until it ends or `shutdown` fires, dispatching each log to
-/// [`handle_log`].
+/// [`handle_log`] and running a periodic re-reconcile on the side. Returns the
+/// next [`Cycle`] to take.
 async fn follow_stream<P, S>(
     stream: &mut S,
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     shutdown: &mut oneshot::Receiver<()>,
-) -> Follow
+) -> Cycle
 where
     P: Provider + Clone,
     S: futures_util::Stream<Item = Log> + Unpin,
 {
+    // First tick fires one interval out, not immediately — the cycle already
+    // reconciled before calling us.
+    let mut reconcile = tokio::time::interval_at(
+        tokio::time::Instant::now() + RECONCILE_INTERVAL,
+        RECONCILE_INTERVAL,
+    );
     loop {
         tokio::select! {
             _ = &mut *shutdown => {
                 debug!("blacklist watcher shutting down");
-                return Follow::Shutdown;
+                return Cycle::Shutdown;
+            }
+            _ = reconcile.tick() => {
+                reconcile_all(contract, operator, cache).await;
             }
             maybe_log = stream.next() => {
                 match maybe_log {
                     Some(log) => handle_log(contract, operator, cache, log).await,
-                    None => return Follow::StreamEnded,
+                    None => return Cycle::Resubscribe,
                 }
             }
         }
@@ -279,8 +282,10 @@ where
     true
 }
 
-/// Query the operator-scope predicate for `hash`. On RPC error, returns `false`
-/// (leave the blob in place) after logging — the next event or reconnect retries.
+/// Query the operator-scope predicate for `hash`, bounded by [`RPC_CALL_TIMEOUT`]
+/// so a stalled provider cannot hang the reconcile scan. On timeout or RPC error
+/// returns `false` (leave the blob in place) after logging — the next event or
+/// the periodic re-reconcile retries.
 async fn is_blacklisted_for_operator<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
@@ -290,17 +295,28 @@ where
     P: Provider + Clone,
 {
     let hash_key = B256::from(*hash.as_bytes());
-    match contract
-        .isHashBlacklistedForOperator(hash_key, operator)
-        .call()
-        .await
+    match tokio::time::timeout(
+        RPC_CALL_TIMEOUT,
+        contract
+            .isHashBlacklistedForOperator(hash_key, operator)
+            .call(),
+    )
+    .await
     {
-        Ok(flag) => flag,
-        Err(err) => {
+        Ok(Ok(flag)) => flag,
+        Ok(Err(err)) => {
             warn!(
                 %hash,
                 err = %sanitize_rpc_display(&err),
                 "blacklist watcher: isHashBlacklistedForOperator failed; leaving blob in place"
+            );
+            false
+        }
+        Err(_elapsed) => {
+            warn!(
+                %hash,
+                timeout_secs = RPC_CALL_TIMEOUT.as_secs(),
+                "blacklist watcher: isHashBlacklistedForOperator timed out; leaving blob in place"
             );
             false
         }
