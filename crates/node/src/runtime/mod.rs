@@ -1307,6 +1307,7 @@ pub async fn run(
                 content_blacklist_addr,
                 eth_signer.address(),
                 cache.clone(),
+                cfg.blockchain.content_blacklist_from_block,
                 stop_rx,
             ));
             Some(stop_tx)
@@ -2945,6 +2946,7 @@ mod tests {
         cfg_with_origins(origin.map(|o| vec![o]).unwrap_or_default())
     }
 
+    #[allow(clippy::too_many_lines)] // exhaustive ResolvedConfig test builder
     fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, ResolvedConfig) {
         use decdn_common::config::{
             ResolvedBlockchain, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
@@ -2981,6 +2983,7 @@ mod tests {
                 settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
+                content_blacklist_from_block: 0,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: decdn_common::config::ResolvedCache {

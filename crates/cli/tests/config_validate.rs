@@ -341,6 +341,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
             content_blacklist_address: None,
+            content_blacklist_from_block: 0,
             chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
         },
         cache: ResolvedCache {

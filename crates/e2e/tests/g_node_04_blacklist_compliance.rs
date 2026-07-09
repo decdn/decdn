@@ -6,25 +6,27 @@
 //! - **Global compliance (`global_blacklist_compliance`):** a node holds and
 //!   serves blob `H`; governance adds `H` to `ContentBlacklist`; the node's
 //!   blacklist watcher evicts `H` (asserted via admin `evict` dry-run flipping
-//!   `was_present` true→false) and then refuses paid delivery (the client fetch
-//!   fails). Eviction is durable across a daemon restart. Finally, a signed
-//!   post-entry `ProbeResponse` for `H` is driven through the `SlashJudge`
-//!   commit-reveal to prove serving-after-blacklist is on-chain slashable.
+//!   `was_present` true→false), then refuses paid delivery *with the eviction
+//!   reason* (`EvictedSinceProbe`, not a bare error), and its probe handler
+//!   reports `has_blob: false`. Eviction is durable across a daemon restart.
+//!   Finally, a signed post-entry `ProbeResponse` for `H` is driven through the
+//!   `SlashJudge` commit-reveal to prove serving-after-blacklist is slashable.
 //! - **Regional scope (`regional_blacklist_scope`, ties GOV-05):** a US and a DE
 //!   node both hold `H2`; a US-regional entry is evicted by the US node and
-//!   ignored by the DE node, which keeps serving it.
+//!   ignored by the DE node. A global sentinel blob (held only by DE, blacklisted
+//!   *after* the regional entry) is the ordering barrier: DE evicting it proves
+//!   its watcher processed past the regional entry before we assert non-eviction.
 //!
-//! **Coverage boundary.** Eviction is the single production lever, and DHT
-//! announce-suppression + probe `has_blob:false` are *mechanically downstream*
-//! of it (the republisher's and probe handler's `is_evicted` gates, unit-tested
-//! in `crates/node/src/dht/publish.rs` and `handlers/probe.rs`). This e2e
-//! asserts the two reliably-observable end states — the blob left the store and
-//! delivery is refused — rather than re-testing those gates over the network.
-//! The as-built `SlashJudge` enforces slashability from an entry's `addedAt`
-//! (no on-chain compliance-window grace — that window is the node's *reaction*
-//! budget, ADR 011 "target spec vs as-built"), so "after the window" is modeled
-//! by stamping evidence after `addedAt`. Appeal-driven un-eviction and the
-//! explicit probe-hold interplay are follow-ups (see `blacklist_watcher` docs).
+//! **Coverage.** The journey exercises all three serving seams end-to-end
+//! against the daemon — delivery refusal (matched to `EvictedSinceProbe`), the
+//! probe handler (`has_blob: false`), and on-chain slashability. DHT
+//! announce-suppression stays delegated to `crates/node/src/dht/publish.rs`
+//! unit tests (its `is_evicted` gate). The as-built `SlashJudge` enforces
+//! slashability from an entry's `addedAt` (no on-chain compliance-window grace —
+//! that window is the node's *reaction* budget, ADR 011 "target spec vs
+//! as-built"), so "after the window" is modeled by stamping evidence after
+//! `addedAt`. Appeal-driven un-eviction and the explicit probe-hold interplay
+//! are follow-ups (see `blacklist_watcher` docs).
 
 #![cfg(feature = "anvil-e2e")]
 // Test scaffolding legitimately uses unwrap/expect/panic; the workspace
@@ -56,8 +58,10 @@ use jsonrpsee::http_client::HttpClient;
 const MIB: usize = 1024 * 1024;
 
 /// Overall ceiling so an unbounded await fails fast with a clear message.
-/// Cleanup (anvil kill, daemon kill) runs on drop even on timeout.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(900);
+/// Cleanup (anvil kill, daemon kill) runs on drop even on timeout. Kept
+/// comfortably below the `anvil-e2e` job timeout so this per-test message wins
+/// over the opaque job kill; ~3-4× the observed runtime.
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// EIP-712 typehash string for `ProbeResponse` — must byte-match
 /// `SlashJudge.PROBE_TYPEHASH`.
@@ -119,12 +123,16 @@ async fn run_global() -> anyhow::Result<()> {
         "node never evicted the blacklisted blob H"
     );
 
-    // ...and the paid client path now refuses delivery.
-    let refused = ClientFixture::new(&chain).await?;
-    let fetch = refused.fetch(&chain, &node, hash).await;
+    // ...the paid client path now refuses delivery for the eviction reason
+    // specifically (not some unrelated channel/connect/payment failure).
+    assert_refused_as_evicted(&chain, &node, hash).await?;
+
+    // ...and the probe handler stops signing `has_blob: true` (the phantom-blob
+    // slash seam — distinct from the delivery path above).
+    let probe = ClientFixture::new(&chain).await?.probe(&node, hash).await?;
     assert!(
-        fetch.is_err(),
-        "node must refuse to deliver a blacklisted, evicted blob"
+        !probe.body.has_blob,
+        "daemon must report has_blob:false for an evicted blacklisted blob"
     );
 
     // Eviction is durable across a daemon restart.
@@ -133,16 +141,34 @@ async fn run_global() -> anyhow::Result<()> {
         !evict_was_present(&admin, hash).await?,
         "eviction must survive a restart (evicted.log)"
     );
-    let refused2 = ClientFixture::new(&chain).await?;
-    assert!(
-        refused2.fetch(&chain, &node, hash).await.is_err(),
-        "delivery must stay refused after restart"
-    );
+    assert_refused_as_evicted(&chain, &node, hash).await?;
 
     // Full signed-evidence drive: serving H after the entry is on-chain
     // slashable via SlashJudge.
     drive_blacklist_slash(&chain, &node, hash).await?;
 
+    Ok(())
+}
+
+/// Assert a paid fetch of `hash` from `node` is refused *for the eviction
+/// reason* — matching `EvictedSinceProbe` so a channel/connect/payment
+/// regression that also fails the fetch cannot green this check.
+async fn assert_refused_as_evicted(
+    chain: &ChainFixture,
+    node: &NodeFixture,
+    hash: Hash,
+) -> anyhow::Result<()> {
+    let err = ClientFixture::new(chain)
+        .await?
+        .fetch(chain, node, hash)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("fetch of an evicted blacklisted blob must fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("EvictedSinceProbe"),
+        "refusal must be the eviction reason, got: {msg}"
+    );
     Ok(())
 }
 
@@ -153,45 +179,67 @@ async fn run_regional() -> anyhow::Result<()> {
 
     let chain = ChainFixture::launch().await?;
     let payload = vec![0xC3u8; 2 * MIB];
-    // Same bytes → same hash on both nodes.
-    let (us_node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
-    let (de_node, hash_de) = NodeFixture::launch(&chain, "DE", &payload).await?;
-    assert_eq!(hash, hash_de, "identical payloads must share a hash");
+    // A distinct blob only the DE node holds, used as an event-ordering barrier.
+    let sentinel = vec![0xD4u8; MIB];
+    // US holds H2; DE holds H2 + the sentinel (same H2 bytes → same hash).
+    let (us_node, us_hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&payload]).await?;
+    let (de_node, de_hashes) =
+        NodeFixture::launch_with_blobs(&chain, "DE", &[&payload, &sentinel]).await?;
+    let hash = us_hashes[0];
+    let sentinel_hash = de_hashes[1];
+    assert_eq!(de_hashes[0], hash, "shared payload must share a hash");
     let us_admin = us_node.admin_client()?;
     let de_admin = de_node.admin_client()?;
 
+    assert!(evict_was_present(&us_admin, hash).await?, "US must hold H2");
+    assert!(evict_was_present(&de_admin, hash).await?, "DE must hold H2");
     assert!(
-        evict_was_present(&us_admin, hash).await?,
-        "US node must hold H2"
-    );
-    assert!(
-        evict_was_present(&de_admin, hash).await?,
-        "DE node must hold H2"
+        evict_was_present(&de_admin, sentinel_hash).await?,
+        "DE must hold the sentinel"
     );
 
-    // A US-regional entry: in scope for the US node, out of scope for DE.
+    // A US-regional entry (in scope for US, out of scope for DE), then a GLOBAL
+    // sentinel that DE holds. Emitting the sentinel *after* the regional entry
+    // makes DE's eviction of the sentinel a positive signal that its watcher has
+    // processed events at/after the regional entry — so a scope bug that evicts
+    // the regional entry a cycle late would already have fired before we assert
+    // non-eviction.
     chain
         .add_hash_regional(region_key("US"), to_b256(hash))
         .await?;
+    chain.add_hash_global(to_b256(sentinel_hash)).await?;
     time::increase_time(&chain.admin, 3600).await?;
 
-    // US node evicts.
-    let evicted = poll(Duration::from_secs(60), || async {
+    // US evicts the in-region entry.
+    let us_evicted = poll(Duration::from_secs(60), || async {
         Ok((!evict_was_present(&us_admin, hash).await?).then_some(()))
     })
     .await?;
     assert!(
-        evicted.is_some(),
+        us_evicted.is_some(),
         "US node never evicted the in-region blacklisted blob"
     );
 
-    // DE node keeps serving it: still present, and paid delivery still works.
+    // Barrier: DE evicting the global sentinel proves its watcher processed past
+    // the regional entry.
+    let de_barrier = poll(Duration::from_secs(60), || async {
+        Ok((!evict_was_present(&de_admin, sentinel_hash).await?).then_some(()))
+    })
+    .await?;
+    assert!(
+        de_barrier.is_some(),
+        "DE node never evicted the global sentinel (watcher not processing events)"
+    );
+
+    // DE ignored the US-regional entry: still holds H2 and still delivers it.
     assert!(
         evict_was_present(&de_admin, hash).await?,
         "DE (out-of-region) node must NOT evict a US-regional entry"
     );
-    let client = ClientFixture::new(&chain).await?;
-    let outcome = client.fetch(&chain, &de_node, hash).await?;
+    let outcome = ClientFixture::new(&chain)
+        .await?
+        .fetch(&chain, &de_node, hash)
+        .await?;
     assert_eq!(
         outcome.bytes, payload,
         "out-of-region node must keep delivering the blob"

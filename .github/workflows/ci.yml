@@ -499,9 +499,11 @@ jobs:
     # Bound the job so a stalled in-test `forge script --broadcast` (issue #785)
     # fails red quickly instead of squatting the runner until GitHub's 6-hour
     # default — or masquerading as "cancelled" when a later push pre-empts it.
-    # Raised from 15m when the cross-layer `decdn-e2e` journeys (#1031) joined
-    # the settlement e2e in this job.
-    timeout-minutes: 20
+    # Sized ABOVE the sum of the sequential steps' own in-test `OVERALL_TIMEOUT`
+    # ceilings (settlement 13m + cross-layer journeys 10m) plus compile/forge, so
+    # a genuinely hung test hits its per-test timeout's clear message first rather
+    # than this opaque job-level kill (the #785 masking this bound exists to avoid).
+    timeout-minutes: 30
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||

@@ -172,6 +172,31 @@ impl ClientFixture {
             }
         }
     }
+
+    /// Probe `node` for `hash` over `cdn/probe/v1` and return the signed
+    /// response. Unpaid (no channel) — used to assert the daemon's probe handler
+    /// reports `has_blob: false` after eviction (the phantom-blob slash seam).
+    pub async fn probe(
+        &self,
+        node: &NodeFixture,
+        hash: Hash,
+    ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
+        let target = EndpointAddr::new(node.node_id).with_ip_addr(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port),
+        ));
+        let (resp, _rtt) = decdn_client_pull::probe::probe_once(
+            &self.endpoint,
+            target,
+            *hash.as_bytes(),
+            TIMESTAMP_US,
+            false, // full handshake keeps the probe deterministic
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .context("probe daemon")?;
+        Ok(resp)
+    }
 }
 
 /// Bind a loopback iroh endpoint with relays disabled (no ALPNs — client only

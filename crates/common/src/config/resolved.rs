@@ -108,6 +108,10 @@ pub struct ResolvedBlockchain {
     /// into the blacklist compliance watcher (ADR 011/031); `None` => no
     /// watcher, so blacklisted content is not locally evicted.
     pub content_blacklist_address: Option<String>,
+    /// Starting block for the blacklist watcher's `HashBlacklisted` log replay
+    /// (the `ContentBlacklist` deployment block). Defaults to `0`. Only used
+    /// when `content_blacklist_address` is set.
+    pub content_blacklist_from_block: u64,
     /// EIP-712 `chainId` for the `slash_sig` domain separator. Defaults to
     /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia) when unset.
     pub chain_id: u64,

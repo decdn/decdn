@@ -168,6 +168,12 @@ pub struct BlockchainConfig {
     /// delivery refusal. Unset => no watcher (serving a blacklisted hash after
     /// its compliance window is then slashable with no local protection).
     pub content_blacklist_address: Option<String>,
+    /// Block height at which the blacklist watcher begins its `HashBlacklisted`
+    /// log replay. SHOULD be the `ContentBlacklist` deployment block; absent =>
+    /// `0`, which is correct but scans the whole chain history (slow / RPC-heavy
+    /// on an established L2). Only consulted when `content_blacklist_address` is
+    /// set. Mirrors `origin_directory_from_block`.
+    pub content_blacklist_from_block: Option<u64>,
     /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
     /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
     /// network target — matches the chain id bound on the runtime signer).

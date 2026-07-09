@@ -71,15 +71,31 @@ pub struct NodeFixture {
 }
 
 impl NodeFixture {
-    /// Provision a data dir + keystore + iroh key, onboard the operator
-    /// on-chain, write the daemon config (with a filesystem origin holding
-    /// `serve_blob`), spawn `decdn-node run`, and wait until its admin RPC is
-    /// healthy. Returns the fixture and the BLAKE3 [`struct@Hash`] of the served blob.
+    /// Provision + launch a node serving a single blob. Returns the fixture and
+    /// the served blob's BLAKE3 [`struct@Hash`].
     pub async fn launch(
         chain: &ChainFixture,
         region: &str,
         serve_blob: &[u8],
     ) -> anyhow::Result<(Self, Hash)> {
+        let (node, mut hashes) = Self::launch_with_blobs(chain, region, &[serve_blob]).await?;
+        let hash = hashes
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("launch_with_blobs returned no hash"))?;
+        Ok((node, hash))
+    }
+
+    /// Provision a data dir + keystore + iroh key, onboard the operator
+    /// on-chain, write the daemon config (with a filesystem origin holding
+    /// `serve_blobs`), spawn `decdn-node run`, and wait until its admin RPC is
+    /// healthy. Returns the fixture and the BLAKE3 [`struct@Hash`] of each blob,
+    /// in input order. Multiple blobs let a journey hold a sentinel alongside the
+    /// blob under test (e.g. an ordering barrier for event processing).
+    pub async fn launch_with_blobs(
+        chain: &ChainFixture,
+        region: &str,
+        serve_blobs: &[&[u8]],
+    ) -> anyhow::Result<(Self, Vec<Hash>)> {
         let data_dir = tempfile::tempdir().context("create node data dir")?;
         // `identity::ensure_data_dir` (and the keystore/identity writers) require
         // an `0o700` data dir; a umask of 022 leaves the tempdir at 0o755, so
@@ -108,10 +124,16 @@ impl NodeFixture {
         let node_secret = identity::load_or_generate(data_dir.path()).context("node iroh key")?;
         let node_id = node_secret.public();
 
-        // Seed the blob into a filesystem origin: `{root}/{hex[..2]}/{hex}`.
+        // Seed each blob into a filesystem origin: `{root}/{hex[..2]}/{hex}`.
         let origin_dir = tempfile::tempdir().context("create origin dir")?;
-        let hash = Hash::new(serve_blob);
-        write_fs_origin_blob(origin_dir.path(), &hash, serve_blob)?;
+        let hashes: Vec<Hash> = serve_blobs
+            .iter()
+            .map(|blob| {
+                let hash = Hash::new(blob);
+                write_fs_origin_blob(origin_dir.path(), &hash, blob)?;
+                Ok(hash)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let bind_port = crate::free_port()?;
         let admin_port = crate::free_port()?;
@@ -157,9 +179,11 @@ impl NodeFixture {
             let warm = CacheEngine::open(&cache_dir, vec![origin], 1024)
                 .await
                 .context("open warm cache")?;
-            warm.get(hash)
-                .await
-                .context("warm node cache from fs origin")?;
+            for hash in &hashes {
+                warm.get(*hash)
+                    .await
+                    .context("warm node cache from fs origin")?;
+            }
             // Explicitly flush the iroh-blobs store to disk so the daemon's
             // reopen of `cache_dir` sees the blob (drop alone does not sync).
             warm.shutdown().await.context("flush warm cache")?;
@@ -182,7 +206,7 @@ impl NodeFixture {
             .wait_healthy(Duration::from_secs(30))
             .await
             .context("node never became healthy")?;
-        Ok((fixture, hash))
+        Ok((fixture, hashes))
     }
 
     /// Kill the daemon and respawn it against the same data dir + config, then

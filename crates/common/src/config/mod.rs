@@ -1062,9 +1062,7 @@ fn resolve_blockchain_into(
 
     // Optional `ContentBlacklist` address: when set the node runs the blacklist
     // compliance watcher (ADR 011/031). Opt-in like the origin-directory
-    // addresses — an unset address just means no watcher, so (unlike
-    // `slash_judge_address`) a missing value is not an error and there is no
-    // zero-address cascade to guard.
+    // addresses — a missing value is not an error, it just means no watcher.
     let content_blacklist_address = cli
         .content_blacklist_address
         .clone()
@@ -1076,6 +1074,26 @@ fn resolve_blockchain_into(
                 parse_contract_address("content_blacklist_address", &v),
             )
         });
+    // The zero address is a fail-open trap for compliance (unlike the opt-in
+    // origin-directory addresses): every `isHashBlacklistedForOperator` call
+    // against a codeless address reverts on empty return data, the watcher maps
+    // that to "leave the blob in place", and nothing is ever evicted while the
+    // operator believes compliance is active — maximal slash exposure with a
+    // "configured" watcher. Reject it explicitly, mirroring `slash_judge_address`.
+    if let Some(addr) = content_blacklist_address.as_deref() {
+        bag.check(
+            addr.trim_start_matches("0x").bytes().any(|b| b != b'0'),
+            "blockchain.content_blacklist_address",
+            "blockchain.content_blacklist_address must not be the zero address — \
+             set it to the deployed ContentBlacklist contract (ADR 011/031)",
+        );
+    }
+    // File-only tuning for the watcher's `HashBlacklisted` log replay start block
+    // (mirrors `origin_directory_from_block`). SHOULD be the ContentBlacklist
+    // deployment block; absent => `0`, correct but scans the whole chain.
+    let content_blacklist_from_block = file
+        .and_then(|b| b.content_blacklist_from_block)
+        .unwrap_or(0);
 
     let chain_id = cli
         .chain_id
@@ -1208,6 +1226,7 @@ fn resolve_blockchain_into(
         origin_directory_from_block,
         slash_judge_address,
         content_blacklist_address,
+        content_blacklist_from_block,
         chain_id,
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
@@ -8011,6 +8030,7 @@ mod tests {
         };
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
+            content_blacklist_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: Some("https://file-loses.example/rpc".to_string()),
@@ -8046,6 +8066,7 @@ mod tests {
         let cli = empty_blockchain_args();
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
+            content_blacklist_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: Some("https://file-only.example/rpc".to_string()),
@@ -8276,6 +8297,7 @@ mod tests {
         };
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
+            content_blacklist_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8322,6 +8344,7 @@ mod tests {
         };
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
+            content_blacklist_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8367,6 +8390,7 @@ mod tests {
         };
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
+            content_blacklist_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8412,6 +8436,7 @@ mod tests {
         };
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
+            content_blacklist_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8480,6 +8505,7 @@ mod tests {
         };
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
+            content_blacklist_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8524,6 +8550,7 @@ mod tests {
         };
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
+            content_blacklist_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
@@ -8563,6 +8590,7 @@ mod tests {
         };
         let file = types::BlockchainConfig {
             origin_directory_from_block: None,
+            content_blacklist_from_block: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
             rpc_url: None,
