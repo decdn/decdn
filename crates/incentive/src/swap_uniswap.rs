@@ -143,12 +143,16 @@ pub struct UniswapV3Venue {
     usdc: Address,
     token: Address,
     fee: u32,
+    payer: Address,
 }
 
 impl UniswapV3Venue {
     /// Construct a venue against `provider`. `pool` is `None` when the
     /// current config surface has no Uniswap pool address (the common case
     /// today — see module docs); the price-impact gate simply won't fire.
+    /// `payer` is the account whose USDC funds the swap (the signer behind
+    /// `provider`); the router pulls `tokenIn` from it, so it is the allowance
+    /// owner.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: impl Provider + Clone + 'static,
@@ -158,6 +162,7 @@ impl UniswapV3Venue {
         usdc: Address,
         token: Address,
         fee: u32,
+        payer: Address,
     ) -> Self {
         Self {
             provider: provider.erased(),
@@ -167,6 +172,7 @@ impl UniswapV3Venue {
             usdc,
             token,
             fee,
+            payer,
         }
     }
 
@@ -220,9 +226,10 @@ impl UniswapV3Venue {
     /// `SwapRouter02` pulls `tokenIn` via a direct ERC20 allowance, so it
     /// ERC20-approves the router for `max_in` first (idempotent — skipped when
     /// the standing allowance already covers `max_in`, so a `setup` re-run
-    /// doesn't re-approve). `recipient` is the swap payer/signer (the venue's
-    /// caller configures `provider` with `recipient` as its signer), so it is
-    /// the allowance owner. `SwapRouter02.exactOutputSingle` has no `deadline`
+    /// doesn't re-approve). The venue holds `payer` explicitly (the account the
+    /// router pulls USDC from), so it is the allowance owner; `recipient` can be
+    /// an arbitrary address — Uniswap's `exactOutputSingle` honors it — so the
+    /// two need not coincide. `SwapRouter02.exactOutputSingle` has no `deadline`
     /// parameter (unlike the V1 router), so `_deadline` is unused here — it
     /// exists only to satisfy `SwapVenue::swap_exact_out`'s venue-neutral
     /// signature (Balancer, added in Task 6, does use one).
@@ -237,7 +244,7 @@ impl UniswapV3Venue {
         // allowance). Idempotent: a sufficient existing allowance is a no-op.
         let usdc = Erc20::new(self.usdc, &self.provider);
         let allowance = usdc
-            .allowance(recipient, self.router)
+            .allowance(self.payer, self.router)
             .call()
             .await
             .context("failed to read USDC allowance")?;

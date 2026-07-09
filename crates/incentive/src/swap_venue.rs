@@ -112,10 +112,14 @@ pub struct ResolvedSwap {
 /// Construct the configured [`SwapVenue`] from resolved chain config,
 /// dispatching on `resolved.venue`. `token` is the TOKEN address being
 /// bought (not carried by `ResolvedSwap`, which is USDC-side config only).
+/// `payer` is the account whose USDC funds the swap — the signer behind
+/// `provider` — which each venue uses as the allowance owner (Uniswap) and
+/// enforced swap recipient (Balancer V3 has no recipient slot).
 pub fn from_config<P: Provider + Clone + 'static>(
     provider: P,
     resolved: &ResolvedSwap,
     token: Address,
+    payer: Address,
 ) -> anyhow::Result<SwapVenue> {
     match resolved.venue.as_str() {
         "uniswap-v3" => {
@@ -147,7 +151,7 @@ pub fn from_config<P: Provider + Clone + 'static>(
                 None => None,
             };
             Ok(SwapVenue::UniswapV3(UniswapV3Venue::new(
-                provider, router, quoter, pool, usdc, token, fee,
+                provider, router, quoter, pool, usdc, token, fee, payer,
             )))
         }
         "balancer-v3" => {
@@ -170,7 +174,7 @@ pub fn from_config<P: Provider + Clone + 'static>(
                 anyhow::anyhow!("balancer_pool_id {pool_str:?} is not a valid address: {e}")
             })?;
             Ok(SwapVenue::BalancerV3(BalancerV3Venue::new(
-                provider, router, pool, usdc, token,
+                provider, router, pool, usdc, token, payer,
             )))
         }
         other => anyhow::bail!("unknown swap venue {other}"),
@@ -257,6 +261,7 @@ mod tests {
             unconnected_provider(),
             &resolved,
             Address::repeat_byte(0x44),
+            Address::ZERO,
         )
         .unwrap();
         assert!(matches!(venue, SwapVenue::UniswapV3(_)));
@@ -273,7 +278,13 @@ mod tests {
             balancer_pool_id: None,
             pool: None,
         };
-        let err = from_config(unconnected_provider(), &resolved, Address::ZERO).unwrap_err();
+        let err = from_config(
+            unconnected_provider(),
+            &resolved,
+            Address::ZERO,
+            Address::ZERO,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("uniswap_fee_tier"), "{err}");
     }
 
@@ -288,7 +299,13 @@ mod tests {
             balancer_pool_id: None,
             pool: None,
         };
-        let err = from_config(unconnected_provider(), &resolved, Address::ZERO).unwrap_err();
+        let err = from_config(
+            unconnected_provider(),
+            &resolved,
+            Address::ZERO,
+            Address::ZERO,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("unknown swap venue curve"),
             "{err}"
@@ -310,6 +327,7 @@ mod tests {
             unconnected_provider(),
             &resolved,
             Address::repeat_byte(0x44),
+            Address::ZERO,
         )
         .unwrap_err();
         assert!(err.to_string().contains("balancer_pool_id"), "{err}");
@@ -330,6 +348,7 @@ mod tests {
             unconnected_provider(),
             &resolved,
             Address::repeat_byte(0x44),
+            Address::ZERO,
         )
         .unwrap();
         assert!(matches!(venue, SwapVenue::BalancerV3(_)));
@@ -346,7 +365,13 @@ mod tests {
             balancer_pool_id: Some("not-an-address".to_string()),
             pool: None,
         };
-        let err = from_config(unconnected_provider(), &resolved, Address::ZERO).unwrap_err();
+        let err = from_config(
+            unconnected_provider(),
+            &resolved,
+            Address::ZERO,
+            Address::ZERO,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("balancer_pool_id"), "{err}");
     }
 
@@ -361,7 +386,13 @@ mod tests {
             balancer_pool_id: None,
             pool: None,
         };
-        let err = from_config(unconnected_provider(), &resolved, Address::ZERO).unwrap_err();
+        let err = from_config(
+            unconnected_provider(),
+            &resolved,
+            Address::ZERO,
+            Address::ZERO,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("swap_router_address"), "{err}");
     }
 }

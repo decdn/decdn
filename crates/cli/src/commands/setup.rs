@@ -15,7 +15,7 @@
 //! with it — two prompts only when the password isn't supplied via
 //! `DECDN_KEYSTORE_PASSWORD` / `--keystore-password-file`.)
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -827,6 +827,12 @@ fn confirm(
     mbps: u64,
     swap_max_in: Option<U256>,
 ) -> io::Result<bool> {
+    // No TTY on either stream: the prompt would be invisible and
+    // `read_line` would block or read EOF. Fail fast to "no" (the existing
+    // non-interactive outcome) without emitting an unseen prompt.
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(false);
+    }
     if let Some(max_in) = swap_max_in {
         // USDC mode: acquiring the top-up spends up to `max_in` USDC, then bonds.
         print!(
@@ -872,6 +878,12 @@ struct SwapSummary {
 /// ceiling. Returns `false` on EOF / a non-affirmative answer (a
 /// non-interactive stdin reads as "no").
 fn confirm_impact(impact_bps: u32, swap_out: U256, max_in: U256) -> io::Result<bool> {
+    // No TTY on either stream: the prompt would be invisible and `read_line`
+    // would block or read EOF. Fail fast to "no" without emitting an unseen
+    // prompt.
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(false);
+    }
     print!(
         "Swap price impact is {impact_bps} bps (over the {PRICE_IMPACT_LIMIT_BPS} bps limit): \
          acquiring {swap_out} TOKEN may cost up to {max_in} USDC base units. Proceed? [y/N] "
@@ -932,11 +944,20 @@ async fn prepare_usdc_swap<P: Provider + Clone + 'static>(
     dry_run: bool,
 ) -> anyhow::Result<Option<PreparedSwap>> {
     let json = args.chain.json;
+    // Bound the slippage tolerance (USDC mode only): without a ceiling a
+    // fat-finger like 65535 sets a ~7.5x spend cap. 10000 bps = 100%.
+    anyhow::ensure!(
+        args.max_slippage_bps <= 10_000,
+        "--max-slippage-bps cannot exceed 10000 (100%)"
+    );
     let resolved_swap = chain_ctx::resolve_swap(&args.chain, file)?.context(
         "--pay-bond-with usdc requires swap-venue config (--swap-venue, \
          --swap-router-address, --swap-quoter-address, --usdc-address)",
     )?;
-    let venue = swap_venue::from_config(provider.clone(), &resolved_swap, plan.token)?;
+    // `operator` is the signer whose USDC funds the swap; thread it in as the
+    // payer so each venue uses it as the allowance owner (Uniswap) and the
+    // enforced swap recipient (Balancer V3 has no recipient slot).
+    let venue = swap_venue::from_config(provider.clone(), &resolved_swap, plan.token, operator)?;
     let swap_out = swap_top_up(plan.shortfall, token_balance);
     if swap_out.is_zero() {
         hline(

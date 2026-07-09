@@ -171,18 +171,23 @@ pub struct BalancerV3Venue {
     pool: Address,
     usdc: Address,
     token: Address,
+    payer: Address,
 }
 
 impl BalancerV3Venue {
     /// Construct a venue against `provider`. `pool` is the Balancer V3 pool
     /// contract address (V3 pools are addressed directly — unlike V2, there
-    /// is no bytes32 `poolId` indirection through the Vault).
+    /// is no bytes32 `poolId` indirection through the Vault). `payer` is the
+    /// account whose USDC funds the swap (the signer behind `provider`);
+    /// Balancer V3 always sends swap output to that account, so
+    /// `swap_exact_out` requires its `recipient` to equal `payer`.
     pub fn new(
         provider: impl Provider + Clone + 'static,
         router: Address,
         pool: Address,
         usdc: Address,
         token: Address,
+        payer: Address,
     ) -> Self {
         Self {
             provider: provider.erased(),
@@ -191,6 +196,7 @@ impl BalancerV3Venue {
             pool,
             usdc,
             token,
+            payer,
         }
     }
 
@@ -250,7 +256,15 @@ impl BalancerV3Venue {
         recipient: Address,
         deadline: U256,
     ) -> anyhow::Result<B256> {
-        let _ = recipient; // see doc comment: no on-chain recipient slot.
+        // Balancer V3 has no recipient slot: output always settles to the
+        // signer (the payer). A `recipient` != payer would silently misroute,
+        // so reject it up front rather than paying to the wrong address.
+        anyhow::ensure!(
+            recipient == self.payer,
+            "Balancer V3 sends swap output to the signer; recipient {recipient} must equal the \
+             payer {}",
+            self.payer
+        );
 
         let usdc = Erc20::new(self.usdc, &self.provider);
         let permit2 = Permit2::new(self.permit2, &self.provider);
@@ -328,41 +342,80 @@ impl BalancerV3Venue {
         let tx_hash = receipt.transaction_hash;
 
         // Reset both legs — mirrors the reference's unconditional post-swap
-        // reset so no standing allowance survives. Best-effort: only reached
-        // once the swap itself has succeeded (see module docs for why the
-        // non-atomic, multi-transaction error path can't mirror the
-        // reference's automatic on-revert rollback).
-        let permit2_reset_pending = permit2
-            .approve(self.usdc, self.router, U160::ZERO, U48::ZERO)
-            .send()
-            .await
-            .context("Permit2 allowance reset transaction failed to send")?;
-        let permit2_reset_receipt = permit2_reset_pending
-            .get_receipt()
-            .await
-            .context("Permit2 allowance reset sent but the receipt could not be fetched")?;
-        anyhow::ensure!(
-            permit2_reset_receipt.status(),
-            "Permit2 allowance reset reverted (tx {})",
-            permit2_reset_receipt.transaction_hash
-        );
-
-        let usdc_reset_pending = usdc
-            .approve(self.permit2, U256::ZERO)
-            .send()
-            .await
-            .context("USDC approve(Permit2) reset transaction failed to send")?;
-        let usdc_reset_receipt = usdc_reset_pending
-            .get_receipt()
-            .await
-            .context("USDC approve(Permit2) reset sent but the receipt could not be fetched")?;
-        anyhow::ensure!(
-            usdc_reset_receipt.status(),
-            "USDC approve(Permit2) reset reverted (tx {})",
-            usdc_reset_receipt.transaction_hash
-        );
+        // reset so no standing allowance survives. Best-effort: the swap has
+        // already succeeded (the operator now holds TOKEN), so a failed reset
+        // must NOT abort onboarding or be misreported as a swap failure. Each
+        // helper warns and continues, so the successful swap tx hash is returned
+        // regardless (see module docs for why the non-atomic, multi-transaction
+        // error path can't mirror the reference's automatic on-revert rollback).
+        self.reset_permit2_allowance().await;
+        self.reset_usdc_approval().await;
 
         Ok(tx_hash)
+    }
+
+    /// Best-effort reset of the Router's Permit2 allowance to zero. Warns and
+    /// returns on any failure — the swap has already succeeded, so a stale
+    /// Router allowance must not abort onboarding (see `swap_exact_out`).
+    async fn reset_permit2_allowance(&self) {
+        let permit2 = Permit2::new(self.permit2, &self.provider);
+        let outcome = async {
+            let pending = permit2
+                .approve(self.usdc, self.router, U160::ZERO, U48::ZERO)
+                .send()
+                .await
+                .context("failed to send")?;
+            let receipt = pending
+                .get_receipt()
+                .await
+                .context("sent but the receipt could not be fetched")?;
+            anyhow::ensure!(
+                receipt.status(),
+                "reverted (tx {})",
+                receipt.transaction_hash
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(e) = outcome {
+            tracing::warn!(
+                error = %e,
+                "Permit2 allowance reset failed; swap already succeeded, continuing (a stale \
+                 Router allowance may survive)"
+            );
+        }
+    }
+
+    /// Best-effort reset of the USDC→Permit2 ERC20 approval to zero. Warns and
+    /// returns on any failure — the swap has already succeeded, so a stale
+    /// Permit2 approval must not abort onboarding (see `swap_exact_out`).
+    async fn reset_usdc_approval(&self) {
+        let usdc = Erc20::new(self.usdc, &self.provider);
+        let outcome = async {
+            let pending = usdc
+                .approve(self.permit2, U256::ZERO)
+                .send()
+                .await
+                .context("failed to send")?;
+            let receipt = pending
+                .get_receipt()
+                .await
+                .context("sent but the receipt could not be fetched")?;
+            anyhow::ensure!(
+                receipt.status(),
+                "reverted (tx {})",
+                receipt.transaction_hash
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(e) = outcome {
+            tracing::warn!(
+                error = %e,
+                "USDC approve(Permit2) reset failed; swap already succeeded, continuing (a stale \
+                 Permit2 allowance may survive)"
+            );
+        }
     }
 }
 
@@ -374,6 +427,30 @@ mod tests {
     const USDC: Address = Address::repeat_byte(0xA1);
     const TOKEN: Address = Address::repeat_byte(0xB2);
     const POOL: Address = Address::repeat_byte(0xD4);
+    const ROUTER: Address = Address::repeat_byte(0xE5);
+
+    /// A provider that never dials out: the `recipient != payer` guard fires
+    /// before any RPC call, so this is safe (see `swap_venue`'s test note).
+    fn unconnected_provider() -> impl Provider + Clone + 'static {
+        alloy::providers::ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn swap_exact_out_rejects_recipient_ne_payer() {
+        let payer = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x22);
+        let venue = BalancerV3Venue::new(unconnected_provider(), ROUTER, POOL, USDC, TOKEN, payer);
+        let err = venue
+            .swap_exact_out(
+                U256::from(1u64),
+                U256::from(1u64),
+                recipient,
+                U256::from(0u64),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must equal the payer"), "{err}");
+    }
 
     #[test]
     fn exact_out_swap_args_are_usdc_in_token_out() {
