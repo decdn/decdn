@@ -271,21 +271,31 @@ impl BalancerV3Venue {
         let router = BalancerV3Router::new(self.router, &self.provider);
 
         // Leg 1: ERC20-approve Permit2 for max_in (mirrors the reference's
-        // `usdc.forceApprove(address(permit2), amountIn)`).
-        let approve_permit2_pending = usdc
-            .approve(self.permit2, max_in)
-            .send()
+        // `usdc.forceApprove(address(permit2), amountIn)`). Idempotent —
+        // skipped when the payer's standing Permit2 allowance already covers
+        // `max_in`, mirroring the Uniswap venue's approve-only-the-shortfall
+        // pattern so a `setup` re-run doesn't re-approve.
+        let permit2_allowance = usdc
+            .allowance(self.payer, self.permit2)
+            .call()
             .await
-            .context("USDC approve(Permit2) transaction failed to send")?;
-        let approve_permit2_receipt = approve_permit2_pending
-            .get_receipt()
-            .await
-            .context("USDC approve(Permit2) sent but the receipt could not be fetched")?;
-        anyhow::ensure!(
-            approve_permit2_receipt.status(),
-            "USDC approve(Permit2) reverted (tx {})",
-            approve_permit2_receipt.transaction_hash
-        );
+            .context("failed to read USDC allowance for Permit2")?;
+        if permit2_allowance < max_in {
+            let approve_permit2_pending = usdc
+                .approve(self.permit2, max_in)
+                .send()
+                .await
+                .context("USDC approve(Permit2) transaction failed to send")?;
+            let approve_permit2_receipt = approve_permit2_pending
+                .get_receipt()
+                .await
+                .context("USDC approve(Permit2) sent but the receipt could not be fetched")?;
+            anyhow::ensure!(
+                approve_permit2_receipt.status(),
+                "USDC approve(Permit2) reverted (tx {})",
+                approve_permit2_receipt.transaction_hash
+            );
+        }
 
         // Leg 2: grant the Router a Permit2 allowance, scoped to `deadline`
         // (see module docs — deviates from the reference's `block.timestamp`

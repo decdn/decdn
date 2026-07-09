@@ -5,15 +5,13 @@
 //! `QuoterV2.quoteExactOutputSingle` + [`crate::swap_math::max_in_with_slippage`].
 //!
 //! `spot_in` (the price-impact gate's baseline) is advisory only — it never
-//! bounds the actual swap, that's `expected_in`/`max_in`. The current
-//! `--swap-venue` config surface (`chain_ctx::ResolvedSwap` in the `cli`
-//! crate) carries a router, quoter, USDC address, and fee tier, but no
-//! dedicated Uniswap *pool* address (only `swap_pool_id`, reserved for
-//! Balancer's bytes32 pool id — see Task 6). Without a pool address the
-//! `slot0` spot check can't run, so `UniswapV3Venue`'s `pool` field is
-//! `Option`: `None` degrades `spot_in` to `expected_in` (0 bps impact, gate
-//! never fires) rather than fabricating a number. A future config extension
-//! can wire a real pool address through to light the gate up.
+//! bounds the actual swap, that's `expected_in`/`max_in`. The `--swap-venue`
+//! config surface ([`crate::swap_venue::ResolvedSwap`]) carries a dedicated
+//! Uniswap TOKEN/USDC `pool` address (`--swap-pool-address`): when it is
+//! configured the `slot0` spot read runs and lights up the price-impact gate,
+//! and `UniswapV3Venue`'s `pool` field is `Option` so an unset pool degrades
+//! `spot_in` to `expected_in` (0 bps impact, gate stays inert) rather than
+//! fabricating a number.
 
 // The `sol!`-generated bindings include macro-emitted code that uses
 // patterns workspace clippy denies (raw indexing, `unwrap` on infallible
@@ -42,6 +40,8 @@ mod sol_types {
             }
             function exactOutputSingle(ExactOutputSingleParams calldata params)
                 external payable returns (uint256 amountIn);
+            function multicall(uint256 deadline, bytes[] calldata data)
+                external payable returns (bytes[] memory results);
         }
         #[sol(rpc)]
         contract QuoterV2 {
@@ -63,8 +63,9 @@ mod sol_types {
 pub use sol_types::{QuoterV2, SwapRouter02, UniswapV3Pool};
 
 use alloy::primitives::aliases::U24;
-use alloy::primitives::{Address, B256, U160, U256};
+use alloy::primitives::{Address, B256, Bytes, U160, U256};
 use alloy::providers::{DynProvider, Provider};
+use alloy::sol_types::SolCall;
 use anyhow::Context;
 
 use crate::erc20::Erc20;
@@ -229,16 +230,17 @@ impl UniswapV3Venue {
     /// doesn't re-approve). The venue holds `payer` explicitly (the account the
     /// router pulls USDC from), so it is the allowance owner; `recipient` can be
     /// an arbitrary address — Uniswap's `exactOutputSingle` honors it — so the
-    /// two need not coincide. `SwapRouter02.exactOutputSingle` has no `deadline`
-    /// parameter (unlike the V1 router), so `_deadline` is unused here — it
-    /// exists only to satisfy `SwapVenue::swap_exact_out`'s venue-neutral
-    /// signature (Balancer, added in Task 6, does use one).
+    /// two need not coincide. `SwapRouter02.exactOutputSingle` has no per-call
+    /// `deadline` parameter (unlike the V1 router), so the swap is submitted
+    /// through the router's `multicall(uint256 deadline, bytes[] data)`, which
+    /// reverts if the transaction can't land before `deadline` — the same
+    /// expiry guarantee the Balancer venue gets natively.
     pub async fn swap_exact_out(
         &self,
         amount_out: U256,
         max_in: U256,
         recipient: Address,
-        _deadline: U256,
+        deadline: U256,
     ) -> anyhow::Result<B256> {
         // Approve the router to pull up to `max_in` USDC (direct ERC20
         // allowance). Idempotent: a sufficient existing allowance is a no-op.
@@ -269,11 +271,16 @@ impl UniswapV3Venue {
         let params = build_exact_output_params(
             self.usdc, self.token, self.fee, recipient, amount_out, max_in,
         );
+        // `exactOutputSingle` has no per-call deadline, so wrap it in the
+        // router's `multicall(deadline, data)`: the router reverts the whole
+        // batch if it can't execute before `deadline`, giving the swap the same
+        // expiry guarantee the Balancer venue has natively.
+        let inner = SwapRouter02::exactOutputSingleCall { params }.abi_encode();
         let pending = router
-            .exactOutputSingle(params)
+            .multicall(deadline, vec![Bytes::from(inner)])
             .send()
             .await
-            .context("exactOutputSingle transaction failed to send")?;
+            .context("exactOutputSingle (via multicall) transaction failed to send")?;
         let receipt = pending
             .get_receipt()
             .await
