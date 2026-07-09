@@ -4534,3 +4534,37 @@ async fn export_bao_range_empty_blob_round_trips() -> anyhow::Result<()> {
     anyhow::ensure!(got.as_ref().is_empty(), "empty blob decodes to empty bytes");
     Ok(())
 }
+
+/// `export_bao_range` on a 0-byte blob must honor a logical eviction (#279):
+/// after `evict`, the empty early-return must surface a `Store` error rather
+/// than keep serving an empty body — matching the non-empty path, whose store
+/// export stops serving an evicted hash (#1054 review). (The empty blob is
+/// otherwise trivially "present" in the store, so eviction — not absence — is
+/// the state that must stop the empty serve.)
+#[tokio::test]
+async fn export_bao_range_empty_blob_evicted_errors() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let engine = decdn_cache::CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
+    let empty: Vec<u8> = Vec::new();
+    let hash = Hash::new(&empty);
+    // The empty blob is trivially present; a whole serve succeeds.
+    anyhow::ensure!(engine.has(hash).await?, "empty blob is trivially present");
+    anyhow::ensure!(
+        engine.export_bao_range(hash, 0, 0, 0).await?.is_empty(),
+        "present empty blob serves empty"
+    );
+
+    // After eviction the node must stop serving it — including the empty body.
+    engine.evict(hash).await?;
+    anyhow::ensure!(!engine.has(hash).await?, "evicted blob reads as absent");
+    let err = engine
+        .export_bao_range(hash, 0, 0, 0)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected an error for an evicted empty blob"))?;
+    anyhow::ensure!(
+        matches!(err, decdn_cache::CacheError::Store(_)),
+        "evicted empty blob must surface a Store error, got {err:?}"
+    );
+    Ok(())
+}

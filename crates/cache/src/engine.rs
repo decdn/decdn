@@ -2086,12 +2086,19 @@ impl CacheEngine {
         })?;
 
         // A 0-byte blob (#1054) has no chunk groups and no proof: the header-less
-        // wire form is empty. `align_range` already confirmed the request is the
-        // whole (empty) blob, and the caller resolved presence/completeness
-        // (`BlobStatus::Complete { size: 0 }` → `blob_size == 0`). Return empty
-        // directly rather than driving an empty `export_bao` stream, whose
-        // terminal `Done` we would otherwise depend on to clear the `!done` guard.
+        // wire form is empty. Return it directly rather than driving an empty
+        // `export_bao` stream, whose terminal `Done` we would otherwise depend on
+        // to clear the `!done` guard. Still confirm presence first: the documented
+        // contract errors on an absent blob, the non-empty path below faults on
+        // `export_bao` for a missing hash, and `has` honors a logical eviction
+        // (#279) — so a present-only early return keeps behavior consistent and
+        // never serves an empty body for a hash this node has taken down.
         if blob_size == 0 {
+            if !self.has(hash).await? {
+                return Err(CacheError::Store(anyhow::anyhow!(
+                    "export_bao_range: blob {hash} not present"
+                )));
+            }
             return Ok(Bytes::new());
         }
 
