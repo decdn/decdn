@@ -22,9 +22,9 @@
 //!   at the head (no genesis scan — an operator isn't slashed before its node
 //!   first runs, and older slashes are past the appeal window anyway).
 //! - **Bounded backfill.** The `[cursor, head]` range is walked in
-//!   [`crate::payment_settlement::MAX_BACKFILL_BLOCK_SPAN`]-block windows (one
-//!   `eth_getLogs` each) via the shared [`backfill_windows`], so a single call
-//!   never exceeds a provider's range cap.
+//!   `MAX_BACKFILL_BLOCK_SPAN`-block windows (one `eth_getLogs` each) via the
+//!   shared `payment_settlement::backfill_windows`, so a single call never
+//!   exceeds a provider's range cap.
 //!
 //! The store is deduped by `slashId`, so the backfill/live overlap is harmless.
 
