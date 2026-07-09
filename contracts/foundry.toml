@@ -70,9 +70,13 @@ verbosity = 2
 #     "metadata is not found").
 #   sepolia — swap+burn suite (#995), forks at LATEST and creates its own pool,
 #     so a plain public (non-archive) endpoint suffices.
+#   arbitrum_sepolia — genesis buyback-activation deploy suite, forks at LATEST
+#     and creates + seeds its own Uniswap V3 pool, so a plain public (non-archive)
+#     endpoint suffices.
 [rpc_endpoints]
 arbitrum = "${ARBITRUM_RPC_URL}"
 sepolia = "${SEPOLIA_RPC_URL}"
+arbitrum_sepolia = "${ARBITRUM_SEPOLIA_RPC_URL}"
 
 [fmt]
 line_length = 120

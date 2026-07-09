@@ -12,7 +12,10 @@ import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
 import { IBalancerV3Vault } from "../src/interfaces/IBalancerV3Vault.sol";
 import { IPermit2 } from "../src/interfaces/IPermit2.sol";
-import { IBalancerV3RouterInit, IBalancerV3WeightedPoolFactory } from "./interfaces/IBalancerV3PoolCreation.sol";
+import {
+    IBalancerV3RouterInit,
+    IBalancerV3WeightedPoolFactory
+} from "../script/interfaces/IBalancerV3PoolCreation.sol";
 
 /// @dev 6-decimal stand-in for USDC (the bond/settlement currency).
 contract MintableUSDC is ERC20 {
