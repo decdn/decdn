@@ -815,7 +815,11 @@ abstract contract BaseProtocolDeploy is Script {
         _requireSeedBalance(token, cfg.deployer, act.tokenSeed);
 
         bool usdcFirst = address(usdc) < address(token);
-        IBalancerV3WeightedPoolFactory.TokenConfig[] memory tokens = new IBalancerV3WeightedPoolFactory.TokenConfig[](2);
+        // Split the declaration from the allocation: `forge fmt` treats
+        // `new T[](n)` as atomic and won't wrap the combined line, which trips
+        // solhint's 120-char rule for this long factory type.
+        IBalancerV3WeightedPoolFactory.TokenConfig[] memory tokens;
+        tokens = new IBalancerV3WeightedPoolFactory.TokenConfig[](2);
         uint256[] memory weights = new uint256[](2);
         {
             IBalancerV3WeightedPoolFactory.TokenConfig memory usdcCfg = IBalancerV3WeightedPoolFactory.TokenConfig({
