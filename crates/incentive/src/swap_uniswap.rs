@@ -67,6 +67,7 @@ use alloy::primitives::{Address, B256, U160, U256};
 use alloy::providers::{DynProvider, Provider};
 use anyhow::Context;
 
+use crate::erc20::Erc20;
 use crate::swap_math::max_in_with_slippage;
 use crate::swap_venue::Quote;
 
@@ -215,8 +216,13 @@ impl UniswapV3Venue {
         })
     }
 
-    /// Execute the exact-out swap; caller has already approved `max_in` to
-    /// the router. `SwapRouter02.exactOutputSingle` has no `deadline`
+    /// Execute the exact-out swap. This method owns its own approvals:
+    /// `SwapRouter02` pulls `tokenIn` via a direct ERC20 allowance, so it
+    /// ERC20-approves the router for `max_in` first (idempotent — skipped when
+    /// the standing allowance already covers `max_in`, so a `setup` re-run
+    /// doesn't re-approve). `recipient` is the swap payer/signer (the venue's
+    /// caller configures `provider` with `recipient` as its signer), so it is
+    /// the allowance owner. `SwapRouter02.exactOutputSingle` has no `deadline`
     /// parameter (unlike the V1 router), so `_deadline` is unused here — it
     /// exists only to satisfy `SwapVenue::swap_exact_out`'s venue-neutral
     /// signature (Balancer, added in Task 6, does use one).
@@ -227,6 +233,31 @@ impl UniswapV3Venue {
         recipient: Address,
         _deadline: U256,
     ) -> anyhow::Result<B256> {
+        // Approve the router to pull up to `max_in` USDC (direct ERC20
+        // allowance). Idempotent: a sufficient existing allowance is a no-op.
+        let usdc = Erc20::new(self.usdc, &self.provider);
+        let allowance = usdc
+            .allowance(recipient, self.router)
+            .call()
+            .await
+            .context("failed to read USDC allowance")?;
+        if allowance < max_in {
+            let approve_pending = usdc
+                .approve(self.router, max_in)
+                .send()
+                .await
+                .context("USDC approve transaction failed to send")?;
+            let approve_receipt = approve_pending
+                .get_receipt()
+                .await
+                .context("USDC approve sent but the receipt could not be fetched")?;
+            anyhow::ensure!(
+                approve_receipt.status(),
+                "USDC approve reverted (tx {})",
+                approve_receipt.transaction_hash
+            );
+        }
+
         let router = SwapRouter02::new(self.router, &self.provider);
         let params = build_exact_output_params(
             self.usdc, self.token, self.fee, recipient, amount_out, max_in,

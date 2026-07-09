@@ -1,6 +1,8 @@
 //! Venue-neutral exact-out USDC→TOKEN swap abstraction for the bond funding
-//! path (#991). One enum, one impl per DEX venue, chosen by chain config. The
-//! caller (setup) approves `max_in` to the router before `swap_exact_out`.
+//! path (#991). One enum, one impl per DEX venue, chosen by chain config. Each
+//! venue's `swap_exact_out` owns its own approvals (Uniswap: a direct ERC20
+//! allowance to the router; Balancer: the ERC20→Permit2→Router dance), so the
+//! caller just quotes then calls `swap_exact_out` — it never pre-approves.
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
@@ -53,7 +55,7 @@ impl SwapVenue {
         }
     }
 
-    /// Execute the exact-out swap; caller has already approved `max_in`.
+    /// Execute the exact-out swap; the venue performs its own approvals.
     pub async fn swap_exact_out(
         &self,
         amount_out: U256,
