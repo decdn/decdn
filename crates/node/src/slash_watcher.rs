@@ -166,12 +166,18 @@ async fn watcher_loop<P: Provider + Clone>(
                 // A "clean" end is often a provider-side filter TTL expiry
                 // (common on polling RPCs). Pace the resubscribe by at least the
                 // initial backoff so a stream that keeps ending immediately
-                // can't spin into a zero-delay resubscribe storm.
+                // can't spin into a zero-delay resubscribe storm. `down_since`
+                // was already cleared inside `run_once` when the cycle
+                // established, so a clean end reads 0 downtime.
                 debug!("slash watcher stream ended cleanly; resubscribing after backoff");
                 tokio::time::sleep(WATCHER_INITIAL_BACKOFF).await;
                 backoff = WATCHER_INITIAL_BACKOFF;
             }
             Err(err) => {
+                // Open/keep a downtime window so `slash_watcher_down_seconds`
+                // climbs — the only signal a wedged watcher is silently missing
+                // slashes (`admin_v1_slashes` is always wired).
+                metrics.slash_watcher_backoff_started();
                 warn!(
                     %err,
                     backoff_secs = backoff.as_secs(),
@@ -225,6 +231,11 @@ async fn run_once<P: Provider + Clone>(
     // Persist progress: the next resubscribe backfills from here, covering any
     // gap. `head + 1` never regresses (head only grows).
     *cursor = Some(head + 1);
+
+    // The cycle is established (filter installed, backfill drained), so clear
+    // any downtime window — `slash_watcher_down_seconds` reads 0 for the life of
+    // this healthy cycle, even if the live drain below runs for hours.
+    metrics.slash_watcher_cycle_established();
 
     while let Some(log) = events.next().await {
         record_log(provider, self_address, store, metrics, &log).await;
