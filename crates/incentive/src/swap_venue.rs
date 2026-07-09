@@ -5,6 +5,7 @@
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 
+use crate::swap_balancer::BalancerV3Venue;
 use crate::swap_uniswap::UniswapV3Venue;
 
 // Only referenced from the `#[cfg(test)] Mock` arm below; the real
@@ -24,12 +25,13 @@ pub struct Quote {
     pub spot_in: U256,
 }
 
-/// A configured DEX venue. The Balancer arm lands in Task 6.
+/// A configured DEX venue.
 #[derive(Debug)]
 pub enum SwapVenue {
     #[cfg(test)]
     Mock(MockVenue),
     UniswapV3(UniswapV3Venue),
+    BalancerV3(BalancerV3Venue),
 }
 
 impl SwapVenue {
@@ -47,6 +49,7 @@ impl SwapVenue {
                 spot_in: m.spot_in,
             }),
             Self::UniswapV3(v) => v.quote_exact_out(amount_out, slippage_bps).await,
+            Self::BalancerV3(v) => v.quote_exact_out(amount_out, slippage_bps).await,
         }
     }
 
@@ -62,6 +65,10 @@ impl SwapVenue {
             #[cfg(test)]
             Self::Mock(m) => Ok(m.swap_tx),
             Self::UniswapV3(v) => {
+                v.swap_exact_out(amount_out, max_in, recipient, deadline)
+                    .await
+            }
+            Self::BalancerV3(v) => {
                 v.swap_exact_out(amount_out, max_in, recipient, deadline)
                     .await
             }
@@ -87,8 +94,11 @@ pub struct ResolvedSwap {
     /// Uniswap V3 fee tier (e.g. `3000` for 0.3%); required for
     /// `"uniswap-v3"`.
     pub uniswap_fee_tier: Option<u32>,
-    /// Balancer pool id (bytes32 hex string); required for `"balancer"`
-    /// (Task 6).
+    /// Balancer V3 pool contract address (hex string, unparsed); required for
+    /// `"balancer-v3"`. Despite the field name, this is parsed as an
+    /// `Address`, not a bytes32: unlike Balancer V2, V3 pools are addressed
+    /// directly (no `poolId` indirection through the Vault) — see
+    /// `IBalancerV3Router.sol`'s `pool` parameter.
     pub balancer_pool_id: Option<String>,
     /// Uniswap V3 pool address (hex string, unparsed) for the TOKEN/USDC
     /// pair. Optional: when `Some`, lights up the advisory price-impact gate
@@ -136,6 +146,29 @@ pub fn from_config<P: Provider + Clone + 'static>(
             };
             Ok(SwapVenue::UniswapV3(UniswapV3Venue::new(
                 provider, router, quoter, pool, usdc, token, fee,
+            )))
+        }
+        "balancer-v3" => {
+            let router: Address = resolved.router.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "swap_router_address {:?} is not a valid address: {e}",
+                    resolved.router
+                )
+            })?;
+            let usdc: Address = resolved.usdc.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "usdc_address {:?} is not a valid address: {e}",
+                    resolved.usdc
+                )
+            })?;
+            let pool_str = resolved.balancer_pool_id.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("balancer_pool_id required for --swap-venue balancer-v3")
+            })?;
+            let pool: Address = pool_str.parse().map_err(|e| {
+                anyhow::anyhow!("balancer_pool_id {pool_str:?} is not a valid address: {e}")
+            })?;
+            Ok(SwapVenue::BalancerV3(BalancerV3Venue::new(
+                provider, router, pool, usdc, token,
             )))
         }
         other => anyhow::bail!("unknown swap venue {other}"),
@@ -258,6 +291,61 @@ mod tests {
             err.to_string().contains("unknown swap venue curve"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn balancer_from_config_requires_pool_id() {
+        let resolved = ResolvedSwap {
+            venue: "balancer-v3".to_string(),
+            router: addr_hex(0x11),
+            quoter: String::new(),
+            usdc: addr_hex(0x33),
+            uniswap_fee_tier: None,
+            balancer_pool_id: None,
+            pool: None,
+        };
+        let err = from_config(
+            unconnected_provider(),
+            &resolved,
+            Address::repeat_byte(0x44),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("balancer_pool_id"), "{err}");
+    }
+
+    #[test]
+    fn from_config_dispatches_balancer_v3() {
+        let resolved = ResolvedSwap {
+            venue: "balancer-v3".to_string(),
+            router: addr_hex(0x11),
+            quoter: String::new(),
+            usdc: addr_hex(0x33),
+            uniswap_fee_tier: None,
+            balancer_pool_id: Some(addr_hex(0x55)),
+            pool: None,
+        };
+        let venue = from_config(
+            unconnected_provider(),
+            &resolved,
+            Address::repeat_byte(0x44),
+        )
+        .unwrap();
+        assert!(matches!(venue, SwapVenue::BalancerV3(_)));
+    }
+
+    #[test]
+    fn from_config_rejects_malformed_balancer_pool_id() {
+        let resolved = ResolvedSwap {
+            venue: "balancer-v3".to_string(),
+            router: addr_hex(0x11),
+            quoter: String::new(),
+            usdc: addr_hex(0x33),
+            uniswap_fee_tier: None,
+            balancer_pool_id: Some("not-an-address".to_string()),
+            pool: None,
+        };
+        let err = from_config(unconnected_provider(), &resolved, Address::ZERO).unwrap_err();
+        assert!(err.to_string().contains("balancer_pool_id"), "{err}");
     }
 
     #[test]
