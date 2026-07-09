@@ -41,6 +41,14 @@ const CLOCK_SKEW_LIMIT_SECS: i64 = 10;
 /// the native-gas pre-flight check, so an over-estimate is the safe direction.
 const PREFLIGHT_GAS_UNITS: u64 = 600_000;
 
+/// Extra native-gas headroom for USDC mode, on top of [`PREFLIGHT_GAS_UNITS`].
+/// USDC funding adds at least two more transactions before the bond flow —
+/// the router/Permit2 `approve`(s) and the exact-out `swap` itself (Balancer
+/// issues three: ERC20-approve Permit2, Permit2-approve Router, swap, plus two
+/// resets). `300_000` conservatively covers the heaviest of these paths; as with
+/// [`PREFLIGHT_GAS_UNITS`], over-estimating is the safe direction.
+const USDC_MODE_EXTRA_GAS_UNITS: u64 = 300_000;
+
 /// Price-impact ceiling (bps) above which the USDC swap warns and asks for an
 /// extra confirmation. Advisory only — never hard-blocks (an operator can
 /// pre-swap and bond manually, so a hard fail would be theater).
@@ -233,7 +241,16 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         .get_gas_price()
         .await
         .context("failed to read gas price")?;
-    let gas_needed = U256::from(PREFLIGHT_GAS_UNITS) * U256::from(gas_price);
+    let usdc_mode = matches!(args.pay_bond_with, cli::PayBondWith::Usdc);
+    // USDC mode adds ≥2 txs (router/Permit2 approve(s) + swap) ahead of the
+    // Phase 2 transactions, so size the gas pre-flight higher; over-estimate is
+    // the safe direction.
+    let gas_units = if usdc_mode {
+        PREFLIGHT_GAS_UNITS + USDC_MODE_EXTRA_GAS_UNITS
+    } else {
+        PREFLIGHT_GAS_UNITS
+    };
+    let gas_needed = U256::from(gas_units) * U256::from(gas_price);
     let clock_skew = measure_clock_skew(&resolved.rpc_url).await;
 
     let pf = Preflight {
@@ -244,7 +261,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         shortfall: plan.shortfall,
         native_balance,
         gas_needed,
-        usdc_mode: matches!(args.pay_bond_with, cli::PayBondWith::Usdc),
+        usdc_mode,
     };
 
     check_line(
@@ -255,11 +272,14 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     );
     check_line(json, "clock", pf.clock_status(), &clock_detail(clock_skew));
 
-    // ---- USDC mode: acquire the exact bond top-up by an exact-out swap
-    //      before bonding (see `run_usdc_swap`). TOKEN mode leaves this `None`
-    //      and keeps the original TOKEN-balance pre-flight below. ----
-    let swap_summary = if matches!(args.pay_bond_with, cli::PayBondWith::Usdc) {
-        run_usdc_swap(
+    // ---- USDC mode: quote the exact bond top-up and run its up-front gates
+    //      (USDC-balance pre-flight + advisory price-impact confirm) now, but
+    //      do NOT execute the swap yet — the actual `approve`+`swap` fires only
+    //      after every abort gate below has cleared (see the live path), so a
+    //      doomed run never spends USDC. TOKEN mode leaves this `None` and keeps
+    //      the original TOKEN-balance pre-flight below. ----
+    let prepared_swap = if usdc_mode {
+        prepare_usdc_swap(
             args,
             &file,
             &provider,
@@ -275,7 +295,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
 
     // TOKEN mode keeps the original TOKEN-balance pre-flight; USDC mode
     // replaced it with the `usdc_balance` check above.
-    if swap_summary.is_none() {
+    if prepared_swap.is_none() {
         check_line(
             json,
             "token_balance",
@@ -292,6 +312,15 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
 
     // ---- Dry run: report and stop before submitting anything. ----
     if dry_run {
+        // The preview (quote, max_in, impact) was already emitted by
+        // `prepare_usdc_swap`; surface it in the aggregated summary too, with
+        // no tx (nothing was sent).
+        let swap_summary = prepared_swap.as_ref().map(|p| SwapSummary {
+            swap_out: p.swap_out,
+            max_in: p.max_in,
+            impact_bps: p.impact_bps,
+            tx: None,
+        });
         // Human mode prints the bond plan inline; JSON mode emits a single
         // aggregated object below (no second JSON object from `write_plan`).
         if !json {
@@ -362,15 +391,46 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     )
     .await?;
 
-    // ---- Confirm the bond before submitting (unless --yes). ----
+    // ---- Confirm before submitting (unless --yes). In USDC mode the prompt
+    //      covers the swap spend AND the bond, so the operator can't be asked
+    //      only about the bond and then silently charged for a swap. ----
     if !args.yes
-        && !confirm(plan.shortfall, plan.target, args.mbps)
-            .context("failed to read confirmation from stdin")?
+        && !confirm(
+            plan.shortfall,
+            plan.target,
+            args.mbps,
+            prepared_swap.as_ref().map(|p| p.max_in),
+        )
+        .context("failed to read confirmation from stdin")?
     {
         anyhow::bail!(
             "aborted by operator (no confirmation); re-run with --yes for non-interactive use"
         );
     }
+
+    // ---- USDC mode: execute the swap now — after every abort gate above has
+    //      cleared and the operator confirmed the spend — so a doomed or
+    //      declined run never touches USDC. TOKEN mode leaves this `None`. ----
+    let swap_summary = if let Some(prepared) = prepared_swap {
+        let deadline = swap_deadline()?;
+        let tx = prepared
+            .venue
+            .swap_exact_out(prepared.swap_out, prepared.max_in, operator, deadline)
+            .await
+            .context("USDC→TOKEN swap failed")?;
+        hline(
+            json,
+            &format!("swap: {tx:#x} ({} TOKEN acquired)", prepared.swap_out),
+        );
+        Some(SwapSummary {
+            swap_out: prepared.swap_out,
+            max_in: prepared.max_in,
+            impact_bps: prepared.impact_bps,
+            tx: Some(tx),
+        })
+    } else {
+        None
+    };
 
     // ---- Phase 2.1/2.2: bond (idempotent stake-to-tier). ----
     if !json {
@@ -757,9 +817,24 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 /// Prompt `[y/N]` for the bond submission. Returns `false` on EOF / a
-/// non-affirmative answer (a non-interactive stdin reads as "no").
-fn confirm(shortfall: U256, target: U256, mbps: u64) -> io::Result<bool> {
-    if shortfall == U256::ZERO {
+/// non-affirmative answer (a non-interactive stdin reads as "no"). When
+/// `swap_max_in` is `Some`, the run will first swap up to that many USDC base
+/// units for the bond top-up, so the prompt covers the spend AND the bond —
+/// the operator is never asked only about the bond and then silently charged.
+fn confirm(
+    shortfall: U256,
+    target: U256,
+    mbps: u64,
+    swap_max_in: Option<U256>,
+) -> io::Result<bool> {
+    if let Some(max_in) = swap_max_in {
+        // USDC mode: acquiring the top-up spends up to `max_in` USDC, then bonds.
+        print!(
+            "Swap up to {max_in} USDC base units for TOKEN, then submit bond of {shortfall} base \
+             units (target {target}, tier {mbps} Mbps) and complete on-chain setup (declare + \
+             register, as needed)? [y/N] "
+        );
+    } else if shortfall == U256::ZERO {
         // Already bonded to target (e.g. `node bond` was run manually) — no
         // deposit, but `declareMbps` and/or `registerNode` may still submit.
         print!(
@@ -809,40 +884,6 @@ fn confirm_impact(impact_bps: u32, swap_out: U256, max_in: U256) -> io::Result<b
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
 }
 
-/// Approve `amount` USDC to `router` when the current allowance is short.
-/// Idempotent — a sufficient existing allowance is a no-op, so a `setup`
-/// re-run doesn't re-approve.
-async fn approve_if_needed<P: Provider + Clone>(
-    usdc: &Erc20::Erc20Instance<P>,
-    owner: Address,
-    router: Address,
-    amount: U256,
-) -> anyhow::Result<()> {
-    let allowance = usdc
-        .allowance(owner, router)
-        .call()
-        .await
-        .context("failed to read USDC allowance")?;
-    if allowance >= amount {
-        return Ok(());
-    }
-    let pending = usdc
-        .approve(router, amount)
-        .send()
-        .await
-        .context("USDC approve transaction failed to send")?;
-    let receipt = pending
-        .get_receipt()
-        .await
-        .context("USDC approve sent but the receipt could not be fetched")?;
-    anyhow::ensure!(
-        receipt.status(),
-        "USDC approve reverted (tx {})",
-        receipt.transaction_hash
-    );
-    Ok(())
-}
-
 /// Deadline for the exact-out swap: `now + SWAP_DEADLINE_SECS`, as a Unix
 /// timestamp. Saturating so a far-future clock can't wrap.
 fn swap_deadline() -> anyhow::Result<U256> {
@@ -853,15 +894,35 @@ fn swap_deadline() -> anyhow::Result<U256> {
     Ok(U256::from(now.saturating_add(SWAP_DEADLINE_SECS)))
 }
 
-/// USDC-mode bond funding: quote and (outside dry-run) execute the exact-out
-/// USDC→TOKEN swap that acquires the bond top-up, so the bond flow that follows
-/// finds TOKEN in the wallet. This replaces the TOKEN-balance pre-flight with a
-/// USDC-covers-`max_in` check and an advisory price-impact gate. `swap_top_up`
-/// saturates, so a re-run after a partial failure re-quotes only the remaining
-/// shortfall and converges. Returns `None` when the operator already holds
-/// enough TOKEN (nothing to swap); `Some` (with `tx: None` on a dry run)
-/// otherwise.
-async fn run_usdc_swap<P: Provider + Clone + 'static>(
+/// A USDC→TOKEN swap that has cleared every up-front gate (USDC-balance
+/// pre-flight + advisory price-impact confirm) and is ready to execute. Held
+/// across the register-divergence / terms / bond-confirm gates so the actual
+/// `approve`+`swap` transactions fire only after all of them clear — an
+/// operator who bails, or a run that fails a gate, never spends USDC. Each
+/// venue's `swap_exact_out` owns its own approvals, so nothing but the venue
+/// handle and the amounts is needed to execute.
+struct PreparedSwap {
+    /// The configured venue; `swap_exact_out` performs its own approvals.
+    venue: swap_venue::SwapVenue,
+    /// TOKEN to buy (the bond top-up).
+    swap_out: U256,
+    /// `amountInMaximum` — the slippage-bounded USDC cap the swap may spend.
+    max_in: U256,
+    /// Measured execution price impact vs pool spot, in bps (advisory).
+    impact_bps: u32,
+}
+
+/// USDC-mode bond funding, up-front phase: quote the exact-out USDC→TOKEN swap
+/// that acquires the bond top-up and run its gates (USDC-covers-`max_in`
+/// pre-flight + advisory price-impact confirm), but do NOT send any
+/// transaction. This replaces the TOKEN-balance pre-flight with the
+/// USDC-balance check. `swap_top_up` saturates, so a re-run after a partial
+/// failure re-quotes only the remaining shortfall and converges. Returns `None`
+/// when the operator already holds enough TOKEN (nothing to swap); `Some`
+/// otherwise — the caller executes it (via [`PreparedSwap::venue`]'s
+/// `swap_exact_out`) only after every abort gate has cleared. On a dry run it
+/// additionally previews the swap (quote, `max_in`, impact) here.
+async fn prepare_usdc_swap<P: Provider + Clone + 'static>(
     args: &cli::SetupArgs,
     file: &chain_ctx::FileConfig,
     provider: &P,
@@ -869,7 +930,7 @@ async fn run_usdc_swap<P: Provider + Clone + 'static>(
     plan: &bond::Plan,
     token_balance: U256,
     dry_run: bool,
-) -> anyhow::Result<Option<SwapSummary>> {
+) -> anyhow::Result<Option<PreparedSwap>> {
     let json = args.chain.json;
     let resolved_swap = chain_ctx::resolve_swap(&args.chain, file)?.context(
         "--pay-bond-with usdc requires swap-venue config (--swap-venue, \
@@ -933,28 +994,13 @@ async fn run_usdc_swap<P: Provider + Clone + 'static>(
                 quote.max_in
             ),
         );
-        return Ok(Some(SwapSummary {
-            swap_out,
-            max_in: quote.max_in,
-            impact_bps: impact,
-            tx: None,
-        }));
     }
 
-    // Approve the router for max_in, then the exact-out swap.
-    let router = chain_ctx::parse_address(&resolved_swap.router, "swap_router_address")?;
-    approve_if_needed(&usdc, operator, router, quote.max_in).await?;
-    let deadline = swap_deadline()?;
-    let tx = venue
-        .swap_exact_out(swap_out, quote.max_in, operator, deadline)
-        .await
-        .context("USDC→TOKEN swap failed")?;
-    hline(json, &format!("swap: {tx:#x} ({swap_out} TOKEN acquired)"));
-    Ok(Some(SwapSummary {
+    Ok(Some(PreparedSwap {
+        venue,
         swap_out,
         max_in: quote.max_in,
         impact_bps: impact,
-        tx: Some(tx),
     }))
 }
 
