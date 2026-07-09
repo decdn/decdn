@@ -198,6 +198,40 @@ impl NodeFixture {
         Ok((fixture, hash))
     }
 
+    /// Restart the daemon in place: kill the current `decdn-node` subprocess and
+    /// respawn it against the same config + data dir (no re-onboarding — the
+    /// operator is already on-chain), then wait until healthy. Exercises the
+    /// across-restart slash re-scan (#1032): the new process rebuilds its
+    /// in-memory slash store from the `slash_judge_from_block` floor.
+    pub async fn restart(&self) -> anyhow::Result<()> {
+        // Kill the old process and swap in the new one, holding the guard lock
+        // only briefly (never across an await). `wait()` reaps the old process
+        // so it has released its ports before the replacement binds them.
+        {
+            let mut child = self
+                .child
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = child.kill();
+            let _ = child.wait();
+            *child = std::process::Command::new(decdn_node_bin()?)
+                .arg("--config")
+                .arg(&self.config_path)
+                .arg("run")
+                .env("DECDN_KEYSTORE_PASSWORD", KEYSTORE_PASSWORD)
+                .env(
+                    "RUST_LOG",
+                    std::env::var("DECDN_NODE_LOG").unwrap_or_else(|_| "warn".into()),
+                )
+                .spawn()
+                .context("respawn decdn-node")?;
+        }
+        self.wait_healthy(Duration::from_secs(30))
+            .await
+            .context("node never became healthy after restart")
+    }
+
     /// Build a loopback admin JSON-RPC client for this node.
     pub fn admin_client(&self) -> anyhow::Result<HttpClient> {
         HttpClientBuilder::default()

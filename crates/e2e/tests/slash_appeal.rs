@@ -122,6 +122,28 @@ async fn run() -> anyhow::Result<()> {
     .await?;
     assert!(surfaced.is_some(), "A's daemon never surfaced the slash");
 
+    // ---- Restart regression (#1032): a fresh process must re-surface the slash
+    // by rebuilding its in-memory store from the SlashJudge floor scan, not
+    // silently drop it. From the new process's view, the slash was mined while
+    // it was down — the exact gap this guards against.
+    node_a.restart().await?;
+    let after_restart = poll(Duration::from_secs(30), || async {
+        let resp = admin_a
+            .slashes()
+            .await
+            .context("admin slashes after restart")?;
+        Ok(resp
+            .slashes
+            .iter()
+            .any(|s| s.slash_id == slash_id.to_string())
+            .then_some(()))
+    })
+    .await?;
+    assert!(
+        after_restart.is_some(),
+        "restarted daemon must re-surface the slash via the floor rescan"
+    );
+
     // ---- Negative: a non-operator (B) cannot file A's appeal. Fund + approve
     // B's bond first so a zero-allowance `transferFrom` can't be the revert
     // reason — with the bond payable, only the `CallerNotOperator` guard can

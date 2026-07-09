@@ -15,13 +15,18 @@
 //! - **Filter-first, then head.** Each cycle installs the live filter *before*
 //!   reading the head block used as the backfill bound, so no block mined
 //!   between the two falls into a gap (same ordering as the settlement watcher).
-//! - **Cursor across resubscribes.** A last-scanned-block cursor is carried
-//!   across every resubscribe (filter TTL expiry / RPC error), so a slash mined
-//!   during an outage window is recovered by the next cycle's backfill rather
-//!   than silently lost until a full restart. The first cycle seeds the cursor
-//!   at the head (no genesis scan — an operator isn't slashed before its node
-//!   first runs, and older slashes are past the appeal window anyway).
-//! - **Bounded backfill.** The `[cursor, head]` range is walked in
+//! - **Rebuild from a floor on every start.** The detected-slash store is
+//!   in-memory, so it is empty on each process start and must be rebuilt by
+//!   scanning history — a durable scan checkpoint could not skip this (resuming
+//!   from it would drop still-appealable slashes at/below the checkpoint). The
+//!   first cycle therefore scans `[from_block, head]`, where `from_block` is the
+//!   configured `SlashJudge` deployment floor (`0` = genesis). This re-surfaces
+//!   a slash mined while the node was down on the next restart, within its
+//!   30-day appeal window.
+//! - **Cursor across resubscribes.** Within one process, a cursor is carried
+//!   across every resubscribe (filter TTL expiry / RPC error), so an in-process
+//!   outage `[cursor, head]` window is recovered by the next cycle's backfill.
+//! - **Bounded backfill.** The scanned range is walked in
 //!   `MAX_BACKFILL_BLOCK_SPAN`-block windows (one `eth_getLogs` each) via the
 //!   shared `payment_settlement::backfill_windows`, so a single call never
 //!   exceeds a provider's range cap.
@@ -107,19 +112,27 @@ impl SlashWatcher {
     /// `get_logs`, subscribe) happens inside the retrying loop, so a transient
     /// bring-up failure retries with backoff rather than disabling detection for
     /// the daemon's lifetime.
+    ///
+    /// `from_block` is the first-run scan floor (the `SlashJudge` deployment
+    /// block; `0` scans from genesis). The in-memory store is rebuilt from this
+    /// floor on **every** process start, so a slash mined while the node was down
+    /// is re-surfaced on restart within its 30-day appeal window — the store is
+    /// not durable, so a scan checkpoint could not skip this rebuild.
     #[must_use]
     pub fn bootstrap<P: Provider + Clone + 'static>(
         provider: P,
         slash_judge_addr: Address,
         self_address: Address,
+        from_block: u64,
         metrics: Arc<Metrics>,
     ) -> Self {
-        info!(%slash_judge_addr, %self_address, "slash-detection watcher started");
+        info!(%slash_judge_addr, %self_address, from_block, "slash-detection watcher started");
         let store: SlashStore = Arc::new(RwLock::new(Vec::new()));
         let task = tokio::spawn(watcher_loop(
             provider,
             slash_judge_addr,
             self_address,
+            from_block,
             Arc::clone(&store),
             metrics,
         ));
@@ -144,11 +157,13 @@ async fn watcher_loop<P: Provider + Clone>(
     provider: P,
     slash_judge_addr: Address,
     self_address: Address,
+    from_block: u64,
     store: SlashStore,
     metrics: Arc<Metrics>,
 ) {
-    // Last-scanned-block cursor, carried across resubscribes. `None` until the
-    // first cycle seeds it at the head (no genesis scan).
+    // Next-block-to-scan cursor, carried across resubscribes. `None` until the
+    // first cycle seeds it at `from_block` (rebuilding the in-memory store from
+    // the floor on every process start).
     let mut cursor: Option<u64> = None;
     let mut backoff = WATCHER_INITIAL_BACKOFF;
     loop {
@@ -156,6 +171,7 @@ async fn watcher_loop<P: Provider + Clone>(
             &provider,
             slash_judge_addr,
             self_address,
+            from_block,
             &mut cursor,
             &store,
             &metrics,
@@ -197,6 +213,7 @@ async fn run_once<P: Provider + Clone>(
     provider: &P,
     slash_judge_addr: Address,
     self_address: Address,
+    from_block: u64,
     cursor: &mut Option<u64>,
     store: &SlashStore,
     metrics: &Arc<Metrics>,
@@ -212,10 +229,11 @@ async fn run_once<P: Provider + Clone>(
         .get_block_number()
         .await
         .context("read head block for slash backfill bound")?;
-    // First cycle seeds the cursor at head (scan only the head block — no
-    // genesis history). Later cycles resume from the cursor so an outage
-    // `[cursor, head]` window is recovered.
-    let from = cursor.unwrap_or(head).min(head);
+    // First cycle scans from the configured floor (rebuilding the in-memory
+    // store from `from_block` on every process start, so a restart re-surfaces a
+    // slash mined while down); later cycles resume from the retained cursor so
+    // an in-process outage `[cursor, head]` window is recovered.
+    let from = cursor.unwrap_or(from_block).min(head);
     for (start, end) in backfill_windows(from, head, MAX_BACKFILL_BLOCK_SPAN) {
         let filter = operator_filter(slash_judge_addr, self_address)
             .from_block(start)

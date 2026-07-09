@@ -104,6 +104,10 @@ pub struct ResolvedBlockchain {
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `slash_sig` signatures (ADR 014). Required (no default).
     pub slash_judge_address: String,
+    /// First-run scan floor for the slash-detection watcher (the `SlashJudge`
+    /// deployment block). Defaults to `0` (#1032); restarts resume from the
+    /// persisted checkpoint.
+    pub slash_judge_from_block: u64,
     /// EIP-712 `chainId` for the `slash_sig` domain separator. Defaults to
     /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia) when unset.
     pub chain_id: u64,
