@@ -1101,6 +1101,16 @@ fn resolve_blockchain_into(
     let content_blacklist_poll_interval_sec = file
         .and_then(|b| b.content_blacklist_poll_interval_sec)
         .unwrap_or(DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC);
+    // `0` is not a "disable" sentinel — disabling the periodic re-scope would
+    // break the retain/re-scope compliance guarantee — and it panics
+    // `tokio::time::interval_at` ("period must be non-zero"), which would kill
+    // the watcher task and silently stop enforcement. Reject it up front.
+    bag.check(
+        content_blacklist_poll_interval_sec != 0,
+        "blockchain.content_blacklist_poll_interval_sec",
+        "blockchain.content_blacklist_poll_interval_sec must not be 0 — the \
+         reconcile interval must be non-zero; omit it for the default (600s)",
+    );
 
     let chain_id = cli
         .chain_id
@@ -8231,6 +8241,37 @@ mod tests {
         assert!(
             msg.contains("slash_judge_address") && msg.contains("zero address"),
             "error should reject the zero address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_content_blacklist_poll_interval() -> anyhow::Result<()> {
+        // A zero interval panics `tokio::time::interval_at`, killing the watcher.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            content_blacklist_poll_interval_sec: Some(0),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error for zero content_blacklist_poll_interval_sec");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("content_blacklist_poll_interval_sec") && msg.contains("must not be 0"),
+            "error should reject the zero poll interval: {msg}"
         );
         Ok(())
     }

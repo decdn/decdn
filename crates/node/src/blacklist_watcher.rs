@@ -113,6 +113,9 @@ pub(crate) async fn run<P>(
 ) where
     P: Provider + Clone,
 {
+    // Config rejects a zero interval, but clamp defensively: `interval_at`
+    // panics on a zero period, and a panic here silently stops enforcement.
+    let poll_interval = poll_interval.max(Duration::from_secs(1));
     let contract = ContentBlacklist::new(contract_addr, provider.clone());
     info!(%contract_addr, %operator, from_block, "blacklist compliance watcher starting");
 
