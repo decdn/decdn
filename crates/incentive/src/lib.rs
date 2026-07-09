@@ -42,6 +42,7 @@ mod sig_canon;
 pub mod store;
 pub mod stream_sig;
 pub mod swap_math;
+pub mod swap_venue;
 pub mod voucher;
 pub mod voucher_activity;
 
@@ -76,6 +77,7 @@ pub use store::{
 };
 pub use stream_sig::{StreamSlashData, StreamSlashError};
 pub use swap_math::{max_in_with_slippage, price_impact_bps, swap_top_up};
+pub use swap_venue::{Quote, SwapVenue};
 pub use voucher::{
     DOMAIN_NAME, DOMAIN_VERSION, SignedVoucher, Voucher, VoucherError, voucher_domain,
 };
