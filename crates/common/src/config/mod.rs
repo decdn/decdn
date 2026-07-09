@@ -1069,20 +1069,23 @@ fn resolve_blockchain_into(
         .clone()
         .or_else(|| file.and_then(|b| b.slash_appeal_address.clone()))
         .filter(|s| !s.is_empty());
-    if let Some(raw) = slash_appeal_raw.as_deref() {
-        bag.check(
-            raw.trim_start_matches("0x").bytes().any(|b| b != b'0'),
-            "blockchain.slash_appeal_address",
-            "blockchain.slash_appeal_address must not be the zero address — \
-             set it to the deployed SlashAppeal contract (ADR 028)",
-        );
-    }
     let slash_appeal_address = slash_appeal_raw.and_then(|v| {
         bag.try_with(
             "blockchain.slash_appeal_address",
             parse_contract_address("slash_appeal_address", &v),
         )
     });
+    // Zero-address check runs only after the parse succeeds — mirrors the
+    // `slash_judge_address` cascade-suppression above so a malformed all-zero
+    // value doesn't get both a parse error and a "zero address" error.
+    if let Some(addr) = slash_appeal_address.as_deref() {
+        bag.check(
+            addr.trim_start_matches("0x").bytes().any(|b| b != b'0'),
+            "blockchain.slash_appeal_address",
+            "blockchain.slash_appeal_address must not be the zero address — \
+             set it to the deployed SlashAppeal contract (ADR 028)",
+        );
+    }
 
     let chain_id = cli
         .chain_id

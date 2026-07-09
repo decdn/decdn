@@ -38,6 +38,11 @@ const APPEAL_FILING_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Block-range span per genesis-backfill `get_logs`, kept under common RPC
+/// provider caps (many cap `eth_getLogs` at ~10k blocks) so the backfill can't
+/// fail with a range-too-wide error on a long-lived chain.
+const BACKFILL_WINDOW: u64 = 9_000;
+
 /// One slash detected against this node's operator.
 #[derive(Debug, Clone)]
 pub struct DetectedSlash {
@@ -158,7 +163,12 @@ async fn watcher_loop<P: Provider + Clone>(
         .await
         {
             Ok(()) => {
-                debug!("slash watcher stream ended cleanly; resubscribing");
+                // A "clean" end is often a provider-side filter TTL expiry
+                // (common on polling RPCs). Always pace the resubscribe by at
+                // least the initial backoff so a stream that keeps ending
+                // immediately can't spin into a zero-delay resubscribe storm.
+                debug!("slash watcher stream ended cleanly; resubscribing after backoff");
+                tokio::time::sleep(WATCHER_INITIAL_BACKOFF).await;
                 backoff = WATCHER_INITIAL_BACKOFF;
             }
             Err(err) => {
@@ -200,8 +210,12 @@ async fn run_once<P: Provider + Clone>(
     }
 
     while let Some(log) = events.next().await {
-        let event =
-            SlashJudge::Slashed::decode_log_data(&log.inner.data).context("decode Slashed")?;
+        // Skip an undecodable log rather than tearing down the whole cycle
+        // (resubscribe + backoff) for one bad log — matches the backfill path.
+        let Ok(event) = SlashJudge::Slashed::decode_log_data(&log.inner.data) else {
+            warn!("skipping undecodable Slashed log from live stream");
+            continue;
+        };
         if event.operator != self_address {
             continue;
         }
@@ -222,9 +236,10 @@ async fn run_once<P: Provider + Clone>(
     Ok(())
 }
 
-/// Backfill `Slashed` for this operator over `[0, to]` via a single `get_logs`.
-/// Sufficient for the initial network scale (short chains / tens of nodes); a
-/// windowed scan against a long-lived L2 is a later refinement.
+/// Backfill `Slashed` for this operator over `[0, to]`, scanning in
+/// `BACKFILL_WINDOW`-sized ranges so no single `get_logs` exceeds an RPC
+/// provider's block-range cap on a long-lived chain. On restart this
+/// re-populates the in-memory store (deduped by `slashId`).
 async fn backfill_slashes<P: Provider>(
     provider: &P,
     slash_judge_addr: Address,
@@ -233,36 +248,44 @@ async fn backfill_slashes<P: Provider>(
     metrics: &Arc<Metrics>,
     to: u64,
 ) -> Result<()> {
-    let filter = Filter::new()
-        .address(slash_judge_addr)
-        .event_signature(SlashJudge::Slashed::SIGNATURE_HASH)
-        .from_block(0u64)
-        .to_block(to);
-    let logs = provider
-        .get_logs(&filter)
-        .await
-        .context("get_logs Slashed backfill")?;
-    for log in logs {
-        let Ok(event) = SlashJudge::Slashed::decode_log_data(&log.inner.data) else {
-            warn!("skipping undecodable Slashed log during backfill");
-            continue;
-        };
-        if event.operator != self_address {
-            continue;
+    let mut from = 0u64;
+    loop {
+        let end = from.saturating_add(BACKFILL_WINDOW - 1).min(to);
+        let filter = Filter::new()
+            .address(slash_judge_addr)
+            .event_signature(SlashJudge::Slashed::SIGNATURE_HASH)
+            .from_block(from)
+            .to_block(end);
+        let logs = provider
+            .get_logs(&filter)
+            .await
+            .with_context(|| format!("get_logs Slashed backfill [{from}, {end}]"))?;
+        for log in logs {
+            let Ok(event) = SlashJudge::Slashed::decode_log_data(&log.inner.data) else {
+                warn!("skipping undecodable Slashed log during backfill");
+                continue;
+            };
+            if event.operator != self_address {
+                continue;
+            }
+            let window_close = appeal_window_close(provider, log.block_number).await;
+            record_slash(
+                store,
+                metrics,
+                DetectedSlash {
+                    slash_id: event.slashId,
+                    offense_type: event.offenseType as u8,
+                    amount: event.amount,
+                    evidence_hash: event.evidenceHash,
+                    block_number: log.block_number,
+                    appeal_window_close: window_close,
+                },
+            );
         }
-        let window_close = appeal_window_close(provider, log.block_number).await;
-        record_slash(
-            store,
-            metrics,
-            DetectedSlash {
-                slash_id: event.slashId,
-                offense_type: event.offenseType as u8,
-                amount: event.amount,
-                evidence_hash: event.evidenceHash,
-                block_number: log.block_number,
-                appeal_window_close: window_close,
-            },
-        );
+        if end >= to {
+            break;
+        }
+        from = end + 1;
     }
     Ok(())
 }

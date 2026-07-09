@@ -77,6 +77,40 @@ pub fn load_optional_config(config_path: Option<&Path>) -> anyhow::Result<FileCo
     }
 }
 
+/// Resolve the `chain_id` / `data_dir` / `keystore` triple shared by every
+/// on-chain command with the same flag > config > default precedence. Kept
+/// separate so [`resolve`] and [`resolve_appeal`] can't drift on this chain.
+/// `expand_tilde` is applied to whichever explicit value wins (flag OR config);
+/// the `default_data_dir` fallback is already absolute.
+fn resolve_common(
+    chain: &cli::ChainArgs,
+    file: &FileConfig,
+) -> anyhow::Result<(u64, PathBuf, PathBuf)> {
+    let bc = file.blockchain.as_ref();
+    let chain_id = chain
+        .chain_id
+        .or_else(|| bc.and_then(|b| b.chain_id))
+        .unwrap_or(DEFAULT_CHAIN_ID);
+    let data_dir = chain
+        .data_dir
+        .clone()
+        .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
+        .map(|p| expand_tilde(&p))
+        .or_else(cli::default_data_dir)
+        .ok_or_else(|| {
+            anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
+        })?;
+    let keystore = chain
+        .keystore
+        .clone()
+        .or_else(|| bc.and_then(|b| b.eth_keystore.clone()))
+        .map_or_else(
+            || eth_identity::keystore_path(&data_dir),
+            |p| expand_tilde(&p),
+        );
+    Ok((chain_id, data_dir, keystore))
+}
+
 /// Resolve the chain coordinates with flag > config > default precedence.
 /// Pure so the precedence is unit-testable.
 pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Resolved> {
@@ -98,30 +132,7 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
                  blockchain.capacity_bond_address)"
             )
         })?;
-    let chain_id = chain
-        .chain_id
-        .or_else(|| bc.and_then(|b| b.chain_id))
-        .unwrap_or(DEFAULT_CHAIN_ID);
-    // `expand_tilde` is applied to whichever explicit value wins (flag OR
-    // config) — config-file paths get `~` expansion too, not just flags. The
-    // `default_data_dir` fallback is already absolute.
-    let data_dir = chain
-        .data_dir
-        .clone()
-        .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
-        .map(|p| expand_tilde(&p))
-        .or_else(cli::default_data_dir)
-        .ok_or_else(|| {
-            anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
-        })?;
-    let keystore = chain
-        .keystore
-        .clone()
-        .or_else(|| bc.and_then(|b| b.eth_keystore.clone()))
-        .map_or_else(
-            || eth_identity::keystore_path(&data_dir),
-            |p| expand_tilde(&p),
-        );
+    let (chain_id, data_dir, keystore) = resolve_common(chain, file)?;
     Ok(Resolved {
         rpc_url,
         chain_id,
@@ -168,27 +179,7 @@ pub fn resolve_appeal(
                  blockchain.slash_appeal_address)"
             )
         })?;
-    let chain_id = chain
-        .chain_id
-        .or_else(|| bc.and_then(|b| b.chain_id))
-        .unwrap_or(DEFAULT_CHAIN_ID);
-    let data_dir = chain
-        .data_dir
-        .clone()
-        .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
-        .map(|p| expand_tilde(&p))
-        .or_else(cli::default_data_dir)
-        .ok_or_else(|| {
-            anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
-        })?;
-    let keystore = chain
-        .keystore
-        .clone()
-        .or_else(|| bc.and_then(|b| b.eth_keystore.clone()))
-        .map_or_else(
-            || eth_identity::keystore_path(&data_dir),
-            |p| expand_tilde(&p),
-        );
+    let (chain_id, data_dir, keystore) = resolve_common(chain, file)?;
     Ok(ResolvedAppeal {
         rpc_url,
         chain_id,

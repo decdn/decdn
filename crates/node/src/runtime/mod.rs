@@ -708,8 +708,12 @@ pub async fn run(
     // for this operator so the slash surfaces over `admin_v1_slashes` (+ the
     // `decdn_slashes_detected_total` metric) and the operator can file
     // `decdn appeal slash` in time. Read-only; held to `run()`'s end so its
-    // background task lives as long as the daemon.
-    let slash_watcher = crate::slash_watcher::SlashWatcher::bootstrap(
+    // background task lives as long as the daemon. Bootstrap failure is
+    // NON-fatal (like the node-address resolver below): slash detection is an
+    // observability aid, so a transient RPC failure disables it with a warning
+    // rather than aborting node bring-up — `admin_v1_slashes` then reports
+    // unavailable and the watcher is simply absent.
+    let slash_watcher = match crate::slash_watcher::SlashWatcher::bootstrap(
         with_poll_interval(
             ProviderBuilder::new().connect_http(rpc_url.clone()),
             event_poll_interval,
@@ -719,10 +723,20 @@ pub async fn run(
         Arc::clone(&node_metrics),
     )
     .await
-    .with_context(|| {
-        format!("slash-detection watcher bootstrap from SlashJudge at {slash_judge_addr}")
-    })?;
-    let slash_store = slash_watcher.store();
+    {
+        Ok(watcher) => Some(watcher),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                %slash_judge_addr,
+                "slash-detection watcher bootstrap failed; slash detection disabled"
+            );
+            None
+        }
+    };
+    let slash_store = slash_watcher
+        .as_ref()
+        .map(crate::slash_watcher::SlashWatcher::store);
 
     // NodeId → bonded operator address resolver for node-to-node pulls (#831).
     // Reads the same `CapacityBond` registration data as the staker set
@@ -1675,7 +1689,7 @@ pub async fn run(
             reload_state: Arc::clone(&reload_state),
             config_path: path.clone(),
         });
-        let state = admin::AdminState::new(
+        let mut state = admin::AdminState::new(
             Arc::clone(&peer_table),
             *secret_key.public().as_bytes(),
             started_at,
@@ -1711,12 +1725,16 @@ pub async fn run(
         .with_reputation(admin::ReputationStatusHandles {
             network: Arc::clone(&network_reputation),
             coverage: Arc::clone(&regional_coverage),
-        })
-        // Slash-detection introspection for `admin_v1_slashes` (#1032). Shares
-        // the in-memory store the slash watcher appends to — read-only here.
-        .with_slash_detection(admin::SlashStatusHandles {
-            store: Arc::clone(&slash_store),
         });
+        // Slash-detection introspection for `admin_v1_slashes` (#1032), only
+        // when the watcher bootstrapped. Shares the in-memory store the watcher
+        // appends to — read-only here. Absent → `admin_v1_slashes` reports
+        // unavailable.
+        if let Some(store) = &slash_store {
+            state = state.with_slash_detection(admin::SlashStatusHandles {
+                store: Arc::clone(store),
+            });
+        }
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");

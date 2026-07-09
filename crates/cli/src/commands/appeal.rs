@@ -29,7 +29,7 @@ pub async fn run(args: &cli::AppealSlashArgs, global_config: Option<&Path>) -> a
     let resolved =
         chain_ctx::resolve_appeal(&args.chain, args.slash_appeal_address.as_deref(), &file)?;
     let sa_addr = chain_ctx::parse_address(&resolved.slash_appeal_address, "slash_appeal_address")?;
-    let slash_id = U256::from(args.slash_id);
+    let slash_id = parse_slash_id(&args.slash_id)?;
     let evidence = parse_bytes32(&args.evidence_bundle_hash)?;
 
     let signer = chain_ctx::load_operator_signer(&args.chain, &resolved.keystore).await?;
@@ -37,7 +37,7 @@ pub async fn run(args: &cli::AppealSlashArgs, global_config: Option<&Path>) -> a
     let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
     let appeal = SlashAppeal::new(sa_addr, &provider);
 
-    let plan = build_plan(&appeal, operator, args.slash_id, evidence, sa_addr).await?;
+    let plan = build_plan(&appeal, operator, slash_id, evidence, sa_addr).await?;
 
     if args.chain.dry_run {
         let mut out = io::stdout().lock();
@@ -59,7 +59,7 @@ pub async fn run(args: &cli::AppealSlashArgs, global_config: Option<&Path>) -> a
 
 /// What `appeal slash` intends to do, computed from chain state.
 pub(crate) struct Plan {
-    pub(crate) slash_id: u64,
+    pub(crate) slash_id: U256,
     pub(crate) slash_appeal: Address,
     pub(crate) token: Address,
     pub(crate) evidence: B256,
@@ -80,7 +80,7 @@ pub(crate) struct Outcome {
 pub(crate) async fn build_plan<P: Provider + Clone>(
     appeal: &SlashAppeal::SlashAppealInstance<P>,
     operator: Address,
-    slash_id: u64,
+    slash_id: U256,
     evidence: B256,
     sa_addr: Address,
 ) -> anyhow::Result<Plan> {
@@ -168,6 +168,13 @@ pub(crate) async fn execute<P: Provider + Clone>(
     Ok(outcome)
 }
 
+/// Parse a `uint256` slash id from a decimal string. Kept as `U256` (not
+/// `u64`) because the on-chain `slashId` can exceed `u64::MAX`.
+pub(crate) fn parse_slash_id(s: &str) -> anyhow::Result<U256> {
+    s.parse::<U256>()
+        .map_err(|e| anyhow::anyhow!("invalid slash id {s:?}: expected a uint256 decimal: {e}"))
+}
+
 /// Parse a 0x-prefixed 32-byte hex string into a `B256` (the evidence bundle
 /// hash). Rejects the wrong length up front with a labelled error.
 pub(crate) fn parse_bytes32(s: &str) -> anyhow::Result<B256> {
@@ -194,7 +201,7 @@ pub(crate) fn write_plan(
         let value = serde_json::json!({
             "submitted": submitted,
             "dry_run": dry_run,
-            "slash_id": p.slash_id,
+            "slash_id": p.slash_id.to_string(),
             "slash_appeal": format!("{:#x}", p.slash_appeal),
             "token": format!("{:#x}", p.token),
             "evidence_bundle_hash": format!("{:#x}", p.evidence),
@@ -232,7 +239,7 @@ mod tests {
 
     fn plan(needs_approve: bool) -> Plan {
         Plan {
-            slash_id: 7,
+            slash_id: U256::from(7u64),
             slash_appeal: Address::repeat_byte(0x11),
             token: Address::repeat_byte(0x22),
             evidence: B256::repeat_byte(0xAB),
@@ -254,6 +261,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_slash_id_accepts_values_above_u64_max() {
+        // u64::MAX + 1 — must not overflow (the whole point of U256).
+        let big = "18446744073709551616";
+        assert_eq!(
+            parse_slash_id(big).unwrap(),
+            U256::from(u64::MAX) + U256::from(1u64)
+        );
+        assert!(parse_slash_id("not-a-number").is_err());
+    }
+
+    #[test]
     fn dry_run_reports_dry_run_true() {
         let p = plan(true);
         let mut buf = Vec::new();
@@ -270,9 +288,10 @@ mod tests {
         let mut buf = Vec::new();
         write_plan(&mut buf, &p, true, &Outcome::default(), true).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        // slash_id is emitted as a decimal string (uint256 can exceed u64).
         assert_eq!(
-            v.get("slash_id").and_then(serde_json::Value::as_u64),
-            Some(7)
+            v.get("slash_id").and_then(serde_json::Value::as_str),
+            Some("7")
         );
         assert_eq!(
             v.get("needs_approve").and_then(serde_json::Value::as_bool),

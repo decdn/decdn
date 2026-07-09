@@ -31,9 +31,10 @@ pub enum AppealCommand {
 #[derive(Args, Debug)]
 pub struct AppealSlashArgs {
     /// The on-chain slash id to appeal (surfaced by the daemon admin RPC
-    /// `admin_v1_slashes`, or the `Slashed` event's `slashId`).
+    /// `admin_v1_slashes`, or the `Slashed` event's `slashId`). A `uint256`
+    /// decimal string — taken as text so an id above `u64::MAX` still parses.
     #[arg(value_name = "SLASH_ID")]
-    pub slash_id: u64,
+    pub slash_id: String,
 
     /// Evidence bundle hash — a 0x-prefixed 32-byte hex reference to the
     /// off-chain evidence bundle (ADR 028). Stored on-chain verbatim.
