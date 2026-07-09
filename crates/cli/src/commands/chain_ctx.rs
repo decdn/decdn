@@ -260,7 +260,10 @@ pub fn resolve_swap(
     let pick = |flag: &Option<String>, cfg: fn(&FileBlockchain) -> Option<String>| {
         flag.clone().or_else(|| bc.and_then(cfg))
     };
-    let venue = pick(&chain.swap_venue, |b| b.swap_venue.clone());
+    let venue = chain
+        .swap_venue
+        .map(|v| v.as_str().to_string())
+        .or_else(|| bc.and_then(|b| b.swap_venue.clone()));
     let Some(venue) = venue else { return Ok(None) };
     let router = pick(&chain.swap_router_address, |b| {
         b.swap_router_address.clone()
@@ -279,10 +282,7 @@ pub fn resolve_swap(
         uniswap_fee_tier: chain
             .swap_fee_tier
             .or_else(|| bc.and_then(|b| b.swap_fee_tier)),
-        balancer_pool_address: chain
-            .swap_balancer_pool
-            .clone()
-            .or_else(|| bc.and_then(|b| b.swap_balancer_pool.clone())),
+        balancer_pool_address: pick(&chain.swap_balancer_pool, |b| b.swap_balancer_pool.clone()),
         pool: pick(&chain.swap_pool_address, |b| b.swap_pool_address.clone()),
     }))
 }
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn resolve_swap_flag_beats_config() {
         let mut chain = empty_chain();
-        chain.swap_venue = Some("uniswap-v3".into());
+        chain.swap_venue = Some(cli::SwapVenueArg::UniswapV3);
         chain.swap_router_address = Some("0xROUTER".into());
         chain.swap_quoter_address = Some("0xQUOTER".into());
         chain.usdc_address = Some("0xUSDC".into());
@@ -470,7 +470,7 @@ mod tests {
         // Balancer quotes through its router, so a quoter is not required —
         // `resolve_swap` must succeed with `quoter: None` and carry the pool.
         let mut chain = empty_chain();
-        chain.swap_venue = Some("balancer-v3".into());
+        chain.swap_venue = Some(cli::SwapVenueArg::BalancerV3);
         chain.swap_router_address = Some("0xROUTER".into());
         chain.usdc_address = Some("0xUSDC".into());
         chain.swap_balancer_pool = Some("0xBALPOOL".into());
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn resolve_swap_carries_pool_flag_beats_config() {
         let mut chain = empty_chain();
-        chain.swap_venue = Some("uniswap-v3".into());
+        chain.swap_venue = Some(cli::SwapVenueArg::UniswapV3);
         chain.swap_router_address = Some("0xROUTER".into());
         chain.swap_quoter_address = Some("0xQUOTER".into());
         chain.usdc_address = Some("0xUSDC".into());
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn resolve_swap_pool_falls_through_to_config() {
         let mut chain = empty_chain();
-        chain.swap_venue = Some("uniswap-v3".into());
+        chain.swap_venue = Some(cli::SwapVenueArg::UniswapV3);
         chain.swap_router_address = Some("0xROUTER".into());
         chain.swap_quoter_address = Some("0xQUOTER".into());
         chain.usdc_address = Some("0xUSDC".into());

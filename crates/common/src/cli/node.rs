@@ -22,6 +22,28 @@ const DEFAULT_WAIT_POLL_MS: NonZeroU64 = match NonZeroU64::new(250) {
     None => unreachable!(),
 };
 
+/// Accepted `--swap-venue` values. A `ValueEnum` so clap rejects typos at
+/// parse time and `--help` lists the supported venues. The TOML config
+/// `swap_venue` string is validated later when the venue is constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SwapVenueArg {
+    #[value(name = "uniswap-v3")]
+    UniswapV3,
+    #[value(name = "balancer-v3")]
+    BalancerV3,
+}
+
+impl SwapVenueArg {
+    /// Canonical wire string consumed by `resolve_swap`/`from_config`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UniswapV3 => "uniswap-v3",
+            Self::BalancerV3 => "balancer-v3",
+        }
+    }
+}
+
 /// Operator-local admin commands that query a running deCDN node.
 #[derive(Args, Debug)]
 pub struct NodeArgs {
@@ -549,8 +571,8 @@ pub struct ChainArgs {
     pub json: bool,
 
     /// DEX venue for `--pay-bond-with usdc`: `uniswap-v3` or `balancer-v3`.
-    #[arg(long = "swap-venue", value_name = "VENUE")]
-    pub swap_venue: Option<String>,
+    #[arg(long = "swap-venue", value_enum)]
+    pub swap_venue: Option<SwapVenueArg>,
 
     /// Exact-out swap router address (Uniswap `SwapRouter02` / Balancer `Router`).
     #[arg(long = "swap-router-address", value_name = "ADDR")]
