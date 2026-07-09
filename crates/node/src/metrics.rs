@@ -406,6 +406,11 @@ pub struct DecdnMetrics {
     /// operator was slashed and should consider `decdn appeal slash` within the
     /// 30-day window. Operator-visible name: `decdn_slashes_detected_total`.
     pub slashes_detected: Counter,
+    /// `decdn_slash_watcher_restarts_total` (#1032): distinct drift windows the
+    /// slash-detection watcher has entered, bumped once on the edge into the
+    /// error/backoff state. Pairs with `slash_watcher_down_seconds` to tell one
+    /// long outage from repeated flapping. Mirrors `staker_set_watcher_restarts`.
+    pub slash_watcher_restarts: Counter,
     /// `decdn_slash_watcher_down_seconds` (#1032): seconds the slash-detection
     /// watcher has been stuck in its resubscribe/backoff loop (`0` on a healthy
     /// cycle), recomputed at scrape from `slash_watcher_down_since`. Mirrors the
@@ -1343,6 +1348,7 @@ impl Metrics {
             && down_since.is_none()
         {
             *down_since = Some(Instant::now());
+            self.decdn.slash_watcher_restarts.inc();
         }
     }
 
@@ -2864,6 +2870,13 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_slash_watcher_down_seconds", 150),
             "down-seconds should climb to the downtime depth once in backoff:\n{text}"
+        );
+        // The restart counter bumps exactly once per drift window (edge-triggered).
+        metrics.slash_watcher_backoff_started();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_slash_watcher_restarts_total", 1),
+            "restarts must bump once per drift window, not per call:\n{text}"
         );
 
         metrics.slash_watcher_cycle_established();
