@@ -64,6 +64,10 @@ Before any on-chain or protocol activity:
 
 All transactions must be confirmed on-chain before proceeding to Phase 3.
 
+#### Optional: funding the bond via USDC swap
+
+Steps 2.1–2.2 assume the operator already holds TOKEN. `decdn setup` also accepts `--pay-bond-with usdc` (default `token`) for operators who would rather bring USDC instead. In USDC mode, `setup` acquires the bond shortfall — `bond_required(declaredMbps)` less TOKEN already held — through an exact-out USDC→TOKEN swap on a config-selected venue (`uniswap-v3` or `balancer-v3`) before submitting the approve and bond transactions below. `--max-slippage-bps` (default 300) bounds the swap's `amountInMaximum` alongside a swap deadline; if the venue's execution price impact exceeds 300 bps, the operator is warned and must confirm before the swap proceeds. The swap and the bond deposit remain separate transactions: a bond call that fails after a successful swap leaves the operator holding the swapped TOKEN, and re-running `setup` swaps nothing further, retrying only the bond step. `setup` submits no privileged transaction in either mode — the swap, like the approve and bond calls it precedes, is a standard self-custodial transaction the operator signs.
+
 #### Step 2.1 — Approve TOKEN transfer
 
 Call `TOKEN.approve(capacityBond, amount)` where `amount ≥ bond_required(declared_Mbps)` per the curve `bond = k × Mbps^α` ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). This ERC-20 approval authorizes `CapacityBond` to pull the bond deposit.
