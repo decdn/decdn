@@ -16,6 +16,7 @@ use decdn_common::cli;
 use decdn_common::cli::common::expand_tilde;
 use decdn_common::config::DEFAULT_CHAIN_ID;
 use decdn_incentive::eth_identity::{self, PasswordSource};
+use decdn_incentive::swap_venue::ResolvedSwap;
 use serde::Deserialize;
 
 /// Partial deserializer for the TOML config — only the `[blockchain]` and
@@ -42,6 +43,7 @@ struct FileBlockchain {
     usdc_address: Option<String>,
     swap_fee_tier: Option<u32>,
     swap_pool_id: Option<String>,
+    swap_pool_address: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -245,17 +247,6 @@ pub fn resolve_publish(
     })
 }
 
-/// Resolved swap-venue coordinates (present only when a venue is configured).
-#[derive(Debug, Clone)]
-pub struct ResolvedSwap {
-    pub venue: String,
-    pub router: String,
-    pub quoter: String,
-    pub usdc: String,
-    pub uniswap_fee_tier: Option<u32>,
-    pub balancer_pool_id: Option<String>,
-}
-
 /// Resolve swap coordinates with flag > config precedence. Returns `None` when
 /// no venue is configured (token-mode). When a venue *is* named, the router,
 /// quoter, and usdc address are required and their absence errors here.
@@ -291,6 +282,7 @@ pub fn resolve_swap(
             .swap_pool_id
             .clone()
             .or_else(|| bc.and_then(|b| b.swap_pool_id.clone())),
+        pool: pick(&chain.swap_pool_address, |b| b.swap_pool_address.clone()),
     }))
 }
 
@@ -316,6 +308,7 @@ mod tests {
             usdc_address: None,
             swap_fee_tier: None,
             swap_pool_id: None,
+            swap_pool_address: None,
         }
     }
 
@@ -345,6 +338,7 @@ mod tests {
             usdc_address: None,
             swap_fee_tier: None,
             swap_pool_id: None,
+            swap_pool_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");
@@ -368,6 +362,7 @@ mod tests {
             usdc_address: None,
             swap_fee_tier: None,
             swap_pool_id: None,
+            swap_pool_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://config:8545");
@@ -393,6 +388,7 @@ mod tests {
             usdc_address: None,
             swap_fee_tier: None,
             swap_pool_id: None,
+            swap_pool_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.keystore, PathBuf::from("/tmp/decdn-test/keystore.json"));
@@ -432,6 +428,7 @@ mod tests {
             usdc_address: None,
             swap_fee_tier: None,
             swap_pool_id: None,
+            swap_pool_address: None,
         });
         let r = resolve_publish(&args, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");
@@ -465,5 +462,59 @@ mod tests {
         assert_eq!(s.venue, "uniswap-v3");
         assert_eq!(s.router, "0xROUTER");
         assert_eq!(s.uniswap_fee_tier, Some(3000));
+    }
+
+    #[test]
+    fn resolve_swap_carries_pool_flag_beats_config() {
+        let mut chain = empty_chain();
+        chain.swap_venue = Some("uniswap-v3".into());
+        chain.swap_router_address = Some("0xROUTER".into());
+        chain.swap_quoter_address = Some("0xQUOTER".into());
+        chain.usdc_address = Some("0xUSDC".into());
+        chain.swap_pool_address = Some("0xPOOLFLAG".into());
+        let file = file_with(FileBlockchain {
+            rpc_url: Some("http://config:8545".to_string()),
+            chain_id: None,
+            capacity_bond_address: None,
+            eth_keystore: None,
+            publisher_registry_address: None,
+            origin_assignment_address: None,
+            swap_venue: None,
+            swap_router_address: None,
+            swap_quoter_address: None,
+            usdc_address: None,
+            swap_fee_tier: None,
+            swap_pool_id: None,
+            swap_pool_address: Some("0xPOOLCONFIG".to_string()),
+        });
+        let s = resolve_swap(&chain, &file).unwrap().unwrap();
+        // Flag wins over config for the pool address.
+        assert_eq!(s.pool.as_deref(), Some("0xPOOLFLAG"));
+    }
+
+    #[test]
+    fn resolve_swap_pool_falls_through_to_config() {
+        let mut chain = empty_chain();
+        chain.swap_venue = Some("uniswap-v3".into());
+        chain.swap_router_address = Some("0xROUTER".into());
+        chain.swap_quoter_address = Some("0xQUOTER".into());
+        chain.usdc_address = Some("0xUSDC".into());
+        let file = file_with(FileBlockchain {
+            rpc_url: None,
+            chain_id: None,
+            capacity_bond_address: None,
+            eth_keystore: None,
+            publisher_registry_address: None,
+            origin_assignment_address: None,
+            swap_venue: None,
+            swap_router_address: None,
+            swap_quoter_address: None,
+            usdc_address: None,
+            swap_fee_tier: None,
+            swap_pool_id: None,
+            swap_pool_address: Some("0xPOOLCONFIG".to_string()),
+        });
+        let s = resolve_swap(&chain, &file).unwrap().unwrap();
+        assert_eq!(s.pool.as_deref(), Some("0xPOOLCONFIG"));
     }
 }

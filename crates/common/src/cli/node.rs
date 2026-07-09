@@ -571,6 +571,11 @@ pub struct ChainArgs {
     /// Balancer V3 pool id (bytes32 hex). Balancer venue only.
     #[arg(long = "swap-pool-id", value_name = "POOLID")]
     pub swap_pool_id: Option<String>,
+
+    /// Uniswap V3 pool address for the TOKEN/USDC pair; enables the
+    /// price-impact warning. Uniswap venue only.
+    #[arg(long = "swap-pool-address", value_name = "ADDR")]
+    pub swap_pool_address: Option<String>,
 }
 
 /// `decdn node register` — submit `CapacityBond.registerNode` (ADR 019

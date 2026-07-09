@@ -69,12 +69,11 @@ impl SwapVenue {
     }
 }
 
-/// Mirror of the `cli` crate's `chain_ctx::ResolvedSwap` (flag > config
-/// resolved swap coordinates). Duplicated here rather than imported because
-/// `cli` depends on `incentive`, not the reverse (see the workspace
-/// dependency-flow note in the crate root docs) — `incentive` can't name a
-/// type defined in `cli`. Field names/shapes match 1:1 so a future CLI wiring
-/// pass (Task 4) can convert directly.
+/// Flag > config resolved swap coordinates (USDC-side config only). This is
+/// the canonical type: `cli`'s `chain_ctx::resolve_swap` builds and returns it
+/// directly (the CLI imports it rather than defining its own, since `cli`
+/// depends on `incentive`, not the reverse — see the workspace dependency-flow
+/// note in the crate root docs), and [`from_config`] consumes it.
 #[derive(Debug, Clone)]
 pub struct ResolvedSwap {
     /// Venue selector, e.g. `"uniswap-v3"`.
@@ -91,6 +90,11 @@ pub struct ResolvedSwap {
     /// Balancer pool id (bytes32 hex string); required for `"balancer"`
     /// (Task 6).
     pub balancer_pool_id: Option<String>,
+    /// Uniswap V3 pool address (hex string, unparsed) for the TOKEN/USDC
+    /// pair. Optional: when `Some`, lights up the advisory price-impact gate
+    /// via `slot0`; when `None`, the gate stays inert (see [`from_config`] and
+    /// the `swap_uniswap` module docs).
+    pub pool: Option<String>,
 }
 
 /// Construct the configured [`SwapVenue`] from resolved chain config,
@@ -124,8 +128,14 @@ pub fn from_config<P: Provider + Clone + 'static>(
             let fee = resolved.uniswap_fee_tier.ok_or_else(|| {
                 anyhow::anyhow!("uniswap_fee_tier required for --swap-venue uniswap-v3")
             })?;
+            let pool = match &resolved.pool {
+                Some(p) => Some(p.parse::<Address>().map_err(|e| {
+                    anyhow::anyhow!("swap_pool_address {p:?} is not a valid address: {e}")
+                })?),
+                None => None,
+            };
             Ok(SwapVenue::UniswapV3(UniswapV3Venue::new(
-                provider, router, quoter, None, usdc, token, fee,
+                provider, router, quoter, pool, usdc, token, fee,
             )))
         }
         other => anyhow::bail!("unknown swap venue {other}"),
@@ -206,6 +216,7 @@ mod tests {
             usdc: addr_hex(0x33),
             uniswap_fee_tier: Some(3000),
             balancer_pool_id: None,
+            pool: None,
         };
         let venue = from_config(
             unconnected_provider(),
@@ -225,6 +236,7 @@ mod tests {
             usdc: addr_hex(0x33),
             uniswap_fee_tier: None,
             balancer_pool_id: None,
+            pool: None,
         };
         let err = from_config(unconnected_provider(), &resolved, Address::ZERO).unwrap_err();
         assert!(err.to_string().contains("uniswap_fee_tier"), "{err}");
@@ -239,6 +251,7 @@ mod tests {
             usdc: String::new(),
             uniswap_fee_tier: None,
             balancer_pool_id: None,
+            pool: None,
         };
         let err = from_config(unconnected_provider(), &resolved, Address::ZERO).unwrap_err();
         assert!(
@@ -256,6 +269,7 @@ mod tests {
             usdc: addr_hex(0x33),
             uniswap_fee_tier: Some(3000),
             balancer_pool_id: None,
+            pool: None,
         };
         let err = from_config(unconnected_provider(), &resolved, Address::ZERO).unwrap_err();
         assert!(err.to_string().contains("swap_router_address"), "{err}");
