@@ -53,7 +53,7 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
     // 80/20 seed (ADR 018 proportions): 250k USDC pairs 100M TOKEN at the $0.01
     // anchor, giving a marginal spot of ~100 TOKEN per USDC.
     uint256 internal constant USDC_SEED = 250_000e6;
-    uint256 internal constant TOKEN_SEED = 100_000_000e18;
+    uint256 internal constant TARGET_PRICE = 10_000; // $0.01/TOKEN in 6-dec USDC units
     uint256 internal constant EXPECTED_SPOT = 100e18; // TOKEN per USDC, 1e18 fixed point
 
     address internal emergencyMultisig = address(0xC0DE);
@@ -124,7 +124,7 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
         act.balSubSwapCount = 4;
         act.balSubSwapMinBlockGap = 10;
         act.usdcSeed = USDC_SEED;
-        act.tokenSeed = TOKEN_SEED;
+        act.tokenSeed = _deriveTokenSeed(BuybackVenue.BALANCER, USDC_SEED, TARGET_PRICE);
     }
 
     /// @notice The headline acceptance: flag ON + Balancer venue creates + seeds a

@@ -122,6 +122,8 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     address internal swapRouter = address(0x5AFE);
 
     uint256 internal constant USDC_SEED = 10_000e6;
+    uint256 internal constant TARGET_PRICE = 10_000; // $0.01/TOKEN in 6-dec USDC units
+    // 10k USDC at $0.01/TOKEN pairs 1M TOKEN in a 50/50 pool — the derived seed.
     uint256 internal constant TOKEN_SEED = 1_000_000e18;
 
     function setUp() public {
@@ -169,7 +171,7 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         act.uniPositionManager = positionManager;
         act.uniPoolFee = 10_000;
         act.usdcSeed = USDC_SEED;
-        act.tokenSeed = TOKEN_SEED;
+        act.tokenSeed = _deriveTokenSeed(BuybackVenue.UNISWAP, USDC_SEED, TARGET_PRICE);
     }
 
     // External wrapper so `vm.expectRevert` catches reverts at the call boundary.
@@ -284,4 +286,42 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     // factory/vault/router stack is impractical to mock in-process. The keeper
     // guard here (`test_revertsWhenKeeperMissing`) is venue-agnostic and fires
     // before any venue-specific work, so it covers the Balancer path too.
+
+    // -----------------------------------------------------------------
+    // _deriveTokenSeed — price-driven TOKEN seed sizing
+    // -----------------------------------------------------------------
+
+    function test_deriveTokenSeed_uniswapAnchor() public pure {
+        // 10k USDC at $0.01/TOKEN -> 1M TOKEN (50/50 value split).
+        assertEq(_deriveTokenSeed(BuybackVenue.UNISWAP, 10_000e6, 10_000), 1_000_000e18);
+    }
+
+    function test_deriveTokenSeed_balancerAnchor() public pure {
+        // 250k USDC at $0.01/TOKEN, 80/20 -> 100M TOKEN (TOKEN side is 4x by value).
+        assertEq(_deriveTokenSeed(BuybackVenue.BALANCER, 250_000e6, 10_000), 100_000_000e18);
+    }
+
+    function test_deriveTokenSeed_scalesInverselyWithPrice() public pure {
+        // At $0.02/TOKEN the same USDC buys half the TOKEN.
+        assertEq(_deriveTokenSeed(BuybackVenue.UNISWAP, 10_000e6, 20_000), 500_000e18);
+    }
+
+    function test_deriveTokenSeed_smallSeed() public pure {
+        // The point of the price knob: 100 USDC at $0.01 seeds 10k TOKEN, no
+        // hand-computed ratio and no large USDC balance required.
+        assertEq(_deriveTokenSeed(BuybackVenue.UNISWAP, 100e6, 10_000), 10_000e18);
+    }
+
+    function test_deriveTokenSeed_revertsOnZeroPrice() public {
+        vm.expectRevert(BaseProtocolDeploy.TargetPriceZero.selector);
+        this.externalDeriveTokenSeed(BuybackVenue.UNISWAP, 100e6, 0);
+    }
+
+    function externalDeriveTokenSeed(BuybackVenue venue, uint256 usdcSeed, uint256 targetPrice)
+        external
+        pure
+        returns (uint256)
+    {
+        return _deriveTokenSeed(venue, usdcSeed, targetPrice);
+    }
 }

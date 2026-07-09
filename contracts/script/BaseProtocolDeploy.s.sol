@@ -160,6 +160,11 @@ abstract contract BaseProtocolDeploy is Script {
     uint160 internal constant UNIV3_MIN_SQRT_RATIO = 4_295_128_739;
     uint160 internal constant UNIV3_MAX_SQRT_RATIO = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
 
+    /// @dev Balancer 80/20 TOKEN/USDC normalized weights (WAD). Single source of
+    ///      truth for both the pool creation and the price-implied TOKEN seed sizing.
+    uint256 internal constant BAL_TOKEN_WEIGHT = 0.8e18;
+    uint256 internal constant BAL_USDC_WEIGHT = 0.2e18;
+
     /// @notice Venue the genesis buyback activation targets. `UNISWAP` creates and
     ///         seeds the TOKEN/USDC V3 pool in-script (the only venue live on the
     ///         Arbitrum Sepolia initial network). `BALANCER` wires an already-seeded
@@ -315,6 +320,9 @@ abstract contract BaseProtocolDeploy is Script {
     ///         the pool cannot represent. Caught here so the deploy fails with a
     ///         clear error instead of an opaque revert inside pool `initialize`.
     error SqrtPriceOutOfRange(uint256 value);
+    /// @notice The genesis-activation target price was zero — the TOKEN seed is
+    ///         derived as `usdcSeed / targetPrice`, so a zero divides by zero.
+    error TargetPriceZero();
     /// @notice Post-activation invariant — the FeeRouter split is not the expected
     ///         steady-state `[6000, 3000, 1000]` after `setSharesAndDestinations`.
     error BuybackSharesNotActivated(uint256 operator, uint256 buyback, uint256 treasury);
@@ -836,8 +844,8 @@ abstract contract BaseProtocolDeploy is Script {
             });
             tokens[0] = usdcFirst ? usdcCfg : tokenCfg;
             tokens[1] = usdcFirst ? tokenCfg : usdcCfg;
-            weights[0] = usdcFirst ? 0.2e18 : 0.8e18;
-            weights[1] = usdcFirst ? 0.8e18 : 0.2e18;
+            weights[0] = usdcFirst ? BAL_USDC_WEIGHT : BAL_TOKEN_WEIGHT;
+            weights[1] = usdcFirst ? BAL_TOKEN_WEIGHT : BAL_USDC_WEIGHT;
         }
 
         IBalancerV3WeightedPoolFactory.PoolRoleAccounts memory roles = IBalancerV3WeightedPoolFactory.PoolRoleAccounts({
@@ -945,6 +953,25 @@ abstract contract BaseProtocolDeploy is Script {
     ///      before the division. Reverts if the price falls outside Uniswap V3's
     ///      valid `[MIN_SQRT_RATIO, MAX_SQRT_RATIO]` band — a fail-fast in place of
     ///      the opaque revert the pool `initialize` would otherwise throw.
+    /// @dev The TOKEN seed that pairs `usdcSeed` at `targetPrice` — the price of one
+    ///      whole TOKEN in USDC base units (USDC is 6-dec, so `$0.01/TOKEN` is
+    ///      `10_000`). The USDC decimals cancel (`usdcSeed` and `targetPrice` share
+    ///      them), so the result is only scaled by TOKEN's 18 decimals:
+    ///        tokenSeed = (wTOKEN / wUSDC) · usdcSeed · 1e18 / targetPrice
+    ///      where the value-weight ratio is 1:1 for the 50/50 constant-product
+    ///      Uniswap pool and 4:1 (80/20) for the Balancer weighted pool. Feeding the
+    ///      seeds in this proportion makes the pool initialize at exactly `targetPrice`.
+    function _deriveTokenSeed(BuybackVenue venue, uint256 usdcSeed, uint256 targetPrice)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (targetPrice == 0) revert TargetPriceZero();
+        (uint256 wToken, uint256 wUsdc) =
+            venue == BuybackVenue.BALANCER ? (BAL_TOKEN_WEIGHT, BAL_USDC_WEIGHT) : (uint256(1), uint256(1));
+        return Math.mulDiv(Math.mulDiv(usdcSeed, wToken, wUsdc), 1e18, targetPrice);
+    }
+
     function _sqrtPriceX96(uint256 amount1, uint256 amount0) internal pure returns (uint160) {
         uint256 ratioX192 = Math.mulDiv(amount1, uint256(1) << 192, amount0);
         uint256 s = Math.sqrt(ratioX192);

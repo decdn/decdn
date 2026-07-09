@@ -34,7 +34,7 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
     uint24 internal constant FEE = 10_000; // 1% tier
 
     uint256 internal constant USDC_SEED = 10_000e6;
-    uint256 internal constant TOKEN_SEED = 1_000_000e18; // pairs the USDC seed at the $0.01 anchor
+    uint256 internal constant TARGET_PRICE = 10_000; // $0.01/TOKEN in 6-dec USDC units
 
     address internal emergencyMultisig = address(0xC0DE);
     address internal challengerPool = address(0xCCEE);
@@ -98,7 +98,7 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
         act.uniPositionManager = POSITION_MANAGER;
         act.uniPoolFee = FEE;
         act.usdcSeed = USDC_SEED;
-        act.tokenSeed = TOKEN_SEED;
+        act.tokenSeed = _deriveTokenSeed(BuybackVenue.UNISWAP, USDC_SEED, TARGET_PRICE);
     }
 
     /// @notice The headline acceptance: flag ON + Uniswap venue lands the
