@@ -8246,6 +8246,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_blockchain_rejects_zero_content_blacklist_address() -> anyhow::Result<()> {
+        // The zero address is a fail-open compliance trap: every scope check
+        // reverts, nothing is evicted, and the operator believes the watcher
+        // is active. Must be rejected like `slash_judge_address`.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(
+                "0x0000000000000000000000000000000000000000".to_string(),
+            ),
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error for zero content_blacklist_address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("content_blacklist_address") && msg.contains("zero address"),
+            "error should reject the zero address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resolve_blockchain_rejects_zero_content_blacklist_poll_interval() -> anyhow::Result<()> {
         // A zero interval panics `tokio::time::interval_at`, killing the watcher.
         let dir = data_dir_with_keystore()?;

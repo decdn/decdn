@@ -7,14 +7,17 @@
 //! `isHashBlacklistedForOperator` view, so region packing and the ADR 030
 //! ripening math never leave the chain.
 //!
-//! **Event-sourced, re-scoped deny-set.** The set of blacklisted hashes is
+//! **Event-sourced, re-scoped deny-set.** The set of blacklisted entries is
 //! learned from `HashBlacklisted` logs replayed from a checkpoint block (the
 //! configured deployment block on first pass) plus a live subscription.
 //! `ContentBlacklist` exposes no enumeration view, so events are the only
-//! source. Every seen-but-not-yet-evicted hash is retained in `known` —
-//! *including* ones currently out of scope (wrong region) or fast-track
-//! suspended — and re-scoped on every periodic pass. This is essential: a hash
-//! can become live + in scope with **no** `HashBlacklisted` event — an operator
+//! source. Entries are keyed by `(region, hash)` — the contract's own key
+//! (`_hashEntries[region][hash]`) — so a `HashRemoved` for one region's entry
+//! never drops a surviving same-hash entry in another region. Every
+//! seen-but-not-yet-evicted entry is retained in `known` — *including* ones
+//! currently out of scope (wrong region) or fast-track suspended — and
+//! re-scoped on every periodic pass. This is essential: a hash can become
+//! live + in scope with **no** `HashBlacklisted` event — an operator
 //! region/ripening change (`CapacityBond.updateRegion`) or an appeal
 //! reversal/lapse that clears `suspended` — and the advanced checkpoint means
 //! the original log is never replayed. Re-scoping `known` is what catches those.
@@ -91,11 +94,41 @@ struct WatcherState {
     /// Next block the `HashBlacklisted` replay resumes from (advances per
     /// successfully-queried window).
     checkpoint: u64,
-    /// Every blacklisted hash seen and not yet locally evicted — including
-    /// out-of-scope and suspended entries — re-scoped on each reconcile so a
-    /// later region/ripening or appeal transition (which emits no
-    /// `HashBlacklisted`) still leads to eviction.
-    known: HashSet<Hash>,
+    /// Every blacklisted `(region, hash)` entry seen and not yet locally
+    /// evicted — including out-of-scope and suspended entries — re-scoped on
+    /// each reconcile so a later region/ripening or appeal transition (which
+    /// emits no `HashBlacklisted`) still leads to eviction. Keyed like the
+    /// contract's `_hashEntries[region][hash]` so a `HashRemoved` drops
+    /// exactly the removed entry.
+    known: HashSet<(B256, Hash)>,
+}
+
+impl WatcherState {
+    /// Record a `HashBlacklisted(region, hash)` entry.
+    fn add_entry(&mut self, region: B256, hash: Hash) {
+        self.known.insert((region, hash));
+    }
+
+    /// Drop exactly the `HashRemoved(region, hash)` entry — same-hash entries
+    /// under other regions stay retained for re-scoping.
+    fn remove_entry(&mut self, region: B256, hash: Hash) {
+        self.known.remove(&(region, hash));
+    }
+
+    /// Drop every entry for `hash` (once locally evicted, the sticky eviction
+    /// covers all regions).
+    fn drop_hash(&mut self, hash: Hash) {
+        self.known.retain(|(_, known_hash)| *known_hash != hash);
+    }
+
+    /// Distinct hashes across all regions — the scope view
+    /// (`isHashBlacklistedForOperator`) is per `(operator, hash)`, so each
+    /// hash needs exactly one `eth_call` per pass regardless of how many
+    /// regional entries reference it.
+    fn distinct_hashes(&self) -> Vec<Hash> {
+        let unique: HashSet<Hash> = self.known.iter().map(|(_, hash)| *hash).collect();
+        unique.into_iter().collect()
+    }
 }
 
 /// Run the blacklist compliance watcher until `shutdown` is cancelled.
@@ -312,15 +345,16 @@ async fn replay<P>(
         for (event, _log) in logs {
             let hash = Hash::from_bytes(event.hash.0);
             if !cache.is_evicted(hash) {
-                state.known.insert(hash);
+                state.add_entry(event.region, hash);
             }
         }
         state.checkpoint = to.saturating_add(1);
     }
 }
 
-/// Re-scope every hash in `known` and evict those now in scope. Interruptible by
-/// shutdown between hashes.
+/// Re-scope every distinct hash in `known` (one scope `eth_call` per hash, not
+/// per regional entry) and evict those now in scope. Interruptible by shutdown
+/// between hashes.
 async fn rescan<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
@@ -330,7 +364,7 @@ async fn rescan<P>(
 ) where
     P: Provider + Clone,
 {
-    let snapshot: Vec<Hash> = state.known.iter().copied().collect();
+    let snapshot = state.distinct_hashes();
     let mut evicted = 0usize;
     for hash in snapshot {
         if shutdown.is_cancelled() {
@@ -345,8 +379,9 @@ async fn rescan<P>(
     }
 }
 
-/// Handle one live log: `HashBlacklisted` re-checks the hash; `HashRemoved`
-/// drops it from `known` (hygiene — eviction stays sticky).
+/// Handle one live log: `HashBlacklisted` records the `(region, hash)` entry
+/// and re-checks the hash; `HashRemoved` drops exactly that entry (hygiene —
+/// eviction stays sticky, and same-hash entries in other regions survive).
 async fn handle_log<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
@@ -358,35 +393,55 @@ async fn handle_log<P>(
 {
     match log.topic0() {
         Some(topic) if *topic == HashBlacklisted::SIGNATURE_HASH => {
-            match HashBlacklisted::decode_log_data(&log.inner.data) {
-                Ok(event) => {
-                    recheck(
-                        contract,
-                        operator,
-                        cache,
-                        state,
-                        Hash::from_bytes(event.hash.0),
-                    )
-                    .await;
-                }
-                Err(err) => warn!(err = %err, "blacklist watcher: undecodable HashBlacklisted log"),
-            }
+            on_blacklisted_log(contract, operator, cache, state, &log).await;
         }
-        Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => {
-            if let Ok(event) = HashRemoved::decode_log_data(&log.inner.data) {
-                let hash = Hash::from_bytes(event.hash.0);
-                state.known.remove(&hash);
-                debug!(%hash, "blacklist entry removed on-chain (local eviction stays sticky)");
-            }
-        }
+        Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => on_removed_log(state, &log),
         _ => {}
     }
 }
 
-/// Retain `hash` in `known` and evict it if in scope. Returns `true` iff an
-/// eviction was performed. Out-of-scope/suspended (`Some(false)`) and RPC-error
-/// (`None`) hashes stay in `known` for the next re-scope; already-evicted hashes
-/// are dropped from `known`.
+/// Decode a `HashBlacklisted` log, record its `(region, hash)` entry, and
+/// re-check the hash.
+async fn on_blacklisted_log<P>(
+    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
+    operator: Address,
+    cache: &CacheEngine,
+    state: &mut WatcherState,
+    log: &Log,
+) where
+    P: Provider + Clone,
+{
+    match HashBlacklisted::decode_log_data(&log.inner.data) {
+        Ok(event) => {
+            let hash = Hash::from_bytes(event.hash.0);
+            state.add_entry(event.region, hash);
+            recheck(contract, operator, cache, state, hash).await;
+        }
+        Err(err) => warn!(err = %err, "blacklist watcher: undecodable HashBlacklisted log"),
+    }
+}
+
+/// Decode a `HashRemoved` log and drop exactly that `(region, hash)` entry.
+fn on_removed_log(state: &mut WatcherState, log: &Log) {
+    match HashRemoved::decode_log_data(&log.inner.data) {
+        Ok(event) => {
+            let hash = Hash::from_bytes(event.hash.0);
+            state.remove_entry(event.region, hash);
+            debug!(
+                region = %event.region,
+                %hash,
+                "blacklist entry removed on-chain (local eviction stays sticky)"
+            );
+        }
+        Err(err) => warn!(err = %err, "blacklist watcher: undecodable HashRemoved log"),
+    }
+}
+
+/// Evict `hash` if in scope. Returns `true` iff an eviction was performed.
+/// Out-of-scope/suspended (`Some(false)`) and RPC-error (`None`) hashes keep
+/// their `known` entries for the next re-scope (callers insert before calling);
+/// evicted hashes drop *all* their regional entries — eviction is sticky and
+/// region-independent.
 async fn recheck<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
@@ -398,14 +453,13 @@ where
     P: Provider + Clone,
 {
     if cache.is_evicted(hash) {
-        state.known.remove(&hash);
+        state.drop_hash(hash);
         return false;
     }
-    state.known.insert(hash);
     match scope_check(contract, operator, hash).await {
         Some(true) => {
             if evict(cache, hash).await {
-                state.known.remove(&hash);
+                state.drop_hash(hash);
                 true
             } else {
                 false
@@ -531,5 +585,79 @@ async fn sleep_or_cancel(dur: Duration, shutdown: &CancellationToken) -> bool {
     tokio::select! {
         () = shutdown.cancelled() => true,
         () = tokio::time::sleep(dur) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const US: B256 = B256::repeat_byte(0x01);
+    const FR: B256 = B256::repeat_byte(0x02);
+
+    fn state() -> WatcherState {
+        WatcherState {
+            checkpoint: 0,
+            known: HashSet::new(),
+        }
+    }
+
+    /// Removing one region's entry must not drop a surviving same-hash entry
+    /// in another region — otherwise a later `updateRegion` into the surviving
+    /// region (which emits no blacklist event) would never lead to eviction.
+    #[test]
+    fn remove_entry_is_region_scoped() {
+        let hash = Hash::from_bytes([0xAB; 32]);
+        let mut state = state();
+        state.add_entry(US, hash);
+        state.add_entry(FR, hash);
+
+        state.remove_entry(FR, hash);
+
+        assert!(!state.known.contains(&(FR, hash)));
+        assert!(state.known.contains(&(US, hash)), "US entry must survive");
+        assert_eq!(state.distinct_hashes(), vec![hash]);
+    }
+
+    #[test]
+    fn remove_entry_drops_last_entry_for_hash() {
+        let hash = Hash::from_bytes([0xCD; 32]);
+        let mut state = state();
+        state.add_entry(US, hash);
+
+        state.remove_entry(US, hash);
+
+        assert!(state.known.is_empty());
+        assert!(state.distinct_hashes().is_empty());
+    }
+
+    /// Local eviction is sticky and region-independent, so it clears every
+    /// regional entry for the hash while leaving other hashes untouched.
+    #[test]
+    fn drop_hash_clears_all_regions_for_that_hash_only() {
+        let evicted = Hash::from_bytes([0xEE; 32]);
+        let retained = Hash::from_bytes([0x11; 32]);
+        let mut state = state();
+        state.add_entry(US, evicted);
+        state.add_entry(FR, evicted);
+        state.add_entry(FR, retained);
+
+        state.drop_hash(evicted);
+
+        assert!(!state.known.contains(&(US, evicted)));
+        assert!(!state.known.contains(&(FR, evicted)));
+        assert_eq!(state.distinct_hashes(), vec![retained]);
+    }
+
+    /// The scope view is per `(operator, hash)`, so re-scoping must issue one
+    /// check per distinct hash even when several regional entries share it.
+    #[test]
+    fn distinct_hashes_dedupes_across_regions() {
+        let hash = Hash::from_bytes([0x42; 32]);
+        let mut state = state();
+        state.add_entry(US, hash);
+        state.add_entry(FR, hash);
+
+        assert_eq!(state.distinct_hashes(), vec![hash]);
     }
 }
