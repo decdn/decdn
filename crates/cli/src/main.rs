@@ -53,5 +53,10 @@ async fn run() -> anyhow::Result<()> {
         Command::Publish(args) => {
             commands::publish::publish_dispatch(&args, config_path.as_deref()).await
         }
+        Command::Appeal(args) => match args.command {
+            cli::AppealCommand::Slash(slash) => {
+                commands::appeal::run(&slash, config_path.as_deref()).await
+            }
+        },
     }
 }

@@ -26,8 +26,10 @@ use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
 use crate::chain::ChainFixture;
 
-/// Fixed keystore password for the daemon's eth signer (test-only).
-const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
+/// Fixed keystore password for the daemon's eth signer (test-only). Public so a
+/// journey that drives the `decdn` CLI against this node's keystore can pass it
+/// via `DECDN_KEYSTORE_PASSWORD` (#1032).
+pub const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
 
 /// Kills the spawned `decdn-node` on drop so a panicking assertion never leaks
 /// the daemon process. The `Child` is behind a `Mutex` so [`NodeFixture::wait_healthy`]
@@ -65,9 +67,11 @@ pub struct NodeFixture {
     pub bind_port: u16,
     /// Loopback admin RPC base URL.
     pub admin_url: String,
-    /// Path to the daemon's config file (in the data dir), used to respawn the
-    /// daemon on [`NodeFixture::restart`] against the same state.
-    config_path: PathBuf,
+    /// Path to the rendered `node.toml` (in the data dir): used to respawn the
+    /// daemon on [`NodeFixture::restart`] against the same state, and public so
+    /// a journey can point the `decdn` CLI at the same `[blockchain]`
+    /// coordinates + keystore the daemon uses (#1032).
+    pub config_path: PathBuf,
 }
 
 impl NodeFixture {
@@ -209,11 +213,18 @@ impl NodeFixture {
         Ok((fixture, hashes))
     }
 
-    /// Kill the daemon and respawn it against the same data dir + config, then
-    /// wait until healthy. Proves persisted state (e.g. durable blacklist
-    /// eviction via `evicted.log`) survives a restart. Uses `&self`: the child
-    /// handle lives behind a `Mutex`, so the swap needs no exclusive borrow.
+    /// Restart the daemon in place: kill the current `decdn-node` subprocess and
+    /// respawn it against the same config + data dir (no re-onboarding — the
+    /// operator is already on-chain), then wait until healthy. Proves persisted
+    /// state (e.g. durable blacklist eviction via `evicted.log`) survives a
+    /// restart, and exercises the across-restart slash re-scan (#1032): the new
+    /// process rebuilds its in-memory slash store from the
+    /// `slash_judge_from_block` floor. Uses `&self`: the child handle lives
+    /// behind a `Mutex`, so the swap needs no exclusive borrow.
     pub async fn restart(&self) -> anyhow::Result<()> {
+        // Kill the old process and swap in the new one, holding the guard lock
+        // only briefly (never across an await). `wait()` reaps the old process
+        // so it has released its ports before the replacement binds them.
         {
             let mut child = self
                 .child
@@ -321,6 +332,7 @@ chain_id = {chain_id}
 payment_channel_address = "{payment_channel}"
 capacity_bond_address = "{capacity_bond}"
 slash_judge_address = "{slash_judge}"
+slash_appeal_address = "{slash_appeal}"
 content_blacklist_address = "{content_blacklist}"
 # Small so a scope transition with no on-chain event (region/ripening, appeal
 # reversal) is re-scoped within the test budget rather than the 10-min default.
@@ -357,6 +369,7 @@ metrics_bind = "127.0.0.1"
         payment_channel = a.payment_channel,
         capacity_bond = a.capacity_bond,
         slash_judge = a.slash_judge,
+        slash_appeal = a.slash_appeal,
         content_blacklist = a.content_blacklist,
         publisher_registry = a.publisher_registry,
         origin_assignment = a.origin_assignment,

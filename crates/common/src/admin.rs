@@ -439,6 +439,46 @@ pub struct ChannelsResponse {
     pub redeem_threshold_micro_usdc: u64,
 }
 
+/// One slash detected against this node's operator (`SlashJudge.Slashed`,
+/// #1032, G-NODE-05). Surfaced so an operator (or a keeper script) can notice a
+/// slash and file `decdn appeal slash` within the 30-day window without watching
+/// the chain directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashRecordDto {
+    /// The globally-monotonic on-chain `slashId` (`CapacityBond.slash`),
+    /// rendered as a decimal string — it is a `uint256` and can exceed `u64`.
+    /// This is the value passed to `decdn appeal slash <SLASH_ID>`.
+    pub slash_id: String,
+    /// Offense taxonomy index (ADR 014): `0` = Phantom, `1` = `RateManipulation`,
+    /// `2` = Blacklist. Kept numeric to avoid drift if the enum grows.
+    pub offense_type: u8,
+    /// Bond amount slashed, in TOKEN base units, as a decimal string (`uint256`).
+    pub amount: String,
+    /// `keccak256` evidence digest from the `Slashed` event (ADR 014),
+    /// `0x`-prefixed 32-byte hex.
+    pub evidence_hash: String,
+    /// Block number the `Slashed` log was mined in, or `None` if the log was
+    /// still pending when observed (rare; live logs carry a block number).
+    #[serde(default)]
+    pub block_number: Option<u64>,
+    /// **Nominal** appeal-window close (Unix seconds): the `Slashed` block
+    /// timestamp + 30 days, or `None` if the block read failed. This is a cheap
+    /// client-side hint, NOT read from the `CapacityBond` slash record, and it
+    /// ignores protocol-pause extensions — which only ever move the real
+    /// deadline *later* (`markAppealOpen` adds `pausedTotal`). Safe to file
+    /// before this; a keeper must not treat a just-past value as final.
+    #[serde(default)]
+    pub appeal_window_close: Option<u64>,
+}
+
+/// Snapshot of every slash the watcher has detected against this node's
+/// operator (#1032). Empty list when none — a clean operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashesResponse {
+    /// One entry per distinct detected `slashId`, most-recent first.
+    pub slashes: Vec<SlashRecordDto>,
+}
+
 /// Region-bucket key for traffic whose counterparty has no known region (#750).
 pub const UNKNOWN_REGION: &str = "UNKNOWN";
 
@@ -570,6 +610,12 @@ pub const CHANNEL_STORE_ERROR_CODE: i32 = -32_007;
 /// generic failure so an operator gets "no reputation to report on".
 pub const REPUTATION_UNAVAILABLE_CODE: i32 = -32_008;
 
+/// JSON-RPC error code: `admin_v1_slashes` was called on a node whose slash
+/// watcher is not wired (e.g. no `slash_judge_address`, or a test/CLI-only
+/// invocation). Benign config state, distinct from a generic failure so an
+/// operator gets "no slash detection on this node" rather than an opaque error.
+pub const SLASH_DETECTION_UNAVAILABLE_CODE: i32 = -32_009;
+
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
 /// within `v1`, a breaking change cuts over to `admin_v2_...`.
@@ -693,6 +739,16 @@ pub trait AdminRpc {
     /// [`REPUTATION_UNAVAILABLE_CODE`] when the reputation subsystem is not wired.
     #[method(name = "reputation")]
     async fn reputation(&self, req: ReputationRequest) -> RpcResult<ReputationResponse>;
+
+    /// Return every slash the node's watcher has detected against its own
+    /// operator (#1032, G-NODE-05): per slash the `slashId`, offense type,
+    /// amount, evidence digest, block, and the 30-day appeal-window close time.
+    /// Consumed directly by operators/keepers (no CLI subcommand wraps it) so
+    /// they notice a slash and file `decdn appeal slash` in time. Returns
+    /// [`SLASH_DETECTION_UNAVAILABLE_CODE`]
+    /// when the slash watcher is not wired on this node.
+    #[method(name = "slashes")]
+    async fn slashes(&self) -> RpcResult<SlashesResponse>;
 }
 
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].

@@ -104,6 +104,12 @@ pub struct ResolvedBlockchain {
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `slash_sig` signatures (ADR 014). Required (no default).
     pub slash_judge_address: String,
+    /// Scan floor for the slash-detection watcher (the `SlashJudge`
+    /// deployment block). Defaults to `0` (#1032). Every daemon start rescans
+    /// from this block (the in-memory detected-slash store must be rebuilt);
+    /// the in-process cursor only covers resubscribe gaps within one process
+    /// lifetime.
+    pub slash_judge_from_block: u64,
     /// `ContentBlacklist` contract address. `Some` only when the operator opts
     /// into the blacklist compliance watcher (ADR 011/031); `None` => no
     /// watcher, so blacklisted content is not locally evicted.

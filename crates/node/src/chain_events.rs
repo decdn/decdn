@@ -32,6 +32,17 @@ pub(crate) async fn watch_contract_events<P: Provider>(
     let filter = Filter::new()
         .address(address)
         .event_signature(signatures.into_iter().collect::<Vec<_>>());
+    watch_filter(provider, filter).await
+}
+
+/// Open a poller over an already-built [`Filter`] and yield individual logs.
+/// Use this when the caller needs indexed-topic constraints (e.g. a `topic2`
+/// operator filter) that [`watch_contract_events`] does not express — the same
+/// stream/error contract applies.
+pub(crate) async fn watch_filter<P: Provider>(
+    provider: &P,
+    filter: Filter,
+) -> anyhow::Result<impl Stream<Item = Log> + Unpin> {
     Ok(provider
         .watch_logs(&filter)
         .await?

@@ -33,3 +33,4 @@ pub mod reputation_indexer;
 pub mod reputation_wiring;
 pub mod runtime;
 pub mod selection;
+pub mod slash_watcher;

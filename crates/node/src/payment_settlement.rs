@@ -182,7 +182,11 @@ const fn ready_to_settle(now: u64, settle_after: u64) -> bool {
 /// `register_open_channel` is idempotent, so the only cost of the margin is a
 /// few extra blocks of `eth_getLogs`. Sized for the shallow reorgs of an
 /// Arbitrum-Sepolia-class L2.
-const REORG_MARGIN_BLOCKS: u64 = 128;
+///
+/// `pub(crate)` so the slash-detection watcher ([`crate::slash_watcher`],
+/// #1032) applies the same margin to its cursor resume rather than forking the
+/// sizing rationale.
+pub(crate) const REORG_MARGIN_BLOCKS: u64 = 128;
 
 /// Maximum block span scanned per `eth_getLogs` during the resume backfill
 /// (#751). A node down for a long time resumes from a checkpoint many thousands

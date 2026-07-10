@@ -52,7 +52,7 @@ use alloy::sol_types::SolValue;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_common::admin::{AdminRpcClient, EvictRequest};
-use decdn_e2e::bindings::{Erc20, ProbeMsg, SlashJudge};
+use decdn_e2e::bindings::{Erc20, SlashJudge, SlashJudgeBlacklist};
 use decdn_e2e::chain::{ChainFixture, region_key};
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
@@ -329,7 +329,7 @@ async fn drive_blacklist_slash(
     let hash_key = to_b256(hash);
     // Evidence timestamp: current chain time (µs), strictly after the entry's
     // `addedAt` and fresh enough to pass the staleness check.
-    let response_ts_us = chain.block_timestamp().await? * 1_000_000;
+    let response_ts_us = chain.head_timestamp().await? * 1_000_000;
 
     // The signed `slash_sig` — the production probe signer produces exactly the
     // EIP-712 digest `SlashJudge` verifies.
@@ -395,7 +395,7 @@ async fn drive_blacklist_slash(
     assert!(commit.status(), "commitChallenge reverted");
     time::increase_time(&chain.admin, 61).await?;
 
-    let response_data = ProbeMsg {
+    let response_data = SlashJudge::ProbeMsg {
         hash: hash_key,
         hasBlob: true,
         ratePerMb: RATE_PER_MB,
@@ -403,7 +403,7 @@ async fn drive_blacklist_slash(
     }
     .abi_encode();
     let node_id = B256::from_slice(node.node_id.as_bytes());
-    let receipt = judge_c
+    let receipt = SlashJudgeBlacklist::new(chain.addrs.slash_judge, &cp)
         .submitBlacklistChallenge(
             node.operator_addr,
             node_id,

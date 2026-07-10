@@ -60,6 +60,19 @@ alloy::sol! {
         function bindingNonce(address operator) external view returns (uint64);
         function registrationNonce(bytes32 nodeId) external view returns (uint64);
         function updateRegion(string newRegion) external;
+        function declareMbps(uint256 mbps) external;
+        function bondRequired(uint256 mbps) external view returns (uint256);
+        function activeBond(address operator) external view returns (uint256);
+        // Slash-appeal assertion reads (#1032, G-NODE-05). `slashedAtEpoch`
+        // is the ADR-036 vote-weight watermark cleared/recomputed on a granted
+        // appeal; `firstBondedAt` feeds the Governor age-ramp; `slashRecords`
+        // exposes the escrowed slash amount.
+        function slashedAtEpoch(address operator) external view returns (uint64);
+        function firstBondedAt(address operator) external view returns (uint64);
+        function slashRecords(uint256 slashId)
+            external
+            view
+            returns (address operator, uint64 slashedAt, uint256 slashAmount);
     }
 
     /// Buyer-side `openChannel` (omitted by the seller-only production binding)
@@ -101,21 +114,15 @@ alloy::sol! {
     }
 
     /// `SlashJudge.submitBlacklistChallenge` — the blacklist-violation slash
-    /// entry point (ADR 014 §Blacklist violation). The G-NODE-04 negative case
-    /// drives it with a signed post-window `ProbeResponse` to prove the on-chain
-    /// slashability of serving blacklisted content.
-    /// `ProbeResponse` fields SlashJudge `abi.decode`s from `responseData` (the
-    /// EIP-712 `ProbeResponse` type). Mirrors `decdn_incentive::ProbeSlashData`.
-    struct ProbeMsg {
-        bytes32 hash;
-        bool hasBlob;
-        uint64 ratePerMb;
-        uint64 timestampUs;
-    }
-
+    /// entry point (ADR 014 §Blacklist violation), absent from the re-exported
+    /// production `SlashJudge` binding below (the daemon never submits
+    /// challenges). Bound at the `SlashJudge` address; the G-NODE-04 negative
+    /// case drives it with a signed post-window `ProbeResponse` (the production
+    /// binding's `ProbeMsg` as `responseData`) to prove the on-chain
+    /// slashability of serving blacklisted content. `commitChallenge` /
+    /// `challengeBond` come from the production binding.
     #[sol(rpc)]
-    contract SlashJudge {
-        function commitChallenge(bytes32 commitment) external;
+    contract SlashJudgeBlacklist {
         function submitBlacklistChallenge(
             address challengedNode,
             bytes32 nodeId,
@@ -125,7 +132,6 @@ alloy::sol! {
             bool isStreamResponse,
             bytes32 salt
         ) external;
-        function challengeBond() external view returns (uint256);
     }
 
     /// OpenZeppelin `AccessControl` surface, bound at a governed contract's
@@ -136,4 +142,80 @@ alloy::sol! {
         function grantRole(bytes32 role, address account) external;
         function hasRole(bytes32 role, address account) external view returns (bool);
     }
+
+    /// `SlashAppeal` full lifecycle surface (ADR 028) the G-NODE-05 journey
+    /// drives: the operator files via `openSlashAppeal` (also exercised through
+    /// the `decdn appeal slash` CLI), the emergency multisig `fastTrackAppeal`s,
+    /// and the Governor `grantAppeal`s via a Timelock-executed proposal. The
+    /// production `decdn_incentive::slash_appeal` binding is operator-only; the
+    /// role-gated methods + status reads live here.
+    #[sol(rpc)]
+    contract SlashAppeal {
+        enum AppealStatus {
+            None,
+            Open,
+            FastTracked,
+            Resolved
+        }
+
+        struct Appeal {
+            address appellant;
+            address operator;
+            uint256 bond;
+            bytes32 evidenceBundleHash;
+            uint64 openedAt;
+            uint64 fastTrackedAt;
+            AppealStatus status;
+        }
+
+        function appealBond() external view returns (uint256);
+        function token() external view returns (address);
+        function lastAcceptedAppealAt(address operator) external view returns (uint64);
+        function getAppeal(uint256 slashId) external view returns (Appeal memory);
+        function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external;
+        function fastTrackAppeal(uint256 slashId) external;
+        function grantAppeal(uint256 slashId) external;
+    }
+
+    /// `DecdnGovernor` proposal lifecycle (OZ Governor, timestamp clock) — the
+    /// G-NODE-05 grant runs propose → castVote → queue → execute, all against a
+    /// SlashAppeal.grantAppeal call executed by the Timelock.
+    #[sol(rpc)]
+    contract DecdnGovernor {
+        function propose(
+            address[] targets,
+            uint256[] values,
+            bytes[] calldatas,
+            string description
+        ) external returns (uint256 proposalId);
+        function castVote(uint256 proposalId, uint8 support) external returns (uint256 weight);
+        function queue(
+            address[] targets,
+            uint256[] values,
+            bytes[] calldatas,
+            bytes32 descriptionHash
+        ) external returns (uint256 proposalId);
+        function execute(
+            address[] targets,
+            uint256[] values,
+            bytes[] calldatas,
+            bytes32 descriptionHash
+        ) external payable returns (uint256 proposalId);
+        function state(uint256 proposalId) external view returns (uint8);
+        function votingDelay() external view returns (uint256);
+        function votingPeriod() external view returns (uint256);
+        function getVotes(address account, uint256 timepoint) external view returns (uint256);
+    }
+
+    /// `TimelockController` minimum delay — the G-NODE-05 grant must advance the
+    /// chain clock past this between `queue` and `execute`.
+    #[sol(rpc)]
+    contract TimelockController {
+        function getMinDelay() external view returns (uint256);
+    }
 }
+
+// Reuse the production `SlashJudge` binding (commit/reveal + `Slashed` + the
+// `ProbeMsg`/`StreamMsg` evidence structs) rather than re-declaring it — the
+// same ABI the daemon slash watcher decodes.
+pub use decdn_incentive::slash_judge::SlashJudge;

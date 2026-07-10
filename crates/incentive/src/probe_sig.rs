@@ -124,6 +124,16 @@ impl ProbeSlashData {
         (*self).to_sol().eip712_signing_hash(domain)
     }
 
+    /// EIP-712 struct hash (`keccak256(abi.encode(PROBE_RESPONSE_TYPEHASH,
+    /// fields...))`), independent of any domain. This is the per-message hash
+    /// `SlashJudge` folds into its `evidenceHash` commit
+    /// (`keccak256(abi.encode(offense, probeStructHash, streamStructHash))`), so
+    /// a challenger reconstructs the commitment from it (#1032, G-NODE-05).
+    #[must_use]
+    pub fn struct_hash(&self) -> B256 {
+        (*self).to_sol().eip712_hash_struct()
+    }
+
     /// Sign the probe response with `signer` for the given EIP-712 `domain`,
     /// returning the 65-byte (`r‖s‖v`) signature for the wire `slash_sig`.
     ///

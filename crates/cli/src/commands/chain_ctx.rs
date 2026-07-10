@@ -36,6 +36,7 @@ struct FileBlockchain {
     eth_keystore: Option<PathBuf>,
     publisher_registry_address: Option<String>,
     origin_assignment_address: Option<String>,
+    slash_appeal_address: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -76,9 +77,15 @@ pub fn load_optional_config(config_path: Option<&Path>) -> anyhow::Result<FileCo
     }
 }
 
-/// Resolve the chain coordinates with flag > config > default precedence.
-/// Pure so the precedence is unit-testable.
-pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Resolved> {
+/// Resolve the `rpc_url` / `chain_id` / `data_dir` / `keystore` fields shared by
+/// every on-chain command with the same flag > config > default precedence.
+/// Kept separate so [`resolve`] and [`resolve_appeal`] can't drift on this
+/// chain. `expand_tilde` is applied to whichever explicit path wins (flag OR
+/// config); the `default_data_dir` fallback is already absolute.
+fn resolve_common(
+    chain: &cli::ChainArgs,
+    file: &FileConfig,
+) -> anyhow::Result<(String, u64, PathBuf, PathBuf)> {
     let bc = file.blockchain.as_ref();
     let rpc_url = chain
         .rpc_url
@@ -87,23 +94,10 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
         .ok_or_else(|| {
             anyhow::anyhow!("rpc_url not set (pass --rpc-url or set blockchain.rpc_url)")
         })?;
-    let capacity_bond_address = chain
-        .capacity_bond_address
-        .clone()
-        .or_else(|| bc.and_then(|b| b.capacity_bond_address.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "capacity_bond_address not set (pass --capacity-bond-address or set \
-                 blockchain.capacity_bond_address)"
-            )
-        })?;
     let chain_id = chain
         .chain_id
         .or_else(|| bc.and_then(|b| b.chain_id))
         .unwrap_or(DEFAULT_CHAIN_ID);
-    // `expand_tilde` is applied to whichever explicit value wins (flag OR
-    // config) — config-file paths get `~` expansion too, not just flags. The
-    // `default_data_dir` fallback is already absolute.
     let data_dir = chain
         .data_dir
         .clone()
@@ -121,10 +115,81 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
             || eth_identity::keystore_path(&data_dir),
             |p| expand_tilde(&p),
         );
+    Ok((rpc_url, chain_id, data_dir, keystore))
+}
+
+/// Resolve the chain coordinates with flag > config > default precedence.
+/// Pure so the precedence is unit-testable.
+pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Resolved> {
+    let bc = file.blockchain.as_ref();
+    // `resolve_common` first so `rpc_url` is the first missing-field reported
+    // (preserves the original error priority before the shared extraction).
+    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
+    let capacity_bond_address = chain
+        .capacity_bond_address
+        .clone()
+        .or_else(|| bc.and_then(|b| b.capacity_bond_address.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "capacity_bond_address not set (pass --capacity-bond-address or set \
+                 blockchain.capacity_bond_address)"
+            )
+        })?;
     Ok(Resolved {
         rpc_url,
         chain_id,
         capacity_bond_address,
+        keystore,
+        data_dir,
+    })
+}
+
+/// Coordinates for `decdn appeal slash`, resolved from flags > config >
+/// defaults. Requires `rpc_url` + `slash_appeal_address`; unlike [`Resolved`]
+/// it does *not* require `capacity_bond_address` (the appeal path doesn't touch
+/// `CapacityBond` directly).
+#[derive(Debug)]
+pub struct ResolvedAppeal {
+    pub rpc_url: String,
+    pub chain_id: u64,
+    pub slash_appeal_address: String,
+    pub keystore: PathBuf,
+    pub data_dir: PathBuf,
+}
+
+/// Resolve appeal-command coordinates. Pure so precedence is unit-testable.
+/// `slash_appeal_flag` is the command's `--slash-appeal-address` override.
+pub fn resolve_appeal(
+    chain: &cli::ChainArgs,
+    slash_appeal_flag: Option<&str>,
+    file: &FileConfig,
+) -> anyhow::Result<ResolvedAppeal> {
+    let bc = file.blockchain.as_ref();
+    let slash_appeal_address = slash_appeal_flag
+        .map(str::to_string)
+        .or_else(|| bc.and_then(|b| b.slash_appeal_address.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "slash_appeal_address not set (pass --slash-appeal-address or set \
+                 blockchain.slash_appeal_address)"
+            )
+        })?;
+    // Guard the *consumer*: a zero address parses fine but is never a real
+    // deployment (it would surface only as an opaque on-chain revert at appeal
+    // time). This is the sole validation site for the appeal address.
+    anyhow::ensure!(
+        slash_appeal_address
+            .trim_start_matches("0x")
+            .bytes()
+            .any(|b| b != b'0'),
+        "slash_appeal_address must not be the zero address — \
+         set it to the deployed SlashAppeal contract (ADR 028)"
+    );
+    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
+    Ok(ResolvedAppeal {
+        rpc_url,
+        chain_id,
+        slash_appeal_address,
         keystore,
         data_dir,
     })
@@ -278,6 +343,7 @@ mod tests {
             eth_keystore: None,
             publisher_registry_address: None,
             origin_assignment_address: None,
+            slash_appeal_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");
@@ -295,6 +361,7 @@ mod tests {
             eth_keystore: Some(PathBuf::from("/keys/ks.json")),
             publisher_registry_address: None,
             origin_assignment_address: None,
+            slash_appeal_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://config:8545");
@@ -314,6 +381,7 @@ mod tests {
             eth_keystore: None,
             publisher_registry_address: None,
             origin_assignment_address: None,
+            slash_appeal_address: None,
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.keystore, PathBuf::from("/tmp/decdn-test/keystore.json"));
@@ -347,6 +415,7 @@ mod tests {
             eth_keystore: None,
             publisher_registry_address: Some("0xCONFIG".to_string()),
             origin_assignment_address: Some("0xOA".to_string()),
+            slash_appeal_address: None,
         });
         let r = resolve_publish(&args, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");

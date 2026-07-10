@@ -132,6 +132,41 @@ fn align_range_rejects_len_past_end_but_accepts_exact_fit() -> anyhow::Result<()
 }
 
 #[test]
+fn align_range_empty_blob_serves_as_empty_whole() -> anyhow::Result<()> {
+    // A 0-byte blob is addressable only as the whole blob (offset 0, "to end").
+    // It aligns to an empty chunk-range set with a zero-byte wire form — the
+    // pre-bao path served it as empty bytes; the bao path must too (#1054).
+    let a = align_range(0, 0, 0)?;
+    anyhow::ensure!(
+        a.fetch_start() == 0 && a.fetch_end() == 0,
+        "empty blob has an empty fetch span, got [{}, {})",
+        a.fetch_start(),
+        a.fetch_end()
+    );
+    anyhow::ensure!(a.chunk_ranges().is_empty(), "no chunk groups for 0 bytes");
+    anyhow::ensure!(a.wire_len() == 0, "zero wire bytes, got {}", a.wire_len());
+    anyhow::ensure!(a.blob_size() == 0);
+    Ok(())
+}
+
+#[test]
+fn align_range_empty_blob_rejects_positive_offset_or_len() -> anyhow::Result<()> {
+    // Only (0, 0) is in bounds for a 0-byte blob; a positive offset or an
+    // explicit positive length is still out of bounds (no clamp, ADR 005).
+    let off = err_of(align_range(3, 0, 0))?;
+    anyhow::ensure!(
+        matches!(off, RangeVerifyError::RangeOutOfBounds { .. }),
+        "{off:?}"
+    );
+    let len = err_of(align_range(0, 5, 0))?;
+    anyhow::ensure!(
+        matches!(len, RangeVerifyError::RangeOutOfBounds { .. }),
+        "{len:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn encode_verified_range_roundtrips_for_honest_bytes() -> anyhow::Result<()> {
     let blob = make_blob(200 * 1024);
     let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
@@ -410,6 +445,27 @@ fn bao_encoded_size_whole_blob_1_5_mib_is_golden() -> anyhow::Result<()> {
     anyhow::ensure!(
         actual_wire == GOLDEN_WIRE,
         "actual emitted wire {actual_wire} != golden {GOLDEN_WIRE}"
+    );
+    Ok(())
+}
+
+#[test]
+fn bao_encoded_size_zero_blob_or_empty_ranges_is_zero() -> anyhow::Result<()> {
+    // A 0-byte blob (#1054) has no wire bytes for ANY requested range — including
+    // the universal `ChunkRanges::all()` the window-path helpers pass — and an
+    // empty range set encodes to nothing regardless of blob size. Both must
+    // short-circuit to 0 without walking (or mis-walking) a degenerate tree.
+    anyhow::ensure!(
+        bao_encoded_size(0, &bao_tree::ChunkRanges::all()) == 0,
+        "0-byte blob over all() ranges is 0 wire bytes"
+    );
+    anyhow::ensure!(
+        bao_encoded_size(0, &bao_tree::ChunkRanges::empty()) == 0,
+        "0-byte blob over empty ranges is 0 wire bytes"
+    );
+    anyhow::ensure!(
+        bao_encoded_size(200 * 1024, &bao_tree::ChunkRanges::empty()) == 0,
+        "empty range set over a non-empty blob is 0 wire bytes"
     );
     Ok(())
 }
