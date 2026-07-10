@@ -27,6 +27,9 @@
 
 // Reuse the production seller-path binding for the `Channel` struct + reads.
 pub use decdn_incentive::payment_channel::PaymentChannel;
+// Reuse the node-side ContentBlacklist binding (read view + membership events +
+// governance add/remove writes) — same ABI the runtime watcher decodes.
+pub use decdn_incentive::content_blacklist::ContentBlacklist;
 
 alloy::sol! {
     /// Mintable ERC-20 surface (mock USDC + the staking TOKEN). `mint` exists
@@ -56,6 +59,7 @@ alloy::sol! {
         function isActive(address operator) external view returns (bool);
         function bindingNonce(address operator) external view returns (uint64);
         function registrationNonce(bytes32 nodeId) external view returns (uint64);
+        function updateRegion(string newRegion) external;
         function declareMbps(uint256 mbps) external;
         function bondRequired(uint256 mbps) external view returns (uint256);
         function activeBond(address operator) external view returns (uint256);
@@ -107,6 +111,36 @@ alloy::sol! {
         function activateAssignment(uint256 namespaceId) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
+    }
+
+    /// `SlashJudge.submitBlacklistChallenge` — the blacklist-violation slash
+    /// entry point (ADR 014 §Blacklist violation), absent from the re-exported
+    /// production `SlashJudge` binding below (the daemon never submits
+    /// challenges). Bound at the `SlashJudge` address; the G-NODE-04 negative
+    /// case drives it with a signed post-window `ProbeResponse` (the production
+    /// binding's `ProbeMsg` as `responseData`) to prove the on-chain
+    /// slashability of serving blacklisted content. `commitChallenge` /
+    /// `challengeBond` come from the production binding.
+    #[sol(rpc)]
+    contract SlashJudgeBlacklist {
+        function submitBlacklistChallenge(
+            address challengedNode,
+            bytes32 nodeId,
+            bytes32 blobHash,
+            bytes responseData,
+            bytes slashSig,
+            bool isStreamResponse,
+            bytes32 salt
+        ) external;
+    }
+
+    /// OpenZeppelin `AccessControl` surface, bound at a governed contract's
+    /// address so the fixture can grant `REGIONAL_BODY_ROLE` (impersonating the
+    /// role admin) for the regional-blacklist journey.
+    #[sol(rpc)]
+    contract AccessControl {
+        function grantRole(bytes32 role, address account) external;
+        function hasRole(bytes32 role, address account) external view returns (bool);
     }
 
     /// `SlashAppeal` full lifecycle surface (ADR 028) the G-NODE-05 journey

@@ -29,6 +29,7 @@ pub mod channel;
 pub mod channel_open_error;
 pub mod client_bridge;
 pub mod client_reputation;
+pub mod content_blacklist;
 pub mod cooperative_close;
 pub mod erc20;
 pub mod eth_identity;

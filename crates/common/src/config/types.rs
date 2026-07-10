@@ -176,6 +176,26 @@ pub struct BlockchainConfig {
     /// denies unknown fields and a node's `node.toml` is shared with the CLI —
     /// but does not resolve or use it.
     pub slash_appeal_address: Option<String>,
+    /// `ContentBlacklist` contract address. Optional: when set, the node runs
+    /// the blacklist compliance watcher (ADR 011/031) — it evicts held blobs
+    /// whose hash is blacklisted in scope for this operator (global ∪ region),
+    /// which cascades to DHT-announce suppression, probe `has_blob:false`, and
+    /// delivery refusal. Unset => no watcher (serving a blacklisted hash after
+    /// its compliance window is then slashable with no local protection).
+    pub content_blacklist_address: Option<String>,
+    /// Block height at which the blacklist watcher begins its `HashBlacklisted`
+    /// log replay. SHOULD be the `ContentBlacklist` deployment block; absent =>
+    /// `0`, which is correct but scans the whole chain history (slow / RPC-heavy
+    /// on an established L2). Only consulted when `content_blacklist_address` is
+    /// set. Mirrors `origin_directory_from_block`.
+    pub content_blacklist_from_block: Option<u64>,
+    /// Seconds between the blacklist watcher's periodic replay + re-scope pass
+    /// (ADR 011 §Polling cadence). This backstop is what catches scope changes
+    /// with no `ContentBlacklist` event — an operator region/ripening transition
+    /// or an appeal reversal/lapse re-enabling a suspended entry. Absent =>
+    /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (600s). Only
+    /// consulted when `content_blacklist_address` is set.
+    pub content_blacklist_poll_interval_sec: Option<u64>,
     /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
     /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
     /// network target — matches the chain id bound on the runtime signer).

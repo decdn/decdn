@@ -10,18 +10,19 @@ publish = false
 # This crate is test-infrastructure only: it ships reusable fixtures (chain /
 # node / client / time-control / assertions) that compose a real anvil
 # deployment, subprocess daemon(s), and the paid client path. The fixtures live
-# in the library; the only test target is the feature-gated smoke test that
-# proves they compose. See `crates/node/tests/anvil_settlement_e2e.rs` for the
-# monolith this generalizes.
+# in the library; the test targets are feature-gated journeys built on them —
+# the smoke test that proves the fixtures compose, and the G-NODE-04 blacklist
+# compliance journeys (#1031). See `crates/node/tests/anvil_settlement_e2e.rs`
+# for the monolith this generalizes.
 [lib]
 doctest = false
 
 [features]
 default = []
-# Opt-in gate for the live anvil-backed smoke test (`tests/smoke.rs`). Mirrors
+# Opt-in gate for the live anvil-backed test targets (`tests/`). Mirrors
 # `decdn-node`'s `anvil-e2e` feature: off by default so `cargo nextest run`
 # stays fast and needs no `anvil`/`forge` binaries. The fixtures themselves
-# always compile; only the test that actually drives a chain is gated.
+# always compile; only the tests that actually drive a chain are gated.
 anvil-e2e = []
 
 [dependencies]

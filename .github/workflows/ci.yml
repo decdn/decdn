@@ -499,7 +499,16 @@ jobs:
     # Bound the job so a stalled in-test `forge script --broadcast` (issue #785)
     # fails red quickly instead of squatting the runner until GitHub's 6-hour
     # default — or masquerading as "cancelled" when a later push pre-empts it.
-    timeout-minutes: 15
+    # Sized ABOVE the sum of the sequential steps' worst-case in-test
+    # `OVERALL_TIMEOUT` ceilings, so a genuinely hung test hits its per-test
+    # timeout's clear message first rather than this opaque job-level kill (the
+    # #785 masking this bound exists to avoid): settlement 13m, then the
+    # cross-layer journeys at --test-threads 2 — 5 tests (smoke 13m + three
+    # G-NODE-04 at 10m + slash_appeal at 20m) whose worst 2-thread schedule is
+    # 43m (one thread draws smoke + all three G-NODE-04 while the other runs
+    # slash_appeal) — plus workspace compiles and the per-fixture in-test forge
+    # deploys.
+    timeout-minutes: 75
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||
@@ -542,6 +551,19 @@ jobs:
           tool: cargo-nextest
       - name: Run on-chain settlement e2e
         run: cargo nextest run -p decdn-node --features anvil-e2e --test anvil_settlement_e2e
+      # The cross-layer `decdn-e2e` fixtures spawn the built `decdn-node`
+      # binary, and the slash-appeal journey additionally shells out to the
+      # user CLI `decdn` (package `decdn-cli`), so both must exist on disk
+      # before the journeys run.
+      - name: Build daemon + CLI for cross-layer fixtures
+        run: cargo build -p decdn-node -p decdn-cli
+      # Cross-layer journeys (smoke + G-NODE-04 blacklist compliance, #1031 +
+      # G-NODE-05 slash appeal, #1032).
+      # --test-threads 2: each journey runs its own anvil + forge deploy +
+      # daemon(s); more at once oversubscribes the 4-core runner and turns
+      # poll-based assertions flaky, so cap concurrency at two.
+      - name: Run cross-layer e2e journeys
+        run: cargo nextest run -p decdn-e2e --features anvil-e2e --test-threads 2
 
   # ----- Solidity contracts ----------------------------------------------
   # The contracts pipeline mirrors the Rust split (one concern per job).
