@@ -503,11 +503,12 @@ jobs:
     # `OVERALL_TIMEOUT` ceilings, so a genuinely hung test hits its per-test
     # timeout's clear message first rather than this opaque job-level kill (the
     # #785 masking this bound exists to avoid): settlement 13m, then the
-    # cross-layer journeys at --test-threads 2 — 4 tests (smoke 13m + three
-    # G-NODE-04 at 10m each) whose worst 2-thread schedule is 30m (one thread
-    # draws all three 10m tests) — plus workspace compiles and the per-fixture
-    # in-test forge deploys.
-    timeout-minutes: 60
+    # cross-layer journeys at --test-threads 2 — 5 tests (smoke 13m + three
+    # G-NODE-04 at 10m + slash_appeal at 20m) whose worst 2-thread schedule is
+    # 43m (one thread draws smoke + all three G-NODE-04 while the other runs
+    # slash_appeal) — plus workspace compiles and the per-fixture in-test forge
+    # deploys.
+    timeout-minutes: 75
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||
@@ -551,12 +552,15 @@ jobs:
       - name: Run on-chain settlement e2e
         run: cargo nextest run -p decdn-node --features anvil-e2e --test anvil_settlement_e2e
       # The cross-layer `decdn-e2e` fixtures spawn the built `decdn-node`
-      # binary, so it must exist on disk before the journeys run.
-      - name: Build daemon for cross-layer fixtures
-        run: cargo build -p decdn-node
-      # Cross-layer journeys (smoke + G-NODE-04 blacklist compliance, #1031).
+      # binary, and the slash-appeal journey additionally shells out to the
+      # user CLI `decdn` (package `decdn-cli`), so both must exist on disk
+      # before the journeys run.
+      - name: Build daemon + CLI for cross-layer fixtures
+        run: cargo build -p decdn-node -p decdn-cli
+      # Cross-layer journeys (smoke + G-NODE-04 blacklist compliance, #1031 +
+      # G-NODE-05 slash appeal, #1032).
       # --test-threads 2: each journey runs its own anvil + forge deploy +
-      # daemon(s); four at once oversubscribes the 4-core runner and turns
+      # daemon(s); more at once oversubscribes the 4-core runner and turns
       # poll-based assertions flaky, so cap concurrency at two.
       - name: Run cross-layer e2e journeys
         run: cargo nextest run -p decdn-e2e --features anvil-e2e --test-threads 2
