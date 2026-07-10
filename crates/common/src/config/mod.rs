@@ -1029,6 +1029,10 @@ fn resolve_blockchain_into(
     let origin_directory_from_block = file
         .and_then(|b| b.origin_directory_from_block)
         .unwrap_or(0);
+    // Scan floor for the slash watcher (#1032). Every daemon start rescans
+    // from this block (the in-memory detected-slash store must be rebuilt), so
+    // setting it to the SlashJudge deploy block bounds every restart's scan.
+    let slash_judge_from_block = file.and_then(|b| b.slash_judge_from_block).unwrap_or(0);
 
     // Required like the other contract addresses: a wrong/zero
     // `verifyingContract` silently produces `slash_sig`s no verifier accepts
@@ -1059,6 +1063,11 @@ fn resolve_blockchain_into(
              set it to the deployed SlashJudge contract (ADR 014 §1)",
         );
     }
+
+    // `blockchain.slash_appeal_address` is accepted in the file (see
+    // `BlockchainConfig`) but consumed only by the `decdn appeal slash` CLI
+    // (via `chain_ctx::resolve_appeal`, which validates it) — the daemon does
+    // not resolve or use it, so there is nothing to resolve here.
 
     let chain_id = cli
         .chain_id
@@ -1190,6 +1199,7 @@ fn resolve_blockchain_into(
         publisher_registry_address,
         origin_directory_from_block,
         slash_judge_address,
+        slash_judge_from_block,
         chain_id,
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
@@ -2811,6 +2821,10 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
             "blockchain.publisher_registry_address",
         )?;
         expand_str(&mut b.slash_judge_address, "blockchain.slash_judge_address")?;
+        expand_str(
+            &mut b.slash_appeal_address,
+            "blockchain.slash_appeal_address",
+        )?;
     }
     if let Some(c) = cfg.cache.as_mut() {
         expand_path(&mut c.cache_dir, "cache.cache_dir")?;
@@ -3663,6 +3677,8 @@ mod tests {
                 origin_assignment_address: None,
                 publisher_registry_address: None,
                 slash_judge_address: Some("${HOME}/judge".to_string()),
+                slash_judge_from_block: None,
+                slash_appeal_address: None,
                 ..Default::default()
             }),
             ..Default::default()
@@ -7987,6 +8003,8 @@ mod tests {
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
@@ -8021,6 +8039,8 @@ mod tests {
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
@@ -8242,6 +8262,8 @@ mod tests {
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
@@ -8286,6 +8308,8 @@ mod tests {
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
@@ -8329,6 +8353,8 @@ mod tests {
             settlement_auto_threshold_micro_usdc: Some(0),
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
@@ -8372,6 +8398,8 @@ mod tests {
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: Some(0),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
@@ -8437,6 +8465,8 @@ mod tests {
             settlement_auto_threshold_micro_usdc: Some(50_000_000),
             settlement_auto_by_voucher_nonce_span: Some(1_000),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
@@ -8479,6 +8509,8 @@ mod tests {
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
@@ -8516,6 +8548,8 @@ mod tests {
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
@@ -8571,6 +8605,8 @@ mod tests {
         let file = types::BlockchainConfig {
             event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS - 1),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             ..Default::default()
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
@@ -8631,6 +8667,8 @@ mod tests {
         let at_min = types::BlockchainConfig {
             event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&at_min), dir.path())?;
@@ -8639,6 +8677,8 @@ mod tests {
         let in_range = types::BlockchainConfig {
             event_poll_interval_ms: Some(1000),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_from_block: None,
+            slash_appeal_address: None,
             ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&in_range), dir.path())?;

@@ -161,6 +161,21 @@ pub struct BlockchainConfig {
     /// verifier accepts, so resolution fails fast when it is missing rather
     /// than defaulting.
     pub slash_judge_address: Option<String>,
+    /// Block height at which the slash-detection watcher begins its
+    /// `SlashJudge.Slashed` log scan (#1032). SHOULD be the `SlashJudge`
+    /// deployment block; absent => `0`, which is correct but scans the entire
+    /// chain history (slow / RPC-heavy on an established L2). Every daemon
+    /// start rescans from this block — the detected-slash store is in-memory
+    /// and must be rebuilt — so this bounds the scan cost of *every* restart;
+    /// the watcher's in-process cursor only covers resubscribe gaps within one
+    /// process lifetime.
+    pub slash_judge_from_block: Option<u64>,
+    /// `SlashAppeal` contract address — the target for `decdn appeal slash`
+    /// (ADR 028). Consumed **only** by that CLI (via `chain_ctx::resolve_appeal`,
+    /// which validates it); the daemon accepts the key here — `[blockchain]`
+    /// denies unknown fields and a node's `node.toml` is shared with the CLI —
+    /// but does not resolve or use it.
+    pub slash_appeal_address: Option<String>,
     /// EIP-712 `chainId` bound into every `slash_sig` domain separator.
     /// Absent => [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial
     /// network target — matches the chain id bound on the runtime signer).

@@ -26,8 +26,10 @@ use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
 use crate::chain::ChainFixture;
 
-/// Fixed keystore password for the daemon's eth signer (test-only).
-const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
+/// Fixed keystore password for the daemon's eth signer (test-only). Public so a
+/// journey that drives the `decdn` CLI against this node's keystore can pass it
+/// via `DECDN_KEYSTORE_PASSWORD` (#1032).
+pub const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
 
 /// Kills the spawned `decdn-node` on drop so a panicking assertion never leaks
 /// the daemon process. The `Child` is behind a `Mutex` so [`NodeFixture::wait_healthy`]
@@ -65,6 +67,9 @@ pub struct NodeFixture {
     pub bind_port: u16,
     /// Loopback admin RPC base URL.
     pub admin_url: String,
+    /// Path to the rendered `node.toml`, so a journey can point the `decdn` CLI
+    /// at the same `[blockchain]` coordinates + keystore the daemon uses (#1032).
+    pub config_path: PathBuf,
 }
 
 impl NodeFixture {
@@ -184,12 +189,47 @@ impl NodeFixture {
             node_id,
             bind_port,
             admin_url: format!("http://127.0.0.1:{admin_port}"),
+            config_path,
         };
         fixture
             .wait_healthy(Duration::from_secs(30))
             .await
             .context("node never became healthy")?;
         Ok((fixture, hash))
+    }
+
+    /// Restart the daemon in place: kill the current `decdn-node` subprocess and
+    /// respawn it against the same config + data dir (no re-onboarding — the
+    /// operator is already on-chain), then wait until healthy. Exercises the
+    /// across-restart slash re-scan (#1032): the new process rebuilds its
+    /// in-memory slash store from the `slash_judge_from_block` floor.
+    pub async fn restart(&self) -> anyhow::Result<()> {
+        // Kill the old process and swap in the new one, holding the guard lock
+        // only briefly (never across an await). `wait()` reaps the old process
+        // so it has released its ports before the replacement binds them.
+        {
+            let mut child = self
+                .child
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = child.kill();
+            let _ = child.wait();
+            *child = std::process::Command::new(decdn_node_bin()?)
+                .arg("--config")
+                .arg(&self.config_path)
+                .arg("run")
+                .env("DECDN_KEYSTORE_PASSWORD", KEYSTORE_PASSWORD)
+                .env(
+                    "RUST_LOG",
+                    std::env::var("DECDN_NODE_LOG").unwrap_or_else(|_| "warn".into()),
+                )
+                .spawn()
+                .context("respawn decdn-node")?;
+        }
+        self.wait_healthy(Duration::from_secs(30))
+            .await
+            .context("node never became healthy after restart")
     }
 
     /// Build a loopback admin JSON-RPC client for this node.
@@ -284,6 +324,7 @@ chain_id = {chain_id}
 payment_channel_address = "{payment_channel}"
 capacity_bond_address = "{capacity_bond}"
 slash_judge_address = "{slash_judge}"
+slash_appeal_address = "{slash_appeal}"
 publisher_registry_address = "{publisher_registry}"
 origin_assignment_address = "{origin_assignment}"
 event_poll_interval_ms = 500
@@ -316,6 +357,7 @@ metrics_bind = "127.0.0.1"
         payment_channel = a.payment_channel,
         capacity_bond = a.capacity_bond,
         slash_judge = a.slash_judge,
+        slash_appeal = a.slash_appeal,
         publisher_registry = a.publisher_registry,
         origin_assignment = a.origin_assignment,
         cache_dir = c.cache_dir.display(),

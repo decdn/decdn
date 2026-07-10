@@ -5,6 +5,7 @@
 //! operations: generate a key, render or validate a config file, probe
 //! a remote node.
 
+pub mod appeal;
 pub mod bond;
 pub mod bundle;
 pub mod bundle_pull;

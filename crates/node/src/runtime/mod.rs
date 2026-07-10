@@ -704,6 +704,26 @@ pub async fn run(
         })?,
     );
 
+    // Slash-detection watcher (#1032, G-NODE-05): follow `SlashJudge.Slashed`
+    // for this operator so the slash surfaces over `admin_v1_slashes` (+ the
+    // `decdn_slashes_detected_total` metric) and the operator can file
+    // `decdn appeal slash` in time. Read-only; held to `run()`'s end so its
+    // background task lives as long as the daemon. `bootstrap` is infallible —
+    // every RPC (head read, `get_logs`, subscribe) happens inside the retrying
+    // loop, so a bring-up RPC blip retries with backoff rather than disabling
+    // detection for the daemon's lifetime.
+    let slash_watcher = crate::slash_watcher::SlashWatcher::bootstrap(
+        with_poll_interval(
+            ProviderBuilder::new().connect_http(rpc_url.clone()),
+            event_poll_interval,
+        ),
+        slash_judge_addr,
+        eth_signer.address(),
+        cfg.blockchain.slash_judge_from_block,
+        Arc::clone(&node_metrics),
+    );
+    let slash_store = slash_watcher.store();
+
     // NodeId → bonded operator address resolver for node-to-node pulls (#831).
     // Reads the same `CapacityBond` registration data as the staker set
     // (`getActiveNodes` / `NodeRegistered` carry `ethAddress`). Built only when
@@ -1691,6 +1711,11 @@ pub async fn run(
         .with_reputation(admin::ReputationStatusHandles {
             network: Arc::clone(&network_reputation),
             coverage: Arc::clone(&regional_coverage),
+        })
+        // Slash-detection introspection for `admin_v1_slashes` (#1032). Shares
+        // the in-memory store the watcher appends to — read-only here.
+        .with_slash_detection(admin::SlashStatusHandles {
+            store: Arc::clone(&slash_store),
         });
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
@@ -2939,6 +2964,7 @@ mod tests {
                 settlement_auto_threshold_micro_usdc: None,
                 settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
+                slash_judge_from_block: 0,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
             cache: decdn_common::config::ResolvedCache {
