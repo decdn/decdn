@@ -12,6 +12,12 @@
 //! and `UniswapV3Venue`'s `pool` field is `Option` so an unset pool degrades
 //! `spot_in` to `expected_in` (0 bps impact, gate stays inert) rather than
 //! fabricating a number.
+//!
+//! The `slot0` mid-price is fee-exclusive while `QuoterV2`'s `expected_in`
+//! includes the pool fee, so `spot_in` is grossed up by the fee tier
+//! ([`crate::swap_math::fee_inclusive_spot_in`]) before the gate compares them
+//! — otherwise the fee (e.g. 30 bps on a 0.3% pool) would read as phantom
+//! impact and eat the advisory budget before any real depth impact.
 
 // The `sol!`-generated bindings include macro-emitted code that uses
 // patterns workspace clippy denies (raw indexing, `unwrap` on infallible
@@ -69,7 +75,7 @@ use alloy::sol_types::SolCall;
 use anyhow::Context;
 
 use crate::erc20::Erc20;
-use crate::swap_math::max_in_with_slippage;
+use crate::swap_math::{fee_inclusive_spot_in, max_in_with_slippage};
 use crate::swap_venue::Quote;
 
 /// Build the `exactOutputSingle` params for a USDC→TOKEN exact-out swap.
@@ -221,7 +227,13 @@ impl UniswapV3Venue {
                     .await
                     .context("UniswapV3Pool.slot0 failed")?;
                 let usdc_is_token0 = self.usdc < self.token;
-                spot_in_from_sqrt(U256::from(slot0.sqrtPriceX96), amount_out, usdc_is_token0)
+                let mid =
+                    spot_in_from_sqrt(U256::from(slot0.sqrtPriceX96), amount_out, usdc_is_token0);
+                // `mid` is the fee-exclusive mid-price cost; `expected_in`
+                // includes the pool fee. Gross `mid` up by the fee so the
+                // mandatory fee tier isn't counted as price impact (see
+                // `fee_inclusive_spot_in`).
+                fee_inclusive_spot_in(mid, self.fee)
             }
             None => expected_in,
         };

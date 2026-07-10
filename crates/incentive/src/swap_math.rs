@@ -1,7 +1,7 @@
 //! Pure math for the USDC→TOKEN bond swap (#991). No I/O — all inputs are
 //! on-chain reads passed in by the caller, so every branch is unit-testable.
 
-use alloy::primitives::U256;
+use alloy::primitives::{U256, U512};
 
 /// TOKEN to acquire via swap: the bond shortfall minus TOKEN already held.
 /// Saturating, so an operator who already holds enough swaps nothing — this is
@@ -16,6 +16,30 @@ pub const fn swap_top_up(shortfall: U256, token_balance: U256) -> U256 {
 pub fn max_in_with_slippage(expected_in: U256, slippage_bps: u16) -> U256 {
     let num = U256::from(10_000u32) + U256::from(slippage_bps);
     expected_in * num / U256::from(10_000u32)
+}
+
+/// Gross a fee-exclusive spot amount-in up by the pool's swap fee, so the
+/// mandatory fee tier is not double-counted as price impact.
+///
+/// `spot_in` (from the pool's instantaneous mid-price) excludes the swap fee,
+/// while the quoter's `expected_in` includes it — comparing them directly makes
+/// the fee tier read as phantom impact (~30 bps on a 0.3% pool). Scaling
+/// `spot_in` by `1/(1 − fee)` gives the fee-inclusive fair cost at mid-price, so
+/// [`price_impact_bps`] against it measures depth impact alone.
+///
+/// `fee_pips` is the Uniswap V3 fee in millionths (e.g. `3000` = 0.3%). A `0`
+/// fee is the identity; a `fee_pips ≥ 1_000_000` (≥100%, unreachable for a real
+/// tier) can't be grossed up, so `spot_in` is returned unchanged. The multiply
+/// runs in `U512` and saturates on narrowing — `spot_in` is advisory only, so a
+/// saturated estimate never bounds real spend.
+pub fn fee_inclusive_spot_in(spot_in: U256, fee_pips: u32) -> U256 {
+    const SCALE: u32 = 1_000_000;
+    if fee_pips == 0 || fee_pips >= SCALE {
+        return spot_in;
+    }
+    let denom = SCALE - fee_pips;
+    let grossed = U512::from(spot_in).saturating_mul(U512::from(SCALE)) / U512::from(denom);
+    grossed.saturating_to::<U256>()
 }
 
 /// Execution price impact vs spot, in bps: `(expected_in − spot_in)/spot_in`.
@@ -75,5 +99,21 @@ mod tests {
         // exec at/below spot → 0
         assert_eq!(price_impact_bps(U256::from(100u64), U256::from(100u64)), 0);
         assert_eq!(price_impact_bps(U256::ZERO, U256::from(5u64)), 0); // guard div-by-zero
+    }
+
+    #[test]
+    fn fee_grossup_removes_fee_from_impact() {
+        // A 0.3% pool with a fee-inclusive quote exactly at mid-price + fee:
+        // fee-exclusive spot 1_000_000, expected_in = 1_000_000 / (1 − 0.003)
+        // ≈ 1_003_009. Raw impact reads ~30 bps (the fee); grossing spot up by
+        // the fee collapses it to ~0.
+        let spot = U256::from(1_000_000u64);
+        let expected = U256::from(1_003_009u64);
+        assert_eq!(price_impact_bps(spot, expected), 30);
+        let grossed = fee_inclusive_spot_in(spot, 3000);
+        assert!(price_impact_bps(grossed, expected) <= 1);
+        // zero fee and out-of-range fee are the identity
+        assert_eq!(fee_inclusive_spot_in(spot, 0), spot);
+        assert_eq!(fee_inclusive_spot_in(spot, 1_000_000), spot);
     }
 }

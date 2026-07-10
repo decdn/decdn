@@ -317,38 +317,75 @@ pub fn resolve_publish(
 /// usdc address are required and their absence errors here. The quoter is
 /// passed through as `Option` — only the Uniswap venue needs it (Balancer
 /// quotes through its router), so `from_config` enforces it per-venue.
+///
+/// Venue/address safety: if `--swap-venue` is passed and the config file names a
+/// *different* venue, the config's address fields describe that other venue —
+/// inheriting them would point the selected venue at foreign coordinates (e.g.
+/// approving USDC to the wrong router). In that case venue-specific addresses
+/// (router, quoter, both pool fields, fee tier) must come from flags; only the
+/// venue-agnostic `usdc_address` still falls back to config.
 pub fn resolve_swap(
     chain: &cli::ChainArgs,
     file: &FileConfig,
 ) -> anyhow::Result<Option<ResolvedSwap>> {
     let bc = file.blockchain.as_ref();
-    let pick = |flag: &Option<String>, cfg: fn(&FileBlockchain) -> Option<String>| {
-        flag.clone().or_else(|| bc.and_then(cfg))
-    };
+    let config_venue = bc.and_then(|b| b.swap_venue.clone());
     let venue = chain
         .swap_venue
         .map(|v| v.as_str().to_string())
-        .or_else(|| bc.and_then(|b| b.swap_venue.clone()));
+        .or_else(|| config_venue.clone());
     let Some(venue) = venue else { return Ok(None) };
-    let router = pick(&chain.swap_router_address, |b| {
+
+    // The venue is chosen by flag but the config names a different one, so the
+    // config's venue-specific coordinates belong to that other venue and must
+    // not be reused for the selected venue.
+    let venue_overrides_config =
+        chain.swap_venue.is_some() && config_venue.as_deref().is_some_and(|c| c != venue);
+
+    // Venue-agnostic: the USDC token is the same regardless of venue.
+    let pick = |flag: &Option<String>, cfg: fn(&FileBlockchain) -> Option<String>| {
+        flag.clone().or_else(|| bc.and_then(cfg))
+    };
+    // Venue-specific: flag-only when the flag overrides a different config venue.
+    let pick_venue = |flag: &Option<String>, cfg: fn(&FileBlockchain) -> Option<String>| {
+        if venue_overrides_config {
+            flag.clone()
+        } else {
+            flag.clone().or_else(|| bc.and_then(cfg))
+        }
+    };
+
+    let router = pick_venue(&chain.swap_router_address, |b| {
         b.swap_router_address.clone()
     })
-    .ok_or_else(|| anyhow::anyhow!("swap_router_address required for --swap-venue {venue}"))?;
-    let quoter = pick(&chain.swap_quoter_address, |b| {
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "swap_router_address required for --swap-venue {venue} (pass --swap-router-address; \
+                 the config file's address is for a different venue)"
+        )
+    })?;
+    let quoter = pick_venue(&chain.swap_quoter_address, |b| {
         b.swap_quoter_address.clone()
     });
     let usdc = pick(&chain.usdc_address, |b| b.usdc_address.clone())
         .ok_or_else(|| anyhow::anyhow!("usdc_address required for --swap-venue {venue}"))?;
+    let uniswap_fee_tier = if venue_overrides_config {
+        chain.swap_fee_tier
+    } else {
+        chain
+            .swap_fee_tier
+            .or_else(|| bc.and_then(|b| b.swap_fee_tier))
+    };
     Ok(Some(ResolvedSwap {
         venue,
         router,
         quoter,
         usdc,
-        uniswap_fee_tier: chain
-            .swap_fee_tier
-            .or_else(|| bc.and_then(|b| b.swap_fee_tier)),
-        balancer_pool_address: pick(&chain.swap_balancer_pool, |b| b.swap_balancer_pool.clone()),
-        pool: pick(&chain.swap_pool_address, |b| b.swap_pool_address.clone()),
+        uniswap_fee_tier,
+        balancer_pool_address: pick_venue(&chain.swap_balancer_pool, |b| {
+            b.swap_balancer_pool.clone()
+        }),
+        pool: pick_venue(&chain.swap_pool_address, |b| b.swap_pool_address.clone()),
     }))
 }
 
@@ -605,5 +642,74 @@ mod tests {
         });
         let s = resolve_swap(&chain, &file).unwrap().unwrap();
         assert_eq!(s.pool.as_deref(), Some("0xPOOLCONFIG"));
+    }
+
+    #[test]
+    fn resolve_swap_venue_override_rejects_config_router() {
+        // Config names balancer-v3 with a Balancer router; the operator forces
+        // --swap-venue uniswap-v3. The Balancer router must NOT be inherited for
+        // the Uniswap venue (that would approve USDC to the wrong contract) — a
+        // uniswap router flag is required instead.
+        let mut chain = empty_chain();
+        chain.swap_venue = Some(cli::SwapVenueArg::UniswapV3);
+        chain.usdc_address = Some("0xUSDC".into());
+        let file = file_with(FileBlockchain {
+            swap_venue: Some("balancer-v3".to_string()),
+            swap_router_address: Some("0xBALANCER_ROUTER".to_string()),
+            swap_balancer_pool: Some("0xBALPOOL".to_string()),
+            ..Default::default()
+        });
+        let err = resolve_swap(&chain, &file).unwrap_err().to_string();
+        assert!(
+            err.contains("swap_router_address required"),
+            "expected a router-required error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_swap_venue_override_uses_flag_addresses() {
+        // Same venue mismatch, but the operator supplies the Uniswap coordinates
+        // by flag — resolution succeeds and never picks up the config's Balancer
+        // router / pool.
+        let mut chain = empty_chain();
+        chain.swap_venue = Some(cli::SwapVenueArg::UniswapV3);
+        chain.swap_router_address = Some("0xUNI_ROUTER".into());
+        chain.swap_quoter_address = Some("0xUNI_QUOTER".into());
+        chain.usdc_address = Some("0xUSDC".into());
+        chain.swap_fee_tier = Some(3000);
+        let file = file_with(FileBlockchain {
+            swap_venue: Some("balancer-v3".to_string()),
+            swap_router_address: Some("0xBALANCER_ROUTER".to_string()),
+            swap_balancer_pool: Some("0xBALPOOL".to_string()),
+            swap_pool_address: Some("0xBAL_STALE_POOL".to_string()),
+            ..Default::default()
+        });
+        let s = resolve_swap(&chain, &file).unwrap().unwrap();
+        assert_eq!(s.venue, "uniswap-v3");
+        assert_eq!(s.router, "0xUNI_ROUTER");
+        // The config's Balancer-venue pool must not leak into the Uniswap venue.
+        assert!(s.pool.is_none());
+        assert!(s.balancer_pool_address.is_none());
+    }
+
+    #[test]
+    fn resolve_swap_matching_venue_still_inherits_config() {
+        // When the flag venue matches the config venue, the config's
+        // venue-specific addresses are still inherited (no mismatch).
+        let mut chain = empty_chain();
+        chain.swap_venue = Some(cli::SwapVenueArg::UniswapV3);
+        let file = file_with(FileBlockchain {
+            swap_venue: Some("uniswap-v3".to_string()),
+            swap_router_address: Some("0xUNI_ROUTER".to_string()),
+            swap_quoter_address: Some("0xUNI_QUOTER".to_string()),
+            usdc_address: Some("0xUSDC".to_string()),
+            swap_fee_tier: Some(500),
+            swap_pool_address: Some("0xUNI_POOL".to_string()),
+            ..Default::default()
+        });
+        let s = resolve_swap(&chain, &file).unwrap().unwrap();
+        assert_eq!(s.router, "0xUNI_ROUTER");
+        assert_eq!(s.pool.as_deref(), Some("0xUNI_POOL"));
+        assert_eq!(s.uniswap_fee_tier, Some(500));
     }
 }

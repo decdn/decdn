@@ -55,6 +55,20 @@ impl SwapVenue {
         }
     }
 
+    /// Estimated extra native-gas units this venue's swap sequence consumes,
+    /// on top of the bond-phase transactions — used to size `setup`'s
+    /// native-gas pre-flight. Over-estimates (the safe direction). Uniswap runs
+    /// approve + `exactOutputSingle` + reset; Balancer runs ERC20-approve +
+    /// Permit2-approve + swap + two allowance resets, so it needs more headroom.
+    pub const fn swap_gas_units(&self) -> u64 {
+        match self {
+            #[cfg(test)]
+            Self::Mock(_) => 0,
+            Self::UniswapV3(_) => 300_000,
+            Self::BalancerV3(_) => 450_000,
+        }
+    }
+
     /// Execute the exact-out swap; the venue performs its own approvals.
     pub async fn swap_exact_out(
         &self,
