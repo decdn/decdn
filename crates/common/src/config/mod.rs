@@ -1029,8 +1029,9 @@ fn resolve_blockchain_into(
     let origin_directory_from_block = file
         .and_then(|b| b.origin_directory_from_block)
         .unwrap_or(0);
-    // First-run scan floor for the slash watcher (#1032); restarts resume from
-    // the persisted checkpoint, so this only bounds the first-ever scan.
+    // Scan floor for the slash watcher (#1032). Every daemon start rescans
+    // from this block (the in-memory detected-slash store must be rebuilt), so
+    // setting it to the SlashJudge deploy block bounds every restart's scan.
     let slash_judge_from_block = file.and_then(|b| b.slash_judge_from_block).unwrap_or(0);
 
     // Required like the other contract addresses: a wrong/zero

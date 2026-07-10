@@ -743,8 +743,9 @@ pub trait AdminRpc {
     /// Return every slash the node's watcher has detected against its own
     /// operator (#1032, G-NODE-05): per slash the `slashId`, offense type,
     /// amount, evidence digest, block, and the 30-day appeal-window close time.
-    /// Backs `decdn node slashes` and lets an operator notice a slash and file
-    /// `decdn appeal slash` in time. Returns [`SLASH_DETECTION_UNAVAILABLE_CODE`]
+    /// Consumed directly by operators/keepers (no CLI subcommand wraps it) so
+    /// they notice a slash and file `decdn appeal slash` in time. Returns
+    /// [`SLASH_DETECTION_UNAVAILABLE_CODE`]
     /// when the slash watcher is not wired on this node.
     #[method(name = "slashes")]
     async fn slashes(&self) -> RpcResult<SlashesResponse>;

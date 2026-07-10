@@ -26,6 +26,9 @@
 //! - **Cursor across resubscribes.** Within one process, a cursor is carried
 //!   across every resubscribe (filter TTL expiry / RPC error), so an in-process
 //!   outage `[cursor, head]` window is recovered by the next cycle's backfill.
+//!   The resume rewinds the cursor by `REORG_MARGIN_BLOCKS` (shared with the
+//!   settlement watcher), so a shallow reorg during the backoff can't hide a
+//!   `Slashed` log re-mined at a slightly different height.
 //! - **Bounded backfill.** The scanned range is walked in
 //!   `MAX_BACKFILL_BLOCK_SPAN`-block windows (one `eth_getLogs` each) via the
 //!   shared `payment_settlement::backfill_windows`, so a single call never
@@ -48,7 +51,7 @@ use tracing::{debug, info, warn};
 
 use crate::chain_events::watch_filter;
 use crate::metrics::Metrics;
-use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, backfill_windows};
+use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, backfill_windows};
 
 /// Nominal appeal filing window (ADR 028: 30 days from the slash timestamp).
 const APPEAL_FILING_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
@@ -231,9 +234,11 @@ async fn run_once<P: Provider + Clone>(
         .context("read head block for slash backfill bound")?;
     // First cycle scans from the configured floor (rebuilding the in-memory
     // store from `from_block` on every process start, so a restart re-surfaces a
-    // slash mined while down); later cycles resume from the retained cursor so
-    // an in-process outage `[cursor, head]` window is recovered.
-    let from = cursor.unwrap_or(from_block).min(head);
+    // slash mined while down); later cycles resume from the retained cursor
+    // rewound by `REORG_MARGIN_BLOCKS`, so an in-process outage `[cursor, head]`
+    // window is recovered and a shallow reorg during the backoff can't hide a
+    // re-mined `Slashed` log (the `slashId` dedup makes the overlap free).
+    let from = resolve_scan_start(*cursor, from_block, head, REORG_MARGIN_BLOCKS);
     for (start, end) in backfill_windows(from, head, MAX_BACKFILL_BLOCK_SPAN) {
         let filter = operator_filter(slash_judge_addr, self_address)
             .from_block(start)
@@ -246,8 +251,9 @@ async fn run_once<P: Provider + Clone>(
             record_log(provider, self_address, store, metrics, &log).await;
         }
     }
-    // Persist progress: the next resubscribe backfills from here, covering any
-    // gap. `head + 1` never regresses (head only grows).
+    // Retain progress: the next resubscribe backfills from here (rewound by the
+    // reorg margin in `resolve_scan_start`), covering any gap. `head + 1` never
+    // regresses (head only grows).
     *cursor = Some(head + 1);
 
     // The cycle is established (filter installed, backfill drained), so clear
@@ -261,6 +267,31 @@ async fn run_once<P: Provider + Clone>(
     Ok(())
 }
 
+/// Resolve this cycle's backfill start. First cycle (`cursor == None`): the
+/// configured `from_block` floor, rebuilding the in-memory store on every
+/// process start. Later cycles: the retained cursor rewound by `margin` blocks,
+/// so a shallow reorg during the resubscribe backoff can't hide a `Slashed` log
+/// re-mined at a slightly different height — the `slashId` dedup makes the
+/// overlap free. Clamped to `>= from_block` (the contract does not exist below
+/// its deployment floor) and `<= head` (a cursor momentarily ahead of a lagging
+/// RPC head never inverts the `[start, head]` range). Pure so the policy is
+/// unit-testable without a live provider (mirrors
+/// `payment_settlement::resolve_backfill_start`).
+const fn resolve_scan_start(cursor: Option<u64>, from_block: u64, head: u64, margin: u64) -> u64 {
+    let start = match cursor {
+        Some(c) => {
+            let rewound = c.saturating_sub(margin);
+            if rewound > from_block {
+                rewound
+            } else {
+                from_block
+            }
+        }
+        None => from_block,
+    };
+    if start < head { start } else { head }
+}
+
 /// The address + `Slashed`-signature + `topic2 == operator` filter shared by the
 /// live subscription and every backfill window, so the RPC only ever returns
 /// this operator's slashes.
@@ -271,11 +302,32 @@ fn operator_filter(slash_judge_addr: Address, self_address: Address) -> Filter {
         .topic2(self_address.into_word())
 }
 
-/// Decode one `Slashed` log and record it. Skips reorged-out logs
-/// (`removed == true`, re-delivered by `eth_getFilterChanges` per the JSON-RPC
-/// spec) and undecodable logs, so neither tears down the cycle nor records a
-/// phantom slash. The `topic2` filter already constrains to this operator, but
-/// a defensive operator check guards against a provider that ignores the topic.
+/// Decode one `Slashed` log, or `None` for a log that must not be recorded:
+/// reorged-out (`removed == true`, re-delivered by `eth_getFilterChanges` per
+/// the JSON-RPC spec), undecodable, or another operator's. The `topic2` filter
+/// already constrains to this operator, but the defensive operator check guards
+/// against a provider that ignores the topic. Pure (no provider) so the skip
+/// policy is unit-testable.
+fn decode_slashed(
+    self_address: Address,
+    log: &alloy::rpc::types::Log,
+) -> Option<SlashJudge::Slashed> {
+    if log.removed {
+        debug!("skipping reorged-out (removed) Slashed log");
+        return None;
+    }
+    let Ok(event) = SlashJudge::Slashed::decode_log_data(&log.inner.data) else {
+        warn!("skipping undecodable Slashed log");
+        return None;
+    };
+    if event.operator != self_address {
+        return None;
+    }
+    Some(event)
+}
+
+/// Decode one `Slashed` log and record it. Skipped logs (see
+/// [`decode_slashed`]) neither tear down the cycle nor record a phantom slash.
 async fn record_log<P: Provider>(
     provider: &P,
     self_address: Address,
@@ -283,17 +335,9 @@ async fn record_log<P: Provider>(
     metrics: &Arc<Metrics>,
     log: &alloy::rpc::types::Log,
 ) {
-    if log.removed {
-        debug!("skipping reorged-out (removed) Slashed log");
-        return;
-    }
-    let Ok(event) = SlashJudge::Slashed::decode_log_data(&log.inner.data) else {
-        warn!("skipping undecodable Slashed log");
+    let Some(event) = decode_slashed(self_address, log) else {
         return;
     };
-    if event.operator != self_address {
-        return;
-    }
     let window_close = appeal_window_close(provider, log.block_number).await;
     record_slash(
         store,
@@ -345,4 +389,103 @@ fn record_slash(store: &SlashStore, metrics: &Arc<Metrics>, slash: DetectedSlash
     guard.push(slash);
     drop(guard);
     metrics.slash_detected();
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A `DetectedSlash` distinguished only by `slash_id` (the dedup key).
+    fn slash(id: u64) -> DetectedSlash {
+        DetectedSlash {
+            slash_id: U256::from(id),
+            offense_type: 0,
+            amount: U256::from(42u64),
+            evidence_hash: B256::repeat_byte(7),
+            block_number: Some(100),
+            appeal_window_close: None,
+        }
+    }
+
+    /// A well-formed `Slashed` RPC log for `operator`, with the `removed`
+    /// reorg flag under test control.
+    fn slashed_log(operator: Address, removed: bool) -> alloy::rpc::types::Log {
+        let event = SlashJudge::Slashed {
+            slashId: U256::from(1u64),
+            operator,
+            offenseType: SlashJudge::OffenseType::Phantom,
+            amount: U256::from(42u64),
+            evidenceHash: B256::repeat_byte(7),
+        };
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::repeat_byte(0xAA),
+                data: event.encode_log_data(),
+            },
+            removed,
+            ..Default::default()
+        }
+    }
+
+    /// Exact `<name> <value>` line match against the Prometheus text encoding,
+    /// so `..._total 1` can't accidentally match `..._total 10`.
+    fn has_metric_line(text: &str, name: &str, value: u64) -> bool {
+        let needle = format!("{name} {value}");
+        text.lines().any(|l| l.trim_end() == needle)
+    }
+
+    #[test]
+    fn record_slash_dedupes_by_slash_id() {
+        let store: SlashStore = Arc::new(RwLock::new(Vec::new()));
+        let metrics = Arc::new(Metrics::new());
+
+        // Backfill/live overlap re-delivers the same slashId: no double insert,
+        // no double count.
+        record_slash(&store, &metrics, slash(1));
+        record_slash(&store, &metrics, slash(1));
+        record_slash(&store, &metrics, slash(2));
+
+        let guard = store.read().unwrap();
+        assert_eq!(guard.len(), 2, "duplicate slashId must not double-insert");
+        assert!(guard.iter().any(|s| s.slash_id == U256::from(1u64)));
+        assert!(guard.iter().any(|s| s.slash_id == U256::from(2u64)));
+        drop(guard);
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_slashes_detected_total", 2),
+            "duplicate slashId must not double-count:\n{text}"
+        );
+    }
+
+    #[test]
+    fn decode_slashed_skips_removed_and_foreign_logs() {
+        let operator = Address::repeat_byte(0x11);
+
+        // The same log decodes when live but is skipped once reorged out
+        // (`removed == true`), so a reorg can't record a phantom slash.
+        assert!(decode_slashed(operator, &slashed_log(operator, false)).is_some());
+        assert!(decode_slashed(operator, &slashed_log(operator, true)).is_none());
+        // Defensive operator check: another operator's slash is never recorded
+        // even if a provider ignores the `topic2` filter.
+        assert!(
+            decode_slashed(Address::repeat_byte(0x22), &slashed_log(operator, false)).is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_scan_start_applies_reorg_margin() {
+        // First cycle (no cursor): the configured floor, clamped to head.
+        assert_eq!(resolve_scan_start(None, 500, 2_000, 128), 500);
+        assert_eq!(resolve_scan_start(None, 5_000, 2_000, 128), 2_000);
+        // Resume: cursor rewound by the reorg margin.
+        assert_eq!(resolve_scan_start(Some(1_000), 0, 2_000, 128), 872);
+        // The rewind never drops below the deployment floor…
+        assert_eq!(resolve_scan_start(Some(1_000), 950, 2_000, 128), 950);
+        // …and saturates at 0 for an early cursor (no underflow).
+        assert_eq!(resolve_scan_start(Some(10), 0, 2_000, 128), 0);
+        // A cursor momentarily ahead of a lagging RPC head clamps to head
+        // (range never inverts).
+        assert_eq!(resolve_scan_start(Some(5_000), 0, 1_000, 128), 1_000);
+    }
 }

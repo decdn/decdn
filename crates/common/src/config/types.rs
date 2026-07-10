@@ -162,11 +162,13 @@ pub struct BlockchainConfig {
     /// than defaulting.
     pub slash_judge_address: Option<String>,
     /// Block height at which the slash-detection watcher begins its
-    /// `SlashJudge.Slashed` log scan on a first run (#1032). SHOULD be the
-    /// `SlashJudge` deployment block; absent => `0`, which is correct but scans
-    /// the entire chain history (slow / RPC-heavy on an established L2). Restarts
-    /// resume from the persisted checkpoint, so this only bounds the first-ever
-    /// scan.
+    /// `SlashJudge.Slashed` log scan (#1032). SHOULD be the `SlashJudge`
+    /// deployment block; absent => `0`, which is correct but scans the entire
+    /// chain history (slow / RPC-heavy on an established L2). Every daemon
+    /// start rescans from this block — the detected-slash store is in-memory
+    /// and must be rebuilt — so this bounds the scan cost of *every* restart;
+    /// the watcher's in-process cursor only covers resubscribe gaps within one
+    /// process lifetime.
     pub slash_judge_from_block: Option<u64>,
     /// `SlashAppeal` contract address — the target for `decdn appeal slash`
     /// (ADR 028). Consumed **only** by that CLI (via `chain_ctx::resolve_appeal`,
