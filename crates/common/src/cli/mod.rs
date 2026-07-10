@@ -6,6 +6,7 @@
 //! or starting any tasks. The daemon's own clap shell lives in
 //! `crates/node/src/main.rs` and is not part of this module.
 
+pub mod appeal;
 pub mod bundle;
 pub mod channel;
 pub mod common;
@@ -18,6 +19,7 @@ pub mod publish;
 pub mod run;
 pub mod setup;
 
+pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
 pub use channel::{ChannelArgs, ChannelCommand, CoopCloseArgs};
 pub use common::{ConfigPathSource, LogFormat, default_config_path, default_data_dir};
@@ -99,4 +101,6 @@ pub enum Command {
     /// Publisher control plane: create namespaces, claim content hashes, and
     /// propose authorized-origin operator sets on-chain (issue #1029).
     Publish(PublishArgs),
+    /// File a slash appeal, posting the appeal bond (ADR 028).
+    Appeal(AppealArgs),
 }

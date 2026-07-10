@@ -242,6 +242,88 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     Ok(())
 }
 
+/// Regression for #1054: a 0-byte blob delivers end-to-end over `cdn/client/v1`.
+/// The serve emits no `ChunkData` and no voucher (0 wire bytes), the requester
+/// proves the empty stream against the empty root `Hash::new(&[])` and returns
+/// empty bytes, and the channel does NOT advance (nonce 0, 0 bytes delivered).
+/// Before the fix, `align_range(0, 0, 0)` rejected the whole-empty serve/receive
+/// with `RangeOutOfBounds`.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_delivers_empty_blob() -> anyhow::Result<()> {
+    // Empty payload → `hash` is the empty root `blake3::hash(&[])` by construction.
+    let payload: Vec<u8> = Vec::new();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let ctx = channel_context(Arc::clone(&client_signer), deposit);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    anyhow::ensure!(got.as_ref().is_empty(), "empty blob delivers empty bytes");
+
+    // No wire bytes → no voucher → the channel stays at its registered state.
+    let persisted = store.load_all()?;
+    let only = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
+    anyhow::ensure!(
+        only.last_nonce() == U256::ZERO,
+        "no voucher for a 0-byte blob, nonce: {}",
+        only.last_nonce()
+    );
+    anyhow::ensure!(
+        only.last_bytes_delivered() == U256::ZERO,
+        "0 bytes delivered, got {}",
+        only.last_bytes_delivered()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// Watermark-on-error contract (#852) on the `stream_fetch_tracked` path: when a
 /// pull errors mid-stream *after* at least one voucher was acked, `progress` must
 /// still hold the last acked watermark so the caller can persist what it paid —

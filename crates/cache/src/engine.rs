@@ -2085,6 +2085,23 @@ impl CacheEngine {
             CacheError::Store(anyhow::Error::from(e).context("export_bao_range: range alignment"))
         })?;
 
+        // A 0-byte blob (#1054) has no chunk groups and no proof: the header-less
+        // wire form is empty. Return it directly rather than driving an empty
+        // `export_bao` stream, whose terminal `Done` we would otherwise depend on
+        // to clear the `!done` guard. Still confirm presence first: the documented
+        // contract errors on an absent blob, the non-empty path below faults on
+        // `export_bao` for a missing hash, and `has` honors a logical eviction
+        // (#279) — so a present-only early return keeps behavior consistent and
+        // never serves an empty body for a hash this node has taken down.
+        if blob_size == 0 {
+            if !self.has(hash).await? {
+                return Err(CacheError::Store(anyhow::anyhow!(
+                    "export_bao_range: blob {hash} not present"
+                )));
+            }
+            return Ok(Bytes::new());
+        }
+
         // Pre-size to the exact wire length (proof + data) so the buffer never
         // reallocates; `wire_len` walks the same node set the export stream emits.
         let cap = usize::try_from(aligned.wire_len()).unwrap_or(0);
@@ -3661,6 +3678,58 @@ mod tests {
         anyhow::ensure!(
             !engine.has(wanted).await?,
             "mismatched bytes must not be promoted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tee_sink_empty_blob_commits_and_promotes() -> anyhow::Result<()> {
+        // A 0-byte blob teed through the window path (#1054): `content_size` 0 and
+        // zero wire bytes. `finish` must promote the empty blob under the empty
+        // root `Hash::new(&[])` — the window-forward loop's finalize on a size-0
+        // reservation.
+        let tmp = tempfile::tempdir()?;
+        let empty: Vec<u8> = Vec::new();
+        let hash = Hash::new(&empty);
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+
+        let sink = owner(engine.open_tee_sink(hash))?.begin(0);
+        // No writes: the empty blob has no chunk group. `finish` drops the feeder,
+        // closing the stream with no data.
+        sink.finish().await?;
+
+        anyhow::ensure!(
+            engine.has(hash).await?,
+            "empty blob must be present after finish"
+        );
+        let got = engine.get(hash).await?;
+        anyhow::ensure!(got.as_ref().is_empty(), "served empty bytes");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tee_sink_empty_claim_for_nonempty_hash_does_not_promote() -> anyhow::Result<()> {
+        // A lying upstream that claims `content_size == 0` (feeds nothing) for a
+        // NON-empty requested hash must NOT promote: the empty root must be proven,
+        // never accepted for an arbitrary hash (#1054, the tee's fail-closed leg).
+        let tmp = tempfile::tempdir()?;
+        let genuine: Vec<u8> = (0..200_000u32)
+            .map(|i| u8::try_from(i % 256).unwrap_or(0))
+            .collect();
+        let wanted = Hash::new(&genuine);
+        let empty: Vec<u8> = Vec::new();
+        anyhow::ensure!(Hash::new(&empty) != wanted, "fixtures must differ");
+
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+        let sink = owner(engine.open_tee_sink(wanted))?.begin(0);
+        let res = sink.finish().await;
+        anyhow::ensure!(
+            res.is_err(),
+            "an empty feed for a non-empty hash must fail closed, got Ok"
+        );
+        anyhow::ensure!(
+            !engine.has(wanted).await?,
+            "an empty feed for a non-empty hash must not be promoted"
         );
         Ok(())
     }

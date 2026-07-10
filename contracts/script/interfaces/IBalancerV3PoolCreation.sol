@@ -3,17 +3,18 @@ pragma solidity 0.8.28;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @title Balancer V3 pool-creation + initialization surface (TEST-ONLY)
-/// @notice Minimal vendored interfaces used by `BuybackBurnerBalancerV3.swapburn.fork.t.sol`
-///         to stand up a real 80/20 TOKEN/USDC weighted pool on a live Balancer
-///         V3 fork (Ethereum Sepolia) so the swap+burn path can run against real
-///         weighted-pool math (issue #995).
-/// @dev    Deliberately NOT placed under `src/interfaces/` — production code
-///         never creates or seeds pools, so these signatures must not leak into
-///         the deployed surface. Signatures are vendored verbatim from
-///         balancer/balancer-v3-monorepo (`VaultTypes.sol`, `IRouter.sol`,
-///         `WeightedPoolFactory.sol`). Permit2 (`approve`) is reused from the
-///         production `src/interfaces/IPermit2.sol`, not redeclared here.
+/// @title Balancer V3 pool-creation + initialization surface (OFF-CHAIN-ONLY)
+/// @notice Minimal vendored interfaces for standing up and seeding a real 80/20
+///         TOKEN/USDC Balancer V3 weighted pool. Used by the genesis
+///         buyback-activation path in `BaseProtocolDeploy.s.sol` (which seeds the
+///         pool in-script when `BUYBACK_VENUE=balancer`) and by the live-Balancer
+///         fork tests.
+/// @dev    Deliberately NOT under `src/interfaces/` — the deployed contract surface
+///         never creates or seeds pools; only the deploy script and tests do.
+///         Signatures are vendored verbatim from balancer/balancer-v3-monorepo
+///         (`VaultTypes.sol`, `IRouter.sol`, `WeightedPoolFactory.sol`). Permit2
+///         (`approve`) is reused from the production `src/interfaces/IPermit2.sol`,
+///         not redeclared here.
 
 /// @notice `WeightedPoolFactory.create` + the `VaultTypes` structs it consumes.
 interface IBalancerV3WeightedPoolFactory {

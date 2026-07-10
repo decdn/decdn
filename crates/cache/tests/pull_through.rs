@@ -4495,3 +4495,79 @@ async fn export_bao_range_whole_blob_offset_zero() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A 0-byte blob served whole (`export_bao_range(hash, 0, 0, 0)`) must emit an
+/// empty header-less wire form, and re-importing it round-trips to empty bytes
+/// under the same content hash — the pre-bao empty delivery, preserved on the
+/// bao path (#1054). The empty root is `Hash::new(&[])`.
+#[tokio::test]
+async fn export_bao_range_empty_blob_round_trips() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use decdn_cache::range_pull::align_range;
+    use iroh_blobs::store::mem::MemStore;
+
+    let payload: Vec<u8> = Vec::new();
+    let hash = Hash::new(&payload);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    // Pull-through caches a 0-byte blob (BlobStatus::Complete { size: 0 }).
+    engine.get(hash).await?;
+
+    let wire = engine.export_bao_range(hash, 0, 0, 0).await?;
+    anyhow::ensure!(wire.is_empty(), "0-byte blob has an empty bao wire form");
+
+    let aligned = align_range(0, 0, 0)?;
+    // The combined encoding is the 8-byte LE size header (0) plus the (empty) wire.
+    let mut combined = 0u64.to_le_bytes().to_vec();
+    combined.extend_from_slice(&wire);
+    let store = MemStore::new();
+    store
+        .blobs()
+        .import_bao_bytes(hash, aligned.chunk_ranges().clone(), Bytes::from(combined))
+        .await?;
+    let got = store.blobs().get_bytes(hash).await?;
+    anyhow::ensure!(got.as_ref().is_empty(), "empty blob decodes to empty bytes");
+    Ok(())
+}
+
+/// `export_bao_range` on a 0-byte blob must honor a logical eviction (#279):
+/// after `evict`, the empty early-return must surface a `Store` error rather
+/// than keep serving an empty body (#1054 review). The empty blob is trivially
+/// "present" in the store, so — unlike a non-empty blob, which can be genuinely
+/// absent — eviction (not absence) is the only state that stops the empty serve,
+/// and only the added `has()` check (which honors the logical-eviction set)
+/// enforces it here. (On the non-empty path, `export_bao_range` itself has no
+/// eviction check: `export_bao` faults on a genuinely absent hash, and callers
+/// gate eviction before invoking it — see `handlers/client.rs`.)
+#[tokio::test]
+async fn export_bao_range_empty_blob_evicted_errors() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let engine = decdn_cache::CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
+    let empty: Vec<u8> = Vec::new();
+    let hash = Hash::new(&empty);
+    // The empty blob is trivially present; a whole serve succeeds.
+    anyhow::ensure!(engine.has(hash).await?, "empty blob is trivially present");
+    anyhow::ensure!(
+        engine.export_bao_range(hash, 0, 0, 0).await?.is_empty(),
+        "present empty blob serves empty"
+    );
+
+    // After eviction the node must stop serving it — including the empty body.
+    engine.evict(hash).await?;
+    anyhow::ensure!(!engine.has(hash).await?, "evicted blob reads as absent");
+    let err = engine
+        .export_bao_range(hash, 0, 0, 0)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected an error for an evicted empty blob"))?;
+    anyhow::ensure!(
+        matches!(err, decdn_cache::CacheError::Store(_)),
+        "evicted empty blob must surface a Store error, got {err:?}"
+    );
+    Ok(())
+}

@@ -400,6 +400,23 @@ pub struct DecdnMetrics {
     /// resubscribe), but a non-zero rate flags a struggling channel store or RPC.
     /// Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
+    /// Slashes detected against this node's operator by the slash watcher
+    /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
+    /// bring-up backfill and the live stream (#1032). A non-zero value means the
+    /// operator was slashed and should consider `decdn appeal slash` within the
+    /// 30-day window. Operator-visible name: `decdn_slashes_detected_total`.
+    pub slashes_detected: Counter,
+    /// `decdn_slash_watcher_restarts_total` (#1032): distinct drift windows the
+    /// slash-detection watcher has entered, bumped once on the edge into the
+    /// error/backoff state. Pairs with `slash_watcher_down_seconds` to tell one
+    /// long outage from repeated flapping. Mirrors `staker_set_watcher_restarts`.
+    pub slash_watcher_restarts: Counter,
+    /// `decdn_slash_watcher_down_seconds` (#1032): seconds the slash-detection
+    /// watcher has been stuck in its resubscribe/backoff loop (`0` on a healthy
+    /// cycle), recomputed at scrape from `slash_watcher_down_since`. Mirrors the
+    /// other chain watchers — since `admin_v1_slashes` is always wired, this is
+    /// the only signal that a wedged watcher could be silently missing slashes.
+    pub slash_watcher_down_seconds: Gauge,
     /// Channels the seller path proactively `closeChannel`d because an
     /// operator-configured auto-settlement trigger fired — the un-redeemed
     /// value or voucher count crossed its threshold (#742). Each close starts
@@ -944,6 +961,11 @@ pub struct Metrics {
     /// established. Backs the `origin_directory_watcher_down_seconds` gauge,
     /// recomputed at scrape time. Mirrors `staker_set_watcher_down_since`.
     origin_directory_watcher_down_since: Mutex<Option<Instant>>,
+    /// `Instant` the slash-detection watcher entered its current error/backoff
+    /// window (#1032). `None` whenever a cycle is established. Backs the
+    /// `slash_watcher_down_seconds` gauge, recomputed at scrape time. Mirrors
+    /// `staker_set_watcher_down_since`.
+    slash_watcher_down_since: Mutex<Option<Instant>>,
 }
 
 impl Default for Metrics {
@@ -976,6 +998,7 @@ impl Metrics {
             staker_set_watcher_down_since: Mutex::new(None),
             node_address_watcher_down_since: Mutex::new(None),
             origin_directory_watcher_down_since: Mutex::new(None),
+            slash_watcher_down_since: Mutex::new(None),
         }
     }
 
@@ -1307,6 +1330,35 @@ impl Metrics {
     /// #751). Pairs with the per-site `warn!` in `run_watcher_once`.
     pub fn watcher_persist_failure(&self) {
         self.decdn.watcher_persist_failures.inc();
+    }
+
+    /// A distinct slash against this node's operator was detected by the slash
+    /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).
+    pub fn slash_detected(&self) {
+        self.decdn.slashes_detected.inc();
+    }
+
+    /// The slash-detection watcher's cycle errored and the loop is about to back
+    /// off (#1032). Stamps `slash_watcher_down_since` (once per drift window) so
+    /// `slash_watcher_down_seconds` climbs until the next healthy cycle. Mirrors
+    /// [`Self::staker_set_watcher_backoff_started`]; a poisoned lock skips the
+    /// update (the gauge keeps climbing — the safe alerting direction).
+    pub fn slash_watcher_backoff_started(&self) {
+        if let Ok(mut down_since) = self.slash_watcher_down_since.lock()
+            && down_since.is_none()
+        {
+            *down_since = Some(Instant::now());
+            self.decdn.slash_watcher_restarts.inc();
+        }
+    }
+
+    /// Mark the slash-detection watcher cycle established (#1032): clear
+    /// `slash_watcher_down_since` so `slash_watcher_down_seconds` reads `0` for
+    /// the life of the cycle. Mirrors [`Self::staker_set_watcher_cycle_established`].
+    pub fn slash_watcher_cycle_established(&self) {
+        if let Ok(mut down_since) = self.slash_watcher_down_since.lock() {
+            *down_since = None;
+        }
     }
 
     /// The staker-set watcher's event stream terminated with an error and the
@@ -2006,6 +2058,17 @@ impl Metrics {
         self.decdn
             .origin_directory_watcher_down_seconds
             .set(origin_dir_down_seconds);
+
+        // Same recompute for the slash-detection watcher (#1032).
+        let slash_watcher_down_seconds = match self.slash_watcher_down_since.lock() {
+            Ok(down_since) => down_since
+                .map(|t| t.elapsed().as_secs())
+                .map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)),
+            Err(_) => i64::MAX,
+        };
+        self.decdn
+            .slash_watcher_down_seconds
+            .set(slash_watcher_down_seconds);
 
         let reg = self
             .registry
@@ -2780,6 +2843,47 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
             "down-seconds should reset to 0 once filters re-establish:\n{text}"
+        );
+    }
+
+    #[test]
+    fn slash_watcher_down_seconds_tracks_true_downtime() {
+        // Mirrors the staker-set guard for the slash watcher (#1032): the gauge
+        // measures downtime, not cycle age, so a long healthy cycle reads 0, a
+        // backoff window climbs, and re-establishing clears it.
+        let mut metrics = Metrics::new();
+        metrics.started_at = Instant::now()
+            .checked_sub(Duration::from_hours(1))
+            .unwrap_or_else(Instant::now);
+        metrics.slash_watcher_cycle_established();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_slash_watcher_down_seconds", 0),
+            "down-seconds must read 0 across a long healthy cycle:\n{text}"
+        );
+
+        metrics.slash_watcher_backoff_started();
+        if let Ok(mut down_since) = metrics.slash_watcher_down_since.lock() {
+            *down_since = Instant::now().checked_sub(Duration::from_secs(150));
+        }
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_slash_watcher_down_seconds", 150),
+            "down-seconds should climb to the downtime depth once in backoff:\n{text}"
+        );
+        // The restart counter bumps exactly once per drift window (edge-triggered).
+        metrics.slash_watcher_backoff_started();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_slash_watcher_restarts_total", 1),
+            "restarts must bump once per drift window, not per call:\n{text}"
+        );
+
+        metrics.slash_watcher_cycle_established();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_slash_watcher_down_seconds", 0),
+            "down-seconds should reset to 0 once the cycle re-establishes:\n{text}"
         );
     }
 
