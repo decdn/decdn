@@ -956,7 +956,12 @@ abstract contract BaseProtocolDeploy is Script {
                 amount0Min: 0,
                 amount1Min: 0,
                 recipient: address(d.timelock),
-                deadline: block.timestamp
+                // Buffer, not `block.timestamp`: under `forge script` the deadline is
+                // encoded during the execution phase, but the tx mines a later block
+                // (on-chain simulation / broadcast) whose timestamp would already be
+                // past a zero-margin deadline — `Transaction too old`. The seed has no
+                // slippage to guard (amounts-min are 0), so a wide window is safe.
+                deadline: block.timestamp + 1 hours
             })
         );
 
