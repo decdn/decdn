@@ -10073,4 +10073,54 @@ bind_port = 12345
         assert_eq!(resolved.max_tracked_per_ip, 0);
         assert_eq!(resolved.max_tracked_per_peer, 0);
     }
+
+    /// The shipped Arbitrum Sepolia sample config must stay in lockstep with the
+    /// live `FileConfig` schema: `deny_unknown_fields` means a renamed or removed
+    /// key would otherwise break every operator who copied it, and only surface
+    /// when they run the node. Parse it here, confirm the seeded chain id, and run
+    /// each contract address through the same EIP-55 check the resolver uses so a
+    /// bad-checksum paste is caught at CI time rather than on someone's node.
+    #[test]
+    fn arbitrum_sepolia_sample_config_matches_schema() -> anyhow::Result<()> {
+        const SAMPLE: &str = include_str!("../../../../examples/configs/arbitrum-sepolia.toml");
+
+        let cfg: FileConfig = toml::from_str(SAMPLE)
+            .context("examples/configs/arbitrum-sepolia.toml no longer matches FileConfig")?;
+
+        let chain = cfg
+            .blockchain
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("sample is missing the [blockchain] section"))?;
+        assert_eq!(
+            chain.chain_id,
+            Some(421_614),
+            "sample chain_id must be Arbitrum Sepolia"
+        );
+
+        // Every address present in the sample must pass the resolver's EIP-55 check
+        // (all-lowercase / bad-checksum values are rejected there, not at parse time).
+        for (field, addr) in [
+            ("payment_channel_address", &chain.payment_channel_address),
+            ("capacity_bond_address", &chain.capacity_bond_address),
+            ("slash_judge_address", &chain.slash_judge_address),
+            (
+                "origin_assignment_address",
+                &chain.origin_assignment_address,
+            ),
+            (
+                "publisher_registry_address",
+                &chain.publisher_registry_address,
+            ),
+            (
+                "content_blacklist_address",
+                &chain.content_blacklist_address,
+            ),
+            ("slash_appeal_address", &chain.slash_appeal_address),
+        ] {
+            if let Some(value) = addr {
+                parse_contract_address(field, value)?;
+            }
+        }
+        Ok(())
+    }
 }

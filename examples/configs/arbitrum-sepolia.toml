@@ -1,0 +1,77 @@
+# deCDN node configuration — Arbitrum Sepolia testnet (chain 421614)
+#
+# Copy this file, replace every value marked MUST-EDIT, then run:
+#   decdn-node run --config arbitrum-sepolia.toml
+#
+# The [blockchain] contract addresses are the on-chain v0.1.0 genesis deployment
+# recorded in contracts/deployments/421614.json. Values marked MUST-EDIT are
+# operator-specific and have no safe default — the node will not do what you want
+# until you set them. Everything else is a sensible testnet default you can tune.
+
+[identity]
+# MUST-EDIT — node data directory: holds the Ed25519 node key and the blob store.
+data_dir = "/var/lib/decdn"
+# ISO 3166-1 alpha-2 region you operate in. Sets the region scope for blacklist
+# compliance (enforced set is global ∪ this region). Omit if you have no region.
+region = "US"
+
+[network]
+# QUIC bind port for paid delivery (cdn/client/v1) and probing (cdn/probe/v1).
+bind_port = 4433
+# iroh relay URLs for NAT traversal. Omit to use the default n0-hosted discovery.
+# relay_urls = ["https://your-relay.example"]
+
+[blockchain]
+# MUST-EDIT — Arbitrum Sepolia JSON-RPC endpoint. The public endpoint below works
+# for light use; run your own or use a provider for production reliability.
+rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
+# MUST-EDIT — path to the operator's Ethereum keystore JSON (pays gas, signs
+# settlement + slash responses).
+eth_keystore = "/etc/decdn/eth-keystore.json"
+
+# EIP-712 chainId bound into slash-signature domain separators — Arbitrum Sepolia.
+chain_id = 421614
+
+# --- Contract addresses (v0.1.0 genesis deploy; see deployments/421614.json) ---
+
+# Required. Settlement gateway, operator bond, and the slash-signature verifying
+# contract. A wrong/missing slash_judge_address silently produces signatures no
+# verifier accepts, so resolution fails fast if it is absent.
+payment_channel_address = "0xb4bcA0AbF679212708164dCAb98eFa621Fa0F4d3"
+capacity_bond_address   = "0x2aF490628579c08DC6D0B013090cDC11D4d60Dd4"
+slash_judge_address     = "0x20abcCC80F595a586f4Bd906a1b00c4196416EB7"
+
+# Optional — chain-backed origin directory that gates DHT prefetch (ADR 022).
+# Set BOTH or NEITHER; unset => the directory is empty (deny-all) and prefetch
+# finds no authorized origins.
+origin_assignment_address  = "0x06b394f497481c33FB5ae164d5FbB0307299546c"
+publisher_registry_address = "0x32c811eA20326B911B518c2Cf38f9f172aC02e6c"
+
+# Optional — blacklist compliance watcher (ADR 011/031). When set, the node
+# evicts held blobs whose hash is blacklisted in your scope. Unset => no watcher
+# (serving a blacklisted hash past its compliance window is then slashable with
+# no local protection).
+content_blacklist_address = "0xd4b2b7CC768c14004dC3400743E2EDB0724355f3"
+
+# Optional — target for `decdn appeal slash` (ADR 028). Consumed by the CLI only;
+# the daemon accepts but ignores this key (node.toml is shared by both binaries).
+slash_appeal_address = "0x0D60c0AbffBb5D612B66DB6bDd0d741BB36072cF"
+
+# Log-replay start heights for the chain watchers. Set to the deploy block so a
+# node restart does not rescan the whole chain (all contracts were deployed in
+# the same broadcast). Absent => 0, which is correct but slow / RPC-heavy.
+origin_directory_from_block  = 11249862
+slash_judge_from_block       = 11249862
+content_blacklist_from_block = 11249862
+
+[cache]
+# MUST-EDIT — blob cache directory and size budget (MB).
+cache_dir     = "/var/cache/decdn"
+cache_size_mb = 10240
+
+# MUST-EDIT — origin backend the node pulls through on a cache miss. Pick ONE
+# kind: "http", "fs", or "s3". An HTTP origin is shown; for fs/s3 see the schema
+# docs in crates/common/src/config/types.rs (OriginConfig).
+[cache.origin]
+kind = "http"
+url  = "https://your-origin.example/"
