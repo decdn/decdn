@@ -1,0 +1,35 @@
+{
+  "chainId": 421614,
+  "config": {
+    "feeRouterEpochLength": 604800,
+    "feeRouterShares": [
+      6000,
+      3000,
+      1000
+    ],
+    "feeRouterWindowEpochs": 13,
+    "minBond": "50000000000000000000000",
+    "timelockDelay": 172800
+  },
+  "contracts": {
+    "BuybackBurner": "0x7c13A70e72fBa09275d8167d32b1C3e1F4A0C034",
+    "CapacityBond": "0x2aF490628579c08DC6D0B013090cDC11D4d60Dd4",
+    "ContentBlacklist": "0xd4b2b7CC768c14004dC3400743E2EDB0724355f3",
+    "DecdnGovernor": "0x689Bf4afa0E42f87f461D22Fc61F4b005bA3cfcF",
+    "Ed25519Verifier": "0xb07E5Aa034FbA4e46154a0De4b3ae305F3A5FA62",
+    "FeeRouter": "0xA195f2960a7818382c3e527512f2b99e12E8B1A4",
+    "OriginAssignment": "0x06b394f497481c33FB5ae164d5FbB0307299546c",
+    "PaymentChannel": "0xb4bcA0AbF679212708164dCAb98eFa621Fa0F4d3",
+    "PublisherRegistry": "0x32c811eA20326B911B518c2Cf38f9f172aC02e6c",
+    "SlashAppeal": "0x0D60c0AbffBb5D612B66DB6bDd0d741BB36072cF",
+    "SlashJudge": "0x20abcCC80F595a586f4Bd906a1b00c4196416EB7",
+    "TimelockController": "0x12F1fE3890A3Bd2884eB8F87C88D50382CCf2612",
+    "Token": "0x7489DddE12ea7EDC5E67E17ac78D019a562BC20D"
+  },
+  "deployBlock": 11249862,
+  "deployer": "0x54824572fd837897F4666127E8b90B8c1C62C09F",
+  "externalDeps": {
+    "emergencyMultisig": "0x54824572fd837897F4666127E8b90B8c1C62C09F",
+    "usdc": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"
+  }
+}
