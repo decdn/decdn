@@ -22,6 +22,28 @@ const DEFAULT_WAIT_POLL_MS: NonZeroU64 = match NonZeroU64::new(250) {
     None => unreachable!(),
 };
 
+/// Accepted `--swap-venue` values. A `ValueEnum` so clap rejects typos at
+/// parse time and `--help` lists the supported venues. The TOML config
+/// `swap_venue` string is validated later when the venue is constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SwapVenueArg {
+    #[value(name = "uniswap-v3")]
+    UniswapV3,
+    #[value(name = "balancer-v3")]
+    BalancerV3,
+}
+
+impl SwapVenueArg {
+    /// Canonical wire string consumed by `resolve_swap`/`from_config`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UniswapV3 => "uniswap-v3",
+            Self::BalancerV3 => "balancer-v3",
+        }
+    }
+}
+
 /// Operator-local admin commands that query a running deCDN node.
 #[derive(Args, Debug)]
 pub struct NodeArgs {
@@ -547,6 +569,37 @@ pub struct ChainArgs {
     /// Emit the result as JSON instead of human-readable `key=value` lines.
     #[arg(long)]
     pub json: bool,
+
+    /// DEX venue for `--pay-bond-with usdc`: `uniswap-v3` or `balancer-v3`.
+    #[arg(long = "swap-venue", value_enum)]
+    pub swap_venue: Option<SwapVenueArg>,
+
+    /// Exact-out swap router address (Uniswap `SwapRouter02` / Balancer `Router`).
+    #[arg(long = "swap-router-address", value_name = "ADDR")]
+    pub swap_router_address: Option<String>,
+
+    /// Quoter address (Uniswap `QuoterV2`; Balancer uses the router's query).
+    #[arg(long = "swap-quoter-address", value_name = "ADDR")]
+    pub swap_quoter_address: Option<String>,
+
+    /// USDC token address to spend on the swap.
+    #[arg(long = "usdc-address", value_name = "ADDR")]
+    pub usdc_address: Option<String>,
+
+    /// Uniswap V3 pool fee tier (e.g. 3000 = 0.3%). Uniswap venue only.
+    #[arg(long = "swap-fee-tier", value_name = "FEE")]
+    pub swap_fee_tier: Option<u32>,
+
+    /// Balancer V3 pool address (Balancer V3 addresses pools directly, not by
+    /// bytes32 id). Balancer venue only.
+    #[arg(long = "swap-balancer-pool", value_name = "ADDR")]
+    pub swap_balancer_pool: Option<String>,
+
+    /// Uniswap V3 TOKEN/USDC pool address, used for the price-impact `slot0`
+    /// read that enables the advisory price-impact warning. Uniswap venue only
+    /// (distinct from `--swap-balancer-pool`).
+    #[arg(long = "swap-pool-address", value_name = "ADDR")]
+    pub swap_pool_address: Option<String>,
 }
 
 /// `decdn node register` — submit `CapacityBond.registerNode` (ADR 019

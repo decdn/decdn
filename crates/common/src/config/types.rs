@@ -251,6 +251,37 @@ pub struct BlockchainConfig {
     /// (logical OR). Absent => disabled (`None`); a configured value of `0` is
     /// rejected at resolution.
     pub settlement_auto_by_voucher_nonce_span: Option<u64>,
+    /// USDC bond-funding swap venue for `decdn setup --pay-bond-with usdc`
+    /// (#991). One of `uniswap-v3` / `balancer-v3`. Absent => no swap (the
+    /// operator funds the bond in TOKEN directly). Consumed only by the CLI
+    /// `setup`/`bond` path (see `cli::commands::chain_ctx`), not the node
+    /// runtime — declared here so a config that drives `setup` also passes
+    /// `decdn config validate` under this section's `deny_unknown_fields`.
+    pub swap_venue: Option<String>,
+    /// Swap router contract address for the configured `swap_venue` (#991).
+    /// Uniswap `SwapRouter02` or the Balancer V3 `Router`. Required by the CLI
+    /// when `swap_venue` is set; CLI-consumed only (see [`Self::swap_venue`]).
+    pub swap_router_address: Option<String>,
+    /// Uniswap `QuoterV2` contract address (#991). Only the Uniswap venue needs
+    /// it — Balancer quotes through its own router — so it is optional even when
+    /// `swap_venue` is set. CLI-consumed only (see [`Self::swap_venue`]).
+    pub swap_quoter_address: Option<String>,
+    /// USDC token contract address the swap spends (#991). Required by the CLI
+    /// when `swap_venue` is set; CLI-consumed only (see [`Self::swap_venue`]).
+    pub usdc_address: Option<String>,
+    /// Uniswap V3 pool fee tier (e.g. `500`/`3000`/`10000`) for the swap (#991).
+    /// Only meaningful for the Uniswap venue. CLI-consumed only (see
+    /// [`Self::swap_venue`]).
+    pub swap_fee_tier: Option<u32>,
+    /// Balancer V3 pool contract address for the swap (#991). Only meaningful
+    /// for the Balancer venue (V3 pools are addressed directly). CLI-consumed
+    /// only (see [`Self::swap_venue`]).
+    pub swap_balancer_pool: Option<String>,
+    /// Uniswap V3 TOKEN/USDC pool address for the advisory price-impact check
+    /// (#991). Optional even for the Uniswap venue — unset degrades the spot
+    /// read to the quoter's expected-in (the price-impact gate stays inert).
+    /// CLI-consumed only (see [`Self::swap_venue`]).
+    pub swap_pool_address: Option<String>,
 }
 
 /// Cache section of the config file.

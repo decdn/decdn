@@ -44,6 +44,10 @@ pub mod slash_appeal;
 pub mod slash_judge;
 pub mod store;
 pub mod stream_sig;
+pub mod swap_balancer;
+pub mod swap_math;
+pub mod swap_uniswap;
+pub mod swap_venue;
 pub mod voucher;
 pub mod voucher_activity;
 
@@ -77,6 +81,10 @@ pub use store::{
     PendingSettleStore, StoreError, WatcherCheckpointStore,
 };
 pub use stream_sig::{StreamSlashData, StreamSlashError};
+pub use swap_balancer::BalancerV3Venue;
+pub use swap_math::{max_in_with_slippage, price_impact_bps, swap_top_up};
+pub use swap_uniswap::UniswapV3Venue;
+pub use swap_venue::{Quote, ResolvedSwap, SwapVenue, from_config};
 pub use voucher::{
     DOMAIN_NAME, DOMAIN_VERSION, SignedVoucher, Voucher, VoucherError, voucher_domain,
 };

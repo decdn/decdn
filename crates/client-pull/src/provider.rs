@@ -22,10 +22,15 @@ use anyhow::Context;
 /// error: an `rpc_url` secret commonly lives in the path/query, which userinfo
 /// redaction wouldn't scrub, so the value is hidden entirely (matching
 /// `config validate`'s `<redacted> (N chars)`).
+// `use<>` pins the returned provider to capture *no* input lifetimes: it owns
+// a clone of `signer` and the parsed URL, so it is genuinely `'static`. Without
+// the precise-capturing bound, Rust 2024's RPIT rules over-capture `&signer`,
+// which would stop callers (e.g. `setup`'s USDC swap venue) from handing the
+// provider to APIs that need `P: 'static` (`DynProvider::erased`).
 pub fn build_provider(
     rpc_url: &str,
     signer: &PrivateKeySigner,
-) -> anyhow::Result<impl Provider + Clone> {
+) -> anyhow::Result<impl Provider + Clone + use<>> {
     Ok(ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_http(rpc_url.parse().with_context(|| {

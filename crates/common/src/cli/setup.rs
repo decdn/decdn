@@ -10,6 +10,15 @@ use clap::Args;
 
 use super::node::ChainArgs;
 
+/// Bond funding source for `decdn setup`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum PayBondWith {
+    /// Operator already holds TOKEN (today's behavior).
+    Token,
+    /// Swap USDC→TOKEN for the exact bond top-up before bonding.
+    Usdc,
+}
+
 /// `decdn setup --mbps <N> --region <CC>` — run the operator through Phase 1
 /// pre-flight checks and Phase 2 on-chain setup, then print a go/no-go
 /// readiness summary. The flattened [`ChainArgs`] supplies the same
@@ -47,6 +56,18 @@ pub struct SetupArgs {
     /// terminal the terms are shown and confirmed interactively instead.
     #[arg(long = "accept-terms")]
     pub accept_terms: bool,
+
+    /// How to fund the capacity bond. `token` (default) requires you already
+    /// hold TOKEN. `usdc` exact-out swaps USDC→TOKEN for the exact bond top-up
+    /// on the configured DEX venue before bonding (requires the swap-venue
+    /// config below).
+    #[arg(long = "pay-bond-with", value_enum, default_value_t = PayBondWith::Token)]
+    pub pay_bond_with: PayBondWith,
+
+    /// Max slippage for the USDC→TOKEN swap, in basis points (1% = 100).
+    /// Bounds `amountInMaximum`. Ignored unless `--pay-bond-with usdc`.
+    #[arg(long = "max-slippage-bps", value_name = "BPS", default_value_t = 300)]
+    pub max_slippage_bps: u16,
 
     #[command(flatten)]
     pub chain: ChainArgs,

@@ -24,9 +24,9 @@ use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::identity;
-use decdn_incentive::Erc20;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::eth_identity;
+use decdn_incentive::{Erc20, price_impact_bps, swap_top_up, swap_venue};
 
 use crate::commands::{bond, chain_ctx, key_gen, register, terms};
 
@@ -40,6 +40,24 @@ const CLOCK_SKEW_LIMIT_SECS: i64 = 10;
 /// (`approve` + `bond` + `declareMbps` + `registerNode`). Used only to size
 /// the native-gas pre-flight check, so an over-estimate is the safe direction.
 const PREFLIGHT_GAS_UNITS: u64 = 600_000;
+
+/// Price-impact ceiling (bps) above which the USDC swap warns and asks for an
+/// extra confirmation. Advisory only — never hard-blocks (an operator can
+/// pre-swap and bond manually, so a hard fail would be theater).
+const PRICE_IMPACT_LIMIT_BPS: u32 = 300;
+
+/// Exact-out swap deadline, seconds from submission.
+const SWAP_DEADLINE_SECS: u64 = 120;
+
+/// USDC balance covers the slippage-bounded max input.
+fn swap_preflight(usdc_balance: U256, max_in: U256) -> bool {
+    usdc_balance >= max_in
+}
+
+/// Whether measured price impact exceeds the advisory ceiling.
+const fn impact_over_threshold(impact_bps: u32) -> bool {
+    impact_bps > PRICE_IMPACT_LIMIT_BPS
+}
 
 /// Tri-state pre-flight outcome. `Warn` is non-blocking — it neither passes
 /// silently (it renders distinctly from `Ok`) nor aborts a live run. Used for
@@ -86,6 +104,16 @@ struct Preflight {
     shortfall: U256,
     native_balance: U256,
     gas_needed: U256,
+    /// USDC-mode funding: the bond is acquired by a USDC→TOKEN swap, so the raw
+    /// TOKEN-balance check is not the binding funding constraint — the swap's
+    /// USDC-covers-`max_in` result is threaded through `usdc_funding_ok`
+    /// instead. Kept for the summary and the gas-sizing branch in `run`.
+    usdc_mode: bool,
+    /// USDC-mode funding verdict: `Some(true/false)` when a swap was quoted
+    /// (USDC covers `max_in` or not), `None` in TOKEN mode *and* when a USDC
+    /// run needs no swap (the operator already holds enough TOKEN). `None`
+    /// makes [`Preflight::funding_ok`] fall back to the TOKEN-balance check.
+    usdc_funding_ok: Option<bool>,
 }
 
 impl Preflight {
@@ -114,14 +142,41 @@ impl Preflight {
         self.native_balance >= self.gas_needed
     }
 
+    /// Bond funding covers the shortfall. In TOKEN mode (and a USDC run that
+    /// needs no swap) `usdc_funding_ok` is `None` and this reduces to the
+    /// TOKEN-balance check; a USDC run that quoted a swap threads its
+    /// USDC-covers-`max_in` verdict through instead, so the final gate enforces
+    /// USDC sufficiency rather than waiving funding outright.
+    fn funding_ok(&self) -> bool {
+        self.usdc_funding_ok.unwrap_or_else(|| self.token_ok())
+    }
+
+    /// Value for the summary's `token_ok` field. In TOKEN mode this is the raw
+    /// TOKEN-balance check; in USDC mode the bond is funded by the swap, so the
+    /// pre-swap TOKEN balance is not the binding constraint — report the funding
+    /// verdict instead, otherwise a fully successful USDC run reports
+    /// `token_ok: false` and reads as underfunded. `funding_ok` is the canonical
+    /// field to gate on either way.
+    fn summary_token_ok(&self) -> bool {
+        if self.usdc_mode {
+            self.funding_ok()
+        } else {
+            self.token_ok()
+        }
+    }
+
     /// Every *blocking* check passes (a `Warn` does not block).
     fn all_ok(&self) -> bool {
-        self.chain_id_ok() && !self.clock_status().blocks() && self.token_ok() && self.native_ok()
+        self.chain_id_ok() && !self.clock_status().blocks() && self.funding_ok() && self.native_ok()
     }
 }
 
 /// Entry point for `decdn setup`.
-#[allow(clippy::too_many_lines)]
+// `run` is a linear onboarding script (pre-flight → optional USDC swap → bond
+// → register → readiness); the branch count reads as complex to clippy but the
+// control flow is top-to-bottom with no shared mutable state, so splitting it
+// further would scatter the sequence rather than clarify it.
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
     let config_path = args.chain.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
@@ -200,17 +255,23 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         .get_gas_price()
         .await
         .context("failed to read gas price")?;
-    let gas_needed = U256::from(PREFLIGHT_GAS_UNITS) * U256::from(gas_price);
+    let usdc_mode = matches!(args.pay_bond_with, cli::PayBondWith::Usdc);
     let clock_skew = measure_clock_skew(&resolved.rpc_url).await;
 
-    let pf = Preflight {
+    let mut pf = Preflight {
         rpc_chain_id,
         signing_chain_id: resolved.chain_id,
         clock_skew,
         token_balance,
         shortfall: plan.shortfall,
         native_balance,
-        gas_needed,
+        // Sized after the swap plan is known (see below) — the USDC-mode swap
+        // gas depends on whether a swap actually runs and on the venue.
+        gas_needed: U256::ZERO,
+        usdc_mode,
+        // Filled in from the swap quote below (USDC mode); stays `None` in
+        // TOKEN mode so `funding_ok()` reduces to the TOKEN-balance check.
+        usdc_funding_ok: None,
     };
 
     check_line(
@@ -220,12 +281,53 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         &format!("chainId {rpc_chain_id}, signing for {}", resolved.chain_id),
     );
     check_line(json, "clock", pf.clock_status(), &clock_detail(clock_skew));
-    check_line(
-        json,
-        "token_balance",
-        status(pf.token_ok()),
-        &format!("need {} base units, hold {token_balance}", plan.shortfall),
-    );
+
+    // ---- USDC mode: quote the exact bond top-up and run its up-front gates
+    //      (USDC-balance pre-flight + advisory price-impact confirm) now, but
+    //      do NOT execute the swap yet — the actual `approve`+`swap` fires only
+    //      after every abort gate below has cleared (see the live path), so a
+    //      doomed run never spends USDC. TOKEN mode leaves this `None` and keeps
+    //      the original TOKEN-balance pre-flight below. ----
+    let prepared_swap = if usdc_mode {
+        prepare_usdc_swap(
+            args,
+            &file,
+            &provider,
+            operator,
+            &plan,
+            token_balance,
+            dry_run,
+        )
+        .await?
+    } else {
+        SwapPrep::None
+    };
+    // Thread the swap's USDC-covers-`max_in` verdict into the pre-flight so
+    // `all_ok()` enforces USDC sufficiency at the final gate (dry-run and live
+    // alike). `None` when no swap was quoted (TOKEN mode, or a USDC run that
+    // already holds enough TOKEN) → `funding_ok()` falls back to `token_ok()`;
+    // `Some(false)` when the quote failed, so the run still reports and then
+    // aborts at the `all_ok()` gate rather than dying mid-pre-flight.
+    pf.usdc_funding_ok = prepared_swap.funding_ok();
+
+    // Size the native-gas pre-flight now that the swap plan is known: the
+    // bond-phase transactions plus the selected venue's swap sequence — and 0
+    // extra when no swap will actually run (TOKEN mode, or a resumable re-run
+    // that already holds enough TOKEN). Over-estimate is the safe direction.
+    let gas_needed =
+        U256::from(PREFLIGHT_GAS_UNITS + prepared_swap.swap_gas_units()) * U256::from(gas_price);
+    pf.gas_needed = gas_needed;
+
+    // TOKEN mode keeps the original TOKEN-balance pre-flight; USDC mode replaced
+    // it with the `usdc_balance` (or, on a failed quote, `swap`) check above.
+    if matches!(prepared_swap, SwapPrep::None) {
+        check_line(
+            json,
+            "token_balance",
+            status(pf.token_ok()),
+            &format!("need {} base units, hold {token_balance}", plan.shortfall),
+        );
+    }
     check_line(
         json,
         "native_gas",
@@ -235,6 +337,15 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
 
     // ---- Dry run: report and stop before submitting anything. ----
     if dry_run {
+        // The preview (quote, max_in, impact) was already emitted by
+        // `prepare_usdc_swap`; surface it in the aggregated summary too, with
+        // no tx (nothing was sent).
+        let swap_summary = prepared_swap.ready().map(|p| SwapSummary {
+            swap_out: p.swap_out,
+            max_in: p.max_in,
+            impact_bps: p.impact_bps,
+            tx: None,
+        });
         // Human mode prints the bond plan inline; JSON mode emits a single
         // aggregated object below (no second JSON object from `write_plan`).
         if !json {
@@ -254,6 +365,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                     &plan,
                     &bond::Outcome::default(),
                     None,
+                    swap_summary.as_ref(),
                     true,
                     &readiness,
                     &args.region,
@@ -304,15 +416,66 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     )
     .await?;
 
-    // ---- Confirm the bond before submitting (unless --yes). ----
+    // ---- Confirm before submitting (unless --yes). In USDC mode the prompt
+    //      covers the swap spend AND the bond, so the operator can't be asked
+    //      only about the bond and then silently charged for a swap. ----
     if !args.yes
-        && !confirm(plan.shortfall, plan.target, args.mbps)
-            .context("failed to read confirmation from stdin")?
+        && !confirm(
+            plan.shortfall,
+            plan.target,
+            args.mbps,
+            prepared_swap.ready().map(|p| p.max_in),
+        )
+        .context("failed to read confirmation from stdin")?
     {
         anyhow::bail!(
             "aborted by operator (no confirmation); re-run with --yes for non-interactive use"
         );
     }
+
+    // ---- USDC mode: execute the swap now — after every abort gate above has
+    //      cleared and the operator confirmed the spend — so a doomed or
+    //      declined run never touches USDC. TOKEN mode leaves this `None`. ----
+    let swap_summary = if let SwapPrep::Ready(prepared) = prepared_swap {
+        // Advisory price-impact confirm (never hard-blocks). Deferred to here —
+        // the live path only, after every abort gate — so a `--dry-run` (which
+        // returned above) never prompts, and no USDC is spent until the
+        // operator has cleared this too.
+        let impact = prepared.impact_bps;
+        if impact_over_threshold(impact) {
+            // Always surface the advisory warning when the threshold trips;
+            // `--yes` skips only the [y/N] confirmation, never the notice — so
+            // a thin-pool swap can't execute with zero indication.
+            warn_impact(impact, prepared.swap_out, prepared.max_in);
+            if !args.yes
+                && !confirm_impact(impact, prepared.swap_out, prepared.max_in)
+                    .context("failed to read confirmation from stdin")?
+            {
+                anyhow::bail!(
+                    "aborted by operator (price impact {impact} bps exceeds \
+                     {PRICE_IMPACT_LIMIT_BPS} bps); re-run with --yes to accept"
+                );
+            }
+        }
+        let deadline = swap_deadline()?;
+        let tx = prepared
+            .venue
+            .swap_exact_out(prepared.swap_out, prepared.max_in, operator, deadline)
+            .await
+            .context("USDC→TOKEN swap failed")?;
+        hline(
+            json,
+            &format!("swap: {tx:#x} ({} TOKEN acquired)", prepared.swap_out),
+        );
+        Some(SwapSummary {
+            swap_out: prepared.swap_out,
+            max_in: prepared.max_in,
+            impact_bps: prepared.impact_bps,
+            tx: Some(tx),
+        })
+    } else {
+        None
+    };
 
     // ---- Phase 2.1/2.2: bond (idempotent stake-to-tier). ----
     if !json {
@@ -377,6 +540,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 &plan,
                 &bond_outcome,
                 register_outcome.as_ref(),
+                swap_summary.as_ref(),
                 false,
                 &readiness,
                 &args.region,
@@ -698,9 +862,26 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 /// Prompt `[y/N]` for the bond submission. Returns `false` on EOF / a
-/// non-affirmative answer (a non-interactive stdin reads as "no").
-fn confirm(shortfall: U256, target: U256, mbps: u64) -> io::Result<bool> {
-    if shortfall == U256::ZERO {
+/// non-affirmative answer, and reads stdin unconditionally so a piped answer
+/// (`echo y | decdn setup …`) is honored regardless of whether stdout is a TTY;
+/// `--yes` remains the documented fully non-interactive path. When `swap_max_in`
+/// is `Some`, the run will first swap up to that many USDC base units for the
+/// bond top-up, so the prompt covers the spend AND the bond — the operator is
+/// never asked only about the bond and then silently charged.
+fn confirm(
+    shortfall: U256,
+    target: U256,
+    mbps: u64,
+    swap_max_in: Option<U256>,
+) -> io::Result<bool> {
+    if let Some(max_in) = swap_max_in {
+        // USDC mode: acquiring the top-up spends up to `max_in` USDC, then bonds.
+        print!(
+            "Swap up to {max_in} USDC base units for TOKEN, then submit bond of {shortfall} base \
+             units (target {target}, tier {mbps} Mbps) and complete on-chain setup (declare + \
+             register, as needed)? [y/N] "
+        );
+    } else if shortfall == U256::ZERO {
         // Already bonded to target (e.g. `node bond` was run manually) — no
         // deposit, but `declareMbps` and/or `registerNode` may still submit.
         print!(
@@ -719,6 +900,244 @@ fn confirm(shortfall: U256, target: U256, mbps: u64) -> io::Result<bool> {
         return Ok(false);
     }
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
+}
+
+/// USDC-mode swap outcome, surfaced in the readiness summary and the `--json`
+/// object. `tx` is `None` on a dry run (nothing was sent).
+struct SwapSummary {
+    /// TOKEN bought by the exact-out swap (the bond top-up).
+    swap_out: U256,
+    /// `amountInMaximum` — the slippage-bounded USDC cap the swap spent up to.
+    max_in: U256,
+    /// Measured execution price impact vs pool spot, in bps (advisory).
+    impact_bps: u32,
+    /// Swap transaction hash; `None` on a dry run.
+    tx: Option<B256>,
+}
+
+/// Emit the advisory price-impact warning to stderr — unconditionally when the
+/// threshold trips, so it shows even under `--yes` (which skips only the
+/// confirmation) and never pollutes the `--json` object on stdout.
+fn warn_impact(impact_bps: u32, swap_out: U256, max_in: U256) {
+    eprintln!(
+        "warning: swap price impact is {impact_bps} bps (over the {PRICE_IMPACT_LIMIT_BPS} bps \
+         advisory limit): acquiring {swap_out} TOKEN may cost up to {max_in} USDC base units"
+    );
+}
+
+/// Prompt `[y/N]` to proceed when the swap's price impact exceeds the advisory
+/// ceiling. Returns `false` on EOF / a non-affirmative answer, and reads stdin
+/// unconditionally (a piped `y` is honored); `--yes` skips this prompt entirely.
+/// The unconditional advisory warning is printed by the caller before this — so
+/// even under `--yes` the operator is told, only the confirmation is skipped.
+fn confirm_impact(impact_bps: u32, swap_out: U256, max_in: U256) -> io::Result<bool> {
+    print!(
+        "Swap price impact is {impact_bps} bps (over the {PRICE_IMPACT_LIMIT_BPS} bps limit): \
+         acquiring {swap_out} TOKEN may cost up to {max_in} USDC base units. Proceed? [y/N] "
+    );
+    io::stdout().flush()?;
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line)? == 0 {
+        return Ok(false);
+    }
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
+}
+
+/// Deadline for the exact-out swap: `now + SWAP_DEADLINE_SECS`, as a Unix
+/// timestamp. Saturating so a far-future clock can't wrap.
+fn swap_deadline() -> anyhow::Result<U256> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    Ok(U256::from(now.saturating_add(SWAP_DEADLINE_SECS)))
+}
+
+/// A USDC→TOKEN swap that has cleared every up-front gate (USDC-balance
+/// pre-flight + advisory price-impact confirm) and is ready to execute. Held
+/// across the register-divergence / terms / bond-confirm gates so the actual
+/// `approve`+`swap` transactions fire only after all of them clear — an
+/// operator who bails, or a run that fails a gate, never spends USDC. Each
+/// venue's `swap_exact_out` owns its own approvals, so nothing but the venue
+/// handle and the amounts is needed to execute.
+struct PreparedSwap {
+    /// The configured venue; `swap_exact_out` performs its own approvals.
+    venue: swap_venue::SwapVenue,
+    /// TOKEN to buy (the bond top-up).
+    swap_out: U256,
+    /// `amountInMaximum` — the slippage-bounded USDC cap the swap may spend.
+    max_in: U256,
+    /// Measured execution price impact vs pool spot, in bps (advisory).
+    impact_bps: u32,
+    /// Whether the operator's USDC balance covers `max_in`. Threaded into
+    /// [`Preflight::usdc_funding_ok`] so the final `all_ok()` gate enforces it
+    /// — the quote/gate stage never bails on it, so `--dry-run` prints a full
+    /// report instead of aborting early.
+    usdc_ok: bool,
+}
+
+/// Outcome of the USDC-mode up-front swap phase ([`prepare_usdc_swap`]).
+// One short-lived value per `setup` run, moved once into the live path — boxing
+// the `Ready` payload would add a heap allocation (and force `ready()` off
+// `const`) for no real benefit.
+#[allow(clippy::large_enum_variant)]
+enum SwapPrep {
+    /// No swap needed: TOKEN mode, or a USDC run already holding enough TOKEN.
+    /// Funding falls back to the TOKEN-balance check.
+    None,
+    /// Quoted and gated, ready to execute once the abort gates clear.
+    Ready(PreparedSwap),
+    /// The USDC→TOKEN quote failed (recorded as a FAILED `swap` pre-flight
+    /// check). Funding is forced not-ok so the run reports readiness and then
+    /// aborts at the `all_ok()` gate rather than dying mid-pre-flight.
+    QuoteFailed,
+}
+
+impl SwapPrep {
+    /// The USDC-funding verdict threaded into [`Preflight::usdc_funding_ok`]:
+    /// `None` when no swap was quoted (funding falls back to `token_ok`),
+    /// `Some(true/false)` from a successful quote, `Some(false)` on a failed
+    /// quote so the final gate blocks.
+    const fn funding_ok(&self) -> Option<bool> {
+        match self {
+            Self::None => None,
+            Self::Ready(p) => Some(p.usdc_ok),
+            Self::QuoteFailed => Some(false),
+        }
+    }
+
+    /// Extra native-gas units to add to the pre-flight for the swap that will
+    /// actually run — the selected venue's sequence when a swap is ready, else
+    /// 0 (nothing swaps in TOKEN mode, a skipped re-run, or a failed quote).
+    const fn swap_gas_units(&self) -> u64 {
+        match self {
+            Self::Ready(p) => p.venue.swap_gas_units(),
+            Self::None | Self::QuoteFailed => 0,
+        }
+    }
+
+    /// The prepared swap when one is ready to execute, else `None`.
+    const fn ready(&self) -> Option<&PreparedSwap> {
+        match self {
+            Self::Ready(p) => Some(p),
+            Self::None | Self::QuoteFailed => None,
+        }
+    }
+}
+
+/// USDC-mode bond funding, up-front phase: quote the exact-out USDC→TOKEN swap
+/// that acquires the bond top-up and run its gates (USDC-covers-`max_in`
+/// pre-flight + advisory price-impact confirm), but do NOT send any
+/// transaction. This replaces the TOKEN-balance pre-flight with the
+/// USDC-balance check. `swap_top_up` saturates, so a re-run after a partial
+/// failure re-quotes only the remaining shortfall and converges.
+///
+/// Returns [`SwapPrep::None`] when the operator already holds enough TOKEN
+/// (nothing to swap); [`SwapPrep::Ready`] when the swap is quoted and gated —
+/// the caller executes it (via [`PreparedSwap::venue`]'s `swap_exact_out`) only
+/// after every abort gate has cleared; and [`SwapPrep::QuoteFailed`] when the
+/// quote itself fails (e.g. no pool exists yet), recorded as a FAILED `swap`
+/// pre-flight check so the caller still emits the readiness report / `--json`
+/// object and then stops at the `all_ok()` gate, rather than dying mid-pre-flight
+/// with no report. Genuine misconfiguration (missing venue, bad slippage) and
+/// RPC read failures still propagate as errors. On a dry run it additionally
+/// previews the swap (quote, `max_in`, impact) here.
+async fn prepare_usdc_swap<P: Provider + Clone + 'static>(
+    args: &cli::SetupArgs,
+    file: &chain_ctx::FileConfig,
+    provider: &P,
+    operator: Address,
+    plan: &bond::Plan,
+    token_balance: U256,
+    dry_run: bool,
+) -> anyhow::Result<SwapPrep> {
+    let json = args.chain.json;
+    // Bound the slippage tolerance (USDC mode only): without a ceiling a
+    // fat-finger like 65535 sets a ~7.5x spend cap. 10000 bps = 100%.
+    anyhow::ensure!(
+        args.max_slippage_bps <= 10_000,
+        "--max-slippage-bps cannot exceed 10000 (100%)"
+    );
+    let resolved_swap = chain_ctx::resolve_swap(&args.chain, file)?.context(
+        "--pay-bond-with usdc requires swap-venue config (--swap-venue, \
+         --swap-router-address, --usdc-address, plus --swap-quoter-address for \
+         the uniswap-v3 venue only)",
+    )?;
+    // `operator` is the signer whose USDC funds the swap; thread it in as the
+    // payer so each venue uses it as the allowance owner (Uniswap) and the
+    // enforced swap recipient (Balancer V3 has no recipient slot).
+    let venue = swap_venue::from_config(provider.clone(), &resolved_swap, plan.token, operator)?;
+    let swap_out = swap_top_up(plan.shortfall, token_balance);
+    if swap_out.is_zero() {
+        hline(
+            json,
+            "swap: skipped (TOKEN balance already covers the bond)",
+        );
+        return Ok(SwapPrep::None);
+    }
+
+    let usdc = Erc20::new(
+        chain_ctx::parse_address(&resolved_swap.usdc, "usdc_address")?,
+        provider.clone(),
+    );
+    let usdc_balance = usdc
+        .balanceOf(operator)
+        .call()
+        .await
+        .context("failed to read USDC balance")?;
+    // A failed quote (e.g. no TOKEN/USDC pool exists yet) is recorded as a
+    // FAILED `swap` pre-flight check and returned as `QuoteFailed` — NOT
+    // propagated — so the caller still prints the readiness report / `--json`
+    // object and then aborts at the `all_ok()` gate, instead of dying here with
+    // no report.
+    let quote = match venue.quote_exact_out(swap_out, args.max_slippage_bps).await {
+        Ok(q) => q,
+        Err(e) => {
+            check_line(
+                json,
+                "swap",
+                CheckStatus::Fail,
+                &format!("failed to quote USDC→TOKEN swap: {e:#}"),
+            );
+            return Ok(SwapPrep::QuoteFailed);
+        }
+    };
+    // Pre-flight: USDC covers max_in (replaces the TOKEN-balance check). This
+    // records the verdict but does NOT bail — it is threaded onto `PreparedSwap`
+    // and enforced at the final `all_ok()` gate, so `--dry-run` still prints a
+    // full report (and the live path stops before spending) rather than
+    // aborting here.
+    let usdc_ok = swap_preflight(usdc_balance, quote.max_in);
+    check_line(
+        json,
+        "usdc_balance",
+        status(usdc_ok),
+        &format!("need {} base units, hold {usdc_balance}", quote.max_in),
+    );
+
+    // Price impact (advisory). The interactive confirm is deferred to the
+    // live swap-execute path so `--dry-run` never prompts; here we only
+    // measure it for the preview and the summary.
+    let impact = price_impact_bps(quote.spot_in, quote.expected_in);
+
+    if dry_run {
+        hline(
+            json,
+            &format!(
+                "swap (dry-run): would swap up to {} USDC base units for {swap_out} TOKEN \
+                 (impact {impact} bps)",
+                quote.max_in
+            ),
+        );
+    }
+
+    Ok(SwapPrep::Ready(PreparedSwap {
+        venue,
+        swap_out,
+        max_in: quote.max_in,
+        impact_bps: impact,
+        usdc_ok,
+    }))
 }
 
 /// Print the Phase-5 readiness summary (human mode). The on-chain subset
@@ -747,6 +1166,7 @@ fn build_summary(
     plan: &bond::Plan,
     bond_outcome: &bond::Outcome,
     register_outcome: Option<&register::RegisterOutcome>,
+    swap: Option<&SwapSummary>,
     dry_run: bool,
     readiness: &Readiness,
     region: &str,
@@ -762,10 +1182,12 @@ fn build_summary(
             "clock_skew_secs": pf.clock_skew,
             "clock_ok": !pf.clock_status().blocks(),
             "token_balance_base": pf.token_balance.to_string(),
-            "token_ok": pf.token_ok(),
+            "token_ok": pf.summary_token_ok(),
             "native_balance_wei": pf.native_balance.to_string(),
             "native_gas_needed_wei": pf.gas_needed.to_string(),
             "native_ok": pf.native_ok(),
+            "usdc_mode": pf.usdc_mode,
+            "funding_ok": pf.funding_ok(),
         },
         "keys_generated": keys_generated,
         "bond": {
@@ -784,6 +1206,15 @@ fn build_summary(
                 "node_id": format!("{:#x}", o.node_id),
             }),
             None => serde_json::json!({ "skipped": true }),
+        },
+        "swap": match swap {
+            Some(s) => serde_json::json!({
+                "swap_out_token_base": s.swap_out.to_string(),
+                "max_in_usdc_base": s.max_in.to_string(),
+                "price_impact_bps": s.impact_bps,
+                "tx": tx_hex(s.tx),
+            }),
+            None => serde_json::Value::Null,
         },
         "readiness": {
             "registry_active": readiness.active,
@@ -882,6 +1313,8 @@ mod tests {
             shortfall: U256::from(shortfall),
             native_balance: U256::from(native),
             gas_needed: U256::from(gas),
+            usdc_mode: false,
+            usdc_funding_ok: None,
         }
     }
 
@@ -923,6 +1356,39 @@ mod tests {
         let mut pf = pf_with(Some(0), 100, 10, 100, 10);
         pf.signing_chain_id = 1;
         assert!(!pf.all_ok());
+    }
+
+    #[test]
+    fn funding_ok_threads_usdc_result() {
+        // No swap quoted (`usdc_funding_ok: None`) → falls back to token_ok().
+        let mut pf = pf_with(None, 100, 10, 100, 10); // token 100 >= shortfall 10
+        assert!(pf.funding_ok());
+        pf.token_balance = U256::from(5u64); // token 5 < shortfall 10
+        assert!(!pf.funding_ok());
+        // A quoted swap threads its USDC-covers-max_in verdict through,
+        // independent of the (now irrelevant) TOKEN balance.
+        pf.usdc_funding_ok = Some(true);
+        assert!(pf.funding_ok());
+        assert!(pf.all_ok()); // and the final gate now passes on it
+        pf.usdc_funding_ok = Some(false);
+        assert!(!pf.funding_ok());
+        assert!(!pf.all_ok()); // USDC shortfall blocks the gate
+    }
+
+    #[test]
+    fn summary_token_ok_is_funding_aware_in_usdc_mode() {
+        // TOKEN mode: the summary field is the raw TOKEN-balance check.
+        let mut pf = pf_with(None, 5, 10, 100, 10); // token 5 < shortfall 10
+        assert!(!pf.summary_token_ok());
+        // USDC mode: a successful swap funds the bond, so a zero pre-swap TOKEN
+        // balance must NOT report the run as underfunded (the stale-field bug).
+        pf.usdc_mode = true;
+        pf.token_balance = U256::ZERO;
+        pf.usdc_funding_ok = Some(true);
+        assert!(pf.summary_token_ok());
+        // A USDC run that fails the funding gate still reports not-ok.
+        pf.usdc_funding_ok = Some(false);
+        assert!(!pf.summary_token_ok());
     }
 
     #[test]
@@ -977,6 +1443,7 @@ mod tests {
             &sample_plan(),
             &bond::Outcome::default(),
             None,
+            None,
             false,
             &sample_readiness(),
             "US",
@@ -984,6 +1451,8 @@ mod tests {
         );
         assert_eq!(v["register"]["skipped"], serde_json::json!(true));
         assert!(v["register"].get("submitted").is_none());
+        // No swap in token mode → the `swap` key serializes as JSON null.
+        assert!(v["swap"].is_null());
         // Undetermined clock serializes as JSON null and clock_ok stays true.
         assert!(v["preflight"]["clock_skew_secs"].is_null());
         assert_eq!(v["preflight"]["clock_ok"], serde_json::json!(true));
@@ -1012,6 +1481,7 @@ mod tests {
             &sample_plan(),
             &bond::Outcome::default(),
             Some(&outcome),
+            None,
             false,
             &sample_readiness(),
             "DE",
@@ -1029,8 +1499,58 @@ mod tests {
     }
 
     #[test]
+    fn build_summary_includes_swap_object() {
+        let pf = pf_with(None, 0, 50_000, 100, 10);
+        let swap = SwapSummary {
+            swap_out: U256::from(50_000u64),
+            max_in: U256::from(1_030_000u64),
+            impact_bps: 42,
+            tx: Some(B256::repeat_byte(0x9A)),
+        };
+        let v = build_summary(
+            &pf,
+            false,
+            &sample_plan(),
+            &bond::Outcome::default(),
+            None,
+            Some(&swap),
+            false,
+            &sample_readiness(),
+            "US",
+            1,
+        );
+        assert_eq!(v["swap"]["swap_out_token_base"], serde_json::json!("50000"));
+        assert_eq!(v["swap"]["max_in_usdc_base"], serde_json::json!("1030000"));
+        assert_eq!(v["swap"]["price_impact_bps"], serde_json::json!(42));
+        assert!(
+            v["swap"]["tx"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("0x9a9a"))
+        );
+    }
+
+    #[test]
     fn present_label_maps() {
         assert_eq!(present_label(true), "present");
         assert_eq!(present_label(false), "absent");
+    }
+
+    #[test]
+    fn swap_preflight_checks_usdc_covers_max_in() {
+        assert!(swap_preflight(
+            U256::from(1_030_000u64),
+            U256::from(1_030_000u64)
+        ));
+        assert!(!swap_preflight(
+            U256::from(1_000_000u64),
+            U256::from(1_030_000u64)
+        ));
+    }
+
+    #[test]
+    fn impact_gate_trips_above_threshold_only() {
+        assert!(!impact_over_threshold(299));
+        assert!(!impact_over_threshold(300));
+        assert!(impact_over_threshold(301));
     }
 }
