@@ -10,10 +10,12 @@
 
 [identity]
 # MUST-EDIT — node data directory: holds the Ed25519 node key and the blob store.
-data_dir = "/var/lib/decdn"
+data_dir = '/var/lib/decdn'
 # ISO 3166-1 alpha-2 region you operate in. Sets the region scope for blacklist
-# compliance (enforced set is global ∪ this region). Omit if you have no region.
-region = "US"
+# compliance (enforced set is global ∪ this region). Opt in explicitly: leaving
+# it unset means global-only scope. Uncomment and set YOUR region — the "US"
+# below is a placeholder, not a default.
+# region = "US"
 
 [network]
 # QUIC bind port for paid delivery (cdn/client/v1) and probing (cdn/probe/v1).
@@ -27,7 +29,7 @@ bind_port = 4433
 rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
 # MUST-EDIT — path to the operator's Ethereum keystore JSON (pays gas, signs
 # settlement + slash responses).
-eth_keystore = "/etc/decdn/eth-keystore.json"
+eth_keystore = '/etc/decdn/eth-keystore.json'
 
 # EIP-712 chainId bound into slash-signature domain separators — Arbitrum Sepolia.
 chain_id = 421614
@@ -66,7 +68,7 @@ content_blacklist_from_block = 11249862
 
 [cache]
 # MUST-EDIT — blob cache directory and size budget (MB).
-cache_dir     = "/var/cache/decdn"
+cache_dir     = '/var/cache/decdn'
 cache_size_mb = 10240
 
 # MUST-EDIT — origin backend the node pulls through on a cache miss. Pick ONE
