@@ -199,6 +199,14 @@ jobs:
               - '.github/workflows/ci.yml'
             solidity:
               - 'contracts/**'
+              # Deployment manifests (contracts/deployments/<chainId>.json) are
+              # recorded artifacts — no code, no tests. A manifest-only commit
+              # (e.g. the Arbitrum Sepolia 421614.json for #1083) should not
+              # trigger build/test/slither/aderyn/coverage/fork jobs. dorny
+              # negation is last-match-wins, so this excludes them from the
+              # 'contracts/**' match above. (Test-chain 31337*.json manifests
+              # are gitignored and never committed.)
+              - '!contracts/deployments/**'
               - '.gitmodules'
               - '.github/workflows/ci.yml'
               - '.github/actions/**'
