@@ -10074,18 +10074,16 @@ bind_port = 12345
         assert_eq!(resolved.max_tracked_per_peer, 0);
     }
 
-    /// The shipped Arbitrum Sepolia sample config must stay in lockstep with the
-    /// live `FileConfig` schema: `deny_unknown_fields` means a renamed or removed
-    /// key would otherwise break every operator who copied it, and only surface
-    /// when they run the node. Parse it here, confirm the seeded chain id, and run
-    /// each contract address through the same EIP-55 check the resolver uses so a
-    /// bad-checksum paste is caught at CI time rather than on someone's node.
-    #[test]
-    fn arbitrum_sepolia_sample_config_matches_schema() -> anyhow::Result<()> {
-        const SAMPLE: &str = include_str!("../../../../examples/configs/arbitrum-sepolia.toml");
-
-        let cfg: FileConfig = toml::from_str(SAMPLE)
-            .context("examples/configs/arbitrum-sepolia.toml no longer matches FileConfig")?;
+    /// Shared check for a shipped Arbitrum Sepolia sample config (operator or
+    /// client): the config must stay in lockstep with the live `FileConfig`
+    /// schema — `deny_unknown_fields` means a renamed or removed key would
+    /// otherwise break every user who copied it, and only surface when they run
+    /// the binary. Parse it, confirm the seeded chain id, and run each contract
+    /// address present through the same EIP-55 check the resolver uses so a
+    /// bad-checksum paste is caught at CI time rather than on someone's machine.
+    fn assert_sample_config_matches_schema(sample: &str) -> anyhow::Result<()> {
+        let cfg: FileConfig =
+            toml::from_str(sample).context("sample config no longer matches FileConfig")?;
 
         let chain = cfg
             .blockchain
@@ -10099,6 +10097,7 @@ bind_port = 12345
 
         // Every address present in the sample must pass the resolver's EIP-55 check
         // (all-lowercase / bad-checksum values are rejected there, not at parse time).
+        // Absent fields are skipped — the client sample carries only a subset.
         for (field, addr) in [
             ("payment_channel_address", &chain.payment_channel_address),
             ("capacity_bond_address", &chain.capacity_bond_address),
@@ -10122,5 +10121,19 @@ bind_port = 12345
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn arbitrum_sepolia_operator_sample_config_matches_schema() -> anyhow::Result<()> {
+        assert_sample_config_matches_schema(include_str!(
+            "../../../../examples/configs/arbitrum-sepolia.toml"
+        ))
+    }
+
+    #[test]
+    fn arbitrum_sepolia_client_sample_config_matches_schema() -> anyhow::Result<()> {
+        assert_sample_config_matches_schema(include_str!(
+            "../../../../examples/configs/arbitrum-sepolia-client.toml"
+        ))
     }
 }
