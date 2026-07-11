@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, DepositOutcome, PendingSettle,
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, PendingSettle,
     PendingSettleStore, StoreError, Voucher,
 };
 use iroh::{Endpoint, EndpointAddr, PublicKey};
@@ -610,6 +610,12 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// Add `additional` USDC to the channel tracked for `provider_addr`.
     /// Does not extend the channel expiry (the contract forbids it).
     ///
+    /// Thin delegation to the shared
+    /// [`decdn_client_pull::buyer_channel::top_up`] kernel (the same mechanism
+    /// the CLI fetch buyer's auto-refill uses, #1103): read the `channel_id`,
+    /// `topUp` on-chain, then reconcile the committed deposit — handling the
+    /// escrowed-but-untracked / channel-replaced races.
+    ///
     /// # Errors
     ///
     /// Errors if no channel is tracked for `provider_addr` *before* the RPC, or
@@ -620,76 +626,13 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// `Ok(())`, not an error — the funds are already escrowed on-chain against
     /// the topped-up channel, so failing here would not unwind them.
     pub async fn top_up(&self, provider_addr: Address, additional: U256) -> Result<()> {
-        // Read the channel_id BEFORE the RPC — we need it for `topUp` and as the
-        // channel-id guard on the post-RPC write.
-        let channel_id = self
-            .store
-            .get_by_provider(provider_addr)
-            .context("look up buyer channel for top-up")?
-            .with_context(|| format!("top_up for unknown provider {provider_addr}"))?
-            .channel_id;
-        let receipt = self
-            .contract
-            .topUp(channel_id, additional)
-            .send()
-            .await
-            .context("submit topUp")?
-            .get_receipt()
-            .await
-            .context("await topUp receipt")?;
-        if !receipt.status() {
-            anyhow::bail!("topUp reverted for channel {channel_id}");
-        }
-        let tx = receipt.transaction_hash;
-        // Add to the *committed* deposit inside a write txn (never the pre-RPC
-        // snapshot), channel-id-guarded so a concurrent advance/reuse during the
-        // RPC is not clobbered (#838). USDC is not fee-on-transfer, so the local
-        // `+= additional` always matches the contract's `+= received`.
-        match self
-            .store
-            .add_deposit(provider_addr, channel_id, additional)
-            .context("persist buyer channel top-up")?
-        {
-            DepositOutcome::Added(new_deposit) => {
-                info!(
-                    provider = %provider_addr,
-                    %channel_id,
-                    %new_deposit,
-                    %tx,
-                    "topped up buyer channel"
-                );
-                Ok(())
-            }
-            // The on-chain topUp already credited `channel_id`, but the local row
-            // vanished during the RPC. Funds are escrowed on-chain with zero
-            // local tracking — `error!` (matching `open_and_persist`'s
-            // escrowed-but-untracked posture) and surface the tx for reconcile.
-            DepositOutcome::UnknownProvider => {
-                error!(
-                    provider = %provider_addr,
-                    %channel_id,
-                    %additional,
-                    %tx,
-                    "top_up: on-chain topUp landed but no local channel record exists to credit; \
-                     deposit is escrowed on-chain and untracked — reconcile against the tx"
-                );
-                Ok(())
-            }
-            // A row still exists (for a different channel), so the provider stays
-            // reclaimable — less severe than `UnknownProvider`, hence `warn!`.
-            DepositOutcome::ChannelMismatch => {
-                warn!(
-                    provider = %provider_addr,
-                    %channel_id,
-                    %additional,
-                    %tx,
-                    "top_up: provider channel replaced during the topUp RPC; the on-chain deposit \
-                     was credited to the topped-up channel but the local record now tracks a \
-                     different channel — reconcile against the tx"
-                );
-                Ok(())
-            }
-        }
+        decdn_client_pull::buyer_channel::top_up(
+            &self.contract,
+            self.store.as_ref(),
+            provider_addr,
+            additional,
+        )
+        .await
     }
 }
 

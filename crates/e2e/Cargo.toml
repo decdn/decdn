@@ -27,7 +27,7 @@ anvil-e2e = []
 
 [dependencies]
 decdn-node = { workspace = true }
-decdn-incentive = { workspace = true }
+decdn-incentive = { workspace = true, features = ["redb"] }
 decdn-cache = { workspace = true }
 decdn-common = { workspace = true }
 decdn-client-pull = { workspace = true }
