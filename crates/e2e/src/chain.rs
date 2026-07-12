@@ -60,9 +60,17 @@ const MIN_BOND_WEI: &str = "50000000000000000000000";
 /// `FeeRouter`/`CapacityBond` epoch length, for the served-bytes read.
 const EPOCH_LENGTH_SECS: u64 = 7 * 24 * 60 * 60;
 
-const FORGE_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
+// A cold-CI compile of the full contracts suite can be slow; a single 180s cap
+// with no retry made an over-budget-but-progressing build a hard failure. Give
+// it headroom plus a bounded retry for a transient stall (mirrors the deploy
+// retry). A real compile error still fails fast — only a timeout is retried.
+const FORGE_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
+const BUILD_ATTEMPTS: usize = 3;
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(45);
 const DEPLOY_ATTEMPTS: usize = 3;
+/// Re-pick the ephemeral port and re-spawn anvil this many times when it dies at
+/// startup (the `free_port` TOCTOU: another process claimed the port first).
+const ANVIL_ATTEMPTS: usize = 3;
 
 /// Deployed protocol contract addresses, read from the forge-script manifest.
 #[derive(Debug, Clone, Copy)]
@@ -102,24 +110,24 @@ impl Drop for AnvilGuard {
 }
 
 /// A live anvil deployment of the full protocol with typed handles.
+///
+/// The descriptive handles (endpoint, chain id, addresses, admin provider) are
+/// facts about the already-running anvil process, fixed at [`Self::launch`].
+/// They are exposed as accessors rather than `pub` fields so a caller can't
+/// reassign one and silently desync the fixture from the live process it
+/// describes (the endpoint used to be two `pub` fields, `rpc_url` + `url`, that
+/// had to agree — now one stored form derives both).
 #[derive(Debug)]
 pub struct ChainFixture {
     _anvil: AnvilGuard,
-    /// JSON-RPC endpoint (e.g. `http://127.0.0.1:PORT`).
-    pub rpc_url: String,
-    /// Parsed RPC URL for building providers.
-    pub url: reqwest::Url,
-    /// Per-fixture chain id (anvil `--chain-id`); also the EIP-712 / ed25519
-    /// domain chain id every signature in this fixture is bound to.
-    pub chain_id: u64,
-    /// Deployed contract addresses.
-    pub addrs: ContractAddrs,
-    /// Mock USDC (mintable) the settlement token points at.
-    pub usdc: Address,
-    /// Admin provider (anvil dev #1): raw RPC, minting, TOKEN distribution.
-    pub admin: DynProvider,
-    /// The admin EOA address (initial TOKEN holder, mock-USDC minter).
-    pub admin_addr: Address,
+    /// Parsed RPC endpoint — the single stored form; `rpc_url()` derives the
+    /// string.
+    url: reqwest::Url,
+    chain_id: u64,
+    addrs: ContractAddrs,
+    usdc: Address,
+    admin: DynProvider,
+    admin_addr: Address,
 }
 
 impl ChainFixture {
@@ -130,52 +138,74 @@ impl ChainFixture {
         let contracts = contracts_dir()?;
         forge_build(&contracts).await?;
 
-        let port = crate::free_port()?;
-        // Unique per fixture so the deploy manifest path never collides with a
-        // concurrent fixture's: the full ephemeral port is unique across live
-        // listeners (see `CHAIN_BASE`).
-        let chain_id = CHAIN_BASE + u64::from(port);
-        let rpc_url = format!("http://127.0.0.1:{port}");
-        let child = Command::new("anvil")
-            .args([
-                "--port",
-                &port.to_string(),
-                "--chain-id",
-                &chain_id.to_string(),
-                "--silent",
-            ])
-            .spawn()
-            .context("spawn anvil (is foundry installed?)")?;
-        let manifest = contracts.join(format!("deployments/{chain_id}.json"));
-        let mut anvil = AnvilGuard {
-            child,
-            manifest: manifest.clone(),
-        };
-
-        let url: reqwest::Url = rpc_url.parse().context("parse anvil rpc url")?;
         let admin_signer: PrivateKeySigner = ADMIN_KEY.parse().context("parse admin key")?;
         let admin_addr = admin_signer.address();
-        let admin: DynProvider = ProviderBuilder::new()
-            .with_simple_nonce_management()
-            .wallet(EthereumWallet::from(admin_signer))
-            .connect_http(url.clone())
-            .erased();
 
-        // Wait for the RPC to accept requests, failing fast if anvil died at
-        // startup (bad args / port clash) rather than waiting out the timeout.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            if admin.get_chain_id().await.is_ok() {
-                break;
+        // Pick an ephemeral port and bring anvil up on it, re-picking on a
+        // collision. `free_port` releases the port before anvil binds it, so
+        // another process can take it in the gap (a TOCTOU that also seeds
+        // `chain_id`); the collision makes anvil exit at startup, so re-pick and
+        // retry rather than failing the whole fixture. The port is unique across
+        // live listeners once claimed, so the deploy manifest path never
+        // collides with a concurrent fixture's (see `CHAIN_BASE`).
+        let mut attempt = 0;
+        let (anvil, chain_id, rpc_url, url, admin) = loop {
+            attempt += 1;
+            let port = crate::free_port()?;
+            let chain_id = CHAIN_BASE + u64::from(port);
+            let rpc_url = format!("http://127.0.0.1:{port}");
+            let child = Command::new("anvil")
+                .args([
+                    "--port",
+                    &port.to_string(),
+                    "--chain-id",
+                    &chain_id.to_string(),
+                    "--silent",
+                ])
+                .spawn()
+                .context("spawn anvil (is foundry installed?)")?;
+            let manifest = contracts.join(format!("deployments/{chain_id}.json"));
+            let mut anvil = AnvilGuard { child, manifest };
+
+            let url: reqwest::Url = rpc_url.parse().context("parse anvil rpc url")?;
+            let admin: DynProvider = ProviderBuilder::new()
+                .with_simple_nonce_management()
+                .wallet(EthereumWallet::from(admin_signer.clone()))
+                .connect_http(url.clone())
+                .erased();
+
+            // Wait for the RPC to accept requests. A premature anvil exit is
+            // almost always the port clash above (retryable); a genuine timeout
+            // is a hard failure.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let up = loop {
+                if admin.get_chain_id().await.is_ok() {
+                    break true;
+                }
+                if let Ok(Some(status)) = anvil.child.try_wait() {
+                    tracing::warn!(
+                        "anvil exited at startup (status {status}) on attempt \
+                         {attempt}/{ANVIL_ATTEMPTS}, likely a port collision"
+                    );
+                    break false;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!("anvil RPC never came up within 20s");
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            };
+            if up {
+                break (anvil, chain_id, rpc_url, url, admin);
             }
-            if let Ok(Some(status)) = anvil.child.try_wait() {
-                anyhow::bail!("anvil exited prematurely before its RPC came up: {status}");
+            // `anvil` (AnvilGuard) drops here: kills the dead child and removes
+            // its manifest before the next attempt.
+            if attempt >= ANVIL_ATTEMPTS {
+                anyhow::bail!(
+                    "anvil never came up after {ANVIL_ATTEMPTS} attempts (repeated port collisions)"
+                );
             }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("anvil RPC never came up within 20s");
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
+        };
+        let manifest = contracts.join(format!("deployments/{chain_id}.json"));
 
         // Deploy mock USDC, then the protocol with the initial TOKEN supply held
         // by the admin EOA so it can distribute bond stake to N operators.
@@ -186,7 +216,6 @@ impl ChainFixture {
 
         Ok(Self {
             _anvil: anvil,
-            rpc_url,
             url,
             chain_id,
             addrs,
@@ -194,6 +223,45 @@ impl ChainFixture {
             admin,
             admin_addr,
         })
+    }
+
+    /// JSON-RPC endpoint string (e.g. `http://127.0.0.1:PORT`).
+    #[must_use]
+    pub fn rpc_url(&self) -> String {
+        // `Url::as_str` appends a trailing slash for the empty path; trim it
+        // back to the exact `http://host:port` form the fixture built.
+        self.url.as_str().trim_end_matches('/').to_string()
+    }
+
+    /// Per-fixture chain id (anvil `--chain-id`); also the EIP-712 / ed25519
+    /// domain chain id every signature in this fixture is bound to.
+    #[must_use]
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Deployed protocol contract addresses.
+    #[must_use]
+    pub const fn addrs(&self) -> ContractAddrs {
+        self.addrs
+    }
+
+    /// Mock USDC (mintable) the settlement token points at.
+    #[must_use]
+    pub const fn usdc(&self) -> Address {
+        self.usdc
+    }
+
+    /// Admin provider (anvil dev #1): raw RPC, minting, TOKEN distribution.
+    #[must_use]
+    pub const fn admin(&self) -> &DynProvider {
+        &self.admin
+    }
+
+    /// The admin EOA address (initial TOKEN holder, mock-USDC minter).
+    #[must_use]
+    pub const fn admin_addr(&self) -> Address {
+        self.admin_addr
     }
 
     /// Build a wallet-filled provider for `signer` (simple nonce management
@@ -840,17 +908,32 @@ fn forge_script_body_completed(stdout: &[u8]) -> bool {
 }
 
 async fn forge_build(contracts: &Path) -> anyhow::Result<()> {
-    let mut build_cmd = tokio::process::Command::new("forge");
-    build_cmd.current_dir(contracts).args(["build"]);
-    match forge_output(build_cmd, FORGE_BUILD_TIMEOUT, "forge build").await? {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => anyhow::bail!(
-            "forge build failed:\n{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ),
-        Err(timeout) => anyhow::bail!("`forge build` timed out after {timeout:?}"),
+    for attempt in 1..=BUILD_ATTEMPTS {
+        let mut build_cmd = tokio::process::Command::new("forge");
+        build_cmd.current_dir(contracts).args(["build"]);
+        match forge_output(build_cmd, FORGE_BUILD_TIMEOUT, "forge build").await? {
+            Ok(out) if out.status.success() => return Ok(()),
+            // A non-zero exit is a deterministic compile error — retrying wastes
+            // attempts, so surface it immediately with diagnostics.
+            Ok(out) => anyhow::bail!(
+                "forge build failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(timeout) => {
+                if attempt == BUILD_ATTEMPTS {
+                    anyhow::bail!(
+                        "forge build failed after {BUILD_ATTEMPTS} attempts; \
+                         final attempt timed out after {timeout:?}"
+                    );
+                }
+                tracing::warn!(
+                    "forge build attempt {attempt}/{BUILD_ATTEMPTS} timed out after {timeout:?}, retrying"
+                );
+            }
+        }
     }
+    anyhow::bail!("BUILD_ATTEMPTS must be >= 1 (was {BUILD_ATTEMPTS})")
 }
 
 /// Deploy the mintable mock USDC from its compiled artifact bytecode.

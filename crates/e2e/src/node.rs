@@ -24,7 +24,7 @@ use decdn_common::admin::AdminRpcClient;
 use decdn_common::identity;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
-use crate::chain::ChainFixture;
+use crate::chain::{ChainFixture, ContractAddrs};
 
 /// Fixed keystore password for the daemon's eth signer (test-only). Public so a
 /// journey that drives the `decdn` CLI against this node's keystore can pass it
@@ -51,27 +51,27 @@ impl Drop for NodeGuard {
 
 /// A live `decdn-node` daemon onboarded against a chain deployment, serving one
 /// pre-seeded blob via a filesystem pull-through origin.
+///
+/// The descriptive handles (operator keys/address, node id, ports, admin URL,
+/// config path) are facts about the already-running daemon, fixed at
+/// [`Self::launch`]. They are exposed as accessors rather than `pub` fields so a
+/// caller can't reassign one and silently desync the fixture from the live
+/// process it describes.
 #[derive(Debug)]
 pub struct NodeFixture {
     child: NodeGuard,
     // TempDirs kept alive for the daemon's lifetime.
     _data_dir: tempfile::TempDir,
     _origin_dir: tempfile::TempDir,
-    /// The operator's Ethereum signer (also the on-chain bond/settlement key).
-    pub operator: PrivateKeySigner,
-    /// The operator's Ethereum address.
-    pub operator_addr: Address,
-    /// The node's iroh identity (its `NodeId`), for clients to dial.
-    pub node_id: iroh::PublicKey,
-    /// QUIC bind port (loopback) the client dials.
-    pub bind_port: u16,
-    /// Loopback admin RPC base URL.
-    pub admin_url: String,
-    /// Path to the rendered `node.toml` (in the data dir): used to respawn the
-    /// daemon on [`NodeFixture::restart`] against the same state, and public so
-    /// a journey can point the `decdn` CLI at the same `[blockchain]`
-    /// coordinates + keystore the daemon uses (#1032).
-    pub config_path: PathBuf,
+    operator: PrivateKeySigner,
+    operator_addr: Address,
+    node_id: iroh::PublicKey,
+    bind_port: u16,
+    admin_url: String,
+    // Rendered `node.toml`: respawns the daemon on `restart` against the same
+    // state; `config_path()` lets a journey point the `decdn` CLI at the same
+    // `[blockchain]` coordinates + keystore the daemon uses (#1032).
+    config_path: PathBuf,
 }
 
 impl NodeFixture {
@@ -87,6 +87,43 @@ impl NodeFixture {
             .pop()
             .ok_or_else(|| anyhow::anyhow!("launch_with_blobs returned no hash"))?;
         Ok((node, hash))
+    }
+
+    /// The operator's Ethereum signer (also the on-chain bond/settlement key).
+    #[must_use]
+    pub const fn operator(&self) -> &PrivateKeySigner {
+        &self.operator
+    }
+
+    /// The operator's Ethereum address.
+    #[must_use]
+    pub const fn operator_addr(&self) -> Address {
+        self.operator_addr
+    }
+
+    /// The node's iroh identity (its `NodeId`), for clients to dial.
+    #[must_use]
+    pub const fn node_id(&self) -> iroh::PublicKey {
+        self.node_id
+    }
+
+    /// QUIC bind port (loopback) the client dials.
+    #[must_use]
+    pub const fn bind_port(&self) -> u16 {
+        self.bind_port
+    }
+
+    /// Loopback admin RPC base URL.
+    #[must_use]
+    pub fn admin_url(&self) -> &str {
+        &self.admin_url
+    }
+
+    /// Path to the rendered `node.toml`: lets a journey point the `decdn` CLI at
+    /// the same `[blockchain]` coordinates + keystore the daemon uses (#1032).
+    #[must_use]
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
     }
 
     /// Provision a data dir + keystore + iroh key, onboard the operator
@@ -139,9 +176,9 @@ impl NodeFixture {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let bind_port = crate::free_port()?;
-        let admin_port = crate::free_port()?;
-        let metrics_port = crate::free_port()?;
+        // One simultaneous grab so the three ports are guaranteed distinct
+        // (three sequential grabs can repeat a number).
+        let [bind_port, admin_port, metrics_port] = crate::free_ports::<3>()?;
         let multiaddr = format!("/ip4/127.0.0.1/udp/{bind_port}/quic-v1");
 
         chain
@@ -156,11 +193,12 @@ impl NodeFixture {
             bind_port,
             admin_port,
             metrics_port,
-            rpc_url: &chain.rpc_url,
+            rpc_url: &chain.rpc_url(),
             keystore: &keystore,
             cache_dir: &cache_dir,
             origin_dir: origin_dir.path(),
-            chain,
+            chain_id: chain.chain_id(),
+            addrs: chain.addrs(),
         });
         let config_path = data_dir.path().join("node.toml");
         std::fs::write(&config_path, config).context("write node config")?;
@@ -294,7 +332,9 @@ impl NodeFixture {
     }
 }
 
-/// Inputs for [`render_config`].
+/// Inputs for [`render_config`]. Holds only the chain coordinates the template
+/// needs (`chain_id` + contract `addrs`) rather than the whole
+/// [`ChainFixture`], so the renderer is unit-testable without a live chain.
 struct RenderConfig<'a> {
     data_dir: PathBuf,
     region: &'a str,
@@ -305,14 +345,15 @@ struct RenderConfig<'a> {
     keystore: &'a std::path::Path,
     cache_dir: &'a std::path::Path,
     origin_dir: &'a std::path::Path,
-    chain: &'a ChainFixture,
+    chain_id: u64,
+    addrs: ContractAddrs,
 }
 
 /// Render the daemon TOML config. Emits only the keys the fixture sets; the
 /// daemon fills the rest from defaults. `event_poll_interval_ms` is dropped to
 /// 500ms so chain watchers react quickly against the local anvil.
 fn render_config(c: &RenderConfig<'_>) -> String {
-    let a = &c.chain.addrs;
+    let a = &c.addrs;
     // Path fields use single-quoted TOML *literal* strings so backslashes in a
     // Windows path (or any stray escape) round-trip verbatim. The other string
     // values are controlled (alpha-2 region, `http://127.0.0.1:port` RPC, hex
@@ -365,7 +406,7 @@ metrics_bind = "127.0.0.1"
         bind_port = c.bind_port,
         rpc_url = c.rpc_url,
         keystore = c.keystore.display(),
-        chain_id = c.chain.chain_id,
+        chain_id = c.chain_id,
         payment_channel = a.payment_channel,
         capacity_bond = a.capacity_bond,
         slash_judge = a.slash_judge,
@@ -432,4 +473,67 @@ fn spawn_daemon(config_path: &std::path::Path) -> anyhow::Result<Child> {
         )
         .spawn()
         .context("spawn decdn-node")
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    /// A malformed `render_config` template only surfaces behind the `anvil-e2e`
+    /// feature (Foundry + a built binary). Parse the rendered TOML here so a
+    /// template regression (bad `format!`, dropped/mis-nested key) is caught in
+    /// a normal `cargo nextest run -p decdn-e2e`, no chain required.
+    #[test]
+    fn render_config_emits_parseable_toml() {
+        let addrs = ContractAddrs {
+            capacity_bond: Address::from([0x11; 20]),
+            payment_channel: Address::from([0x22; 20]),
+            fee_router: Address::from([0x33; 20]),
+            token: Address::from([0x44; 20]),
+            slash_judge: Address::from([0x55; 20]),
+            slash_appeal: Address::from([0x66; 20]),
+            governor: Address::from([0x77; 20]),
+            timelock: Address::from([0x88; 20]),
+            publisher_registry: Address::from([0x99; 20]),
+            origin_assignment: Address::from([0xAA; 20]),
+            content_blacklist: Address::from([0xBB; 20]),
+        };
+        let rendered = render_config(&RenderConfig {
+            data_dir: PathBuf::from("/var/lib/decdn"),
+            region: "US",
+            bind_port: 4433,
+            admin_port: 9944,
+            metrics_port: 9100,
+            rpc_url: "http://127.0.0.1:8545",
+            keystore: std::path::Path::new("/var/lib/decdn/keystore.json"),
+            cache_dir: std::path::Path::new("/var/lib/decdn/cache"),
+            origin_dir: std::path::Path::new("/var/lib/decdn/origin"),
+            chain_id: 31_337,
+            addrs,
+        });
+
+        // The core check: the whole template parses as TOML.
+        let doc: toml::Value =
+            toml::from_str(&rendered).expect("render_config must emit valid TOML");
+
+        // Guard the tables/keys the daemon depends on against silent drift.
+        assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
+        assert_eq!(
+            doc["blockchain"]["capacity_bond_address"].as_str(),
+            Some(addrs.capacity_bond.to_string().as_str())
+        );
+        assert_eq!(
+            doc["blockchain"]["redeem_threshold_micro_usdc"].as_integer(),
+            Some(10)
+        );
+        assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
+        assert!(doc["cache"]["origin"].get("path").is_some());
+        assert_eq!(doc["payment"]["rate_per_mb"].as_integer(), Some(10));
+        assert_eq!(doc["observability"]["admin_port"].as_integer(), Some(9944));
+        assert_eq!(
+            doc["observability"]["metrics_port"].as_integer(),
+            Some(9100)
+        );
+    }
 }

@@ -28,12 +28,12 @@
 
 use std::time::Duration;
 
-use alloy::primitives::U256;
+use alloy::primitives::{B256, U256};
 use anyhow::Context;
 use decdn_common::admin::AdminRpcClient;
 use decdn_e2e::assert as e2e_assert;
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::client::ClientFixture;
+use decdn_e2e::client::{ClientFixture, DEPOSIT_MICRO_USDC};
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::time;
 
@@ -73,8 +73,12 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- Layer 2 (chain): the operator is active (bonded + registered).
     assert!(
-        e2e_assert::operator_active(&chain.admin, chain.addrs.capacity_bond, node.operator_addr)
-            .await?,
+        e2e_assert::operator_active(
+            chain.admin(),
+            chain.addrs().capacity_bond,
+            node.operator_addr()
+        )
+        .await?,
         "operator must be on-chain active"
     );
 
@@ -86,37 +90,55 @@ async fn run() -> anyhow::Result<()> {
         "delivered bytes must match the blob"
     );
 
-    // ---- Cross-layer: the daemon now reports the open channel over admin RPC.
-    // The poll closure propagates the real admin error rather than swallowing it
-    // into a generic timeout.
-    let channels = poll(Duration::from_secs(30), || async {
+    // ---- Cross-layer: the daemon reports *the* channel we paid through — not
+    // merely that some channel exists. Match on the exact on-chain channelId,
+    // then check the counterparty + deposit it reports. The poll closure
+    // propagates the real admin error rather than swallowing it into a generic
+    // timeout.
+    let expected_cid = outcome.channel_id;
+    let snapshot = poll(Duration::from_secs(30), || async {
         let c = admin.channels().await.context("admin channels")?;
-        Ok(if c.channels.is_empty() { None } else { Some(c) })
+        Ok(c.channels.into_iter().find(|s| {
+            s.channel_id
+                .parse::<B256>()
+                .is_ok_and(|id| id == expected_cid)
+        }))
     })
-    .await?;
-    assert!(
-        channels.is_some(),
-        "daemon admin RPC never reported the open channel"
+    .await?
+    .with_context(|| format!("daemon admin RPC never reported the paid channel {expected_cid}"))?;
+    assert_eq!(
+        snapshot.counterparty,
+        client.address().to_string(),
+        "reported channel counterparty must be the buyer"
+    );
+    assert_eq!(
+        snapshot.deposit_micro_usdc, DEPOSIT_MICRO_USDC,
+        "reported channel deposit must match the opened deposit"
     );
 
     // ---- Cross-layer: delivery landed on-chain — the seller redeemed the
-    // voucher, so FeeRouter served-bytes for the operator advanced past zero.
+    // voucher, so FeeRouter accumulates the voucher's delivered-bytes (ADR 036).
+    // A single-blob fetch redeems one cumulative voucher, so served-bytes equals
+    // the exact payload size; assert that precise count to catch accounting
+    // drift, not merely that it advanced past zero.
+    let expected_served = U256::from(payload.len());
     let served = poll(Duration::from_secs(90), || async {
         let b = chain
-            .served_bytes(node.operator_addr)
+            .served_bytes(node.operator_addr())
             .await
             .context("read served bytes")?;
         Ok(if b > U256::ZERO { Some(b) } else { None })
     })
-    .await?;
-    assert!(
-        served.is_some(),
-        "on-chain served-bytes never advanced (seller redeem did not land)"
+    .await?
+    .context("on-chain served-bytes never advanced (seller redeem did not land)")?;
+    assert_eq!(
+        served, expected_served,
+        "on-chain served-bytes must equal the delivered payload size"
     );
 
     // ---- Time control: advancing the chain clock works (used by window
     // journeys: dispute / timelock / unbond).
-    time::increase_time(&chain.admin, 60).await?;
+    time::increase_time(chain.admin(), 60).await?;
 
     Ok(())
 }

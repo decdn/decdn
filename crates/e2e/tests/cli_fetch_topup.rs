@@ -92,15 +92,15 @@ async fn run() -> anyhow::Result<()> {
         .await?;
 
     let buyer_provider = chain.provider_for(&buyer_signer);
-    let pc = PaymentChannel::new(chain.addrs.payment_channel, buyer_provider.clone());
+    let pc = PaymentChannel::new(chain.addrs().payment_channel, buyer_provider.clone());
     // Unlimited standing allowance: covers both the initial `openChannel`
     // deposit and the later refill `topUp` without re-approving (a `--max-approve`
     // buyer). Passing `None` selects the max-approval path.
     ensure_allowance(
         &buyer_provider,
-        chain.usdc,
+        chain.usdc(),
         buyer_addr,
-        chain.addrs.payment_channel,
+        chain.addrs().payment_channel,
         None,
     )
     .await
@@ -109,13 +109,13 @@ async fn run() -> anyhow::Result<()> {
     // Clamp the deposit up to the on-chain floor (as the CLI open path does).
     let min_deposit = pc.minDeposit().call().await.context("read minDeposit")?;
     let deposit = U256::from(DEPOSIT_MICRO_USDC).max(min_deposit);
-    let voucher_dom = voucher_domain(chain.chain_id, chain.addrs.payment_channel);
+    let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_channel);
 
     let opened = open_channel(
         &pc,
         Arc::new(buyer_signer.clone()),
         &voucher_dom,
-        chain.usdc,
+        chain.usdc(),
         buyer_addr,
         provider_addr,
         deposit,
