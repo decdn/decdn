@@ -77,8 +77,8 @@ pub use probe_sig::{
 };
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 pub use store::{
-    ChannelStateStore, MemoryChannelStateStore, MemoryPendingSettleStore, PendingSettle,
-    PendingSettleStore, StoreError, WatcherCheckpointStore,
+    ChannelStateStore, CheckpointKey, KeyedCheckpointStore, MemoryChannelStateStore,
+    MemoryPendingSettleStore, PendingSettle, PendingSettleStore, StoreError,
 };
 pub use stream_sig::{StreamSlashData, StreamSlashError};
 pub use swap_balancer::BalancerV3Venue;

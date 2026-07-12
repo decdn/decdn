@@ -153,63 +153,97 @@ pub trait PendingSettleStore: Send + Sync {
     fn forget_pending(&self, channel_id: ChannelId) -> Result<(), StoreError>;
 }
 
-/// Durable high-water mark of the last block the settlement watcher scanned for
-/// `ChannelOpened` events (#751). Persisting it across restarts is what lets the
-/// watcher bring-up backfill cover the **downtime gap**: a channel a client
-/// opens against this node while the node is *down* lands in a block before the
-/// next boot's head, so without a persisted floor the head-anchored backfill
-/// (#762) never sees it and the channel's vouchers are rejected `WrongChannel`
-/// forever. On boot the watcher backfills from the stored block (minus a small
-/// reorg margin) up to the live-filter install block; `register_open_channel`
-/// is idempotent, so re-scanning the overlap is harmless.
+/// Identifies which on-chain event watcher a persisted scan checkpoint belongs
+/// to (#1092). Every variant maps to a stable string key in the single
+/// `watcher_checkpoint_v1` table, so one concrete store holds every watcher's
+/// high-water mark (redb forbids two `Database` handles to one file).
+///
+/// The [`as_str`](CheckpointKey::as_str) literals are **on-disk identifiers**:
+/// renaming one silently forfeits that watcher's resume (its next boot re-scans
+/// from the configured floor instead of the stored block), so they are frozen
+/// for backward compatibility. `ChannelOpened`'s literal predates the keyed
+/// store (#751) and is preserved verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CheckpointKey {
+    /// Settlement watcher `ChannelOpened` high-water block (#751).
+    ChannelOpened,
+    /// Blacklist watcher `HashBlacklisted`/`HashRemoved` scan cursor (#1108).
+    Blacklist,
+    /// Origin-directory watcher `ContentClaimed` scan cursor (#1108).
+    Origin,
+}
+
+impl CheckpointKey {
+    /// The stable on-disk key for this checkpoint. Frozen for backward
+    /// compatibility — see the type-level doc.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChannelOpened => "channel_opened_last_block",
+            Self::Blacklist => "content_blacklist_last_block",
+            Self::Origin => "origin_directory_last_block",
+        }
+    }
+}
+
+/// Durable high-water marks of the last block each on-chain watcher scanned,
+/// keyed by [`CheckpointKey`] (#751, generalized in #1092/#1108). Persisting
+/// them across restarts is what lets a watcher's bring-up backfill cover the
+/// **downtime gap**: an event landing while the node is *down* sits in a block
+/// before the next boot's head, so without a persisted floor a head-anchored
+/// backfill never sees it (e.g. a settlement `ChannelOpened` whose channel then
+/// rejects vouchers `WrongChannel` forever, #762). On boot the watcher backfills
+/// from the stored block (minus a small reorg margin) up to head; the per-log
+/// sinks are idempotent, so re-scanning the overlap is harmless.
 ///
 /// A directly disk-backed implementation MUST commit durably (fsync) before
-/// returning `Ok` from `record_last_seen_block`, mirroring the
+/// returning `Ok` from [`record_checkpoint`](Self::record_checkpoint), mirroring the
 /// [`ChannelStateStore`] durability contract. A debouncing *decorator* MAY
 /// relax that per-call fsync — buffering in memory and coarsening the durable
 /// write cadence — provided it preserves the two invariants this contract
-/// rests on: the persisted block is **monotonic** (never lowered) and the
-/// latest buffered block is forced out on graceful shutdown via
-/// [`flush`](WatcherCheckpointStore::flush). Both relaxations are safe because
-/// a lost or lagging checkpoint only ever silently widens the rescan (more
-/// RPC), never narrows it.
-pub trait WatcherCheckpointStore: Send + Sync {
-    /// The last block scanned for `ChannelOpened`, or `None` on a never-written
-    /// store (first-ever boot — there is no downtime gap to cover, so the
-    /// caller backfills from the current head).
+/// rests on, **per key**: the persisted block is **monotonic** (never lowered)
+/// and the latest buffered block is forced out on graceful shutdown via
+/// [`flush_checkpoint`](KeyedCheckpointStore::flush_checkpoint). Both relaxations are safe because a
+/// lost or lagging checkpoint only ever silently widens the rescan (more RPC),
+/// never narrows it.
+pub trait KeyedCheckpointStore: Send + Sync {
+    /// The last block scanned for `key`, or `None` on a never-written key
+    /// (first-ever boot for that watcher — the caller applies its configured
+    /// none-fallback floor).
     ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the backing store is unreadable.
-    fn load_last_seen_block(&self) -> Result<Option<u64>, StoreError>;
+    fn load_checkpoint(&self, key: CheckpointKey) -> Result<Option<u64>, StoreError>;
 
-    /// Persist the last block scanned for `ChannelOpened`. Overwrites the prior
-    /// value. Called after the bring-up backfill completes and as the live
-    /// stream advances, so the next boot resumes from here.
+    /// Persist the last block scanned for `key`. Overwrites the prior value.
+    /// Called as each backfill window and live tick advances, so the next boot
+    /// resumes from here.
     ///
     /// A debouncing decorator MAY buffer the value in memory and defer the
     /// durable write to a coarser cadence (the floor only ever lags the true
     /// scan position, which is safe — see the type-level contract above); such
-    /// a decorator overrides [`flush`](Self::flush) to force the buffered value
+    /// a decorator overrides [`flush_checkpoint`](Self::flush_checkpoint) to force the buffered value
     /// out on graceful shutdown. A directly disk-backed implementation commits
     /// durably before returning `Ok`.
     ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the durable write fails.
-    fn record_last_seen_block(&self, block: u64) -> Result<(), StoreError>;
+    fn record_checkpoint(&self, key: CheckpointKey, block: u64) -> Result<(), StoreError>;
 
-    /// Force any buffered checkpoint to durable storage. The default is a no-op:
-    /// implementations that already commit durably inside
-    /// [`record_last_seen_block`](Self::record_last_seen_block) have nothing
-    /// buffered. A debouncing decorator overrides this to fsync the latest
-    /// deferred block, and the runtime calls it on graceful shutdown so the most
-    /// recent scan progress is not lost to the next boot's rescan.
+    /// Force any buffered checkpoint for `key` to durable storage. The default
+    /// is a no-op: implementations that already commit durably inside
+    /// [`record_checkpoint`](Self::record_checkpoint) have nothing buffered. A debouncing decorator
+    /// overrides this to fsync the latest deferred block, and the runtime calls
+    /// it on graceful shutdown so the most recent scan progress is not lost to
+    /// the next boot's rescan.
     ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the durable write fails.
-    fn flush(&self) -> Result<(), StoreError> {
+    fn flush_checkpoint(&self, key: CheckpointKey) -> Result<(), StoreError> {
+        let _ = key;
         Ok(())
     }
 }

@@ -15,46 +15,59 @@
 //! - **Filter-first, then head.** Each cycle installs the live filter *before*
 //!   reading the head block used as the backfill bound, so no block mined
 //!   between the two falls into a gap (same ordering as the settlement watcher).
-//! - **Rebuild from a floor on every start.** The detected-slash store is
-//!   in-memory, so it is empty on each process start and must be rebuilt by
-//!   scanning history — a durable scan checkpoint could not skip this (resuming
-//!   from it would drop still-appealable slashes at/below the checkpoint). The
-//!   first cycle therefore scans `[from_block, head]`, where `from_block` is the
-//!   configured `SlashJudge` deployment floor (`0` = genesis). This re-surfaces
-//!   a slash mined while the node was down on the next restart, within its
-//!   30-day appeal window.
-//! - **Cursor across resubscribes.** Within one process, a cursor is carried
-//!   across every resubscribe (filter TTL expiry / RPC error), so an in-process
-//!   outage `[cursor, head]` window is recovered by the next cycle's backfill.
-//!   The resume rewinds the cursor by `REORG_MARGIN_BLOCKS` (shared with the
-//!   settlement watcher), so a shallow reorg during the backoff can't hide a
-//!   `Slashed` log re-mined at a slightly different height.
-//! - **Bounded backfill.** The scanned range is walked in
-//!   `MAX_BACKFILL_BLOCK_SPAN`-block windows (one `eth_getLogs` each) via the
-//!   shared `payment_settlement::backfill_windows`, so a single call never
-//!   exceeds a provider's range cap.
-//!
-//! The store is deduped by `slashId`, so the backfill/live overlap is harmless.
+//! - **Rebuild from a bounded floor on every start.** The detected-slash store
+//!   is in-memory, so it is empty on each process start and must be rebuilt by
+//!   scanning history — a durable resume cursor could not skip this (resuming
+//!   from it would drop still-appealable slashes at/below the cursor). But only
+//!   the still-appealable tail matters, so the boot scan is bounded to the
+//!   `appeal_window_blocks` lookback (`head - ~30 days`, clamped `>= from_block`
+//!   the `SlashJudge` deploy floor) rather than genesis (#1108) — turning an
+//!   O(chain-age) boot scan into O(appeal window). This still re-surfaces a slash
+//!   mined while the node was down on the next restart, within its appeal window.
+//! - **Unified getLogs poller.** Backfill and the live tail are one
+//!   `resumable_watcher` cursor loop (#1092/#1106): each poll tick scans
+//!   `[cursor, head]` in `MAX_BACKFILL_BLOCK_SPAN` windows via `eth_getLogs`
+//!   (no `eth_newFilter`), advancing the cursor. The store is deduped by
+//!   `slashId`, so the re-scan overlap each boot is harmless.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::Filter;
+use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use decdn_incentive::slash_judge::SlashJudge;
-use futures_util::StreamExt;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::chain_events::watch_filter;
+use crate::chain_events::resumable_watcher::{
+    self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
+};
 use crate::metrics::Metrics;
-use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, backfill_windows};
+use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS};
 
 /// Nominal appeal filing window (ADR 028: 30 days from the slash timestamp).
 const APPEAL_FILING_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Nominal Arbitrum block time. Used only to convert the 30-day appeal window
+/// into a block-count lookback for the boot re-scan (below); it does not need to
+/// be exact, only a *lower* bound on the true block time so the derived
+/// block-count is an *upper* bound and the re-scan never covers less than the
+/// appeal window. Arbitrum Sepolia observes ~0.25–0.3s/block.
+const ARBITRUM_BLOCK_TIME_MS: u64 = 250;
+
+/// Block-count lookback that covers at least the [`APPEAL_FILING_WINDOW_SECS`]
+/// appeal window (#1108). The slash watcher re-scans `[head - this, head]` each
+/// boot (clamped `>= from_block`) instead of `[from_block, head]`, because the
+/// in-memory store must be rebuilt every start but only the still-appealable tail
+/// matters — bounding an O(chain-age) boot scan to O(appeal window). `div_ceil`
+/// keeps it an upper bound so the window is never under-covered.
+const fn appeal_window_blocks() -> u64 {
+    (APPEAL_FILING_WINDOW_SECS * 1_000).div_ceil(ARBITRUM_BLOCK_TIME_MS)
+}
 
 /// Backoff bounds for the resubscribe loop (mirrors the settlement watcher).
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -116,29 +129,56 @@ impl SlashWatcher {
     /// bring-up failure retries with backoff rather than disabling detection for
     /// the daemon's lifetime.
     ///
-    /// `from_block` is the first-run scan floor (the `SlashJudge` deployment
-    /// block; `0` scans from genesis). The in-memory store is rebuilt from this
-    /// floor on **every** process start, so a slash mined while the node was down
-    /// is re-surfaced on restart within its 30-day appeal window — the store is
-    /// not durable, so a scan checkpoint could not skip this rebuild.
+    /// `from_block` is the deploy floor the boot re-scan is clamped to. The
+    /// in-memory store is rebuilt on **every** process start, but bounded to the
+    /// `appeal_window_blocks` lookback (`head - ~30 days`, clamped `>=
+    /// from_block`) rather than genesis (#1108), so a slash mined while the node
+    /// was down is re-surfaced on restart within its appeal window without an
+    /// O(chain-age) scan — the store is not durable, so a resume cursor could not
+    /// skip this rebuild.
     #[must_use]
     pub fn bootstrap<P: Provider + Clone + 'static>(
         provider: P,
         slash_judge_addr: Address,
         self_address: Address,
         from_block: u64,
+        event_poll_interval: Duration,
         metrics: Arc<Metrics>,
     ) -> Self {
         info!(%slash_judge_addr, %self_address, from_block, "slash-detection watcher started");
         let store: SlashStore = Arc::new(RwLock::new(Vec::new()));
-        let task = tokio::spawn(watcher_loop(
-            provider,
-            slash_judge_addr,
+        let on_established = Some(established_hook(&metrics));
+        let on_backoff = Some(backoff_hook(&metrics));
+        let sink = SlashSink {
+            provider: provider.clone(),
             self_address,
-            from_block,
-            Arc::clone(&store),
+            store: Arc::clone(&store),
             metrics,
-        ));
+        };
+        let cfg = WatcherConfig {
+            filter: operator_filter(slash_judge_addr, self_address),
+            from_block,
+            poll_interval: event_poll_interval,
+            confirmations: 0,
+            reorg_margin: REORG_MARGIN_BLOCKS,
+            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
+            // No durable resume cursor (the in-memory store is rebuilt each boot);
+            // re-scan the bounded appeal-window lookback, clamped to the deploy
+            // floor, so a slash mined while down is re-surfaced (#1108).
+            cursor: CursorPolicy::HeadMinusWindow {
+                window_blocks: appeal_window_blocks(),
+                floor: from_block,
+            },
+            initial_backoff: WATCHER_INITIAL_BACKOFF,
+            max_backoff: WATCHER_MAX_BACKOFF,
+            rpc_call_timeout: None,
+            shutdown: CancellationToken::new(),
+            seed_cursor: None,
+            label: "slash",
+            on_established,
+            on_backoff,
+        };
+        let task = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
         Self {
             store,
             _task: AbortOnDrop(task),
@@ -152,144 +192,44 @@ impl SlashWatcher {
     }
 }
 
-/// Background watcher: install the operator-filtered `Slashed` stream, backfill
-/// `[cursor, head]`, then drain the stream — resubscribing with exponential
-/// backoff on error and re-arming the backfill from the retained cursor so an
-/// outage window is recovered on the next cycle.
-async fn watcher_loop<P: Provider + Clone>(
+/// Applies operator-filtered `Slashed` logs to the in-memory detected-slash
+/// store (#1092). `apply` never returns `Err`: [`record_log`] decodes, skips a
+/// reorged-out/undecodable/foreign log, and dedupes by `slashId`, so a bad log
+/// neither tears down the poll cycle nor hot-loops the deterministic re-scan. The
+/// best-effort appeal-window block-timestamp read fails soft (logged, `None`).
+struct SlashSink<P: Provider + Clone> {
     provider: P,
-    slash_judge_addr: Address,
     self_address: Address,
-    from_block: u64,
     store: SlashStore,
     metrics: Arc<Metrics>,
-) {
-    // Next-block-to-scan cursor, carried across resubscribes. `None` until the
-    // first cycle seeds it at `from_block` (rebuilding the in-memory store from
-    // the floor on every process start).
-    let mut cursor: Option<u64> = None;
-    let mut backoff = WATCHER_INITIAL_BACKOFF;
-    loop {
-        match run_once(
-            &provider,
-            slash_judge_addr,
-            self_address,
-            from_block,
-            &mut cursor,
-            &store,
-            &metrics,
+}
+
+impl<P: Provider + Clone> LogSink for SlashSink<P> {
+    async fn apply(&mut self, log: Log) -> Result<()> {
+        record_log(
+            &self.provider,
+            self.self_address,
+            &self.store,
+            &self.metrics,
+            &log,
         )
-        .await
-        {
-            Ok(()) => {
-                // A "clean" end is often a provider-side filter TTL expiry
-                // (common on polling RPCs). Pace the resubscribe by at least the
-                // initial backoff so a stream that keeps ending immediately
-                // can't spin into a zero-delay resubscribe storm. `down_since`
-                // was already cleared inside `run_once` when the cycle
-                // established, so a clean end reads 0 downtime.
-                debug!("slash watcher stream ended cleanly; resubscribing after backoff");
-                tokio::time::sleep(WATCHER_INITIAL_BACKOFF).await;
-                backoff = WATCHER_INITIAL_BACKOFF;
-            }
-            Err(err) => {
-                // Open/keep a downtime window so `slash_watcher_down_seconds`
-                // climbs — the only signal a wedged watcher is silently missing
-                // slashes (`admin_v1_slashes` is always wired).
-                metrics.slash_watcher_backoff_started();
-                warn!(
-                    %err,
-                    backoff_secs = backoff.as_secs(),
-                    "slash watcher error; restarting after backoff"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(WATCHER_MAX_BACKOFF);
-            }
-        }
+        .await;
+        Ok(())
     }
 }
 
-/// One watcher cycle: install the operator-filtered live stream, read the head
-/// as the backfill bound, backfill `[cursor, head]` in bounded windows, advance
-/// the cursor, then drain the live stream until it ends or errors.
-async fn run_once<P: Provider + Clone>(
-    provider: &P,
-    slash_judge_addr: Address,
-    self_address: Address,
-    from_block: u64,
-    cursor: &mut Option<u64>,
-    store: &SlashStore,
-    metrics: &Arc<Metrics>,
-) -> Result<()> {
-    // Install the live filter first so any slash mined between the head read
-    // below and the filter install still buffers in the stream (the backfill
-    // covers up to head; the overlap is deduped by `slashId`).
-    let mut events = watch_filter(provider, operator_filter(slash_judge_addr, self_address))
-        .await
-        .context("watch SlashJudge Slashed for operator")?;
-
-    let head = provider
-        .get_block_number()
-        .await
-        .context("read head block for slash backfill bound")?;
-    // First cycle scans from the configured floor (rebuilding the in-memory
-    // store from `from_block` on every process start, so a restart re-surfaces a
-    // slash mined while down); later cycles resume from the retained cursor
-    // rewound by `REORG_MARGIN_BLOCKS`, so an in-process outage `[cursor, head]`
-    // window is recovered and a shallow reorg during the backoff can't hide a
-    // re-mined `Slashed` log (the `slashId` dedup makes the overlap free).
-    let from = resolve_scan_start(*cursor, from_block, head, REORG_MARGIN_BLOCKS);
-    for (start, end) in backfill_windows(from, head, MAX_BACKFILL_BLOCK_SPAN) {
-        let filter = operator_filter(slash_judge_addr, self_address)
-            .from_block(start)
-            .to_block(end);
-        let logs = provider
-            .get_logs(&filter)
-            .await
-            .with_context(|| format!("get_logs Slashed backfill [{start}, {end}]"))?;
-        for log in logs {
-            record_log(provider, self_address, store, metrics, &log).await;
-        }
-    }
-    // Retain progress: the next resubscribe backfills from here (rewound by the
-    // reorg margin in `resolve_scan_start`), covering any gap. `head + 1` never
-    // regresses (head only grows).
-    *cursor = Some(head + 1);
-
-    // The cycle is established (filter installed, backfill drained), so clear
-    // any downtime window — `slash_watcher_down_seconds` reads 0 for the life of
-    // this healthy cycle, even if the live drain below runs for hours.
-    metrics.slash_watcher_cycle_established();
-
-    while let Some(log) = events.next().await {
-        record_log(provider, self_address, store, metrics, &log).await;
-    }
-    Ok(())
+/// Wire the watcher's healthy-cycle transition to `slash_watcher_cycle_established`
+/// (down-seconds → 0).
+fn established_hook(metrics: &Arc<Metrics>) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || metrics.slash_watcher_cycle_established())
 }
 
-/// Resolve this cycle's backfill start. First cycle (`cursor == None`): the
-/// configured `from_block` floor, rebuilding the in-memory store on every
-/// process start. Later cycles: the retained cursor rewound by `margin` blocks,
-/// so a shallow reorg during the resubscribe backoff can't hide a `Slashed` log
-/// re-mined at a slightly different height — the `slashId` dedup makes the
-/// overlap free. Clamped to `>= from_block` (the contract does not exist below
-/// its deployment floor) and `<= head` (a cursor momentarily ahead of a lagging
-/// RPC head never inverts the `[start, head]` range). Pure so the policy is
-/// unit-testable without a live provider (mirrors
-/// `payment_settlement::resolve_backfill_start`).
-const fn resolve_scan_start(cursor: Option<u64>, from_block: u64, head: u64, margin: u64) -> u64 {
-    let start = match cursor {
-        Some(c) => {
-            let rewound = c.saturating_sub(margin);
-            if rewound > from_block {
-                rewound
-            } else {
-                from_block
-            }
-        }
-        None => from_block,
-    };
-    if start < head { start } else { head }
+/// Wire a tick failure to `slash_watcher_backoff_started` (opens the downtime
+/// window `slash_watcher_down_seconds` reads).
+fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || metrics.slash_watcher_backoff_started())
 }
 
 /// The address + `Slashed`-signature + `topic2 == operator` filter shared by the
@@ -473,19 +413,19 @@ mod tests {
         );
     }
 
+    /// The scan-floor policy (cursor rewind, deploy-floor clamp, head clamp) now
+    /// lives on the resumable watcher's `resolve_head_window_start` /
+    /// `resolve_persisted_start`; its unit tests live in
+    /// `crate::chain_events::resumable_watcher`.
     #[test]
-    fn resolve_scan_start_applies_reorg_margin() {
-        // First cycle (no cursor): the configured floor, clamped to head.
-        assert_eq!(resolve_scan_start(None, 500, 2_000, 128), 500);
-        assert_eq!(resolve_scan_start(None, 5_000, 2_000, 128), 2_000);
-        // Resume: cursor rewound by the reorg margin.
-        assert_eq!(resolve_scan_start(Some(1_000), 0, 2_000, 128), 872);
-        // The rewind never drops below the deployment floor…
-        assert_eq!(resolve_scan_start(Some(1_000), 950, 2_000, 128), 950);
-        // …and saturates at 0 for an early cursor (no underflow).
-        assert_eq!(resolve_scan_start(Some(10), 0, 2_000, 128), 0);
-        // A cursor momentarily ahead of a lagging RPC head clamps to head
-        // (range never inverts).
-        assert_eq!(resolve_scan_start(Some(5_000), 0, 1_000, 128), 1_000);
+    fn appeal_window_covers_thirty_days() {
+        // The boot lookback must cover the full 30-day appeal window even at the
+        // fastest plausible block time (upper-bound block count via `div_ceil`).
+        assert_eq!(
+            appeal_window_blocks(),
+            (APPEAL_FILING_WINDOW_SECS * 1_000).div_ceil(ARBITRUM_BLOCK_TIME_MS)
+        );
+        // At least one block per second of the window (block time < 1s).
+        assert!(appeal_window_blocks() >= APPEAL_FILING_WINDOW_SECS);
     }
 }

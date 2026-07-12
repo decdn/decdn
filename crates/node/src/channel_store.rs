@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
 use decdn_incentive::store::{
-    ChannelStateStore, PendingSettle, PendingSettleStore, StoreError, WatcherCheckpointStore,
+    ChannelStateStore, CheckpointKey, KeyedCheckpointStore, PendingSettle, PendingSettleStore,
+    StoreError,
 };
 use decdn_incentive::{
     AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, ChannelState, DepositOutcome,
@@ -116,17 +117,18 @@ const PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
 const BUYER_PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
     TableDefinition::new("buyer_pending_settle_v1");
 
-/// redb table holding the settlement watcher's `ChannelOpened` scan checkpoint
-/// (#751): the last block scanned, so the bring-up backfill resumes across
-/// restarts and covers channels opened while the node was down. Lives in the
-/// same database file as [`CHANNEL_TABLE`]. A single fixed string key holds the
-/// block height; a fixed-width native `u64` value needs no postcard envelope.
+/// redb table holding each on-chain watcher's scan checkpoint (#751, keyed in
+/// #1092/#1108): the last block scanned per [`CheckpointKey`], so a bring-up
+/// backfill resumes across restarts and covers events landing while the node was
+/// down. Lives in the same database file as [`CHANNEL_TABLE`]. One `&str` key per
+/// watcher (the [`CheckpointKey::as_str`] literals); a fixed-width native `u64`
+/// value needs no postcard envelope. Multi-key is additive — pre-#1092 stores
+/// carrying only `channel_opened_last_block` upgrade in place with no migration.
 const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("watcher_checkpoint_v1");
 
-/// The sole key in [`WATCHER_CHECKPOINT_TABLE`] — the last block scanned for
-/// `ChannelOpened`.
-const WATCHER_CHECKPOINT_KEY: &str = "channel_opened_last_block";
+// The per-watcher key strings live on [`CheckpointKey::as_str`] (frozen on-disk
+// identifiers); this table stores one `u64` block height per key (#1092/#1108).
 
 /// On-disk record. All numeric fields use fixed-size big-endian byte arrays
 /// instead of variable-length integers so the encoded value width is stable
@@ -1434,8 +1436,8 @@ impl PendingSettleStore for BuyerPendingSettleStoreHandle {
     }
 }
 
-impl WatcherCheckpointStore for PersistentChannelStateStore {
-    fn load_last_seen_block(&self) -> Result<Option<u64>, StoreError> {
+impl KeyedCheckpointStore for PersistentChannelStateStore {
+    fn load_checkpoint(&self, key: CheckpointKey) -> Result<Option<u64>, StoreError> {
         let read_txn = self
             .db
             .begin_read()
@@ -1447,12 +1449,12 @@ impl WatcherCheckpointStore for PersistentChannelStateStore {
             Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
         };
         let value = table
-            .get(WATCHER_CHECKPOINT_KEY)
+            .get(key.as_str())
             .map_err(|err| StoreError::Backend(format!("get: {err}")))?;
         Ok(value.map(|g| g.value()))
     }
 
-    fn record_last_seen_block(&self, block: u64) -> Result<(), StoreError> {
+    fn record_checkpoint(&self, key: CheckpointKey, block: u64) -> Result<(), StoreError> {
         let mut write_txn = self
             .db
             .begin_write()
@@ -1475,7 +1477,7 @@ impl WatcherCheckpointStore for PersistentChannelStateStore {
                 .open_table(WATCHER_CHECKPOINT_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
-                .insert(WATCHER_CHECKPOINT_KEY, block)
+                .insert(key.as_str(), block)
                 .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
         }
         write_txn
@@ -2007,20 +2009,51 @@ mod tests {
         let dir = data_dir()?;
         {
             let store = PersistentChannelStateStore::open(dir.path())?;
-            // Never-written table → None (first-ever boot).
-            anyhow::ensure!(store.load_last_seen_block()?.is_none());
-            store.record_last_seen_block(1_000)?;
-            anyhow::ensure!(store.load_last_seen_block()? == Some(1_000));
-            // Overwrite advances the single key (no second row).
-            store.record_last_seen_block(2_500)?;
-            anyhow::ensure!(store.load_last_seen_block()? == Some(2_500));
+            // Never-written key → None (first-ever boot).
+            anyhow::ensure!(
+                store
+                    .load_checkpoint(CheckpointKey::ChannelOpened)?
+                    .is_none()
+            );
+            store.record_checkpoint(CheckpointKey::ChannelOpened, 1_000)?;
+            anyhow::ensure!(store.load_checkpoint(CheckpointKey::ChannelOpened)? == Some(1_000));
+            // Overwrite advances the same key (no second row).
+            store.record_checkpoint(CheckpointKey::ChannelOpened, 2_500)?;
+            anyhow::ensure!(store.load_checkpoint(CheckpointKey::ChannelOpened)? == Some(2_500));
         }
         // Survives a reopen.
         let store = PersistentChannelStateStore::open(dir.path())?;
         anyhow::ensure!(
-            store.load_last_seen_block()? == Some(2_500),
+            store.load_checkpoint(CheckpointKey::ChannelOpened)? == Some(2_500),
             "checkpoint must survive a restart"
         );
+        Ok(())
+    }
+
+    /// Each [`CheckpointKey`] is an independent cursor in the one table — the
+    /// #1108 win (blacklist/origin resume separately). Also asserts the
+    /// `ChannelOpened` on-disk literal is frozen: a rename would silently forfeit
+    /// the pre-#1092 settlement resume.
+    #[test]
+    fn watcher_checkpoint_keys_are_independent() -> anyhow::Result<()> {
+        assert_eq!(
+            CheckpointKey::ChannelOpened.as_str(),
+            "channel_opened_last_block",
+            "frozen on-disk key — renaming forfeits the #751 resume"
+        );
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        store.record_checkpoint(CheckpointKey::ChannelOpened, 100)?;
+        store.record_checkpoint(CheckpointKey::Blacklist, 200)?;
+        store.record_checkpoint(CheckpointKey::Origin, 300)?;
+        anyhow::ensure!(store.load_checkpoint(CheckpointKey::ChannelOpened)? == Some(100));
+        anyhow::ensure!(store.load_checkpoint(CheckpointKey::Blacklist)? == Some(200));
+        anyhow::ensure!(store.load_checkpoint(CheckpointKey::Origin)? == Some(300));
+        // Advancing one key leaves the others untouched.
+        store.record_checkpoint(CheckpointKey::Blacklist, 250)?;
+        anyhow::ensure!(store.load_checkpoint(CheckpointKey::ChannelOpened)? == Some(100));
+        anyhow::ensure!(store.load_checkpoint(CheckpointKey::Blacklist)? == Some(250));
+        anyhow::ensure!(store.load_checkpoint(CheckpointKey::Origin)? == Some(300));
         Ok(())
     }
 
@@ -2036,10 +2069,10 @@ mod tests {
             channel_id: s.channel_id,
             settle_after: 99,
         })?;
-        store.record_last_seen_block(4_242)?;
+        store.record_checkpoint(CheckpointKey::ChannelOpened, 4_242)?;
         anyhow::ensure!(store.load_all()?.len() == 1);
         anyhow::ensure!(store.load_pending()?.len() == 1);
-        anyhow::ensure!(store.load_last_seen_block()? == Some(4_242));
+        anyhow::ensure!(store.load_checkpoint(CheckpointKey::ChannelOpened)? == Some(4_242));
         Ok(())
     }
 

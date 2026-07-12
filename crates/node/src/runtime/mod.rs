@@ -498,7 +498,7 @@ pub async fn run(
     // service forces a final flush on graceful shutdown so steady-state progress
     // is not lost. Wrapping here (the wiring layer) keeps the domain trait and the
     // disk store free of the debounce policy.
-    let watcher_checkpoint_store: Arc<dyn decdn_incentive::WatcherCheckpointStore> = Arc::new(
+    let watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore> = Arc::new(
         crate::payment_settlement::DebouncedCheckpointStore::new(concrete_channel_store.clone()),
     );
     // Boot-time smoke test: read every persisted record so startup fails
@@ -704,6 +704,7 @@ pub async fn run(
         ChainStakerSet::bootstrap(
             chain_provider,
             capacity_bond_addr,
+            event_poll_interval,
             Arc::clone(&node_metrics),
         )
         .await
@@ -728,6 +729,7 @@ pub async fn run(
         slash_judge_addr,
         eth_signer.address(),
         cfg.blockchain.slash_judge_from_block,
+        event_poll_interval,
         Arc::clone(&node_metrics),
     );
     let slash_store = slash_watcher.store();
@@ -747,6 +749,7 @@ pub async fn run(
                     event_poll_interval,
                 ),
                 capacity_bond_addr,
+                event_poll_interval,
                 Arc::clone(&node_metrics),
             )
             .await
@@ -886,6 +889,8 @@ pub async fn run(
                     publisher_registry_addr,
                     capacity_bond_addr,
                     cfg.blockchain.origin_directory_from_block,
+                    Arc::clone(&watcher_checkpoint_store),
+                    event_poll_interval,
                     Arc::clone(&staker_set),
                     Arc::clone(&node_metrics),
                 )
@@ -1030,6 +1035,7 @@ pub async fn run(
                 .map(U256::from),
             voucher_nonce_span_threshold: cfg.blockchain.settlement_auto_by_voucher_nonce_span,
         },
+        event_poll_interval,
         Arc::clone(&node_metrics),
     )
     .await
@@ -1328,6 +1334,7 @@ pub async fn run(
                 eth_signer.address(),
                 cache.clone(),
                 cfg.blockchain.content_blacklist_from_block,
+                event_poll_interval,
                 Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
                 shutdown.clone(),
             ));
@@ -1646,6 +1653,7 @@ pub async fn run(
             payment_channel_addr,
             capacity_bond_addr,
             Arc::clone(&settlement_source),
+            event_poll_interval,
             Arc::clone(&node_metrics),
         )
         .await
@@ -2763,26 +2771,68 @@ impl ShutdownStreams {
     }
 }
 
+/// Classification of an RPC preflight/watchdog probe (#1106/#1108). A
+/// rate-limited (`429`) or server-side (`5xx`) response — and any
+/// timeout/connection error — is [`Transient`](RpcProbe::Transient): the startup
+/// preflight retries it with backoff rather than aborting the process, so a
+/// commodity endpoint that throttles the startup burst does not crash-loop the
+/// node. Any other non-2xx (a `4xx` such as a bad path/auth) is
+/// [`Fatal`](RpcProbe::Fatal) — retrying will not help.
+enum RpcProbe {
+    Healthy,
+    Transient(String),
+    Fatal(String),
+}
+
+/// Number of preflight attempts before a persistent transient failure is treated
+/// as fatal (a real outage still aborts bring-up). Backoff caps at 8s, so the
+/// worst-case wait is bounded (~5×5s request timeouts + 1+2+4+8s backoff).
+const RPC_PREFLIGHT_MAX_ATTEMPTS: u32 = 5;
+
 /// Verify that the JSON-RPC endpoint is reachable by sending a lightweight
-/// `net_version` request with a short timeout. Logs a warning and returns an
-/// error if the endpoint does not respond, letting operators catch typos and
+/// `net_version` request with a short timeout, retrying a transient (429/5xx/
+/// timeout) response with bounded backoff (#1108) — a rate-limited endpoint must
+/// not crash-loop the node at startup. A fatal (other 4xx) response, or an
+/// exhausted retry budget, aborts bring-up so operators still catch typos and
 /// dead endpoints before the node binds ports and joins the gossip network.
 async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .context("failed to build HTTP client for RPC check")?;
-    probe_rpc(&client, rpc_url).await?;
-    tracing::info!("RPC endpoint reachable");
-    Ok(())
+    let mut backoff = Duration::from_secs(1);
+    for attempt in 1..=RPC_PREFLIGHT_MAX_ATTEMPTS {
+        match probe_rpc_classified(&client, rpc_url).await {
+            RpcProbe::Healthy => {
+                tracing::info!("RPC endpoint reachable");
+                return Ok(());
+            }
+            RpcProbe::Fatal(msg) => anyhow::bail!("blockchain.rpc_url {msg}"),
+            RpcProbe::Transient(msg) if attempt == RPC_PREFLIGHT_MAX_ATTEMPTS => {
+                anyhow::bail!(
+                    "blockchain.rpc_url {msg}; still failing after {RPC_PREFLIGHT_MAX_ATTEMPTS} attempts"
+                );
+            }
+            RpcProbe::Transient(msg) => {
+                tracing::warn!(
+                    attempt,
+                    backoff_secs = backoff.as_secs(),
+                    "RPC preflight transient failure ({msg}); retrying after backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(8));
+            }
+        }
+    }
+    // The loop returns or bails on every path; this is unreachable but keeps the
+    // signature total without an `unwrap`/`unreachable!` (anti-panic policy).
+    anyhow::bail!("blockchain.rpc_url preflight exhausted retries")
 }
 
-/// Issue a single `net_version` JSON-RPC probe against `rpc_url` using the
-/// given client. Returns `Ok(())` on a 2xx response, an error otherwise.
-/// Extracted so the startup check and the watchdog share identical
-/// success/failure semantics — a deviation between the two would mean
-/// "startup says healthy, gauge says unhealthy" or vice versa.
-pub(crate) async fn probe_rpc(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
+/// Issue a single `net_version` JSON-RPC probe and classify the outcome (see
+/// [`RpcProbe`]). Shared by the startup preflight and the watchdog so their
+/// health verdict can never diverge.
+async fn probe_rpc_classified(client: &reqwest::Client, rpc_url: &str) -> RpcProbe {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "net_version",
@@ -2790,21 +2840,44 @@ pub(crate) async fn probe_rpc(client: &reqwest::Client, rpc_url: &str) -> anyhow
         "id": 1
     });
 
-    let resp = client
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .context("blockchain.rpc_url is not reachable (timeout or connection refused)")?;
+    let resp = match client.post(rpc_url).json(&body).send().await {
+        Ok(resp) => resp,
+        // A timeout or connection error is transient — the endpoint may be
+        // momentarily overloaded (the #1108 startup-burst 429 arrives here as a
+        // reset on some gateways) rather than misconfigured.
+        Err(err) => {
+            return RpcProbe::Transient(format!(
+                "is not reachable (timeout or connection error): {}",
+                sanitize_rpc_display(&err)
+            ));
+        }
+    };
 
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "blockchain.rpc_url returned unexpected status {}; \
-         verify the endpoint is a valid JSON-RPC server",
-        resp.status()
-    );
+    let status = resp.status();
+    if status.is_success() {
+        RpcProbe::Healthy
+    } else if status.as_u16() == 429 || status.is_server_error() {
+        RpcProbe::Transient(format!(
+            "returned status {status} (rate-limited or server error)"
+        ))
+    } else {
+        RpcProbe::Fatal(format!(
+            "returned unexpected status {status}; verify the endpoint is a valid JSON-RPC server"
+        ))
+    }
+}
 
-    Ok(())
+/// Issue a single `net_version` JSON-RPC probe against `rpc_url`. Returns
+/// `Ok(())` on a healthy (2xx) response, an error otherwise — a thin adapter over
+/// [`probe_rpc_classified`] preserving the watchdog's original pass/fail
+/// semantics (it treats any non-2xx as unhealthy for the gauge, transient or not).
+pub(crate) async fn probe_rpc(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
+    match probe_rpc_classified(client, rpc_url).await {
+        RpcProbe::Healthy => Ok(()),
+        RpcProbe::Transient(msg) | RpcProbe::Fatal(msg) => {
+            anyhow::bail!("blockchain.rpc_url {msg}")
+        }
+    }
 }
 
 /// Spawn the RPC connectivity watchdog. On each tick of `interval`, calls

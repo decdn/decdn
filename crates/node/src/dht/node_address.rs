@@ -36,16 +36,18 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::chain_events::watch_contract_events;
+use crate::chain_events::resumable_watcher::{
+    self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
+};
 use crate::dht::routing::NodeId;
 use crate::metrics::Metrics;
-use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 
 /// Page size for the initial paginated `getActiveNodes` read (matches
@@ -125,12 +127,13 @@ impl ChainNodeAddressDirectory {
     pub async fn bootstrap<P>(
         provider: P,
         registry_addr: Address,
+        event_poll_interval: Duration,
         metrics: Arc<Metrics>,
     ) -> Result<Self>
     where
         P: Provider + Clone + 'static,
     {
-        let registry = CapacityBond::new(registry_addr, provider);
+        let registry = CapacityBond::new(registry_addr, provider.clone());
         let initial = bootstrap_bindings(&registry).await.with_context(|| {
             format!("paginated getActiveNodes from CapacityBond at {registry_addr}")
         })?;
@@ -142,13 +145,99 @@ impl ChainNodeAddressDirectory {
         metrics.node_address_directory_size(initial.len());
 
         let bindings = Arc::new(RwLock::new(initial));
-        let watcher_handle = tokio::spawn(watcher_loop(registry, Arc::clone(&bindings), metrics));
+        // Authoritative bindings came from `getActiveNodes` enumeration above; the
+        // watcher only live-tails binding events from head on the getLogs poller
+        // (#1092/#1106), no historical backfill and no persisted cursor.
+        let sink = NodeAddressSink {
+            bindings: Arc::clone(&bindings),
+            metrics: Arc::clone(&metrics),
+        };
+        let cfg = WatcherConfig {
+            filter: Filter::new().address(registry_addr).event_signature(vec![
+                CapacityBond::NodeRegistered::SIGNATURE_HASH,
+                CapacityBond::NodeDeregistered::SIGNATURE_HASH,
+            ]),
+            from_block: 0,
+            poll_interval: event_poll_interval,
+            confirmations: 0,
+            reorg_margin: 0,
+            max_backfill_span: u64::MAX,
+            cursor: CursorPolicy::HeadMinusWindow {
+                window_blocks: 0,
+                floor: 0,
+            },
+            initial_backoff: WATCHER_INITIAL_BACKOFF,
+            max_backoff: WATCHER_MAX_BACKOFF,
+            rpc_call_timeout: None,
+            shutdown: CancellationToken::new(),
+            seed_cursor: None,
+            label: "node-address",
+            on_established: Some(established_hook(&metrics)),
+            on_backoff: Some(backoff_hook(&metrics)),
+        };
+        let watcher_handle = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
 
         Ok(Self {
             bindings,
             _watcher: AbortOnDrop(watcher_handle),
         })
     }
+}
+
+/// Applies `CapacityBond` `NodeRegistered`/`NodeDeregistered` logs to the
+/// node→address bindings (#1092). `apply` live-tails from head (the
+/// authoritative set came from `getActiveNodes` at bootstrap) and never returns
+/// `Err` — an undecodable log is logged and skipped.
+struct NodeAddressSink {
+    bindings: Arc<RwLock<HashMap<NodeId, Address>>>,
+    metrics: Arc<Metrics>,
+}
+
+impl LogSink for NodeAddressSink {
+    #[allow(clippy::cognitive_complexity)]
+    async fn apply(&mut self, log: Log) -> Result<()> {
+        match log.topic0().copied() {
+            Some(sig) if sig == CapacityBond::NodeRegistered::SIGNATURE_HASH => {
+                match CapacityBond::NodeRegistered::decode_log_data(&log.inner.data) {
+                    Ok(event) => set_binding(
+                        &self.bindings,
+                        &self.metrics,
+                        NodeId::from_bytes(event.nodeId.0),
+                        event.ethAddress,
+                    ),
+                    Err(err) => warn!(%err, "skipping undecodable NodeRegistered log"),
+                }
+            }
+            Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
+                match CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data) {
+                    Ok(event) => {
+                        remove_binding(
+                            &self.bindings,
+                            &self.metrics,
+                            &NodeId::from_bytes(event.nodeId.0),
+                        );
+                    }
+                    Err(err) => warn!(%err, "skipping undecodable NodeDeregistered log"),
+                }
+            }
+            _ => {
+                debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Wire the healthy-cycle transition to the down-seconds gauge (→ 0).
+fn established_hook(metrics: &Arc<Metrics>) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || metrics.node_address_watcher_cycle_established())
+}
+
+/// Wire a tick failure to the backoff gauge.
+fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || metrics.node_address_watcher_backoff_started())
 }
 
 impl NodeAddressResolver for ChainNodeAddressDirectory {
@@ -225,101 +314,6 @@ where
         offset = offset.saturating_add(page_len);
     }
     Ok(bindings)
-}
-
-/// Background event loop following `NodeRegistered` / `NodeDeregistered`. On a
-/// stream error it logs, backs off exponentially, and re-establishes filters.
-async fn watcher_loop<P>(
-    registry: CapacityBond::CapacityBondInstance<P>,
-    bindings: Arc<RwLock<HashMap<NodeId, Address>>>,
-    metrics: Arc<Metrics>,
-) where
-    P: Provider + Clone,
-{
-    let mut backoff = WATCHER_INITIAL_BACKOFF;
-    loop {
-        match run_watcher_once(&registry, &bindings, &metrics).await {
-            Ok(()) => {
-                debug!("node-address watcher stream ended cleanly; restarting subscription");
-                backoff = WATCHER_INITIAL_BACKOFF;
-            }
-            Err(err) => {
-                // Open a drift window: bindings arriving on-chain while filters
-                // are down are missed until the next re-establish, so those
-                // providers become unpayable and are skipped. Edge-trip the
-                // restart counter + start the down-seconds clock (mirrors the
-                // staker-set watcher, #788).
-                metrics.node_address_watcher_backoff_started();
-                warn!(
-                    err = %sanitize_rpc_display(&err),
-                    backoff_secs = backoff.as_secs(),
-                    "ChainNodeAddressDirectory watcher RPC error; restarting after backoff \
-                     (binding map may be briefly stale)"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(WATCHER_MAX_BACKOFF);
-            }
-        }
-    }
-}
-
-/// Open a single multi-topic filter over the two binding-mutating events and
-/// drain it, demuxing each log by `topic0`. `Ok(())` on a clean stream end
-/// (filter expiry / provider rotation, or the provider being dropped); `Err` on
-/// a decode failure, which trips the caller's backoff exactly as a per-event
-/// stream error did before.
-async fn run_watcher_once<P>(
-    registry: &CapacityBond::CapacityBondInstance<P>,
-    bindings: &Arc<RwLock<HashMap<NodeId, Address>>>,
-    metrics: &Arc<Metrics>,
-) -> Result<()>
-where
-    P: Provider + Clone,
-{
-    // One multi-topic filter over both binding events (#1011), replacing the
-    // previous two per-event filters. Demux below by `topic0`.
-    let mut events = watch_contract_events(
-        registry.provider(),
-        *registry.address(),
-        [
-            CapacityBond::NodeRegistered::SIGNATURE_HASH,
-            CapacityBond::NodeDeregistered::SIGNATURE_HASH,
-        ],
-    )
-    .await
-    .context("watch CapacityBond binding events")?;
-
-    // Filter established: a healthy cycle. Clear the down-seconds clock so it
-    // reads 0 for the life of this cycle (it climbs again only on the next
-    // error).
-    metrics.node_address_watcher_cycle_established();
-
-    while let Some(log) = events.next().await {
-        match log.topic0().copied() {
-            Some(sig) if sig == CapacityBond::NodeRegistered::SIGNATURE_HASH => {
-                let event = CapacityBond::NodeRegistered::decode_log_data(&log.inner.data)
-                    .context("decode NodeRegistered")?;
-                set_binding(
-                    bindings,
-                    metrics,
-                    NodeId::from_bytes(event.nodeId.0),
-                    event.ethAddress,
-                );
-            }
-            Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
-                let event = CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data)
-                    .context("decode NodeDeregistered")?;
-                remove_binding(bindings, metrics, &NodeId::from_bytes(event.nodeId.0));
-            }
-            // Unreachable today (the filter's topic0 OR-set bounds the inputs);
-            // don't panic (anti-panic policy), log it so a future OR-set/dispatch
-            // drift leaves a greppable trail instead of a silently dropped event.
-            _ => {
-                debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Insert/update `node_id → address`, republishing the size gauge only when the

@@ -80,8 +80,8 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, MemoryPendingSettleStore,
-    PendingSettleStore, WatcherCheckpointStore, bind_node_id_domain, register_node_signing_hash,
+    BuyerChannelStore, ChannelStateStore, KeyedCheckpointStore, MemoryBuyerChannelStore,
+    MemoryPendingSettleStore, PendingSettleStore, bind_node_id_domain, register_node_signing_hash,
     slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerChannelService;
@@ -515,7 +515,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let pending_store: Arc<dyn PendingSettleStore> = concrete_store.clone();
     // Keep `concrete_store` alive (don't move it) so the downtime-backfill phase
     // at the end can re-bootstrap a second service against the same store.
-    let checkpoint_store: Arc<dyn WatcherCheckpointStore> = concrete_store.clone();
+    let checkpoint_store: Arc<dyn KeyedCheckpointStore> = concrete_store.clone();
 
     let node_eth = Arc::new(node_signer.clone());
     let metrics = Arc::new(Metrics::new());
@@ -547,6 +547,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
+        Duration::from_millis(250),
         Arc::clone(&metrics),
     )
     .await?;
@@ -1016,6 +1017,7 @@ async fn run_e2e() -> anyhow::Result<()> {
             value_threshold: Some(U256::from(5u64)),
             voucher_nonce_span_threshold: None,
         },
+        Duration::from_millis(250),
         Arc::clone(&metrics),
     )
     .await?;
@@ -1250,6 +1252,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
+        Duration::from_millis(250),
         Arc::clone(&metrics),
     )
     .await?;
@@ -1331,6 +1334,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
+        Duration::from_millis(250),
         Arc::clone(&metrics),
     )
     .await?;
