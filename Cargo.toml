@@ -72,6 +72,9 @@ alloy = { version = "2", features = ["providers", "signers", "signer-keystore", 
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+# `decdn fetch` delivery progress bar (#1118). TTY-aware by default (drawn to
+# stderr, hidden when piped/CI), so it never pollutes scripted output.
+indicatif = "0.18"
 
 # Observability
 tracing = "0.1"

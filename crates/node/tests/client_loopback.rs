@@ -37,7 +37,7 @@ use decdn_incentive::{
 };
 use decdn_node::client_requester::{
     ChannelContext, ChannelLedger, Cumulative, UpstreamVoucherRejected, VoucherProgress,
-    stream_fetch, stream_fetch_shared, stream_fetch_tracked,
+    stream_fetch, stream_fetch_shared, stream_fetch_tracked, stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
@@ -1755,6 +1755,89 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
     anyhow::ensure!(
         got.as_ref() == payload.as_slice(),
         "exact-ceiling blob must deliver intact"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Delivery-progress hook (#1118): `stream_fetch_tracked_with_progress` invokes
+/// the callback as bytes arrive with `(wire_bytes_received, wire_bytes_expected)`.
+/// The expected total is fixed once the signed `StreamResponse` arrives, received
+/// bytes advance monotonically, and the final observation reaches the full
+/// promised wire length — the contract `decdn fetch`'s progress bar relies on.
+#[tokio::test(flavor = "multi_thread")]
+async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
+    // Multi-chunk payload (256 KiB > CHUNK_SIZE) so the callback fires repeatedly
+    // and the monotonic-advance assertion has intermediate points to check.
+    let payload = vec![0xABu8; 256 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let mut progress = VoucherProgress::default();
+    // `ProgressCallback` is `'static`, so the closure owns an `Arc` handle to the
+    // shared sink rather than borrowing a stack local.
+    let observations = Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+    let sink = Arc::clone(&observations);
+    let record = move |received: u64, expected: u64| {
+        if let Ok(mut v) = sink.lock() {
+            v.push((received, expected));
+        }
+    };
+    let got = stream_fetch_tracked_with_progress(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c3,
+        Duration::from_secs(10),
+        0, // unlimited buyer ceiling
+        &mut progress,
+        Some(&record),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "progress-tracked fetch must still deliver the blob intact"
+    );
+
+    // Clone the observations out and drop the guard before the cleanup awaits
+    // below (clippy `await_holding_lock`).
+    let obs: Vec<(u64, u64)> = observations
+        .lock()
+        .map_err(|_| anyhow::anyhow!("progress mutex poisoned"))?
+        .clone();
+    anyhow::ensure!(!obs.is_empty(), "progress callback must fire at least once");
+    let expected = obs.last().map_or(0, |&(_, e)| e);
+    anyhow::ensure!(expected > 0, "expected wire length must be positive");
+    anyhow::ensure!(
+        obs.iter().all(|&(_, e)| e == expected),
+        "expected total must stay constant across the pull"
+    );
+    let mut prev = 0u64;
+    for &(received, _) in &obs {
+        anyhow::ensure!(
+            received >= prev,
+            "progress must be monotonically non-decreasing ({received} < {prev})"
+        );
+        anyhow::ensure!(
+            received <= expected,
+            "progress ({received}) must never exceed the expected total ({expected})"
+        );
+        prev = received;
+    }
+    anyhow::ensure!(
+        prev == expected,
+        "final progress ({prev}) must reach the expected wire length ({expected})"
     );
 
     client_ep.close().await;
