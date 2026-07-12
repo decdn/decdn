@@ -12,6 +12,7 @@
 //! machinery, so only the open kernel is shared.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, TxHash, U256};
@@ -33,6 +34,15 @@ use crate::ChannelContext;
 fn approval_floor() -> U256 {
     U256::MAX >> 1
 }
+
+/// Bound the wait for the one-time USDC `approve` receipt so a stuck or
+/// underpriced tx can't wedge the buyer lane (#1109 — ~27 min observed on a live
+/// node). Sized well above a normal inclusion window but short enough that the
+/// worst case is a few minutes. On timeout the broadcast tx may still mine
+/// later; the allowance read at the top of the next run makes the re-approve
+/// idempotent, so no funds are stranded. Not config-tunable yet (YAGNI), like
+/// the `RECONCILE_IDLE_SWEEPS` convention in the node's `buyer_channel`.
+const APPROVE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// A freshly opened buyer channel: the persistable [`BuyerChannelState`], a
 /// ready-to-sign [`ChannelContext`], and the open transaction hash (so a caller
@@ -74,13 +84,23 @@ pub async fn ensure_allowance<P: Provider + Clone>(
         debug!(%current, "USDC allowance already sufficient; skipping approve");
         return Ok(());
     }
-    let receipt = erc20
+    let pending = erc20
         .approve(spender, U256::MAX)
         .send()
         .await
-        .context("submit USDC approve")?
-        .get_receipt()
+        .context("submit USDC approve")?;
+    // Capture the hash before `get_receipt` consumes `pending`, so a timeout
+    // error names the broadcast tx an operator needs to look up (it stays in the
+    // mempool and may still mine after we give up).
+    let approve_tx = *pending.tx_hash();
+    let receipt = tokio::time::timeout(APPROVE_RECEIPT_TIMEOUT, pending.get_receipt())
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "USDC approve receipt timed out after {APPROVE_RECEIPT_TIMEOUT:?} \
+                 (tx {approve_tx}; may still mine later)"
+            )
+        })?
         .context("await USDC approve receipt")?;
     if !receipt.status() {
         anyhow::bail!("USDC approve transaction reverted");

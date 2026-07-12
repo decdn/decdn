@@ -1137,8 +1137,9 @@ pub async fn run(
     // `open_or_reuse_channel` is the `NodeOrigin` provisioned below (#831), gated
     // on `cache.node_to_node_pull_through_enabled`; the service is also held for
     // the process lifetime so its reclaim sweep keeps running even when
-    // pull-through is off. `buyer_channel_service` keeps the binding — and thus
-    // its `AbortOnDrop` reclaim task — alive to shutdown.
+    // pull-through is off. The backgrounded bootstrap task (#1109, below) owns
+    // that binding via its `let _service` hold — and thus keeps the service's
+    // `AbortOnDrop` reclaim task alive to shutdown.
     //
     // Unlike the seller service, a buyer-bootstrap failure is NON-fatal: buying
     // is opportunistic cost-recovery, so a failed startup `approve` tx (e.g.
@@ -1171,43 +1172,13 @@ pub async fn run(
         Arc::new(crate::channel_store::BuyerPendingSettleStoreHandle::new(
             Arc::clone(&concrete_channel_store),
         ));
-    let buyer_channel_service = match crate::buyer_channel::BuyerChannelService::bootstrap(
-        buyer_wallet_provider,
-        payment_channel_addr,
-        eth_signer.address(),
-        buyer_channel_store,
-        Arc::clone(&eth_signer),
-        decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr),
-        U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
-        cfg.blockchain.buyer_max_approve,
-        // Idle-reconcile dial wiring (#972): only when node→node pull-through
-        // gave us a node-address resolver to map a provider's address back to a
-        // NodeId. Absent → reconcile is disabled, expiry reclaim runs alone.
-        node_address_resolver
-            .as_ref()
-            .map(|resolver| crate::buyer_channel::BuyerReconcileConfig {
-                endpoint: ep.clone(),
-                resolver: Arc::clone(resolver),
-            }),
-        buyer_pending_settle_store,
-        Arc::clone(&node_metrics),
-    )
-    .await
-    {
-        Ok(service) => Some(Arc::new(service)),
-        Err(err) => {
-            tracing::warn!(
-                err = %sanitize_rpc_display(&err),
-                %payment_channel_addr,
-                "buyer-side PaymentChannel bootstrap failed; node→node paid cache-miss pulls are \
-                 DISABLED for this process (seller settlement is unaffected). This condition is \
-                 sticky — restart the node to retry. Check: (1) blockchain.payment_channel_address \
-                 is correct, (2) the RPC endpoint is reachable, (3) the wallet holds gas for the \
-                 one-time USDC approve."
-            );
-            None
-        }
-    };
+    // The buyer-side PaymentChannel bootstrap (whose on-chain round-trips —
+    // notably the one-time USDC `approve` receipt — historically blocked for many
+    // minutes on a stuck tx; now also bounded by `APPROVE_RECEIPT_TIMEOUT`) and
+    // the node-origin pull-through provisioning it feeds are BOTH deferred to a
+    // background task spawned below (#1109), so the metrics/admin listeners and
+    // the "node runtime ready" banner come up independent of any chain RPC. The
+    // provider/store/pending handles built just above are moved into that task.
 
     let router = Router::builder(ep.clone())
         .accept(ProbeHandler::ALPN, probe_handler)
@@ -1532,74 +1503,172 @@ pub async fn run(
         }),
     };
 
-    // Provision the node-to-node pull origin now that every dependency exists
-    // (#831). Only when the feature is on AND both the buyer service and the
-    // address resolver bootstrapped; otherwise the origin (if it was added to
-    // the cache chain) stays a clean miss. The origin shares its `OnceLock` with
-    // the clone already in the cache's origin chain, so this set is what
-    // actually arms pull-through.
-    if let Some(origin) = &node_origin {
-        if let (Some(buyer), Some(resolver)) = (
-            buyer_channel_service.as_ref(),
-            node_address_resolver.as_ref(),
-        ) {
-            origin.provision(crate::node_origin::NodeOriginDeps {
-                endpoint: ep.clone(),
-                routing_table: Arc::clone(&dht_routing),
-                staker_set: Arc::clone(&staker_set),
-                // FIND_VALUE last-resort fallback when the DHT returns no
-                // providers (ADR 022 §FIND_VALUE Flow; #912). Shares the single
-                // origin directory built above with the prefetch and reactive
-                // pull-through gates, so a configured `ChainOriginDirectory`
-                // backs this fallback for every node, not just prefetch-enabled
-                // ones. Absent chain addresses it is empty (same prior
-                // behavior). NOTE: if a future decision ever drops speculative
-                // prefetch, this `Arc` must be repointed here, not deleted — it
-                // is independently required by ADR 022.
-                origin_directory: Arc::clone(&origin_directory),
-                addr_resolver: Arc::clone(resolver),
-                buyer: Arc::clone(buyer) as Arc<dyn crate::buyer_channel::ChannelOpener>,
-                self_id: crate::dht::NodeId::from_bytes(*secret_key.public().as_bytes()),
-                slash_domain: decdn_incentive::slash_judge_domain(
-                    cfg.blockchain.chain_id,
-                    slash_judge_addr,
-                ),
-                local_rep: Arc::clone(&local_reputation),
-                obs_buffer: Arc::clone(&observation_buffer),
-                network_rep: Arc::clone(&network_reputation),
-                rep_cfg: reputation_cfg.clone(),
-                negative_cache: crate::dht::NegativeProbeCache::new(),
-                metrics: Arc::clone(&node_metrics),
-                region_accountant: Arc::clone(&region_accountant),
-                config: crate::node_origin::NodeOriginConfig {
-                    probe_fanout: cfg.cache.node_pull_probe_fanout,
-                    pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
-                    max_blob_size_bytes: cfg
-                        .cache
-                        .max_blob_size_mb
-                        .saturating_mul(decdn_protocol::MB_BYTES),
-                    enable_0rtt: cfg.network.enable_0rtt,
-                    deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
-                    lookup: crate::dht::LookupConfig::default(),
-                },
-                // Feed the prefetch ledger when prefetch is enabled (#820); the
-                // observer records only prefetch-initiated pulls.
-                acquisition_observer: cfg.prefetch.enabled.then(|| {
-                    Arc::new(crate::prefetch::PrefetchAcquisitionObserver::new(
-                        Arc::clone(&prefetch_engine),
-                        Arc::clone(&node_metrics),
-                    )) as Arc<dyn crate::node_origin::AcquisitionObserver>
+    // Buyer-side PaymentChannel bootstrap + node-to-node pull-through
+    // provisioning (#831), fully backgrounded off the startup critical path
+    // (#1109). The USDC `approve` receipt that `bootstrap` awaits could hang for
+    // many minutes on a stuck tx (now capped by `APPROVE_RECEIPT_TIMEOUT`);
+    // running it inline here previously gated the metrics/admin binds and the
+    // "node runtime ready" banner below. The origin shares its `OnceLock` with
+    // the clone already in the cache's origin chain, so a later `provision` from
+    // this task arms pull-through; reads before it land as clean misses (no
+    // spend, no panic). Bootstrap failure stays NON-fatal — buying is
+    // opportunistic cost-recovery.
+    //
+    // Precompute every cfg/secret-derived value the task needs: the closure is
+    // `'static` so it can't borrow `cfg`/`secret_key`, and those are used later.
+    let (buyer_bootstrap_stop_tx, buyer_bootstrap_stop_rx) = oneshot::channel::<()>();
+    let buyer_voucher_domain =
+        decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr);
+    let buyer_default_deposit = U256::from(cfg.blockchain.buyer_deposit_micro_usdc);
+    let buyer_ensure_max_approval = cfg.blockchain.buyer_max_approve;
+    let buyer_signer_address = eth_signer.address();
+    let pull_through_enabled = cfg.cache.node_to_node_pull_through_enabled;
+    let node_origin_self_id = crate::dht::NodeId::from_bytes(*secret_key.public().as_bytes());
+    let node_origin_slash_domain =
+        decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
+    let node_origin_config = crate::node_origin::NodeOriginConfig {
+        probe_fanout: cfg.cache.node_pull_probe_fanout,
+        pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
+        max_blob_size_bytes: cfg
+            .cache
+            .max_blob_size_mb
+            .saturating_mul(decdn_protocol::MB_BYTES),
+        enable_0rtt: cfg.network.enable_0rtt,
+        deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
+        lookup: crate::dht::LookupConfig::default(),
+    };
+    let node_origin_prefetch_enabled = cfg.prefetch.enabled;
+    let node_origin_reputation_cfg = reputation_cfg.clone();
+    // Arc/handle clones for the task — the originals are used later in `run()`.
+    let ep_for_buyer = ep.clone();
+    let eth_signer_for_buyer = Arc::clone(&eth_signer);
+    let resolver_opt = node_address_resolver.clone();
+    let node_origin_opt = node_origin.clone();
+    let dht_routing_c = Arc::clone(&dht_routing);
+    let staker_set_c = Arc::clone(&staker_set);
+    let origin_directory_c = Arc::clone(&origin_directory);
+    let local_reputation_c = Arc::clone(&local_reputation);
+    let observation_buffer_c = Arc::clone(&observation_buffer);
+    let network_reputation_c = Arc::clone(&network_reputation);
+    let region_accountant_c = Arc::clone(&region_accountant);
+    let prefetch_engine_c = Arc::clone(&prefetch_engine);
+    let node_metrics_for_buyer = Arc::clone(&node_metrics);
+    let node_metrics_for_origin = Arc::clone(&node_metrics);
+    let node_metrics_for_observer = Arc::clone(&node_metrics);
+    let mut buyer_bootstrap_stop_rx = buyer_bootstrap_stop_rx;
+    tasks.spawn(async move {
+        let service = tokio::select! {
+            biased;
+            // A shutdown that races a slow bootstrap unwinds cleanly here.
+            _ = &mut buyer_bootstrap_stop_rx => return,
+            res = crate::buyer_channel::BuyerChannelService::bootstrap(
+                buyer_wallet_provider,
+                payment_channel_addr,
+                buyer_signer_address,
+                buyer_channel_store,
+                eth_signer_for_buyer,
+                buyer_voucher_domain,
+                buyer_default_deposit,
+                buyer_ensure_max_approval,
+                // Idle-reconcile dial wiring (#972): only when node→node
+                // pull-through gave us a node-address resolver to map a
+                // provider's address back to a NodeId. Absent → reconcile is
+                // disabled, expiry reclaim runs alone.
+                resolver_opt.as_ref().map(|resolver| {
+                    crate::buyer_channel::BuyerReconcileConfig {
+                        endpoint: ep_for_buyer.clone(),
+                        resolver: Arc::clone(resolver),
+                    }
                 }),
-            });
-            tracing::info!("node-to-node cache-miss pull-through provisioned and enabled (#831)");
-        } else {
-            tracing::warn!(
-                "cache.node_to_node_pull_through_enabled is set, but the buyer service or the \
-                 node-address resolver failed to bootstrap; pull-through stays DISABLED this \
-                 process (restart to retry)"
-            );
+                buyer_pending_settle_store,
+                node_metrics_for_buyer,
+            ) => match res {
+                Ok(service) => Arc::new(service),
+                Err(err) => {
+                    tracing::warn!(
+                        err = %sanitize_rpc_display(&err),
+                        %payment_channel_addr,
+                        "buyer-side PaymentChannel bootstrap failed; node→node paid cache-miss \
+                         pulls are DISABLED for this process (seller settlement is unaffected). \
+                         This condition is sticky — restart the node to retry. Check: (1) \
+                         blockchain.payment_channel_address is correct, (2) the RPC endpoint is \
+                         reachable, (3) the wallet holds gas for the one-time USDC approve."
+                    );
+                    if pull_through_enabled {
+                        tracing::warn!(
+                            "cache.node_to_node_pull_through_enabled is set, but the buyer service \
+                             failed to bootstrap; pull-through stays DISABLED this process \
+                             (restart to retry)"
+                        );
+                    }
+                    return;
+                }
+            }
+        };
+
+        // Provision the node-to-node pull origin now that the buyer service is
+        // up (#831). `node_origin_opt` is `Some` iff the feature is on; the
+        // buyer is always present at this point, so the remaining gate is the
+        // address resolver. The origin's `OnceLock` is shared with the cache
+        // chain's clone, so this set is what actually arms pull-through.
+        if let Some(origin) = node_origin_opt.as_ref() {
+            if let Some(resolver) = resolver_opt.as_ref() {
+                origin.provision(crate::node_origin::NodeOriginDeps {
+                    endpoint: ep_for_buyer.clone(),
+                    routing_table: dht_routing_c,
+                    staker_set: staker_set_c,
+                    // FIND_VALUE last-resort fallback when the DHT returns no
+                    // providers (ADR 022 §FIND_VALUE Flow; #912). Shares the
+                    // single origin directory built above with the prefetch and
+                    // reactive pull-through gates, so a configured
+                    // `ChainOriginDirectory` backs this fallback for every node,
+                    // not just prefetch-enabled ones. Absent chain addresses it
+                    // is empty (same prior behavior). NOTE: if a future decision
+                    // ever drops speculative prefetch, this `Arc` must be
+                    // repointed here, not deleted — it is independently required
+                    // by ADR 022.
+                    origin_directory: origin_directory_c,
+                    addr_resolver: Arc::clone(resolver),
+                    buyer: Arc::clone(&service) as Arc<dyn crate::buyer_channel::ChannelOpener>,
+                    self_id: node_origin_self_id,
+                    slash_domain: node_origin_slash_domain,
+                    local_rep: local_reputation_c,
+                    obs_buffer: observation_buffer_c,
+                    network_rep: network_reputation_c,
+                    rep_cfg: node_origin_reputation_cfg,
+                    negative_cache: crate::dht::NegativeProbeCache::new(),
+                    metrics: node_metrics_for_origin,
+                    region_accountant: region_accountant_c,
+                    config: node_origin_config,
+                    // Feed the prefetch ledger when prefetch is enabled (#820);
+                    // the observer records only prefetch-initiated pulls.
+                    acquisition_observer: node_origin_prefetch_enabled.then(|| {
+                        Arc::new(crate::prefetch::PrefetchAcquisitionObserver::new(
+                            prefetch_engine_c,
+                            node_metrics_for_observer,
+                        ))
+                            as Arc<dyn crate::node_origin::AcquisitionObserver>
+                    }),
+                });
+                tracing::info!(
+                    "node-to-node cache-miss pull-through provisioned and enabled (#831)"
+                );
+            } else {
+                tracing::warn!(
+                    "cache.node_to_node_pull_through_enabled is set, but the node-address \
+                     resolver failed to bootstrap; pull-through stays DISABLED this process \
+                     (restart to retry)"
+                );
+            }
         }
-    }
+
+        // Hold the service (and thus its `AbortOnDrop` reclaim/reconcile
+        // sweeps) alive until shutdown, preserving the pre-#1109
+        // process-lifetime binding — reclaim must keep running even when
+        // pull-through is off (`node_origin_opt` is `None`).
+        let _service = service;
+        let _ = buyer_bootstrap_stop_rx.await;
+    });
 
     // Provision the live prefetch acquirer (#820) once the cache exists. Gated on
     // `prefetch.enabled` — a disabled engine never reaches `try_acquire`, so an
@@ -1857,6 +1926,11 @@ pub async fn run(
     // through `JoinSet::join_next` during the drain phase below — no
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
+    // Cancel a still-running buyer bootstrap and release the task's
+    // process-lifetime hold on the service (#1109). Best-effort: on the
+    // bootstrap-failed path the task already returned and dropped the receiver,
+    // so this send errors harmlessly.
+    let _ = buyer_bootstrap_stop_tx.send(());
     // region bandwidth accounting log (#750)
     if let Some(tx) = region_log_stop_tx {
         let _ = tx.send(());
