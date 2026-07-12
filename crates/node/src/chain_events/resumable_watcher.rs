@@ -244,20 +244,27 @@ pub(crate) const fn resolve_head_window_start(head: u64, window: u64, floor: u64
     if floored < head { floored } else { head }
 }
 
-/// Apply an optional per-call timeout to an RPC future, mapping its error into
-/// `anyhow`. A timeout is a retryable error (the tick backs off).
+/// Fallback per-RPC-call timeout when a watcher does not set its own. The alloy
+/// HTTP provider has no request timeout of its own, so a provider that keeps the
+/// connection open but never responds would otherwise wedge the tick forever —
+/// silently stopping event processing and blocking graceful shutdown. A bounded
+/// default makes such a call fail fast into the retry/backoff path instead.
+const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Apply a per-call timeout to an RPC future, mapping its error into `anyhow`. A
+/// timeout is a retryable error (the tick backs off). A `None` config uses
+/// [`DEFAULT_RPC_CALL_TIMEOUT`] — no call runs unbounded, so a stalled provider
+/// can never permanently wedge the watcher.
 async fn timed<T, E, F>(timeout: Option<Duration>, what: &str, fut: F) -> Result<T>
 where
     F: Future<Output = std::result::Result<T, E>>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    match timeout {
-        Some(d) => tokio::time::timeout(d, fut)
-            .await
-            .map_err(|_| anyhow::anyhow!("{what} timed out after {d:?}"))?
-            .map_err(anyhow::Error::new),
-        None => fut.await.map_err(anyhow::Error::new),
-    }
+    let d = timeout.unwrap_or(DEFAULT_RPC_CALL_TIMEOUT);
+    tokio::time::timeout(d, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{what} timed out after {d:?}"))?
+        .map_err(anyhow::Error::new)
 }
 
 /// Run one poll tick: read head, scan `[cursor, head - confirmations]` in
@@ -292,21 +299,32 @@ where
         // Head has not advanced past the cursor yet (idle tick or confirmations
         // lag). Retain the resolved floor so the next tick does not re-resolve.
         *cursor = Some(from);
-        return Ok(());
-    }
-    for (start, end) in backfill_windows(from, to, cfg.max_backfill_span) {
-        let filter = cfg.filter.clone().from_block(start).to_block(end);
-        let logs = timed(cfg.rpc_call_timeout, "get_logs", provider.get_logs(&filter))
-            .await
-            .with_context(|| format!("get_logs [{start}, {end}] for {}", cfg.label))?;
-        for log in logs {
-            sink.apply(log).await?;
+    } else {
+        for (start, end) in backfill_windows(from, to, cfg.max_backfill_span) {
+            // Check between windows so a large first-boot backfill (blacklist's
+            // full replay, slash's appeal-window span) yields promptly to a
+            // graceful shutdown rather than blocking it until the whole tick
+            // completes. Progress persisted per window resumes on the next boot.
+            if cfg.shutdown.is_cancelled() {
+                return Ok(());
+            }
+            let filter = cfg.filter.clone().from_block(start).to_block(end);
+            let logs = timed(cfg.rpc_call_timeout, "get_logs", provider.get_logs(&filter))
+                .await
+                .with_context(|| format!("get_logs [{start}, {end}] for {}", cfg.label))?;
+            for log in logs {
+                sink.apply(log).await?;
+            }
+            // Window drained: advance the cursor and (Persisted only) persist it,
+            // so a mid-backfill crash resumes here rather than at the floor (#1108).
+            *cursor = Some(end.saturating_add(1));
+            cfg.cursor.persist(end);
         }
-        // Window drained: advance the cursor and (Persisted only) persist it, so
-        // a mid-backfill crash resumes here rather than at the floor (#1108).
-        *cursor = Some(end.saturating_add(1));
-        cfg.cursor.persist(end);
     }
+    // Always run the end-of-tick reconcile, including on an idle tick — a sink
+    // whose `on_tick_complete` is a periodic, time-gated pass (e.g. the blacklist
+    // re-scope that catches no-event scope transitions) would otherwise never run
+    // on a quiet chain where every tick has `from > to`.
     sink.on_tick_complete().await?;
     Ok(())
 }

@@ -48,6 +48,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::dht::routing::NodeId;
 use crate::metrics::Metrics;
+use crate::payment_settlement::MAX_BACKFILL_BLOCK_SPAN;
 use decdn_incentive::capacity_bond::CapacityBond;
 
 /// Page size for the initial paginated `getActiveNodes` read (matches
@@ -161,7 +162,10 @@ impl ChainNodeAddressDirectory {
             poll_interval: event_poll_interval,
             confirmations: 0,
             reorg_margin: 0,
-            max_backfill_span: u64::MAX,
+            // Live-from-head, but still chunk `[cursor, head]` so a long lag
+            // (RPC outage / rate-limit) recovers in bounded windows instead of one
+            // range-limit-tripping `eth_getLogs`.
+            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             cursor: CursorPolicy::HeadMinusWindow {
                 window_blocks: 0,
                 floor: 0,
