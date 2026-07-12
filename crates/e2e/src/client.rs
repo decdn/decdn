@@ -246,7 +246,10 @@ fn is_retryable(err: &anyhow::Error) -> bool {
         // `RetryLater` is a transient node-side persist failure that asks us to
         // resend the same voucher on a fresh stream; every other reason is a
         // terminal payment-state desync.
-        return matches!(rejected.reason, decdn_protocol::VoucherRejectReason::RetryLater);
+        return matches!(
+            rejected.reason,
+            decdn_protocol::VoucherRejectReason::RetryLater
+        );
     }
     true
 }
