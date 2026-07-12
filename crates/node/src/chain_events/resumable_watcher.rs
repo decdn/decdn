@@ -35,9 +35,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-// The windowing/reorg primitives are shared with the settlement bootstrap and
-// the buyer-side reconciliation scan; they live in `payment_settlement` for now
-// and are re-used here rather than duplicated.
+// The windowing/reorg primitives are shared with the buyer-side reconciliation
+// scan; they live in `payment_settlement` for now and are re-used here rather
+// than duplicated.
 use crate::payment_settlement::backfill_windows;
 
 /// What a first-ever boot (no persisted checkpoint) falls back to for a
@@ -47,9 +47,11 @@ pub(crate) enum NoneFallback {
     /// Nothing existed before this node did (e.g. settlement `ChannelOpened`):
     /// start at head, scanning essentially nothing.
     Head,
-    /// The stream must be replayed from genesis for correctness because the
-    /// contract exposes no current-state enumeration (blacklist, origin): start
-    /// at the configured `from_block` (deploy block).
+    /// The stream must be replayed from the deploy block for correctness
+    /// because the contract exposes no current-state enumeration (origin's
+    /// `ContentClaimed` cursor — blacklist has the same constraint but uses
+    /// [`CursorPolicy::FullReplay`] instead of a persisted cursor): start at
+    /// the configured `from_block` (deploy block).
     FromBlock,
 }
 
@@ -79,37 +81,58 @@ pub(crate) enum CursorPolicy {
 
 impl CursorPolicy {
     /// Resolve the first tick's scan floor against the current scan upper bound.
-    fn initial_from(&self, from_block: u64, head: u64, reorg_margin: u64) -> u64 {
+    ///
+    /// A checkpoint read error is **retryable** for a [`NoneFallback::Head`]
+    /// watcher: falling back to head would anchor the first persisted window at
+    /// head and durably *overwrite* the stored floor, permanently discarding the
+    /// downtime gap the checkpoint exists to cover (#751/#762) — so the tick
+    /// fails into backoff and re-resolves next tick. For [`NoneFallback::FromBlock`]
+    /// the fallback is the deploy floor, where the worst case of a lost
+    /// checkpoint is only a wider (idempotent) rescan, so a read error degrades
+    /// to the fallback with a warning.
+    fn initial_from(&self, from_block: u64, head: u64, reorg_margin: u64) -> Result<u64> {
         match self {
             Self::Persisted {
                 store,
                 key,
                 none_fallback,
             } => {
-                let last = match store.load_checkpoint(*key) {
-                    Ok(v) => v,
-                    Err(err) => {
+                let last = match (store.load_checkpoint(*key), none_fallback) {
+                    (Ok(v), _) => v,
+                    (Err(err), NoneFallback::Head) => {
+                        return Err(anyhow::Error::new(err)).with_context(|| {
+                            format!("read watcher scan checkpoint {}", key.as_str())
+                        });
+                    }
+                    (Err(err), NoneFallback::FromBlock) => {
                         warn!(
                             err = %n(&err),
                             key = key.as_str(),
-                            "failed to read watcher scan checkpoint; using none-fallback floor"
+                            "failed to read watcher scan checkpoint; rescanning from deploy floor"
                         );
                         None
                     }
                 };
-                resolve_persisted_start(last, head, from_block, reorg_margin, *none_fallback)
+                Ok(resolve_persisted_start(
+                    last,
+                    head,
+                    from_block,
+                    reorg_margin,
+                    *none_fallback,
+                ))
             }
             Self::HeadMinusWindow {
                 window_blocks,
                 floor,
-            } => resolve_head_window_start(head, *window_blocks, *floor),
+            } => Ok(resolve_head_window_start(head, *window_blocks, *floor)),
             // Full replay from the deploy floor: `head - u64::MAX` saturates to 0,
             // clamped up to `floor` and down to `head`.
-            Self::FullReplay { floor } => resolve_head_window_start(head, u64::MAX, *floor),
+            Self::FullReplay { floor } => Ok(resolve_head_window_start(head, u64::MAX, *floor)),
         }
     }
 
-    /// Durably record `block` as scanned (no-op for [`Self::HeadMinusWindow`]).
+    /// Durably record `block` as scanned (no-op for the non-persisting
+    /// [`Self::HeadMinusWindow`] and [`Self::FullReplay`] policies).
     /// Best-effort: a lost write only widens the next rescan (see the store's
     /// monotonic-floor contract).
     fn persist(&self, block: u64) {
@@ -168,10 +191,11 @@ pub(crate) struct WatcherConfig {
     pub(crate) max_backfill_span: u64,
     /// Floor-derivation and persistence policy.
     pub(crate) cursor: CursorPolicy,
-    /// Initial / max resubscribe backoff.
+    /// Initial / max failed-tick retry backoff.
     pub(crate) initial_backoff: Duration,
     pub(crate) max_backoff: Duration,
-    /// Per-RPC-call timeout (head read + each `get_logs`); `None` = no timeout.
+    /// Per-RPC-call timeout (head read + each `get_logs`); `None` = the loop's
+    /// [`DEFAULT_RPC_CALL_TIMEOUT`] (10s).
     pub(crate) rpc_call_timeout: Option<Duration>,
     /// Cancelled on graceful shutdown; flushes the checkpoint and returns.
     pub(crate) shutdown: CancellationToken,
@@ -309,7 +333,7 @@ where
         Some(c) => c,
         None => cfg
             .cursor
-            .initial_from(cfg.from_block, to, cfg.reorg_margin),
+            .initial_from(cfg.from_block, to, cfg.reorg_margin)?,
     };
     if from > to {
         // Head has not advanced past the cursor yet (idle tick or confirmations
@@ -416,7 +440,7 @@ mod tests {
 
     #[test]
     fn persisted_none_from_block_starts_at_from_block() {
-        // Blacklist/origin: no enumeration view → replay from the deploy block.
+        // Origin: no enumeration view for claims → replay from the deploy block.
         assert_eq!(
             resolve_persisted_start(None, 1_000, 200, MARGIN, NoneFallback::FromBlock),
             200
@@ -497,5 +521,223 @@ mod tests {
     fn scan_upper_bound_lags_by_confirmations() {
         assert_eq!(scan_upper_bound(1_000, 12), 988);
         assert_eq!(scan_upper_bound(5, 12), 0);
+    }
+
+    /// A store whose reads always fail, for the load-error policy cases.
+    struct FailingLoadStore;
+
+    impl KeyedCheckpointStore for FailingLoadStore {
+        fn load_checkpoint(
+            &self,
+            _key: CheckpointKey,
+        ) -> std::result::Result<Option<u64>, decdn_incentive::StoreError> {
+            Err(decdn_incentive::StoreError::Backend("boom".into()))
+        }
+
+        fn record_checkpoint(
+            &self,
+            _key: CheckpointKey,
+            _block: u64,
+        ) -> std::result::Result<(), decdn_incentive::StoreError> {
+            Ok(())
+        }
+    }
+
+    /// Minimal in-memory durable store for the tick-loop tests.
+    #[derive(Default)]
+    struct MemoryCheckpointStore {
+        stored: std::sync::Mutex<std::collections::HashMap<CheckpointKey, u64>>,
+    }
+
+    impl KeyedCheckpointStore for MemoryCheckpointStore {
+        fn load_checkpoint(
+            &self,
+            key: CheckpointKey,
+        ) -> std::result::Result<Option<u64>, decdn_incentive::StoreError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .copied())
+        }
+
+        fn record_checkpoint(
+            &self,
+            key: CheckpointKey,
+            block: u64,
+        ) -> std::result::Result<(), decdn_incentive::StoreError> {
+            self.stored
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, block);
+            Ok(())
+        }
+    }
+
+    /// Sink scripted to fail on the N-th apply (0-indexed), counting deliveries.
+    struct ScriptedSink {
+        applied: usize,
+        fail_on: Option<usize>,
+    }
+
+    impl LogSink for ScriptedSink {
+        async fn apply(&mut self, _log: Log) -> Result<()> {
+            if self.fail_on == Some(self.applied) {
+                anyhow::bail!("scripted sink failure");
+            }
+            self.applied += 1;
+            Ok(())
+        }
+    }
+
+    /// One default log, typed so the mock transport can serialize it as a
+    /// `get_logs` response.
+    fn one_log() -> Vec<Log> {
+        vec![Log::default()]
+    }
+
+    /// Build a `run_tick` config over the mocked provider: span-10 windows,
+    /// no confirmations lag / reorg rewind, persisting through `store`.
+    fn tick_cfg(store: Arc<MemoryCheckpointStore>) -> WatcherConfig {
+        WatcherConfig {
+            filter: Filter::new(),
+            from_block: 0,
+            poll_interval: Duration::from_secs(1),
+            confirmations: 0,
+            reorg_margin: 0,
+            max_backfill_span: 10,
+            cursor: CursorPolicy::Persisted {
+                store,
+                key: CheckpointKey::ChannelOpened,
+                none_fallback: NoneFallback::FromBlock,
+            },
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+            rpc_call_timeout: None,
+            shutdown: CancellationToken::new(),
+            seed_cursor: None,
+            label: "test",
+            on_established: None,
+            on_backoff: None,
+        }
+    }
+
+    /// The anti-strand invariant, end to end through `run_tick` on a mocked
+    /// transport: a sink `Err` mid-backfill aborts the tick with the in-memory
+    /// cursor AND the durable checkpoint at the last *completed* window, and
+    /// the retry tick re-delivers the failed window's log before flowing on.
+    /// Pins the apply-before-persist ordering a refactor could silently break
+    /// (persisting per tick, or hoisting the persist above the log loop, would
+    /// strand a `ChannelOpened` past the durable floor forever).
+    #[tokio::test]
+    async fn sink_error_leaves_cursor_and_checkpoint_at_last_completed_window() {
+        use alloy::primitives::U64;
+        use alloy::providers::ProviderBuilder;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let cfg = tick_cfg(Arc::clone(&store));
+        let load = |store: &MemoryCheckpointStore| {
+            store
+                .load_checkpoint(CheckpointKey::ChannelOpened)
+                .ok()
+                .flatten()
+        };
+
+        // Tick 1: head 25 → windows [0,9], [10,19], [20,25]. One log per queried
+        // window; the sink fails on the second delivery (window [10,19]).
+        asserter.push_success(&U64::from(25));
+        asserter.push_success(&one_log());
+        asserter.push_success(&one_log());
+        let mut sink = ScriptedSink {
+            applied: 0,
+            fail_on: Some(1),
+        };
+        let mut cursor = None;
+        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
+        assert!(result.is_err(), "the failed window must fail the tick");
+        assert_eq!(cursor, Some(10), "cursor at the last completed window");
+        assert_eq!(
+            load(&store),
+            Some(9),
+            "durable checkpoint must not advance past the failed window"
+        );
+        assert_eq!(sink.applied, 1, "only window [0,9]'s log applied");
+
+        // Retry tick: same head; the failed window re-scans and re-delivers its
+        // log, then the final window drains empty and the cursor reaches head+1.
+        asserter.push_success(&U64::from(25));
+        asserter.push_success(&one_log());
+        asserter.push_success(&Vec::<Log>::new());
+        sink.fail_on = None;
+        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
+        assert!(result.is_ok(), "retry tick should complete: {result:?}");
+        assert_eq!(cursor, Some(26));
+        assert_eq!(load(&store), Some(25));
+        assert_eq!(sink.applied, 2, "the failed window's log was re-delivered");
+    }
+
+    /// An idle tick (`cursor` already at/above the confirmed head) scans no
+    /// windows, keeps the durable checkpoint untouched, and still succeeds —
+    /// the seam `on_tick_complete`-driven sinks (blacklist re-scope, origin
+    /// deferred re-reads) rely on firing every tick on a quiet chain.
+    #[tokio::test]
+    async fn idle_tick_scans_nothing_and_retains_cursor() {
+        use alloy::primitives::U64;
+        use alloy::providers::ProviderBuilder;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let cfg = tick_cfg(Arc::clone(&store));
+
+        // Cursor already past the head → no get_logs response queued at all.
+        asserter.push_success(&U64::from(25));
+        let mut sink = ScriptedSink {
+            applied: 0,
+            fail_on: None,
+        };
+        let mut cursor = Some(26);
+        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
+        assert!(result.is_ok(), "idle tick should succeed: {result:?}");
+        assert_eq!(cursor, Some(26), "cursor retained");
+        assert_eq!(sink.applied, 0);
+        let stored = store
+            .load_checkpoint(CheckpointKey::ChannelOpened)
+            .ok()
+            .flatten();
+        assert_eq!(stored, None, "idle tick persists nothing");
+    }
+
+    fn persisted(none_fallback: NoneFallback) -> CursorPolicy {
+        CursorPolicy::Persisted {
+            store: Arc::new(FailingLoadStore),
+            key: CheckpointKey::ChannelOpened,
+            none_fallback,
+        }
+    }
+
+    #[test]
+    fn load_error_is_retryable_for_head_fallback() {
+        // Falling back to head would durably overwrite the stored floor and
+        // permanently discard the downtime gap (#751/#762) — the tick must fail
+        // into backoff instead so the read is retried.
+        assert!(
+            persisted(NoneFallback::Head)
+                .initial_from(0, 1_000, MARGIN)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn load_error_degrades_to_deploy_floor_for_from_block_fallback() {
+        // For a deploy-floor watcher the worst case of a lost checkpoint is a
+        // wider idempotent rescan, so a read error degrades instead of failing.
+        let start = persisted(NoneFallback::FromBlock)
+            .initial_from(200, 1_000, MARGIN)
+            .unwrap_or(u64::MAX);
+        assert_eq!(start, 200);
     }
 }

@@ -69,16 +69,21 @@
 //! tick, re-applying any event lost in the gap — surfaced by
 //! `..._watcher_restarts_total` / `..._down_seconds`.
 //!
-//! A narrower silent-drift source: a per-event `getOrigins` or `nodeIdOf` RPC
-//! failure is surfaced by `decdn_origin_directory_watcher_resolve_failures_total`
+//! A narrower drift source: a per-event `getOrigins` or `nodeIdOf` RPC failure
+//! is surfaced by `decdn_origin_directory_watcher_resolve_failures_total`
 //! (and a `warn!`). On an **addition/replace** event (activation, default-open
 //! add/replace) the cache fail-closes for the affected set (an un-added operator
-//! authorizes nothing) and self-heals on the next event (or the poller's window
-//! re-scan). On a **removal** event (revoke / prune / default-open remove) a
-//! failed re-read falls back to a precise delta removal from the event payload,
-//! so a revoke is never weaker than a direct delete even when `getOrigins` is
-//! unavailable. `decdn_origin_directory_operator_count` tracks the live
-//! authorised-origin surface to spot a frozen or collapsed cache.
+//! authorizes nothing); the failed namespace is recorded and its `getOrigins`
+//! re-read retried at the end of every poll tick until it succeeds (the tick
+//! fails → backs off while any retry is outstanding), so the hole heals without
+//! waiting for another same-namespace event — necessary because the persisted
+//! cursor may already have advanced past the triggering log. On a **removal**
+//! event (revoke / prune / default-open remove) a failed re-read falls back to a
+//! precise delta removal from the event payload, so a revoke is never weaker
+//! than a direct delete even when `getOrigins` is unavailable (and the
+//! namespace is still queued for the retry re-read).
+//! `decdn_origin_directory_operator_count` tracks the live authorised-origin
+//! surface to spot a frozen or collapsed cache.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -124,10 +129,10 @@ const REPLAY_WINDOW_BLOCKS: u64 = 9_000;
 /// namespace falls back to it.
 const DEFAULT_OPEN_NAMESPACE: U256 = U256::ZERO;
 
-/// Backoff between watcher restart attempts after an event-stream terminates
-/// with an error. Mirrors [`crate::dht::chain_staker_set`].
+/// Backoff between watcher retry attempts after a failed poll tick. Mirrors
+/// [`crate::dht::chain_staker_set`].
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound for the watcher restart backoff.
+/// Upper bound for the watcher retry backoff.
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// In-memory projection of the on-chain origin directory. All resolution logic
@@ -265,12 +270,18 @@ where
 impl ChainOriginDirectory {
     /// Bootstrap: snapshot current chain state into the cache, then spawn the
     /// background event watcher. Returns once the cache is populated and the
-    /// watcher is running — the watcher's own subscription failures do not fail
+    /// watcher is running — the watcher's own poll-tick failures do not fail
     /// bootstrap.
     ///
     /// A bootstrap RPC failure is propagated; the runtime treats it the same as
     /// the `ChainStakerSet` bootstrap (fatal — the prefetch authorized-origin
     /// gate cannot be trusted without a complete snapshot).
+    ///
+    /// `shutdown` must be a token the runtime cancels on graceful shutdown: the
+    /// watcher persists its scan cursor through the (debounced)
+    /// `checkpoint_store`, and only the cancel path flushes the buffered tail
+    /// (`CheckpointKey::Origin`) to disk — an abort-only teardown would silently
+    /// drop up to a debounce window of progress on every clean stop.
     #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap<P>(
         provider: P,
@@ -282,6 +293,7 @@ impl ChainOriginDirectory {
         event_poll_interval: Duration,
         staker_set: Arc<dyn StakerSet>,
         metrics: Arc<Metrics>,
+        shutdown: CancellationToken,
     ) -> Result<Self>
     where
         P: Provider + Clone + 'static,
@@ -324,6 +336,7 @@ impl ChainOriginDirectory {
             contracts,
             cache: Arc::clone(&cache),
             metrics: Arc::clone(&metrics),
+            deferred: HashSet::new(),
         };
         let cfg = WatcherConfig {
             filter: Filter::new()
@@ -342,15 +355,11 @@ impl ChainOriginDirectory {
             confirmations: 0,
             reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-            cursor: CursorPolicy::Persisted {
-                store: checkpoint_store,
-                key: CheckpointKey::Origin,
-                none_fallback: NoneFallback::FromBlock,
-            },
+            cursor: cursor_policy(checkpoint_store),
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
-            shutdown: CancellationToken::new(),
+            shutdown,
             seed_cursor: Some(snapshot_block),
             label: "origin-directory",
             on_established: Some(established_hook(&metrics)),
@@ -372,12 +381,22 @@ impl ChainOriginDirectory {
 /// chain set (`getOrigins`), not a delta — so cross-event reorder or a single
 /// lost event cannot corrupt the cache, and the poller's re-scan on a getLogs
 /// error re-applies any event lost in a filter-down gap. `apply` never returns
-/// `Err`: a `getOrigins` re-read failure is deferred (fail-closed, healed by a
-/// later event on the same namespace), and an undecodable log is skipped.
+/// `Err` (a deterministic per-namespace failure must not stall the cursor):
+/// a `getOrigins` re-read failure fail-closes the namespace and records it in
+/// `deferred`; [`Self::on_tick_complete`] retries every deferred namespace each
+/// tick and fails the tick (→ backoff) while any remain, so the re-read heals
+/// on its own and a throttled provider gets backoff pressure instead of
+/// full-cadence polling. An undecodable log is skipped.
 struct OriginSink<P: Provider + Clone> {
     contracts: Contracts<P>,
     cache: Arc<RwLock<DirectoryCache>>,
     metrics: Arc<Metrics>,
+    /// Namespaces whose authoritative `getOrigins` re-read failed
+    /// ([`DEFAULT_OPEN_NAMESPACE`] = the default-open allow-list). Bounded by
+    /// the number of distinct namespaces. Retried in [`Self::on_tick_complete`]
+    /// until each re-read succeeds; until then the affected namespace stays
+    /// fail-closed (unpopulated → authorizes nothing).
+    deferred: HashSet<U256>,
 }
 
 impl<P: Provider + Clone> LogSink for OriginSink<P> {
@@ -391,6 +410,7 @@ impl<P: Provider + Clone> LogSink for OriginSink<P> {
                         &self.contracts,
                         &self.cache,
                         &self.metrics,
+                        &mut self.deferred,
                         Hash::from_bytes(event.blake3Hash.0),
                         event.namespaceId,
                     )
@@ -403,13 +423,56 @@ impl<P: Provider + Clone> LogSink for OriginSink<P> {
         self.apply_origin_event(&log).await;
         Ok(())
     }
+
+    /// Retry every deferred `getOrigins` re-read. Runs at the end of every tick
+    /// (idle ones included), so a namespace whose re-read failed at apply time —
+    /// after which the persisted cursor may already have advanced past the
+    /// triggering event — heals here rather than staying fail-closed until an
+    /// unrelated same-namespace event. Returns `Err` while any namespace is
+    /// still failing so the tick backs off instead of re-polling a throttled
+    /// provider at full cadence.
+    async fn on_tick_complete(&mut self) -> Result<()> {
+        if self.deferred.is_empty() {
+            return Ok(());
+        }
+        let pending: Vec<U256> = self.deferred.iter().copied().collect();
+        for namespace in pending {
+            let resynced = if namespace == DEFAULT_OPEN_NAMESPACE {
+                resync_default_open(&self.contracts, &self.cache, &self.metrics).await
+            } else {
+                resync_namespace(&self.contracts, &self.cache, &self.metrics, namespace).await
+            };
+            match resynced {
+                Ok(()) => {
+                    self.deferred.remove(&namespace);
+                    info!(%namespace, "deferred getOrigins re-read healed");
+                }
+                Err(err) => {
+                    self.metrics.origin_directory_watcher_resolve_failure();
+                    warn!(
+                        err = %sanitize_rpc_display(&err),
+                        %namespace,
+                        "deferred getOrigins re-read still failing"
+                    );
+                }
+            }
+        }
+        if self.deferred.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "{} deferred getOrigins re-read(s) still failing",
+                self.deferred.len()
+            )
+        }
+    }
 }
 
 impl<P: Provider + Clone> OriginSink<P> {
     /// Dispatch one `OriginAssignment` log by `topic0` (all decoded from the
     /// origin-assignment contract). Each arm re-reads the authoritative set.
     #[allow(clippy::cognitive_complexity)]
-    async fn apply_origin_event(&self, log: &Log) {
+    async fn apply_origin_event(&mut self, log: &Log) {
         match log.topic0().copied() {
             Some(sig) if sig == AssignmentActivated::SIGNATURE_HASH => {
                 match AssignmentActivated::decode_log_data(&log.inner.data) {
@@ -418,6 +481,7 @@ impl<P: Provider + Clone> OriginSink<P> {
                             &self.contracts,
                             &self.cache,
                             &self.metrics,
+                            &mut self.deferred,
                             event.namespaceId,
                         )
                         .await;
@@ -432,6 +496,7 @@ impl<P: Provider + Clone> OriginSink<P> {
                             &self.contracts,
                             &self.cache,
                             &self.metrics,
+                            &mut self.deferred,
                             event.namespaceId,
                             event.operator,
                         )
@@ -447,6 +512,7 @@ impl<P: Provider + Clone> OriginSink<P> {
                             &self.contracts,
                             &self.cache,
                             &self.metrics,
+                            &mut self.deferred,
                             event.namespaceId,
                             event.operator,
                         )
@@ -456,10 +522,22 @@ impl<P: Provider + Clone> OriginSink<P> {
                 }
             }
             Some(sig) if sig == DefaultOpenAllowlistUpdated::SIGNATURE_HASH => {
-                on_default_open_changed(&self.contracts, &self.cache, &self.metrics).await;
+                on_default_open_changed(
+                    &self.contracts,
+                    &self.cache,
+                    &self.metrics,
+                    &mut self.deferred,
+                )
+                .await;
             }
             Some(sig) if sig == DefaultOpenOperatorAdded::SIGNATURE_HASH => {
-                on_default_open_changed(&self.contracts, &self.cache, &self.metrics).await;
+                on_default_open_changed(
+                    &self.contracts,
+                    &self.cache,
+                    &self.metrics,
+                    &mut self.deferred,
+                )
+                .await;
             }
             Some(sig) if sig == DefaultOpenOperatorRemoved::SIGNATURE_HASH => {
                 match DefaultOpenOperatorRemoved::decode_log_data(&log.inner.data) {
@@ -468,6 +546,7 @@ impl<P: Provider + Clone> OriginSink<P> {
                             &self.contracts,
                             &self.cache,
                             &self.metrics,
+                            &mut self.deferred,
                             DEFAULT_OPEN_NAMESPACE,
                             event.operator,
                         )
@@ -480,6 +559,22 @@ impl<P: Provider + Clone> OriginSink<P> {
                 debug!(topic0 = ?log.topic0(), "unmatched OriginAssignment event in subscribed OR-set");
             }
         }
+    }
+}
+
+/// The origin watcher's cursor policy: resume the durable
+/// [`CheckpointKey::Origin`] scan cursor (#1108); a first-ever boot replays
+/// `ContentClaimed` from the **deploy floor** — the `hash → namespaces` view
+/// has no on-chain enumeration, so the stream must be replayed for
+/// correctness. Pinned by a test: a `Head` fallback silently loses every claim
+/// that predates the node. (In steady state `bootstrap` seeds the live cursor
+/// at its snapshot block, so the fallback governs only a checkpoint-less start
+/// of the poller itself.)
+fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
+    CursorPolicy::Persisted {
+        store,
+        key: CheckpointKey::Origin,
+        none_fallback: NoneFallback::FromBlock,
     }
 }
 
@@ -688,17 +783,16 @@ async fn resync_default_open<R: OriginChainReads>(
 /// A new `(hash, namespace)` claim. Record the mapping and, for a not-yet-known
 /// namespace, authoritatively read its current operator set so the hash resolves
 /// immediately. On `getOrigins` failure the namespace is left unpopulated (the
-/// hash resolves to empty, fail-closed) and the failure is counted + warned. This
-/// heals **event-drivenly**: a subsequent claim or assignment-mutation on the
-/// same namespace re-reads it. (The old periodic re-arm resync pass that re-read
-/// every namespace was removed with the poller migration — the poller's window
-/// re-scan recovers lost *events*, but not a deferred `getOrigins` on an event
-/// that was already scanned, so an unrelated event for a *different* namespace
-/// does not heal this one.)
+/// hash resolves to empty, fail-closed), the failure is counted + warned, and
+/// the namespace is recorded in `deferred` so the sink's `on_tick_complete`
+/// retries the re-read every tick until it heals — the persisted cursor may
+/// already have advanced past this event, so waiting for a later same-namespace
+/// event would leave a permanent hole.
 async fn on_content_claimed<R: OriginChainReads>(
     reads: &R,
     cache: &Arc<RwLock<DirectoryCache>>,
     metrics: &Arc<Metrics>,
+    deferred: &mut HashSet<U256>,
     hash: Hash,
     namespace: U256,
 ) {
@@ -708,22 +802,26 @@ async fn on_content_claimed<R: OriginChainReads>(
     });
     if !namespace_known && let Err(err) = resync_namespace(reads, cache, metrics, namespace).await {
         metrics.origin_directory_watcher_resolve_failure();
-        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins for newly-claimed namespace failed; origins deferred");
+        deferred.insert(namespace);
+        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins for newly-claimed namespace failed; deferred for retry");
     }
 }
 
 /// An addition/replace event for `namespace` (activation). Re-read the
 /// authoritative set; on RPC failure, defer — an un-added operator authorizes
-/// nothing, so failing closed is safe and self-heals on the next event/resync.
+/// nothing, so failing closed is safe — and record the namespace for the
+/// `on_tick_complete` retry.
 async fn on_namespace_changed<R: OriginChainReads>(
     reads: &R,
     cache: &Arc<RwLock<DirectoryCache>>,
     metrics: &Arc<Metrics>,
+    deferred: &mut HashSet<U256>,
     namespace: U256,
 ) {
     if let Err(err) = resync_namespace(reads, cache, metrics, namespace).await {
         metrics.origin_directory_watcher_resolve_failure();
-        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins re-read failed on activation; namespace origins deferred");
+        deferred.insert(namespace);
+        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins re-read failed on activation; deferred for retry");
     }
 }
 
@@ -733,10 +831,12 @@ async fn on_default_open_changed<R: OriginChainReads>(
     reads: &R,
     cache: &Arc<RwLock<DirectoryCache>>,
     metrics: &Arc<Metrics>,
+    deferred: &mut HashSet<U256>,
 ) {
     if let Err(err) = resync_default_open(reads, cache, metrics).await {
         metrics.origin_directory_watcher_resolve_failure();
-        warn!(err = %sanitize_rpc_display(&err), "getOrigins(0) re-read failed on default-open change; deferred");
+        deferred.insert(DEFAULT_OPEN_NAMESPACE);
+        warn!(err = %sanitize_rpc_display(&err), "getOrigins(0) re-read failed on default-open change; deferred for retry");
     }
 }
 
@@ -745,11 +845,14 @@ async fn on_default_open_changed<R: OriginChainReads>(
 /// `DefaultOpenOperatorRemoved` (dispatched here with `namespace == 0`). Re-read
 /// the authoritative set; on RPC failure, fall back to the precise delta removal
 /// from the event payload so a revoke is **never weaker** than a direct delete
-/// even when `getOrigins` is unavailable.
+/// even when `getOrigins` is unavailable — and still record the namespace for
+/// the `on_tick_complete` retry, since the delta fallback leaves the rest of the
+/// cached set potentially stale.
 async fn on_origin_removed<R: OriginChainReads>(
     reads: &R,
     cache: &Arc<RwLock<DirectoryCache>>,
     metrics: &Arc<Metrics>,
+    deferred: &mut HashSet<U256>,
     namespace: U256,
     operator: Address,
 ) {
@@ -760,6 +863,7 @@ async fn on_origin_removed<R: OriginChainReads>(
     };
     if let Err(err) = resynced {
         metrics.origin_directory_watcher_resolve_failure();
+        deferred.insert(namespace);
         warn!(err = %sanitize_rpc_display(&err), %namespace, %operator, "getOrigins re-read failed on removal; applying precise delta fallback");
         delta_remove_origin(cache, metrics, namespace, operator);
     }
@@ -1304,8 +1408,9 @@ mod tests {
             &[],
             &[(addr(0xA), nid(0xA)), (addr(0xC), nid(0xC))],
         ));
-        on_origin_removed(&reads, &cache, &metrics, ns(7), addr(0xC)).await;
-        on_namespace_changed(&reads, &cache, &metrics, ns(7)).await;
+        let mut deferred = HashSet::new();
+        on_origin_removed(&reads, &cache, &metrics, &mut deferred, ns(7), addr(0xC)).await;
+        on_namespace_changed(&reads, &cache, &metrics, &mut deferred, ns(7)).await;
         read_cache(&cache, |c| {
             assert!(
                 !c.origins_of_ns[&ns(7)].contains(&addr(0xC)),
@@ -1319,8 +1424,9 @@ mod tests {
             &[],
             &[(addr(0xA), nid(0xA)), (addr(0xC), nid(0xC))],
         ));
-        on_namespace_changed(&reads, &cache, &metrics, ns(7)).await;
-        on_origin_removed(&reads, &cache, &metrics, ns(7), addr(0xC)).await;
+        on_namespace_changed(&reads, &cache, &metrics, &mut deferred, ns(7)).await;
+        on_origin_removed(&reads, &cache, &metrics, &mut deferred, ns(7), addr(0xC)).await;
+        assert!(deferred.is_empty(), "no failures → nothing deferred");
         read_cache(&cache, |c| {
             assert!(
                 !c.origins_of_ns[&ns(7)].contains(&addr(0xC)),
@@ -1341,7 +1447,8 @@ mod tests {
             &[(addr(0xA), nid(0xA)), (addr(0xC), nid(0xC))],
         ));
         let reads = StubReads::new().fail_origins(&[7]);
-        on_origin_removed(&reads, &cache, &metrics, ns(7), addr(0xC)).await;
+        let mut deferred = HashSet::new();
+        on_origin_removed(&reads, &cache, &metrics, &mut deferred, ns(7), addr(0xC)).await;
         read_cache(&cache, |c| {
             assert!(
                 !c.origins_of_ns[&ns(7)].contains(&addr(0xC)),
@@ -1352,6 +1459,10 @@ mod tests {
                 "others untouched"
             );
         });
+        assert!(
+            deferred.contains(&ns(7)),
+            "failed removal re-read must queue the namespace for the tick retry"
+        );
         let text = metrics.encode().unwrap();
         assert!(
             text.lines()
@@ -1370,7 +1481,8 @@ mod tests {
             .origins(&[(7, &[addr(0xA), addr(0xB)])])
             .bindings(&[(addr(0xA), nid(0xA)), (addr(0xB), nid(0xB))])
             .fail_origins(&[7]);
-        on_namespace_changed(&reads, &cache, &metrics, ns(7)).await;
+        let mut deferred = HashSet::new();
+        on_namespace_changed(&reads, &cache, &metrics, &mut deferred, ns(7)).await;
         read_cache(&cache, |c| {
             assert_eq!(
                 c.origins_of_ns[&ns(7)].len(),
@@ -1378,9 +1490,13 @@ mod tests {
                 "set unchanged on failed add"
             );
         });
+        assert!(
+            deferred.contains(&ns(7)),
+            "failed activation re-read must queue the namespace for the tick retry"
+        );
         // The injected failure clears → a later activation heals to {A, B}.
         reads.fail_origins.write().unwrap().clear();
-        on_namespace_changed(&reads, &cache, &metrics, ns(7)).await;
+        on_namespace_changed(&reads, &cache, &metrics, &mut deferred, ns(7)).await;
         read_cache(&cache, |c| {
             assert!(
                 c.origins_of_ns[&ns(7)].contains(&addr(0xB)),
@@ -1398,7 +1514,16 @@ mod tests {
         let reads = StubReads::new()
             .origins(&[(0, &[addr(0xA)])])
             .bindings(&[(addr(0xA), nid(0xA))]);
-        on_origin_removed(&reads, &cache, &metrics, DEFAULT_OPEN_NAMESPACE, addr(0xC)).await;
+        let mut deferred = HashSet::new();
+        on_origin_removed(
+            &reads,
+            &cache,
+            &metrics,
+            &mut deferred,
+            DEFAULT_OPEN_NAMESPACE,
+            addr(0xC),
+        )
+        .await;
         read_cache(&cache, |c| {
             assert!(c.default_open.contains(&addr(0xA)));
             assert!(
@@ -1415,11 +1540,45 @@ mod tests {
         let reads = StubReads::new()
             .origins(&[(7, &[addr(0xA)])])
             .bindings(&[(addr(0xA), nid(0xA))]);
-        on_content_claimed(&reads, &cache, &metrics, h(1), ns(7)).await;
+        let mut deferred = HashSet::new();
+        on_content_claimed(&reads, &cache, &metrics, &mut deferred, h(1), ns(7)).await;
         let stakers = StubStakers::new(&[nid(0xA)]);
         read_cache(&cache, |c| {
             assert_eq!(c.resolve(&h(1), &stakers), vec![nid(0xA)]);
         });
+    }
+
+    /// POLICY PIN: the origin watcher persists `CheckpointKey::Origin` and a
+    /// first-ever boot replays from the deploy floor — `hash → namespaces` has
+    /// no enumeration view, so a `Head` fallback silently loses every claim
+    /// that predates the node.
+    #[test]
+    fn cursor_policy_is_persisted_origin_from_block_fallback() {
+        struct NoopCheckpointStore;
+        impl KeyedCheckpointStore for NoopCheckpointStore {
+            fn load_checkpoint(
+                &self,
+                _key: CheckpointKey,
+            ) -> Result<Option<u64>, decdn_incentive::StoreError> {
+                Ok(None)
+            }
+            fn record_checkpoint(
+                &self,
+                _key: CheckpointKey,
+                _block: u64,
+            ) -> Result<(), decdn_incentive::StoreError> {
+                Ok(())
+            }
+        }
+        let store: Arc<dyn KeyedCheckpointStore> = Arc::new(NoopCheckpointStore);
+        assert!(matches!(
+            cursor_policy(store),
+            CursorPolicy::Persisted {
+                key: CheckpointKey::Origin,
+                none_fallback: NoneFallback::FromBlock,
+                ..
+            }
+        ));
     }
 
     #[test]

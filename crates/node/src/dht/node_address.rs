@@ -55,9 +55,9 @@ use decdn_incentive::capacity_bond::CapacityBond;
 /// [`crate::dht::chain_staker_set`]).
 const PAGE_SIZE: u64 = 100;
 
-/// Backoff between watcher restart attempts after the event stream errors.
+/// Backoff between watcher retry attempts after a failed poll tick.
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound for the watcher restart backoff.
+/// Upper bound for the watcher retry backoff.
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Read-only resolver from a provider's iroh [`NodeId`] to its bonded operator

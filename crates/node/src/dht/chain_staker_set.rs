@@ -14,7 +14,8 @@
 //!   cached active-staker set populated from
 //!   `CapacityBond.getActiveNodes()`.
 //! - ADR 019 § Step 3.3: bootstrap pattern (initial paginated
-//!   `getActiveNodes` + event subscription).
+//!   `getActiveNodes` + event follow — implemented as an `eth_getLogs`
+//!   poll, #1106).
 //! - The event set this watcher follows is grounded in
 //!   `CapacityBond.sol`'s own write-paths — every contract write
 //!   that flips the canonical `isActive` predicate is mirrored by an
@@ -104,10 +105,9 @@ const PAGE_SIZE: u64 = 100;
 /// headroom rather than a hot-path constraint.
 const CHANGES_CHANNEL_CAPACITY: usize = 128;
 
-/// Backoff between watcher restart attempts after an event-stream
-/// terminates with an error.
+/// Backoff between watcher retry attempts after a failed poll tick.
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound for the watcher restart backoff.
+/// Upper bound for the watcher retry backoff.
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Chain-backed staker set. Cheap to clone via the shared inner
@@ -126,7 +126,7 @@ impl ChainStakerSet {
     /// Initial bootstrap: paginate `getActiveNodes`, filter each entry
     /// through `isActive(operator)`, spawn the background event
     /// watcher. Returns once the cache is populated and the watcher
-    /// is running — the watcher's own subscription failures do not
+    /// is running — the watcher's own poll-tick failures do not
     /// fail bootstrap.
     pub async fn bootstrap<P>(
         provider: P,

@@ -66,7 +66,9 @@ const fn appeal_window_blocks() -> u64 {
     (APPEAL_FILING_WINDOW_SECS * 1_000).div_ceil(ARBITRUM_BLOCK_TIME_MS)
 }
 
-/// Backoff bounds for the poll-retry loop (mirrors the settlement watcher).
+/// Backoff bounds for the poll-retry loop. The ceiling is deliberately lower
+/// than the other watchers' 1-minute cap: a missed `Slashed` event burns the
+/// operator's fixed 30-day appeal window, so recovery is prioritized.
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -255,7 +257,11 @@ fn decode_slashed(
         return None;
     }
     let Ok(event) = SlashJudge::Slashed::decode_log_data(&log.inner.data) else {
-        warn!("skipping undecodable Slashed log");
+        warn!(
+            block_number = ?log.block_number,
+            tx = ?log.transaction_hash,
+            "skipping undecodable Slashed log"
+        );
         return None;
     };
     if event.operator != self_address {
@@ -315,7 +321,14 @@ fn record_slash(store: &SlashStore, metrics: &Arc<Metrics>, slash: DetectedSlash
     let mut guard = store
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.iter().any(|s| s.slash_id == slash.slash_id) {
+    if let Some(existing) = guard.iter_mut().find(|s| s.slash_id == slash.slash_id) {
+        // Re-sighting (backfill/live overlap or a re-scanned window): don't
+        // re-record or re-count, but do backfill the best-effort deadline hint
+        // if the original sighting's block-timestamp read failed — the dedup
+        // would otherwise leave a one-off RPC error's `None` in place forever.
+        if existing.appeal_window_close.is_none() {
+            existing.appeal_window_close = slash.appeal_window_close;
+        }
         return;
     }
     info!(
@@ -418,11 +431,10 @@ mod tests {
     #[test]
     fn appeal_window_covers_thirty_days() {
         // The boot lookback must cover the full 30-day appeal window even at the
-        // fastest plausible block time (upper-bound block count via `div_ceil`).
-        assert_eq!(
-            appeal_window_blocks(),
-            (APPEAL_FILING_WINDOW_SECS * 1_000).div_ceil(ARBITRUM_BLOCK_TIME_MS)
-        );
+        // fastest plausible block time. Pinned to the concrete expected count
+        // (30 days of 250ms Arbitrum blocks) so an accidental unit slip in the
+        // formula (secs vs ms) fails loudly rather than restating itself.
+        assert_eq!(appeal_window_blocks(), 10_368_000);
         // At least one block per second of the window (block time < 1s).
         assert!(appeal_window_blocks() >= APPEAL_FILING_WINDOW_SECS);
     }

@@ -489,15 +489,17 @@ pub async fn run(
     // stays bound for the buyer handle built further below.
     let channel_state_store: Arc<dyn ChannelStateStore> = concrete_channel_store.clone();
     let pending_settle_store: Arc<dyn PendingSettleStore> = concrete_channel_store.clone();
-    // Debounce the scan-checkpoint write (#784): the live watcher advances the
-    // checkpoint once per distinct block carrying a provider-owned
-    // `ChannelOpened`, and the directly-durable store fsyncs on each. The
-    // persisted value is only a *floor* for the resume backfill
-    // (`resolve_persisted_start` rewinds it by the reorg margin; registration is
-    // idempotent), so coarsening the write cadence is safe — and the settlement
-    // service forces a final flush on graceful shutdown so steady-state progress
-    // is not lost. Wrapping here (the wiring layer) keeps the domain trait and the
-    // disk store free of the debounce policy.
+    // Debounce the scan-checkpoint writes (#784, keyed in #1092): each persisted
+    // watcher (settlement `ChannelOpened`, origin `Origin`) advances its cursor
+    // once per completed `eth_getLogs` window — on the live tail, once per poll
+    // tick with new confirmed blocks — and the directly-durable store fsyncs on
+    // each. The persisted value is only a *floor* for the resume backfill
+    // (`resolve_persisted_start` rewinds it by the reorg margin; the sinks are
+    // idempotent), so coarsening the write cadence is safe — and each key is
+    // force-flushed on graceful shutdown (settlement by its service, origin by
+    // the shutdown sequence below) so steady-state progress is not lost.
+    // Wrapping here (the wiring layer) keeps the domain trait and the disk store
+    // free of the debounce policy.
     let watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore> = Arc::new(
         crate::payment_settlement::DebouncedCheckpointStore::new(concrete_channel_store.clone()),
     );
@@ -864,6 +866,12 @@ pub async fn run(
     // prior behavior). The prefetch enabled gauge is published regardless so
     // dashboards have a uniform schema across enabled/disabled nodes
     // (appendix-observability §Prefetch).
+    // Cancelled by the shutdown sequence so the origin watcher's cancel path
+    // flushes its debounced `CheckpointKey::Origin` cursor (an abort-only
+    // teardown would drop up to a debounce window of scan progress on every
+    // clean stop). Unconditionally cancelled at shutdown; without the
+    // chain-backed directory nothing listens, so that cancel is a no-op.
+    let origin_watcher_shutdown = CancellationToken::new();
     let origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> = match (
         cfg.blockchain.origin_assignment_address.as_deref(),
         cfg.blockchain.publisher_registry_address.as_deref(),
@@ -893,6 +901,7 @@ pub async fn run(
                     event_poll_interval,
                     Arc::clone(&staker_set),
                     Arc::clone(&node_metrics),
+                    origin_watcher_shutdown.clone(),
                 )
                 .await
                 .context("ChainOriginDirectory bootstrap")?,
@@ -1859,6 +1868,19 @@ pub async fn run(
     let _ = bucket_refresh_stop_tx.send(());
     if let Some(token) = blacklist_watcher_shutdown {
         token.cancel();
+    }
+    origin_watcher_shutdown.cancel();
+    // Deterministically flush the origin scan cursor: the watcher's own
+    // cancel-path flush races `origin_directory`'s abort-on-drop teardown, and
+    // a lost flush silently widens the next boot's rescan by up to a debounce
+    // window. Settlement's `ChannelOpened` key is flushed by its service's
+    // `flush_checkpoint_on_shutdown`; `Origin` has no owning service, so flush
+    // it here. Best-effort, mirroring that path: a failed flush only widens
+    // the next rescan, so warn and continue shutting down.
+    if let Err(err) =
+        watcher_checkpoint_store.flush_checkpoint(decdn_incentive::CheckpointKey::Origin)
+    {
+        tracing::warn!(%err, "failed to flush origin-directory scan checkpoint on shutdown");
     }
     // Admin server shutdown is ordered per `admin_stop_order`:
     //

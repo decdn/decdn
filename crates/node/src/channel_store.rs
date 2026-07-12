@@ -1460,13 +1460,13 @@ impl KeyedCheckpointStore for PersistentChannelStateStore {
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
         // Force fsync-on-commit, same durability discipline as the other tables.
-        // Each call here fsyncs. To avoid one fsync per distinct block carrying a
-        // provider-owned `ChannelOpened` (a backlog drain after a resubscribe, and
-        // steady state on a high-fan-out provider), the runtime wraps this store in
+        // Each call here fsyncs. To avoid one fsync per completed `eth_getLogs`
+        // window (a backlog drain, and on the live tail once per poll tick with
+        // new confirmed blocks), the runtime wraps this store in
         // `payment_settlement::DebouncedCheckpointStore` (#784), which coarsens the
         // write cadence and forces a final flush on graceful shutdown. That is
         // safe because the resume backfill rounds this checkpoint down by
-        // `REORG_MARGIN_BLOCKS` and `register_open_channel` is idempotent, so a
+        // `REORG_MARGIN_BLOCKS` and the sinks are idempotent, so a
         // lagging floor only ever widens the next rescan. This impl stays durable
         // per-call so the floor the debouncer *does* forward is crash-safe.
         write_txn

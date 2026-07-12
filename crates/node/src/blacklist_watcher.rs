@@ -30,10 +30,11 @@
 //! (still out-of-scope, so un-evicted) entries are gone from the in-memory
 //! `known`, silently dropping them from re-scoping — a compliance gap, since
 //! serving a blacklisted hash is slashable. The #1108 crash-loop (a rate-limited
-//! boot tripping the startup preflight) is instead fixed by the preflight's
-//! 429/5xx tolerance: the poller then makes windowed forward progress under
-//! backoff without exiting the process. A durable deny-set (to make the resume
-//! safe) is a tracked follow-up.
+//! boot tripping the startup preflight) is instead mitigated by the preflight's
+//! bounded 429/5xx retry (`check_rpc_reachability` — a *persistently* throttled
+//! endpoint can still exhaust it): the poller then makes windowed forward
+//! progress under backoff without exiting the process. A durable deny-set (to
+//! make the resume safe) is a tracked follow-up.
 //!
 //! Eviction is the single lever, and it cascades to every serving surface:
 //! [`decdn_cache::CacheEngine::evict`] durably records the takedown (survives
@@ -44,7 +45,10 @@
 //! `evict` is sticky and works on absent hashes, so a hash blacklisted while the
 //! node was offline (and not yet held) is still pre-blocked.
 //!
-//! **Resilience.** The re-scope pass (`on_tick_complete`) runs every poll tick;
+//! **Resilience.** The re-scope pass runs on the operator's rescan cadence
+//! (checked at the end of every poll tick), pulled forward to the poll cadence
+//! whenever a live re-check or a re-scope pass fails — an enforcement failure
+//! must not wait out the full cadence while the blob stays slashably servable;
 //! every RPC read is bounded by a per-call timeout; the re-scope is interruptible
 //! by shutdown (checked between hashes) so a large backlog cannot overrun the
 //! runtime shutdown deadline. Serving a blacklisted hash is slashable
@@ -72,7 +76,8 @@ use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS};
 
 /// Backoff floor after a failed poll tick.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Backoff ceiling — matches the other on-chain watchers.
+/// Backoff ceiling — matches the settlement/origin/staker-set watchers (the
+/// slash watcher caps lower, at 30s).
 const MAX_BACKOFF: Duration = Duration::from_mins(1);
 /// Per-call ceiling on RPC reads (scope view, log query, head) so a stalled
 /// provider — which has no request timeout configured — cannot wedge the watcher.
@@ -121,10 +126,11 @@ impl WatcherState {
 /// Applies `HashBlacklisted`/`HashRemoved` logs to the deny-set and enforces
 /// compliance (#1092). `apply` records each entry and, for a `HashBlacklisted`,
 /// immediately re-checks scope + evicts (prompt live enforcement); it never
-/// returns `Err` — a scope-check RPC failure keeps the entry in `known` for the
-/// next re-scope, and an undecodable log is logged and skipped.
-/// [`Self::on_tick_complete`] runs the batched re-scope (bounded to the
-/// operator's rescan cadence) that catches no-event scope transitions.
+/// returns `Err` — a scope-check RPC failure keeps the entry in `known` and
+/// pulls the batched re-scope forward to the poll cadence until the re-check
+/// succeeds, and an undecodable log is logged and skipped.
+/// [`Self::on_tick_complete`] runs the batched re-scope (normally bounded to
+/// the operator's rescan cadence) that catches no-event scope transitions.
 struct BlacklistSink<P: Provider + Clone> {
     contract: ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
@@ -141,7 +147,7 @@ struct BlacklistSink<P: Provider + Clone> {
 
 impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
     async fn apply(&mut self, log: Log) -> Result<()> {
-        handle_log(
+        let failed = handle_log(
             &self.contract,
             self.operator,
             &self.cache,
@@ -149,17 +155,27 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             log,
         )
         .await;
+        // A live `HashBlacklisted` whose scope-check or eviction failed must
+        // retry at the poll cadence (seconds), not the operator's re-scope
+        // cadence (default 10 min) — serving the blob meanwhile is slashable.
+        // Clearing `last_rescan` forces the batched re-scope on this tick's
+        // `on_tick_complete`, which re-checks the retained entry.
+        if failed {
+            self.last_rescan = None;
+        }
         Ok(())
     }
 
     async fn on_tick_complete(&mut self) -> Result<()> {
         // Re-scope the whole deny-set on the operator's cadence (not every poll
         // tick): catches a region/ripening/appeal transition that emits no event.
+        // An apply-time enforcement failure clears `last_rescan` (see `apply`),
+        // pulling the next pass forward to the poll cadence.
         let due = self
             .last_rescan
             .is_none_or(|at| at.elapsed() >= self.rescan_interval);
         if due {
-            rescan(
+            let clean = rescan(
                 &self.contract,
                 self.operator,
                 &self.cache,
@@ -167,10 +183,24 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
                 &self.shutdown,
             )
             .await;
-            self.last_rescan = Some(Instant::now());
+            // A pass with any failed re-check retries at the poll cadence until
+            // it comes back clean; only a clean pass waits out the full
+            // operator cadence again.
+            self.last_rescan = clean.then(Instant::now);
         }
         Ok(())
     }
+}
+
+/// The blacklist watcher's cursor policy: **full replay from the deploy floor
+/// on every boot, never persisted**. The in-memory deny-set has no on-chain
+/// enumeration source, so a persisted resume would skip logs whose (still
+/// out-of-scope, so un-evicted) entries are gone from `known` — silently
+/// dropping them from re-scoping, a slashable compliance gap (see the module
+/// header). Pinned by a test so a wiring change to a persisted cursor cannot
+/// land silently.
+const fn cursor_policy(from_block: u64) -> CursorPolicy {
+    CursorPolicy::FullReplay { floor: from_block }
 }
 
 /// Run the blacklist compliance watcher until `shutdown` is cancelled.
@@ -215,10 +245,7 @@ pub(crate) async fn run<P>(
         confirmations: 0,
         reorg_margin: REORG_MARGIN_BLOCKS,
         max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-        // Full replay from the deploy floor every boot, no persisted cursor: the
-        // in-memory deny-set has no enumeration source, so a resume would drop
-        // still-out-of-scope entries (a compliance gap).
-        cursor: CursorPolicy::FullReplay { floor: from_block },
+        cursor: cursor_policy(from_block),
         initial_backoff: INITIAL_BACKOFF,
         max_backoff: MAX_BACKOFF,
         rpc_call_timeout: Some(RPC_CALL_TIMEOUT),
@@ -233,70 +260,88 @@ pub(crate) async fn run<P>(
 
 /// Re-scope every distinct hash in `known` (one scope `eth_call` per hash, not
 /// per regional entry) and evict those now in scope. Interruptible by shutdown
-/// between hashes.
+/// between hashes. Returns `true` iff the pass completed with no failed
+/// re-check (a shutdown-interrupted pass counts as unclean so the next tick
+/// finishes it — moot in practice, since the loop exits on cancel).
 async fn rescan<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
     shutdown: &CancellationToken,
-) where
+) -> bool
+where
     P: Provider + Clone,
 {
     let snapshot = state.distinct_hashes();
     let mut evicted = 0usize;
+    let mut clean = true;
     for hash in snapshot {
         if shutdown.is_cancelled() {
-            return;
+            return false;
         }
-        if recheck(contract, operator, cache, state, hash).await {
-            evicted = evicted.saturating_add(1);
+        match recheck(contract, operator, cache, state, hash).await {
+            Recheck::Evicted => evicted = evicted.saturating_add(1),
+            Recheck::NoAction => {}
+            Recheck::Failed => clean = false,
         }
     }
     if evicted > 0 {
         info!(evicted, "blacklist watcher evicted blacklisted blobs");
     }
+    clean
 }
 
 /// Handle one live log: `HashBlacklisted` records the `(region, hash)` entry
 /// and re-checks the hash; `HashRemoved` drops exactly that entry (hygiene —
 /// eviction stays sticky, and same-hash entries in other regions survive).
+/// Returns `true` iff a `HashBlacklisted` re-check failed and needs a prompt
+/// retry.
 async fn handle_log<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
     log: Log,
-) where
+) -> bool
+where
     P: Provider + Clone,
 {
     match log.topic0() {
         Some(topic) if *topic == HashBlacklisted::SIGNATURE_HASH => {
-            on_blacklisted_log(contract, operator, cache, state, &log).await;
+            on_blacklisted_log(contract, operator, cache, state, &log).await == Recheck::Failed
         }
-        Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => on_removed_log(state, &log),
-        _ => {}
+        Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => {
+            on_removed_log(state, &log);
+            false
+        }
+        _ => false,
     }
 }
 
 /// Decode a `HashBlacklisted` log, record its `(region, hash)` entry, and
-/// re-check the hash.
+/// re-check the hash. An undecodable log is [`Recheck::NoAction`] (skipped, per
+/// the `LogSink` contract).
 async fn on_blacklisted_log<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
     log: &Log,
-) where
+) -> Recheck
+where
     P: Provider + Clone,
 {
     match HashBlacklisted::decode_log_data(&log.inner.data) {
         Ok(event) => {
             let hash = Hash::from_bytes(event.hash.0);
             state.add_entry(event.region, hash);
-            recheck(contract, operator, cache, state, hash).await;
+            recheck(contract, operator, cache, state, hash).await
         }
-        Err(err) => warn!(err = %err, "blacklist watcher: undecodable HashBlacklisted log"),
+        Err(err) => {
+            warn!(err = %err, "blacklist watcher: undecodable HashBlacklisted log");
+            Recheck::NoAction
+        }
     }
 }
 
@@ -316,35 +361,49 @@ fn on_removed_log(state: &mut WatcherState, log: &Log) {
     }
 }
 
-/// Evict `hash` if in scope. Returns `true` iff an eviction was performed.
-/// Out-of-scope/suspended (`Some(false)`) and RPC-error (`None`) hashes keep
-/// their `known` entries for the next re-scope (callers insert before calling);
-/// evicted hashes drop *all* their regional entries — eviction is sticky and
-/// region-independent.
+/// Outcome of one scope re-check, so callers can distinguish an enforcement
+/// *failure* (retry promptly — the entry may be live and slashable) from a
+/// legitimately out-of-scope entry (the periodic re-scope keeps watching it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recheck {
+    /// The hash was in scope and its eviction succeeded.
+    Evicted,
+    /// Nothing to do: already evicted, or currently out of scope / suspended.
+    NoAction,
+    /// The scope read or the eviction failed (RPC error/timeout, cache error) —
+    /// the entry is retained and must be re-checked promptly.
+    Failed,
+}
+
+/// Evict `hash` if in scope. Out-of-scope/suspended (`Some(false)`) and
+/// RPC-error (`None`) hashes keep their `known` entries for the next re-scope
+/// (callers insert before calling); evicted hashes drop *all* their regional
+/// entries — eviction is sticky and region-independent.
 async fn recheck<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
     hash: Hash,
-) -> bool
+) -> Recheck
 where
     P: Provider + Clone,
 {
     if cache.is_evicted(hash) {
         state.drop_hash(hash);
-        return false;
+        return Recheck::NoAction;
     }
     match scope_check(contract, operator, hash).await {
         Some(true) => {
             if evict(cache, hash).await {
                 state.drop_hash(hash);
-                true
+                Recheck::Evicted
             } else {
-                false
+                Recheck::Failed
             }
         }
-        Some(false) | None => false,
+        Some(false) => Recheck::NoAction,
+        None => Recheck::Failed,
     }
 }
 
@@ -413,6 +472,21 @@ mod tests {
         WatcherState {
             known: HashSet::new(),
         }
+    }
+
+    /// COMPLIANCE PIN: the blacklist watcher must full-replay from the deploy
+    /// floor on every boot. A swap to `CursorPolicy::Persisted` resumes past
+    /// logs whose entries no longer exist in the in-memory deny-set, silently
+    /// dropping them from re-scoping — serving such a hash is slashable.
+    #[test]
+    fn cursor_policy_is_full_replay_never_persisted() {
+        assert!(
+            matches!(
+                cursor_policy(1234),
+                CursorPolicy::FullReplay { floor: 1234 }
+            ),
+            "blacklist deny-set rebuild requires FullReplay from the deploy block"
+        );
     }
 
     /// Removing one region's entry must not drop a surviving same-hash entry

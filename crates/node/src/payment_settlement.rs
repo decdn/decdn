@@ -58,7 +58,7 @@
 //! dispute monitor (challenging a client's stale close, #324) are out of scope
 //! here. Structurally this mirrors
 //! [`crate::dht::chain_staker_set`]: a generic-over-`Provider` struct owning
-//! `AbortOnDrop` background tasks with exponential-backoff resubscription.
+//! `AbortOnDrop` background tasks with exponential-backoff poll retry.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -93,7 +93,7 @@ use crate::metrics::{Metrics, SettleParty};
 /// concurrent channels without backpressuring the voucher-accept path.
 pub const REDEEM_HINT_CAPACITY: usize = 256;
 
-/// Backoff between watcher restart attempts after an event stream errors.
+/// Backoff between watcher retry attempts after a failed poll tick.
 /// Mirrors [`crate::dht::chain_staker_set`]'s watcher policy.
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
@@ -197,9 +197,9 @@ pub(crate) const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
 /// sink is
 /// idempotent, so a checkpoint that lags the true scan position by a bounded
 /// amount only ever *widens* the next rescan, never narrows it. That makes the
-/// per-block fsync the live `opened` arm would otherwise pay (one fsync per
-/// distinct block carrying a provider-owned `ChannelOpened`, both while draining
-/// a backoff re-scan backlog and in steady state on a high-fan-out provider) safe to
+/// per-advance fsync the poller would otherwise pay (the cursor persists once
+/// per completed `eth_getLogs` window — on the live tail, once per poll tick
+/// that found new confirmed blocks, events or not) safe to
 /// coarsen: [`DebouncedCheckpointStore`] forwards a durable write only once the
 /// buffered block is at least [`CHECKPOINT_FLUSH_BLOCKS`] ahead of the last
 /// persisted value *or* at least [`CHECKPOINT_FLUSH_INTERVAL`] has elapsed since
@@ -385,11 +385,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             confirmations: 0,
             reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-            cursor: CursorPolicy::Persisted {
-                store: Arc::clone(&checkpoint_store),
-                key: CheckpointKey::ChannelOpened,
-                none_fallback: NoneFallback::Head,
-            },
+            cursor: cursor_policy(Arc::clone(&checkpoint_store)),
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
@@ -497,10 +493,10 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             // span the next boot's resume backfill will re-scan. Logging it gives a
             // post-mortem the rescan depth without a dedicated accessor.
             //
-            // The watcher's persist sites bump `metrics.watcher_persist_failure()`,
-            // but no `metrics` handle is held on this shutdown path (the watcher
-            // task owns it), so we deliberately do not plumb one through solely for
-            // counter parity here — the warn is the signal for a failed flush.
+            // Checkpoint persist/flush failures are warn-only everywhere (the
+            // resumable watcher's persist sites likewise only log; the
+            // `watcher_persist_failure` counter tracks channel-*state* write
+            // failures, not checkpoint ones), so the warn is the signal here too.
             let pending_block = self
                 .checkpoint_store
                 .load_checkpoint(CheckpointKey::ChannelOpened)
@@ -689,19 +685,19 @@ async fn record_pending_after_close<P: Provider + Clone>(
         settle_after,
     };
     if let Err(err) = pending_store.record_pending(&entry) {
-        // A lost write here is now recoverable across a restart: the channel is
-        // still `Closing` on-chain, so the next boot's closing-reconciliation
-        // backfill (#839, `backfill_closing_channels`) re-reads its status and
-        // re-derives this entry — independent of the local forget. The manual
-        // remedy below only bites if the channel also leaves `Closing` (settles)
-        // before that next reconciliation runs, or for the boot-floor residual
-        // documented at the backfill call site.
+        // Best-effort recovery across a restart: the channel is still `Closing`
+        // on-chain, and the watcher re-scans `ChannelCloseInitiated` from the
+        // persisted `ChannelOpened`-keyed cursor, so as long as that cursor is
+        // still at/below the close's block the re-scanned log re-derives this
+        // entry via `reconcile_closing_channel`. That is NOT guaranteed: an
+        // unrelated open can advance the checkpoint past this close's block (the
+        // residual documented on `reconcile_closing_channel`), in which case the
+        // manual remedy below is the only path.
         error!(
             %err, %channel_id, settle_after,
             "failed to persist pending-settle entry — \
-             if clientRefund==0 the remainder will not auto-settle until the next \
-             boot's closing-reconciliation backfill; or call settleChannel(<channel_id>) \
-             manually after the dispute window"
+             if clientRefund==0 the remainder may not auto-settle; \
+             call settleChannel(<channel_id>) manually after the dispute window"
         );
     } else {
         info!(
@@ -979,20 +975,35 @@ async fn reconcile_closing_channel<P: Provider + Clone>(
     Ok(())
 }
 
+/// The settlement watcher's cursor policy: resume the durable
+/// [`CheckpointKey::ChannelOpened`] floor (#751); a first-ever boot anchors at
+/// **head** — no channel toward this node can predate the node itself, so
+/// there is no history to replay. Pinned by a test: swapping the fallback to
+/// `FromBlock` full-scans chain history on every fresh node (`from_block` is
+/// `0` here), and swapping the key forfeits the persisted resume.
+fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
+    CursorPolicy::Persisted {
+        store,
+        key: CheckpointKey::ChannelOpened,
+        none_fallback: NoneFallback::Head,
+    }
+}
+
 /// Applies `PaymentChannel` lifecycle logs to the settlement state (#1092). One
 /// per settlement watcher; the resumable `eth_getLogs` poller feeds it
 /// block-ordered logs and advances + persists the `ChannelOpened` scan
 /// checkpoint per window on a clean tick.
 ///
 /// Failure policy — preserves the #751 anti-strand invariant. A `ChannelOpened`
-/// whose persist fails, or a `ChannelCloseInitiated` whose reconcile fails,
-/// returns `Err`: the tick aborts before this window is persisted, so the cursor
-/// stays below the failed block and the backoff re-scans + re-applies it
-/// (idempotently) on the next tick. Because the scan is block-ordered and the
-/// tick aborts on the first `Err`, the persisted checkpoint can never advance
-/// past an unpersisted open — the same guarantee the old
-/// `advance_checkpoint`-on-successful-open gave. A top-up/settle apply failure is
-/// logged and skipped (`Ok`); so is any undecodable log — a permanently
+/// whose persist fails, a `ChannelToppedUp` whose deposit update fails, or a
+/// `ChannelCloseInitiated` whose reconcile fails, returns `Err`: the tick aborts
+/// before this window is persisted, so the cursor stays below the failed block
+/// and the backoff re-scans + re-applies it (idempotently) on the next tick.
+/// Because the scan is block-ordered and the tick aborts on the first `Err`,
+/// the persisted checkpoint can never advance past an unpersisted open — the
+/// same guarantee the old `advance_checkpoint`-on-successful-open gave. A
+/// settle-cleanup failure is logged and skipped (`Ok`) — the settle sweeper
+/// retries it independently; so is any undecodable log — a permanently
 /// undecodable log must not hot-loop the deterministic re-scan (see [`LogSink`]).
 struct SettlementSink<P: Provider + Clone> {
     contract: PaymentChannel::PaymentChannelInstance<P>,
@@ -1039,22 +1050,27 @@ impl<P: Provider + Clone> LogSink for SettlementSink<P> {
                     }
                 };
                 // Not provider-indexed; `update_channel_deposit` is a no-op for
-                // channels this node does not track. A failure only affects the
-                // tracked deposit ceiling, so it is logged and skipped.
+                // channels this node does not track, so an `Err` is a real
+                // durable-write failure. That is retryable: swallowing it would
+                // advance the cursor past the log and permanently cap the
+                // channel at its pre-top-up deposit ceiling (the client paid,
+                // this node keeps rejecting vouchers above the stale bound), so
+                // fail the tick and re-scan the window — same policy as
+                // `ChannelOpened`.
                 if let Err(err) = self
                     .handler
                     .update_channel_deposit(event.channelId, event.newDeposit)
                     .await
                 {
                     self.metrics.watcher_persist_failure();
-                    warn!(%err, channel_id = %event.channelId, "failed to apply channel top-up");
-                } else {
-                    debug!(
-                        channel_id = %event.channelId,
-                        new_deposit = %event.newDeposit,
-                        "channel top-up applied to tracked deposit"
-                    );
+                    return Err(err)
+                        .with_context(|| format!("apply top-up for channel {}", event.channelId));
                 }
+                debug!(
+                    channel_id = %event.channelId,
+                    new_deposit = %event.newDeposit,
+                    "channel top-up applied to tracked deposit"
+                );
             }
             Some(sig) if sig == PaymentChannel::ChannelSettled::SIGNATURE_HASH => {
                 let event = match PaymentChannel::ChannelSettled::decode_log_data(&log.inner.data) {
@@ -1289,13 +1305,15 @@ impl KeyedCheckpointStore for DebouncedCheckpointStore {
         // existing checkpoint into `last_persisted`. The lazy insert leaves it
         // `None`, so without this a fresh key-state around an *already-populated*
         // inner store could forward a block BELOW its existing checkpoint and
-        // regress the on-disk floor. `first_record` is captured before flipping
-        // the flag so we still force that first advance durable (re-anchor after
-        // a restart).
+        // regress the on-disk floor. `seeded` flips only after the load
+        // *succeeds*: an `Err` here must leave the key unseeded so the next
+        // record retries the seed — flipping first would leave
+        // `last_persisted = None` with the guard armed, re-enabling exactly the
+        // floor regression the seed exists to prevent.
         let first_record = !state.seeded;
         if first_record {
-            state.seeded = true;
             state.last_persisted = self.inner.load_checkpoint(key)?;
+            state.seeded = true;
         }
         // Buffer the latest block (monotonic: never lower an already-buffered or
         // already-persisted floor).
@@ -2204,6 +2222,9 @@ mod tests {
         /// When set, `record_checkpoint` returns an error without storing, to
         /// exercise the debouncer's retry-after-failure path.
         fail_writes: std::sync::atomic::AtomicBool,
+        /// When set, `load_checkpoint` returns an error, to exercise the
+        /// debouncer's seed-retry path.
+        fail_loads: std::sync::atomic::AtomicBool,
     }
 
     impl Default for RecordingCheckpointStore {
@@ -2212,6 +2233,7 @@ mod tests {
                 stored: std::sync::Mutex::new(HashMap::new()),
                 writes: std::sync::atomic::AtomicUsize::new(0),
                 fail_writes: std::sync::atomic::AtomicBool::new(false),
+                fail_loads: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -2221,6 +2243,9 @@ mod tests {
             &self,
             key: CheckpointKey,
         ) -> Result<Option<u64>, decdn_incentive::StoreError> {
+            if self.fail_loads.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(decdn_incentive::StoreError::Backend("injected load".into()));
+            }
             Ok(self
                 .stored
                 .lock()
@@ -2256,6 +2281,66 @@ mod tests {
             self.fail_writes
                 .store(fail, std::sync::atomic::Ordering::SeqCst);
         }
+
+        fn set_fail_loads(&self, fail: bool) {
+            self.fail_loads
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// POLICY PIN: the settlement watcher resumes the durable `ChannelOpened`
+    /// floor and anchors a first-ever boot at head. A `FromBlock` fallback here
+    /// would full-scan chain history on every fresh node (settlement's
+    /// `from_block` is 0); a different key forfeits the #751 resume.
+    #[test]
+    fn cursor_policy_is_persisted_channel_opened_head_fallback() {
+        let store: Arc<dyn KeyedCheckpointStore> = Arc::new(RecordingCheckpointStore::default());
+        assert!(matches!(
+            cursor_policy(store),
+            CursorPolicy::Persisted {
+                key: CheckpointKey::ChannelOpened,
+                none_fallback: NoneFallback::Head,
+                ..
+            }
+        ));
+    }
+
+    /// A failed seed load must leave the key *unseeded* so a later record
+    /// retries it — otherwise the key runs with `last_persisted = None` and a
+    /// low record forwarded by a later flush regresses the on-disk floor below
+    /// its pre-existing checkpoint (the exact hazard the seed exists to prevent).
+    #[test]
+    fn debounce_seed_load_error_retries_and_never_regresses_floor() -> Result<(), StoreError> {
+        let inner = Arc::new(RecordingCheckpointStore::default());
+        // Pre-existing durable floor from a previous process.
+        inner.record_checkpoint(CheckpointKey::ChannelOpened, 1_000)?;
+        let store = DebouncedCheckpointStore::with_params(
+            Arc::clone(&inner) as Arc<dyn KeyedCheckpointStore>,
+            512,
+            Duration::from_secs(30),
+            Box::new(Instant::now),
+        );
+
+        // First record hits a transient load error while seeding: it must
+        // propagate and must NOT mark the key seeded.
+        inner.set_fail_loads(true);
+        assert!(
+            store
+                .record_checkpoint(CheckpointKey::ChannelOpened, 5)
+                .is_err()
+        );
+        inner.set_fail_loads(false);
+
+        // The retry re-seeds from the recovered inner store, so the low block
+        // folds into the existing floor instead of anchoring a fresh one at 5.
+        store.record_checkpoint(CheckpointKey::ChannelOpened, 5)?;
+        store.flush_checkpoint(CheckpointKey::ChannelOpened)?;
+        assert_eq!(
+            inner.load_checkpoint(CheckpointKey::ChannelOpened)?,
+            Some(1_000),
+            "a post-seed-failure record must never lower the durable floor"
+        );
+        Ok(())
     }
 
     /// The debounce decorator keeps a *separate* buffer/floor per `CheckpointKey`,

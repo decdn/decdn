@@ -50,13 +50,12 @@ use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
 use crate::metrics::Metrics;
-use crate::payment_settlement::REORG_MARGIN_BLOCKS;
+// `MAX_BACKFILL_BLOCK_SPAN` doubles as this watcher's head-anchored boot
+// lookback; imported (not duplicated) so the shared per-call range cap can't
+// silently diverge.
+use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS};
 use crate::reputation_wiring::NodeSettlementSource;
 
-/// Maximum block span scanned per `eth_getLogs`, and the head-anchored lookback
-/// the boot backfill covers. Mirrors `payment_settlement`'s bound so a single
-/// call stays within typical RPC range caps.
-const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
 /// Initial retry backoff after a watcher tick error.
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Upper bound for the retry backoff.
