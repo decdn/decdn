@@ -114,6 +114,7 @@ fn fresh_context(channel_id: B256, signer: Arc<PrivateKeySigner>) -> ChannelCont
         prior_nonce: U256::ZERO,
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
+        client_binding: None,
     }
 }
 

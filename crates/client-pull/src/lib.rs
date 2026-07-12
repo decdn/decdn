@@ -54,15 +54,20 @@ use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature, U256};
+use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use bao_tree::BaoTree;
 use bao_tree::io::sync::DecodeResponseIter;
 use bao_tree::io::{BaoContentItem, DecodeError};
 use bytes::{Bytes, BytesMut};
 use decdn_bao_range::{IROH_BLOCK_SIZE, align_range};
-use decdn_incentive::{BuyerChannelState, StreamSlashData, Voucher, signed_to_wire_voucher};
+use decdn_incentive::{
+    BuyerChannelState, EPHEMERAL_BINDING_NONCE, StreamSlashData, Voucher, binding_signing_hash,
+    signed_to_wire_voucher,
+};
 use decdn_protocol::client::{
-    ClientMessage, StreamError, StreamRequest, StreamResponse, VoucherRejectReason,
+    ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
+    VoucherRejectReason,
 };
 use decdn_protocol::{
     ALPN_CLIENT, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, decode_message, encode_message, read_frame,
@@ -98,6 +103,14 @@ pub struct ChannelContext {
     pub prior_bytes_delivered: U256,
     /// Cumulative amount paid on this channel before this stream.
     pub prior_amount: U256,
+    /// Optional ADR 005 client identity binding (address + `BindNodeId`
+    /// signature over the requester's own iroh `NodeId`, see
+    /// [`sign_client_binding`]). Attached to every `cdn/client/v1` request's
+    /// `ext` so the serving node can recover the buyer address, confirm it owns
+    /// the channel (`pull_authorized`), and reactively populate from its
+    /// configured origin (#1115). `None` ⇒ no binding is sent (an unconfigured
+    /// `capacity_bond` on the client, or an on-chain/registered requester).
+    pub client_binding: Option<ClientBinding>,
 }
 
 impl ChannelContext {
@@ -122,8 +135,62 @@ impl ChannelContext {
             prior_nonce: state.last_nonce,
             prior_bytes_delivered: state.last_bytes_delivered,
             prior_amount: state.last_amount,
+            client_binding: None,
         }
     }
+
+    /// Attach an ADR 005 client identity binding (see [`sign_client_binding`]) so
+    /// this context's `cdn/client/v1` requests prove channel ownership to the
+    /// serving node, enabling reactive cache-miss origin pull-through (#1115).
+    #[must_use]
+    pub fn with_client_binding(mut self, binding: ClientBinding) -> Self {
+        self.client_binding = Some(binding);
+        self
+    }
+}
+
+/// Sign an ADR 005 ephemeral client identity binding: an EIP-712
+/// `BindNodeId(nodeId, nonce = 0)` attestation over the requester's OWN iroh
+/// `NodeId`, signed with the buyer key. The serving node recovers the signer via
+/// `ecrecover` (`verify_binding`) and checks it owns the named channel before
+/// honoring a cache-miss origin pull (`pull_authorized`, ADR 003 §Off-Chain
+/// Ephemeral Binding). Reusable by the CLI client fetch (#1115) and node-to-node
+/// pulls (#1117).
+///
+/// `own_node_id` MUST be the requester's own endpoint `NodeId` — what the peer
+/// authenticates as `conn.remote_id()` — NOT the target node's. `bind_domain` is
+/// `decdn_incentive::bind_node_id_domain(chain_id, capacity_bond)`.
+///
+/// # Errors
+///
+/// Propagates a signing error from the buyer signer.
+pub fn sign_client_binding(
+    signer: &PrivateKeySigner,
+    own_node_id: B256,
+    bind_domain: &Eip712Domain,
+) -> anyhow::Result<ClientBinding> {
+    let hash = binding_signing_hash(own_node_id, EPHEMERAL_BINDING_NONCE, bind_domain);
+    let binding_signature = signer
+        .sign_hash_sync(&hash)
+        .map_err(|e| anyhow::anyhow!("sign client binding: {e}"))?
+        .as_bytes()
+        .to_vec();
+    Ok(ClientBinding {
+        ethereum_address: signer.address().into(),
+        binding_signature,
+    })
+}
+
+/// Build the trailing [`StreamRequestExt`] carrying the context's client
+/// identity binding, or `None` when the context is unbound — in which case
+/// `encode_stream_request` appends no ext bytes, byte-for-byte the pre-#1115
+/// wire. Shared by `fetch_inner` and `open_progressive_pull`. `voucher_interval_mb`
+/// stays `None` so both sides keep negotiating the default cadence.
+fn client_binding_ext(ctx: &ChannelContext) -> Option<StreamRequestExt> {
+    ctx.client_binding.as_ref().map(|binding| StreamRequestExt {
+        voucher_interval_mb: None,
+        binding: Some(binding.clone()),
+    })
 }
 
 impl std::fmt::Debug for ChannelContext {
@@ -544,9 +611,12 @@ async fn fetch_inner(
         byte_len: 0,
         timestamp_us,
     };
-    // Two-phase encode (ADR 005): no ext for node-to-node pulls. The payload is
-    // the `ClientMessage` plus any trailing ext bytes.
-    let payload = decdn_protocol::encode_stream_request(&req, None)
+    // Two-phase encode (ADR 005): attach the client identity binding when the
+    // context carries one, so the serving node can prove channel ownership and
+    // authorize a cache-miss origin pull (#1115). Absent ⇒ no ext bytes, exactly
+    // the pre-#1115 wire (unbound node-to-node / registered-client path).
+    let ext = client_binding_ext(ctx);
+    let payload = decdn_protocol::encode_stream_request(&req, ext.as_ref())
         .map_err(|e| anyhow::anyhow!("encode stream request: {e}"))?;
     write_frame(&mut send, &payload)
         .await
@@ -942,7 +1012,10 @@ pub async fn open_progressive_pull(
         byte_len: 0,
         timestamp_us,
     };
-    let payload = decdn_protocol::encode_stream_request(&req, None)
+    // Two-phase encode (ADR 005): attach the client identity binding when the
+    // context carries one (#1115), mirroring `fetch_inner`.
+    let ext = client_binding_ext(ctx);
+    let payload = decdn_protocol::encode_stream_request(&req, ext.as_ref())
         .map_err(|e| anyhow::anyhow!("encode stream request: {e}"))?;
     write_frame(&mut send, &payload)
         .await

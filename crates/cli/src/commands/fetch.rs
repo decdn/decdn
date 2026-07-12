@@ -26,11 +26,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel};
 use decdn_client_pull::{
-    ChannelContext, ProgressCallback, VoucherProgress, stream_fetch_tracked_with_progress,
+    ChannelContext, ProgressCallback, VoucherProgress, sign_client_binding,
+    stream_fetch_tracked_with_progress,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -38,7 +39,7 @@ use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelStore};
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
-use decdn_incentive::{slash_judge_domain, voucher_domain};
+use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
 use super::chain_ctx;
@@ -486,6 +487,25 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         chain.max_approve,
     )
     .await?;
+
+    // ADR 005 client identity binding (#1115): sign our OWN iroh NodeId with the
+    // buyer key so the serving node can prove we own the channel and reactively
+    // pull a cache-missed blob from its configured origin. The bind domain's
+    // verifying contract is the `CapacityBond`; without it configured we can't
+    // sign, so we fall back to the pre-#1115 behavior (only already-cached
+    // content is served — a cache miss is refused).
+    let ctx = if let Some(capacity_bond) = chain.capacity_bond {
+        let bind_dom = bind_node_id_domain(chain.chain_id, capacity_bond);
+        let own_node_id = B256::from(*endpoint.id().as_bytes());
+        ctx.with_client_binding(sign_client_binding(&signer, own_node_id, &bind_dom)?)
+    } else {
+        eprintln!(
+            "warning: [blockchain].capacity_bond_address is not set; omitting the client \
+             identity binding, so a node cannot reactively pull this blob from its origin \
+             (only already-cached content will be served)"
+        );
+        ctx
+    };
 
     let mut target = EndpointAddr::new(node_id);
     // `--addr` requires `--node-id` (clap), so it only pins the explicit-node

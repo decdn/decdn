@@ -37,7 +37,8 @@ use decdn_incentive::{
 };
 use decdn_node::client_requester::{
     ChannelContext, ChannelLedger, Cumulative, UpstreamVoucherRejected, VoucherProgress,
-    stream_fetch, stream_fetch_shared, stream_fetch_tracked, stream_fetch_tracked_with_progress,
+    sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
+    stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::ClientHandler;
@@ -154,6 +155,7 @@ fn channel_context(client_signer: Arc<PrivateKeySigner>, deposit: U256) -> Chann
         prior_nonce: U256::ZERO,
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
+        client_binding: None,
     }
 }
 
@@ -997,6 +999,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
         prior_nonce: s1.last_nonce(),
         prior_bytes_delivered: s1.last_bytes_delivered(),
         prior_amount: s1.last_amount(),
+        client_binding: None,
         ..channel_context(Arc::clone(&client_signer), deposit)
     };
     let got2 = stream_fetch(
@@ -2768,6 +2771,158 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
             );
         }
         other => anyhow::bail!("expected StreamResponse, got {other:?}"),
+    }
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Build a cache whose local store is EMPTY but whose filesystem origin holds
+/// `payload`, so a `cdn/client/v1` cache miss must reactively pull the origin
+/// through to serve. Both temp dirs are returned so the caller keeps the origin
+/// alive across the fetch (unlike [`cache_with_two_blobs`], which pre-populates
+/// the store and drops the origin).
+async fn empty_cache_with_fs_origin(
+    payload: &[u8],
+) -> anyhow::Result<(
+    CacheEngine,
+    decdn_cache::Hash,
+    tempfile::TempDir,
+    tempfile::TempDir,
+)> {
+    let hash = decdn_cache::Hash::new(payload);
+    let origin_dir = tempfile::tempdir()?;
+    let hex = hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    let dir = origin_dir.path().join(shard);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hex.as_str()), payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    // Local store intentionally left unpopulated: `has(hash)` is false until a
+    // pull-through fills it, which is what the tests below exercise.
+    anyhow::ensure!(!cache.has(hash).await?, "cache store must start empty");
+    Ok((cache, hash, origin_dir, cache_dir))
+}
+
+/// Spawn a `ClientHandler` server with buffered origin pull-through attached
+/// (`attach_pull_through`), returning the dial target and the server's voucher
+/// signer address. Unlike [`spawn_handler_server`], the handler is built inline
+/// so pull-through can be wired before it is spawned.
+async fn spawn_pull_through_server(
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+) -> anyhow::Result<(EndpointAddr, Address, Endpoint, tokio::task::JoinHandle<()>)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        0,
+        16,
+    )?;
+    handler.attach_pull_through(Duration::from_secs(20));
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth.address(), server_ep, server_task))
+}
+
+/// #1115: a direct client fetch that sends the ADR 005 client identity binding
+/// authorizes reactive origin pull-through — with the blob present only in the
+/// node's filesystem origin (an empty local store), the miss populates from the
+/// origin and the bytes are delivered + hash-verified.
+#[tokio::test(flavor = "multi_thread")]
+async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::Result<()> {
+    let payload = vec![0x7Bu8; 64 * 1024];
+    let (cache, hash, _origin_tmp, _cache_tmp) = empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_pull_through_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // Sign the binding over the CLIENT's own node id with the channel-owning key,
+    // under the handler's binding domain — exactly what `pull_authorized` checks.
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx = channel_context(Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1115 control: the SAME setup WITHOUT a client binding is refused. An
+/// unauthenticated request fails `pull_authorized`, so the buffered pull-through
+/// never runs and the origin-only blob is a clean `CacheMiss` delivery refusal —
+/// pinning that the binding is what unlocks the reactive path.
+#[tokio::test(flavor = "multi_thread")]
+async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result<()> {
+    let payload = vec![0x7Bu8; 64 * 1024];
+    let (cache, hash, _origin_tmp, _cache_tmp) = empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_pull_through_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // No `with_client_binding`: `verified_client` stays `None`.
+    let ctx = channel_context(Arc::clone(&signer), deposit);
+
+    match stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("unbound fetch of an origin-only blob must be refused"),
+        Err(e) => anyhow::ensure!(
+            e.to_string().contains("delivery refused"),
+            "expected a delivery-refused error, got: {e}"
+        ),
     }
 
     client_ep.close().await;
