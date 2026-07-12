@@ -15,7 +15,10 @@ use alloy::primitives::{B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_client_pull::{ChannelContext, VoucherProgress, stream_fetch_tracked};
+use decdn_client_pull::{
+    BlobTooLargeClaim, ChannelContext, HashMismatch, UpstreamVoucherRejected, VoucherProgress,
+    stream_fetch_tracked,
+};
 use decdn_incentive::{slash_judge_domain, voucher_domain};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -172,7 +175,7 @@ impl ClientFixture {
                         channel_id: cid,
                     });
                 }
-                Err(e) if tokio::time::Instant::now() < deadline => {
+                Err(e) if tokio::time::Instant::now() < deadline && is_retryable(&e) => {
                     // Fold whatever the node acked back into `ctx` so the next attempt
                     // signs the next nonce rather than replaying a stale one. `acked()`
                     // is `None` for the common pre-observation failure, leaving `ctx` at
@@ -185,6 +188,9 @@ impl ClientFixture {
                     tracing::debug!("paid fetch not ready ({e}); retrying after watcher catch-up");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
+                // Deadline expired, or a terminal error (`is_retryable` == false):
+                // return the real cause immediately rather than spinning to the
+                // deadline and misreporting a corruption/desync as a readiness timeout.
                 Err(e) => return Err(e).context("paid fetch failed"),
             }
         }
@@ -214,6 +220,35 @@ impl ClientFixture {
         .context("probe daemon")?;
         Ok(resp)
     }
+}
+
+/// Classify a `stream_fetch_tracked` error: `true` if it is the transient
+/// watcher-catch-up condition the retry loop is meant to wait out, `false` if
+/// re-running with the same channel would only spin to the deadline.
+///
+/// The loop exists to ride out the node's pre-observation window, during which
+/// it refuses delivery up front with a plain `"delivery refused: UnknownChannel"`
+/// string error (not a typed sentinel) until its chain watcher decodes
+/// `ChannelOpened`. That, transport errors, a per-attempt `PullTimeout`, and the
+/// node's explicit `RetryLater` resend signal are all retryable. Everything typed
+/// is terminal: a corrupt delivery (`HashMismatch`), a buyer-side size-cap
+/// rejection (`BlobTooLargeClaim`), or any other mid-stream voucher rejection
+/// (`UpstreamVoucherRejected` — e.g. a stale nonce left by one-sided ack loss,
+/// deposit exhaustion, or an expired channel) cannot be fixed by retrying, so we
+/// fail fast and surface the real cause.
+fn is_retryable(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<HashMismatch>().is_some()
+        || err.downcast_ref::<BlobTooLargeClaim>().is_some()
+    {
+        return false;
+    }
+    if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
+        // `RetryLater` is a transient node-side persist failure that asks us to
+        // resend the same voucher on a fresh stream; every other reason is a
+        // terminal payment-state desync.
+        return matches!(rejected.reason, decdn_protocol::VoucherRejectReason::RetryLater);
+    }
+    true
 }
 
 /// Bind a loopback iroh endpoint with relays disabled (no ALPNs — client only
