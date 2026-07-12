@@ -667,8 +667,12 @@ impl ClientHandler {
             Ok(true) => return true,
             Ok(false) => {}
             Err(e) => {
+                // A store-lookup fault at the deadline is a store error, not a
+                // timeout: meter it as an error and return — do NOT also count a
+                // timeout or emit a misleading "timed out" line for it.
                 self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e, "reactive local-origin pull-through store lookup failed after deadline");
+                return false;
             }
         }
         self.metrics.node_pull_through_timeout();

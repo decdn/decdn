@@ -1095,10 +1095,11 @@ pub async fn run(
     if !cfg.cache.origins.is_empty() {
         // A single local origin-chain walk (fs/http/s3), NOT a provider fan-out —
         // so budget it at the per-attempt `node_pull_timeout_sec`, not
-        // `outer_pull_deadline` (which multiplies by `MAX_PROVIDER_ATTEMPTS` for
-        // the sequential node→node pull). Using the outer deadline would let a
-        // wedged local origin block ~3× longer before falling through to the
-        // node→node paths.
+        // `outer_pull_deadline` (which budgets `MAX_PROVIDER_ATTEMPTS ×
+        // per_candidate + PULL_THROUGH_OUTER_SLACK` for the sequential node→node
+        // pull). Using the outer deadline would let a wedged local origin block
+        // several times longer (>3×, and more at small per-attempt budgets where
+        // the fixed slack dominates) before falling through to the node→node paths.
         let local_deadline = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
         client_handler.attach_local_populate(local_deadline);
     }

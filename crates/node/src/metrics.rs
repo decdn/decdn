@@ -652,12 +652,15 @@ pub struct DecdnMetrics {
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
-    /// `NotFound`).
+    /// `NotFound`). Covers BOTH reactive fill tiers — node→node (#831) and the
+    /// local-origin populate (#1116) — so it is not solely a node→node-health
+    /// signal; a cache-only operator's own wedged origin bumps it too.
     pub node_pull_through_timeouts: Counter,
     /// `decdn_node_pull_through_errors_total` (#831): cache-engine errors (not
     /// clean misses) hit while filling a miss on the delivery path — a real
     /// store/pull fault, surfaced as `NotFound` to the client but logged + bumped
-    /// here so it isn't silent.
+    /// here so it isn't silent. Covers BOTH reactive fill tiers: node→node (#831)
+    /// and the local-origin populate (#1116).
     pub node_pull_through_errors: Counter,
     /// `decdn_node_pull_through_background_spawned_total` (#859): detached
     /// background cache-fill tasks spawned after the foreground delivery

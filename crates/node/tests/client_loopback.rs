@@ -3169,3 +3169,74 @@ async fn local_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
     server_task.await?;
     Ok(())
 }
+
+/// #1116: with node→node OFF and only the local populate armed, a bound fetch for
+/// a blob ABSENT from the node's own origin cleanly terminates as a delivery
+/// refusal (not a hang or a masked error) after the local origin is consulted
+/// exactly once — the miss path (`try_local_populate` returns false → falls
+/// through to a `CacheMiss`, since node→node is the only further tier and it's
+/// off). Guards that the local-first insertion neither shadows a would-be
+/// node→node fallthrough nor short-circuits the miss handling.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
+    let payload = vec![0x2Bu8; 64 * 1024];
+    let hash = decdn_cache::Hash::new(&payload);
+    // A filesystem origin that does NOT contain the blob (empty dir), plus an
+    // empty local store — so the reactive local populate is a genuine miss.
+    let origin_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache_metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&cache_metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_local_populate_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx = channel_context(Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    match stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("a blob absent from the local origin must be refused"),
+        Err(e) => anyhow::ensure!(
+            e.to_string().contains("delivery refused"),
+            "expected a delivery-refused error, got: {e}"
+        ),
+    }
+    // The local origin WAS consulted on the miss (proving the local-first path
+    // ran, not that it was skipped), then the request fell through to a clean
+    // refusal because node→node is off — the only further tier.
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 1,
+        "local origin should be consulted once on the miss, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}

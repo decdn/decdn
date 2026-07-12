@@ -747,14 +747,6 @@ async fn try_pull(
     None
 }
 
-/// Attempt a single paid pull from one candidate: resolve its operator address,
-/// open/reuse a buyer channel, `stream_fetch`, and record the reputation
-/// outcome. Returns the bytes on success, `None` (try the next) otherwise.
-// Sequential resolve → open → fetch → classify pipeline; the tracing macros and
-// the success/failure classification inflate the cognitive-complexity + line
-// metrics past threshold (same inflation noted in `chain_staker_set`). Splitting
-// it would scatter a single linear flow across helpers.
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 /// Attach this node's ADR 005 client identity binding to an upstream pull's
 /// `ChannelContext` (#1117). Signs over our OWN endpoint `NodeId` with the
 /// channel's buyer key (`ctx.client_signer`) under the `CapacityBond` bind
@@ -776,6 +768,14 @@ fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> Option<Chann
     }
 }
 
+/// Attempt a single paid pull from one candidate: resolve its operator address,
+/// open/reuse a buyer channel, `stream_fetch`, and record the reputation
+/// outcome. Returns the bytes on success, `None` (try the next) otherwise.
+// Sequential resolve → open → fetch → classify pipeline; the tracing macros and
+// the success/failure classification inflate the cognitive-complexity + line
+// metrics past threshold (same inflation noted in `chain_staker_set`). Splitting
+// it would scatter a single linear flow across helpers.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn pull_from_candidate(
     deps: &NodeOriginDeps,
     candidate: &Candidate,
