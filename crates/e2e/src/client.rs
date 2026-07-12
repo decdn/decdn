@@ -15,7 +15,7 @@ use alloy::primitives::{B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_client_pull::{ChannelContext, stream_fetch};
+use decdn_client_pull::{ChannelContext, VoucherProgress, stream_fetch_tracked};
 use decdn_incentive::{slash_judge_domain, voucher_domain};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -120,7 +120,7 @@ impl ClientFixture {
             u64::try_from(nonce).context("channel nonce overflow")?,
         );
 
-        let ctx = ChannelContext {
+        let mut ctx = ChannelContext {
             channel_id: cid,
             token: chain.usdc,
             deposit,
@@ -140,7 +140,13 @@ impl ClientFixture {
         // that catch-up completes or the budget expires.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
         loop {
-            match stream_fetch(
+            // `stream_fetch_tracked` reports the acked voucher watermark via
+            // `progress` on every return path (Ok/Err/timeout), so a retry after a
+            // mid-stream failure that already consumed a voucher can resume from the
+            // node's advanced nonce instead of replaying nonce 0 (#1062). No blob-size
+            // ceiling on this loopback path — mirrors the plain `stream_fetch` wrapper.
+            let mut progress = VoucherProgress::default();
+            match stream_fetch_tracked(
                 &self.endpoint,
                 target.clone(),
                 &ctx,
@@ -150,6 +156,8 @@ impl ClientFixture {
                 0,
                 TIMESTAMP_US,
                 Duration::from_secs(30),
+                0,
+                &mut progress,
             )
             .await
             {
@@ -165,6 +173,15 @@ impl ClientFixture {
                     });
                 }
                 Err(e) if tokio::time::Instant::now() < deadline => {
+                    // Fold whatever the node acked back into `ctx` so the next attempt
+                    // signs the next nonce rather than replaying a stale one. `acked()`
+                    // is `None` for the common pre-observation failure, leaving `ctx` at
+                    // zero (correct for a never-observed channel).
+                    if let Some((nonce, bytes_delivered, amount)) = progress.acked() {
+                        ctx.prior_nonce = nonce;
+                        ctx.prior_bytes_delivered = bytes_delivered;
+                        ctx.prior_amount = amount;
+                    }
                     tracing::debug!("paid fetch not ready ({e}); retrying after watcher catch-up");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
