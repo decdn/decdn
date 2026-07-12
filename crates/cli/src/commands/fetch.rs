@@ -507,8 +507,13 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // same bar we `finish_and_clear` below. The callback must be `'static`
     // (`ProgressCallback`), hence the owned clone rather than a borrow.
     let cb_bar = bar.clone();
+    // `expected` is constant across the pull, so set the bar length once (it
+    // takes a write lock) rather than on every chunk in the hot receive loop.
+    let length_set = std::sync::atomic::AtomicBool::new(false);
     let on_progress = move |received: u64, expected: u64| {
-        cb_bar.set_length(expected);
+        if !length_set.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            cb_bar.set_length(expected);
+        }
         cb_bar.set_position(received);
     };
     let blob = fetch_blob(
