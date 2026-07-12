@@ -61,9 +61,9 @@ use decdn_incentive::ChannelOpenFailureReason;
 
 use crate::buyer_channel::ChannelOpener;
 use crate::client_requester::{
-    BlobTooLargeClaim, HashMismatch, PullTimeout, UpstreamPull, UpstreamPullHeader,
+    BlobTooLargeClaim, ChannelContext, HashMismatch, PullTimeout, UpstreamPull, UpstreamPullHeader,
     UpstreamVoucherRejected, VoucherProgress, open_progressive_pull as open_progressive_upstream,
-    stream_fetch_tracked,
+    sign_client_binding, stream_fetch_tracked,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -158,6 +158,14 @@ pub struct NodeOriginDeps {
     pub self_id: DhtNodeId,
     /// EIP-712 domain verifying the delivery `slash_sig` (ADR 014 §1).
     pub slash_domain: Eip712Domain,
+    /// `CapacityBond` EIP-712 bind domain (ADR 005). Used to sign the client
+    /// identity binding this node attaches — over its OWN iroh `NodeId` with
+    /// the buyer key — to every node→node pull, so an upstream node can prove
+    /// this node owns the named channel and, on its own cache miss, chain a
+    /// further reactive origin pull (`pull_authorized`, #1117). Built from
+    /// `chain_id` + the `CapacityBond` address, identical to the domain the
+    /// serving side verifies against.
+    pub bind_domain: Eip712Domain,
     /// Local per-peer reputation score store (folded on each pull outcome).
     pub local_rep: Arc<LocalReputation>,
     /// Outbound observation buffer the gossip publisher drains.
@@ -283,6 +291,8 @@ impl NodeOrigin {
                 return None;
             }
         };
+        // #1117: bind the request so the upstream can chain a reactive pull.
+        let ctx = bind_upstream_ctx(deps, ctx)?;
         match open_progressive_upstream(
             &deps.endpoint,
             EndpointAddr::new(pk),
@@ -737,6 +747,27 @@ async fn try_pull(
     None
 }
 
+/// Attach this node's ADR 005 client identity binding to an upstream pull's
+/// `ChannelContext` (#1117). Signs over our OWN endpoint `NodeId` with the
+/// channel's buyer key (`ctx.client_signer`) under the `CapacityBond` bind
+/// domain, so the upstream can prove we own the named channel and, on its own
+/// cache miss, chain a further reactive origin pull (`pull_authorized`). A
+/// signing failure drops the candidate rather than sending an unbound request
+/// the upstream would refuse to chain — try the next provider instead.
+fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> Option<ChannelContext> {
+    let own_node_id = B256::from(*deps.endpoint.id().as_bytes());
+    match sign_client_binding(&ctx.client_signer, own_node_id, &deps.bind_domain) {
+        Ok(binding) => Some(ctx.with_client_binding(binding)),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "node-origin: failed to sign client identity binding; skipping candidate"
+            );
+            None
+        }
+    }
+}
+
 /// Attempt a single paid pull from one candidate: resolve its operator address,
 /// open/reuse a buyer channel, `stream_fetch`, and record the reputation
 /// outcome. Returns the bytes on success, `None` (try the next) otherwise.
@@ -775,6 +806,8 @@ async fn pull_from_candidate(
             return None;
         }
     };
+    // #1117: bind the request so the upstream can chain a reactive pull.
+    let ctx = bind_upstream_ctx(deps, ctx)?;
     let started = Instant::now();
     let mut progress = VoucherProgress::default();
     let result = stream_fetch_tracked(

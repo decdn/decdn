@@ -766,6 +766,117 @@ async fn engine_rejects_oversize_bytes_from_misbehaving_origin() -> anyhow::Resu
     Ok(())
 }
 
+/// A `Peer`-kind origin (the node→node analogue) that records whether it was
+/// consulted. `populate_local` (#1116) MUST skip it so an operator's reactive
+/// local-origin fill fronts no paid node→node pull; the full `populate` (`get`)
+/// path still walks it.
+#[derive(Debug)]
+struct PeerOrigin {
+    payload: bytes::Bytes,
+    fetches: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Origin for PeerOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Peer
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let payload = self.payload.clone();
+        Box::pin(async move { Ok(OriginFetch::found_one_shot(payload)) })
+    }
+}
+
+#[tokio::test]
+async fn populate_local_skips_peer_origin_and_fills_from_local() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Chain = [Peer(could serve), Filesystem(has the blob)]. `populate_local`
+    // must skip the paid `Peer` origin (fronting no USDC) and fill from the
+    // local fs origin — the engine-level guarantee behind #1116's local-first
+    // serve path.
+    let payload: &[u8] = b"served from the operator's own origin";
+    let hash = Hash::new(payload);
+    let peer_fetches = Arc::new(AtomicUsize::new(0));
+
+    let origin_dir = tempfile::tempdir()?;
+    seed_fs_blob(origin_dir.path(), hash, payload)?;
+    let cache_dir = tempfile::tempdir()?;
+
+    let peer = Arc::new(PeerOrigin {
+        payload: bytes::Bytes::from(payload.to_vec()),
+        fetches: Arc::clone(&peer_fetches),
+    });
+    let fs = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
+    let engine = CacheEngine::open(
+        cache_dir.path(),
+        vec![peer as Arc<dyn Origin>, fs as Arc<dyn Origin>],
+        16,
+    )
+    .await?;
+
+    engine.populate_local(hash).await?;
+    anyhow::ensure!(
+        engine.has(hash).await?,
+        "local populate must fill the store"
+    );
+    anyhow::ensure!(
+        peer_fetches.load(Ordering::SeqCst) == 0,
+        "populate_local must NOT consult the Peer origin, got {} fetches",
+        peer_fetches.load(Ordering::SeqCst)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn populate_local_with_only_peer_origin_is_no_origin() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A chain of nothing but a `Peer` origin has no eligible local origin, so
+    // `populate_local` is a fast `NoOrigin` miss that never consults the peer —
+    // whereas the full `populate` DOES pull from it. This is the engine contract
+    // that keeps a cache-only operator's reactive path from silently becoming a
+    // paid node→node pull (#1116).
+    let payload: &[u8] = b"only reachable via a paid peer";
+    let hash = Hash::new(payload);
+    let peer_fetches = Arc::new(AtomicUsize::new(0));
+
+    let cache_dir = tempfile::tempdir()?;
+    let peer = Arc::new(PeerOrigin {
+        payload: bytes::Bytes::from(payload.to_vec()),
+        fetches: Arc::clone(&peer_fetches),
+    });
+    let engine = CacheEngine::open(cache_dir.path(), vec![peer as Arc<dyn Origin>], 16).await?;
+
+    let err = err_of(engine.populate_local(hash).await)?;
+    anyhow::ensure!(
+        matches!(err, CacheError::NoOrigin { .. }),
+        "populate_local over a peer-only chain must be NoOrigin, got: {err:?}"
+    );
+    anyhow::ensure!(
+        peer_fetches.load(Ordering::SeqCst) == 0,
+        "peer-only populate_local must not consult the peer"
+    );
+
+    // Contrast: the full populate path DOES fall back to the peer and fills.
+    engine.populate(hash).await?;
+    anyhow::ensure!(
+        engine.has(hash).await?,
+        "full populate should fill via the peer"
+    );
+    anyhow::ensure!(
+        peer_fetches.load(Ordering::SeqCst) == 1,
+        "full populate should consult the peer exactly once"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn shutdown_flushes_without_drop() -> anyhow::Result<()> {
     // Prove that `shutdown()` — not `Drop` — is what flushes pending state
