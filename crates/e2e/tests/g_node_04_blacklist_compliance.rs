@@ -124,7 +124,7 @@ async fn run_global() -> anyhow::Result<()> {
     // Governance blacklists H globally; advance a while to model the compliance
     // window passing.
     chain.add_hash_global(hash_key).await?;
-    time::increase_time(&chain.admin, 3600).await?;
+    time::increase_time(chain.admin(), 3600).await?;
 
     // The watcher evicts H — assert the blob left the store.
     let evicted = poll(Duration::from_secs(60), || async {
@@ -221,7 +221,7 @@ async fn run_regional() -> anyhow::Result<()> {
         .add_hash_regional(region_key("US"), to_b256(hash))
         .await?;
     chain.add_hash_global(to_b256(sentinel_hash)).await?;
-    time::increase_time(&chain.admin, 3600).await?;
+    time::increase_time(chain.admin(), 3600).await?;
 
     // US evicts the in-region entry.
     let us_evicted = poll(Duration::from_secs(60), || async {
@@ -290,7 +290,7 @@ async fn run_scope_transition() -> anyhow::Result<()> {
     );
 
     // Operator moves to US (no ContentBlacklist event fires) — H is now in scope.
-    chain.update_region(&node.operator, "US").await?;
+    chain.update_region(node.operator(), "US").await?;
 
     // The periodic re-scope of the retained deny-set now finds H in scope and evicts.
     let evicted = poll(Duration::from_secs(60), || async {
@@ -339,8 +339,8 @@ async fn drive_blacklist_slash(
         rate_per_mb: RATE_PER_MB,
         timestamp_us: response_ts_us,
     };
-    let domain = slash_judge_domain(chain.chain_id, chain.addrs.slash_judge);
-    let slash_sig = probe.sign(&node.operator, &domain)?.as_bytes().to_vec();
+    let domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+    let slash_sig = probe.sign(node.operator(), &domain)?.as_bytes().to_vec();
 
     // evidenceHash = keccak(abi.encode(uint8(Blacklist), structHash, isStream)),
     // structHash = keccak(abi.encode(PROBE_TYPEHASH, fields)) — mirrors SlashJudge.
@@ -361,7 +361,7 @@ async fn drive_blacklist_slash(
     let challenger = PrivateKeySigner::random();
     let challenger_addr = challenger.address();
     chain.fund_eth(challenger_addr, 100).await?;
-    let judge = SlashJudge::new(chain.addrs.slash_judge, &chain.admin);
+    let judge = SlashJudge::new(chain.addrs().slash_judge, chain.admin());
     let bond = judge
         .challengeBond()
         .call()
@@ -370,8 +370,8 @@ async fn drive_blacklist_slash(
     chain.transfer_token(challenger_addr, bond).await?;
 
     let cp = chain.provider_for(&challenger);
-    let approve = Erc20::new(chain.addrs.token, &cp)
-        .approve(chain.addrs.slash_judge, bond)
+    let approve = Erc20::new(chain.addrs().token, &cp)
+        .approve(chain.addrs().slash_judge, bond)
         .send()
         .await
         .context("challenger approve TOKEN")?
@@ -383,7 +383,7 @@ async fn drive_blacklist_slash(
     // Commit, mature past MIN_REVEAL_DELAY (1 min), then reveal.
     let salt = B256::ZERO;
     let commitment = keccak256((evidence_hash, salt, challenger_addr).abi_encode());
-    let judge_c = SlashJudge::new(chain.addrs.slash_judge, &cp);
+    let judge_c = SlashJudge::new(chain.addrs().slash_judge, &cp);
     let commit = judge_c
         .commitChallenge(commitment)
         .send()
@@ -393,7 +393,7 @@ async fn drive_blacklist_slash(
         .await
         .context("commitChallenge receipt")?;
     assert!(commit.status(), "commitChallenge reverted");
-    time::increase_time(&chain.admin, 61).await?;
+    time::increase_time(chain.admin(), 61).await?;
 
     let response_data = SlashJudge::ProbeMsg {
         hash: hash_key,
@@ -402,10 +402,10 @@ async fn drive_blacklist_slash(
         timestampUs: response_ts_us,
     }
     .abi_encode();
-    let node_id = B256::from_slice(node.node_id.as_bytes());
-    let receipt = SlashJudgeBlacklist::new(chain.addrs.slash_judge, &cp)
+    let node_id = B256::from_slice(node.node_id().as_bytes());
+    let receipt = SlashJudgeBlacklist::new(chain.addrs().slash_judge, &cp)
         .submitBlacklistChallenge(
-            node.operator_addr,
+            node.operator_addr(),
             node_id,
             hash_key,
             response_data.into(),

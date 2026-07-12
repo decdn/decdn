@@ -28,8 +28,9 @@ use crate::bindings::{Erc20, PaymentChannelOpen};
 use crate::chain::ChainFixture;
 use crate::node::NodeFixture;
 
-/// Default channel deposit: 10 USDC (≥ the contract `minDeposit`).
-const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
+/// Default channel deposit: 10 USDC (≥ the contract `minDeposit`). Public so a
+/// journey can assert the daemon reports this exact deposit for the channel.
+pub const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Fixed slash-receipt timestamp (µs). The node does not gate freshness on this
 /// path; a constant keeps the voucher deterministic (matches the settlement
 /// e2e).
@@ -66,9 +67,9 @@ impl ClientFixture {
 
         // One-time max-ish approval so repeated opens don't each re-approve.
         let provider = chain.provider_for(&signer);
-        let approve_receipt = Erc20::new(chain.usdc, &provider)
+        let approve_receipt = Erc20::new(chain.usdc(), &provider)
             .approve(
-                chain.addrs.payment_channel,
+                chain.addrs().payment_channel,
                 U256::from(DEPOSIT_MICRO_USDC) * U256::from(100u64),
             )
             .send()
@@ -102,14 +103,14 @@ impl ClientFixture {
     ) -> anyhow::Result<FetchOutcome> {
         let client_addr = self.signer.address();
         let provider = chain.provider_for(&self.signer);
-        let pc = PaymentChannelOpen::new(chain.addrs.payment_channel, &provider);
+        let pc = PaymentChannelOpen::new(chain.addrs().payment_channel, &provider);
 
-        let nonce = client_channel_nonce(&provider, chain.addrs.payment_channel, client_addr)
+        let nonce = client_channel_nonce(&provider, chain.addrs().payment_channel, client_addr)
             .await
             .context("read client channel nonce")?;
         let deposit = U256::from(DEPOSIT_MICRO_USDC);
         let open_receipt = pc
-            .openChannel(node.operator_addr, deposit)
+            .openChannel(node.operator_addr(), deposit)
             .send()
             .await
             .context("openChannel send")?
@@ -119,23 +120,23 @@ impl ClientFixture {
         crate::ensure_mined(&open_receipt, "openChannel")?;
         let cid = channel_id(
             client_addr,
-            node.operator_addr,
+            node.operator_addr(),
             u64::try_from(nonce).context("channel nonce overflow")?,
         );
 
         let mut ctx = ChannelContext {
             channel_id: cid,
-            token: chain.usdc,
+            token: chain.usdc(),
             deposit,
             client_signer: Arc::clone(&self.signer),
-            voucher_domain: voucher_domain(chain.chain_id, chain.addrs.payment_channel),
+            voucher_domain: voucher_domain(chain.chain_id(), chain.addrs().payment_channel),
             prior_nonce: U256::ZERO,
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
         };
-        let slash_domain = slash_judge_domain(chain.chain_id, chain.addrs.slash_judge);
-        let target = EndpointAddr::new(node.node_id).with_ip_addr(SocketAddr::V4(
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port),
+        let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+        let target = EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port()),
         ));
 
         // The node accepts vouchers only once its chain watcher has decoded the
@@ -154,7 +155,7 @@ impl ClientFixture {
                 target.clone(),
                 &ctx,
                 &slash_domain,
-                node.operator_addr,
+                node.operator_addr(),
                 *hash.as_bytes(),
                 0,
                 TIMESTAMP_US,
@@ -204,8 +205,8 @@ impl ClientFixture {
         node: &NodeFixture,
         hash: Hash,
     ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
-        let target = EndpointAddr::new(node.node_id).with_ip_addr(SocketAddr::V4(
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port),
+        let target = EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port()),
         ));
         let (resp, _rtt) = decdn_client_pull::probe::probe_once(
             &self.endpoint,

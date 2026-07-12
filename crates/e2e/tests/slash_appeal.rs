@@ -82,7 +82,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- Age the chain past the ~180-day vote-weight ramp so B's weight is at
     // full strength once it has served bytes.
-    time::increase_time(&chain.admin, 185 * DAY).await?;
+    time::increase_time(chain.admin(), 185 * DAY).await?;
 
     // ---- B serves real bytes → its FeeRouter served-bytes advance, giving it
     // Governor vote weight in the trailing window.
@@ -90,7 +90,7 @@ async fn run() -> anyhow::Result<()> {
     let outcome = client.fetch(&chain, &node_b, hash_b).await?;
     assert_eq!(outcome.bytes, payload, "B must deliver the blob");
     let served = poll(Duration::from_secs(120), || async {
-        let b = chain.served_bytes(node_b.operator_addr).await?;
+        let b = chain.served_bytes(node_b.operator_addr()).await?;
         Ok((b > U256::ZERO).then_some(b))
     })
     .await?;
@@ -98,15 +98,15 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- Cross an epoch boundary so those bytes sit in a fully-elapsed epoch
     // inside the trailing window at the proposal snapshot.
-    time::increase_time(&chain.admin, 8 * DAY).await?;
+    time::increase_time(chain.admin(), 8 * DAY).await?;
 
     // ---- Slash A via a real SlashJudge phantom challenge. A fresh EOA is the
     // challenger; A's own eth key signs the self-incriminating evidence.
     let challenger = PrivateKeySigner::random();
-    let node_a_id = B256::from_slice(node_a.node_id.as_bytes());
+    let node_a_id = B256::from_slice(node_a.node_id().as_bytes());
     let blob_hash = B256::repeat_byte(0x42);
     let slash_id = chain
-        .slash_operator_via_judge(&challenger, &node_a.operator, node_a_id, blob_hash)
+        .slash_operator_via_judge(&challenger, node_a.operator(), node_a_id, blob_hash)
         .await?;
 
     // ---- Layer 1 (daemon): A surfaces the slash over admin RPC.
@@ -149,10 +149,10 @@ async fn run() -> anyhow::Result<()> {
     // reason — with the bond payable, only the `CallerNotOperator` guard can
     // reject it (if the guard were removed the call would succeed).
     let evidence = B256::repeat_byte(0xEE);
-    let b_provider = chain.provider_for(&node_b.operator);
+    let b_provider = chain.provider_for(node_b.operator());
     let bond = chain.appeal_bond().await?;
-    fund_and_approve_bond(&chain, &b_provider, node_b.operator_addr, bond).await?;
-    let appeal_as_b = SlashAppeal::new(chain.addrs.slash_appeal, &b_provider)
+    fund_and_approve_bond(&chain, &b_provider, node_b.operator_addr(), bond).await?;
+    let appeal_as_b = SlashAppeal::new(chain.addrs().slash_appeal, &b_provider)
         .openSlashAppeal(slash_id, evidence)
         .send()
         .await;
@@ -164,15 +164,15 @@ async fn run() -> anyhow::Result<()> {
     // ---- File the appeal through the `decdn appeal slash` CLI (posts the bond).
     // The operator's stake is locked in `CapacityBond`, so fund its wallet with
     // the appeal bond first — the CLI approves + posts it.
-    chain.transfer_token(node_a.operator_addr, bond).await?;
-    let balance_before = chain.token_balance(node_a.operator_addr).await?;
-    run_appeal_cli(&node_a.config_path, slash_id, evidence)?;
+    chain.transfer_token(node_a.operator_addr(), bond).await?;
+    let balance_before = chain.token_balance(node_a.operator_addr()).await?;
+    run_appeal_cli(node_a.config_path(), slash_id, evidence)?;
     assert_eq!(
         chain.appeal_status(slash_id).await?,
         STATUS_OPEN,
         "appeal must be Open after the CLI filed it"
     );
-    let balance_after_open = chain.token_balance(node_a.operator_addr).await?;
+    let balance_after_open = chain.token_balance(node_a.operator_addr()).await?;
     assert_eq!(
         balance_before - balance_after_open,
         bond,
@@ -180,14 +180,14 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- Emergency multisig fast-tracks, then a real Governor proposal grants.
-    let epoch_before = chain.slashed_at_epoch(node_a.operator_addr).await?;
+    let epoch_before = chain.slashed_at_epoch(node_a.operator_addr()).await?;
     assert!(
         epoch_before != 0,
         "A must carry a slash watermark pre-grant"
     );
     chain.fast_track_appeal(slash_id).await?;
     chain
-        .governor_grant_appeal(slash_id, &node_b.operator)
+        .governor_grant_appeal(slash_id, node_b.operator())
         .await?;
 
     // ---- Grant effects: appeal Resolved, bond refunded, watermark cleared.
@@ -196,14 +196,14 @@ async fn run() -> anyhow::Result<()> {
         STATUS_RESOLVED,
         "appeal must be Resolved after the grant"
     );
-    let balance_after_grant = chain.token_balance(node_a.operator_addr).await?;
+    let balance_after_grant = chain.token_balance(node_a.operator_addr()).await?;
     assert!(
         balance_after_grant >= balance_before,
         "the appeal bond (and escrowed slash) must be refunded on a granted appeal: \
          before={balance_before}, after={balance_after_grant}"
     );
     assert_eq!(
-        chain.slashed_at_epoch(node_a.operator_addr).await?,
+        chain.slashed_at_epoch(node_a.operator_addr()).await?,
         0,
         "slashedAtEpoch must be recomputed to 0 (vote weight restored)"
     );
@@ -212,11 +212,11 @@ async fn run() -> anyhow::Result<()> {
     // slashed again; fund + approve so the guard (`FrequencyCapHit`), not a
     // zero-allowance `transferFrom`, is what rejects A's own openSlashAppeal.
     let slash_id2 = chain
-        .slash_operator_via_judge(&challenger, &node_a.operator, node_a_id, blob_hash)
+        .slash_operator_via_judge(&challenger, node_a.operator(), node_a_id, blob_hash)
         .await?;
-    let a_provider = chain.provider_for(&node_a.operator);
-    fund_and_approve_bond(&chain, &a_provider, node_a.operator_addr, bond).await?;
-    let second_appeal = SlashAppeal::new(chain.addrs.slash_appeal, &a_provider)
+    let a_provider = chain.provider_for(node_a.operator());
+    fund_and_approve_bond(&chain, &a_provider, node_a.operator_addr(), bond).await?;
+    let second_appeal = SlashAppeal::new(chain.addrs().slash_appeal, &a_provider)
         .openSlashAppeal(slash_id2, evidence)
         .send()
         .await;
@@ -229,13 +229,13 @@ async fn run() -> anyhow::Result<()> {
     // (never granted, so not frequency-capped), fund + approve its bond so the
     // only possible revert is the closed filing window, warp past 30 days, then
     // openSlashAppeal must revert (FilingWindowClosed).
-    let node_b_id = B256::from_slice(node_b.node_id.as_bytes());
+    let node_b_id = B256::from_slice(node_b.node_id().as_bytes());
     let slash_id3 = chain
-        .slash_operator_via_judge(&challenger, &node_b.operator, node_b_id, blob_hash)
+        .slash_operator_via_judge(&challenger, node_b.operator(), node_b_id, blob_hash)
         .await?;
-    fund_and_approve_bond(&chain, &b_provider, node_b.operator_addr, bond).await?;
-    time::increase_time(&chain.admin, 31 * DAY).await?;
-    let late_appeal = SlashAppeal::new(chain.addrs.slash_appeal, &b_provider)
+    fund_and_approve_bond(&chain, &b_provider, node_b.operator_addr(), bond).await?;
+    time::increase_time(chain.admin(), 31 * DAY).await?;
+    let late_appeal = SlashAppeal::new(chain.addrs().slash_appeal, &b_provider)
         .openSlashAppeal(slash_id3, evidence)
         .send()
         .await;
@@ -259,8 +259,8 @@ async fn fund_and_approve_bond(
     bond: U256,
 ) -> anyhow::Result<()> {
     chain.transfer_token(who, bond).await?;
-    let receipt = decdn_e2e::bindings::Erc20::new(chain.addrs.token, provider)
-        .approve(chain.addrs.slash_appeal, bond)
+    let receipt = decdn_e2e::bindings::Erc20::new(chain.addrs().token, provider)
+        .approve(chain.addrs().slash_appeal, bond)
         .send()
         .await?
         .get_receipt()
