@@ -93,11 +93,15 @@ async fn run() -> anyhow::Result<()> {
 
     let buyer_provider = chain.provider_for(&buyer_signer);
     let pc = PaymentChannel::new(chain.addrs.payment_channel, buyer_provider.clone());
+    // Unlimited standing allowance: covers both the initial `openChannel`
+    // deposit and the later refill `topUp` without re-approving (a `--max-approve`
+    // buyer). Passing `None` selects the max-approval path.
     ensure_allowance(
         &buyer_provider,
         chain.usdc,
         buyer_addr,
         chain.addrs.payment_channel,
+        None,
     )
     .await
     .context("approve PaymentChannel")?;
