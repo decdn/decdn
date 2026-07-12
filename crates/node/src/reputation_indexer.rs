@@ -10,16 +10,16 @@
 //! [`NodeSettlementSource`]. Once fed, `compute_reporter_weight` returns a
 //! non-zero weight and received gossip reports actually move network scores.
 //!
-//! The watcher mirrors [`crate::dht::chain_staker_set`] (bootstrap → background
-//! task → exponential-backoff resubscribe → `AbortOnDrop`) and the bring-up
-//! backfill in [`crate::payment_settlement`].
+//! The watcher runs on the shared `resumable_watcher` `eth_getLogs` poller
+//! (#1092/#1106): its first tick backfills a bounded recent window and later
+//! ticks are the live tail, with a background task aborted on drop.
 //!
 //! # Known limitations (flagged in #326 / tracked by the follow-up issue)
 //!
 //! - **Bounded backfill, in-memory rebuild.** [`NodeSettlementSource`] is
 //!   in-memory, so on each boot the indexer rebuilds it by backfilling a bounded
 //!   recent block window (`MAX_BACKFILL_BLOCK_SPAN`); settlements older than
-//!   the window — and any arriving during a resubscribe gap — are not counted.
+//!   the window — and any arriving during a backoff gap — are not counted.
 //!   Durable, full-52-week indexing is a refinement.
 //! - **`settled_at` ≈ index time.** The settlement age used for exponential
 //!   decay is stamped at index time rather than read from the settling block's
@@ -35,28 +35,30 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
 use alloy::providers::Provider;
+use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
 use iroh::PublicKey;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::payment_channel::PaymentChannel;
 
-use crate::chain_events::watch_contract_events;
+use crate::chain_events::resumable_watcher::{
+    self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
+};
 use crate::metrics::Metrics;
+// `MAX_BACKFILL_BLOCK_SPAN` doubles as this watcher's head-anchored boot
+// lookback; imported (not duplicated) so the shared per-call range cap can't
+// silently diverge.
+use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS};
 use crate::reputation_wiring::NodeSettlementSource;
 
-/// Maximum block span scanned for the bring-up backfill, and the lookback from
-/// head used as the backfill floor. Mirrors `payment_settlement`'s bound so a
-/// single `eth_getLogs` stays within typical RPC range caps.
-const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
-/// Initial resubscribe backoff after a watcher stream error.
+/// Initial retry backoff after a watcher tick error.
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound for the resubscribe backoff.
+/// Upper bound for the retry backoff.
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Aborts the watcher task on drop so a node-restart cycle never leaks a
@@ -86,43 +88,75 @@ impl SettlementIndexer {
         payment_channel_addr: Address,
         capacity_bond_addr: Address,
         settlement: Arc<NodeSettlementSource>,
+        event_poll_interval: Duration,
         metrics: Arc<Metrics>,
     ) -> Result<Self>
     where
         P: Provider + Clone + 'static,
     {
-        let payment = PaymentChannel::new(payment_channel_addr, provider.clone());
-        let capacity_bond = CapacityBond::new(capacity_bond_addr, provider);
-        let head = payment
-            .provider()
+        // Fail-fast bring-up smoke check: confirm the RPC is reachable before
+        // spawning the poller (the backfill floor itself is the poller's job now).
+        let head = provider
             .get_block_number()
             .await
-            .context("read head block for settlement-indexer backfill")?;
-        let backfill_from = head.saturating_sub(MAX_BACKFILL_BLOCK_SPAN);
+            .context("read head block for settlement-indexer bring-up")?;
+        let capacity_bond = CapacityBond::new(capacity_bond_addr, provider.clone());
         info!(
             %payment_channel_addr,
-            backfill_from,
             head,
-            "SettlementIndexer bootstrap (network-wide ChannelSettled)"
+            "SettlementIndexer bootstrap (network-wide ChannelSettled, getLogs poller)"
         );
-        let handle = tokio::spawn(watcher_loop(
-            payment,
+        let sink = ReputationSink {
             capacity_bond,
             settlement,
-            backfill_from,
-            metrics,
-        ));
+            metrics: Arc::clone(&metrics),
+            state: IndexerState::new(),
+        };
+        let cfg = WatcherConfig {
+            filter: Filter::new()
+                .address(payment_channel_addr)
+                .event_signature(vec![
+                    PaymentChannel::ChannelOpened::SIGNATURE_HASH,
+                    PaymentChannel::ChannelSettled::SIGNATURE_HASH,
+                ]),
+            from_block: 0,
+            poll_interval: event_poll_interval,
+            confirmations: 0,
+            reorg_margin: REORG_MARGIN_BLOCKS,
+            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
+            // Bounded recent lookback each boot (in-memory rebuild; no durable
+            // cursor); the live tail then flows forward from there.
+            cursor: CursorPolicy::HeadMinusWindow {
+                window_blocks: MAX_BACKFILL_BLOCK_SPAN,
+                floor: 0,
+            },
+            initial_backoff: WATCHER_INITIAL_BACKOFF,
+            max_backoff: WATCHER_MAX_BACKOFF,
+            rpc_call_timeout: None,
+            shutdown: CancellationToken::new(),
+            seed_cursor: None,
+            label: "reputation-indexer",
+            on_established: None,
+            on_backoff: Some(rpc_failure_hook(&metrics)),
+        };
+        let handle = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
         Ok(Self {
             _watcher: AbortOnDrop(handle),
         })
     }
 }
 
+/// Wire a tick failure to the indexer's RPC-failure counter.
+fn rpc_failure_hook(metrics: &Arc<Metrics>) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || metrics.reputation_indexer_rpc_failure())
+}
+
 /// Upper bound on parked `ChannelSettled`-before-`ChannelOpened` events (#864).
 /// Bounds the out-of-order buffer's memory; on overflow the oldest parked event
-/// is dropped and the backfill is re-armed from its block so the next cycle
-/// re-credits it (provider-only if its open still hasn't arrived). 4096 covers a
-/// generous burst of opens/settles racing in the same poll window.
+/// is dropped (its client leg is recovered only if it is still within the next
+/// boot's recent-window backfill — see [`park_settled`]). 4096 covers a generous
+/// burst of opens/settles racing in the same poll window.
 const MAX_PENDING_SETTLED: usize = 4096;
 
 /// Upper bound on the `settled_seen` dedup set (#864). Unlike
@@ -130,7 +164,7 @@ const MAX_PENDING_SETTLED: usize = 4096;
 /// it just forgets that a channel was already credited. The oldest entries
 /// are the longest-settled, so FIFO eviction sheds exactly those. The
 /// residual risk: if an evicted channel's `ChannelSettled` is then
-/// re-delivered (a resubscribe/backfill overlap), `process_settled` no
+/// re-delivered (a re-scan/backfill overlap), `process_settled` no
 /// longer short-circuits and `apply_settlement` re-credits the **provider**
 /// (resolved from the never-removed on-chain `CapacityBond` binding) for
 /// that amount once more — the counterparty leg is lost since the `channels`
@@ -147,19 +181,16 @@ const MAX_SETTLED_SEEN: usize = 65_536;
 struct PendingSettled {
     provider_addr: Address,
     routed_amount: alloy::primitives::U256,
-    /// Settled-event block, used to re-arm backfill if the parked event is
-    /// evicted or its re-credit fails transiently.
-    block: Option<u64>,
 }
 
-/// Persistent across resubscribe cycles: channel→parties map, the settled-once
-/// dedup set, the out-of-order settled buffer, and whether the bring-up backfill
-/// still needs to run.
+/// Persistent for the watcher's life (carried across poll ticks and backoff):
+/// the channel→parties map, the settled-once dedup set, and the out-of-order
+/// settled buffer.
 struct IndexerState {
     /// `channelId → (client, provider)` learned from `ChannelOpened`.
     channels: HashMap<[u8; 32], (Address, Address)>,
     /// `channelId`s already credited, so a backfill/live overlap or a
-    /// resubscribe never double-counts (a channel settles exactly once).
+    /// re-scan never double-counts (a channel settles exactly once).
     /// Bounded by `MAX_SETTLED_SEEN` (#864); kept in sync with
     /// `settled_seen_order` (the FIFO eviction order) by `mark_settled_seen`.
     settled_seen: HashSet<[u8; 32]>,
@@ -173,148 +204,52 @@ struct IndexerState {
     /// `park_settled`.
     pending_settled: HashMap<[u8; 32], PendingSettled>,
     pending_order: VecDeque<[u8; 32]>,
-    /// `Some(start)` until the one-shot bring-up backfill has run.
-    backfill_from: Option<u64>,
 }
 
-async fn watcher_loop<P>(
-    payment: PaymentChannel::PaymentChannelInstance<P>,
+impl IndexerState {
+    fn new() -> Self {
+        Self {
+            channels: HashMap::new(),
+            settled_seen: HashSet::new(),
+            settled_seen_order: VecDeque::new(),
+            pending_settled: HashMap::new(),
+            pending_order: VecDeque::new(),
+        }
+    }
+}
+
+/// Applies network-wide `ChannelOpened`/`ChannelSettled` logs to the in-memory
+/// settlement index (#1092). Backfill and the live tail are one
+/// `resumable_watcher` `eth_getLogs` cursor loop (#1106): opens and settles
+/// arrive block-ordered and interleaved, so a settle whose open is later in the
+/// scan is parked (`pending_settled`, #864) until the open arrives. A transient
+/// resolution failure returns `Err` so the tick backs off and re-scans the window
+/// (`settled_seen` dedups already-credited channels); an undecodable log is
+/// skipped (`Ok`) rather than hot-looping the deterministic re-scan.
+struct ReputationSink<P: Provider + Clone> {
     capacity_bond: CapacityBond::CapacityBondInstance<P>,
     settlement: Arc<NodeSettlementSource>,
-    backfill_from: u64,
     metrics: Arc<Metrics>,
-) where
-    P: Provider + Clone,
-{
-    let mut state = IndexerState {
-        channels: HashMap::new(),
-        settled_seen: HashSet::new(),
-        settled_seen_order: VecDeque::new(),
-        pending_settled: HashMap::new(),
-        pending_order: VecDeque::new(),
-        backfill_from: Some(backfill_from),
-    };
-    let mut backoff = WATCHER_INITIAL_BACKOFF;
-    loop {
-        match run_watcher_once(&payment, &capacity_bond, &settlement, &mut state, &metrics).await {
-            Ok(()) => {
-                debug!("settlement-indexer stream ended cleanly; resubscribing");
-                backoff = WATCHER_INITIAL_BACKOFF;
-            }
-            Err(err) => {
-                metrics.reputation_indexer_rpc_failure();
-                warn!(
-                    err = %sanitize_rpc_display(&err),
-                    backoff_secs = backoff.as_secs(),
-                    "settlement-indexer RPC error; resubscribing after backoff"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(WATCHER_MAX_BACKOFF);
-            }
-        }
-    }
+    state: IndexerState,
 }
 
-// Backfill + two-event dispatch; fundamentally a few branches over one unified
-// log stream (same posture as `chain_staker_set::run_watcher_once`). One-shot
-// backfill followed by the live drain loop reads as a single sequence; splitting
-// the backfill into its own function would obscure the bring-up flow.
-#[allow(clippy::cognitive_complexity)]
-#[allow(clippy::too_many_lines)]
-async fn run_watcher_once<P>(
-    payment: &PaymentChannel::PaymentChannelInstance<P>,
-    capacity_bond: &CapacityBond::CapacityBondInstance<P>,
-    settlement: &Arc<NodeSettlementSource>,
-    state: &mut IndexerState,
-    metrics: &Arc<Metrics>,
-) -> Result<()>
-where
-    P: Provider + Clone,
-{
-    // One multi-topic filter over both channel events (#1011), replacing the two
-    // per-event filters. Installed *before* the bring-up backfill below so any
-    // event emitted during the backfill RPCs buffers in the stream — same
-    // ordering guarantee as before. Demux below by `topic0`.
-    let mut events = watch_contract_events(
-        payment.provider(),
-        *payment.address(),
-        [
-            PaymentChannel::ChannelOpened::SIGNATURE_HASH,
-            PaymentChannel::ChannelSettled::SIGNATURE_HASH,
-        ],
-    )
-    .await
-    .context("watch PaymentChannel settlement events")?;
-
-    // One-shot bring-up backfill: learn opens first (so settled events can find
-    // their counterparty), then process settlements over the same window.
-    // `backfill_from` is only cleared *after* the window completes — a transient
-    // RPC error inside it returns `Err`, the watcher backs off, and the retry
-    // re-runs the full backfill rather than silently skipping it.
-    if let Some(start) = state.backfill_from {
-        let to = payment
-            .provider()
-            .get_block_number()
-            .await
-            .context("read head for settlement backfill")?;
-        if start <= to {
-            let opened_logs = payment
-                .ChannelOpened_filter()
-                .from_block(start)
-                .to_block(to)
-                .query()
-                .await
-                .with_context(|| format!("backfill ChannelOpened over [{start}, {to}]"))?;
-            for (event, _log) in opened_logs {
-                state
-                    .channels
-                    .insert(event.channelId.0, (event.client, event.provider));
-            }
-            let settled_logs = payment
-                .ChannelSettled_filter()
-                .from_block(start)
-                .to_block(to)
-                .query()
-                .await
-                .with_context(|| format!("backfill ChannelSettled over [{start}, {to}]"))?;
-            let (opened_n, settled_n) = (state.channels.len(), settled_logs.len());
-            for (event, _log) in settled_logs {
-                process_settled(
-                    capacity_bond,
-                    settlement,
-                    state,
-                    metrics,
-                    event.channelId.0,
-                    event.provider,
-                    event.routedAmount,
-                )
-                .await?;
-            }
-            info!(
-                start,
-                to,
-                opened = opened_n,
-                settled = settled_n,
-                "settlement-indexer backfill complete"
-            );
-        }
-        // Reached only if every backfill RPC above succeeded; otherwise we
-        // returned `Err` with `backfill_from` still set, so the retry repeats it.
-        state.backfill_from = None;
-    }
-
-    // Filters established and (first cycle) backfill done — the indexer is live.
-    info!("settlement-indexer event cycle established");
-    while let Some(log) = events.next().await {
+impl<P: Provider + Clone> LogSink for ReputationSink<P> {
+    #[allow(clippy::cognitive_complexity)]
+    async fn apply(&mut self, log: Log) -> Result<()> {
         match log.topic0().copied() {
             Some(sig) if sig == PaymentChannel::ChannelOpened::SIGNATURE_HASH => {
-                let event = PaymentChannel::ChannelOpened::decode_log_data(&log.inner.data)
-                    .context("decode ChannelOpened")?;
+                let event = match PaymentChannel::ChannelOpened::decode_log_data(&log.inner.data) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        warn!(%err, "skipping undecodable ChannelOpened log");
+                        return Ok(());
+                    }
+                };
                 handle_opened(
-                    capacity_bond,
-                    settlement,
-                    state,
-                    metrics,
+                    &self.capacity_bond,
+                    &self.settlement,
+                    &mut self.state,
+                    &self.metrics,
                     event.channelId.0,
                     event.client,
                     event.provider,
@@ -322,35 +257,37 @@ where
                 .await?;
             }
             Some(sig) if sig == PaymentChannel::ChannelSettled::SIGNATURE_HASH => {
-                let event = PaymentChannel::ChannelSettled::decode_log_data(&log.inner.data)
-                    .context("decode ChannelSettled")?;
+                let event = match PaymentChannel::ChannelSettled::decode_log_data(&log.inner.data) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        warn!(%err, "skipping undecodable ChannelSettled log");
+                        return Ok(());
+                    }
+                };
                 handle_settled(
-                    capacity_bond,
-                    settlement,
-                    state,
-                    metrics,
+                    &self.capacity_bond,
+                    &self.settlement,
+                    &mut self.state,
+                    &self.metrics,
                     event.channelId.0,
                     event.provider,
                     event.routedAmount,
-                    log.block_number,
                 )
                 .await?;
             }
-            // Unreachable today (the filter's topic0 OR-set bounds the inputs);
-            // don't panic (anti-panic policy), log it so a future OR-set/dispatch
-            // drift leaves a greppable trail instead of a silently dropped event.
             _ => {
                 debug!(topic0 = ?log.topic0(), "unmatched PaymentChannel event in subscribed OR-set");
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Live `ChannelOpened` handler: record the channel's parties, then credit any
 /// `ChannelSettled` that was parked before this open arrived (#864). A transient
-/// re-credit failure re-arms the backfill from the parked event's block so it is
-/// retried next cycle rather than lost.
+/// re-credit failure returns `Err` so the poll tick re-scans the window
+/// (`settled_seen` dedups already-credited channels); the poller subsumes the
+/// old explicit backfill re-arm.
 async fn handle_opened<P>(
     capacity_bond: &CapacityBond::CapacityBondInstance<P>,
     settlement: &Arc<NodeSettlementSource>,
@@ -378,9 +315,6 @@ where
     )
     .await
     {
-        if let Some(block) = parked.block {
-            arm_backfill_from_block(state, block);
-        }
         return Err(err).context("parked ChannelSettled re-credit");
     }
     Ok(())
@@ -388,9 +322,8 @@ where
 
 /// Live `ChannelSettled` handler. Parks the event when its `ChannelOpened`
 /// hasn't been observed (so the client party isn't dropped, #864); otherwise
-/// credits it. A transient resolution error re-arms the backfill from `block`,
-/// since `.watch()` resubscribes at head and never replays the event.
-#[allow(clippy::too_many_arguments)]
+/// credits it. A transient resolution error returns `Err` so the poll tick
+/// re-scans the window (the poller subsumes the old backfill re-arm).
 async fn handle_settled<P>(
     capacity_bond: &CapacityBond::CapacityBondInstance<P>,
     settlement: &Arc<NodeSettlementSource>,
@@ -399,13 +332,12 @@ async fn handle_settled<P>(
     channel_id: [u8; 32],
     provider: Address,
     routed_amount: alloy::primitives::U256,
-    block: Option<u64>,
 ) -> Result<()>
 where
     P: Provider + Clone,
 {
     if !state.settled_seen.contains(&channel_id) && !state.channels.contains_key(&channel_id) {
-        park_settled(state, channel_id, provider, routed_amount, block);
+        park_settled(state, channel_id, provider, routed_amount);
         return Ok(());
     }
     if let Err(err) = process_settled(
@@ -419,9 +351,6 @@ where
     )
     .await
     {
-        if let Some(block) = block {
-            arm_backfill_from_block(state, block);
-        }
         return Err(err).context("ChannelSettled live event");
     }
     Ok(())
@@ -434,11 +363,10 @@ where
 ///
 /// A transient `nodeIdOf` RPC error is propagated as `Err` and the channel is
 /// **not** marked seen, so the settlement is retried rather than silently
-/// dropped: a backfill-path error leaves `backfill_from` set, and a live-path
-/// error re-arms `backfill_from` from the event's block (see the live arm in
-/// [`run_watcher_once`]), so either way the next cycle re-queries the window.
-/// Only a fully resolved settlement — or a genuinely unresolvable one (unbound
-/// key / amount overflow) — is marked seen.
+/// dropped: returning `Err` aborts the poll tick, which re-scans the window on
+/// the next tick (`settled_seen` dedups anything already credited). Only a fully
+/// resolved settlement — or a genuinely unresolvable one (unbound key / amount
+/// overflow) — is marked seen.
 async fn process_settled<P>(
     capacity_bond: &CapacityBond::CapacityBondInstance<P>,
     settlement: &Arc<NodeSettlementSource>,
@@ -452,7 +380,7 @@ where
     P: Provider + Clone,
 {
     if state.settled_seen.contains(&channel_id) {
-        return Ok(()); // already credited (backfill/live overlap or resubscribe)
+        return Ok(()); // already credited (backfill/live overlap or re-scan)
     }
     // Skip (don't saturate) an implausibly large amount: a `u128::MAX` would
     // poison `max_effective_settled_value` and drive every reporter's weight to
@@ -600,32 +528,22 @@ fn mark_settled_seen(state: &mut IndexerState, channel_id: [u8; 32]) -> bool {
     true
 }
 
-/// Re-arm the one-shot backfill to re-query from `block` (taking the earliest of
-/// any already-armed start), so a settlement that couldn't be credited now is
-/// re-attempted next cycle. `settled_seen` dedups anything already credited.
-fn arm_backfill_from_block(state: &mut IndexerState, block: u64) {
-    state.backfill_from = Some(match state.backfill_from {
-        Some(existing) => existing.min(block),
-        None => block,
-    });
-}
-
 /// Park a live `ChannelSettled` whose `ChannelOpened` hasn't been observed yet
 /// (#864), keeping `pending_settled` and `pending_order` in sync and bounding
 /// the buffer at `MAX_PENDING_SETTLED`. On overflow the oldest parked event is
-/// dropped and the backfill re-armed from its block so it isn't lost — the next
-/// cycle re-credits it (provider-only if its open still hasn't arrived).
+/// dropped — a bounded, rare degradation (it requires `MAX_PENDING_SETTLED`
+/// opens racing their settles). The next boot's recent-window backfill
+/// re-credits it if it is still within the lookback; otherwise the client leg is
+/// lost. The old explicit backfill re-arm is subsumed by the poller's re-scan.
 fn park_settled(
     state: &mut IndexerState,
     channel_id: [u8; 32],
     provider_addr: Address,
     routed_amount: alloy::primitives::U256,
-    block: Option<u64>,
 ) {
     let entry = PendingSettled {
         provider_addr,
         routed_amount,
-        block,
     };
     if state.pending_settled.insert(channel_id, entry).is_none() {
         // New key — append to the FIFO order. A duplicate (re-delivered settled
@@ -636,24 +554,14 @@ fn park_settled(
         let Some(evicted) = state.pending_order.pop_front() else {
             break;
         };
-        if let Some(dropped) = state.pending_settled.remove(&evicted) {
-            // Re-arm the backfill from the evicted event's block so it is
-            // re-credited next cycle. A `None` block (should not occur for a
-            // confirmed `.watch()` event) can't be re-queried, so log that the
-            // credit is dropped unrecoverably rather than implying recovery.
-            if let Some(block) = dropped.block {
-                warn!(
-                    channel_id = %alloy::hex::encode(evicted),
-                    block,
-                    "pending-settled buffer full; evicting oldest and re-arming backfill (#864)"
-                );
-                arm_backfill_from_block(state, block);
-            } else {
-                warn!(
-                    channel_id = %alloy::hex::encode(evicted),
-                    "pending-settled buffer full; evicting oldest with no block — credit dropped unrecoverably (#864)"
-                );
-            }
+        if state.pending_settled.remove(&evicted).is_some() {
+            // Dropped: the poller re-scans a bounded recent window each boot, so a
+            // still-in-window evicted settle is re-credited then; otherwise its
+            // client leg is lost (bounded, rare — see the fn doc, #864).
+            warn!(
+                channel_id = %alloy::hex::encode(evicted),
+                "pending-settled buffer full; evicting oldest parked settle (#864)"
+            );
         }
     }
 }
@@ -695,14 +603,7 @@ mod tests {
     }
 
     fn empty_state() -> IndexerState {
-        IndexerState {
-            channels: HashMap::new(),
-            settled_seen: HashSet::new(),
-            settled_seen_order: VecDeque::new(),
-            pending_settled: HashMap::new(),
-            pending_order: VecDeque::new(),
-            backfill_from: None,
-        }
+        IndexerState::new()
     }
 
     fn cid(n: u8) -> [u8; 32] {
@@ -712,14 +613,14 @@ mod tests {
     #[test]
     fn park_then_take_round_trips_and_keeps_order_in_sync() {
         let mut state = empty_state();
-        park_settled(&mut state, cid(1), addr(1), U256::from(10), Some(100));
-        park_settled(&mut state, cid(2), addr(2), U256::from(20), Some(101));
+        park_settled(&mut state, cid(1), addr(1), U256::from(10));
+        park_settled(&mut state, cid(2), addr(2), U256::from(20));
         assert_eq!(state.pending_settled.len(), 2);
         assert_eq!(state.pending_order.len(), 2);
 
         // A re-delivered settled for an already-parked channel refreshes in
         // place — it must not double-count in the FIFO order.
-        park_settled(&mut state, cid(1), addr(1), U256::from(11), Some(100));
+        park_settled(&mut state, cid(1), addr(1), U256::from(11));
         assert_eq!(state.pending_settled.len(), 2);
         assert_eq!(state.pending_order.len(), 2);
 
@@ -734,25 +635,23 @@ mod tests {
     }
 
     #[test]
-    fn pending_buffer_is_bounded_and_evicts_oldest_arming_backfill() {
+    fn pending_buffer_is_bounded_and_evicts_oldest() {
         let mut state = empty_state();
-        // Fill exactly to capacity; oldest is block 1_000.
+        // Fill exactly to capacity.
         for i in 0..MAX_PENDING_SETTLED {
             let id = u32::try_from(i).expect("fits u32");
             let mut key = [0u8; 32];
             key[..4].copy_from_slice(&id.to_be_bytes());
-            let block = 1_000 + u64::try_from(i).expect("fits u64");
-            park_settled(&mut state, key, addr(1), U256::from(1), Some(block));
+            park_settled(&mut state, key, addr(1), U256::from(1));
         }
         assert_eq!(state.pending_settled.len(), MAX_PENDING_SETTLED);
-        assert!(state.backfill_from.is_none(), "no eviction yet");
 
-        // One more overflows: the oldest (block 1_000) is evicted and the
-        // backfill is re-armed from its block so its credit isn't lost.
-        park_settled(&mut state, cid(255), addr(2), U256::from(2), Some(9_999));
+        // One more overflows: the oldest is evicted (its credit is dropped —
+        // bounded, rare; the poller's recent-window re-scan recovers an
+        // in-window settle, #864). The buffer stays pinned at the cap.
+        park_settled(&mut state, cid(255), addr(2), U256::from(2));
         assert_eq!(state.pending_settled.len(), MAX_PENDING_SETTLED);
         assert_eq!(state.pending_order.len(), MAX_PENDING_SETTLED);
-        assert_eq!(state.backfill_from, Some(1_000));
         // The newest entry survived; the evicted oldest is gone.
         assert!(state.pending_settled.contains_key(&cid(255)));
         let mut oldest = [0u8; 32];

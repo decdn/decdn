@@ -12,6 +12,7 @@
 //! machinery, so only the open kernel is shared.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, TxHash, U256};
@@ -26,14 +27,48 @@ use tracing::{debug, error, info, warn};
 
 use crate::ChannelContext;
 
-/// Re-approve the `PaymentChannel` spender when the standing USDC allowance has
-/// fallen below this floor. Half of `U256::MAX` so one max approval covers
-/// effectively unlimited deposits and a re-run with the approval already in
-/// place skips the redundant `approve`, while a never-approved wallet (allowance
-/// `0`) trips it.
+/// Re-approve the `PaymentChannel` spender for the *unlimited* case when the
+/// standing USDC allowance has fallen below this floor. Half of `U256::MAX` so
+/// one max approval covers effectively unlimited deposits and a re-run with the
+/// approval already in place skips the redundant `approve`, while a
+/// never-approved wallet (allowance `0`) trips it. Only consulted for the
+/// unlimited mode; the exact mode compares against the requested amount instead
+/// (see [`approve_decision`]).
 fn approval_floor() -> U256 {
     U256::MAX >> 1
 }
+
+/// Decide, purely, what `approve` value (if any) to issue given the wallet's
+/// `current` standing allowance and the requested approval `amount`:
+///
+/// - `amount == None` (unlimited): skip when `current >= approval_floor()`,
+///   otherwise approve `U256::MAX` — the node/operator posture that avoids
+///   re-approve churn.
+/// - `amount == Some(needed)` (exact, the client default): skip when
+///   `current >= needed`, otherwise approve exactly `needed`. Because the skip
+///   threshold *is* `needed`, a wallet that previously granted an unlimited
+///   (`U256::MAX`) allowance always skips — switching a client to exact never
+///   re-approves the allowance *downward*.
+fn approve_decision(current: U256, amount: Option<U256>) -> Option<U256> {
+    let (threshold, approve_value) = match amount {
+        None => (approval_floor(), U256::MAX),
+        Some(needed) => (needed, needed),
+    };
+    if current >= threshold {
+        None
+    } else {
+        Some(approve_value)
+    }
+}
+
+/// Bound the wait for the one-time USDC `approve` receipt so a stuck or
+/// underpriced tx can't wedge the buyer lane (#1109 — ~27 min observed on a live
+/// node). Sized well above a normal inclusion window but short enough that the
+/// worst case is a few minutes. On timeout the broadcast tx may still mine
+/// later; the allowance read at the top of the next run makes the re-approve
+/// idempotent, so no funds are stranded. Not config-tunable yet (YAGNI), like
+/// the `RECONCILE_IDLE_SWEEPS` convention in the node's `buyer_channel`.
+const APPROVE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// A freshly opened buyer channel: the persistable [`BuyerChannelState`], a
 /// ready-to-sign [`ChannelContext`], and the open transaction hash (so a caller
@@ -50,11 +85,14 @@ pub struct OpenedChannel {
     pub tx: TxHash,
 }
 
-/// Ensure `owner` holds a standing USDC allowance for the `PaymentChannel`
-/// `spender`, issuing a single `approve(spender, U256::MAX)` only when the
-/// current allowance is below `approval_floor`. Idempotent across runs — a
-/// wallet that has approved before skips the tx. Mirrors the node's one-time
-/// approval at bring-up.
+/// Ensure `owner` holds a sufficient USDC allowance for the `PaymentChannel`
+/// `spender`, issuing at most one `approve` when the current allowance is below
+/// what `amount` requires. `amount == None` grants an unlimited
+/// (`U256::MAX`) allowance — the node/operator posture that avoids re-approve
+/// churn; `amount == Some(deposit)` grants exactly `deposit` — the client
+/// default that keeps the standing spend authority scoped to the deposit being
+/// escrowed. See `approve_decision` for the skip logic. Idempotent across runs
+/// — a wallet already at or above the required allowance skips the tx.
 ///
 /// # Errors
 ///
@@ -64,6 +102,7 @@ pub async fn ensure_allowance<P: Provider + Clone>(
     token: Address,
     owner: Address,
     spender: Address,
+    amount: Option<U256>,
 ) -> Result<()> {
     let erc20 = Erc20::new(token, provider.clone());
     let current = erc20
@@ -71,22 +110,38 @@ pub async fn ensure_allowance<P: Provider + Clone>(
         .call()
         .await
         .context("read USDC allowance")?;
-    if current >= approval_floor() {
+    let Some(approve_value) = approve_decision(current, amount) else {
         debug!(%current, "USDC allowance already sufficient; skipping approve");
         return Ok(());
-    }
-    let receipt = erc20
-        .approve(spender, U256::MAX)
+    };
+    let pending = erc20
+        .approve(spender, approve_value)
         .send()
         .await
-        .context("submit USDC approve")?
-        .get_receipt()
+        .context("submit USDC approve")?;
+    // Capture the hash before `get_receipt` consumes `pending`, so a timeout
+    // error names the broadcast tx an operator needs to look up (it stays in the
+    // mempool and may still mine after we give up).
+    let approve_tx = *pending.tx_hash();
+    let receipt = tokio::time::timeout(APPROVE_RECEIPT_TIMEOUT, pending.get_receipt())
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "USDC approve receipt timed out after {APPROVE_RECEIPT_TIMEOUT:?} \
+                 (tx {approve_tx}; may still mine later)"
+            )
+        })?
         .context("await USDC approve receipt")?;
     if !receipt.status() {
         anyhow::bail!("USDC approve transaction reverted");
     }
-    info!(%token, %spender, "issued one-time max USDC approval for PaymentChannel deposits");
+    info!(
+        %token,
+        %spender,
+        %approve_value,
+        unlimited = amount.is_none(),
+        "issued USDC approval for PaymentChannel deposits"
+    );
     Ok(())
 }
 
@@ -293,5 +348,62 @@ where
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
+mod tests {
+    use super::{approval_floor, approve_decision};
+    use alloy::primitives::U256;
+
+    #[test]
+    fn unlimited_zero_allowance_approves_max() {
+        assert_eq!(approve_decision(U256::ZERO, None), Some(U256::MAX));
+    }
+
+    #[test]
+    fn unlimited_sufficient_skips() {
+        // At exactly the floor the existing (max) approval is honored.
+        assert_eq!(approve_decision(approval_floor(), None), None);
+        assert_eq!(approve_decision(U256::MAX, None), None);
+    }
+
+    #[test]
+    fn unlimited_below_floor_reapproves_max() {
+        let below = approval_floor() - U256::from(1);
+        assert_eq!(approve_decision(below, None), Some(U256::MAX));
+    }
+
+    #[test]
+    fn exact_zero_allowance_approves_deposit() {
+        let deposit = U256::from(10_000_000u64);
+        assert_eq!(approve_decision(U256::ZERO, Some(deposit)), Some(deposit));
+    }
+
+    #[test]
+    fn exact_equal_allowance_skips() {
+        let deposit = U256::from(10_000_000u64);
+        assert_eq!(approve_decision(deposit, Some(deposit)), None);
+    }
+
+    #[test]
+    fn exact_below_deposit_reapproves() {
+        let deposit = U256::from(10_000_000u64);
+        let current = deposit - U256::from(1);
+        assert_eq!(approve_decision(current, Some(deposit)), Some(deposit));
+    }
+
+    #[test]
+    fn exact_no_downgrade_from_unlimited() {
+        // A wallet that previously granted an unlimited allowance never gets
+        // re-approved downward when the client switches to exact mode.
+        let deposit = U256::from(10_000_000u64);
+        assert_eq!(approve_decision(U256::MAX, Some(deposit)), None);
     }
 }

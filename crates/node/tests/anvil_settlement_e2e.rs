@@ -36,9 +36,11 @@
 //!    (`getChannel().withdrawnAmount` advances) and `FeeRouter.bytesPerEpoch`
 //!    increments.
 //! 5. Channel 2 — deliver a claim *below* the redeem threshold (stays
-//!    un-redeemed); graceful-shutdown `closeChannel` fires (assert the on-chain
-//!    `Closing` status); after the dispute window `settleChannel` → assert the
-//!    watcher decodes `ChannelSettled` and `forget`s the row from the store.
+//!    un-redeemed); close it on-chain (assert the `Closing` status) while the
+//!    settlement watcher stays alive; after the dispute window `settleChannel`
+//!    → assert the watcher decodes `ChannelSettled` and `forget`s the row from
+//!    the store. (The service's own graceful-shutdown close path — which now
+//!    cancels the watcher — is exercised after the buyer path, before channel 3.)
 //! 6. Buyer path (#744) — the `client` account drives a [`BuyerChannelService`]
 //!    against the registered provider: `open_or_reuse_channel` opens a channel
 //!    on-chain, a delivery signs vouchers via the service-produced
@@ -80,8 +82,8 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    BuyerChannelStore, ChannelStateStore, MemoryBuyerChannelStore, MemoryPendingSettleStore,
-    PendingSettleStore, WatcherCheckpointStore, bind_node_id_domain, register_node_signing_hash,
+    BuyerChannelStore, ChannelStateStore, KeyedCheckpointStore, MemoryBuyerChannelStore,
+    MemoryPendingSettleStore, PendingSettleStore, bind_node_id_domain, register_node_signing_hash,
     slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerChannelService;
@@ -515,7 +517,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let pending_store: Arc<dyn PendingSettleStore> = concrete_store.clone();
     // Keep `concrete_store` alive (don't move it) so the downtime-backfill phase
     // at the end can re-bootstrap a second service against the same store.
-    let checkpoint_store: Arc<dyn WatcherCheckpointStore> = concrete_store.clone();
+    let checkpoint_store: Arc<dyn KeyedCheckpointStore> = concrete_store.clone();
 
     let node_eth = Arc::new(node_signer.clone());
     let metrics = Arc::new(Metrics::new());
@@ -547,6 +549,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
+        Duration::from_millis(250),
         Arc::clone(&metrics),
     )
     .await?;
@@ -743,12 +746,20 @@ async fn run_e2e() -> anyhow::Result<()> {
         "channel 2 should be below the redeem threshold, but was withdrawn"
     );
 
-    // Graceful shutdown closes the un-redeemed channel (closeChannel fires →
-    // dispute window opens). Verifies the shutdown close path + that the
-    // persisted voucher signature is accepted on-chain.
-    service
-        .close_open_channels_on_shutdown(Duration::from_secs(30))
-        .await;
+    // Close the un-redeemed channel 2 directly on-chain (node = provider party,
+    // zero-voucher — `claimedNonce == 0` since it stayed below the redeem
+    // threshold) to open the dispute window while the settlement watcher stays
+    // ALIVE, so GAP 2 below can observe the live `ChannelSettled`. The
+    // service-driven shutdown-close path is exercised after GAP 2 (it now
+    // cancels the watcher, so it cannot run before an assertion that needs the
+    // watcher). `withdraw` on channel 1 above already proved a persisted voucher
+    // is accepted on-chain.
+    pc_read
+        .closeChannel(id2, U256::ZERO, U256::ZERO, U256::ZERO, Bytes::new())
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
     let closing = poll_until(Duration::from_secs(30), || {
         let pc = pc_read.clone();
         async move {
@@ -983,15 +994,28 @@ async fn run_e2e() -> anyhow::Result<()> {
         "reclaimed channel must be Closed on-chain"
     );
 
+    // Retire the original seller `service` now, via its graceful-shutdown path
+    // (quiesce redeemer + flush checkpoint + stop the watcher). It has served
+    // its purpose — channel 2's settle observation and the buyer channel's
+    // ChannelOpened persistence are done — and channel 3 below is persisted by
+    // its OWN dedicated service, so the original watcher is no longer needed.
+    // Retiring it here (rather than at channel 2's close, which now runs on-chain
+    // directly so the watcher can survive to observe the settle) is what keeps
+    // the original redeemer from racing the auto-settle service on channel 3.
+    service
+        .close_open_channels_on_shutdown(Duration::from_secs(30))
+        .await;
+
     // ============================================================
     // CHANNEL 3 — AUTO-SETTLEMENT (#742). Bring up a dedicated settlement
     // service opted in to auto-settle via a small `value_threshold`, sharing the
     // same store as the live handler so its watcher persists the channel and its
     // redeemer can read the handler-persisted voucher. The original `service`'s
-    // redeemer was permanently quiesced by channel 2's
-    // `close_open_channels_on_shutdown`, and the handler's `redeem_hint` sender
-    // is a `OnceLock` already bound to that dead service — so we drive this
-    // service's redeemer directly via its OWN `redeem_hint_sender()` after the
+    // redeemer was permanently quiesced by the
+    // `close_open_channels_on_shutdown` just above, and the handler's
+    // `redeem_hint` sender is a `OnceLock` already bound to that dead service —
+    // so we drive this service's redeemer directly via its OWN
+    // `redeem_hint_sender()` after the
     // delivery persists the voucher. Deliver enough to cross BOTH the redeem
     // threshold (10 µUSDC) AND the auto-settle value threshold (5 µUSDC), and
     // assert auto-settle SUPERSEDES `withdraw`: the channel goes `Closing` (not
@@ -1016,6 +1040,7 @@ async fn run_e2e() -> anyhow::Result<()> {
             value_threshold: Some(U256::from(5u64)),
             voucher_nonce_span_threshold: None,
         },
+        Duration::from_millis(250),
         Arc::clone(&metrics),
     )
     .await?;
@@ -1250,6 +1275,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
+        Duration::from_millis(250),
         Arc::clone(&metrics),
     )
     .await?;
@@ -1331,6 +1357,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
+        Duration::from_millis(250),
         Arc::clone(&metrics),
     )
     .await?;

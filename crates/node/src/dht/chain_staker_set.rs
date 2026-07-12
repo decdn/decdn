@@ -14,7 +14,8 @@
 //!   cached active-staker set populated from
 //!   `CapacityBond.getActiveNodes()`.
 //! - ADR 019 § Step 3.3: bootstrap pattern (initial paginated
-//!   `getActiveNodes` + event subscription).
+//!   `getActiveNodes` + event follow — implemented as an `eth_getLogs`
+//!   poll, #1106).
 //! - The event set this watcher follows is grounded in
 //!   `CapacityBond.sol`'s own write-paths — every contract write
 //!   that flips the canonical `isActive` predicate is mirrored by an
@@ -26,10 +27,13 @@
 //! treats it as fatal; the DHT cannot function without a staker set).
 //!
 //! Watcher RPC failure (mid-run) → the task logs at `warn!`, sleeps
-//! for an exponentially-growing backoff (1s → 60s cap), and
-//! re-establishes its event filters. Today there is no `getActiveNodes`
-//! resync after extended outage, so the cached set can drift from
-//! chain state when an event arrives while filters are down.
+//! for an exponentially-growing backoff (1s → 60s cap), and re-polls. The
+//! cursor is retained across the backoff, so the next `eth_getLogs` tick
+//! re-scans `[cursor, head]` and re-applies any membership event that landed
+//! during the outage — no stream-level drift window. (There is still no
+//! `getActiveNodes` resync to reconcile against a checkpoint older than the
+//! live cursor, but that is only reachable via the per-event `nodeIdOf` drop
+//! below, not a backoff gap.)
 //!
 //! A narrower drift source: an operator-indexed event whose follow-up
 //! `nodeIdOf(operator)` RPC fails is dropped (the membership change is
@@ -71,17 +75,21 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::chain_events::watch_contract_events;
+use crate::chain_events::resumable_watcher::{
+    self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
+};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::{StakerChange, StakerSet};
 use crate::metrics::Metrics;
+use crate::payment_settlement::MAX_BACKFILL_BLOCK_SPAN;
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 
@@ -97,10 +105,9 @@ const PAGE_SIZE: u64 = 100;
 /// headroom rather than a hot-path constraint.
 const CHANGES_CHANNEL_CAPACITY: usize = 128;
 
-/// Backoff between watcher restart attempts after an event-stream
-/// terminates with an error.
+/// Backoff between watcher retry attempts after a failed poll tick.
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound for the watcher restart backoff.
+/// Upper bound for the watcher retry backoff.
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Chain-backed staker set. Cheap to clone via the shared inner
@@ -119,17 +126,18 @@ impl ChainStakerSet {
     /// Initial bootstrap: paginate `getActiveNodes`, filter each entry
     /// through `isActive(operator)`, spawn the background event
     /// watcher. Returns once the cache is populated and the watcher
-    /// is running — the watcher's own subscription failures do not
+    /// is running — the watcher's own poll-tick failures do not
     /// fail bootstrap.
     pub async fn bootstrap<P>(
         provider: P,
         registry_addr: Address,
+        event_poll_interval: Duration,
         metrics: Arc<Metrics>,
     ) -> Result<Self>
     where
         P: Provider + Clone + 'static,
     {
-        let registry = CapacityBond::new(registry_addr, provider);
+        let registry = CapacityBond::new(registry_addr, provider.clone());
         let initial = bootstrap_active_set(&registry).await.with_context(|| {
             format!("paginated getActiveNodes from CapacityBond at {registry_addr}")
         })?;
@@ -145,12 +153,46 @@ impl ChainStakerSet {
 
         let (changes_tx, _) = broadcast::channel(CHANGES_CHANNEL_CAPACITY);
         let active = Arc::new(RwLock::new(initial));
-        let watcher_handle = tokio::spawn(watcher_loop(
+        // The authoritative set came from `getActiveNodes` enumeration above; the
+        // watcher only needs to *follow* membership events from head forward, so
+        // it live-tails on the shared getLogs poller (#1092/#1106) with no
+        // historical backfill and no persisted cursor.
+        let sink = StakerSink {
             registry,
-            Arc::clone(&active),
-            changes_tx.clone(),
-            metrics,
-        ));
+            active: Arc::clone(&active),
+            changes_tx: changes_tx.clone(),
+            metrics: Arc::clone(&metrics),
+        };
+        let cfg = WatcherConfig {
+            filter: Filter::new().address(registry_addr).event_signature(vec![
+                CapacityBond::NodeRegistered::SIGNATURE_HASH,
+                CapacityBond::NodeDeregistered::SIGNATURE_HASH,
+                CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
+                CapacityBond::Reinstated::SIGNATURE_HASH,
+                CapacityBond::UnbondingRequested::SIGNATURE_HASH,
+            ]),
+            from_block: 0,
+            poll_interval: event_poll_interval,
+            confirmations: 0,
+            reorg_margin: 0,
+            // Live-from-head, but still chunk `[cursor, head]` so a long lag
+            // (RPC outage / rate-limit) recovers in bounded windows instead of one
+            // range-limit-tripping `eth_getLogs`.
+            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
+            cursor: CursorPolicy::HeadMinusWindow {
+                window_blocks: 0,
+                floor: 0,
+            },
+            initial_backoff: WATCHER_INITIAL_BACKOFF,
+            max_backoff: WATCHER_MAX_BACKOFF,
+            rpc_call_timeout: None,
+            shutdown: CancellationToken::new(),
+            seed_cursor: None,
+            label: "staker-set",
+            on_established: Some(established_hook(&metrics)),
+            on_backoff: Some(backoff_hook(&metrics)),
+        };
+        let watcher_handle = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
 
         Ok(Self {
             active,
@@ -158,6 +200,107 @@ impl ChainStakerSet {
             _watcher: AbortOnDrop(watcher_handle),
         })
     }
+}
+
+/// Applies `CapacityBond` membership logs to the active set (#1092). `apply`
+/// live-tails events from head (the authoritative set came from `getActiveNodes`
+/// at bootstrap); it never returns `Err` — an operator-indexed event's
+/// `nodeIdOf` resolution failure is counted and skipped, and an undecodable log
+/// is logged and skipped, so neither hot-loops the deterministic re-scan.
+struct StakerSink<P: Provider + Clone> {
+    registry: CapacityBond::CapacityBondInstance<P>,
+    active: Arc<RwLock<HashSet<NodeId>>>,
+    changes_tx: broadcast::Sender<StakerChange>,
+    metrics: Arc<Metrics>,
+}
+
+impl<P: Provider + Clone> LogSink for StakerSink<P> {
+    #[allow(clippy::cognitive_complexity)]
+    async fn apply(&mut self, log: Log) -> Result<()> {
+        match log.topic0().copied() {
+            Some(sig) if sig == CapacityBond::NodeRegistered::SIGNATURE_HASH => {
+                match CapacityBond::NodeRegistered::decode_log_data(&log.inner.data) {
+                    Ok(event) => apply_change(
+                        &self.active,
+                        &self.changes_tx,
+                        &self.metrics,
+                        StakerChange::Active(event.nodeId.0.into()),
+                    ),
+                    Err(err) => warn!(%err, "skipping undecodable NodeRegistered log"),
+                }
+            }
+            Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
+                match CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data) {
+                    Ok(event) => apply_change(
+                        &self.active,
+                        &self.changes_tx,
+                        &self.metrics,
+                        StakerChange::Inactive(event.nodeId.0.into()),
+                    ),
+                    Err(err) => warn!(%err, "skipping undecodable NodeDeregistered log"),
+                }
+            }
+            Some(sig) if sig == CapacityBond::NodeAutoEjected::SIGNATURE_HASH => {
+                match CapacityBond::NodeAutoEjected::decode_log_data(&log.inner.data) {
+                    Ok(event) => apply_change(
+                        &self.active,
+                        &self.changes_tx,
+                        &self.metrics,
+                        StakerChange::Inactive(event.nodeId.0.into()),
+                    ),
+                    Err(err) => warn!(%err, "skipping undecodable NodeAutoEjected log"),
+                }
+            }
+            Some(sig) if sig == CapacityBond::Reinstated::SIGNATURE_HASH => {
+                match CapacityBond::Reinstated::decode_log_data(&log.inner.data) {
+                    Ok(event) => {
+                        apply_operator_change(
+                            &self.registry,
+                            &self.active,
+                            &self.changes_tx,
+                            &self.metrics,
+                            event.operator,
+                            true,
+                        )
+                        .await;
+                    }
+                    Err(err) => warn!(%err, "skipping undecodable Reinstated log"),
+                }
+            }
+            Some(sig) if sig == CapacityBond::UnbondingRequested::SIGNATURE_HASH => {
+                match CapacityBond::UnbondingRequested::decode_log_data(&log.inner.data) {
+                    Ok(event) => {
+                        apply_operator_change(
+                            &self.registry,
+                            &self.active,
+                            &self.changes_tx,
+                            &self.metrics,
+                            event.operator,
+                            false,
+                        )
+                        .await;
+                    }
+                    Err(err) => warn!(%err, "skipping undecodable UnbondingRequested log"),
+                }
+            }
+            _ => {
+                debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Wire the healthy-cycle transition to the down-seconds gauge (→ 0).
+fn established_hook(metrics: &Arc<Metrics>) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || metrics.staker_set_watcher_cycle_established())
+}
+
+/// Wire a tick failure to the backoff gauge (opens the down-seconds window).
+fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || metrics.staker_set_watcher_backoff_started())
 }
 
 impl StakerSet for ChainStakerSet {
@@ -248,161 +391,6 @@ where
         offset = offset.saturating_add(page_len);
     }
     Ok(active)
-}
-
-/// Background event-subscription loop. Subscribes to the five relevant
-/// `CapacityBond` events and updates the cached active set on each
-/// observation. On stream failure (transport error, RPC timeout), the
-/// loop restarts the subscriptions with exponential backoff.
-///
-/// Operator-indexed events that don't carry a `nodeId` (`Reinstated`,
-/// `EjectedByBlacklist`, `UnbondingRequested`) trigger a follow-up
-/// `nodeIdOf(operator)` call to resolve the binding. If the resolved
-/// `(nodeId, active)` pair disagrees with the event's implied state
-/// (e.g. `Reinstated` arrived but `isActive` is false due to a more
-/// recent unbonding), the canonical `isActive` value wins.
-async fn watcher_loop<P>(
-    registry: CapacityBond::CapacityBondInstance<P>,
-    active: Arc<RwLock<HashSet<NodeId>>>,
-    changes_tx: broadcast::Sender<StakerChange>,
-    metrics: Arc<Metrics>,
-) where
-    P: Provider + Clone,
-{
-    let mut backoff = WATCHER_INITIAL_BACKOFF;
-    loop {
-        match run_watcher_once(&registry, &active, &changes_tx, &metrics).await {
-            Ok(()) => {
-                // Stream ended without error (filter expired, etc.) —
-                // restart immediately and reset backoff. A clean end is
-                // not an error, so it does NOT open a drift window:
-                // `down_since` stays `None` (down_seconds reads 0) and the
-                // restart counter does not advance.
-                debug!("watcher stream ended cleanly; restarting subscription");
-                backoff = WATCHER_INITIAL_BACKOFF;
-            }
-            Err(err) => {
-                // An error opens the drift window: until the next cycle
-                // re-establishes filters, events arriving on-chain are missed.
-                // `backoff_started` stamps `down_since` (so `down_seconds`
-                // begins to climb) and, on the edge into the error state,
-                // counts exactly one restart per window — repeated failed
-                // re-opens during one continuous outage do NOT re-count.
-                metrics.staker_set_watcher_backoff_started();
-                warn!(
-                    err = %sanitize_rpc_display(&err),
-                    backoff_secs = backoff.as_secs(),
-                    "ChainStakerSet watcher RPC error; restarting after backoff"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(WATCHER_MAX_BACKOFF);
-            }
-        }
-    }
-}
-
-/// Run one cycle of the watcher: open a single multi-topic filter over the five
-/// membership events and drain it, demuxing each log by `topic0`, until the
-/// stream ends or a log fails to decode. Returns `Ok(())` if the stream ended
-/// cleanly (filter expiry / provider rotation, or the provider being dropped);
-/// returns `Err` on a decode failure, which trips the caller's backoff exactly
-/// as a per-event stream error did before.
-#[allow(clippy::cognitive_complexity)] // 5-arm event-dispatch loop is fundamentally complex; splitting obscures the dispatch table
-async fn run_watcher_once<P>(
-    registry: &CapacityBond::CapacityBondInstance<P>,
-    active: &Arc<RwLock<HashSet<NodeId>>>,
-    changes_tx: &broadcast::Sender<StakerChange>,
-    metrics: &Arc<Metrics>,
-) -> Result<()>
-where
-    P: Provider + Clone,
-{
-    // EjectedByBlacklist is deliberately NOT subscribed: every
-    // `CapacityBond.ejectNode` call emits both `EjectedByBlacklist`
-    // (operator-indexed) and `NodeAutoEjected` (nodeId-indexed) for
-    // any operator that has a bound nodeId. The nodeId variant lets
-    // us update the active set without a follow-up `nodeIdOf` RPC, so
-    // it's strictly more efficient. Operators with no nodeId binding
-    // are never in the active set anyway, so we lose no information.
-    // One multi-topic filter over all five membership events (#1011), replacing
-    // the previous five per-event filters. Demux below by `topic0`.
-    let mut events = watch_contract_events(
-        registry.provider(),
-        *registry.address(),
-        [
-            CapacityBond::NodeRegistered::SIGNATURE_HASH,
-            CapacityBond::NodeDeregistered::SIGNATURE_HASH,
-            CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
-            CapacityBond::Reinstated::SIGNATURE_HASH,
-            CapacityBond::UnbondingRequested::SIGNATURE_HASH,
-        ],
-    )
-    .await
-    .context("watch CapacityBond membership events")?;
-
-    // Filter established: this is a successful event-stream cycle. Clear
-    // `down_since` so `decdn_staker_set_watcher_down_seconds` reads 0 for the
-    // entire life of this cycle (however long/quiet); it climbs again only if a
-    // log fails to decode and the loop enters backoff, or the stream ends.
-    metrics.staker_set_watcher_cycle_established();
-
-    while let Some(log) = events.next().await {
-        // `.copied()` avoids const-in-pattern structural-match; guard-compare
-        // each `topic0` against the event signatures in the filter's OR-set.
-        match log.topic0().copied() {
-            Some(sig) if sig == CapacityBond::NodeRegistered::SIGNATURE_HASH => {
-                let event = CapacityBond::NodeRegistered::decode_log_data(&log.inner.data)
-                    .context("decode NodeRegistered")?;
-                apply_change(
-                    active,
-                    changes_tx,
-                    metrics,
-                    StakerChange::Active(event.nodeId.0.into()),
-                );
-            }
-            Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
-                let event = CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data)
-                    .context("decode NodeDeregistered")?;
-                apply_change(
-                    active,
-                    changes_tx,
-                    metrics,
-                    StakerChange::Inactive(event.nodeId.0.into()),
-                );
-            }
-            Some(sig) if sig == CapacityBond::NodeAutoEjected::SIGNATURE_HASH => {
-                let event = CapacityBond::NodeAutoEjected::decode_log_data(&log.inner.data)
-                    .context("decode NodeAutoEjected")?;
-                apply_change(
-                    active,
-                    changes_tx,
-                    metrics,
-                    StakerChange::Inactive(event.nodeId.0.into()),
-                );
-            }
-            Some(sig) if sig == CapacityBond::Reinstated::SIGNATURE_HASH => {
-                let event = CapacityBond::Reinstated::decode_log_data(&log.inner.data)
-                    .context("decode Reinstated")?;
-                apply_operator_change(registry, active, changes_tx, metrics, event.operator, true)
-                    .await;
-            }
-            Some(sig) if sig == CapacityBond::UnbondingRequested::SIGNATURE_HASH => {
-                let event = CapacityBond::UnbondingRequested::decode_log_data(&log.inner.data)
-                    .context("decode UnbondingRequested")?;
-                apply_operator_change(registry, active, changes_tx, metrics, event.operator, false)
-                    .await;
-            }
-            // The filter's topic0 OR-set guarantees only the events above reach
-            // us, so this arm is unreachable today. Don't panic (anti-panic
-            // policy); log it so a future OR-set/dispatch drift (a signature
-            // added to the filter without a match arm) leaves a greppable trail
-            // instead of silently dropping a membership event.
-            _ => {
-                debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Resolve an operator-indexed event to its `(NodeId, current_active)`
@@ -603,9 +591,9 @@ mod tests {
     /// counter is edge-triggered, so repeated `backoff_started` calls during
     /// one continuous outage (no intervening `cycle_established`) count as ONE
     /// window. A fresh window requires a `cycle_established` in between.
-    /// Mirrors the `Err` arm of `watcher_loop`. Exercises the metric wiring
-    /// without a live RPC provider (the real `run_watcher_once` needs a chain
-    /// endpoint).
+    /// Mirrors the `on_backoff`/`on_established` hooks the resumable poller fires.
+    /// Exercises the metric wiring without a live RPC provider (the real poll loop
+    /// needs a chain endpoint).
     #[test]
     fn watcher_error_restart_counts_one_per_drift_window() {
         let metrics = Arc::new(Metrics::new());

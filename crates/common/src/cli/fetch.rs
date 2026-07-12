@@ -23,8 +23,27 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Args;
+
+/// Assumed floor client bandwidth (MiB/s) used to scale the per-blob fetch
+/// timeout to `--max-blob-mb` (see [`ClientFetchArgs::effective_timeout`]).
+/// Chosen so the default pair (1024 MiB, `30_000` ms) stays consistent:
+/// `1024 * 1000 / 35 ≈ 29_257 ms < 30_000`, so the default `--timeout-ms` still
+/// dominates and only larger `--max-blob-mb` overrides lengthen the timeout.
+const FETCH_FLOOR_BANDWIDTH_MIB_S: u64 = 35;
+
+/// Pure timeout formula shared by [`ClientFetchArgs::effective_timeout`]: the
+/// larger of the `timeout_ms` floor and the size-scaled value derived from
+/// `max_blob_mb` at [`FETCH_FLOOR_BANDWIDTH_MIB_S`]. Saturating throughout so no
+/// override can panic or overflow.
+fn scaled_timeout(max_blob_mb: u64, timeout_ms: u64) -> Duration {
+    let scaled_ms = max_blob_mb
+        .saturating_mul(1000)
+        .saturating_div(FETCH_FLOOR_BANDWIDTH_MIB_S);
+    Duration::from_millis(timeout_ms.max(scaled_ms))
+}
 
 /// The network, chain, target, and per-blob-limit flags shared by the paid
 /// client commands (`decdn fetch` and `decdn bundle pull`, #391). Flattened into
@@ -101,15 +120,15 @@ pub struct ClientFetchArgs {
     pub chain_id: Option<u64>,
 
     /// Path to the buyer's Ethereum keystore that signs vouchers and the
-    /// `openChannel` tx. Overrides `blockchain.eth_keystore`; defaults to
-    /// `<data-dir>/keystore.json`. Password from `$DECDN_KEYSTORE_PASSWORD`,
-    /// else a TTY prompt.
+    /// `openChannel` tx. Overrides `blockchain.eth_keystore`; when unset defaults
+    /// to `keystore.json` under the (client-scoped) data dir. Password from
+    /// `$DECDN_KEYSTORE_PASSWORD`, else a TTY prompt.
     #[arg(long, value_name = "PATH")]
     pub keystore: Option<PathBuf>,
 
     /// Data dir holding the persistent buyer-channel store (and the default
-    /// keystore). Overrides `identity.data_dir`; defaults to the platform
-    /// data dir.
+    /// keystore). Overrides `identity.data_dir`; when unset defaults to the
+    /// client-scoped `~/.decdn/client` (not the node-shaped `~/.decdn`).
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
@@ -123,14 +142,31 @@ pub struct ClientFetchArgs {
     /// **before** buffering it — guards client memory against a provider that
     /// over-claims `total_bytes`. Defaults to 1024 MiB (the node's default
     /// serve ceiling); raise it to fetch larger blobs. For `bundle pull` this is
-    /// the per-entry ceiling.
+    /// the per-entry ceiling. Also scales the effective fetch timeout (see
+    /// `--timeout-ms`).
     #[arg(long, value_name = "MB", default_value_t = 1024)]
     pub max_blob_mb: u64,
 
-    /// Overall timeout for a single blob fetch, in milliseconds. For
-    /// `bundle pull` this is the per-entry timeout.
+    /// Minimum overall timeout for a single blob fetch, in milliseconds. For
+    /// `bundle pull` this is the per-entry timeout. Acts as a floor: the
+    /// effective timeout is the larger of this and a value scaled from
+    /// `--max-blob-mb` (assuming ~35 MiB/s), so raising `--max-blob-mb` can't
+    /// leave a large blob unable to finish within a stale 30 s window.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     pub timeout_ms: u64,
+}
+
+impl ClientFetchArgs {
+    /// Effective per-blob (per-entry) fetch timeout: the larger of the
+    /// `--timeout-ms` floor and a size-scaled value derived from `--max-blob-mb`
+    /// at `FETCH_FLOOR_BANDWIDTH_MIB_S`. `--timeout-ms` stays a minimum so a
+    /// small blob never times out below the connect/discovery budget, while a
+    /// raised `--max-blob-mb` automatically lengthens the timeout instead of
+    /// silently guaranteeing failure.
+    #[must_use]
+    pub fn effective_timeout(&self) -> Duration {
+        scaled_timeout(self.max_blob_mb, self.timeout_ms)
+    }
 }
 
 /// Arguments for `decdn fetch` — one blob to a file, atop [`ClientFetchArgs`].
@@ -148,4 +184,44 @@ pub struct FetchArgs {
 
     #[command(flatten)]
     pub common: ClientFetchArgs,
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
+mod tests {
+    use super::scaled_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn default_pair_preserves_30s() {
+        // 1024 * 1000 / 35 ≈ 29_257 < 30_000, so the floor wins.
+        assert_eq!(scaled_timeout(1024, 30_000), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn large_blob_scales_up() {
+        // 4096 * 1000 / 35 = 117_028 > 30_000, so the scaled value wins.
+        assert_eq!(scaled_timeout(4096, 30_000), Duration::from_millis(117_028));
+    }
+
+    #[test]
+    fn small_blob_holds_floor() {
+        assert_eq!(scaled_timeout(10, 30_000), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn explicit_timeout_above_scaled_wins() {
+        assert_eq!(scaled_timeout(2048, 200_000), Duration::from_secs(200));
+    }
+
+    #[test]
+    fn saturates_without_panic() {
+        // No overflow/panic on an extreme --max-blob-mb.
+        let _ = scaled_timeout(u64::MAX, 30_000);
+    }
 }

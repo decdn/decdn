@@ -33,7 +33,6 @@
     clippy::too_many_lines
 )]
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -123,9 +122,15 @@ async fn run() -> anyhow::Result<()> {
 
     // The persistent store the CLI fetch path uses. The store enforces a
     // `0o700` data dir; `tempdir()` defaults to `0o755`, so tighten it first.
+    // Unix-only (the `0o700` mode and the store's enforcement are POSIX); the
+    // rest of the journey is platform-independent.
     let dir = tempfile::tempdir().context("tempdir")?;
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-        .context("chmod data dir 0o700")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod data dir 0o700")?;
     let store = RedbBuyerChannelStore::open(dir.path()).context("open redb buyer store")?;
     store.record(&opened.state).context("record channel")?;
 

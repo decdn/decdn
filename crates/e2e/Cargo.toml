@@ -22,12 +22,16 @@ default = []
 # Opt-in gate for the live anvil-backed test targets (`tests/`). Mirrors
 # `decdn-node`'s `anvil-e2e` feature: off by default so `cargo nextest run`
 # stays fast and needs no `anvil`/`forge` binaries. The fixtures themselves
-# always compile; only the tests that actually drive a chain are gated.
-anvil-e2e = []
+# always compile; only the tests that actually drive a chain are gated. Enables
+# `decdn-incentive`'s `redb` store here rather than on the direct dependency: the
+# only `RedbBuyerChannelStore` user is the gated `cli_fetch_topup` test, so
+# default builds skip that crate's `buyer_channel_redb` module and its `postcard`
+# code (the `redb` crate itself still arrives transitively via `decdn-node`).
+anvil-e2e = ["decdn-incentive/redb"]
 
 [dependencies]
 decdn-node = { workspace = true }
-decdn-incentive = { workspace = true, features = ["redb"] }
+decdn-incentive = { workspace = true }
 decdn-cache = { workspace = true }
 decdn-common = { workspace = true }
 decdn-client-pull = { workspace = true }

@@ -21,7 +21,6 @@ use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
@@ -31,6 +30,7 @@ use anyhow::{Context as _, anyhow, bail};
 use decdn_common::cli::{BundlePullArgs, ClientFetchArgs};
 use decdn_common::config::load_file_config;
 use decdn_common::redact::sanitize_err_chain;
+use decdn_incentive::buyer_channel::BuyerChannelStore as _;
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
@@ -162,6 +162,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         candidates,
         common,
         locks: RefCell::new(HashMap::new()),
+        open_lock: tokio::sync::Mutex::new(()),
     };
 
     // Obtain the manifest: the pre-read local one, or fetch the bundle blob.
@@ -219,6 +220,15 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// Per-provider locks: serialize fetches sharing one channel's voucher
     /// nonce. Lazily created; held only across one entry's fetch.
     locks: RefCell<HashMap<Address, Rc<tokio::sync::Mutex<()>>>>,
+    /// Serializes channel *opens* across all providers. The buyer's USDC
+    /// allowance for the `PaymentChannel` is a single owner→spender slot, and the
+    /// client default approves it to the exact per-open deposit (ERC-20 `approve`
+    /// overwrites, not accumulates). Two concurrent opens against distinct
+    /// providers would otherwise race that slot and the second `openChannel`'s
+    /// `transferFrom` would revert. Taken only for an actual open (not a
+    /// live-channel reuse, which issues no approval) and released before
+    /// streaming, so reuse and blob delivery still run concurrently.
+    open_lock: tokio::sync::Mutex<()>,
 }
 
 impl<P: Provider + Clone> PullCtx<'_, P> {
@@ -262,19 +272,36 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let lock = self.provider_lock(provider);
         let _guard = lock.lock().await;
 
-        let ctx = fetch::open_or_reuse(
-            self.store,
-            self.contract,
-            self.rpc,
-            self.signer,
-            self.voucher_dom,
-            provider,
-            self.self_address,
-            self.chain.payment_channel,
-            self.chain.deposit,
-            self.chain.max_approve,
-        )
-        .await?;
+        // Only an actual channel *open* touches the shared USDC allowance, so
+        // only opens take the global `open_lock`. A live-channel reuse issues no
+        // approval and — under the per-provider lock held above, which gives this
+        // provider's channel state exclusive access — cannot turn into an open, so
+        // it stays lock-free and concurrent with another provider's in-flight open
+        // (which can take minutes on-chain).
+        let reuse_only = self
+            .store
+            .get_by_provider(provider)?
+            .is_some_and(|state| !state.is_expired_at(fetch::unix_now()));
+        let ctx = {
+            let _open_guard = if reuse_only {
+                None
+            } else {
+                Some(self.open_lock.lock().await)
+            };
+            fetch::open_or_reuse(
+                self.store,
+                self.contract,
+                self.rpc,
+                self.signer,
+                self.voucher_dom,
+                provider,
+                self.self_address,
+                self.chain.payment_channel,
+                self.chain.deposit,
+                self.chain.max_approve,
+            )
+            .await?
+        };
 
         let mut target = EndpointAddr::new(node_id);
         // `--addr` only applies to the explicit-node path (clap requires
@@ -297,8 +324,12 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             provider,
             self.store,
             hash,
-            Duration::from_millis(self.common.timeout_ms),
+            self.common.effective_timeout(),
             max_blob_bytes,
+            // Per-entry byte bars would interleave illegibly across a manifest's
+            // many concurrent pulls; `bundle pull` reports at entry granularity
+            // instead (#1118 scopes the byte bar to single-blob `fetch`).
+            None,
         )
         .await
     }

@@ -32,7 +32,9 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
-use decdn_client_pull::{ChannelContext, VoucherProgress, stream_fetch_tracked};
+use decdn_client_pull::{
+    ChannelContext, ProgressCallback, VoucherProgress, stream_fetch_tracked_with_progress,
+};
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelStore};
@@ -120,6 +122,27 @@ pub(crate) fn micros_now() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+/// Build the `decdn fetch` delivery progress bar (#1118). Drawn to stderr and
+/// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
+/// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
+/// during the pre-byte connect/handshake so the command never looks hung. The
+/// bar counts **wire** bytes (content plus interleaved bao proof), so its total
+/// runs slightly above the final content-byte count printed on completion — it
+/// tracks the transfer, not the payload size.
+fn new_progress_bar() -> indicatif::ProgressBar {
+    let style = indicatif::ProgressStyle::with_template(
+        "{spinner:.green} {bytes}/{total_bytes} ({bytes_per_sec}, {eta}) [{wide_bar:.cyan/blue}]",
+    )
+    // A bad template is a programming error, not a runtime one; fall back to the
+    // built-in bar rather than panic (clippy forbids `unwrap`/`expect`).
+    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+    .progress_chars("=>-");
+    let bar = indicatif::ProgressBar::new(0);
+    bar.set_style(style);
+    bar.enable_steady_tick(Duration::from_millis(120));
+    bar
+}
+
 /// Chain coordinates resolved flag > `[blockchain]`/`[identity]` config >
 /// default. Pure (parse-only) so the precedence is unit-testable.
 #[derive(Debug)]
@@ -133,6 +156,9 @@ pub(crate) struct ResolvedChain {
     pub(crate) capacity_bond: Option<Address>,
     pub(crate) chain_id: u64,
     pub(crate) keystore: PathBuf,
+    /// Directory holding the buyer-channel redb store and (by default) the
+    /// keystore. Client-scoped (`~/.decdn/client`) unless an explicit
+    /// `--data-dir`/`identity.data_dir` is given.
     pub(crate) data_dir: PathBuf,
     /// Client region for region-first discovery ordering (`--region` >
     /// `identity.region`). `None` skips the ordering.
@@ -195,16 +221,21 @@ pub(crate) fn resolve_chain(
         .or_else(|| bc.and_then(|b| b.chain_id))
         .unwrap_or(DEFAULT_CHAIN_ID);
 
+    // Client data dir: an explicit `--data-dir`/`identity.data_dir` wins,
+    // otherwise the client-scoped `~/.decdn/client` (not the node-shaped
+    // `~/.decdn`, so a pure client install doesn't masquerade as a node).
     let data_dir = args
         .data_dir
         .clone()
         .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
         .map(|p| expand_tilde(&p))
-        .or_else(cli::default_data_dir)
+        .or_else(cli::default_client_data_dir)
         .ok_or_else(|| {
             anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
         })?;
 
+    // Keystore: an explicit `--keystore`/`blockchain.eth_keystore` wins; otherwise
+    // `keystore.json` under the (client-scoped) data dir.
     let keystore = args
         .keystore
         .clone()
@@ -219,7 +250,10 @@ pub(crate) fn resolve_chain(
             .or_else(|| bc.and_then(|b| b.buyer_deposit_micro_usdc))
             .unwrap_or(DEFAULT_DEPOSIT_MICRO_USDC),
     );
-    let max_approve = bc.and_then(|b| b.buyer_max_approve).unwrap_or(true);
+    // Client default: exact (deposit-sized) USDC approval, not an unlimited
+    // standing allowance. `buyer_max_approve = true` opts a power user back into
+    // the node/operator posture. (The daemon's own default stays unlimited.)
+    let max_approve = bc.and_then(|b| b.buyer_max_approve).unwrap_or(false);
 
     Ok(ResolvedChain {
         rpc_url,
@@ -384,14 +418,17 @@ pub(crate) async fn fetch_blob(
     hash: [u8; 32],
     timeout: Duration,
     max_blob_bytes: u64,
+    on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Vec<u8>> {
     let channel_id = ctx.channel_id;
     let timestamp_us = micros_now();
-    // `stream_fetch_tracked` reports the acked watermark via `progress` even on
-    // an error/timeout, so a paid-but-failed delivery still advances the stored
-    // watermark — otherwise the next reuse would re-sign a stale nonce.
+    // `stream_fetch_tracked_with_progress` reports the acked watermark via
+    // `progress` even on an error/timeout, so a paid-but-failed delivery still
+    // advances the stored watermark — otherwise the next reuse would re-sign a
+    // stale nonce. `on_progress` is the byte-delivery readout (`fetch` renders a
+    // bar; `bundle pull` passes `None`).
     let mut progress = VoucherProgress::default();
-    let result = stream_fetch_tracked(
+    let result = stream_fetch_tracked_with_progress(
         endpoint,
         target,
         ctx,
@@ -403,6 +440,7 @@ pub(crate) async fn fetch_blob(
         timeout,
         max_blob_bytes,
         &mut progress,
+        on_progress,
     )
     .await;
 
@@ -504,6 +542,24 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     }
 
     let max_blob_bytes = common.max_blob_mb.saturating_mul(1024 * 1024);
+    // Delivery progress bar (#1118). `indicatif` draws to stderr and hides
+    // itself automatically when stderr is not a terminal, so a piped/redirected
+    // fetch stays silent. The bar starts length-less; the first callback (which
+    // fires once the signed `StreamResponse` fixes the total) sets its length.
+    let bar = new_progress_bar();
+    // `ProgressBar` is `Arc`-backed, so the clone the callback owns drives the
+    // same bar we `finish_and_clear` below. The callback must be `'static`
+    // (`ProgressCallback`), hence the owned clone rather than a borrow.
+    let cb_bar = bar.clone();
+    // `expected` is constant across the pull, so set the bar length once (it
+    // takes a write lock) rather than on every chunk in the hot receive loop.
+    let length_set = std::sync::atomic::AtomicBool::new(false);
+    let on_progress = move |received: u64, expected: u64| {
+        if !length_set.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            cb_bar.set_length(expected);
+        }
+        cb_bar.set_position(received);
+    };
     let blob = fetch_blob(
         &endpoint,
         target,
@@ -512,10 +568,15 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         provider,
         &store,
         hash,
-        Duration::from_millis(common.timeout_ms),
+        common.effective_timeout(),
         max_blob_bytes,
+        Some(&on_progress),
     )
-    .await?;
+    .await;
+    // Clear the bar before the terminal outcome (success line or error) so it
+    // never overwrites the final message, on either path.
+    bar.finish_and_clear();
+    let blob = blob?;
 
     write_blob_atomic(&args.output, &blob)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", args.output.display()))?;
@@ -564,6 +625,21 @@ where
                     state.channel_id,
                     state.deposit.saturating_sub(state.last_amount)
                 );
+                // `topUp` pulls `additional` USDC via `transferFrom`, so the
+                // channel's standing allowance must cover it first. A pre-existing
+                // channel DB reused under a wallet whose allowance was revoked (or
+                // an exact-approve open, which leaves zero residual allowance after
+                // `openChannel` consumes it) would otherwise revert. Ensure it in
+                // the caller's mode: unlimited under `--max-approve`, else exactly
+                // `additional`.
+                ensure_allowance(
+                    rpc,
+                    state.token,
+                    self_address,
+                    payment_channel_addr,
+                    if max_approve { None } else { Some(additional) },
+                )
+                .await?;
                 top_up(contract, store, provider, additional).await?;
                 // Re-read so the returned context's deposit reflects the top-up
                 // (and any concurrent watermark advance the store folded in);
@@ -598,9 +674,19 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentChannel.minDeposit(): {e}"))?;
     let deposit = deposit.max(min_deposit);
-    if max_approve {
-        ensure_allowance(rpc, token, self_address, payment_channel_addr).await?;
-    }
+    // `max_approve` opts into an unlimited standing allowance; otherwise approve
+    // exactly the (clamped) deposit being escrowed. Unconditional either way — the
+    // old `false` branch issued no approve at all, so `openChannel`'s internal
+    // `transferFrom` reverted unless the wallet had pre-approved out of band.
+    let approve_amount = if max_approve { None } else { Some(deposit) };
+    ensure_allowance(
+        rpc,
+        token,
+        self_address,
+        payment_channel_addr,
+        approve_amount,
+    )
+    .await?;
     let opened = open_channel(
         contract,
         Arc::clone(signer),
@@ -700,6 +786,52 @@ mod tests {
         assert_eq!(r.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(r.deposit, U256::from(5_000_000u64));
         // keystore defaults under the data dir.
+        assert_eq!(
+            r.keystore,
+            eth_identity::keystore_path(&PathBuf::from("/tmp/d"))
+        );
+    }
+
+    #[test]
+    fn effective_timeout_delegates_with_correct_arg_order() {
+        // Default pair (1024 MiB, 30_000 ms): scaled ≈ 29_257 < floor → 30 s.
+        let mut c = common();
+        assert_eq!(c.effective_timeout(), Duration::from_secs(30));
+        // Larger blob scales the timeout up (proves max_blob_mb, not timeout_ms,
+        // is the scaled term — a transposed delegation would fail here).
+        c.max_blob_mb = 4096;
+        assert_eq!(c.effective_timeout(), Duration::from_millis(117_028));
+    }
+
+    #[test]
+    fn client_default_max_approve_is_exact() {
+        // Absent `buyer_max_approve` → client defaults to exact (deposit-sized)
+        // approval, i.e. `max_approve == false`.
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        );
+        let r = resolve_chain(&common(), &file).unwrap();
+        assert!(!r.max_approve);
+    }
+
+    #[test]
+    fn buyer_max_approve_true_opts_into_unlimited() {
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_max_approve = true\n",
+        );
+        let r = resolve_chain(&common(), &file).unwrap();
+        assert!(r.max_approve);
+    }
+
+    #[test]
+    fn explicit_data_dir_not_client_scoped() {
+        // `common()` sets an explicit data_dir; it must be used verbatim (no
+        // client-subdir scoping) for both the store dir and the keystore.
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        );
+        let r = resolve_chain(&common(), &file).unwrap();
+        assert_eq!(r.data_dir, PathBuf::from("/tmp/d"));
         assert_eq!(
             r.keystore,
             eth_identity::keystore_path(&PathBuf::from("/tmp/d"))

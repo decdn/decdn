@@ -71,12 +71,12 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **Stale-close defense:** in-process dispute monitor + permissionless `disputeChannel` submission; optional [fraud-detection layer](adr/appendix-fraud-detection.md) anyone can run for `SlashJudge`-bonded challenges
 - **Discovery:** `cdn/dht/v1` Kademlia DHT for content discovery from PoC onward; broadcast probe fan-out as bootstrap fallback
 - **Reputation:** Interaction-weighted scoring ([ADR 008](adr/008-reputation.md)); local per-peer EWMA today, gossip aggregation deferred
-- **Governance:** Admin key for PoC; token-weighted governance with safety bounds for production
+- **Governance:** Single day-one governance contract surface (`DecdnGovernor` + `TimelockController`); served-bytes-weighted operator voting with hardcoded safety bounds — only the process evolves by phase (admin key → bootstrap multisig → DAO), not the contract set
 - **Multi-token payments (post-PoC):** PoC uses USDC only; production supports governance-approved ERC-20 allowlist
 - **Content takedown:** Governance-controlled hash blacklisting with regional compliance bodies
 - **Client architecture:** Lightweight QUIC endpoints; gossip subscribe (no publish); registry bootstrap with fallback; per-connection ephemeral identity binding
 - **Schema evolution:** Varint-length framing, protocol enums, three-tier evolution model (minor/medium/major)
-- **On-chain verification:** Dual-key slash signatures (ed25519 wire + secp256k1 on-chain) with optimistic challenge-response
+- **On-chain verification:** Single secp256k1 EIP-712 slash signature (`slash_sig`) per message with optimistic challenge-response; the Ed25519 NodeId is connection identity only, authenticated separately by the QUIC handshake
 - **0-RTT probing:** QUIC 0-RTT for `cdn/probe/v1` repeat connections, eliminating TLS handshake round trip
 - **Liquidity:** Protocol-owned liquidity via Balancer V3 80/20 TOKEN/USDC weighted pool
 - **Production L2:** Arbitrum One for all on-chain contracts (PoC on Arbitrum Sepolia)

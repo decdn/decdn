@@ -69,6 +69,18 @@ pub fn default_config_path() -> Option<PathBuf> {
     default_data_dir().map(|d| d.join("node.toml"))
 }
 
+/// Returns the client-scoped default data directory (`~/.decdn/client`).
+///
+/// The `decdn` client commands (`fetch`, `bundle pull`, `channel coop-close`)
+/// keep their spending keystore and buyer-channel store here rather than in the
+/// node-shaped `~/.decdn`, so a pure client install does not masquerade as a
+/// node. An explicit `--data-dir` / `identity.data_dir` still wins.
+///
+/// Returns `None` if the home directory cannot be determined.
+pub fn default_client_data_dir() -> Option<PathBuf> {
+    default_data_dir().map(|d| d.join("client"))
+}
+
 /// Whether a TOML config path was chosen by the operator or
 /// defaulted. Drives the "missing file" policy for config-file
 /// lookups in the `decdn node *` subcommands: an explicit path that
@@ -168,5 +180,32 @@ pub(crate) mod test_support {
         let prev = HOME_OVERRIDE.with(|c| c.replace(Some(next)));
         let _g = Guard(prev);
         f()
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
+mod tests {
+    use super::{default_client_data_dir, default_data_dir};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn client_data_dir_is_client_subdir_of_data_dir() {
+        // Home-independent: whatever the base data dir resolves to (or `None`),
+        // the client dir is its `client` subdirectory. Guards against a silent
+        // revert to the node-shaped data dir or a wrong subdir name.
+        match (default_data_dir(), default_client_data_dir()) {
+            (Some(base), Some(client)) => {
+                assert_eq!(client.file_name(), Some(OsStr::new("client")));
+                assert_eq!(client.parent(), Some(base.as_path()));
+            }
+            (None, None) => {} // no home available; both absent, consistent
+            other => panic!("data-dir/client-dir availability mismatch: {other:?}"),
+        }
     }
 }
