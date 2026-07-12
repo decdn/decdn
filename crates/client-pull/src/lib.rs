@@ -139,9 +139,13 @@ impl ChannelContext {
         }
     }
 
-    /// Attach an ADR 005 client identity binding (see [`sign_client_binding`]) so
-    /// this context's `cdn/client/v1` requests prove channel ownership to the
-    /// serving node, enabling reactive cache-miss origin pull-through (#1115).
+    /// Attach an ADR 005 client identity binding so this context's
+    /// `cdn/client/v1` requests prove channel ownership to the serving node,
+    /// enabling reactive cache-miss origin pull-through (#1115). Pass a binding
+    /// produced by [`sign_client_binding`]; a hand-built `ClientBinding` whose
+    /// `ethereum_address` and signature don't correspond (or that doesn't own the
+    /// channel) is rejected by the serving node, so this only ever hurts the
+    /// caller itself.
     #[must_use]
     pub fn with_client_binding(mut self, binding: ClientBinding) -> Self {
         self.client_binding = Some(binding);
@@ -154,8 +158,8 @@ impl ChannelContext {
 /// `NodeId`, signed with the buyer key. The serving node recovers the signer via
 /// `ecrecover` (`verify_binding`) and checks it owns the named channel before
 /// honoring a cache-miss origin pull (`pull_authorized`, ADR 003 §Off-Chain
-/// Ephemeral Binding). Reusable by the CLI client fetch (#1115) and node-to-node
-/// pulls (#1117).
+/// Ephemeral Binding). Used by the CLI client fetch (#1115); shaped to be reused,
+/// once wired, by node-to-node pulls (#1117, not yet a caller).
 ///
 /// `own_node_id` MUST be the requester's own endpoint `NodeId` — what the peer
 /// authenticates as `conn.remote_id()` — NOT the target node's. `bind_domain` is
@@ -1377,6 +1381,56 @@ mod tests {
     use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 
     use super::{HashMismatch, decode_verified_range};
+
+    /// `client_binding_ext` maps an unbound context to `None` (so
+    /// `encode_stream_request` appends no ext bytes — byte-for-byte the pre-#1115
+    /// wire) and a bound one to `Some` carrying exactly the binding at the default
+    /// voucher cadence. This is the shared mapping BOTH request sites
+    /// (`fetch_inner` and `open_progressive_pull`) rely on, so it guards a
+    /// refactor that would silently drop the ext on either path (#1115).
+    #[test]
+    fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
+        use std::sync::Arc;
+
+        use alloy::primitives::{Address, B256, U256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        use super::{ChannelContext, client_binding_ext, sign_client_binding};
+
+        let signer = PrivateKeySigner::random();
+        let domain = decdn_incentive::bind_node_id_domain(1, Address::ZERO);
+        let ctx = ChannelContext {
+            channel_id: B256::ZERO,
+            token: Address::ZERO,
+            deposit: U256::ZERO,
+            client_signer: Arc::new(signer.clone()),
+            voucher_domain: domain.clone(),
+            prior_nonce: U256::ZERO,
+            prior_bytes_delivered: U256::ZERO,
+            prior_amount: U256::ZERO,
+            client_binding: None,
+        };
+        // Unbound ⇒ no ext.
+        anyhow::ensure!(
+            client_binding_ext(&ctx).is_none(),
+            "unbound ctx must yield no ext"
+        );
+
+        // Bound ⇒ ext carries exactly the binding, cadence left defaulted.
+        let binding = sign_client_binding(&signer, B256::repeat_byte(0xAB), &domain)?;
+        let ctx = ctx.with_client_binding(binding.clone());
+        let ext = client_binding_ext(&ctx)
+            .ok_or_else(|| anyhow::anyhow!("bound ctx must yield an ext"))?;
+        anyhow::ensure!(
+            ext.voucher_interval_mb.is_none(),
+            "voucher cadence must stay defaulted"
+        );
+        anyhow::ensure!(
+            ext.binding == Some(binding),
+            "ext must carry the exact binding"
+        );
+        Ok(())
+    }
 
     /// Deterministic pseudo-random blob spanning several 16 KiB chunk groups.
     fn make_blob(len: usize) -> Vec<u8> {

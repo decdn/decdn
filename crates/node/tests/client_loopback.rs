@@ -29,7 +29,7 @@ use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
-use decdn_cache::CacheEngine;
+use decdn_cache::{CacheEngine, CacheMetrics, CircuitBreakerPolicy, PinnedHashes, RetryPolicy};
 use decdn_incentive::{
     ChannelState, ChannelStateStore, CooperativeClose, EPHEMERAL_BINDING_NONCE,
     MemoryChannelStateStore, SignedCooperativeClose, bind_node_id_domain, binding_signing_hash,
@@ -2784,11 +2784,17 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
 /// through to serve. Both temp dirs are returned so the caller keeps the origin
 /// alive across the fetch (unlike [`cache_with_two_blobs`], which pre-populates
 /// the store and drops the origin).
+///
+/// The engine is opened with an `Arc<CacheMetrics>` (returned) so callers can
+/// assert `origin_fetches` — the counter that pins whether the node actually
+/// read its origin (`1`) or short-circuited before any egress (`0`). `open`
+/// wires no metrics, so `origin_fetches.inc()` would be a no-op there.
 async fn empty_cache_with_fs_origin(
     payload: &[u8],
 ) -> anyhow::Result<(
     CacheEngine,
     decdn_cache::Hash,
+    Arc<CacheMetrics>,
     tempfile::TempDir,
     tempfile::TempDir,
 )> {
@@ -2804,16 +2810,22 @@ async fn empty_cache_with_fs_origin(
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(
+    let cache_metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
         cache_dir.path(),
         vec![origin as Arc<dyn decdn_cache::Origin>],
         16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&cache_metrics)),
+        Duration::ZERO,
     )
     .await?;
     // Local store intentionally left unpopulated: `has(hash)` is false until a
     // pull-through fills it, which is what the tests below exercise.
     anyhow::ensure!(!cache.has(hash).await?, "cache store must start empty");
-    Ok((cache, hash, origin_dir, cache_dir))
+    Ok((cache, hash, cache_metrics, origin_dir, cache_dir))
 }
 
 /// Spawn a `ClientHandler` server with buffered origin pull-through attached
@@ -2854,7 +2866,8 @@ async fn spawn_pull_through_server(
 #[tokio::test(flavor = "multi_thread")]
 async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::Result<()> {
     let payload = vec![0x7Bu8; 64 * 1024];
-    let (cache, hash, _origin_tmp, _cache_tmp) = empty_cache_with_fs_origin(&payload).await?;
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth_addr, server_ep, server_task) =
         spawn_pull_through_server(cache, Arc::clone(&store)).await?;
@@ -2882,6 +2895,14 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
         got.as_ref() == payload.as_slice(),
         "delivered bytes mismatch"
     );
+    // The blob existed only in the fs origin, so serving it proves the node
+    // reactively pulled the origin exactly once (not a double-pull, not some
+    // other path).
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 1,
+        "expected exactly 1 origin fetch, got {}",
+        cache_metrics.origin_fetches.get()
+    );
 
     client_ep.close().await;
     server_ep.close().await;
@@ -2896,7 +2917,8 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
 #[tokio::test(flavor = "multi_thread")]
 async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result<()> {
     let payload = vec![0x7Bu8; 64 * 1024];
-    let (cache, hash, _origin_tmp, _cache_tmp) = empty_cache_with_fs_origin(&payload).await?;
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth_addr, server_ep, server_task) =
         spawn_pull_through_server(cache, Arc::clone(&store)).await?;
@@ -2924,6 +2946,14 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
             "expected a delivery-refused error, got: {e}"
         ),
     }
+    // The anti-griefing guarantee: an unauthorized request must not make the node
+    // front upstream/origin work. Prove the gate short-circuited BEFORE any origin
+    // egress — not that it read the origin and then refused.
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 0,
+        "unbound request must not trigger an origin fetch, got {}",
+        cache_metrics.origin_fetches.get()
+    );
 
     client_ep.close().await;
     server_ep.close().await;

@@ -168,9 +168,9 @@ impl NodeFixture {
         // Pre-warm the node's cache store from the filesystem origin. The
         // `cdn/client/v1` serve path gates on local-store presence
         // (`cache.has`); origin pull-through is NOT consulted on this fixture's
-        // path (node-to-node pull-through is off by default, and this fixture's
-        // channel is unbound (`client_binding: None`), so it sends no ADR 005
-        // ownership binding to authorize a reactive origin pull — #1115).
+        // path (reactive pull-through is not attached by default, and this
+        // fixture's channel is unbound (`client_binding: None`), so it sends no
+        // ADR 005 ownership binding to authorize a reactive origin pull — #1115).
         // So an operator serves content it already holds — warm it the same way
         // production does, via the origin engine, then let the daemon reopen the
         // populated store. Mirrors the node integration `cache_with_blob` helper.
