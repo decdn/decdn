@@ -187,13 +187,16 @@ impl NodeFixture {
             .context("onboard operator on-chain")?;
 
         let cache_dir = data_dir.path().join("cache");
+        // Bind to a local so the `&str` field borrows a value that clearly
+        // outlives the `render_config` call (not a same-statement temporary).
+        let rpc_url = chain.rpc_url();
         let config = render_config(&RenderConfig {
             data_dir: data_dir.path().to_path_buf(),
             region,
             bind_port,
             admin_port,
             metrics_port,
-            rpc_url: &chain.rpc_url(),
+            rpc_url: &rpc_url,
             keystore: &keystore,
             cache_dir: &cache_dir,
             origin_dir: origin_dir.path(),

@@ -184,8 +184,8 @@ impl ChainFixture {
                 }
                 if let Ok(Some(status)) = anvil.child.try_wait() {
                     tracing::warn!(
-                        "anvil exited at startup (status {status}) on attempt \
-                         {attempt}/{ANVIL_ATTEMPTS}, likely a port collision"
+                        "anvil exited before its RPC came up (status {status}) on attempt \
+                         {attempt}/{ANVIL_ATTEMPTS}; retrying on a fresh port"
                     );
                     break false;
                 }
@@ -201,7 +201,7 @@ impl ChainFixture {
             // its manifest before the next attempt.
             if attempt >= ANVIL_ATTEMPTS {
                 anyhow::bail!(
-                    "anvil never came up after {ANVIL_ATTEMPTS} attempts (repeated port collisions)"
+                    "anvil never became ready after {ANVIL_ATTEMPTS} attempts (exited before its RPC came up each time)"
                 );
             }
         };
