@@ -651,11 +651,29 @@ impl ClientHandler {
                 tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a cache-engine error");
                 false
             }
-            Err(_) => {
-                tracing::debug!(%hash, ?timeout, "reactive local-origin pull-through timed out");
-                false
+            Err(_) => self.on_local_populate_timeout(hash, timeout).await,
+        }
+    }
+
+    /// Handle a reactive local-origin populate deadline expiry (#1116). Serves the
+    /// blob if a concurrent fill landed it in the store at the instant the
+    /// deadline fired (so a node with node→node OFF doesn't report `CacheMiss` for
+    /// a blob that is now present), otherwise meters the timeout and reports the
+    /// miss. Unlike [`Self::on_pull_through_timeout`] it spawns NO background warm
+    /// — this path is local-only and must not kick off a node→node pull. Returns
+    /// whether the blob is now present.
+    async fn on_local_populate_timeout(&self, hash: Hash, timeout: Duration) -> bool {
+        match self.cache.has(hash).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => {
+                self.metrics.node_pull_through_error();
+                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through store lookup failed after deadline");
             }
         }
+        self.metrics.node_pull_through_timeout();
+        tracing::debug!(%hash, ?timeout, "reactive local-origin pull-through timed out");
+        false
     }
 
     /// Attempt to fill a bounded/offset cache-miss request by pulling only the

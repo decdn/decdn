@@ -1093,9 +1093,13 @@ pub async fn run(
     // and `populate_local` never consults the paid `Peer` node→node origin. The
     // node→node window/buffered/governor/gate paths below stay flag-gated.
     if !cfg.cache.origins.is_empty() {
-        let local_deadline = crate::selection::outer_pull_deadline(Duration::from_secs(
-            cfg.cache.node_pull_timeout_sec,
-        ));
+        // A single local origin-chain walk (fs/http/s3), NOT a provider fan-out —
+        // so budget it at the per-attempt `node_pull_timeout_sec`, not
+        // `outer_pull_deadline` (which multiplies by `MAX_PROVIDER_ATTEMPTS` for
+        // the sequential node→node pull). Using the outer deadline would let a
+        // wedged local origin block ~3× longer before falling through to the
+        // node→node paths.
+        let local_deadline = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
         client_handler.attach_local_populate(local_deadline);
     }
     if cfg.cache.node_to_node_pull_through_enabled {
