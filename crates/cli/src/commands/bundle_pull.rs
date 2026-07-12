@@ -30,6 +30,7 @@ use anyhow::{Context as _, anyhow, bail};
 use decdn_common::cli::{BundlePullArgs, ClientFetchArgs};
 use decdn_common::config::load_file_config;
 use decdn_common::redact::sanitize_err_chain;
+use decdn_incentive::buyer_channel::BuyerChannelStore as _;
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
@@ -224,8 +225,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// client default approves it to the exact per-open deposit (ERC-20 `approve`
     /// overwrites, not accumulates). Two concurrent opens against distinct
     /// providers would otherwise race that slot and the second `openChannel`'s
-    /// `transferFrom` would revert. Held only across `open_or_reuse`, so blob
-    /// streaming still runs concurrently.
+    /// `transferFrom` would revert. Taken only for an actual open (not a
+    /// live-channel reuse, which issues no approval) and released before
+    /// streaming, so reuse and blob delivery still run concurrently.
     open_lock: tokio::sync::Mutex<()>,
 }
 
@@ -270,11 +272,22 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let lock = self.provider_lock(provider);
         let _guard = lock.lock().await;
 
-        // Serialize opens across providers so exact-sized USDC approvals don't
-        // race the shared allowance slot (see `open_lock`). Dropped before
-        // streaming so deliveries stay concurrent.
+        // Only an actual channel *open* touches the shared USDC allowance, so
+        // only opens take the global `open_lock`. A live-channel reuse issues no
+        // approval and — under the per-provider lock held above, which gives this
+        // provider's channel state exclusive access — cannot turn into an open, so
+        // it stays lock-free and concurrent with another provider's in-flight open
+        // (which can take minutes on-chain).
+        let reuse_only = self
+            .store
+            .get_by_provider(provider)?
+            .is_some_and(|state| !state.is_expired_at(fetch::unix_now()));
         let ctx = {
-            let _open_guard = self.open_lock.lock().await;
+            let _open_guard = if reuse_only {
+                None
+            } else {
+                Some(self.open_lock.lock().await)
+            };
             fetch::open_or_reuse(
                 self.store,
                 self.contract,
