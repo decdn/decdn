@@ -224,9 +224,14 @@ pub struct BlockchainConfig {
     /// Economics recommended minimum). Clamped up to the on-chain `minDeposit`
     /// floor at open time.
     pub buyer_deposit_micro_usdc: Option<u64>,
-    /// Whether to issue a one-time max USDC approval for the `PaymentChannel`
-    /// contract at startup so the buyer path can `openChannel` (#744). Absent
-    /// => `true`. Set `false` to manage the allowance out-of-band.
+    /// Whether to issue an unlimited (max) USDC approval for the
+    /// `PaymentChannel` contract so the buyer path can `openChannel` (#744).
+    /// The absent-default is **profile-dependent**: the node daemon defaults to
+    /// `true` (a long-lived operator amortizes one unlimited approval across many
+    /// node-to-node miss pulls), while the `decdn` client fetch commands (`fetch`,
+    /// `bundle pull`) default to `false`, i.e. an **exact deposit-sized** approval
+    /// scoped to what each channel escrows. Set `true` on the client to opt a
+    /// power user back into the unlimited allowance.
     pub buyer_max_approve: Option<bool>,
     /// Outstanding (un-redeemed) USDC (base units, `µUSDC`) at which the node
     /// proactively `closeChannel`s a channel to start its dispute window, so a

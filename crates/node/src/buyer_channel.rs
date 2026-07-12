@@ -275,7 +275,9 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             .context("PaymentChannel.minDeposit() self-check")?;
 
         if ensure_max_approval {
-            ensure_allowance(&provider, token, self_address, payment_channel_addr).await?;
+            // Daemon posture: an unlimited (`None`) standing approval for a
+            // long-lived node, avoiding re-approve churn across many miss pulls.
+            ensure_allowance(&provider, token, self_address, payment_channel_addr, None).await?;
         }
 
         let tracked = store

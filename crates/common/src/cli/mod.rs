@@ -22,7 +22,9 @@ pub mod setup;
 pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
 pub use channel::{ChannelArgs, ChannelCommand, CoopCloseArgs};
-pub use common::{ConfigPathSource, LogFormat, default_config_path, default_data_dir};
+pub use common::{
+    ConfigPathSource, LogFormat, default_client_data_dir, default_config_path, default_data_dir,
+};
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use fetch::{ClientFetchArgs, FetchArgs};
 pub use key_gen::KeyGenArgs;
