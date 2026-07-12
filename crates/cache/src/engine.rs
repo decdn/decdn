@@ -1401,10 +1401,10 @@ impl CacheEngine {
                         inflight: &self.inner.inflight,
                         notify: &notify,
                     };
-                    break self.pull_through(hash).await?;
+                    break self.pull_through(hash, false).await?;
                 }
                 // Mutex poisoned — fall through to a direct pull.
-                None => break self.pull_through(hash).await?,
+                None => break self.pull_through(hash, false).await?,
             }
         };
         self.touch(hash);
@@ -1430,6 +1430,29 @@ impl CacheEngine {
     /// Same set as [`Self::get`] (`NoOrigin` / `NotFound` / `HashMismatch` /
     /// `BlobTooLarge` / `OriginError` / `Store`).
     pub async fn populate(&self, hash: Hash) -> CacheResult<()> {
+        self.populate_inner(hash, false).await
+    }
+
+    /// Like [`Self::populate`], but restricted to the node's OWN configured
+    /// origins (fs/http/s3): the `Peer` node→node origin is never consulted, so
+    /// this fronts no upstream USDC (#1116). The serve path uses it to
+    /// reactively fill from a local origin a blob a paying, channel-owning
+    /// client asked for — independent of `node_to_node_pull_through_enabled` —
+    /// and to prefer a local origin over the paid peer window path. A hit is a
+    /// no-op; absence from every local origin surfaces `NotFound`, and a chain
+    /// with no non-`Peer` origin surfaces `NoOrigin`.
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`Self::populate`].
+    pub async fn populate_local(&self, hash: Hash) -> CacheResult<()> {
+        self.populate_inner(hash, true).await
+    }
+
+    /// Shared body of [`Self::populate`] / [`Self::populate_local`]. `local_only`
+    /// threads through the coalescing loop into [`Self::pull_through`], where it
+    /// skips the `Peer` origin.
+    async fn populate_inner(&self, hash: Hash, local_only: bool) -> CacheResult<()> {
         if self.has(hash).await? {
             self.touch(hash);
             return Ok(());
@@ -1471,12 +1494,12 @@ impl CacheEngine {
                         inflight: &self.inner.inflight,
                         notify: &notify,
                     };
-                    self.pull_through(hash).await?;
+                    self.pull_through(hash, local_only).await?;
                     break;
                 }
                 // Mutex poisoned — fall through to a direct pull.
                 None => {
-                    self.pull_through(hash).await?;
+                    self.pull_through(hash, local_only).await?;
                     break;
                 }
             }
@@ -2148,7 +2171,17 @@ impl CacheEngine {
         Ok(Bytes::from(out))
     }
 
-    async fn pull_through(&self, hash: Hash) -> CacheResult<Bytes> {
+    /// Whether the origin chain has any origin `pull_through` would actually try
+    /// for the given mode: any origin at all normally, or any non-`Peer` origin
+    /// under `local_only` (#1116).
+    fn has_eligible_origin(&self, local_only: bool) -> bool {
+        self.inner
+            .origins
+            .iter()
+            .any(|o| !local_only || o.kind() != OriginKind::Peer)
+    }
+
+    async fn pull_through(&self, hash: Hash, local_only: bool) -> CacheResult<Bytes> {
         // Every pull_through entry is a `get()` cache miss, regardless
         // of how the pull resolves. Coalesced waiters that find a hit
         // on retry never call `pull_through`, so they never reach this
@@ -2157,9 +2190,12 @@ impl CacheEngine {
         if let Some(m) = &self.inner.metrics {
             m.misses.inc();
         }
-        // Reject pulls with no origin configured early — keeps the
-        // per-attempt closure pure with respect to the origin handle.
-        if self.inner.origins.is_empty() {
+        // Reject pulls with no *eligible* origin early. With `local_only`
+        // (#1116) the `Peer` origin (the paid node→node fallback) is skipped, so
+        // a chain of nothing but `Peer` origins is a fast `NoOrigin`, like an
+        // empty chain — checked before the `origin_fetches` bump so that metric
+        // still counts only real local fetch attempts.
+        if !self.has_eligible_origin(local_only) {
             return Err(CacheError::NoOrigin { hash });
         }
 
@@ -2186,6 +2222,13 @@ impl CacheEngine {
         let mut any_short_circuit = false;
         let total = self.inner.origins.len();
         for (idx, origin) in self.inner.origins.iter().enumerate() {
+            // #1116: a `local_only` populate never touches the `Peer` origin
+            // (the paid node→node fallback), so an operator serving its OWN
+            // configured fs/http/s3 origin fronts no upstream USDC. Skipped
+            // before the breaker/retry machinery so it costs nothing.
+            if local_only && origin.kind() == OriginKind::Peer {
+                continue;
+            }
             let origin = Arc::clone(origin);
             // Per-origin circuit-breaker (#963). An OPEN breaker
             // short-circuits this origin *before* the retry/backoff

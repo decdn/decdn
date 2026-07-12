@@ -158,8 +158,9 @@ impl ChannelContext {
 /// `NodeId`, signed with the buyer key. The serving node recovers the signer via
 /// `ecrecover` (`verify_binding`) and checks it owns the named channel before
 /// honoring a cache-miss origin pull (`pull_authorized`, ADR 003 §Off-Chain
-/// Ephemeral Binding). Used by the CLI client fetch (#1115); shaped to be reused,
-/// once wired, by node-to-node pulls (#1117, not yet a caller).
+/// Ephemeral Binding). Used by the CLI client fetch (#1115) and by node-to-node
+/// pulls, where `node_origin` binds its upstream requests so an upstream can
+/// chain a further reactive origin pull (#1117).
 ///
 /// `own_node_id` MUST be the requester's own endpoint `NodeId` — what the peer
 /// authenticates as `conn.remote_id()` — NOT the target node's. `bind_domain` is

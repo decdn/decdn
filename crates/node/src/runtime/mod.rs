@@ -1083,6 +1083,21 @@ pub async fn run(
     // handler spawns when the foreground deadline fires; it is cancelled in the
     // shutdown sequence below alongside `gossip_shutdown`.
     let pull_through_bg_shutdown = CancellationToken::new();
+    // Reactive LOCAL-origin pull-through (#1116). Arm a local-only populate on the
+    // serve-miss path whenever the operator configured any origin
+    // (`[cache.origin]`), INDEPENDENT of `node_to_node_pull_through_enabled`: a
+    // cache-only operator must be able to reactively serve content it holds in its
+    // OWN fs/http/s3 origin, and — with node→node on — that local origin is
+    // preferred over the paid peer window path. The handler still gates it on
+    // proven channel ownership (`pull_authorized`), so it fronts no free egress,
+    // and `populate_local` never consults the paid `Peer` node→node origin. The
+    // node→node window/buffered/governor/gate paths below stay flag-gated.
+    if !cfg.cache.origins.is_empty() {
+        let local_deadline = crate::selection::outer_pull_deadline(Duration::from_secs(
+            cfg.cache.node_pull_timeout_sec,
+        ));
+        client_handler.attach_local_populate(local_deadline);
+    }
     if cfg.cache.node_to_node_pull_through_enabled {
         let per_candidate = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
         let outer_deadline = crate::selection::outer_pull_deadline(per_candidate);
@@ -1526,6 +1541,11 @@ pub async fn run(
     let node_origin_self_id = crate::dht::NodeId::from_bytes(*secret_key.public().as_bytes());
     let node_origin_slash_domain =
         decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
+    // #1117: the `CapacityBond` bind domain this node signs its node→node client
+    // identity binding under — same construction as the serving-side
+    // `bind_domain` (:961) so an upstream verifies against an identical domain.
+    let node_origin_bind_domain =
+        decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
     let node_origin_config = crate::node_origin::NodeOriginConfig {
         probe_fanout: cfg.cache.node_pull_probe_fanout,
         pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
@@ -1632,6 +1652,7 @@ pub async fn run(
                     buyer: Arc::clone(&service) as Arc<dyn crate::buyer_channel::ChannelOpener>,
                     self_id: node_origin_self_id,
                     slash_domain: node_origin_slash_domain,
+                    bind_domain: node_origin_bind_domain,
                     local_rep: local_reputation_c,
                     obs_buffer: observation_buffer_c,
                     network_rep: network_reputation_c,

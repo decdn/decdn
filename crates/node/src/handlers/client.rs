@@ -287,6 +287,16 @@ pub struct ClientHandler {
     /// existence, which is public — is the anti-proxy-abuse gate: a client
     /// without an owned channel cannot make this node front upstream egress.
     pull_through: OnceLock<Duration>,
+    /// Reactive LOCAL-origin pull-through deadline (#1116), attached via
+    /// [`ClientHandler::attach_local_populate`] whenever `[cache.origin]` is
+    /// configured — INDEPENDENT of `node_to_node_pull_through_enabled`. When set,
+    /// a cache miss on a proven-owned channel first tries to fill from the node's
+    /// OWN fs/http/s3 origin (`CacheEngine::populate_local`, which never touches
+    /// the paid `Peer` origin), so a cache-only operator can reactively serve its
+    /// own content and a local origin is preferred over the paid peer window
+    /// path. Unset keeps the pre-#1116 behavior (miss ⇒ node→node path or a plain
+    /// `NotFound`).
+    local_populate: OnceLock<Duration>,
     /// Background cache-fill state (#859), attached post-construction via
     /// [`ClientHandler::attach_background_fill`]. Unset (the default — feature
     /// off, and in tests) means a foreground pull-through deadline simply
@@ -403,6 +413,7 @@ impl ClientHandler {
             voucher_activity: OnceLock::new(),
             region_accountant: OnceLock::new(),
             pull_through: OnceLock::new(),
+            local_populate: OnceLock::new(),
             background_fill: OnceLock::new(),
             pull_through_origin: OnceLock::new(),
             pull_ahead_bytes: OnceLock::new(),
@@ -459,6 +470,18 @@ impl ClientHandler {
     /// back to `NotFound`.
     pub fn attach_pull_through(&self, timeout: Duration) {
         let _ = self.pull_through.set(timeout);
+    }
+
+    /// Attach the reactive LOCAL-origin pull-through deadline (#1116). Called once
+    /// during runtime wiring whenever `[cache.origin]` is configured, INDEPENDENT
+    /// of `cache.node_to_node_pull_through_enabled`; a second call is ignored.
+    /// After this, a cache miss on a proven-owned channel first attempts a
+    /// local-origin fill (`CacheEngine::populate_local`, which skips the paid
+    /// `Peer` origin) before any node→node path — letting a cache-only operator
+    /// serve its own content, and preferring the local origin over the peer
+    /// window path.
+    pub fn attach_local_populate(&self, timeout: Duration) {
+        let _ = self.local_populate.set(timeout);
     }
 
     /// Attach background cache-fill (#859). Called once during runtime wiring
@@ -604,6 +627,34 @@ impl ClientHandler {
                 false
             }
             Err(_) => self.on_pull_through_timeout(hash, timeout).await,
+        }
+    }
+
+    /// Attempt to fill a cache miss from the node's OWN configured origins only
+    /// (#1116), via [`CacheEngine::populate_local`] — which skips the paid `Peer`
+    /// node→node origin, so this fronts no upstream USDC. Bounded by `timeout`
+    /// like [`Self::try_pull_through`]. Returns whether the blob is now present
+    /// locally. A clean miss (`NotFound`/`NoOrigin` — the operator's origin lacks
+    /// it, or only a `Peer` origin is configured) is the normal unfillable case;
+    /// the caller then falls through to the node→node paths. Unlike
+    /// `try_pull_through`, a timeout does NOT spawn node→node background fill —
+    /// this path is local-only.
+    async fn try_local_populate(&self, hash: Hash, timeout: Duration) -> bool {
+        match tokio::time::timeout(timeout, self.cache.populate_local(hash)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
+                tracing::debug!(%hash, error = %e, "reactive local-origin pull-through found no source");
+                false
+            }
+            Ok(Err(e)) => {
+                self.metrics.node_pull_through_error();
+                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a cache-engine error");
+                false
+            }
+            Err(_) => {
+                tracing::debug!(%hash, ?timeout, "reactive local-origin pull-through timed out");
+                false
+            }
         }
     }
 
@@ -1025,12 +1076,11 @@ impl ClientHandler {
                 // cannot make this node spend — closing the proxy-abuse /
                 // griefing vector where an unpaid client drains the buyer
                 // deposit. (Multi-hop node→node pulls therefore require the
-                // downstream requester to send a binding; the direct-client
-                // `decdn fetch` now does (#1115), but the node→node requester
-                // (`node_origin`) does not yet, so chained pull-through remains
-                // a follow-up (#1117).) On a successful fill, fall through to
-                // the normal size-gate + delivery path; otherwise it stays a
-                // `NotFound`.
+                // downstream requester to send a binding; both the direct-client
+                // `decdn fetch` (#1115) and the node→node requester
+                // (`node_origin`, #1117) now do, so chained pull-through works.)
+                // On a successful fill, fall through to the normal size-gate +
+                // delivery path; otherwise it stays a `NotFound`.
                 //
                 // Origin-tier range pull-through (#823, ADR 037 §Origin-tier
                 // pull-through). When the
@@ -1047,6 +1097,25 @@ impl ClientHandler {
                     && self.pull_authorized(&req, verified_client).await
                 {
                     range_pulled_size = self.try_range_pull_through(hash, &req).await;
+                }
+
+                // Reactive LOCAL-origin populate (#1116). Before any node→node
+                // path, try to fill from the node's OWN configured fs/http/s3
+                // origin (`populate_local` never touches the paid `Peer` origin).
+                // This lets a cache-only operator (node→node disabled) reactively
+                // serve its own content, and — when node→node IS enabled — prefers
+                // the local origin over the paid peer window path for a whole-blob
+                // request the operator can satisfy itself. Gated on the SAME proven
+                // channel ownership as the paid paths (`pull_authorized`): an S3
+                // origin has egress cost, and the following delivery is billed
+                // per-voucher. A local miss leaves the blob absent and falls through
+                // to the node→node branches below, unchanged.
+                let mut locally_filled = false;
+                if range_pulled_size.is_none()
+                    && let Some(timeout) = self.local_populate.get().copied()
+                    && self.pull_authorized(&req, verified_client).await
+                {
+                    locally_filled = self.try_local_populate(hash, timeout).await;
                 }
 
                 // Window-paced pull-through (#856, ADR 037) is the preferred path
@@ -1068,10 +1137,12 @@ impl ClientHandler {
                 // prefix. A bounded request whose range pull declines therefore
                 // falls to the buffered path below, which serves exactly the
                 // requested span via `export_range` (#823).
-                if range_pulled_size.is_some() {
-                    // The requested span is already present as a verified partial
-                    // blob — skip the whole-blob fill and fall through to the
-                    // size gate + delivery (which serves it via `export_range`).
+                if range_pulled_size.is_some() || locally_filled {
+                    // The requested span/blob is already present — a verified
+                    // partial blob from the range pull, or the whole blob just
+                    // filled from a local origin (#1116). Skip the node→node fill
+                    // and fall through to the size gate + delivery (which serves a
+                    // partial via `export_range`).
                 } else if let Some(origin) = self.pull_through_origin.get()
                     && req.byte_offset == 0
                     && req.byte_len == 0

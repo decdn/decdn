@@ -26,7 +26,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use decdn_cache::origin::{FilesystemOrigin, Origin, OriginFetch};
-use decdn_cache::{Bytes, CacheEngine, Hash, Percent};
+use decdn_cache::{
+    Bytes, CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, Percent, PinnedHashes,
+    RetryPolicy,
+};
 use decdn_common::admin::RegionBytes;
 use decdn_incentive::{
     ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore,
@@ -503,6 +506,7 @@ fn build_origin_with_timeout(
         buyer,
         self_id: b_dht,
         slash_domain: slash_domain(),
+        bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
         obs_buffer: Arc::clone(obs_buffer),
         network_rep: Arc::new(
@@ -700,6 +704,7 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
         buyer,
         self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
         slash_domain: slash_domain(),
+        bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
         obs_buffer: Arc::clone(&obs_buffer),
         network_rep: Arc::new(
@@ -820,6 +825,172 @@ async fn cache_with_blobs(payloads: &[&[u8]]) -> Result<(CacheEngine, tempfile::
     }
     drop(origin_dir);
     Ok((cache, cache_dir))
+}
+
+/// Build a cache whose local store is EMPTY but whose filesystem origin holds
+/// `payload`, wired with an `Arc<CacheMetrics>` so a caller can assert
+/// `origin_fetches` — the counter that pins whether the node actually read its
+/// origin (`1`) or short-circuited (`0`). Both temp dirs are returned so the
+/// caller keeps the origin alive across a pull. Used by the #1117 chained-pull
+/// test: the upstream must REACTIVELY pull its own origin (authorized by the
+/// requester's ADR 005 binding) to serve, since nothing is pre-warmed.
+async fn cache_with_fs_origin_only(
+    payload: &[u8],
+) -> Result<(
+    CacheEngine,
+    Hash,
+    Arc<CacheMetrics>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+)> {
+    let hash = Hash::new(payload);
+    let origin_dir = tempfile::tempdir()?;
+    let hex = hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    let dir = origin_dir.path().join(shard);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hex.as_str()), payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
+    let metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+    anyhow::ensure!(!cache.has(hash).await?, "upstream store must start empty");
+    Ok((cache, hash, metrics, origin_dir, cache_dir))
+}
+
+/// #1117: node→node CHAINED reactive pull-through. Node B pulls a blob from
+/// upstream A via its `NodeOrigin`; A does NOT hold the blob in its store — only
+/// in its own filesystem origin — so A can serve only by REACTIVELY pulling its
+/// origin, which A's `pull_authorized` gate allows solely because B now attaches
+/// an ADR 005 client identity binding (over B's OWN node id, signed with the
+/// channel's buyer key). B receiving the bytes, and A's origin fetching exactly
+/// once, proves the binding propagated across the hop and authorized the chained
+/// pull. Pre-#1117 (B sent no binding) A refused with `NotFound`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<()> {
+    let payload = vec![0x9Eu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A (upstream): blob ONLY in its fs origin; store starts empty. ----
+    let (cache_a, hash_a, cache_a_metrics, _origin_tmp_a, _cache_tmp_a) =
+        cache_with_fs_origin_only(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xB1);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics_a = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics_a);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics_a,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    // A reactively serves its OWN origin on a miss (#1116) — the chained pull B
+    // triggers. `pull_authorized` still gates it on B proving channel ownership.
+    handler_a.attach_local_populate(Duration::from_secs(20));
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin (now sends a binding).
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let (origin, _recorded) = provisioned_origin(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        channel_id,
+        &b_buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        providers,
+        addr_map,
+    );
+
+    // Discover → probe → open (with binding) → A reactively pulls its own origin
+    // → serve. A held nothing in-store, so a successful pull is proof of the
+    // chained reactive fill.
+    let fetched = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("node-origin chained fetch failed: {e}"))?;
+    let bytes = fetched.collect_to_bytes().await?.ok_or_else(|| {
+        anyhow::anyhow!("node-origin returned NotFound; the chained reactive pull did not fire")
+    })?;
+    anyhow::ensure!(
+        bytes.as_ref() == payload.as_slice(),
+        "chained-pull bytes mismatch"
+    );
+    anyhow::ensure!(
+        cache_a_metrics.origin_fetches.get() == 1,
+        "upstream A must reactively pull its origin exactly once, got {}",
+        cache_a_metrics.origin_fetches.get()
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.abort();
+    Ok(())
 }
 
 /// #900: the demand-quality numerator must be fed through the *live* serve loop.
@@ -973,6 +1144,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         buyer,
         self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
         slash_domain: slash_domain(),
+        bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
         obs_buffer: Arc::clone(&obs_buffer),
         network_rep: Arc::new(

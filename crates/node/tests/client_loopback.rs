@@ -2960,3 +2960,212 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
     server_task.await?;
     Ok(())
 }
+
+/// Like [`spawn_pull_through_server`] but arms ONLY the reactive LOCAL-origin
+/// populate (`attach_local_populate`) — NOT the node→node buffered/window paths.
+/// This is the cache-only-operator wiring (#1116): `[cache.origin]` set,
+/// `node_to_node_pull_through_enabled` off.
+async fn spawn_local_populate_server(
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+) -> anyhow::Result<(EndpointAddr, Address, Endpoint, tokio::task::JoinHandle<()>)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        0,
+        16,
+    )?;
+    handler.attach_local_populate(Duration::from_secs(20));
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth.address(), server_ep, server_task))
+}
+
+/// A server with BOTH the reactive local populate AND a node→node window origin
+/// armed — but the window origin is left UNPROVISIONED (a dead peer path). If the
+/// serve path (wrongly) preferred the peer window path over the local origin for
+/// a whole-blob request, the pull would hit this dead origin and the fetch would
+/// be refused; a successful local serve proves local-first (#1116 shadowing fix).
+async fn spawn_local_and_window_server(
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+) -> anyhow::Result<(EndpointAddr, Address, Endpoint, tokio::task::JoinHandle<()>)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        0,
+        16,
+    )?;
+    handler.attach_local_populate(Duration::from_secs(20));
+    handler.attach_window_pull_through(
+        Arc::new(decdn_node::node_origin::NodeOrigin::new()),
+        decdn_cache::Bytes::new(64 * 1024),
+    );
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth.address(), server_ep, server_task))
+}
+
+/// #1116: a node with node→node pull-through DISABLED — only the reactive
+/// LOCAL-origin populate armed — still reactively serves a blob present solely in
+/// its own filesystem origin to a bound, channel-owning client. This is the
+/// cache-only-operator flow that was a silent `NotFound` before decoupling local
+/// populate from `node_to_node_pull_through_enabled`.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 64 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_local_populate_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx = channel_context(Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 1,
+        "expected exactly 1 local origin fetch, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1116 control: the SAME local-populate-only setup WITHOUT a client binding is
+/// refused — reactive local populate is gated on the SAME proven channel
+/// ownership as the node→node paths (`pull_authorized`), so an S3 origin's egress
+/// isn't fronted for an unauthenticated request. No origin fetch is triggered.
+#[tokio::test(flavor = "multi_thread")]
+async fn unbound_local_populate_is_refused() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 64 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_local_populate_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(Arc::clone(&signer), deposit);
+
+    match stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("unbound local-populate fetch must be refused"),
+        Err(e) => anyhow::ensure!(
+            e.to_string().contains("delivery refused"),
+            "expected a delivery-refused error, got: {e}"
+        ),
+    }
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 0,
+        "unbound request must not trigger a local origin fetch, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1116 (window-shadowing fix): with BOTH the reactive local populate AND a
+/// node→node window origin armed, a whole-blob request for a blob the operator
+/// holds in its OWN filesystem origin is served from that local origin — the
+/// window (peer) path, here deliberately dead/unprovisioned, is never taken.
+/// Before the fix a whole-blob miss went straight to the peer window path and
+/// never read the local origin.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
+    let payload = vec![0x3Cu8; 64 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_local_and_window_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx = channel_context(Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 1,
+        "the local origin must be preferred (served) over the peer window path, got {} fetches",
+        cache_metrics.origin_fetches.get()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
