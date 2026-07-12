@@ -299,6 +299,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             hash,
             Duration::from_millis(self.common.timeout_ms),
             max_blob_bytes,
+            // Per-entry byte bars would interleave illegibly across a manifest's
+            // many concurrent pulls; `bundle pull` reports at entry granularity
+            // instead (#1118 scopes the byte bar to single-blob `fetch`).
+            None,
         )
         .await
     }

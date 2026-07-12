@@ -29,7 +29,9 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel};
-use decdn_client_pull::{ChannelContext, VoucherProgress, stream_fetch_tracked};
+use decdn_client_pull::{
+    ChannelContext, ProgressCallback, VoucherProgress, stream_fetch_tracked_with_progress,
+};
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
 use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelStore};
@@ -85,6 +87,27 @@ pub(crate) fn micros_now() -> u64 {
             .map_or(0, |d| d.as_micros()),
     )
     .unwrap_or(u64::MAX)
+}
+
+/// Build the `decdn fetch` delivery progress bar (#1118). Drawn to stderr and
+/// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
+/// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
+/// during the pre-byte connect/handshake so the command never looks hung. The
+/// bar counts **wire** bytes (content plus interleaved bao proof), so its total
+/// runs slightly above the final content-byte count printed on completion — it
+/// tracks the transfer, not the payload size.
+fn new_progress_bar() -> indicatif::ProgressBar {
+    let style = indicatif::ProgressStyle::with_template(
+        "{spinner:.green} {bytes}/{total_bytes} ({bytes_per_sec}, {eta}) [{wide_bar:.cyan/blue}]",
+    )
+    // A bad template is a programming error, not a runtime one; fall back to the
+    // built-in bar rather than panic (clippy forbids `unwrap`/`expect`).
+    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+    .progress_chars("=>-");
+    let bar = indicatif::ProgressBar::new(0);
+    bar.set_style(style);
+    bar.enable_steady_tick(Duration::from_millis(120));
+    bar
 }
 
 /// Chain coordinates resolved flag > `[blockchain]`/`[identity]` config >
@@ -351,14 +374,17 @@ pub(crate) async fn fetch_blob(
     hash: [u8; 32],
     timeout: Duration,
     max_blob_bytes: u64,
+    on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Vec<u8>> {
     let channel_id = ctx.channel_id;
     let timestamp_us = micros_now();
-    // `stream_fetch_tracked` reports the acked watermark via `progress` even on
-    // an error/timeout, so a paid-but-failed delivery still advances the stored
-    // watermark — otherwise the next reuse would re-sign a stale nonce.
+    // `stream_fetch_tracked_with_progress` reports the acked watermark via
+    // `progress` even on an error/timeout, so a paid-but-failed delivery still
+    // advances the stored watermark — otherwise the next reuse would re-sign a
+    // stale nonce. `on_progress` is the byte-delivery readout (`fetch` renders a
+    // bar; `bundle pull` passes `None`).
     let mut progress = VoucherProgress::default();
-    let result = stream_fetch_tracked(
+    let result = stream_fetch_tracked_with_progress(
         endpoint,
         target,
         ctx,
@@ -370,6 +396,7 @@ pub(crate) async fn fetch_blob(
         timeout,
         max_blob_bytes,
         &mut progress,
+        on_progress,
     )
     .await;
 
@@ -471,6 +498,19 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     }
 
     let max_blob_bytes = common.max_blob_mb.saturating_mul(1024 * 1024);
+    // Delivery progress bar (#1118). `indicatif` draws to stderr and hides
+    // itself automatically when stderr is not a terminal, so a piped/redirected
+    // fetch stays silent. The bar starts length-less; the first callback (which
+    // fires once the signed `StreamResponse` fixes the total) sets its length.
+    let bar = new_progress_bar();
+    // `ProgressBar` is `Arc`-backed, so the clone the callback owns drives the
+    // same bar we `finish_and_clear` below. The callback must be `'static`
+    // (`ProgressCallback`), hence the owned clone rather than a borrow.
+    let cb_bar = bar.clone();
+    let on_progress = move |received: u64, expected: u64| {
+        cb_bar.set_length(expected);
+        cb_bar.set_position(received);
+    };
     let blob = fetch_blob(
         &endpoint,
         target,
@@ -481,8 +521,13 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         hash,
         Duration::from_millis(common.timeout_ms),
         max_blob_bytes,
+        Some(&on_progress),
     )
-    .await?;
+    .await;
+    // Clear the bar before the terminal outcome (success line or error) so it
+    // never overwrites the final message, on either path.
+    bar.finish_and_clear();
+    let blob = blob?;
 
     write_blob_atomic(&args.output, &blob)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", args.output.display()))?;

@@ -370,6 +370,56 @@ pub async fn stream_fetch_tracked(
     max_blob_size_bytes: u64,
     progress: &mut VoucherProgress,
 ) -> anyhow::Result<Bytes> {
+    stream_fetch_tracked_with_progress(
+        endpoint,
+        target,
+        ctx,
+        slash_domain,
+        expected_signer,
+        hash,
+        byte_offset,
+        timestamp_us,
+        timeout,
+        max_blob_size_bytes,
+        progress,
+        None,
+    )
+    .await
+}
+
+/// Delivery-progress callback: invoked with `(wire_bytes_received,
+/// wire_bytes_expected)` after each chunk arrives, so a caller (e.g. `decdn
+/// fetch`) can render a progress bar. Both counts are **wire** bytes — bao
+/// content plus interleaved proof nodes (ADR 038 §Payment metering) — matching
+/// the receive loop's own accounting; `wire_bytes_expected` is the aligned wire
+/// length, known from the signed `StreamResponse` before the first chunk and
+/// constant across the pull. It must not panic (it runs inside the hot receive
+/// loop) and must be `Send + Sync` so the pull future stays spawnable.
+pub type ProgressCallback = dyn Fn(u64, u64) + Send + Sync;
+
+/// Like [`stream_fetch_tracked`], but also reports per-chunk delivery progress
+/// through `on_progress` (see [`ProgressCallback`]) — the byte-progress hook the
+/// watermark-only [`VoucherProgress`] out-param does not provide. `None` behaves
+/// exactly like [`stream_fetch_tracked`].
+///
+/// # Errors
+///
+/// Same as [`stream_fetch`].
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_fetch_tracked_with_progress(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &ChannelContext,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    timeout: Duration,
+    max_blob_size_bytes: u64,
+    progress: &mut VoucherProgress,
+    on_progress: Option<&ProgressCallback>,
+) -> anyhow::Result<Bytes> {
     // One-shot ledger seeded from the channel's prior cumulative state. A single
     // (non-shared) pull owns its ledger; concurrent shared-channel pulls use
     // `stream_fetch_shared` with a caller-owned ledger instead.
@@ -391,6 +441,7 @@ pub async fn stream_fetch_tracked(
             timestamp_us,
             max_blob_size_bytes,
             &ledger,
+            on_progress,
         ),
     )
     .await
@@ -450,6 +501,10 @@ pub async fn stream_fetch_shared(
             timestamp_us,
             max_blob_size_bytes,
             ledger,
+            // Shared concurrent pulls interleave many blobs on one channel; a
+            // single unified byte-progress readout would be meaningless, so this
+            // path never reports progress.
+            None,
         ),
     )
     .await
@@ -468,6 +523,7 @@ async fn fetch_inner(
     timestamp_us: u64,
     max_blob_size_bytes: u64,
     ledger: &ChannelLedger,
+    on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
     // Full handshake — no 0-RTT on cdn/client/v1 (ADR 015).
     let conn = endpoint
@@ -562,6 +618,7 @@ async fn fetch_inner(
         rate_per_mb,
         interval_bytes,
         expected_wire,
+        on_progress,
     )
     .await?;
 
@@ -612,6 +669,7 @@ fn aligned_wire_len(byte_offset: u64, total_bytes: u64) -> anyhow::Result<u64> {
 /// the caller's completeness check (integrity is verified per bao chunk group by
 /// the decoder, not here). Enforces the chunk-size ceiling and the
 /// `cumulative <= expected_wire_bytes` overrun guard (ADR 005 §`cdn/client/v1`).
+#[allow(clippy::too_many_arguments)]
 async fn receive_and_pay(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -620,6 +678,7 @@ async fn receive_and_pay(
     rate_per_mb: u64,
     interval_bytes: u64,
     expected_wire_bytes: u64,
+    on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<(BytesMut, u64)> {
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
@@ -645,6 +704,12 @@ async fn receive_and_pay(
                     );
                 }
                 buf.extend_from_slice(&chunk.bytes);
+                // Surface delivery progress after each chunk. `cumulative` and
+                // `expected_wire_bytes` are both wire bytes, so the readout is
+                // consistent (and can't overshoot — the guard above caps it).
+                if let Some(cb) = on_progress {
+                    cb(cumulative, expected_wire_bytes);
+                }
                 bytes_since_voucher = bytes_since_voucher.saturating_add(chunk.bytes.len() as u64);
                 // Pay at each interval boundary, and a closing voucher once all
                 // expected bytes have arrived — matching the node's pacing.
