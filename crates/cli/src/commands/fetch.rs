@@ -29,11 +29,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
 use decdn_client_pull::{
-    ChannelContext, ProgressCallback, VoucherProgress, stream_fetch_tracked_with_progress,
+    ChannelContext, ProgressCallback, VoucherProgress, sign_client_binding,
+    stream_fetch_tracked_with_progress,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -41,7 +42,7 @@ use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelStore};
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
-use decdn_incentive::{slash_judge_domain, voucher_domain};
+use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
 use super::chain_ctx;
@@ -407,6 +408,29 @@ pub(crate) async fn resolve_target_node(
 /// calls that share a channel (`ctx`/`provider`) — vouchers on one channel use a
 /// strictly-increasing nonce, so two in-flight fetches on the same channel would
 /// race it.
+/// Reconnect an opaque `delivery refused: NotFound` to its likely cause when the
+/// request went out WITHOUT an ADR 005 client binding. An unbound request (no
+/// `blockchain.capacity_bond_address`, so nothing to sign) cannot authorize the
+/// node to reactively pull a cache-missed blob from its origin, so the node
+/// returns a bare `NotFound` — indistinguishable, without this, from a genuinely
+/// absent/blacklisted/wrong hash. Scoped to `NotFound` (a size/blacklist refusal
+/// is not fixed by a binding) and to unbound contexts, so a bound fetch's error
+/// is passed through untouched. Every other error is returned verbatim.
+fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyhow::Error {
+    let msg = err.to_string();
+    if ctx.client_binding.is_none() && msg.contains("delivery refused") && msg.contains("NotFound")
+    {
+        err.context(
+            "no client identity binding was sent because \
+             blockchain.capacity_bond_address is unset, so the node could not \
+             reactively pull this cache-missed blob from its origin; set \
+             blockchain.capacity_bond_address to enable reactive pull-through",
+        )
+    } else {
+        err
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_blob(
     endpoint: &Endpoint,
@@ -531,6 +555,26 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     )
     .await?;
 
+    // ADR 005 client identity binding (#1115): sign our OWN iroh NodeId with the
+    // buyer key so the serving node can prove we own the channel and reactively
+    // pull a cache-missed blob from its configured origin. The bind domain's
+    // verifying contract is the `CapacityBond`; without it configured we can't
+    // sign, so we fall back to the pre-#1115 behavior (only already-cached
+    // content is served — a cache miss is refused).
+    let ctx = if let Some(capacity_bond) = chain.capacity_bond {
+        let bind_dom = bind_node_id_domain(chain.chain_id, capacity_bond);
+        let own_node_id = B256::from(*endpoint.id().as_bytes());
+        ctx.with_client_binding(sign_client_binding(&signer, own_node_id, &bind_dom)?)
+    } else {
+        // No `CapacityBond` configured ⇒ we can't sign the ADR 005 binding, so the
+        // request goes out unbound and the node serves only content it already
+        // holds (a cache miss is refused). No warning here — it would fire on
+        // every successful cached fetch too, training users to ignore it; the
+        // refusal is instead explained at the point of failure below
+        // (`annotate_unbound_cache_miss`).
+        ctx
+    };
+
     let mut target = EndpointAddr::new(node_id);
     // `--addr` requires `--node-id` (clap), so it only pins the explicit-node
     // path; a discovered node is reached via its resolved address + relay hint.
@@ -576,7 +620,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // Clear the bar before the terminal outcome (success line or error) so it
     // never overwrites the final message, on either path.
     bar.finish_and_clear();
-    let blob = blob?;
+    let blob = blob.map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
 
     write_blob_atomic(&args.output, &blob)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", args.output.display()))?;
@@ -756,6 +800,60 @@ mod tests {
 
     fn config(body: &str) -> FileConfig {
         toml::from_str(body).expect("parse test config")
+    }
+
+    fn ctx_with(binding: Option<decdn_protocol::client::ClientBinding>) -> ChannelContext {
+        ChannelContext {
+            channel_id: B256::ZERO,
+            token: Address::ZERO,
+            deposit: U256::ZERO,
+            client_signer: Arc::new(PrivateKeySigner::random()),
+            voucher_domain: bind_node_id_domain(1, Address::ZERO),
+            prior_nonce: U256::ZERO,
+            prior_bytes_delivered: U256::ZERO,
+            prior_amount: U256::ZERO,
+            client_binding: binding,
+        }
+    }
+
+    /// An unbound (no `capacity_bond_address`) fetch refused with `NotFound` gets
+    /// the actionable hint attached, reconnecting the opaque refusal to its cause.
+    #[test]
+    fn unbound_notfound_refusal_gets_actionable_hint() {
+        let annotated = annotate_unbound_cache_miss(
+            anyhow::anyhow!("delivery refused: Some(NotFound)"),
+            &ctx_with(None),
+        );
+        assert!(
+            annotated.to_string().contains("capacity_bond_address"),
+            "expected the binding hint, got: {annotated}"
+        );
+    }
+
+    /// A bound fetch's error is passed through untouched — a `NotFound` there is a
+    /// genuine miss, not a missing-binding problem.
+    #[test]
+    fn bound_notfound_refusal_is_untouched() {
+        let signer = PrivateKeySigner::random();
+        let binding =
+            sign_client_binding(&signer, B256::ZERO, &bind_node_id_domain(1, Address::ZERO))
+                .expect("sign binding");
+        let annotated = annotate_unbound_cache_miss(
+            anyhow::anyhow!("delivery refused: Some(NotFound)"),
+            &ctx_with(Some(binding)),
+        );
+        assert!(!annotated.to_string().contains("capacity_bond_address"));
+    }
+
+    /// A non-`NotFound` failure (e.g. a transport error) is never mislabeled as a
+    /// missing-binding problem, even when unbound.
+    #[test]
+    fn unbound_non_notfound_error_is_untouched() {
+        let annotated = annotate_unbound_cache_miss(
+            anyhow::anyhow!("connect failed: timed out"),
+            &ctx_with(None),
+        );
+        assert!(!annotated.to_string().contains("capacity_bond_address"));
     }
 
     #[test]

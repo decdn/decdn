@@ -636,6 +636,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         prior_nonce: U256::ZERO,
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
+        client_binding: None,
     };
     let got = stream_fetch(
         &client_ep,
@@ -720,6 +721,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         prior_nonce: U256::ZERO,
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
+        client_binding: None,
     };
     let suffix = stream_fetch(
         &client_ep,
@@ -1087,6 +1089,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         prior_nonce: U256::ZERO,
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
+        client_binding: None,
     };
     let got3 = stream_fetch(
         &client_ep,

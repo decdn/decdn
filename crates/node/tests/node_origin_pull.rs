@@ -142,6 +142,7 @@ impl ChannelOpener for StubOpener {
             prior_nonce,
             prior_bytes_delivered,
             prior_amount,
+            client_binding: None,
         })
     }
 
@@ -198,6 +199,7 @@ impl ChannelOpener for FailingRecordOpener {
             prior_nonce: U256::ZERO,
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
+            client_binding: None,
         })
     }
 
@@ -1104,6 +1106,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         prior_nonce: U256::ZERO,
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
+        client_binding: None,
     };
     let got = stream_fetch(
         &ep_c,
@@ -1163,6 +1166,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         prior_nonce: U256::ZERO,
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
+        client_binding: None,
     };
     let got2 = stream_fetch(
         &ep_c,

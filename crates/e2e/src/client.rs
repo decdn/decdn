@@ -133,6 +133,7 @@ impl ClientFixture {
             prior_nonce: U256::ZERO,
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
+            client_binding: None,
         };
         let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
         let target = EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(

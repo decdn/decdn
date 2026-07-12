@@ -1025,10 +1025,12 @@ impl ClientHandler {
                 // cannot make this node spend — closing the proxy-abuse /
                 // griefing vector where an unpaid client drains the buyer
                 // deposit. (Multi-hop node→node pulls therefore require the
-                // downstream requester to send a binding; `stream_fetch` does
-                // not yet, so chained pull-through is a follow-up.) On a
-                // successful fill, fall through to the normal size-gate +
-                // delivery path; otherwise it stays a `NotFound`.
+                // downstream requester to send a binding; the direct-client
+                // `decdn fetch` now does (#1115), but the node→node requester
+                // (`node_origin`) does not yet, so chained pull-through remains
+                // a follow-up (#1117).) On a successful fill, fall through to
+                // the normal size-gate + delivery path; otherwise it stays a
+                // `NotFound`.
                 //
                 // Origin-tier range pull-through (#823, ADR 037 §Origin-tier
                 // pull-through). When the
