@@ -217,12 +217,8 @@ pub(crate) async fn run<P>(
         max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
         // Full replay from the deploy floor every boot, no persisted cursor: the
         // in-memory deny-set has no enumeration source, so a resume would drop
-        // still-out-of-scope entries (a compliance gap). `u64::MAX` window ⇒ the
-        // floor resolves to `from_block`; no store ⇒ no persistence.
-        cursor: CursorPolicy::HeadMinusWindow {
-            window_blocks: u64::MAX,
-            floor: from_block,
-        },
+        // still-out-of-scope entries (a compliance gap).
+        cursor: CursorPolicy::FullReplay { floor: from_block },
         initial_backoff: INITIAL_BACKOFF,
         max_backoff: MAX_BACKOFF,
         rpc_call_timeout: Some(RPC_CALL_TIMEOUT),

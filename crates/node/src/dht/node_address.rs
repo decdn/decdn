@@ -23,10 +23,10 @@
 //! Bootstrap RPC failure → the caller decides (the runtime treats node-to-node
 //! pull-through as opportunistic and non-fatal, so it logs and disables the
 //! buyer path rather than aborting). Watcher RPC failure mid-run → log at
-//! `warn!`, back off (1s → 60s cap), and re-establish filters. The same drift
-//! window `ChainStakerSet` documents applies: a registration whose event
-//! arrives while filters are down is missed until the next event for that node
-//! (a `getActiveNodes` resync is a follow-up). A missing binding fails the pull
+//! `warn!`, back off (1s → 60s cap), and re-poll. The cursor is retained across
+//! the backoff, so the next `eth_getLogs` tick re-scans `[cursor, head]` and
+//! re-applies any binding event that landed during the outage — no backoff-gap
+//! drift. A missing binding fails the pull
 //! *closed* — the orchestrator skips a provider it cannot resolve rather than
 //! guessing an address it would then pay.
 

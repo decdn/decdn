@@ -493,7 +493,7 @@ pub async fn run(
     // checkpoint once per distinct block carrying a provider-owned
     // `ChannelOpened`, and the directly-durable store fsyncs on each. The
     // persisted value is only a *floor* for the resume backfill
-    // (`resolve_backfill_start` rewinds it by the reorg margin; registration is
+    // (`resolve_persisted_start` rewinds it by the reorg margin; registration is
     // idempotent), so coarsening the write cadence is safe — and the settlement
     // service forces a final flush on graceful shutdown so steady-state progress
     // is not lost. Wrapping here (the wiring layer) keeps the domain trait and the
@@ -718,7 +718,7 @@ pub async fn run(
     // `decdn_slashes_detected_total` metric) and the operator can file
     // `decdn appeal slash` in time. Read-only; held to `run()`'s end so its
     // background task lives as long as the daemon. `bootstrap` is infallible —
-    // every RPC (head read, `get_logs`, subscribe) happens inside the retrying
+    // every RPC (head read, `get_logs`) happens inside the poll
     // loop, so a bring-up RPC blip retries with backoff rather than disabling
     // detection for the daemon's lifetime.
     let slash_watcher = crate::slash_watcher::SlashWatcher::bootstrap(
@@ -2800,9 +2800,21 @@ async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
         .timeout(Duration::from_secs(5))
         .build()
         .context("failed to build HTTP client for RPC check")?;
-    let mut backoff = Duration::from_secs(1);
+    preflight_retry(&client, rpc_url, Duration::from_secs(1)).await
+}
+
+/// Retry loop behind [`check_rpc_reachability`], split out so the retry/classify
+/// policy is testable with a small `initial_backoff` (the production caller
+/// passes 1s). Retries a [`RpcProbe::Transient`] with doubling backoff (capped at
+/// 8s) up to [`RPC_PREFLIGHT_MAX_ATTEMPTS`]; a [`RpcProbe::Fatal`] bails at once.
+async fn preflight_retry(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    initial_backoff: Duration,
+) -> anyhow::Result<()> {
+    let mut backoff = initial_backoff;
     for attempt in 1..=RPC_PREFLIGHT_MAX_ATTEMPTS {
-        match probe_rpc_classified(&client, rpc_url).await {
+        match probe_rpc_classified(client, rpc_url).await {
             RpcProbe::Healthy => {
                 tracing::info!("RPC endpoint reachable");
                 return Ok(());
@@ -3593,6 +3605,119 @@ mod tests {
         let _ = tx.send(());
         let join_res = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(join_res.is_ok(), "watchdog should exit on shutdown signal");
+    }
+
+    /// The preflight classifier maps a probe response to the right retry verdict
+    /// (#1106/#1108): 2xx = healthy, 429/5xx = transient (retryable), other 4xx =
+    /// fatal (retrying won't help). A misclassification would either crash-loop a
+    /// node on a transient startup 429 or retry a genuine misconfig to budget.
+    #[tokio::test]
+    async fn preflight_classifier_maps_statuses_to_verdicts() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("build client");
+        for (status, want) in [
+            (200u16, "healthy"),
+            (429, "transient"),
+            (500, "transient"),
+            (503, "transient"),
+            (400, "fatal"),
+            (404, "fatal"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("{}"))
+                .mount(&server)
+                .await;
+            let got = match probe_rpc_classified(&client, &server.uri()).await {
+                RpcProbe::Healthy => "healthy",
+                RpcProbe::Transient(_) => "transient",
+                RpcProbe::Fatal(_) => "fatal",
+            };
+            assert_eq!(got, want, "status {status} misclassified");
+        }
+    }
+
+    /// Returns 429 for the first `fail_first` calls, then 200 — models a
+    /// rate-limited endpoint recovering after the startup burst.
+    struct FlakyThenHealthy {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_first: usize,
+    }
+
+    impl wiremock::Respond for FlakyThenHealthy {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.fail_first {
+                ResponseTemplate::new(429)
+            } else {
+                ResponseTemplate::new(200).set_body_string("{}")
+            }
+        }
+    }
+
+    /// Build the 5s-timeout preflight client the production path uses.
+    fn preflight_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build client")
+    }
+
+    /// A transient (429) preflight is retried with backoff and succeeds once the
+    /// endpoint recovers — the #1108 startup-burst-429 case that used to exit the
+    /// process. Drives `preflight_retry` with a 1ms backoff so the real HTTP path
+    /// to wiremock runs unpaused but the retries stay fast.
+    #[tokio::test]
+    async fn preflight_retries_transient_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(FlakyThenHealthy {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_first: 2,
+            })
+            .mount(&server)
+            .await;
+        preflight_retry(&preflight_client(), &server.uri(), Duration::from_millis(1))
+            .await
+            .expect("preflight should recover after two transient 429s");
+    }
+
+    /// A persistent transient failure aborts bring-up after the retry budget — a
+    /// genuinely-throttled/dead endpoint is not silently tolerated forever.
+    #[tokio::test]
+    async fn preflight_exhausts_budget_on_persistent_transient() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let err = preflight_retry(&preflight_client(), &server.uri(), Duration::from_millis(1))
+            .await
+            .expect_err("persistent 429 must fail after the retry budget");
+        assert!(
+            err.to_string().contains("attempts"),
+            "error should report the exhausted retry budget: {err}"
+        );
+    }
+
+    /// A fatal (non-429 4xx) preflight aborts immediately — retrying a bad
+    /// path/auth won't help, so fail fast with a clear message.
+    #[tokio::test]
+    async fn preflight_fatal_aborts_immediately() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let err = preflight_retry(&preflight_client(), &server.uri(), Duration::from_millis(1))
+            .await
+            .expect_err("a fatal 4xx must abort bring-up");
+        assert!(
+            err.to_string().contains("unexpected status"),
+            "error should surface the fatal status: {err}"
+        );
     }
 
     /// Smoke test for the post-fixup `ShutdownStreams::recv` contract:

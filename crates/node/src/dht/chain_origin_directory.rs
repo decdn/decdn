@@ -2,7 +2,7 @@
 //!
 //! Resolves a content hash to the set of currently-active operator `NodeId`s
 //! authorised as origins for it, reading from an in-memory cache kept current
-//! by a background event-subscription task. The resolution chain (ADR 022
+//! by a background `eth_getLogs`-polling task. The resolution chain (ADR 022
 //! § FIND\_VALUE Flow "Origin discovery", ADR 011 § Origin Assignment
 //! Authority) is:
 //!
@@ -688,10 +688,13 @@ async fn resync_default_open<R: OriginChainReads>(
 /// A new `(hash, namespace)` claim. Record the mapping and, for a not-yet-known
 /// namespace, authoritatively read its current operator set so the hash resolves
 /// immediately. On `getOrigins` failure the namespace is left unpopulated (the
-/// hash resolves to empty, fail-closed). Recovery is guaranteed by the next
-/// re-arm resync pass — which re-reads every namespace in `namespaces_of`, this
-/// one included — or by a subsequent claim / assignment-mutation on the same
-/// namespace; an unrelated event for a *different* namespace does not heal it.
+/// hash resolves to empty, fail-closed) and the failure is counted + warned. This
+/// heals **event-drivenly**: a subsequent claim or assignment-mutation on the
+/// same namespace re-reads it. (The old periodic re-arm resync pass that re-read
+/// every namespace was removed with the poller migration — the poller's window
+/// re-scan recovers lost *events*, but not a deferred `getOrigins` on an event
+/// that was already scanned, so an unrelated event for a *different* namespace
+/// does not heal this one.)
 async fn on_content_claimed<R: OriginChainReads>(
     reads: &R,
     cache: &Arc<RwLock<DirectoryCache>>,

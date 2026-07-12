@@ -10,16 +10,16 @@
 //! [`NodeSettlementSource`]. Once fed, `compute_reporter_weight` returns a
 //! non-zero weight and received gossip reports actually move network scores.
 //!
-//! The watcher mirrors [`crate::dht::chain_staker_set`] (bootstrap → background
-//! task → exponential-backoff resubscribe → `AbortOnDrop`) and the bring-up
-//! backfill in [`crate::payment_settlement`].
+//! The watcher runs on the shared `resumable_watcher` `eth_getLogs` poller
+//! (#1092/#1106): its first tick backfills a bounded recent window and later
+//! ticks are the live tail, with a background task aborted on drop.
 //!
 //! # Known limitations (flagged in #326 / tracked by the follow-up issue)
 //!
 //! - **Bounded backfill, in-memory rebuild.** [`NodeSettlementSource`] is
 //!   in-memory, so on each boot the indexer rebuilds it by backfilling a bounded
 //!   recent block window (`MAX_BACKFILL_BLOCK_SPAN`); settlements older than
-//!   the window — and any arriving during a resubscribe gap — are not counted.
+//!   the window — and any arriving during a backoff gap — are not counted.
 //!   Durable, full-52-week indexing is a refinement.
 //! - **`settled_at` ≈ index time.** The settlement age used for exponential
 //!   decay is stamped at index time rather than read from the settling block's
@@ -57,9 +57,9 @@ use crate::reputation_wiring::NodeSettlementSource;
 /// the boot backfill covers. Mirrors `payment_settlement`'s bound so a single
 /// call stays within typical RPC range caps.
 const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
-/// Initial resubscribe backoff after a watcher tick error.
+/// Initial retry backoff after a watcher tick error.
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound for the resubscribe backoff.
+/// Upper bound for the retry backoff.
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Aborts the watcher task on drop so a node-restart cycle never leaks a
@@ -165,7 +165,7 @@ const MAX_PENDING_SETTLED: usize = 4096;
 /// it just forgets that a channel was already credited. The oldest entries
 /// are the longest-settled, so FIFO eviction sheds exactly those. The
 /// residual risk: if an evicted channel's `ChannelSettled` is then
-/// re-delivered (a resubscribe/backfill overlap), `process_settled` no
+/// re-delivered (a re-scan/backfill overlap), `process_settled` no
 /// longer short-circuits and `apply_settlement` re-credits the **provider**
 /// (resolved from the never-removed on-chain `CapacityBond` binding) for
 /// that amount once more — the counterparty leg is lost since the `channels`
@@ -184,14 +184,14 @@ struct PendingSettled {
     routed_amount: alloy::primitives::U256,
 }
 
-/// Persistent across resubscribe cycles: channel→parties map, the settled-once
-/// dedup set, the out-of-order settled buffer, and whether the bring-up backfill
-/// still needs to run.
+/// Persistent for the watcher's life (carried across poll ticks and backoff):
+/// the channel→parties map, the settled-once dedup set, and the out-of-order
+/// settled buffer.
 struct IndexerState {
     /// `channelId → (client, provider)` learned from `ChannelOpened`.
     channels: HashMap<[u8; 32], (Address, Address)>,
     /// `channelId`s already credited, so a backfill/live overlap or a
-    /// resubscribe never double-counts (a channel settles exactly once).
+    /// re-scan never double-counts (a channel settles exactly once).
     /// Bounded by `MAX_SETTLED_SEEN` (#864); kept in sync with
     /// `settled_seen_order` (the FIFO eviction order) by `mark_settled_seen`.
     settled_seen: HashSet<[u8; 32]>,
@@ -381,7 +381,7 @@ where
     P: Provider + Clone,
 {
     if state.settled_seen.contains(&channel_id) {
-        return Ok(()); // already credited (backfill/live overlap or resubscribe)
+        return Ok(()); // already credited (backfill/live overlap or re-scan)
     }
     // Skip (don't saturate) an implausibly large amount: a `u128::MAX` would
     // poison `max_effective_settled_value` and drive every reporter's weight to

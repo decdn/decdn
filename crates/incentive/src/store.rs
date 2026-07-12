@@ -167,7 +167,11 @@ pub trait PendingSettleStore: Send + Sync {
 pub enum CheckpointKey {
     /// Settlement watcher `ChannelOpened` high-water block (#751).
     ChannelOpened,
-    /// Blacklist watcher `HashBlacklisted`/`HashRemoved` scan cursor (#1108).
+    /// **Reserved, not currently persisted.** The blacklist watcher full-replays
+    /// its deny-set from the deploy block every boot (its in-memory set has no
+    /// enumeration source, so a resume would drop still-out-of-scope entries — see
+    /// `blacklist_watcher`), so it writes no cursor. The key is held for a future
+    /// durable-deny-set that would make a resume safe (#1108).
     Blacklist,
     /// Origin-directory watcher `ContentClaimed` scan cursor (#1108).
     Origin,

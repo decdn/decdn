@@ -66,8 +66,15 @@ pub(crate) enum CursorPolicy {
     /// (clamped `>= floor`); do not persist. Used where a resume cursor is
     /// unsafe or unnecessary: slash (re-scan the appeal window every boot),
     /// reputation (bounded recent window), and the enumeration-bootstrapped
-    /// live-follow watchers (`window_blocks = 0` → start at head).
+    /// live-follow watchers (`window_blocks = 0` → start at head). `window_blocks`
+    /// is always a *bounded* recent window here — full-history replay is
+    /// [`Self::FullReplay`], not a giant window.
     HeadMinusWindow { window_blocks: u64, floor: u64 },
+    /// Replay the entire stream from `floor` (the deploy block) on **every** boot;
+    /// do not persist. For an in-memory projection with no on-chain enumeration
+    /// source, where a resume cursor would drop entries that must be rebuilt (the
+    /// blacklist deny-set — see `blacklist_watcher`).
+    FullReplay { floor: u64 },
 }
 
 impl CursorPolicy {
@@ -96,6 +103,9 @@ impl CursorPolicy {
                 window_blocks,
                 floor,
             } => resolve_head_window_start(head, *window_blocks, *floor),
+            // Full replay from the deploy floor: `head - u64::MAX` saturates to 0,
+            // clamped up to `floor` and down to `head`.
+            Self::FullReplay { floor } => resolve_head_window_start(head, u64::MAX, *floor),
         }
     }
 
@@ -253,8 +263,14 @@ const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Apply a per-call timeout to an RPC future, mapping its error into `anyhow`. A
 /// timeout is a retryable error (the tick backs off). A `None` config uses
-/// [`DEFAULT_RPC_CALL_TIMEOUT`] — no call runs unbounded, so a stalled provider
-/// can never permanently wedge the watcher.
+/// [`DEFAULT_RPC_CALL_TIMEOUT`].
+///
+/// This bounds only the calls it wraps — the loop's own `get_block_number` and
+/// `get_logs`. A follow-up RPC a [`LogSink::apply`] issues (`getOrigins`,
+/// `nodeIdOf`, `getChannel`, …) is NOT routed through here and stays unbounded
+/// unless the sink wraps it itself (as `blacklist_watcher::scope_check` does), so
+/// a provider that stalls one of those can still wedge a tick. Bounding every
+/// sink-internal read is a tracked follow-up.
 async fn timed<T, E, F>(timeout: Option<Duration>, what: &str, fut: F) -> Result<T>
 where
     F: Future<Output = std::result::Result<T, E>>,

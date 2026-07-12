@@ -2031,15 +2031,25 @@ mod tests {
     }
 
     /// Each [`CheckpointKey`] is an independent cursor in the one table — the
-    /// #1108 win (blacklist/origin resume separately). Also asserts the
-    /// `ChannelOpened` on-disk literal is frozen: a rename would silently forfeit
-    /// the pre-#1092 settlement resume.
+    /// #1108 win (origin resumes on its own key). Also freezes **every** on-disk
+    /// literal: renaming one silently forfeits that watcher's resume (a fresh boot
+    /// re-scans from its floor), so a rename must be a deliberate, reviewed change.
     #[test]
     fn watcher_checkpoint_keys_are_independent() -> anyhow::Result<()> {
         assert_eq!(
             CheckpointKey::ChannelOpened.as_str(),
             "channel_opened_last_block",
-            "frozen on-disk key — renaming forfeits the #751 resume"
+            "frozen on-disk key — renaming forfeits the #751 settlement resume"
+        );
+        assert_eq!(
+            CheckpointKey::Blacklist.as_str(),
+            "content_blacklist_last_block",
+            "frozen on-disk key (reserved for a future durable blacklist deny-set)"
+        );
+        assert_eq!(
+            CheckpointKey::Origin.as_str(),
+            "origin_directory_last_block",
+            "frozen on-disk key — renaming forfeits the #1108 origin resume"
         );
         let dir = data_dir()?;
         let store = PersistentChannelStateStore::open(dir.path())?;

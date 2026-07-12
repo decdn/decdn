@@ -26,10 +26,13 @@
 //! treats it as fatal; the DHT cannot function without a staker set).
 //!
 //! Watcher RPC failure (mid-run) → the task logs at `warn!`, sleeps
-//! for an exponentially-growing backoff (1s → 60s cap), and
-//! re-establishes its event filters. Today there is no `getActiveNodes`
-//! resync after extended outage, so the cached set can drift from
-//! chain state when an event arrives while filters are down.
+//! for an exponentially-growing backoff (1s → 60s cap), and re-polls. The
+//! cursor is retained across the backoff, so the next `eth_getLogs` tick
+//! re-scans `[cursor, head]` and re-applies any membership event that landed
+//! during the outage — no stream-level drift window. (There is still no
+//! `getActiveNodes` resync to reconcile against a checkpoint older than the
+//! live cursor, but that is only reachable via the per-event `nodeIdOf` drop
+//! below, not a backoff gap.)
 //!
 //! A narrower drift source: an operator-indexed event whose follow-up
 //! `nodeIdOf(operator)` RPC fails is dropped (the membership change is
@@ -588,9 +591,9 @@ mod tests {
     /// counter is edge-triggered, so repeated `backoff_started` calls during
     /// one continuous outage (no intervening `cycle_established`) count as ONE
     /// window. A fresh window requires a `cycle_established` in between.
-    /// Mirrors the `Err` arm of `watcher_loop`. Exercises the metric wiring
-    /// without a live RPC provider (the real `run_watcher_once` needs a chain
-    /// endpoint).
+    /// Mirrors the `on_backoff`/`on_established` hooks the resumable poller fires.
+    /// Exercises the metric wiring without a live RPC provider (the real poll loop
+    /// needs a chain endpoint).
     #[test]
     fn watcher_error_restart_counts_one_per_drift_window() {
         let metrics = Arc::new(Metrics::new());

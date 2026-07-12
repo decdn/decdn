@@ -10,11 +10,8 @@
 //! settlement path):
 //!
 //! - **Server-side operator filter.** `Slashed` indexes `operator` as `topic2`,
-//!   so both the backfill and the live filter constrain on it — a node never
-//!   downloads or decodes other operators' slashes.
-//! - **Filter-first, then head.** Each cycle installs the live filter *before*
-//!   reading the head block used as the backfill bound, so no block mined
-//!   between the two falls into a gap (same ordering as the settlement watcher).
+//!   so every `eth_getLogs` window constrains on it — a node never downloads or
+//!   decodes other operators' slashes.
 //! - **Rebuild from a bounded floor on every start.** The detected-slash store
 //!   is in-memory, so it is empty on each process start and must be rebuilt by
 //!   scanning history — a durable resume cursor could not skip this (resuming
@@ -69,7 +66,7 @@ const fn appeal_window_blocks() -> u64 {
     (APPEAL_FILING_WINDOW_SECS * 1_000).div_ceil(ARBITRUM_BLOCK_TIME_MS)
 }
 
-/// Backoff bounds for the resubscribe loop (mirrors the settlement watcher).
+/// Backoff bounds for the poll-retry loop (mirrors the settlement watcher).
 const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -125,7 +122,7 @@ impl std::fmt::Debug for SlashWatcher {
 
 impl SlashWatcher {
     /// Spawn the slash-detection watcher. Infallible: every RPC (head read,
-    /// `get_logs`, subscribe) happens inside the retrying loop, so a transient
+    /// `get_logs`) happens inside the poll loop, so a transient
     /// bring-up failure retries with backoff rather than disabling detection for
     /// the daemon's lifetime.
     ///
@@ -232,9 +229,9 @@ fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
     Box::new(move || metrics.slash_watcher_backoff_started())
 }
 
-/// The address + `Slashed`-signature + `topic2 == operator` filter shared by the
-/// live subscription and every backfill window, so the RPC only ever returns
-/// this operator's slashes.
+/// The address + `Slashed`-signature + `topic2 == operator` filter applied to
+/// every `eth_getLogs` poll window, so the RPC only ever returns this operator's
+/// slashes.
 fn operator_filter(slash_judge_addr: Address, self_address: Address) -> Filter {
     Filter::new()
         .address(slash_judge_addr)
@@ -243,11 +240,12 @@ fn operator_filter(slash_judge_addr: Address, self_address: Address) -> Filter {
 }
 
 /// Decode one `Slashed` log, or `None` for a log that must not be recorded:
-/// reorged-out (`removed == true`, re-delivered by `eth_getFilterChanges` per
-/// the JSON-RPC spec), undecodable, or another operator's. The `topic2` filter
-/// already constrains to this operator, but the defensive operator check guards
-/// against a provider that ignores the topic. Pure (no provider) so the skip
-/// policy is unit-testable.
+/// reorged-out (`removed == true` — not expected from `eth_getLogs`, which
+/// returns only canonical logs, so this is defensive against a nonconforming
+/// provider), undecodable, or another operator's. The `topic2` filter already
+/// constrains to this operator, but the defensive operator check guards against a
+/// provider that ignores the topic. Pure (no provider) so the skip policy is
+/// unit-testable.
 fn decode_slashed(
     self_address: Address,
     log: &alloy::rpc::types::Log,
