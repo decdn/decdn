@@ -123,6 +123,9 @@ pub(crate) struct ResolvedChain {
     pub(crate) capacity_bond: Option<Address>,
     pub(crate) chain_id: u64,
     pub(crate) keystore: PathBuf,
+    /// Directory holding the buyer-channel redb store and (by default) the
+    /// keystore. Client-scoped (`~/.decdn/client`) unless an explicit
+    /// `--data-dir`/`identity.data_dir` is given.
     pub(crate) data_dir: PathBuf,
     /// Client region for region-first discovery ordering (`--region` >
     /// `identity.region`). `None` skips the ordering.
@@ -185,16 +188,21 @@ pub(crate) fn resolve_chain(
         .or_else(|| bc.and_then(|b| b.chain_id))
         .unwrap_or(DEFAULT_CHAIN_ID);
 
+    // Client data dir: an explicit `--data-dir`/`identity.data_dir` wins,
+    // otherwise the client-scoped `~/.decdn/client` (not the node-shaped
+    // `~/.decdn`, so a pure client install doesn't masquerade as a node).
     let data_dir = args
         .data_dir
         .clone()
         .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
         .map(|p| expand_tilde(&p))
-        .or_else(cli::default_data_dir)
+        .or_else(cli::default_client_data_dir)
         .ok_or_else(|| {
             anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
         })?;
 
+    // Keystore: an explicit `--keystore`/`blockchain.eth_keystore` wins; otherwise
+    // `keystore.json` under the (client-scoped) data dir.
     let keystore = args
         .keystore
         .clone()
@@ -209,7 +217,10 @@ pub(crate) fn resolve_chain(
             .or_else(|| bc.and_then(|b| b.buyer_deposit_micro_usdc))
             .unwrap_or(DEFAULT_DEPOSIT_MICRO_USDC),
     );
-    let max_approve = bc.and_then(|b| b.buyer_max_approve).unwrap_or(true);
+    // Client default: exact (deposit-sized) USDC approval, not an unlimited
+    // standing allowance. `buyer_max_approve = true` opts a power user back into
+    // the node/operator posture. (The daemon's own default stays unlimited.)
+    let max_approve = bc.and_then(|b| b.buyer_max_approve).unwrap_or(false);
 
     Ok(ResolvedChain {
         rpc_url,
@@ -524,7 +535,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         provider,
         &store,
         hash,
-        Duration::from_millis(common.timeout_ms),
+        common.effective_timeout(),
         max_blob_bytes,
         Some(&on_progress),
     )
@@ -591,9 +602,19 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentChannel.minDeposit(): {e}"))?;
     let deposit = deposit.max(min_deposit);
-    if max_approve {
-        ensure_allowance(rpc, token, self_address, payment_channel_addr).await?;
-    }
+    // `max_approve` opts into an unlimited standing allowance; otherwise approve
+    // exactly the (clamped) deposit being escrowed. Unconditional either way — the
+    // old `false` branch issued no approve at all, so `openChannel`'s internal
+    // `transferFrom` reverted unless the wallet had pre-approved out of band.
+    let approve_amount = if max_approve { None } else { Some(deposit) };
+    ensure_allowance(
+        rpc,
+        token,
+        self_address,
+        payment_channel_addr,
+        approve_amount,
+    )
+    .await?;
     let opened = open_channel(
         contract,
         Arc::clone(signer),
@@ -693,6 +714,52 @@ mod tests {
         assert_eq!(r.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(r.deposit, U256::from(5_000_000u64));
         // keystore defaults under the data dir.
+        assert_eq!(
+            r.keystore,
+            eth_identity::keystore_path(&PathBuf::from("/tmp/d"))
+        );
+    }
+
+    #[test]
+    fn effective_timeout_delegates_with_correct_arg_order() {
+        // Default pair (1024 MiB, 30_000 ms): scaled ≈ 29_257 < floor → 30 s.
+        let mut c = common();
+        assert_eq!(c.effective_timeout(), Duration::from_secs(30));
+        // Larger blob scales the timeout up (proves max_blob_mb, not timeout_ms,
+        // is the scaled term — a transposed delegation would fail here).
+        c.max_blob_mb = 4096;
+        assert_eq!(c.effective_timeout(), Duration::from_millis(117_028));
+    }
+
+    #[test]
+    fn client_default_max_approve_is_exact() {
+        // Absent `buyer_max_approve` → client defaults to exact (deposit-sized)
+        // approval, i.e. `max_approve == false`.
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        );
+        let r = resolve_chain(&common(), &file).unwrap();
+        assert!(!r.max_approve);
+    }
+
+    #[test]
+    fn buyer_max_approve_true_opts_into_unlimited() {
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_max_approve = true\n",
+        );
+        let r = resolve_chain(&common(), &file).unwrap();
+        assert!(r.max_approve);
+    }
+
+    #[test]
+    fn explicit_data_dir_not_client_scoped() {
+        // `common()` sets an explicit data_dir; it must be used verbatim (no
+        // client-subdir scoping) for both the store dir and the keystore.
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        );
+        let r = resolve_chain(&common(), &file).unwrap();
+        assert_eq!(r.data_dir, PathBuf::from("/tmp/d"));
         assert_eq!(
             r.keystore,
             eth_identity::keystore_path(&PathBuf::from("/tmp/d"))
