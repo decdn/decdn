@@ -25,6 +25,57 @@ impl fmt::Display for LogFormat {
     }
 }
 
+/// Blockchain coordinates + keys shared by every on-chain command, flattened
+/// into each command's args so they expose an identical flag group and can't
+/// drift. Each field is taken from a flag when present, otherwise the
+/// `[blockchain]` / `[identity]` tables of the TOML config (the same file the
+/// daemon reads). `ChainArgs` / `PublishChainArgs` layer their contract-address
+/// flags on top of this; the shared resolver (`chain_ctx::resolve_common`)
+/// reads these fields so the flag > config > default precedence lives in one
+/// place.
+#[derive(clap::Args, Debug)]
+pub struct CommonChainArgs {
+    /// Path to the TOML config file supplying `[blockchain]` / `[identity]`
+    /// fields not passed as flags. Takes precedence over the top-level
+    /// `decdn --config`; falls through to `~/.decdn/node.toml`.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// JSON-RPC endpoint URL. Overrides `blockchain.rpc_url`.
+    #[arg(long, value_name = "URL")]
+    pub rpc_url: Option<String>,
+
+    /// EIP-712 `chainId` for signing domains / the expected chain of
+    /// `--rpc-url`. Overrides `blockchain.chain_id`; must match the target
+    /// contract deployment's chain or signatures are rejected on-chain.
+    #[arg(long, value_name = "ID")]
+    pub chain_id: Option<u64>,
+
+    /// Ethereum keystore file. Overrides `blockchain.eth_keystore`; defaults
+    /// to `<data_dir>/keystore.json`.
+    #[arg(long, value_name = "PATH")]
+    pub keystore: Option<PathBuf>,
+
+    /// Data directory holding `node.secret`. Overrides `identity.data_dir`;
+    /// defaults to `~/.decdn`.
+    #[arg(long, value_name = "PATH")]
+    pub data_dir: Option<PathBuf>,
+
+    /// File whose contents are the keystore password. Consulted after the
+    /// `DECDN_KEYSTORE_PASSWORD` env var and before an interactive prompt.
+    #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
+    pub keystore_password_file: Option<PathBuf>,
+
+    /// Build and print what would be submitted without sending any
+    /// transaction.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit the result as JSON instead of human-readable `key=value` lines.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Log verbosity level.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

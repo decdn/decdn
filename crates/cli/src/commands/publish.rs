@@ -12,7 +12,8 @@ use std::io;
 use std::path::Path;
 
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use anyhow::Context;
 use decdn_common::cli;
@@ -38,14 +39,13 @@ pub async fn publish_dispatch(
 }
 
 /// Resolve the publisher coordinates and parse the `PublisherRegistry`
-/// address. Shared by `namespace create` and `claim`. The signer and provider
-/// are built by the caller in its own scope (the wallet-filled provider
-/// borrows the signer under Rust 2024 capture rules, so both must be locals).
+/// address. Shared by `namespace create` and `claim`; the signer and provider
+/// are built on the submit path by [`signer_and_provider`].
 fn registry_ctx(
     chain: &cli::PublishChainArgs,
     global_config: Option<&Path>,
 ) -> anyhow::Result<(ResolvedPublish, Address)> {
-    let config_path = chain.config.as_deref().or(global_config);
+    let config_path = chain.common.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
     let resolved = chain_ctx::resolve_publish(chain, &file)?;
     let registry = chain_ctx::parse_address(
@@ -62,6 +62,55 @@ fn registry_ctx(
         "publisher_registry_address",
     )?;
     Ok((resolved, registry))
+}
+
+/// Resolve the publisher coordinates and parse the `OriginAssignment` address.
+/// The `assign` parallel of [`registry_ctx`]; the signer and provider are built
+/// on the submit path by [`signer_and_provider`].
+fn assignment_ctx(
+    chain: &cli::PublishChainArgs,
+    global_config: Option<&Path>,
+) -> anyhow::Result<(ResolvedPublish, Address)> {
+    let config_path = chain.common.config.as_deref().or(global_config);
+    let file = chain_ctx::load_optional_config(config_path)?;
+    let resolved = chain_ctx::resolve_publish(chain, &file)?;
+    let origin_assignment = chain_ctx::parse_address(
+        resolved
+            .origin_assignment_address
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "origin_assignment_address not set (pass --origin-assignment-address \
+                     or set blockchain.origin_assignment_address)"
+                )
+            })?,
+        "origin_assignment_address",
+    )?;
+    Ok((resolved, origin_assignment))
+}
+
+/// Preflight the RPC network, decrypt the keystore signer, and build the
+/// wallet-filled provider — the byte-identical submit preamble shared by
+/// `namespace create`, `claim`, and `assign`. Called only on the submit path
+/// (never a dry run), so it always decrypts. The network is verified *before*
+/// touching secrets, so a wrong `--rpc-url` fails here rather than after an
+/// interactive password prompt + scrypt KDF.
+///
+/// Returns owned `(signer, provider)`: `build_provider` clones the signer into
+/// the wallet (`+ use<>`), so the provider borrows nothing and the caller can
+/// hold both as independent locals.
+async fn signer_and_provider(
+    resolved: &ResolvedPublish,
+    chain: &cli::PublishChainArgs,
+) -> anyhow::Result<(PrivateKeySigner, impl Provider + Clone)> {
+    preflight_chain_id(&resolved.rpc_url, resolved.chain_id).await?;
+    let signer = chain_ctx::load_signer_with_password_file(
+        chain.common.keystore_password_file.as_deref(),
+        &resolved.keystore,
+    )
+    .await?;
+    let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+    Ok((signer, provider))
 }
 
 /// Reject duplicate operator addresses before submitting — the contract
@@ -166,18 +215,10 @@ async fn namespace_create(
         tx: None,
     };
 
-    if !args.chain.dry_run {
-        // Verify the network before touching secrets — a wrong --rpc-url fails
-        // here, not after an interactive password prompt + scrypt KDF.
-        preflight_chain_id(&resolved.rpc_url, resolved.chain_id).await?;
+    if !args.chain.common.dry_run {
         // The keystore is decrypted only when actually submitting — a dry run
         // needs no secrets.
-        let signer = chain_ctx::load_signer_with_password_file(
-            args.chain.keystore_password_file.as_deref(),
-            &resolved.keystore,
-        )
-        .await?;
-        let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+        let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = PublisherRegistry::new(registry, &provider);
         let pending =
@@ -216,7 +257,7 @@ async fn namespace_create(
     }
 
     let mut out = io::stdout().lock();
-    write_namespace_outcome(&mut out, &outcome, args.chain.json)
+    write_namespace_outcome(&mut out, &outcome, args.chain.common.json)
         .context("failed to write namespace-create output")?;
     Ok(())
 }
@@ -273,14 +314,8 @@ async fn claim(args: &cli::ClaimArgs, global_config: Option<&Path>) -> anyhow::R
         tx: None,
     };
 
-    if !args.chain.dry_run {
-        preflight_chain_id(&resolved.rpc_url, resolved.chain_id).await?;
-        let signer = chain_ctx::load_signer_with_password_file(
-            args.chain.keystore_password_file.as_deref(),
-            &resolved.keystore,
-        )
-        .await?;
-        let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+    if !args.chain.common.dry_run {
+        let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = PublisherRegistry::new(registry, &provider);
         let pending = contract
@@ -306,7 +341,7 @@ async fn claim(args: &cli::ClaimArgs, global_config: Option<&Path>) -> anyhow::R
     }
 
     let mut out = io::stdout().lock();
-    write_claim_outcome(&mut out, &outcome, args.chain.json)
+    write_claim_outcome(&mut out, &outcome, args.chain.common.json)
         .context("failed to write claim output")?;
     Ok(())
 }
@@ -371,21 +406,7 @@ pub(crate) fn write_assign_outcome(
 }
 
 async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    let config_path = args.chain.config.as_deref().or(global_config);
-    let file = chain_ctx::load_optional_config(config_path)?;
-    let resolved = chain_ctx::resolve_publish(&args.chain, &file)?;
-    let oa_addr = chain_ctx::parse_address(
-        resolved
-            .origin_assignment_address
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "origin_assignment_address not set (pass --origin-assignment-address \
-                     or set blockchain.origin_assignment_address)"
-                )
-            })?,
-        "origin_assignment_address",
-    )?;
+    let (resolved, oa_addr) = assignment_ctx(&args.chain, global_config)?;
     let operators = args
         .operators
         .iter()
@@ -405,14 +426,8 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         replaced_prior: false,
     };
 
-    if !args.chain.dry_run {
-        preflight_chain_id(&resolved.rpc_url, resolved.chain_id).await?;
-        let signer = chain_ctx::load_signer_with_password_file(
-            args.chain.keystore_password_file.as_deref(),
-            &resolved.keystore,
-        )
-        .await?;
-        let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
+    if !args.chain.common.dry_run {
+        let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = OriginAssignment::new(oa_addr, &provider);
         let pending = contract
@@ -480,7 +495,7 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
     }
 
     let mut out = io::stdout().lock();
-    write_assign_outcome(&mut out, &outcome, args.chain.json)
+    write_assign_outcome(&mut out, &outcome, args.chain.common.json)
         .context("failed to write assign output")?;
     Ok(())
 }

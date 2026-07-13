@@ -4,9 +4,9 @@
 //! (`claimContent`), and `assign` (`OriginAssignment.proposeAssignment`,
 //! propose-only; governance activates separately).
 
-use std::path::PathBuf;
-
 use clap::{Args, Subcommand};
+
+use super::common::CommonChainArgs;
 
 /// Parse a namespace id, rejecting the reserved `0`. Namespace ids start at 1
 /// (`PublisherRegistry` pre-increments from 0, and id 0 is the governance-only
@@ -99,21 +99,13 @@ pub struct AssignArgs {
 
 /// Chain coordinates shared by the publish subcommands. Mirrors `ChainArgs`
 /// but targets the publisher contracts (`PublisherRegistry`,
-/// `OriginAssignment`) instead of `CapacityBond`.
+/// `OriginAssignment`) instead of `CapacityBond`. The common coordinates live
+/// in [`CommonChainArgs`]; this struct adds the two publisher-contract address
+/// flags.
 #[derive(Args, Debug)]
 pub struct PublishChainArgs {
-    /// Path to the TOML config supplying `[blockchain]` / `[identity]` fields.
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-
-    /// JSON-RPC endpoint URL. Overrides `blockchain.rpc_url`.
-    #[arg(long, value_name = "URL")]
-    pub rpc_url: Option<String>,
-
-    /// Expected chain id of `--rpc-url`; the submit fails if the RPC reports a
-    /// different one. Overrides `blockchain.chain_id`; default Arbitrum Sepolia.
-    #[arg(long, value_name = "ID")]
-    pub chain_id: Option<u64>,
+    #[command(flatten)]
+    pub common: CommonChainArgs,
 
     /// `PublisherRegistry` address (namespace/claim). Overrides
     /// `blockchain.publisher_registry_address`.
@@ -124,28 +116,6 @@ pub struct PublishChainArgs {
     /// `blockchain.origin_assignment_address`.
     #[arg(long, value_name = "ADDR")]
     pub origin_assignment_address: Option<String>,
-
-    /// Ethereum keystore file. Overrides `blockchain.eth_keystore`;
-    /// defaults to `<data_dir>/keystore.json`.
-    #[arg(long, value_name = "PATH")]
-    pub keystore: Option<PathBuf>,
-
-    /// Data directory. Overrides `identity.data_dir`; defaults to `~/.decdn`.
-    #[arg(long, value_name = "PATH")]
-    pub data_dir: Option<PathBuf>,
-
-    /// File whose contents are the keystore password (after
-    /// `DECDN_KEYSTORE_PASSWORD`, before an interactive prompt).
-    #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
-    pub keystore_password_file: Option<PathBuf>,
-
-    /// Build and print what would be submitted without sending a transaction.
-    #[arg(long)]
-    pub dry_run: bool,
-
-    /// Emit the result as JSON instead of `key=value` lines.
-    #[arg(long)]
-    pub json: bool,
 }
 
 #[cfg(test)]

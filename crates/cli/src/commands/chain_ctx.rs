@@ -91,7 +91,7 @@ pub fn load_optional_config(config_path: Option<&Path>) -> anyhow::Result<FileCo
 /// chain. `expand_tilde` is applied to whichever explicit path wins (flag OR
 /// config); the `default_data_dir` fallback is already absolute.
 fn resolve_common(
-    chain: &cli::ChainArgs,
+    chain: &cli::CommonChainArgs,
     file: &FileConfig,
 ) -> anyhow::Result<(String, u64, PathBuf, PathBuf)> {
     let bc = file.blockchain.as_ref();
@@ -132,7 +132,7 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
     let bc = file.blockchain.as_ref();
     // `resolve_common` first so `rpc_url` is the first missing-field reported
     // (preserves the original error priority before the shared extraction).
-    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
+    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(&chain.common, file)?;
     let capacity_bond_address = chain
         .capacity_bond_address
         .clone()
@@ -193,7 +193,7 @@ pub fn resolve_appeal(
         "slash_appeal_address must not be the zero address — \
          set it to the deployed SlashAppeal contract (ADR 028)"
     );
-    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
+    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(&chain.common, file)?;
     Ok(ResolvedAppeal {
         rpc_url,
         chain_id,
@@ -221,7 +221,7 @@ pub async fn load_operator_signer(
     chain: &cli::ChainArgs,
     keystore: &Path,
 ) -> anyhow::Result<PrivateKeySigner> {
-    load_signer_with_password_file(chain.keystore_password_file.as_deref(), keystore).await
+    load_signer_with_password_file(chain.common.keystore_password_file.as_deref(), keystore).await
 }
 
 /// Load an Ethereum keystore signer, sourcing the password from the
@@ -266,17 +266,10 @@ pub fn resolve_publish(
     file: &FileConfig,
 ) -> anyhow::Result<ResolvedPublish> {
     let bc = file.blockchain.as_ref();
-    let rpc_url = args
-        .rpc_url
-        .clone()
-        .or_else(|| bc.and_then(|b| b.rpc_url.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("rpc_url not set (pass --rpc-url or set blockchain.rpc_url)")
-        })?;
-    let chain_id = args
-        .chain_id
-        .or_else(|| bc.and_then(|b| b.chain_id))
-        .unwrap_or(DEFAULT_CHAIN_ID);
+    // Shared with `resolve` / `resolve_appeal` so the rpc_url/chain_id/
+    // data_dir/keystore precedence can't drift between the `node` and
+    // `publish` commands. Only the two contract addresses are publish-specific.
+    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(&args.common, file)?;
     let publisher_registry_address = args
         .publisher_registry_address
         .clone()
@@ -285,23 +278,6 @@ pub fn resolve_publish(
         .origin_assignment_address
         .clone()
         .or_else(|| bc.and_then(|b| b.origin_assignment_address.clone()));
-    let data_dir = args
-        .data_dir
-        .clone()
-        .or_else(|| file.identity.as_ref().and_then(|i| i.data_dir.clone()))
-        .map(|p| expand_tilde(&p))
-        .or_else(cli::default_data_dir)
-        .ok_or_else(|| {
-            anyhow::anyhow!("data_dir not set and no default available (pass --data-dir)")
-        })?;
-    let keystore = args
-        .keystore
-        .clone()
-        .or_else(|| bc.and_then(|b| b.eth_keystore.clone()))
-        .map_or_else(
-            || eth_identity::keystore_path(&data_dir),
-            |p| expand_tilde(&p),
-        );
     Ok(ResolvedPublish {
         rpc_url,
         chain_id,
@@ -396,15 +372,17 @@ mod tests {
 
     fn empty_chain() -> cli::ChainArgs {
         cli::ChainArgs {
-            config: None,
-            rpc_url: None,
+            common: cli::CommonChainArgs {
+                config: None,
+                rpc_url: None,
+                chain_id: None,
+                keystore: None,
+                data_dir: Some(PathBuf::from("/tmp/decdn-test")),
+                keystore_password_file: None,
+                dry_run: true,
+                json: false,
+            },
             capacity_bond_address: None,
-            chain_id: None,
-            keystore: None,
-            data_dir: Some(PathBuf::from("/tmp/decdn-test")),
-            keystore_password_file: None,
-            dry_run: true,
-            json: false,
             swap_venue: None,
             swap_router_address: None,
             swap_quoter_address: None,
@@ -425,9 +403,9 @@ mod tests {
     #[test]
     fn flags_override_config() {
         let mut chain = empty_chain();
-        chain.rpc_url = Some("http://flag:8545".to_string());
+        chain.common.rpc_url = Some("http://flag:8545".to_string());
         chain.capacity_bond_address = Some("0xFLAG".to_string());
-        chain.chain_id = Some(99);
+        chain.common.chain_id = Some(99);
         let file = file_with(FileBlockchain {
             rpc_url: Some("http://config:8545".to_string()),
             chain_id: Some(1),
@@ -510,16 +488,18 @@ mod tests {
     #[test]
     fn resolve_publish_flag_beats_config() {
         let args = cli::PublishChainArgs {
-            config: None,
-            rpc_url: Some("http://flag:8545".to_string()),
-            chain_id: Some(42),
+            common: cli::CommonChainArgs {
+                config: None,
+                rpc_url: Some("http://flag:8545".to_string()),
+                chain_id: Some(42),
+                keystore: None,
+                data_dir: Some(PathBuf::from("/tmp/decdn-test")),
+                keystore_password_file: None,
+                dry_run: true,
+                json: false,
+            },
             publisher_registry_address: Some("0xFLAG".to_string()),
             origin_assignment_address: None,
-            keystore: None,
-            data_dir: Some(PathBuf::from("/tmp/decdn-test")),
-            keystore_password_file: None,
-            dry_run: true,
-            json: false,
         };
         let file = file_with(FileBlockchain {
             rpc_url: Some("http://config:8545".to_string()),
