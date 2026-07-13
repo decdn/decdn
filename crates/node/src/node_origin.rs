@@ -293,19 +293,36 @@ impl NodeOrigin {
         };
         // #1117: bind the request so the upstream can chain a reactive pull.
         let ctx = bind_upstream_ctx(deps, ctx)?;
-        match open_progressive_upstream(
-            &deps.endpoint,
-            EndpointAddr::new(pk),
-            &ctx,
-            &deps.slash_domain,
-            provider_addr,
-            hash_bytes,
-            0,
-            now_micros(),
-            deps.config.max_blob_size_bytes,
+        // Bound the open on the SAME per-candidate budget the buffered path gives
+        // each candidate (`stream_fetch_tracked`). Without it, a candidate that
+        // accepts the connection and then goes quiet blocks here indefinitely and
+        // consumes the caller's whole outer deadline — which is deliberately sized
+        // at `MAX_PROVIDER_ATTEMPTS × pull_timeout + slack` precisely so the loop
+        // below can still reach candidates #2..N (#859) — so the serve path would
+        // sign a `CacheMiss` for a blob an honest fallback holds. The typed
+        // `PullTimeout` flows into the `Err` arm's `classify_pull_failure`, which
+        // exonerates the peer (our deadline is not evidence it is bad, #857) and
+        // meters `node_pull_timeout`, exactly as on the buffered path.
+        match tokio::time::timeout(
+            deps.config.pull_timeout,
+            open_progressive_upstream(
+                &deps.endpoint,
+                EndpointAddr::new(pk),
+                &ctx,
+                &deps.slash_domain,
+                provider_addr,
+                hash_bytes,
+                0,
+                now_micros(),
+                deps.config.max_blob_size_bytes,
+            ),
         )
         .await
-        {
+        .unwrap_or_else(|_| {
+            Err(anyhow::Error::new(PullTimeout {
+                after: deps.config.pull_timeout,
+            }))
+        }) {
             Ok((header, pull)) => Some((
                 header,
                 NodeProgressivePull {

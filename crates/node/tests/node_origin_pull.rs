@@ -2280,6 +2280,192 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     Ok(())
 }
 
+/// The WINDOW-path counterpart of `node_origin_pull_falls_through_a_stalled_candidate`
+/// (#856). The buffered path bounds each candidate with `pull_timeout` inside
+/// `stream_fetch_tracked`; `open_progressive_pull` must do the same, or the first
+/// candidate to accept the connection and go quiet consumes the caller's ENTIRE
+/// budget and candidates #2..N are never opened — the serve path then signs a
+/// `CacheMiss` for a blob the honest fallback holds.
+///
+/// The 10s wrapper stands in for the serve path's outer deadline
+/// (`selection::outer_pull_deadline`, sized to fit all `MAX_PROVIDER_ATTEMPTS`
+/// per-candidate budgets). With no per-candidate bound the staller eats it whole
+/// and this elapses; with one, S is abandoned at its 1s budget and A opens.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)]
+async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<()> {
+    let payload = vec![0xCDu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Honest node A: holds the blob; serves probe + client at `RATE`. ------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xA3);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Stalling node S: quotes a CHEAPER rate so it ranks first, then accepts
+    //     the client stream and never answers. ---------------------------------
+    let s_sk = fresh_key();
+    let s_id = s_sk.public();
+    let s_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s, addr_s) =
+        local_endpoint(s_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_s = spawn_a_stalling_server(
+        ep_s.clone(),
+        Arc::clone(&s_eth),
+        slash_domain(),
+        total_bytes,
+        STALL_RATE,
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    for (id, addr) in [(a_id, addr_a), (s_id, addr_s)] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(id).with_ip_addr(addr),
+            *hash.as_bytes(),
+            1,
+            false,
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+
+    let s_dht = DhtNodeId::from_bytes(*s_id.as_bytes());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let mut addr_map = HashMap::new();
+    addr_map.insert(s_dht, s_eth.address());
+    addr_map.insert(a_dht, a_eth.address());
+
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+    }) as Arc<dyn ChannelOpener>;
+    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
+        HashMap::from([
+            (*s_id.as_bytes(), "XX".to_string()),
+            (*a_id.as_bytes(), "DE".to_string()),
+        ]),
+    ))));
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &region_accountant,
+        vec![s_dht, a_dht],
+        addr_map,
+        Duration::from_secs(1),
+        0,
+    );
+
+    // The open loop must abandon the staller on ITS budget and open against A.
+    let opened = tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "open_progressive_pull never returned: the stalled candidate consumed the whole \
+                 outer budget, so the honest fallback was never opened"
+            )
+        })?;
+    let (header, _pull) = opened
+        .ok_or_else(|| anyhow::anyhow!("expected an open against the honest fallback candidate"))?;
+    // A quotes `RATE`; the staller quotes the cheaper `STALL_RATE` (which is why it
+    // ranks first). The rate on the verified header therefore proves WHICH provider
+    // we opened against.
+    anyhow::ensure!(
+        header.rate_per_mb == RATE,
+        "expected the open against the honest fallback A (rate {RATE}), got rate {}",
+        header.rate_per_mb
+    );
+    anyhow::ensure!(
+        header.total_bytes == total_bytes,
+        "unexpected total_bytes {}",
+        header.total_bytes
+    );
+
+    // The staller hit OUR per-candidate deadline — a buyer-side budget, not evidence
+    // the provider is bad — so it is exonerated: no local EWMA hit, nothing gossiped
+    // (#857). Identical to the buffered path's contract.
+    let drained = obs_buffer.drain();
+    anyhow::ensure!(
+        !drained.iter().any(|(p, _)| *p == s_id),
+        "the timed-out staller must NOT be gossiped about (#857)"
+    );
+    anyhow::ensure!(
+        (local_rep.score(s_id) - 0.5).abs() < f64::EPSILON,
+        "the timed-out staller's local score must stay neutral, got {}",
+        local_rep.score(s_id)
+    );
+    assert_counter(&b_metrics, "node_pull_timeout_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    ep_s.close().await;
+    task_a.await?;
+    task_s.await?;
+    Ok(())
+}
+
 /// A miss with no discoverable provider degrades to a clean `NotFound`, records
 /// no reputation, and bumps the no-providers counter.
 #[tokio::test(flavor = "multi_thread")]

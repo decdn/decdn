@@ -3221,9 +3221,13 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     .await
     {
         Ok(_) => anyhow::bail!("a blob absent from the local origin must be refused"),
+        // A GENUINE absence must still sign `NotFound` — the #1129 counterpart of
+        // the hard-fault tests below. Pinned to the wire error (not just "refused")
+        // so a future change that over-eagerly promotes clean misses to
+        // `InternalError` fails here.
         Err(e) => anyhow::ensure!(
-            e.to_string().contains("delivery refused"),
-            "expected a delivery-refused error, got: {e}"
+            e.to_string().contains("delivery refused") && e.to_string().contains("NotFound"),
+            "expected a signed NotFound for a genuine absence, got: {e}"
         ),
     }
     // The local origin WAS consulted on the miss (proving the local-first path
@@ -3233,6 +3237,194 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
         cache_metrics.origin_fetches.get() == 1,
         "local origin should be consulted once on the miss, got {}",
         cache_metrics.origin_fetches.get()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// An origin that always fails with a TRANSIENT backend error — the shape of an
+/// S3 5xx that survives retry exhaustion, an open circuit breaker, or an fs I/O
+/// fault. The engine surfaces this as `CacheError::OriginError`, which is NOT an
+/// absence: the blob may well exist and be servable once the origin recovers
+/// (#1129). Distinct from [`CountingOrigin`], which reports a clean `NotFound`.
+#[derive(Debug)]
+struct FailingOrigin {
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl decdn_cache::Origin for FailingOrigin {
+    fn fetch(
+        &self,
+        _hash: decdn_cache::Hash,
+        _max_bytes: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<decdn_cache::origin::OriginFetch, decdn_cache::OriginPullError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            Err(decdn_cache::OriginPullError::Transient(anyhow::anyhow!(
+                "synthetic origin outage (HTTP 503)"
+            )))
+        })
+    }
+
+    fn kind(&self) -> decdn_cache::OriginKind {
+        decdn_cache::OriginKind::Http
+    }
+}
+
+/// A cache whose sole configured origin is a [`FailingOrigin`] — the operator's
+/// own backend is down. The local store starts empty, so a serve request is a
+/// miss whose reactive local populate hits a hard fault.
+async fn empty_cache_with_failing_origin(
+    payload: &[u8],
+) -> anyhow::Result<(
+    CacheEngine,
+    decdn_cache::Hash,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tempfile::TempDir,
+)> {
+    let hash = decdn_cache::Hash::new(payload);
+    let cache_dir = tempfile::tempdir()?;
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let origin = Arc::new(FailingOrigin {
+        hits: Arc::clone(&hits),
+    });
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::new(CacheMetrics::default())),
+        Duration::ZERO,
+    )
+    .await?;
+    anyhow::ensure!(!cache.has(hash).await?, "cache store must start empty");
+    Ok((cache, hash, hits, cache_dir))
+}
+
+/// #1129: a cache-only operator (node→node OFF) whose OWN origin hard-faults must
+/// refuse with a retryable `InternalError` — NOT a signed `NotFound`.
+///
+/// The refusal is EIP-712 signed, so `NotFound` is an authoritative, attributable
+/// claim that the blob does not exist. Signing it during a transient S3 outage
+/// tells paying clients to stop asking for a blob the node will serve fine once
+/// the origin recovers. The blob's absence from the store is indistinguishable
+/// from a clean miss without the engine's error classification — which is exactly
+/// what the bare-`bool` fill helpers used to discard.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> anyhow::Result<()> {
+    let payload = vec![0x7Eu8; 64 * 1024];
+    let (cache, hash, origin_hits, _cache_tmp) = empty_cache_with_failing_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_local_populate_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx = channel_context(Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    match stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("a hard origin fault must not deliver"),
+        Err(e) => {
+            let msg = e.to_string();
+            anyhow::ensure!(
+                msg.contains("InternalError"),
+                "a hard origin fault must surface as a retryable InternalError, got: {e}"
+            );
+            anyhow::ensure!(
+                !msg.contains("NotFound"),
+                "a hard origin fault must NOT sign an authoritative NotFound, got: {e}"
+            );
+        }
+    }
+    anyhow::ensure!(
+        origin_hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the failing origin should have been consulted (proving the fault came from \
+         the reactive fill, not a short-circuit before it)"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1129, the arm most likely to regress: with node→node ON, a hard fault on the
+/// LOCAL tier must survive the fall-through to the node→node window tier.
+///
+/// Falling through after a local fault is correct — a peer may legitimately still
+/// serve. But the window origin here is unprovisioned (a dead peer path), so it
+/// cleanly misses; the terminal refusal must still be `InternalError`, because a
+/// later clean miss must not launder the earlier fault back into a signed
+/// `NotFound`. This is what `fault_seen` threading exists to prevent.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::Result<()> {
+    let payload = vec![0x3Du8; 64 * 1024];
+    let (cache, hash, origin_hits, _cache_tmp) = empty_cache_with_failing_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_local_and_window_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx = channel_context(Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    match stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("a hard origin fault must not deliver"),
+        Err(e) => {
+            let msg = e.to_string();
+            anyhow::ensure!(
+                msg.contains("InternalError"),
+                "a local hard fault must still surface as InternalError after the \
+                 node→node tier cleanly misses, got: {e}"
+            );
+            anyhow::ensure!(
+                !msg.contains("NotFound"),
+                "the window tier's clean miss must not overwrite the local fault with \
+                 a signed NotFound, got: {e}"
+            );
+        }
+    }
+    anyhow::ensure!(
+        origin_hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the failing local origin should have been consulted before the window tier"
     );
 
     client_ep.close().await;

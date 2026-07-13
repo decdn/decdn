@@ -110,6 +110,30 @@ since project inception and will roll into the first tagged release.
   operator scripts that match a `\.\d{3}` regex must update to
   `\.\d+`.
 
+### Fixed
+
+#### Node serve path
+
+- **A backend fault no longer signs an authoritative `NotFound` (#1129).** On a
+  `cdn/client/v1` cache miss, a hard origin/store fault during a reactive
+  pull-through fill (an S3 5xx surviving retry exhaustion, an open circuit
+  breaker, an fs I/O error) was indistinguishable from a clean miss and
+  terminated as a signed `CacheMiss` — a positive, attributable claim that the
+  blob does not exist, sent to a paying client for content the node serves fine
+  once the origin recovers. Such faults now terminate as a retryable
+  `InternalError`. A genuine absence still signs `NotFound`, and a fault on one
+  tier is remembered across a legitimate fall-through to a later tier. No wire
+  change: `StreamError::InternalError` already existed; this is a
+  reclassification within the existing surface.
+- **A wedged upstream candidate no longer starves the fallback loop.** The
+  window-paced node→node pull (`open_progressive_pull`) applied no per-candidate
+  timeout, so a provider that accepted the connection and then went quiet
+  consumed the entire outer deadline — which is deliberately sized to fit all
+  `MAX_PROVIDER_ATTEMPTS` per-candidate budgets precisely so candidates #2..N
+  stay reachable (#859) — and the serve path then refused a blob the honest
+  fallback held. Each candidate is now bounded by `pull_timeout`, as on the
+  buffered path; a timed-out candidate is skipped and, per #857, not blamed.
+
 ### Changed
 
 #### Gossip
