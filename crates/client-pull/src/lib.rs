@@ -775,13 +775,15 @@ async fn receive_and_pay(
     loop {
         match read_client_message(recv).await? {
             ClientMessage::ChunkData(chunk) => {
-                // A chunk must not exceed the protocol ceiling, and the running
-                // total must not exceed what the response promised — otherwise a
+                // A chunk must carry 1..=CHUNK_SIZE bytes, and the running total
+                // must not exceed what the response promised — otherwise a
                 // malicious server could stream unbounded bytes (OOM) and we
-                // would overpay (ADR 005 §`cdn/client/v1`).
-                if chunk.bytes.len() > decdn_protocol::CHUNK_SIZE {
-                    anyhow::bail!("chunk of {} bytes exceeds CHUNK_SIZE", chunk.bytes.len());
-                }
+                // would overpay (ADR 005 §`cdn/client/v1`). The non-empty floor
+                // (#1088) is what makes every frame a unit of progress: an empty
+                // one advances neither `cumulative` nor `bytes_since_voucher`, so
+                // a run of them would spin this loop below the overrun guard (and
+                // below the inactivity deadline, which resets only on bytes).
+                chunk.validate()?;
                 cumulative = cumulative.saturating_add(chunk.bytes.len() as u64);
                 if cumulative > expected_wire_bytes {
                     anyhow::bail!(
@@ -1164,9 +1166,12 @@ impl UpstreamPull {
         }
         match read_client_message(&mut self.recv).await? {
             ClientMessage::ChunkData(chunk) => {
-                if chunk.bytes.len() > decdn_protocol::CHUNK_SIZE {
-                    anyhow::bail!("chunk of {} bytes exceeds CHUNK_SIZE", chunk.bytes.len());
-                }
+                // Bounds the payload on BOTH sides: the ceiling caps per-frame
+                // allocation, and the non-empty floor keeps every frame a unit of
+                // progress, so a peer cannot spin this loop (or refresh its
+                // inactivity deadline) with an unbounded run of empty frames
+                // (#1088).
+                chunk.validate()?;
                 self.cumulative = self.cumulative.saturating_add(chunk.bytes.len() as u64);
                 if self.cumulative > self.expected_wire_bytes {
                     anyhow::bail!(

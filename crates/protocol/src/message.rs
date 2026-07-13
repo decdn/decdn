@@ -145,6 +145,21 @@ pub enum MessageValidationError {
     /// [`crate::client::StreamResponse::validate`].
     #[error("StreamResponse.error carries VoucherRejected (a mid-stream-only code)")]
     VoucherRejectedInResponse,
+    /// A [`crate::client::ChunkData`] carries a zero-length payload. ADR 005
+    /// §Partial final chunk permits a *smaller* final frame, never an *empty*
+    /// one: an empty frame advances neither the receiver's cumulative byte count
+    /// nor its voucher accounting, so an unbounded run of them drives the receive
+    /// loop without application-level progress (#1088). Enforced via
+    /// [`crate::client::ChunkData::validate`].
+    #[error(
+        "ChunkData carries a zero-length payload (ADR 005: a chunk must carry at least 1 byte)"
+    )]
+    EmptyChunk,
+    /// A [`crate::client::ChunkData`] payload exceeds [`crate::CHUNK_SIZE`].
+    /// The ceiling bounds receiver allocation per frame (ADR 005
+    /// §`cdn/client/v1`). Enforced via [`crate::client::ChunkData::validate`].
+    #[error("ChunkData payload of {len} bytes exceeds CHUNK_SIZE ({max})", max = crate::CHUNK_SIZE)]
+    ChunkTooLarge { len: usize },
 }
 
 /// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per

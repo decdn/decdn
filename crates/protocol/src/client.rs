@@ -433,13 +433,50 @@ impl StreamResponse {
     }
 }
 
-/// Node → payer chunk of blob bytes. Payload is at most [`CHUNK_SIZE`] bytes;
-/// the final chunk before [`ClientMessage::StreamEnd`] MAY be smaller and
-/// receivers MUST accept it (ADR 005 §Partial final chunk).
+/// Node → payer chunk of blob bytes. Payload is at least 1 and at most
+/// [`CHUNK_SIZE`] bytes; the final chunk before [`ClientMessage::StreamEnd`] MAY
+/// be smaller and receivers MUST accept it (ADR 005 §Partial final chunk).
+///
+/// The lower bound is load-bearing, not cosmetic (#1088). "Partial final chunk"
+/// permits a *smaller* frame, never an *empty* one: an empty frame carries no
+/// payload, so it advances neither the receiver's cumulative byte count nor its
+/// voucher accounting. An unbounded run of them therefore drives the receive
+/// loops without making application-level progress, and the `cumulative >
+/// expected_wire` overrun guard — which only ever trips on bytes — never fires.
+/// Receivers reject an empty frame outright ([`ChunkData::validate`]); it is the
+/// invariant the pull paths' inactivity deadline rests on, since with empty
+/// frames banned "a frame arrived" and "bytes made progress" are the same
+/// statement, so a peer cannot refresh the deadline with padding.
+///
+/// Emitting one is impossible by construction on the serve side: the whole-blob
+/// payload is chunked with `slice::chunks`, which yields no items for an empty
+/// slice, so even the empty blob (whose bao encoding is zero bytes — see
+/// `decdn_bao_range::align_range`) goes straight to [`ClientMessage::StreamEnd`]
+/// rather than sending an empty frame first (#1054).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkData {
-    /// Sequential blob bytes (≤ [`CHUNK_SIZE`]).
+    /// Sequential blob bytes (1..=[`CHUNK_SIZE`]).
     pub bytes: Vec<u8>,
+}
+
+impl ChunkData {
+    /// Enforce the payload bounds: non-empty and within [`CHUNK_SIZE`].
+    ///
+    /// # Errors
+    ///
+    /// [`MessageValidationError::EmptyChunk`] for a zero-length payload;
+    /// [`MessageValidationError::ChunkTooLarge`] above the ceiling.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.bytes.is_empty() {
+            return Err(MessageValidationError::EmptyChunk);
+        }
+        if self.bytes.len() > CHUNK_SIZE {
+            return Err(MessageValidationError::ChunkTooLarge {
+                len: self.bytes.len(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Payer → node cumulative payment voucher (ADR 005 §Voucher wire format).
@@ -1095,16 +1132,45 @@ mod tests {
     }
 
     #[test]
-    fn chunk_data_empty_roundtrip() -> Result<(), postcard::Error> {
-        // A zero-length final chunk is a real on-wire case (ADR 005 §Partial
-        // final chunk); postcard's length-prefix-0 path differs from the
-        // CHUNK_SIZE case already covered.
+    fn chunk_data_empty_decodes_but_does_not_validate() -> Result<(), postcard::Error> {
+        // An empty chunk is NOT a legal on-wire frame (#1088) — but rejecting it
+        // is a receiver-loop obligation, not a decode-time one, matching the
+        // convention the rest of this module follows (see `MessageValidationError`'s
+        // doc: validation is deliberately separate from decode so a handler can
+        // build a message before signing it). So the codec must still round-trip
+        // postcard's length-prefix-0 path without choking, and `validate` is what
+        // refuses the frame.
         let chunk = ChunkData { bytes: Vec::new() };
         let bytes = postcard::to_allocvec(&chunk)?;
         let decoded: ChunkData = postcard::from_bytes(&bytes)?;
         assert_eq!(chunk, decoded);
         assert!(decoded.bytes.is_empty());
+        assert_eq!(decoded.validate(), Err(MessageValidationError::EmptyChunk));
         Ok(())
+    }
+
+    #[test]
+    fn chunk_data_validate_bounds_both_sides() {
+        // The floor is what makes every frame a unit of progress (#1088); the
+        // ceiling bounds per-frame allocation. A 1-byte and a full-size chunk are
+        // both legal — "partial final chunk" means smaller, not empty.
+        assert_eq!(ChunkData { bytes: vec![0u8] }.validate(), Ok(()));
+        assert_eq!(
+            ChunkData {
+                bytes: vec![0u8; CHUNK_SIZE],
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            ChunkData {
+                bytes: vec![0u8; CHUNK_SIZE + 1],
+            }
+            .validate(),
+            Err(MessageValidationError::ChunkTooLarge {
+                len: CHUNK_SIZE + 1
+            })
+        );
     }
 
     #[test]
