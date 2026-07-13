@@ -2280,6 +2280,245 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     Ok(())
 }
 
+/// The WINDOW-path counterpart of `node_origin_pull_falls_through_a_stalled_candidate`
+/// (#856, #1141). The buffered path bounds each candidate with `pull_timeout` inside
+/// `stream_fetch_tracked`; `open_progressive_pull` must do the same, or the first
+/// candidate to accept the connection and go quiet consumes the caller's ENTIRE
+/// budget and candidates #2..N are never opened — the serve path then refuses a
+/// blob the honest fallback holds.
+///
+/// TWO stallers, not one, and that is the point: with a single staller a
+/// regression that applied the budget to the whole LOOP rather than per-candidate
+/// still passes (one 3s stall fits under any plausible outer bound). Two stalls
+/// only fit if the budget is genuinely per-candidate — which is exactly the
+/// property #859 sized the outer deadline around and #1141 broke on this path.
+///
+/// The 12s wrapper stands in for the serve path's outer deadline (the real
+/// `selection::outer_pull_deadline` for a 3s per-candidate budget is 3×3s + 10s
+/// slack = 19s; 12s is a tighter stand-in that still admits two 3s stalls plus a
+/// healthy open). With no per-candidate bound, staller #1 eats the whole wrapper
+/// and this elapses.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)]
+async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<()> {
+    let payload = vec![0xCDu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Honest node A: holds the blob; serves probe + client at `RATE`. ------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xA3);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Stalling nodes S1, S2: both quote the CHEAPER rate so they rank ahead of
+    //     A, then accept the client stream and never answer. Two of them, so the
+    //     budget must be per-candidate to reach A at all. ----------------------
+    let s1_sk = fresh_key();
+    let s1_id = s1_sk.public();
+    let s1_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s1, addr_s1) =
+        local_endpoint(s1_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_s1 = spawn_a_stalling_server(
+        ep_s1.clone(),
+        Arc::clone(&s1_eth),
+        slash_domain(),
+        total_bytes,
+        STALL_RATE,
+    );
+
+    let s2_sk = fresh_key();
+    let s2_id = s2_sk.public();
+    let s2_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s2, addr_s2) =
+        local_endpoint(s2_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_s2 = spawn_a_stalling_server(
+        ep_s2.clone(),
+        Arc::clone(&s2_eth),
+        slash_domain(),
+        total_bytes,
+        STALL_RATE,
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    for (id, addr) in [(a_id, addr_a), (s1_id, addr_s1), (s2_id, addr_s2)] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(id).with_ip_addr(addr),
+            *hash.as_bytes(),
+            1,
+            false,
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+
+    let s1_dht = DhtNodeId::from_bytes(*s1_id.as_bytes());
+    let s2_dht = DhtNodeId::from_bytes(*s2_id.as_bytes());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let mut addr_map = HashMap::new();
+    addr_map.insert(s1_dht, s1_eth.address());
+    addr_map.insert(s2_dht, s2_eth.address());
+    addr_map.insert(a_dht, a_eth.address());
+
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+    }) as Arc<dyn ChannelOpener>;
+    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
+        HashMap::from([
+            (*s1_id.as_bytes(), "XX".to_string()),
+            (*s2_id.as_bytes(), "XX".to_string()),
+            (*a_id.as_bytes(), "DE".to_string()),
+        ]),
+    ))));
+    // 3s per candidate. Deliberately not 1s: this budget now bounds EVERY candidate
+    // open, including the honest one, and A's open is a real QUIC handshake +
+    // `open_or_reuse_channel` + verified-header exchange. At 1s a loaded CI runner
+    // could abandon A too and fail the test for an unrelated reason.
+    let per_candidate = Duration::from_secs(3);
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &region_accountant,
+        vec![s1_dht, s2_dht, a_dht],
+        addr_map,
+        per_candidate,
+        0,
+    );
+
+    // The open loop must abandon BOTH stallers on their own budgets and open A.
+    let opened = tokio::time::timeout(Duration::from_secs(12), origin.open_progressive_pull(hash))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "open_progressive_pull never returned: a stalled candidate consumed the whole \
+                 outer budget, so the honest fallback was never opened"
+            )
+        })?;
+    let (header, _pull) = opened
+        .ok_or_else(|| anyhow::anyhow!("expected an open against the honest fallback candidate"))?;
+    // A quotes `RATE`; the stallers quote the cheaper `STALL_RATE` (which is why they
+    // rank ahead of it). The rate on the verified header therefore proves WHICH
+    // provider we opened against.
+    anyhow::ensure!(
+        header.rate_per_mb == RATE,
+        "expected the open against the honest fallback A (rate {RATE}), got rate {}",
+        header.rate_per_mb
+    );
+    anyhow::ensure!(
+        header.total_bytes == total_bytes,
+        "unexpected total_bytes {}",
+        header.total_bytes
+    );
+
+    // Each staller hit OUR per-candidate deadline — a buyer-side budget, not evidence
+    // the provider is bad — so both are exonerated: no local EWMA hit, nothing
+    // gossiped (#857). Identical to the buffered path's contract.
+    let drained = obs_buffer.drain();
+    for (label, s_id) in [("S1", s1_id), ("S2", s2_id)] {
+        anyhow::ensure!(
+            !drained.iter().any(|(p, _)| *p == s_id),
+            "the timed-out staller {label} must NOT be gossiped about (#857)"
+        );
+        anyhow::ensure!(
+            (local_rep.score(s_id) - 0.5).abs() < f64::EPSILON,
+            "the timed-out staller {label}'s local score must stay neutral, got {}",
+            local_rep.score(s_id)
+        );
+    }
+    // TWO timeouts — the load-bearing assertion. A budget applied to the whole loop
+    // instead of per-candidate would abandon after the first and never reach A.
+    assert_counter(&b_metrics, "node_pull_timeout_total", 2)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
+
+    // The abandoned opens forfeited nothing: no voucher was signed for either staller
+    // (the open dies before the first chunk), and no bytes were attributed to their
+    // region. Guards the resource half of #1141 — a per-candidate timeout that leaked
+    // spend on every stall would be a poor trade.
+    let ledger_len = {
+        let ledger = recorded.lock().expect("progress ledger not poisoned");
+        ledger.len()
+    };
+    anyhow::ensure!(
+        ledger_len == 0,
+        "a stalled open must record no voucher progress, got {ledger_len} entries"
+    );
+    anyhow::ensure!(
+        region_accountant.snapshot().is_empty(),
+        "nothing was delivered, so no region should have bytes_in; got {:?}",
+        region_accountant.snapshot()
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    ep_s1.close().await;
+    ep_s2.close().await;
+    task_a.await?;
+    task_s1.await?;
+    task_s2.await?;
+    Ok(())
+}
+
 /// A miss with no discoverable provider degrades to a clean `NotFound`, records
 /// no reputation, and bumps the no-providers counter.
 #[tokio::test(flavor = "multi_thread")]

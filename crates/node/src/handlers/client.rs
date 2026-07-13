@@ -234,6 +234,90 @@ impl ServeRejectReason {
     }
 }
 
+/// The result of a reactive cache-miss fill attempt (#1129).
+///
+/// Separates a genuine absence from a transient backend fault, which a bare
+/// `bool` cannot. The cache engine already draws this distinction (it
+/// deliberately prefers `OriginError` over `NotFound` when an origin faulted);
+/// the handler used to throw it away, collapsing both to "not filled" and
+/// refusing with `CacheMiss` — wire [`StreamError::NotFound`] — even when the
+/// real cause was the operator's own S3/fs origin being down.
+///
+/// Why the reason code matters, stated precisely (the wire codes' own docs in
+/// `decdn_protocol::client` are the authority here):
+///
+/// - `NotFound` = "node lacks the blob and cannot reach a provider, or declines
+///   to pull through". It is NODE-scoped, not blob-scoped, and it is the code a
+///   healthy-but-empty node returns.
+/// - `InternalError` = "unexpected failure; do not retry THIS node" — i.e. go
+///   elsewhere, this node is broken.
+///
+/// Both steer a client to another node, so this is not the difference between
+/// "retry" and "give up". What it buys is (a) an honest signal that the node is
+/// degraded rather than merely empty, and (b) the per-reason reject metric — the
+/// ONLY server-side place the true cause is observable, since seven distinct
+/// reject reasons collapse to the single `NotFound` wire code
+/// ([`ServeRejectReason::wire_error`]). An operator whose origin is 5xx-ing must
+/// not see that reported as a cache miss.
+///
+/// Note the reason code is NOT covered by the response's EIP-712 `slash_sig`,
+/// which signs only [`StreamResponseBody`] (`ok: false`); `StreamResponse::error`
+/// is explicitly "unsigned and informational". So a misclassification is a
+/// correctness and observability bug, not a false attestation.
+///
+/// A deadline expiry is deliberately NOT a `HardFault` — see
+/// [`ClientHandler::on_pull_through_timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FillOutcome {
+    /// The blob is now present locally; fall through to the size gate + delivery.
+    Filled,
+    /// The tier produced no blob and no evidence of a fault. Covers BOTH a genuine
+    /// clean miss (a source was asked and did not have it) and a tier that was
+    /// never attempted at all (pull-through unconfigured, or the request not
+    /// authorized to make this node spend). The two are deliberately one variant:
+    /// neither is evidence of a fault, so both leave the terminal classification to
+    /// whatever the other tiers found. Terminal (when no tier fills and none
+    /// faulted): `NotFound`.
+    CleanMiss,
+    /// A TRANSIENT backend/store fault — the node is degraded, not empty.
+    /// Terminal: `InternalError` ("do not retry this node"), so a client routes
+    /// around a node whose origin is down and the operator's reject metric names
+    /// the real cause.
+    ///
+    /// Deliberately narrow: ONLY `CacheError::OriginError` and `CacheError::Store`
+    /// qualify. A `BlobTooLarge` / `HashMismatch` / `VerifyFailed` is deterministic
+    /// and will recur on every request for that hash — reporting those as "this
+    /// node is broken" would steer clients off a perfectly healthy node forever
+    /// over one oversized blob.
+    HardFault,
+}
+
+impl FillOutcome {
+    /// The reject reason a *terminal* miss carries, given whether any tier
+    /// attempted for this request hit a hard fault. Falling THROUGH to a further
+    /// tier after a fault is legitimate (a different source may still serve) — so
+    /// a fault seen on an earlier tier must be remembered here rather than
+    /// overwritten by a later clean miss, which would report a degraded node as a
+    /// merely-empty one.
+    const fn miss_reason(fault_seen: bool) -> ServeRejectReason {
+        if fault_seen {
+            ServeRejectReason::InternalError
+        } else {
+            ServeRejectReason::CacheMiss
+        }
+    }
+
+    /// Whether this outcome is a hard backend fault.
+    const fn is_fault(self) -> bool {
+        matches!(self, Self::HardFault)
+    }
+
+    /// Whether the blob is now present locally.
+    const fn is_filled(self) -> bool {
+        matches!(self, Self::Filled)
+    }
+}
+
 /// `cdn/client/v1` paid-delivery handler.
 pub struct ClientHandler {
     node_id: PublicKey,
@@ -607,24 +691,38 @@ impl ClientHandler {
     /// bounded by `timeout` so a slow upstream can't pin the delivery path. The
     /// subsequent normal delivery streams the populated bytes from the store and
     /// accounts the served-bytes metrics there. Returns whether the blob is now
-    /// present locally.
-    async fn try_pull_through(&self, hash: Hash, timeout: Duration) -> bool {
+    /// present locally, and — when it is not — whether the cause was a clean miss
+    /// or a hard fault (#1129).
+    async fn try_pull_through(&self, hash: Hash, timeout: Duration) -> FillOutcome {
         match tokio::time::timeout(timeout, self.cache.populate(hash)).await {
-            Ok(Ok(())) => true,
+            Ok(Ok(())) => FillOutcome::Filled,
             // A clean miss — no origin/provider had it — is the normal
             // unfillable case (`NotFound`/`NoOrigin`); log at debug and move on.
             Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
                 tracing::debug!(%hash, error = %e, "node-to-node pull-through found no source");
-                false
+                FillOutcome::CleanMiss
             }
-            // Any other engine error is a real store/pull fault, NOT a clean
-            // miss. Surface it (matching the `has`-lookup `warn!` on this path)
-            // and meter it so the fault isn't silent — the client still gets a
-            // `NotFound`, but the operator can see it happened.
+            // A TRANSIENT backend fault — the node is degraded, not empty. Report
+            // it as a fault so the caller can refuse `InternalError` if no further
+            // tier fills (#1129), rather than reporting a broken origin as a miss.
+            Ok(Err(e @ (CacheError::OriginError { .. } | CacheError::Store(_)))) => {
+                self.metrics.node_pull_through_error();
+                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a transient backend fault");
+                FillOutcome::HardFault
+            }
+            // Everything else (`BlobTooLarge`, `HashMismatch`, `VerifyFailed`,
+            // `EvictionLimitExceeded`) is DETERMINISTIC: it will recur on every
+            // request for this hash, so it is not evidence the node is degraded.
+            // Reporting it as `InternalError` ("do not retry this node") would
+            // steer clients off a healthy node permanently over one bad blob — and
+            // for `BlobTooLarge` it would also contradict the size gate, which
+            // refuses the very same condition with the dedicated `BlobTooLarge`
+            // code when the blob happens to be in the store. Meter it (the operator
+            // still needs to see it) but let it fall through as a plain miss.
             Ok(Err(e)) => {
                 self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a cache-engine error");
-                false
+                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a permanent cache-engine error");
+                FillOutcome::CleanMiss
             }
             Err(_) => self.on_pull_through_timeout(hash, timeout).await,
         }
@@ -633,23 +731,35 @@ impl ClientHandler {
     /// Attempt to fill a cache miss from the node's OWN configured origins only
     /// (#1116), via [`CacheEngine::populate_local`] — which skips the paid `Peer`
     /// node→node origin, so this fronts no upstream USDC. Bounded by `timeout`
-    /// like [`Self::try_pull_through`]. Returns whether the blob is now present
-    /// locally. A clean miss (`NotFound`/`NoOrigin` — the operator's origin lacks
-    /// it, or only a `Peer` origin is configured) is the normal unfillable case;
-    /// the caller then falls through to the node→node paths. Unlike
-    /// `try_pull_through`, a timeout does NOT spawn node→node background fill —
-    /// this path is local-only.
-    async fn try_local_populate(&self, hash: Hash, timeout: Duration) -> bool {
+    /// like [`Self::try_pull_through`]. A clean miss (`NotFound`/`NoOrigin` — the
+    /// operator's origin lacks it, or only a `Peer` origin is configured) is the
+    /// normal unfillable case; the caller then falls through to the node→node
+    /// paths. A [`FillOutcome::HardFault`] means the operator's OWN origin faulted
+    /// (an S3 5xx, an open breaker, an fs I/O error) — the caller may still try a
+    /// further tier, but must not let a later clean miss launder the fault into a
+    /// signed `NotFound` (#1129). Unlike `try_pull_through`, a timeout does NOT
+    /// spawn node→node background fill — this path is local-only.
+    async fn try_local_populate(&self, hash: Hash, timeout: Duration) -> FillOutcome {
         match tokio::time::timeout(timeout, self.cache.populate_local(hash)).await {
-            Ok(Ok(())) => true,
+            Ok(Ok(())) => FillOutcome::Filled,
             Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
                 tracing::debug!(%hash, error = %e, "reactive local-origin pull-through found no source");
-                false
+                FillOutcome::CleanMiss
             }
+            // Transient — the operator's own origin is down. See
+            // [`Self::try_pull_through`] for why the split is exactly these two
+            // variants and not a catch-all.
+            Ok(Err(e @ (CacheError::OriginError { .. } | CacheError::Store(_)))) => {
+                self.metrics.node_pull_through_error();
+                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a transient backend fault");
+                FillOutcome::HardFault
+            }
+            // Deterministic (`BlobTooLarge` / `HashMismatch` / `VerifyFailed`):
+            // recurs every request, so it is not evidence this node is degraded.
             Ok(Err(e)) => {
                 self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a cache-engine error");
-                false
+                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a permanent cache-engine error");
+                FillOutcome::CleanMiss
             }
             Err(_) => self.on_local_populate_timeout(hash, timeout).await,
         }
@@ -660,24 +770,27 @@ impl ClientHandler {
     /// deadline fired (so a node with node→node OFF doesn't report `CacheMiss` for
     /// a blob that is now present), otherwise meters the timeout and reports the
     /// miss. Unlike [`Self::on_pull_through_timeout`] it spawns NO background warm
-    /// — this path is local-only and must not kick off a node→node pull. Returns
-    /// whether the blob is now present.
-    async fn on_local_populate_timeout(&self, hash: Hash, timeout: Duration) -> bool {
+    /// — this path is local-only and must not kick off a node→node pull.
+    ///
+    /// A deadline expiry is a [`FillOutcome::CleanMiss`], not a fault — see
+    /// [`Self::on_pull_through_timeout`] for why.
+    async fn on_local_populate_timeout(&self, hash: Hash, timeout: Duration) -> FillOutcome {
         match self.cache.has(hash).await {
-            Ok(true) => return true,
+            Ok(true) => return FillOutcome::Filled,
             Ok(false) => {}
             Err(e) => {
                 // A store-lookup fault at the deadline is a store error, not a
                 // timeout: meter it as an error and return — do NOT also count a
-                // timeout or emit a misleading "timed out" line for it.
+                // timeout or emit a misleading "timed out" line for it. It is a
+                // genuine local store fault, so the node is degraded, not empty.
                 self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e, "reactive local-origin pull-through store lookup failed after deadline");
-                return false;
+                return FillOutcome::HardFault;
             }
         }
         self.metrics.node_pull_through_timeout();
         tracing::debug!(%hash, ?timeout, "reactive local-origin pull-through timed out");
-        false
+        FillOutcome::CleanMiss
     }
 
     /// Attempt to fill a bounded/offset cache-miss request by pulling only the
@@ -695,13 +808,24 @@ impl ClientHandler {
     /// ([`RangePullOutcome::Unsupported`]), degrades to `None`. Every failure
     /// mode here is best-effort: the caller falls back to a whole-blob pull,
     /// which is always correct.
-    async fn try_range_pull_through(&self, hash: Hash, req: &StreamRequest) -> Option<u64> {
+    ///
+    /// The second element is the tier's [`FillOutcome`] for the FAULT LATCH only
+    /// (#1129) — never `Filled`, since "did this tier fill?" is carried by the
+    /// `Option`. A `CacheError::Store` here is a real local fault and must latch:
+    /// degrading to the whole-blob path is right for SERVICE (that path may fill
+    /// from a different store route), but if nothing ends up filling, the refusal
+    /// must report a degraded node, not an empty one.
+    async fn try_range_pull_through(
+        &self,
+        hash: Hash,
+        req: &StreamRequest,
+    ) -> (Option<u64>, FillOutcome) {
         let blob_size = match self.cache.origin_size(hash).await {
             Ok(Some(size)) => size,
-            Ok(None) => return None,
+            Ok(None) => return (None, FillOutcome::CleanMiss),
             Err(e) => {
                 tracing::debug!(%hash, error = %e, "origin size probe failed; degrading to whole-blob pull");
-                return None;
+                return (None, FillOutcome::CleanMiss);
             }
         };
         match self
@@ -709,27 +833,30 @@ impl ClientHandler {
             .pull_through_range(hash, req.byte_offset, req.byte_len, blob_size)
             .await
         {
-            Ok(RangePullOutcome::Served) => Some(blob_size),
-            Ok(RangePullOutcome::Unsupported) => None,
+            Ok(RangePullOutcome::Served) => (Some(blob_size), FillOutcome::CleanMiss),
+            Ok(RangePullOutcome::Unsupported) => (None, FillOutcome::CleanMiss),
             // A local store fault (`pull_through_range` fail-fasts on
             // `CacheError::Store` — disk-full / IO / a fault in the partial
             // `import_bao_bytes` path — rather than masking it behind another
             // origin) is a genuine local problem. It still degrades to the
             // whole-blob path (so the client isn't denied service if that path
-            // can fill from a different store route), but log it at `warn`: a
-            // fault localized to the partial-import path would otherwise be
-            // silently masked by a succeeding whole-blob fallback, leaving the
-            // range optimization quietly disabled with no operator-visible signal.
+            // can fill from a different store route), but it is metered and
+            // LATCHED as a fault: a fault localized to the partial-import path
+            // would otherwise be silently masked by a whole-blob fallback that
+            // then cleanly misses, leaving the range optimization quietly disabled
+            // AND reporting a broken store as an empty cache.
             Err(e @ CacheError::Store(_)) => {
+                self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e, "range pull-through hit a local store fault; degrading to whole-blob pull");
-                None
+                (None, FillOutcome::HardFault)
             }
             // An out-of-bounds range or a logically-evicted hash surfaces as an
             // error; degrade to the whole-blob path (which re-applies the same
             // eviction guard and bound checks) rather than failing the stream.
+            // Deterministic, so not a fault (see [`FillOutcome::HardFault`]).
             Err(e) => {
                 tracing::debug!(%hash, error = %e, "range pull-through declined; degrading to whole-blob pull");
-                None
+                (None, FillOutcome::CleanMiss)
             }
         }
     }
@@ -741,7 +868,7 @@ impl ClientHandler {
     /// coalescing [`CacheEngine::populate`] (via [`Self::try_pull_through`]) waits
     /// on the same in-flight entry and re-checks presence; if no pull-through
     /// deadline is configured it degrades to a plain presence check.
-    async fn await_coalesced_fill(&self, hash: Hash) -> bool {
+    async fn await_coalesced_fill(&self, hash: Hash) -> FillOutcome {
         match self.pull_through.get().copied() {
             Some(timeout) => self.try_pull_through(hash, timeout).await,
             // No pull-through configured: the coalesced fill either landed or it
@@ -749,11 +876,12 @@ impl ClientHandler {
             // surface it (like `on_pull_through_timeout`) rather than silently
             // reclassifying it as "blob absent" and reporting a clean `NotFound`.
             None => match self.cache.has(hash).await {
-                Ok(present) => present,
+                Ok(true) => FillOutcome::Filled,
+                Ok(false) => FillOutcome::CleanMiss,
                 Err(e) => {
                     self.metrics.node_pull_through_error();
-                    tracing::warn!(%hash, error = %e, "coalesced-fill store lookup failed; treating as miss");
-                    false
+                    tracing::warn!(%hash, error = %e, "coalesced-fill store lookup failed; treating as a fault");
+                    FillOutcome::HardFault
                 }
             },
         }
@@ -779,32 +907,56 @@ impl ClientHandler {
 
     /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if
     /// it landed in the store in the race; otherwise meters the abandoned pull and
-    /// spawns a background warm before reporting the miss. Returns whether the blob
-    /// is now present.
-    async fn on_pull_through_timeout(&self, hash: Hash, timeout: Duration) -> bool {
+    /// spawns a background warm before reporting the miss.
+    ///
+    /// A deadline expiry itself is a [`FillOutcome::CleanMiss`], NOT a
+    /// [`FillOutcome::HardFault`] (#1129): we do not KNOW that anything is broken.
+    /// The blob may well exist upstream and we simply ran out of patience — which
+    /// is exactly why we spawn the background warm below. Reporting a slow upstream
+    /// as `InternalError` ("do not retry this node") would steer clients off a
+    /// perfectly healthy node because someone ELSE was slow. Only a genuine
+    /// store/origin *error* is a fault, including the `has`-lookup error below.
+    async fn on_pull_through_timeout(&self, hash: Hash, timeout: Duration) -> FillOutcome {
         // Race: the fill may have landed in the store at the instant the outer
         // deadline fired. If so, serve it — this was NOT an abandoned pull, so do
         // not count a timeout. A `has` *error* is a real store fault, not a clean
         // race-loss: surface it like the populate-engine-error arm above rather
         // than silently treating the store as empty, then fall through to the warm.
+        let mut faulted = false;
         match self.cache.has(hash).await {
-            Ok(true) => return true,
+            Ok(true) => return FillOutcome::Filled,
             Ok(false) => {}
             Err(e) => {
+                // A store-lookup fault at the deadline is a store error, NOT a
+                // timeout. Meter it as an error only — counting it as a timeout too
+                // would contaminate `node_pull_through_timeout`, whose whole job is
+                // to separate "slow/wedged upstream" from "broken store", and send
+                // an operator chasing the network while the disk is dying. Same rule
+                // `on_local_populate_timeout` states; the two used to disagree.
                 self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e, "node-to-node pull-through store lookup failed after deadline");
+                faulted = true;
             }
         }
-        // Genuinely abandoned at the deadline (metered here, after the race check,
-        // so a blob that landed in time isn't over-counted as a timeout): this
-        // distinguishes a slow/wedged upstream from "not on network".
-        self.metrics.node_pull_through_timeout();
-        tracing::debug!(%hash, ?timeout, "node-to-node pull-through timed out");
+        if !faulted {
+            // Genuinely abandoned at the deadline (metered here, after the race
+            // check, so a blob that landed in time isn't over-counted as a timeout):
+            // this distinguishes a slow/wedged upstream from "not on network".
+            self.metrics.node_pull_through_timeout();
+            tracing::debug!(%hash, ?timeout, "node-to-node pull-through timed out");
+        }
         // The foreground future was dropped (its partial pull discarded); keep
-        // warming the cache in the background for future requests. Best-effort
-        // and non-blocking — the client still gets `NotFound` now.
+        // warming the cache in the background for future requests. Best-effort and
+        // non-blocking — the client still gets a refusal now. Spawned on BOTH paths:
+        // a store blip at the deadline is no reason to abandon the warm (this is why
+        // the fault arm above cannot simply early-return like its local-only
+        // sibling, which has no background warm to reach).
         self.maybe_spawn_background_fill(hash);
-        false
+        if faulted {
+            FillOutcome::HardFault
+        } else {
+            FillOutcome::CleanMiss
+        }
     }
 
     /// Register a channel observed on-chain via `ChannelOpened` (#327) so the
@@ -1116,10 +1268,20 @@ impl ClientHandler {
                 // `Range` support, verify failure) leaves `range_pulled_size` as
                 // `None` and falls through to the whole-blob path below, which is
                 // always correct (ADR 037 §"Fallback is always correct").
+                // The fault latch (#1129). Declared BEFORE the range tier, not after
+                // it: the range pull can hit a `CacheError::Store` of its own, and a
+                // latch that only starts at the local tier would drop it. Today the
+                // local tier happens to re-detect such a fault (it re-walks the same
+                // origin chain), but that is a coincidence of the current tier
+                // ordering, not an invariant — and this is the one bug the file
+                // exists to prevent. Latch every tier.
+                let mut fault_seen = false;
                 if (req.byte_offset > 0 || req.byte_len > 0)
                     && self.pull_authorized(&req, verified_client).await
                 {
-                    range_pulled_size = self.try_range_pull_through(hash, &req).await;
+                    let (size, range_outcome) = self.try_range_pull_through(hash, &req).await;
+                    range_pulled_size = size;
+                    fault_seen |= range_outcome.is_fault();
                 }
 
                 // Reactive LOCAL-origin populate (#1116). Before any node→node
@@ -1133,12 +1295,27 @@ impl ClientHandler {
                 // origin has egress cost, and the following delivery is billed
                 // per-voucher. A local miss leaves the blob absent and falls through
                 // to the node→node branches below, unchanged.
+                //
+                // A local HARD FAULT (#1129 — the operator's own S3/fs origin
+                // errored, rather than simply not having the blob) also falls
+                // through to the node→node branches: another source may legitimately
+                // still serve. But it is LATCHED in `fault_seen`, because if no later
+                // tier fills, the terminal refusal must report a degraded node
+                // (`InternalError`) rather than an empty one (`NotFound`). Every
+                // terminal MISS below therefore goes through
+                // `FillOutcome::miss_reason` — including the window path's leech
+                // shed. (The channel-class refusals — `UnknownChannel`,
+                // `InsufficientDeposit`, `UnauthorizedOrigin` — keep their own
+                // reasons: they are client-attributable and would refuse regardless
+                // of origin health.)
                 let mut locally_filled = false;
                 if range_pulled_size.is_none()
                     && let Some(timeout) = self.local_populate.get().copied()
                     && self.pull_authorized(&req, verified_client).await
                 {
-                    locally_filled = self.try_local_populate(hash, timeout).await;
+                    let local = self.try_local_populate(hash, timeout).await;
+                    fault_seen |= local.is_fault();
+                    locally_filled = local.is_filled();
                 }
 
                 // Window-paced pull-through (#856, ADR 037) is the preferred path
@@ -1184,6 +1361,7 @@ impl ClientHandler {
                                 client_node_id,
                                 Arc::clone(origin),
                                 tee,
+                                fault_seen,
                             ))
                             .await;
                         }
@@ -1193,26 +1371,29 @@ impl ClientHandler {
                         // fall through to serve from the store; if it does not
                         // land, report the miss.
                         TeeOpen::InFlight => {
-                            if !self.await_coalesced_fill(hash).await {
-                                return self
-                                    .respond_error(&mut send, &req, ServeRejectReason::CacheMiss)
-                                    .await;
+                            let coalesced = self.await_coalesced_fill(hash).await;
+                            if !coalesced.is_filled() {
+                                let reason =
+                                    FillOutcome::miss_reason(fault_seen || coalesced.is_fault());
+                                return self.respond_error(&mut send, &req, reason).await;
                             }
                         }
                     }
                 } else {
                     // Buffered pull-through (#831): the pre-#856 path, used when
                     // the window provider is unattached or for a resumed request.
-                    let filled = match self.pull_through.get().copied() {
+                    let buffered = match self.pull_through.get().copied() {
                         Some(timeout) if self.pull_authorized(&req, verified_client).await => {
                             self.try_pull_through(hash, timeout).await
                         }
-                        _ => false,
+                        // No pull-through configured, or the request is not
+                        // authorized to make this node spend: nothing was attempted,
+                        // so this tier contributes no new information.
+                        _ => FillOutcome::CleanMiss,
                     };
-                    if !filled {
-                        return self
-                            .respond_error(&mut send, &req, ServeRejectReason::CacheMiss)
-                            .await;
+                    if !buffered.is_filled() {
+                        let reason = FillOutcome::miss_reason(fault_seen || buffered.is_fault());
+                        return self.respond_error(&mut send, &req, reason).await;
                     }
                 }
             }
@@ -1381,6 +1562,26 @@ impl ClientHandler {
     /// `pull_ahead_bytes` rather than the whole blob. The caller has already
     /// proven channel ownership, confirmed `byte_offset == 0`, and claimed the
     /// tee sink. Terminal: consumes `send`/`recv`.
+    ///
+    /// `fault_seen` carries whether an EARLIER tier (the reactive local-origin
+    /// populate) hit a transient backend fault for this request (#1129). This path
+    /// is the last tier, so all three of its MISS exits — the leech shed, no
+    /// openable provider, and the open deadline — refuse via
+    /// [`FillOutcome::miss_reason`], reporting `InternalError` when this node is
+    /// degraded rather than merely empty.
+    ///
+    /// The leech shed is included deliberately. `StreamError::NotFound`'s own doc
+    /// does sanction it ("declines to pull through … seed-leech caps"), so a bare
+    /// `CacheMiss` there is defensible in isolation — but it is the wrong code once
+    /// the local origin has already faulted: the ONLY reason this request reached
+    /// the paid peer path at all is that the node's own origin is down, and the
+    /// operator needs that on the reject metric, not a `cache_miss` tally.
+    ///
+    /// The channel-class refusals (`UnknownChannel`, `InsufficientDeposit`) keep
+    /// their own reasons: they are client-attributable and would have refused
+    /// regardless of origin health, and they collapse to `NotFound` deliberately so
+    /// a prober cannot map out other clients' channel balances
+    /// ([`ServeRejectReason::wire_error`]).
     #[allow(clippy::too_many_arguments)]
     async fn serve_via_window_pull_through(
         &self,
@@ -1392,6 +1593,7 @@ impl ClientHandler {
         client_node_id: B256,
         origin: Arc<NodeOrigin>,
         tee: TeeReservation,
+        fault_seen: bool,
     ) -> anyhow::Result<()> {
         // Resolve the owning channel (existence + ownership already proven by
         // `pull_authorized`) — needed for the deposit guard and the downstream
@@ -1450,9 +1652,12 @@ impl ClientHandler {
         let peer = client_node_id.0;
         if !self.leech_admit(&peer) {
             tee.abandon();
-            return self
-                .respond_error(&mut send, req, ServeRejectReason::CacheMiss)
-                .await;
+            // A shed under the leech caps is a miss, not a client fault — so it
+            // honors a fault latched by an earlier tier (#1129). See this function's
+            // doc for why the shed is included where the channel-class refusals are
+            // not.
+            let reason = FillOutcome::miss_reason(fault_seen);
+            return self.respond_error(&mut send, req, reason).await;
         }
 
         // (3) Open the progressive upstream pull, bounded by the pull-through
@@ -1465,20 +1670,21 @@ impl ClientHandler {
         let (header, pull) =
             match tokio::time::timeout(deadline, origin.open_progressive_pull(hash)).await {
                 Ok(Some(pair)) => pair,
+                // No upstream provider could be opened. That is a clean miss on THIS
+                // tier — but if an earlier tier faulted, the request as a whole is
+                // still unresolved-by-fault, so honor that (#1129).
                 Ok(None) => {
                     tee.abandon();
                     self.maybe_spawn_background_fill(hash);
-                    return self
-                        .respond_error(&mut send, req, ServeRejectReason::CacheMiss)
-                        .await;
+                    let reason = FillOutcome::miss_reason(fault_seen);
+                    return self.respond_error(&mut send, req, reason).await;
                 }
                 Err(_elapsed) => {
                     tee.abandon();
                     self.metrics.node_pull_through_timeout();
                     self.maybe_spawn_background_fill(hash);
-                    return self
-                        .respond_error(&mut send, req, ServeRejectReason::CacheMiss)
-                        .await;
+                    let reason = FillOutcome::miss_reason(fault_seen);
+                    return self.respond_error(&mut send, req, reason).await;
                 }
             };
         let total_bytes = header.total_bytes;

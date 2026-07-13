@@ -110,6 +110,37 @@ since project inception and will roll into the first tagged release.
   operator scripts that match a `\.\d{3}` regex must update to
   `\.\d+`.
 
+### Fixed
+
+#### Node serve path
+
+- **A degraded node no longer reports itself as merely empty (#1129).** On a
+  `cdn/client/v1` cache miss, a transient origin/store fault during a reactive
+  pull-through fill (an S3 5xx surviving retry exhaustion, an open circuit
+  breaker, an fs I/O error) was indistinguishable from a clean miss and refused
+  with `CacheMiss` — wire `NotFound`, the code a *healthy but empty* node
+  returns. Such faults now refuse with `InternalError` ("do not retry this
+  node"), so clients route around a node whose origin is down and the operator's
+  reject metric names the real cause — which matters because seven distinct
+  reject reasons collapse to the single `NotFound` wire code, making the
+  per-reason counter the only server-side place the true cause is visible. A
+  genuine absence still returns `NotFound`; a deterministic refusal
+  (`BlobTooLarge`, `HashMismatch`) is not a fault and does not steer clients off
+  the node; and a fault on one tier is latched across a legitimate fall-through
+  to a later tier. No wire change — `StreamError::InternalError` already existed;
+  this is a reclassification within the existing surface.
+- **A wedged upstream candidate no longer starves the fallback loop (#1141).**
+  The window-paced node→node pull (`open_progressive_pull`) applied no
+  per-candidate timeout, so a provider that accepted the connection and then went
+  quiet consumed the entire outer deadline — which is deliberately sized to fit
+  all `MAX_PROVIDER_ATTEMPTS` per-candidate budgets precisely so candidates #2..N
+  stay reachable (#859) — and the serve path then refused a blob the honest
+  fallback held. The progressive-OPEN stage is now bounded by `pull_timeout`, as
+  the buffered fetch stage already was; a timed-out candidate is skipped and, per
+  #857, not blamed. (The `open_or_reuse_channel` stage remains unbounded on both
+  paths — a wedged on-chain RPC can still consume the outer deadline. Tracked
+  separately.)
+
 ### Changed
 
 #### Gossip

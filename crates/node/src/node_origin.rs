@@ -293,19 +293,49 @@ impl NodeOrigin {
         };
         // #1117: bind the request so the upstream can chain a reactive pull.
         let ctx = bind_upstream_ctx(deps, ctx)?;
-        match open_progressive_upstream(
-            &deps.endpoint,
-            EndpointAddr::new(pk),
-            &ctx,
-            &deps.slash_domain,
-            provider_addr,
-            hash_bytes,
-            0,
-            now_micros(),
-            deps.config.max_blob_size_bytes,
+        // Bound the open on the SAME per-candidate budget the buffered path gives
+        // each candidate (`stream_fetch_tracked`). Without it, a candidate that
+        // accepts the connection and then goes quiet blocks here indefinitely and
+        // consumes the caller's whole outer deadline — which is deliberately sized
+        // at `MAX_PROVIDER_ATTEMPTS × pull_timeout + slack` precisely so the
+        // caller's fallback loop (`open_progressive_pull`, above) can still reach
+        // candidates #2..N (#859) — so the serve path would refuse a blob an honest
+        // fallback holds. The typed `PullTimeout` flows into the `Err` arm's
+        // `classify_pull_failure`, which exonerates the peer (our deadline is not
+        // evidence it is bad, #857) and meters `node_pull_timeout`, exactly as on
+        // the buffered path.
+        //
+        // NOTE this bounds the OPEN stage only. `open_or_reuse_channel` above is
+        // still unbounded (as it is on the buffered path), so a wedged on-chain RPC
+        // can still consume the outer deadline — `selection.rs`'s slack doc already
+        // concedes this. Tracked separately; do not read this timeout as "the whole
+        // candidate attempt is bounded".
+        match tokio::time::timeout(
+            deps.config.pull_timeout,
+            open_progressive_upstream(
+                &deps.endpoint,
+                EndpointAddr::new(pk),
+                &ctx,
+                &deps.slash_domain,
+                provider_addr,
+                hash_bytes,
+                0,
+                now_micros(),
+                deps.config.max_blob_size_bytes,
+            ),
         )
         .await
-        {
+        .unwrap_or_else(|_| {
+            // Name the STAGE in the log: this is the progressive OPEN timing out
+            // (handshake + verified response header), not a mid-delivery stall on
+            // the buffered path. The `.context` layer does not affect
+            // classification — `classify_pull_failure`'s `downcast_ref` walks the
+            // anyhow chain (pinned by `buyer_side_sentinels_survive_anyhow_downcast`).
+            Err(anyhow::Error::new(PullTimeout {
+                after: deps.config.pull_timeout,
+            })
+            .context("progressive upstream open"))
+        }) {
             Ok((header, pull)) => Some((
                 header,
                 NodeProgressivePull {
