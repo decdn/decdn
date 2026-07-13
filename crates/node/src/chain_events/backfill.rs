@@ -9,8 +9,9 @@
 //! Known remaining divergence: the origin directory's genesis `ContentClaimed`
 //! replay ([`crate::dht::chain_origin_directory`], #651) still walks its own
 //! `REPLAY_WINDOW_BLOCKS = 9_000` windows by hand rather than going through
-//! [`backfill_windows`]. Migrating it onto this module is a follow-up — until
-//! then the 9k/10k span split is real, not merely historical.
+//! [`backfill_windows`]. That 9k is a deliberate margin under the common
+//! provider 10k `eth_getLogs` cap, not drift — the defect is the hand-rolled
+//! loop, not the value. Migrating it onto this module is tracked by #1139.
 
 use anyhow::Result;
 
