@@ -381,6 +381,65 @@ impl std::fmt::Display for UpstreamVoucherRejected {
 
 impl std::error::Error for UpstreamVoucherRejected {}
 
+/// Typed sentinel for an upstream *refusing* delivery up front — a
+/// `StreamResponse` with `body.ok == false` (#1144). Carries the wire
+/// [`StreamError`] verbatim (mirroring [`UpstreamVoucherRejected`]'s typed
+/// `reason`, not a lossy stringification) so the pull orchestrator can
+/// `downcast_ref` and give each refusal the verdict it deserves, rather than
+/// folding every one into "unreachable".
+///
+/// That distinction is the whole point. A refusal is proof the peer is *reachable
+/// and answering*, so most codes are no evidence at all that it is degraded:
+///
+/// - `NotFound` — the honest, empty-provider answer, and it is NODE-scoped, not
+///   blob-scoped (`ServeRejectReason::wire_error` deliberately collapses seven
+///   reasons onto it so channel existence cannot be probed). Scoring it as
+///   `Unreachable` punished a node for truthfully saying it lacks a blob.
+/// - `EvictedSinceProbe` / `Overloaded` / `BlobTooLarge` — likewise honest, and
+///   the latter is deterministic (it recurs for this blob on any node).
+/// - `InternalError` — the one code that IS evidence of a degraded peer; it means
+///   "unexpected failure, do not retry THIS node" (#1129).
+///
+/// Only the wire code is recoverable here, never the finer server-side
+/// `ServeRejectReason` — that collapse is intentional and must not be reversed.
+/// `Display` keeps the stable `delivery refused: {code}` text that logs, the CLI's
+/// cache-miss annotation, and the loopback tests match on.
+#[derive(Debug)]
+pub struct UpstreamRefused {
+    pub error: StreamError,
+}
+
+impl std::fmt::Display for UpstreamRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The `{:?}` rendering is load-bearing, exactly as in
+        // `UpstreamVoucherRejected`: the loopback tests assert
+        // `.contains("NotFound")` / `.contains("UnknownChannel")` on this string,
+        // and `StreamError` has no `Display`.
+        write!(f, "delivery refused: {:?}", self.error)
+    }
+}
+
+impl std::error::Error for UpstreamRefused {}
+
+/// Build the [`UpstreamRefused`] error for a `body.ok == false` response, shared
+/// by the buffered [`fetch_inner`] and progressive [`open_progressive_pull`] open
+/// stages so the two cannot drift in how they classify a refusal.
+///
+/// Callers MUST have run [`verify_response`] first: its `StreamResponse::validate`
+/// rejects `ok == false` with no error code (`MissingStreamError`), which is what
+/// makes `error` guaranteed `Some` here. The `None` arm is therefore unreachable
+/// on a validated response and is surfaced as the protocol violation it would be
+/// — not defaulted to some invented code, which would launder a malformed refusal
+/// into a plausible-looking one.
+fn refusal(error: Option<&StreamError>) -> anyhow::Error {
+    match error {
+        Some(error) => anyhow::Error::new(UpstreamRefused {
+            error: error.clone(),
+        }),
+        None => anyhow::anyhow!("delivery refused with no error code (unvalidated response?)"),
+    }
+}
+
 /// Fetch `hash` from `target` over `cdn/client/v1`, paying as bytes arrive.
 ///
 /// `expected_signer` is the delivering node's Ethereum address, used to verify
@@ -651,7 +710,7 @@ async fn fetch_inner(
     )?;
 
     if !resp.body.ok {
-        anyhow::bail!("delivery refused: {:?}", resp.error);
+        return Err(refusal(resp.error.as_ref()));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
@@ -1051,7 +1110,7 @@ pub async fn open_progressive_pull(
         timestamp_us,
     )?;
     if !resp.body.ok {
-        anyhow::bail!("delivery refused: {:?}", resp.error);
+        return Err(refusal(resp.error.as_ref()));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");

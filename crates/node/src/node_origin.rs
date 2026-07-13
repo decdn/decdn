@@ -49,6 +49,7 @@ use bytes::Bytes;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
 use decdn_protocol::ReportMetrics;
+use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tracing::{debug, warn};
 
@@ -62,8 +63,8 @@ use decdn_incentive::ChannelOpenFailureReason;
 use crate::buyer_channel::ChannelOpener;
 use crate::client_requester::{
     BlobTooLargeClaim, ChannelContext, HashMismatch, PullTimeout, UpstreamPull, UpstreamPullHeader,
-    UpstreamVoucherRejected, VoucherProgress, open_progressive_pull as open_progressive_upstream,
-    sign_client_binding, stream_fetch_tracked,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
+    open_progressive_pull as open_progressive_upstream, sign_client_binding, stream_fetch_tracked,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -925,13 +926,48 @@ fn persist_buyer_progress(
     }
 }
 
+/// Whether a refusal is evidence the PEER is degraded — and so must score its
+/// reputation — or merely an honest answer from a node that is reachable and
+/// answering (#1144).
+///
+/// Deliberately an exhaustive match rather than a `matches!` on the one true
+/// case: a new `StreamError` variant must not silently inherit "honest" (which
+/// would let a future failure code go unscored) nor "fault" (which would tar
+/// honest peers). It has to be a decision.
+const fn refusal_is_node_fault(error: &StreamError) -> bool {
+    match error {
+        // The one code by which a node reports its OWN degradation: "unexpected
+        // failure; do not retry THIS node" (#1129).
+        StreamError::InternalError => true,
+        // Honest answers from a healthy node. `NotFound` is NODE-scoped, not
+        // blob-scoped; `EvictedSinceProbe` is a race it is being truthful about;
+        // `Overloaded` is backpressure we should respect, not punish; and
+        // `BlobTooLarge` is deterministic for this blob on any node.
+        //
+        // `VoucherRejected` cannot reach a validated response at all —
+        // `StreamResponse::validate` rejects it in the `error` field as a
+        // mid-stream-only code — but were it ever to arrive it would be OUR
+        // payment-side fault, which the `UpstreamVoucherRejected` arm above
+        // already exonerates. So it belongs here too. (Folded in rather than given
+        // its own arm only because clippy's `match_same_arms` forbids the
+        // duplicate body; the match stays exhaustive, which is the point.)
+        StreamError::NotFound
+        | StreamError::EvictedSinceProbe
+        | StreamError::Overloaded
+        | StreamError::BlobTooLarge
+        | StreamError::VoucherRejected { .. } => false,
+    }
+}
+
 /// Classify a failed pull and fold the appropriate (or no) reputation outcome,
 /// shared by the buffered and window-paced paths (#856). Buyer-side faults are
-/// exonerated (don't tar the provider); a hash mismatch is `Corruption`;
-/// everything else is `Unreachable`.
+/// exonerated (don't tar the provider); an honest refusal is exonerated too
+/// (#1144 — a peer that answers is reachable, whatever it answers), except
+/// `InternalError`, by which a peer reports its own degradation; a hash mismatch
+/// is `Corruption`; everything else is `Unreachable`.
 // Straight-line downcast → classify → log chain; the tracing macros inflate the
 // cognitive-complexity metric past threshold (same inflation noted on the
-// pre-extraction `pull_from_candidate`). Splitting the four sentinel arms would
+// pre-extraction `pull_from_candidate`). Splitting the sentinel arms would
 // scatter one linear classification across helpers.
 #[allow(clippy::cognitive_complexity)]
 fn classify_pull_failure(
@@ -963,6 +999,33 @@ fn classify_pull_failure(
     if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
         deps.metrics.node_pull_voucher_rejected();
         debug!(%provider_addr, %err, "node-origin: upstream rejected our voucher (our payment fault); not tarring upstream reputation");
+        return;
+    }
+    // The upstream REFUSED delivery up front (#1144). A refusal proves the peer is
+    // reachable and answering, so it is not `Unreachable` — which is what every
+    // refusal used to score, tarring a node exactly as hard for honestly saying it
+    // lacks a blob as for being dead. Split on the wire code:
+    //
+    //   `InternalError` alone is evidence of a degraded peer — it is precisely the
+    //   "unexpected failure; do not retry THIS node" signal the serve path emits
+    //   for a backend fault or a wedged candidate (#1129), so honour it and score
+    //   `Unreachable` (which also deprioritises the candidate via the EWMA, so the
+    //   ranker steers off it on the next miss).
+    //
+    //   `NotFound` / `EvictedSinceProbe` / `Overloaded` / `BlobTooLarge` are all
+    //   honest answers from a healthy node. `NotFound` in particular is NODE-scoped,
+    //   not blob-scoped, and is the code a healthy-but-empty node returns (seven
+    //   `ServeRejectReason`s collapse onto it so channel existence can't be probed),
+    //   so it is at most a negative-AVAILABILITY signal — never a reputation hit.
+    //   Metered for observability, then the candidate is simply skipped.
+    if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
+        deps.metrics.node_pull_refused();
+        if refusal_is_node_fault(&refused.error) {
+            debug!(%provider_addr, %err, "node-origin: upstream reports itself degraded; scoring unreachable");
+            record_outcome(deps, pk, &Outcome::Unreachable);
+        } else {
+            debug!(%provider_addr, %err, "node-origin: upstream honestly refused delivery; not tarring upstream reputation");
+        }
         return;
     }
     // A bao verification failure (the typed `HashMismatch` sentinel, matched by
@@ -1228,5 +1291,46 @@ mod tests {
         // orchestrator uses still recovers the sentinel (no `root_cause()` needed).
         let wrapped = timeout.context("added context in some future propagation path");
         assert!(wrapped.downcast_ref::<PullTimeout>().is_some());
+
+        // The refusal sentinel (#1144) carries the wire code through the same
+        // channel, so `classify_pull_failure` can split an honest `NotFound` from
+        // a self-reported `InternalError` instead of folding both to Unreachable.
+        let refused: anyhow::Error = anyhow::Error::new(UpstreamRefused {
+            error: StreamError::NotFound,
+        });
+        let recovered = refused
+            .downcast_ref::<UpstreamRefused>()
+            .map(|r| r.error.clone());
+        assert_eq!(recovered, Some(StreamError::NotFound));
+        assert!(refused.downcast_ref::<UpstreamVoucherRejected>().is_none());
+    }
+
+    /// The #1144 split, asserted on the real predicate `classify_pull_failure`
+    /// consults: a refusal is proof the peer ANSWERED, so only the one code by
+    /// which a peer reports its own degradation may score it. The `NotFound` case
+    /// is the heart of the issue — a healthy-but-empty node used to take an
+    /// `Unreachable` hit (local EWMA + a gossiped observation) for honestly saying
+    /// so.
+    #[test]
+    fn only_internal_error_refusals_are_scored() {
+        // The exonerated codes: every one is an honest answer from a reachable
+        // node. `NotFound` is NODE-scoped, not blob-scoped (seven
+        // `ServeRejectReason`s collapse onto it), so it cannot even be read as
+        // "this peer lacks this blob" with confidence — only as "this peer won't
+        // serve it", which is no evidence of a fault.
+        for error in [
+            StreamError::NotFound,
+            StreamError::EvictedSinceProbe,
+            StreamError::Overloaded,
+            StreamError::BlobTooLarge,
+        ] {
+            assert!(
+                !refusal_is_node_fault(&error),
+                "{error:?} is an honest refusal and must not tar the provider"
+            );
+        }
+        // The one code that IS evidence of a degraded peer (#1129): "unexpected
+        // failure; do not retry THIS node".
+        assert!(refusal_is_node_fault(&StreamError::InternalError));
     }
 }

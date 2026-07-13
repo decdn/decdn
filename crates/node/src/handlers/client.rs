@@ -203,6 +203,13 @@ impl ServeRejectReason {
     /// finer split survives only in the per-reason metric (#876). Keeping the
     /// mapping on the type makes an inconsistent error/reason pairing
     /// unrepresentable at the call sites.
+    ///
+    /// The requester side of this mapping is `decdn_client_pull::UpstreamRefused`,
+    /// which recovers the wire code — and ONLY the wire code — from a refusal
+    /// (#1144). So the `NotFound` collapse is what a requester sees for all seven
+    /// reasons below, and the reputation consequences it draws must hold for the
+    /// weakest of them. They do: it scores `NotFound` as no fault at all, and only
+    /// `InternalError` as a degraded peer.
     const fn wire_error(self) -> StreamError {
         match self {
             // `InsufficientDeposit` collapses to `NotFound` alongside the other
@@ -216,10 +223,10 @@ impl ServeRejectReason {
             // `RangeNotSatisfiable` collapses to `NotFound` alongside the other
             // "won't serve this" reasons: an out-of-bounds bounded range is a
             // client error, but signalling it as `NotFound` (rather than
-            // `InternalError`) keeps it reputation-benign — the requester folds
-            // a node fault into the node's score, and a client's own malformed
-            // range must not penalise the node. The distinction survives in the
-            // per-reason metric.
+            // `InternalError`) keeps it reputation-benign — a requester scores
+            // `InternalError` as a degraded peer (#1144), and a client's own
+            // malformed range must not penalise the node for it. The distinction
+            // survives in the per-reason metric.
             Self::CacheMiss
             | Self::UnknownChannel
             | Self::OwnerMismatch

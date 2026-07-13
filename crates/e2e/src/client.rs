@@ -16,10 +16,11 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_client_pull::{
-    BlobTooLargeClaim, ChannelContext, HashMismatch, UpstreamVoucherRejected, VoucherProgress,
-    stream_fetch_tracked,
+    BlobTooLargeClaim, ChannelContext, HashMismatch, UpstreamRefused, UpstreamVoucherRejected,
+    VoucherProgress, stream_fetch_tracked,
 };
 use decdn_incentive::{slash_judge_domain, voucher_domain};
+use decdn_protocol::client::StreamError;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 
@@ -228,16 +229,24 @@ impl ClientFixture {
 /// watcher-catch-up condition the retry loop is meant to wait out, `false` if
 /// re-running with the same channel would only spin to the deadline.
 ///
-/// The loop exists to ride out the node's pre-observation window, during which
-/// it refuses delivery up front with a plain `"delivery refused: UnknownChannel"`
-/// string error (not a typed sentinel) until its chain watcher decodes
-/// `ChannelOpened`. That, transport errors, a per-attempt `PullTimeout`, and the
-/// node's explicit `RetryLater` resend signal are all retryable. Everything typed
-/// is terminal: a corrupt delivery (`HashMismatch`), a buyer-side size-cap
-/// rejection (`BlobTooLargeClaim`), or any other mid-stream voucher rejection
-/// (`UpstreamVoucherRejected` — e.g. a stale nonce left by one-sided ack loss,
-/// deposit exhaustion, or an expired channel) cannot be fixed by retrying, so we
-/// fail fast and surface the real cause.
+/// The loop exists to ride out the node's pre-observation window, during which it
+/// refuses delivery up front — its channel is `UnknownChannel` until the chain
+/// watcher decodes `ChannelOpened`, which reaches us as the wire `NotFound` that
+/// `ServeRejectReason::wire_error` collapses seven reject reasons onto. That,
+/// transport errors, a per-attempt `PullTimeout`, and the node's explicit
+/// `RetryLater` resend signal are all retryable.
+///
+/// Everything else is terminal: a corrupt delivery (`HashMismatch`), a buyer-side
+/// size-cap rejection (`BlobTooLargeClaim`), any other mid-stream voucher
+/// rejection (`UpstreamVoucherRejected` — e.g. a stale nonce left by one-sided ack
+/// loss, deposit exhaustion, or an expired channel), or a refusal by which the
+/// node reports itself degraded / the blob over its own ceiling. Retrying cannot
+/// fix any of those, so we fail fast and surface the real cause.
+///
+/// The refusal arm is only this precise because the wire code now survives as a
+/// typed `UpstreamRefused` (#1144); before that a refusal was an opaque string and
+/// every one of them — including a hard `InternalError` — was retried to the
+/// deadline.
 fn is_retryable(err: &anyhow::Error) -> bool {
     if err.downcast_ref::<HashMismatch>().is_some()
         || err.downcast_ref::<BlobTooLargeClaim>().is_some()
@@ -251,6 +260,17 @@ fn is_retryable(err: &anyhow::Error) -> bool {
         return matches!(
             rejected.reason,
             decdn_protocol::VoucherRejectReason::RetryLater
+        );
+    }
+    if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
+        // `NotFound` is the pre-observation window this loop exists for (and, more
+        // broadly, a node that may hold the blob on a later attempt).
+        // `EvictedSinceProbe` / `Overloaded` are likewise transient. A node that
+        // reports itself degraded, or the blob as over its ceiling, will say the
+        // same thing on every attempt.
+        return !matches!(
+            refused.error,
+            StreamError::InternalError | StreamError::BlobTooLarge
         );
     }
     true

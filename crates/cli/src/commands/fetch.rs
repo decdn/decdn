@@ -33,7 +33,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
 use decdn_client_pull::{
-    ChannelContext, ProgressCallback, VoucherProgress, sign_client_binding,
+    ChannelContext, ProgressCallback, UpstreamRefused, VoucherProgress, sign_client_binding,
     stream_fetch_tracked_with_progress,
 };
 use decdn_common::cli::{self, common::expand_tilde};
@@ -43,6 +43,7 @@ use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
+use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
 use super::chain_ctx;
@@ -417,9 +418,10 @@ pub(crate) async fn resolve_target_node(
 /// is not fixed by a binding) and to unbound contexts, so a bound fetch's error
 /// is passed through untouched. Every other error is returned verbatim.
 fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyhow::Error {
-    let msg = err.to_string();
-    if ctx.client_binding.is_none() && msg.contains("delivery refused") && msg.contains("NotFound")
-    {
+    let refused_not_found = err
+        .downcast_ref::<UpstreamRefused>()
+        .is_some_and(|refused| matches!(refused.error, StreamError::NotFound));
+    if ctx.client_binding.is_none() && refused_not_found {
         err.context(
             "no client identity binding was sent because \
              blockchain.capacity_bond_address is unset, so the node could not \
@@ -816,14 +818,21 @@ mod tests {
         }
     }
 
+    /// The refusal these tests annotate, built the way the fetch path builds it —
+    /// the typed `UpstreamRefused` sentinel (#1144), not a look-alike string. The
+    /// annotation now downcasts, so a synthetic `anyhow!("delivery refused: …")`
+    /// would no longer match and the test would pass vacuously against a hint that
+    /// never fires in production.
+    fn refusal(error: StreamError) -> anyhow::Error {
+        anyhow::Error::new(UpstreamRefused { error })
+    }
+
     /// An unbound (no `capacity_bond_address`) fetch refused with `NotFound` gets
     /// the actionable hint attached, reconnecting the opaque refusal to its cause.
     #[test]
     fn unbound_notfound_refusal_gets_actionable_hint() {
-        let annotated = annotate_unbound_cache_miss(
-            anyhow::anyhow!("delivery refused: Some(NotFound)"),
-            &ctx_with(None),
-        );
+        let annotated =
+            annotate_unbound_cache_miss(refusal(StreamError::NotFound), &ctx_with(None));
         assert!(
             annotated.to_string().contains("capacity_bond_address"),
             "expected the binding hint, got: {annotated}"
@@ -838,11 +847,25 @@ mod tests {
         let binding =
             sign_client_binding(&signer, B256::ZERO, &bind_node_id_domain(1, Address::ZERO))
                 .expect("sign binding");
-        let annotated = annotate_unbound_cache_miss(
-            anyhow::anyhow!("delivery refused: Some(NotFound)"),
-            &ctx_with(Some(binding)),
-        );
+        let annotated =
+            annotate_unbound_cache_miss(refusal(StreamError::NotFound), &ctx_with(Some(binding)));
         assert!(!annotated.to_string().contains("capacity_bond_address"));
+    }
+
+    /// A refusal that is NOT `NotFound` gets no binding hint even when unbound: a
+    /// client binding authorizes reactive pull-through, so it cannot fix a node
+    /// that is degraded (`InternalError`) or a blob that is over the ceiling.
+    /// Previously indistinguishable — the string sniff matched any refusal whose
+    /// text happened to contain `NotFound`.
+    #[test]
+    fn unbound_non_notfound_refusal_is_untouched() {
+        for error in [StreamError::InternalError, StreamError::BlobTooLarge] {
+            let annotated = annotate_unbound_cache_miss(refusal(error.clone()), &ctx_with(None));
+            assert!(
+                !annotated.to_string().contains("capacity_bond_address"),
+                "{error:?} must not get the binding hint"
+            );
+        }
     }
 
     /// A non-`NotFound` failure (e.g. a transport error) is never mislabeled as a
