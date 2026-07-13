@@ -27,24 +27,6 @@ use std::time::Duration;
 
 use clap::Args;
 
-/// Assumed floor client bandwidth (MiB/s) used to scale the per-blob fetch
-/// timeout to `--max-blob-mb` (see [`ClientFetchArgs::effective_timeout`]).
-/// Chosen so the default pair (1024 MiB, `30_000` ms) stays consistent:
-/// `1024 * 1000 / 35 ≈ 29_257 ms < 30_000`, so the default `--timeout-ms` still
-/// dominates and only larger `--max-blob-mb` overrides lengthen the timeout.
-const FETCH_FLOOR_BANDWIDTH_MIB_S: u64 = 35;
-
-/// Pure timeout formula shared by [`ClientFetchArgs::effective_timeout`]: the
-/// larger of the `timeout_ms` floor and the size-scaled value derived from
-/// `max_blob_mb` at [`FETCH_FLOOR_BANDWIDTH_MIB_S`]. Saturating throughout so no
-/// override can panic or overflow.
-fn scaled_timeout(max_blob_mb: u64, timeout_ms: u64) -> Duration {
-    let scaled_ms = max_blob_mb
-        .saturating_mul(1000)
-        .saturating_div(FETCH_FLOOR_BANDWIDTH_MIB_S);
-    Duration::from_millis(timeout_ms.max(scaled_ms))
-}
-
 /// The network, chain, target, and per-blob-limit flags shared by the paid
 /// client commands (`decdn fetch` and `decdn bundle pull`, #391). Flattened into
 /// each command's args so the resolution (`flag > config > default`) and
@@ -142,30 +124,49 @@ pub struct ClientFetchArgs {
     /// **before** buffering it — guards client memory against a provider that
     /// over-claims `total_bytes`. Defaults to 1024 MiB (the node's default
     /// serve ceiling); raise it to fetch larger blobs. For `bundle pull` this is
-    /// the per-entry ceiling. Also scales the effective fetch timeout (see
-    /// `--timeout-ms`).
+    /// the per-entry ceiling.
     #[arg(long, value_name = "MB", default_value_t = 1024)]
     pub max_blob_mb: u64,
 
-    /// Minimum overall timeout for a single blob fetch, in milliseconds. For
-    /// `bundle pull` this is the per-entry timeout. Acts as a floor: the
-    /// effective timeout is the larger of this and a value scaled from
-    /// `--max-blob-mb` (assuming ~35 MiB/s), so raising `--max-blob-mb` can't
-    /// leave a large blob unable to finish within a stale 30 s window.
+    /// Abandon a fetch when the provider sends no data for this long, in
+    /// milliseconds. This is the primary timeout (#1134): the clock resets on
+    /// every byte received, so it catches a dead or stalled provider — what a
+    /// timeout is *for* — without penalising transfer size or link speed. A
+    /// 700 MiB blob on a slow link keeps going as long as bytes keep arriving.
+    /// For `bundle pull` this applies per entry.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
-    pub timeout_ms: u64,
+    pub stall_timeout_ms: u64,
+
+    /// Optional hard cap on the total wall-clock time of a single blob fetch, in
+    /// milliseconds. **Unset by default** — normally you want `--stall-timeout-ms`,
+    /// which bounds the fetch by provider health rather than by the clock.
+    ///
+    /// This used to be the primary (and only) mechanism, defaulting to 30 s, which
+    /// made it a poor health signal: an overall deadline has to be sized against
+    /// `blob size × link speed`, so it killed legitimate large or slow-but-healthy
+    /// transfers while a value small enough to catch a dead node quickly could not
+    /// serve a big blob at all. Set it only when you must bound total runtime
+    /// regardless of whether the transfer is making progress. For `bundle pull`
+    /// this applies per entry.
+    #[arg(long, value_name = "MS")]
+    pub timeout_ms: Option<u64>,
 }
 
 impl ClientFetchArgs {
-    /// Effective per-blob (per-entry) fetch timeout: the larger of the
-    /// `--timeout-ms` floor and a size-scaled value derived from `--max-blob-mb`
-    /// at `FETCH_FLOOR_BANDWIDTH_MIB_S`. `--timeout-ms` stays a minimum so a
-    /// small blob never times out below the connect/discovery budget, while a
-    /// raised `--max-blob-mb` automatically lengthens the timeout instead of
-    /// silently guaranteeing failure.
+    /// Inactivity bound for the streaming stage — the primary timeout (#1134).
+    ///
+    /// Returned as its own value (rather than a `decdn_client_pull::PullDeadlines`)
+    /// because `decdn-common` is upstream of the pull crate in the dependency flow;
+    /// the CLI assembles the two halves into a `PullDeadlines`.
     #[must_use]
-    pub fn effective_timeout(&self) -> Duration {
-        scaled_timeout(self.max_blob_mb, self.timeout_ms)
+    pub const fn stall_timeout(&self) -> Duration {
+        Duration::from_millis(self.stall_timeout_ms)
+    }
+
+    /// Optional overall wall-clock cap; `None` unless `--timeout-ms` is given.
+    #[must_use]
+    pub fn hard_cap(&self) -> Option<Duration> {
+        self.timeout_ms.map(Duration::from_millis)
     }
 }
 
@@ -194,34 +195,59 @@ pub struct FetchArgs {
     clippy::panic
 )]
 mod tests {
-    use super::scaled_timeout;
+    use super::ClientFetchArgs;
+    use clap::Parser;
     use std::time::Duration;
 
+    /// Parse `ClientFetchArgs` the way clap will at runtime, so the tests below
+    /// assert on the real defaults rather than a hand-built struct that could
+    /// drift from them.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        common: ClientFetchArgs,
+    }
+
+    fn parse(args: &[&str]) -> ClientFetchArgs {
+        let mut with_bin = vec!["test"];
+        with_bin.extend_from_slice(args);
+        TestCli::parse_from(with_bin).common
+    }
+
+    /// The headline of #1134: out of the box a fetch has NO overall deadline, so
+    /// blob size and link speed cannot kill a healthy transfer. Liveness comes
+    /// from the stall bound instead.
     #[test]
-    fn default_pair_preserves_30s() {
-        // 1024 * 1000 / 35 ≈ 29_257 < 30_000, so the floor wins.
-        assert_eq!(scaled_timeout(1024, 30_000), Duration::from_secs(30));
+    fn no_overall_deadline_by_default() {
+        let c = parse(&[]);
+        assert_eq!(c.hard_cap(), None);
+        assert_eq!(c.stall_timeout(), Duration::from_secs(30));
+    }
+
+    /// The hard cap is opt-in, for a caller that must bound total runtime whether
+    /// or not the transfer is progressing.
+    #[test]
+    fn hard_cap_is_opt_in() {
+        let c = parse(&["--timeout-ms", "5000"]);
+        assert_eq!(c.hard_cap(), Some(Duration::from_secs(5)));
     }
 
     #[test]
-    fn large_blob_scales_up() {
-        // 4096 * 1000 / 35 = 117_028 > 30_000, so the scaled value wins.
-        assert_eq!(scaled_timeout(4096, 30_000), Duration::from_millis(117_028));
+    fn stall_timeout_is_overridable() {
+        let c = parse(&["--stall-timeout-ms", "1500"]);
+        assert_eq!(c.stall_timeout(), Duration::from_millis(1500));
+        assert_eq!(c.hard_cap(), None);
     }
 
+    /// `--max-blob-mb` is a memory ceiling, nothing more. It used to also scale the
+    /// timeout (at an assumed 35 MiB/s), which is precisely the coupling #1134
+    /// removed: a size flag has no business setting a deadline.
     #[test]
-    fn small_blob_holds_floor() {
-        assert_eq!(scaled_timeout(10, 30_000), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn explicit_timeout_above_scaled_wins() {
-        assert_eq!(scaled_timeout(2048, 200_000), Duration::from_secs(200));
-    }
-
-    #[test]
-    fn saturates_without_panic() {
-        // No overflow/panic on an extreme --max-blob-mb.
-        let _ = scaled_timeout(u64::MAX, 30_000);
+    fn max_blob_mb_does_not_influence_the_deadlines() {
+        let small = parse(&["--max-blob-mb", "1"]);
+        let huge = parse(&["--max-blob-mb", "1048576"]);
+        assert_eq!(small.stall_timeout(), huge.stall_timeout());
+        assert_eq!(small.hard_cap(), huge.hard_cap());
+        assert_eq!(huge.hard_cap(), None);
     }
 }

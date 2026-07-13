@@ -14,20 +14,12 @@ use std::time::Duration;
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
 /// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential
-/// per-candidate stream budgets when computing the outer pull-through deadline
+/// per-candidate OPEN budgets when computing the outer pull-through deadline
 /// (#859). It covers the *one-time* discover → probe → rank overhead that runs
-/// under the outer deadline but is not a per-candidate stream (probing is
-/// concurrent, bounded by a single probe timeout, so it does not scale with the
-/// attempt count). A tunable judgement value: small relative to one per-candidate
-/// budget so it doesn't materially inflate worst-case miss latency.
-///
-/// Note what it does *not* model: per-candidate `open_or_reuse_channel`
-/// (potentially an on-chain `openChannel` tx, once per attempt) is not bounded by
-/// the per-candidate `pull_timeout`, so on a cold cache with a slow L2 the outer
-/// deadline can still preempt before the last candidate. That is a known
-/// fragility at *small* configured per-candidate budgets, not a regression: it is
-/// still strictly better than the pre-#859 `outer == per_candidate` wiring, which
-/// killed the fallback after a single stall.
+/// under the outer deadline but is not per-candidate (probing is concurrent,
+/// bounded by a single probe timeout, so it does not scale with the attempt
+/// count). A tunable judgement value: small relative to one per-candidate budget
+/// so it doesn't materially inflate worst-case miss latency.
 pub const PULL_THROUGH_OUTER_SLACK: Duration = Duration::from_secs(10);
 
 /// Outer deadline for a node-to-node pull-through, derived from the configured
@@ -36,16 +28,34 @@ pub const PULL_THROUGH_OUTER_SLACK: Duration = Duration::from_secs(10);
 /// The delivery handler wraps the whole `discover → probe → rank → pull` fetch
 /// in a single `tokio::time::timeout`. For the sequential `MAX_PROVIDER_ATTEMPTS`
 /// fallback loop to actually reach candidates #2..N when candidate #1 *stalls*,
-/// this outer deadline must strictly exceed the sum of all per-candidate *stream*
-/// budgets — otherwise both clocks (sourced from the same config value before
-/// #859) expire together and the outer timeout cancels the whole fetch at the
-/// instant candidate #1's own timeout fires, killing the fallback. We therefore
-/// budget `MAX_PROVIDER_ATTEMPTS × per_candidate` plus [`PULL_THROUGH_OUTER_SLACK`]
-/// of one-time discovery overhead. The strict-exceed guarantee is over the
-/// per-candidate *stream* budgets; see [`PULL_THROUGH_OUTER_SLACK`] for what the
-/// slack does and does not absorb (notably per-candidate channel-open).
-/// `node_pull_timeout_sec` keeps its documented per-upstream meaning; only the
-/// derived outer backstop grows.
+/// this outer deadline must strictly exceed the sum of all per-candidate budgets —
+/// otherwise both clocks (sourced from the same config value before #859) expire
+/// together and the outer timeout cancels the whole fetch at the instant candidate
+/// #1's own timeout fires, killing the fallback. We therefore budget
+/// `MAX_PROVIDER_ATTEMPTS × per_candidate` plus [`PULL_THROUGH_OUTER_SLACK`] of
+/// one-time discovery overhead.
+///
+/// # What this deadline does and does not bound
+///
+/// Since #1134 the per-candidate budget bounds a candidate's **open** stage
+/// (connect → channel → handshake → response); its **streaming** stage is bounded
+/// by inactivity (`node_pull_stall_timeout_sec`) rather than a wall clock, because
+/// a wall clock over the bytes caps the blob size a node can pull through. Two
+/// consequences worth being explicit about:
+///
+/// - The `MAX_PROVIDER_ATTEMPTS × per_candidate` arithmetic still holds for the
+///   case it was written for — *stalling* candidates, which is what the fallback
+///   loop exists to escape. Each one is abandoned on its own budget (its open
+///   deadline, or its stall bound once bytes start), so the loop still reaches
+///   candidates #2..N.
+/// - A candidate that is **slow but progressing** can now consume the whole outer
+///   deadline on its own. That is correct: it is succeeding, and falling through
+///   mid-stream would restart the download from zero against another peer. The
+///   foreground request gives up (a clean miss) while the transfer continues in the
+///   detached background warm, which is uncapped for exactly this reason.
+///
+/// So this is best read as a bound on how long a **client** waits, not on how long
+/// an acquisition takes.
 #[must_use]
 pub fn outer_pull_deadline(per_candidate: Duration) -> Duration {
     let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);

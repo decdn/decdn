@@ -438,6 +438,7 @@ fn provisioned_origin_with_ceiling(
         providers,
         addr_map,
         Duration::from_secs(20),
+        Duration::from_secs(20),
         max_blob_size_bytes,
     )
 }
@@ -470,6 +471,7 @@ fn build_origin(
         providers,
         addr_map,
         Duration::from_secs(20),
+        Duration::from_secs(20),
         0,
     )
 }
@@ -490,6 +492,7 @@ fn build_origin_with_timeout(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
+    stall_timeout: Duration,
     max_blob_size_bytes: u64,
 ) -> NodeOrigin {
     let mut dir = HashMap::new();
@@ -520,6 +523,7 @@ fn build_origin_with_timeout(
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout,
+            stall_timeout,
             max_blob_size_bytes,
             enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
@@ -718,6 +722,7 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),
+            stall_timeout: Duration::from_secs(20),
             max_blob_size_bytes: 0,
             enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
@@ -1158,6 +1163,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),
+            stall_timeout: Duration::from_secs(20),
             max_blob_size_bytes: 0,
             enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
@@ -2201,6 +2207,10 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         // fetch here; at the `NodeOrigin` level there is no outer wrapper, so this
         // exercises the per-candidate fallthrough the fix preserves.
         Duration::from_secs(1),
+        // Generous stall budget: this fixture stalls at the OPEN stage (before the
+        // `StreamResponse`), so it must be the 1 s open budget above that abandons
+        // the candidate, not the streaming inactivity bound (#1134).
+        Duration::from_secs(20),
         0,
     );
 
@@ -2441,6 +2451,7 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         vec![s1_dht, s2_dht, a_dht],
         addr_map,
         per_candidate,
+        Duration::from_secs(20),
         0,
     );
 

@@ -1107,10 +1107,16 @@ pub async fn run(
         let per_candidate = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
         let outer_deadline = crate::selection::outer_pull_deadline(per_candidate);
         client_handler.attach_pull_through(outer_deadline);
-        // Background fill keeps warming the cache after the delivery path gives
-        // up; it gets a full fresh outer-deadline budget to complete from
-        // scratch (the foreground future was dropped, taking its partial work).
-        client_handler.attach_background_fill(pull_through_bg_shutdown.clone(), outer_deadline);
+        // Background fill keeps warming the cache after the delivery path gives up.
+        // It runs UNCAPPED (#1134): the foreground deadline bounds how long a
+        // *client* waits, but the warm has no client waiting on it, and capping it
+        // at the same budget the foreground just exhausted meant a blob too large to
+        // fetch in one deadline could never be warmed either — the node could not
+        // acquire any blob needing more than ~`outer_deadline` of transfer. The
+        // pull's streaming stage is bounded by inactivity
+        // (`node_pull_stall_timeout_sec`), so an uncapped warm still cannot hang on
+        // a dead upstream; and shutdown cancels it.
+        client_handler.attach_background_fill(pull_through_bg_shutdown.clone(), None);
         // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
         // available, serve cache misses by fusing the upstream pull with
         // downstream delivery (bounded by `pull_ahead_bytes`) instead of the
@@ -1554,6 +1560,7 @@ pub async fn run(
     let node_origin_config = crate::node_origin::NodeOriginConfig {
         probe_fanout: cfg.cache.node_pull_probe_fanout,
         pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
+        stall_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_stall_timeout_sec),
         max_blob_size_bytes: cfg
             .cache
             .max_blob_size_mb
@@ -3236,6 +3243,8 @@ mod tests {
                 node_to_node_pull_through_enabled: false,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
+                node_pull_stall_timeout_sec:
+                    decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
                 pull_ahead_bytes: decdn_cache::Bytes::new(
                     decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
                 ),

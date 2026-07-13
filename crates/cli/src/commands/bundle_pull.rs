@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use super::chain_ctx;
 use super::fetch;
+use decdn_client_pull::PullDeadlines;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::provider;
@@ -324,7 +325,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             provider,
             self.store,
             hash,
-            self.common.effective_timeout(),
+            PullDeadlines {
+                open: self.common.stall_timeout(),
+                stall: self.common.stall_timeout(),
+                hard_cap: self.common.hard_cap(),
+            },
             max_blob_bytes,
             // Per-entry byte bars would interleave illegibly across a manifest's
             // many concurrent pulls; `bundle pull` reports at entry granularity

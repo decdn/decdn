@@ -189,14 +189,26 @@ pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
 /// (#831). Five is enough to find a healthy upstream in a tens-of-nodes
 /// network without spending the miss-latency budget on a wide probe fan-out.
 pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
-/// Default wall-clock bound (seconds) on a single upstream pull during a
-/// node-to-node cache-miss fill (#831). Matches the integration-test budget;
-/// a slow upstream is abandoned for the next ranked candidate at this deadline.
+/// Default wall-clock bound (seconds) on the OPEN stage of a single upstream pull
+/// during a node-to-node cache-miss fill (#831) — connect, channel open,
+/// handshake, signed `StreamResponse`. Matches the integration-test budget; a slow
+/// upstream is abandoned for the next ranked candidate at this deadline.
 /// This is the *per-upstream* budget: the node derives the overall pull-through
 /// deadline as roughly `MAX_PROVIDER_ATTEMPTS ×` it plus a fixed discovery
 /// allowance, so the fallback loop can reach every ranked candidate before the
 /// serving path gives up (#859).
+///
+/// Does not bound the streaming stage — see [`DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`].
 pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
+/// Default INACTIVITY bound (seconds) on the streaming stage of an upstream pull
+/// (#1134). The clock resets on every byte received, so it trips only when an
+/// upstream falls silent — never because a blob is large or a link is slow.
+///
+/// Set equal to [`DEFAULT_NODE_PULL_TIMEOUT_SEC`] because both answer the same
+/// question ("how long do we wait on an unresponsive upstream?"), just at
+/// different stages; they are separate knobs because only one of them can be
+/// safely raised for large content.
+pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 
 /// Default window-paced pull-through pipeline window (#856, ADR 037
 /// `pull_ahead_bytes`): 1 MiB ≈ one voucher interval. The serving node pulls at
@@ -1397,6 +1409,9 @@ fn resolve_cache_into(
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
+    let node_pull_stall_timeout_sec = file
+        .and_then(|c| c.node_pull_stall_timeout_sec)
+        .unwrap_or(DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC);
     // Resolve the seed-leech knobs to their typed `Bytes` / `Percent` form and
     // keep them typed through the cross-field check and `ResolvedCache`
     // construction below, so a bytes<->percent (or bytes<->bytes) transposition
@@ -1452,6 +1467,7 @@ fn resolve_cache_into(
         node_to_node_pull_through_enabled,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
+        node_pull_stall_timeout_sec,
         pull_ahead_bytes,
         max_unrecouped_leech_bytes,
         pull_share_ratio_percent,

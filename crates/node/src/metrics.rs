@@ -655,6 +655,14 @@ pub struct DecdnMetrics {
     /// a sustained rate here usually means content discovery is steering this node
     /// at upstreams that do not hold the blob — not that the upstreams are bad.
     pub node_pull_refused: Counter,
+    /// `decdn_node_pull_stalled_total` (#1134): an upstream went silent mid-stream
+    /// — no byte of progress within `node_pull_stall_timeout_sec` — so the pull was
+    /// abandoned. UNLIKE `node_pull_timeout` (our own budget expiring, which is not
+    /// evidence about the peer), this one DOES tar the provider's reputation: the
+    /// clock resets on every byte received, so it can only fire on a provider that
+    /// stopped delivering while we waited. A sustained rate points at flaky
+    /// upstreams or a `node_pull_stall_timeout_sec` too tight for the network.
+    pub node_pull_stalled: Counter,
     /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
     /// voucher but persisting the buyer channel's resume watermark
     /// (`record_progress`) failed. The bytes were delivered, but the channel's
@@ -1632,6 +1640,12 @@ impl Metrics {
     /// code; only `InternalError` also scores the provider's reputation.
     pub fn node_pull_refused(&self) {
         self.decdn.node_pull_refused.inc();
+    }
+
+    /// An upstream went silent mid-stream (#1134); the pull was abandoned and the
+    /// provider scored `Unreachable`.
+    pub fn node_pull_stalled(&self) {
+        self.decdn.node_pull_stalled.inc();
     }
 
     /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark

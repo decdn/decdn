@@ -62,8 +62,8 @@ use decdn_incentive::ChannelOpenFailureReason;
 
 use crate::buyer_channel::ChannelOpener;
 use crate::client_requester::{
-    BlobTooLargeClaim, ChannelContext, HashMismatch, PullTimeout, UpstreamPull, UpstreamPullHeader,
-    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
+    BlobTooLargeClaim, ChannelContext, HashMismatch, PullDeadlines, PullStalled, PullTimeout,
+    UpstreamPull, UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
     open_progressive_pull as open_progressive_upstream, sign_client_binding, stream_fetch_tracked,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
@@ -124,8 +124,16 @@ pub trait AcquisitionObserver: Send + Sync + std::fmt::Debug {
 pub struct NodeOriginConfig {
     /// How many discovered providers to probe before ranking.
     pub probe_fanout: usize,
-    /// Wall-clock bound on a single upstream pull (`stream_fetch`).
+    /// Wall-clock bound on the OPEN stage of a single upstream pull: connect,
+    /// channel open, handshake, and the signed `StreamResponse`. Bounded work, so
+    /// a slow one is a stall.
     pub pull_timeout: Duration,
+    /// INACTIVITY bound on the STREAMING stage (#1134). Reset on every byte
+    /// received, so it trips only on a silent upstream — never on a large blob or
+    /// a slow link. Deliberately not a wall clock: bounding the bytes by wall clock
+    /// caps the blob size this node can pull through at `pull_timeout × link
+    /// speed`, which is the bug this replaced.
+    pub stall_timeout: Duration,
     /// Buyer-side blob-size ceiling (`cache.max_blob_size_mb` × MB), `0` = unlimited.
     /// Mirrors the serving-side `BlobTooLarge` gate; rejects an oversized server
     /// `total_bytes` claim before buffering (#840).
@@ -306,11 +314,11 @@ impl NodeOrigin {
         // evidence it is bad, #857) and meters `node_pull_timeout`, exactly as on
         // the buffered path.
         //
-        // NOTE this bounds the OPEN stage only. `open_or_reuse_channel` above is
-        // still unbounded (as it is on the buffered path), so a wedged on-chain RPC
-        // can still consume the outer deadline — `selection.rs`'s slack doc already
-        // concedes this. Tracked separately; do not read this timeout as "the whole
-        // candidate attempt is bounded".
+        // This bounds the OPEN stage — bounded work (connect, handshake, verified
+        // response), so a slow one really is a stall. The STREAMING stage that
+        // follows is bounded by inactivity instead (`stall_timeout`, carried into
+        // the returned `UpstreamPull`, #1134): a wall clock over the bytes would
+        // cap the blob size this node can pull through.
         match tokio::time::timeout(
             deps.config.pull_timeout,
             open_progressive_upstream(
@@ -323,6 +331,7 @@ impl NodeOrigin {
                 0,
                 now_micros(),
                 deps.config.max_blob_size_bytes,
+                PullDeadlines::new(deps.config.pull_timeout, deps.config.stall_timeout),
             ),
         )
         .await
@@ -841,6 +850,21 @@ async fn pull_from_candidate(
     let ctx = bind_upstream_ctx(deps, ctx)?;
     let started = Instant::now();
     let mut progress = VoucherProgress::default();
+    // Streaming is bounded by INACTIVITY, with no overall wall-clock cap (#1134).
+    //
+    // `pull_timeout` used to wrap this whole fetch, which quietly capped the blob
+    // size a node could pull through at roughly `pull_timeout × link speed` — at
+    // the 20 s default, any blob needing more than ~20 s of transfer was
+    // unfetchable on this path, and the background warm that should have rescued it
+    // was capped by the same budget. The stall bound catches the thing a deadline
+    // should catch (an upstream that stops delivering) without penalising size or
+    // link speed.
+    //
+    // The FOREGROUND serve path is still bounded — the delivery handler wraps the
+    // whole `discover → probe → rank → pull` in `outer_pull_deadline`, so a client
+    // never waits longer than that; on expiry it gets a clean miss and the transfer
+    // continues in a detached background warm. So "no hard cap here" does not mean
+    // "a client can wait forever".
     let result = stream_fetch_tracked(
         &deps.endpoint,
         EndpointAddr::new(pk),
@@ -850,7 +874,7 @@ async fn pull_from_candidate(
         hash_bytes,
         0,
         now_micros(),
-        deps.config.pull_timeout,
+        PullDeadlines::new(deps.config.pull_timeout, deps.config.stall_timeout),
         deps.config.max_blob_size_bytes,
         &mut progress,
     )
@@ -984,12 +1008,26 @@ fn classify_pull_failure(
         debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
         return;
     }
-    // OUR own per-candidate deadline firing — a possibly mis-sized local
-    // `pull_timeout`, not evidence the provider is unreachable. Don't tar its
-    // reputation locally or over gossip (#857).
+    // OUR own deadline firing — the per-candidate `pull_timeout` on the open stage,
+    // or an overall hard cap — which is a possibly mis-sized local budget, not
+    // evidence the provider is unreachable. Don't tar its reputation locally or
+    // over gossip (#857).
     if err.downcast_ref::<PullTimeout>().is_some() {
         deps.metrics.node_pull_timeout();
         debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; not tarring upstream reputation");
+        return;
+    }
+    // The upstream went SILENT mid-stream (#1134) — and unlike `PullTimeout` above,
+    // this one DOES score the peer. The distinction is the whole reason the two
+    // sentinels are separate: a whole-transfer deadline cannot tell a dead peer from
+    // a big blob on a slow link, so it fired on healthy transfers and had to be
+    // exonerating. A stall deadline resets on every byte, so it fires only when a
+    // provider we are actively waiting on stops delivering. That is what
+    // `Unreachable` means.
+    if err.downcast_ref::<PullStalled>().is_some() {
+        deps.metrics.node_pull_stalled();
+        debug!(%provider_addr, %err, "node-origin: upstream stalled mid-stream; scoring unreachable");
+        record_outcome(deps, pk, &Outcome::Unreachable);
         return;
     }
     // The upstream rejected a voucher WE presented — a stale nonce (#852),

@@ -36,8 +36,8 @@ use decdn_incentive::{
     slash_judge_domain, voucher_domain,
 };
 use decdn_node::client_requester::{
-    ChannelContext, ChannelLedger, Cumulative, UpstreamVoucherRejected, VoucherProgress,
-    sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
+    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, UpstreamVoucherRejected,
+    VoucherProgress, sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
     stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
@@ -387,7 +387,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
         *hash.as_bytes(),
         0,
         0x00c0_ffee,
-        Duration::from_secs(20),
+        PullDeadlines::whole_transfer(Duration::from_secs(20)),
         0,
         &mut progress,
     )
@@ -1701,7 +1701,7 @@ async fn buyer_rejects_oversized_total_bytes() -> anyhow::Result<()> {
         *hash.as_bytes(),
         0,
         0x00c1,
-        Duration::from_secs(10),
+        PullDeadlines::whole_transfer(Duration::from_secs(10)),
         4096,
         &mut progress,
     )
@@ -1750,7 +1750,7 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
         *hash.as_bytes(),
         0,
         0x00c2,
-        Duration::from_secs(10),
+        PullDeadlines::whole_transfer(Duration::from_secs(10)),
         8192,
         &mut progress,
     )
@@ -1802,7 +1802,7 @@ async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
         *hash.as_bytes(),
         0,
         0x00c3,
-        Duration::from_secs(10),
+        PullDeadlines::whole_transfer(Duration::from_secs(10)),
         0, // unlimited buyer ceiling
         &mut progress,
         Some(&record),
@@ -2080,7 +2080,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
             *hash_a.as_bytes(),
             0,
             0x00aa,
-            Duration::from_secs(15),
+            PullDeadlines::whole_transfer(Duration::from_secs(15)),
             0,
         ),
         stream_fetch_shared(
@@ -2093,7 +2093,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
             *hash_b.as_bytes(),
             0,
             0x00bb,
-            Duration::from_secs(15),
+            PullDeadlines::whole_transfer(Duration::from_secs(15)),
             0,
         ),
     );

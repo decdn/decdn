@@ -33,8 +33,8 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
 use decdn_client_pull::{
-    ChannelContext, ProgressCallback, UpstreamRefused, VoucherProgress, sign_client_binding,
-    stream_fetch_tracked_with_progress,
+    ChannelContext, ProgressCallback, PullDeadlines, UpstreamRefused, VoucherProgress,
+    sign_client_binding, stream_fetch_tracked_with_progress,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -442,7 +442,7 @@ pub(crate) async fn fetch_blob(
     provider: Address,
     store: &RedbBuyerChannelStore,
     hash: [u8; 32],
-    timeout: Duration,
+    deadlines: PullDeadlines,
     max_blob_bytes: u64,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Vec<u8>> {
@@ -463,7 +463,7 @@ pub(crate) async fn fetch_blob(
         hash,
         0,
         timestamp_us,
-        timeout,
+        deadlines,
         max_blob_bytes,
         &mut progress,
         on_progress,
@@ -614,7 +614,13 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         provider,
         &store,
         hash,
-        common.effective_timeout(),
+        PullDeadlines {
+            // A node that accepts the connection and never answers is as dead as
+            // one that stops mid-stream, so the same budget answers both (#1134).
+            open: common.stall_timeout(),
+            stall: common.stall_timeout(),
+            hard_cap: common.hard_cap(),
+        },
         max_blob_bytes,
         Some(&on_progress),
     )
@@ -796,7 +802,8 @@ mod tests {
             data_dir: Some(PathBuf::from("/tmp/d")),
             deposit_micro_usdc: None,
             max_blob_mb: 1024,
-            timeout_ms: 30_000,
+            stall_timeout_ms: 30_000,
+            timeout_ms: None,
         }
     }
 
@@ -913,15 +920,19 @@ mod tests {
         );
     }
 
+    /// The deadlines a fetch actually runs under (#1134): an inactivity bound, and
+    /// no overall cap unless one is asked for. The blob-size ceiling no longer
+    /// feeds into either — it used to scale the deadline at an assumed 35 MiB/s,
+    /// which is what made a large-but-healthy transfer fail.
     #[test]
-    fn effective_timeout_delegates_with_correct_arg_order() {
-        // Default pair (1024 MiB, 30_000 ms): scaled ≈ 29_257 < floor → 30 s.
+    fn deadlines_are_stall_bound_and_uncapped_by_default() {
         let mut c = common();
-        assert_eq!(c.effective_timeout(), Duration::from_secs(30));
-        // Larger blob scales the timeout up (proves max_blob_mb, not timeout_ms,
-        // is the scaled term — a transposed delegation would fail here).
+        assert_eq!(c.stall_timeout(), Duration::from_secs(30));
+        assert_eq!(c.hard_cap(), None);
         c.max_blob_mb = 4096;
-        assert_eq!(c.effective_timeout(), Duration::from_millis(117_028));
+        assert_eq!(c.hard_cap(), None, "blob size must not conjure a deadline");
+        c.timeout_ms = Some(200_000);
+        assert_eq!(c.hard_cap(), Some(Duration::from_secs(200)));
     }
 
     #[test]

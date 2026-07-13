@@ -107,10 +107,21 @@ struct BackgroundFill {
     /// Cancelled on node shutdown so in-flight warm tasks stop cooperatively at
     /// their next await rather than being left to run past drain.
     cancel: CancellationToken,
-    /// Fresh budget granted to a background fill (it re-pulls from scratch — the
-    /// foreground future was dropped, taking its partial work). Reuses the
-    /// derived outer pull-through deadline.
-    budget: Duration,
+    /// Optional overall wall-clock cap on a background fill. `None` — the wiring's
+    /// choice — means the warm runs until it completes, stalls, or is cancelled.
+    ///
+    /// It used to reuse the derived outer pull-through deadline, and that made the
+    /// background fill useless for exactly the content it matters most for: the
+    /// warm re-pulls from scratch, so capping it at the same ~70 s the *foreground*
+    /// gave up on meant a blob that could not be pulled in one deadline could not
+    /// be warmed in one either. The node simply could not acquire any blob needing
+    /// more than a deadline's worth of transfer (#1134).
+    ///
+    /// Dropping the cap is safe because the pull's streaming stage is bounded by
+    /// inactivity (`node_pull_stall_timeout_sec`) rather than a wall clock: a warm
+    /// cannot hang, it can only run as long as an upstream keeps feeding it bytes.
+    /// A dead upstream still trips the stall bound, and shutdown still cancels.
+    budget: Option<Duration>,
     /// Hashes with a background fill currently running, so repeated foreground
     /// misses on the same hash don't spawn duplicate warming tasks. A std mutex
     /// (no await held); a poisoned lock is recovered rather than disabling the
@@ -174,6 +185,19 @@ fn arm_background_fill(
         hash,
         inflight: Arc::clone(inflight),
     })
+}
+
+/// Run `fut` under an optional wall-clock deadline, keeping the `Result<_,
+/// Elapsed>` shape of [`tokio::time::timeout`] so callers branch identically
+/// whether or not a cap is set. `None` never elapses.
+async fn with_optional_deadline<F: std::future::Future>(
+    deadline: Option<Duration>,
+    fut: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    match deadline {
+        Some(d) => tokio::time::timeout(d, fut).await,
+        None => Ok(fut.await),
+    }
 }
 
 /// Server-side classification of a `serve_stream` refusal, used to pick the
@@ -578,9 +602,16 @@ impl ClientHandler {
     /// Attach background cache-fill (#859). Called once during runtime wiring
     /// when pull-through is enabled; a second call is ignored. After this, a
     /// foreground pull-through deadline additionally spawns a detached task
-    /// (cancelled via `cancel` on shutdown, bounded by `budget`) to keep warming
-    /// the cache from a slow upstream for future requests.
-    pub fn attach_background_fill(&self, cancel: CancellationToken, budget: Duration) {
+    /// (cancelled via `cancel` on shutdown) to keep warming the cache from a slow
+    /// upstream for future requests.
+    ///
+    /// `budget` is an OPTIONAL overall wall-clock cap; pass `None` to let the warm
+    /// run to completion, which is what the runtime does. A cap here defeats the
+    /// purpose: the warm re-pulls from scratch, so capping it at the same budget the
+    /// foreground just exhausted means a blob too large to fetch in one deadline can
+    /// never be warmed either (#1134). Its streaming stage is bounded by inactivity,
+    /// so an uncapped warm still cannot hang on a dead upstream.
+    pub fn attach_background_fill(&self, cancel: CancellationToken, budget: Option<Duration>) {
         let _ = self.background_fill.set(BackgroundFill {
             cancel,
             budget,
@@ -620,9 +651,10 @@ impl ClientHandler {
 
     /// Spawn a detached background cache-fill for `hash` (#859), unless one is
     /// already running for it or the feature is unattached. The foreground
-    /// delivery path has already given up; this re-pulls from scratch on a fresh
-    /// budget so a slow-but-available upstream still warms the cache. Best-effort
-    /// — never blocks the caller and never affects the foreground result.
+    /// delivery path has already given up; this re-pulls from scratch — uncapped by
+    /// default (see [`BackgroundFill::budget`]) — so a slow-but-available upstream
+    /// still warms the cache, however large the blob. Best-effort: never blocks the
+    /// caller and never affects the foreground result.
     fn maybe_spawn_background_fill(&self, hash: Hash) {
         let Some(bg) = self.background_fill.get() else {
             return;
@@ -645,7 +677,7 @@ impl ClientHandler {
                 () = cancel.cancelled() => {
                     tracing::debug!(%hash, "background cache-fill cancelled on shutdown");
                 }
-                result = tokio::time::timeout(budget, cache.populate(hash)) => match result {
+                result = with_optional_deadline(budget, cache.populate(hash)) => match result {
                     Ok(Ok(())) => {
                         metrics.node_pull_through_background_succeeded();
                         tracing::debug!(%hash, "background cache-fill populated blob");
@@ -653,7 +685,9 @@ impl ClientHandler {
                     Ok(Err(e)) => {
                         // Covers every populate error (clean miss, no origin, AND
                         // store/I/O fault), so the message stays neutral; the
-                        // cause rides in `error`.
+                        // cause rides in `error`. A stalled upstream lands here too
+                        // — the pull's inactivity bound is what stops an uncapped
+                        // warm from running forever.
                         metrics.node_pull_through_background_failed();
                         tracing::debug!(%hash, error = %e, "background cache-fill did not complete");
                     }

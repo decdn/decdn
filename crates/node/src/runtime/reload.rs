@@ -812,6 +812,8 @@ impl RuntimeReloadState {
                 node_to_node_pull_through_enabled: false,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
+                node_pull_stall_timeout_sec:
+                    decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
                 pull_ahead_bytes: decdn_cache::Bytes::new(
                     decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
                 ),
@@ -1324,6 +1326,8 @@ mod tests {
                 node_to_node_pull_through_enabled: false,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
+                node_pull_stall_timeout_sec:
+                    decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
                 pull_ahead_bytes: decdn_cache::Bytes::new(
                     decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
                 ),

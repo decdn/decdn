@@ -421,6 +421,115 @@ impl std::fmt::Display for UpstreamRefused {
 
 impl std::error::Error for UpstreamRefused {}
 
+/// Typed sentinel for an upstream that went SILENT mid-stream — no byte of
+/// progress for the stall budget (#1134). Distinct from [`PullTimeout`], which is
+/// our own overall wall-clock cap firing, and the distinction is load-bearing:
+///
+/// A whole-transfer deadline cannot tell "the provider is dead" from "this blob
+/// is big" or "this link is slow", so `PullTimeout` must NOT tar the provider —
+/// it fires on perfectly healthy transfers. A stall deadline resets on every byte
+/// received, so it fires ONLY when a provider stops delivering while we wait.
+/// That IS evidence the peer is unreachable, and `classify_pull_failure` scores it
+/// as such.
+///
+/// The bound rests on the non-empty-`ChunkData` invariant (#1088): with empty
+/// frames banned, a peer cannot hold the deadline open with padding that carries
+/// no bytes. Belt-and-braces, the deadline is reset only when `cumulative`
+/// actually advances — never merely because a frame arrived — so a run of
+/// non-chunk frames cannot refresh it either.
+#[derive(Debug)]
+pub struct PullStalled {
+    pub after: Duration,
+}
+
+impl std::fmt::Display for PullStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upstream stalled: no progress for {:?}", self.after)
+    }
+}
+
+impl std::error::Error for PullStalled {}
+
+/// The bounds on a pull, each matched to the stage it governs (#1134).
+///
+/// The two are not interchangeable, and conflating them is the bug this type
+/// exists to prevent. A single whole-transfer deadline — what this replaced — is
+/// mostly useless as a health signal: it has to be sized against `blob size ×
+/// link speed`, so it kills legitimate large or slow-but-healthy transfers while
+/// a value small enough to catch a dead peer quickly cannot serve a big blob at
+/// all. The operator ends up tuning a number that has nothing to do with node
+/// health.
+///
+/// Split by stage instead:
+///
+/// - **`stall`** bounds the STREAMING stage by INACTIVITY. It resets on every byte
+///   of progress, so it trips only when the provider goes unresponsive — the thing
+///   a timeout should catch — and is indifferent to transfer size and link speed.
+///   This is the primary mechanism.
+/// - **`hard_cap`** is an optional overall wall-clock escape hatch, `None` by
+///   default. It exists for a caller that must bound total runtime regardless; it
+///   is not how a stalled peer is detected.
+///
+/// - **`open`** bounds the OPEN stage (dial → request → verified `StreamResponse`)
+///   by WALL CLOCK. That stage is bounded work whose duration does not depend on
+///   the blob, so a slow one really is a stall and a wall clock is the right tool.
+///
+/// Every stage must carry a bound of its own. It is not enough for a caller to
+/// wrap the whole pull in a timeout and call the open "bounded": the buffered
+/// path's handshake happens *inside* [`stream_fetch_tracked`], so a caller that
+/// sets `hard_cap: None` would leave the `StreamResponse` read with no bound at
+/// all, and a peer that accepts a connection and then says nothing would hang the
+/// pull forever. `open` exists so that cannot be expressed.
+#[derive(Debug, Clone, Copy)]
+pub struct PullDeadlines {
+    /// Wall-clock bound on the open stage: dial, request, and the signed
+    /// `StreamResponse`. Bounded work — a slow one is a stall.
+    pub open: Duration,
+    /// Inactivity bound on the streaming stage. Reset on every byte of progress.
+    pub stall: Duration,
+    /// Optional overall wall-clock cap on the whole exchange. `None` = uncapped;
+    /// `open` and `stall` between them are what keep an uncapped pull from hanging.
+    pub hard_cap: Option<Duration>,
+}
+
+impl PullDeadlines {
+    /// The recommended shape: a wall clock on the open, inactivity on the stream,
+    /// and no overall cap — so a pull of any size completes as long as the upstream
+    /// keeps feeding it bytes.
+    #[must_use]
+    pub const fn new(open: Duration, stall: Duration) -> Self {
+        Self {
+            open,
+            stall,
+            hard_cap: None,
+        }
+    }
+
+    /// As [`Self::new`], plus an overall wall-clock cap on the whole exchange.
+    #[must_use]
+    pub const fn capped(open: Duration, stall: Duration, hard_cap: Duration) -> Self {
+        Self {
+            open,
+            stall,
+            hard_cap: Some(hard_cap),
+        }
+    }
+
+    /// The legacy single-deadline shape: one budget serving as the open bound, the
+    /// stall bound, AND the overall cap. Retained for the loopback/test helper
+    /// [`stream_fetch`], whose callers pass a deadline generous enough for the tiny
+    /// blobs they move. Production paths should not use it — that conflation is
+    /// exactly what #1134 set out to remove.
+    #[must_use]
+    pub const fn whole_transfer(timeout: Duration) -> Self {
+        Self {
+            open: timeout,
+            stall: timeout,
+            hard_cap: Some(timeout),
+        }
+    }
+}
+
 /// Build the [`UpstreamRefused`] error for a `body.ok == false` response, shared
 /// by the buffered [`fetch_inner`] and progressive [`open_progressive_pull`] open
 /// stages so the two cannot drift in how they classify a refusal.
@@ -473,7 +582,11 @@ pub async fn stream_fetch(
         hash,
         byte_offset,
         timestamp_us,
-        timeout,
+        // The legacy single-deadline shape (#1134): this helper's callers are
+        // loopback tests moving tiny blobs, for which one budget serving as both
+        // the overall cap and the stall bound is harmless. Production paths take
+        // `PullDeadlines` directly and split the two.
+        PullDeadlines::whole_transfer(timeout),
         // No buyer-side blob-size ceiling on this test/loopback helper. The
         // production pull path does not go through here — it calls
         // `stream_fetch_tracked` directly (`node_origin::pull_from_candidate`)
@@ -507,7 +620,7 @@ pub async fn stream_fetch_tracked(
     hash: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
-    timeout: Duration,
+    deadlines: PullDeadlines,
     max_blob_size_bytes: u64,
     progress: &mut VoucherProgress,
 ) -> anyhow::Result<Bytes> {
@@ -520,7 +633,7 @@ pub async fn stream_fetch_tracked(
         hash,
         byte_offset,
         timestamp_us,
-        timeout,
+        deadlines,
         max_blob_size_bytes,
         progress,
         None,
@@ -556,7 +669,7 @@ pub async fn stream_fetch_tracked_with_progress(
     hash: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
-    timeout: Duration,
+    deadlines: PullDeadlines,
     max_blob_size_bytes: u64,
     progress: &mut VoucherProgress,
     on_progress: Option<&ProgressCallback>,
@@ -569,8 +682,8 @@ pub async fn stream_fetch_tracked_with_progress(
         bytes: ctx.prior_bytes_delivered,
         amount: ctx.prior_amount,
     });
-    let result = tokio::time::timeout(
-        timeout,
+    let result = with_hard_cap(
+        deadlines.hard_cap,
         fetch_inner(
             endpoint,
             target,
@@ -581,19 +694,37 @@ pub async fn stream_fetch_tracked_with_progress(
             byte_offset,
             timestamp_us,
             max_blob_size_bytes,
+            deadlines.open,
+            deadlines.stall,
             &ledger,
             on_progress,
         ),
     )
-    .await
-    .map_err(|_| anyhow::Error::new(PullTimeout { after: timeout }));
+    .await;
     // Copy the acked watermark back into `progress` on EVERY return path (Ok, Err,
     // timeout) BEFORE returning, so the latest acked totals survive a mid-stream
     // failure or a paid-but-corrupt delivery (#852). The ledger commits only after
     // an ack, so its snapshot is exactly the last acked cumulative.
     progress.set_from_cumulative(ledger.snapshot().await, ctx.prior_nonce);
-    // Flatten: outer `Result` is the timeout error, inner is `fetch_inner`'s.
-    result?
+    result
+}
+
+/// Apply the optional overall wall-clock cap of a [`PullDeadlines`] to `fut`.
+///
+/// `None` runs the pull uncapped — which is safe precisely because the `stall`
+/// bound inside bounds every streaming read. A pull with no cap cannot hang; it
+/// can only take as long as the upstream keeps feeding it bytes, which is the
+/// point (#1134).
+async fn with_hard_cap<F>(hard_cap: Option<Duration>, fut: F) -> anyhow::Result<Bytes>
+where
+    F: std::future::Future<Output = anyhow::Result<Bytes>>,
+{
+    match hard_cap {
+        Some(cap) => tokio::time::timeout(cap, fut)
+            .await
+            .map_err(|_| anyhow::Error::new(PullTimeout { after: cap }))?,
+        None => fut.await,
+    }
 }
 
 /// Like [`stream_fetch`], but issues vouchers through a caller-owned shared
@@ -626,11 +757,11 @@ pub async fn stream_fetch_shared(
     hash: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
-    timeout: Duration,
+    deadlines: PullDeadlines,
     max_blob_size_bytes: u64,
 ) -> anyhow::Result<Bytes> {
-    tokio::time::timeout(
-        timeout,
+    with_hard_cap(
+        deadlines.hard_cap,
         fetch_inner(
             endpoint,
             target,
@@ -641,6 +772,8 @@ pub async fn stream_fetch_shared(
             byte_offset,
             timestamp_us,
             max_blob_size_bytes,
+            deadlines.open,
+            deadlines.stall,
             ledger,
             // Shared concurrent pulls interleave many blobs on one channel; a
             // single unified byte-progress readout would be meaningless, so this
@@ -649,7 +782,94 @@ pub async fn stream_fetch_shared(
         ),
     )
     .await
-    .map_err(|_| anyhow::Error::new(PullTimeout { after: timeout }))?
+}
+
+/// The OPEN stage of a `cdn/client/v1` pull, shared by the buffered
+/// [`fetch_inner`] and the progressive [`open_progressive_pull`] so the two cannot
+/// drift: dial, open the bi-stream, send the [`StreamRequest`], and read + verify
+/// the signed [`StreamResponse`]. Returns the live connection, its streams, and the
+/// verified response; the caller decides whether to buffer or stream from there.
+///
+/// **Bounded as a whole by `open`** (#1134), and that bound lives HERE rather than
+/// in the caller for a reason worth stating: the production pull paths run with no
+/// overall wall-clock cap, so that a blob of any size can complete as long as bytes
+/// keep arriving. Leaving the open to "whatever the caller wraps us in" therefore
+/// means leaving it *unbounded* — and this is precisely the stage where a peer can
+/// accept a connection, take our request, and then say nothing at all. Such a peer
+/// would hang the pull until the QUIC idle timeout.
+///
+/// The stall bound cannot cover this stage: it measures inactivity BETWEEN bytes,
+/// and here no byte has arrived yet. A wall clock is the right tool because the
+/// open is bounded work whose duration does not scale with the blob.
+///
+/// A `slash_sig` that does not recover to `expected_signer`, a mismatched echoed
+/// field, or a zero rate fails here (see [`verify_response`]) — before any byte is
+/// paid for. A refusal (`body.ok == false`) is returned to the caller intact, since
+/// only the caller knows how to classify it.
+#[allow(clippy::too_many_arguments)]
+async fn open_stream(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &ChannelContext,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    open: Duration,
+) -> anyhow::Result<(
+    iroh::endpoint::Connection,
+    SendStream,
+    RecvStream,
+    StreamResponse,
+)> {
+    tokio::time::timeout(open, async move {
+        // Full handshake — no 0-RTT on cdn/client/v1 (ADR 015).
+        let conn = endpoint
+            .connect(target, ALPN_CLIENT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
+
+        let req = StreamRequest {
+            hash,
+            channel_id: ctx.channel_id.into(),
+            byte_offset,
+            // Whole-tail fetch; a bounded range is plumbed by the origin range-pull
+            // path (ADR 037 §Origin-tier pull-through), not these node-to-node pulls.
+            byte_len: 0,
+            timestamp_us,
+        };
+        // Two-phase encode (ADR 005): attach the client identity binding when the
+        // context carries one, so the serving node can prove channel ownership and
+        // authorize a cache-miss origin pull (#1115). Absent ⇒ no ext bytes, exactly
+        // the pre-#1115 wire (unbound node-to-node / registered-client path).
+        let ext = client_binding_ext(ctx);
+        let payload = decdn_protocol::encode_stream_request(&req, ext.as_ref())
+            .map_err(|e| anyhow::anyhow!("encode stream request: {e}"))?;
+        write_frame(&mut send, &payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("write stream request: {e}"))?;
+
+        let resp = match read_client_message(&mut recv).await? {
+            ClientMessage::StreamResponse(r) => r,
+            other => anyhow::bail!("expected StreamResponse, got {}", variant_name(&other)),
+        };
+        verify_response(
+            &resp,
+            slash_domain,
+            expected_signer,
+            hash,
+            ctx.channel_id,
+            timestamp_us,
+        )?;
+        Ok((conn, send, recv, resp))
+    })
+    .await
+    .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -663,51 +883,23 @@ async fn fetch_inner(
     byte_offset: u64,
     timestamp_us: u64,
     max_blob_size_bytes: u64,
+    open: Duration,
+    stall: Duration,
     ledger: &ChannelLedger,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
-    // Full handshake — no 0-RTT on cdn/client/v1 (ADR 015).
-    let conn = endpoint
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
-
-    let req = StreamRequest {
-        hash,
-        channel_id: ctx.channel_id.into(),
-        byte_offset,
-        // Whole-tail fetch; a bounded range is plumbed by the origin range-pull
-        // path (ADR 037 §Origin-tier pull-through), not these node-to-node pulls.
-        byte_len: 0,
-        timestamp_us,
-    };
-    // Two-phase encode (ADR 005): attach the client identity binding when the
-    // context carries one, so the serving node can prove channel ownership and
-    // authorize a cache-miss origin pull (#1115). Absent ⇒ no ext bytes, exactly
-    // the pre-#1115 wire (unbound node-to-node / registered-client path).
-    let ext = client_binding_ext(ctx);
-    let payload = decdn_protocol::encode_stream_request(&req, ext.as_ref())
-        .map_err(|e| anyhow::anyhow!("encode stream request: {e}"))?;
-    write_frame(&mut send, &payload)
-        .await
-        .map_err(|e| anyhow::anyhow!("write stream request: {e}"))?;
-
-    let resp = match read_client_message(&mut recv).await? {
-        ClientMessage::StreamResponse(r) => r,
-        other => anyhow::bail!("expected StreamResponse, got {}", variant_name(&other)),
-    };
-    verify_response(
-        &resp,
+    let (conn, mut send, mut recv, resp) = open_stream(
+        endpoint,
+        target,
+        ctx,
         slash_domain,
         expected_signer,
         hash,
-        ctx.channel_id,
+        byte_offset,
         timestamp_us,
-    )?;
+        open,
+    )
+    .await?;
 
     if !resp.body.ok {
         return Err(refusal(resp.error.as_ref()));
@@ -762,6 +954,7 @@ async fn fetch_inner(
         rate_per_mb,
         interval_bytes,
         expected_wire,
+        stall,
         on_progress,
     )
     .await?;
@@ -813,6 +1006,11 @@ fn aligned_wire_len(byte_offset: u64, total_bytes: u64) -> anyhow::Result<u64> {
 /// the caller's completeness check (integrity is verified per bao chunk group by
 /// the decoder, not here). Enforces the chunk-size ceiling and the
 /// `cumulative <= expected_wire_bytes` overrun guard (ADR 005 §`cdn/client/v1`).
+///
+/// `stall` bounds this loop by INACTIVITY (#1134): every read must land within
+/// `stall` of the last byte of progress, so the loop is bounded no matter how
+/// large the blob or how slow the link, and a silent upstream is abandoned
+/// promptly rather than left to the QUIC idle timeout.
 #[allow(clippy::too_many_arguments)]
 async fn receive_and_pay(
     send: &mut SendStream,
@@ -822,6 +1020,7 @@ async fn receive_and_pay(
     rate_per_mb: u64,
     interval_bytes: u64,
     expected_wire_bytes: u64,
+    stall: Duration,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<(BytesMut, u64)> {
     let mut buf = BytesMut::new();
@@ -830,9 +1029,17 @@ async fn receive_and_pay(
     // handed to the ledger (which accumulates deltas across this and any concurrent
     // streams on the channel, advancing only after the upstream acks).
     let mut bytes_since_voucher: u64 = 0;
+    // The inactivity deadline (#1134). Reset ONLY where `cumulative` advances —
+    // not on every frame — so neither a run of non-chunk frames nor (were #1088's
+    // floor ever relaxed) a run of empty ones could hold it open without
+    // delivering anything.
+    let mut deadline = tokio::time::Instant::now() + stall;
 
     loop {
-        match read_client_message(recv).await? {
+        let msg = tokio::time::timeout_at(deadline, read_client_message(recv))
+            .await
+            .map_err(|_| anyhow::Error::new(PullStalled { after: stall }))??;
+        match msg {
             ClientMessage::ChunkData(chunk) => {
                 // A chunk must carry 1..=CHUNK_SIZE bytes, and the running total
                 // must not exceed what the response promised — otherwise a
@@ -849,6 +1056,9 @@ async fn receive_and_pay(
                         "server sent {cumulative} bytes, more than the {expected_wire_bytes} promised"
                     );
                 }
+                // Bytes arrived: the upstream is alive, so extend the inactivity
+                // deadline. This is the ONLY place it moves.
+                deadline = tokio::time::Instant::now() + stall;
                 buf.extend_from_slice(&chunk.bytes);
                 // Surface delivery progress after each chunk. `cumulative` and
                 // `expected_wire_bytes` are both wire bytes, so the readout is
@@ -862,8 +1072,21 @@ async fn receive_and_pay(
                 let boundary = bytes_since_voucher >= interval_bytes && interval_bytes > 0;
                 let closing = cumulative >= expected_wire_bytes && bytes_since_voucher > 0;
                 if boundary || closing {
-                    self_pay(send, recv, ctx, ledger, rate_per_mb, bytes_since_voucher).await?;
+                    self_pay(
+                        send,
+                        recv,
+                        ctx,
+                        ledger,
+                        rate_per_mb,
+                        bytes_since_voucher,
+                        stall,
+                    )
+                    .await?;
                     bytes_since_voucher = 0;
+                    // The voucher exchange is a round trip we just completed, so
+                    // the upstream is alive as of now — don't charge its latency
+                    // against the next chunk's stall budget.
+                    deadline = tokio::time::Instant::now() + stall;
                 }
             }
             ClientMessage::StreamEnd => break,
@@ -1005,12 +1228,19 @@ pub struct UpstreamPullHeader {
 /// connection if none ran, but cannot return the watermark, so the obligation
 /// stands.
 ///
-/// **Deadlines.** The serve loop bounds only the *open* (handshake) phase with
-/// the pull-through deadline. The streaming `next_chunk`/`finish` reads here are
-/// NOT each deadline-bounded: a stalled upstream mid-stream is bounded by the
-/// QUIC idle timeout and by the loop's own pacing — it stops pulling and recoups
-/// a downstream voucher every window, so it cannot run unboundedly ahead of
-/// (unpaid) downstream demand — rather than by a per-read timeout in this type.
+/// **Deadlines.** The caller bounds the *open* (handshake) phase with its own
+/// wall clock (the per-candidate pull-through deadline). The streaming
+/// `next_chunk`/`finish` reads are bounded here, by INACTIVITY (#1134): each read
+/// must land within `stall` of the last byte of progress. Before that they had no
+/// application-level bound at all — a silent upstream was left to the QUIC idle
+/// timeout, with only the loop's window pacing (it recoups a downstream voucher
+/// every window, so it cannot run unboundedly ahead of unpaid demand) standing
+/// between a wedged peer and an indefinitely-held serve task.
+///
+/// A wall clock would be the wrong bound to reach for here: this type exists to
+/// stream blobs of any size, so any fixed deadline would either kill a healthy
+/// large transfer or be too loose to catch a dead one. Inactivity is indifferent
+/// to size and link speed.
 pub struct UpstreamPull {
     conn: iroh::endpoint::Connection,
     send: SendStream,
@@ -1020,6 +1250,8 @@ pub struct UpstreamPull {
     hash: [u8; 32],
     rate_per_mb: u64,
     interval_bytes: u64,
+    /// Inactivity budget for every streaming read (#1134). Reset on byte progress.
+    stall: Duration,
     /// Promised **wire** bytes for this stream: the bao-encoded size of the
     /// chunk-group-aligned range (content plus interleaved proof, ADR 038), not
     /// the content-byte remainder. Bounds the receive loop and the closing voucher.
@@ -1057,6 +1289,13 @@ impl std::fmt::Debug for UpstreamPull {
 /// Same set as [`stream_fetch`] for the handshake/response phase (connect /
 /// transport, refused or zero-rate response, bad `slash_sig`, mismatched echoed
 /// field, oversized `total_bytes`).
+///
+/// The open stage is bounded by `deadlines.open`, inside the shared `open_stream`
+/// helper — NOT left to the caller (#1134). `node_origin` additionally wraps this
+/// call in its per-candidate budget, which is belt-and-braces rather than the sole
+/// bound. `deadlines.stall` is the INACTIVITY budget the returned [`UpstreamPull`]
+/// carries into every streaming read; `deadlines.hard_cap` is not consulted here
+/// (the caller owns the streaming lifetime on this path).
 #[allow(clippy::too_many_arguments)]
 pub async fn open_progressive_pull(
     endpoint: &Endpoint,
@@ -1068,47 +1307,21 @@ pub async fn open_progressive_pull(
     byte_offset: u64,
     timestamp_us: u64,
     max_blob_size_bytes: u64,
+    deadlines: PullDeadlines,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-    // Full handshake — no 0-RTT on cdn/client/v1 (ADR 015).
-    let conn = endpoint
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
-
-    let req = StreamRequest {
-        hash,
-        channel_id: ctx.channel_id.into(),
-        byte_offset,
-        // Whole-tail fetch; a bounded range is plumbed by the origin range-pull
-        // path (ADR 037 §Origin-tier pull-through), not these node-to-node pulls.
-        byte_len: 0,
-        timestamp_us,
-    };
-    // Two-phase encode (ADR 005): attach the client identity binding when the
-    // context carries one (#1115), mirroring `fetch_inner`.
-    let ext = client_binding_ext(ctx);
-    let payload = decdn_protocol::encode_stream_request(&req, ext.as_ref())
-        .map_err(|e| anyhow::anyhow!("encode stream request: {e}"))?;
-    write_frame(&mut send, &payload)
-        .await
-        .map_err(|e| anyhow::anyhow!("write stream request: {e}"))?;
-
-    let resp = match read_client_message(&mut recv).await? {
-        ClientMessage::StreamResponse(r) => r,
-        other => anyhow::bail!("expected StreamResponse, got {}", variant_name(&other)),
-    };
-    verify_response(
-        &resp,
+    let stall = deadlines.stall;
+    let (conn, send, recv, resp) = open_stream(
+        endpoint,
+        target,
+        ctx,
         slash_domain,
         expected_signer,
         hash,
-        ctx.channel_id,
+        byte_offset,
         timestamp_us,
-    )?;
+        deadlines.open,
+    )
+    .await?;
     if !resp.body.ok {
         return Err(refusal(resp.error.as_ref()));
     }
@@ -1148,6 +1361,7 @@ pub async fn open_progressive_pull(
         interval_bytes,
     };
     let pull = UpstreamPull {
+        stall,
         conn,
         send,
         recv,
@@ -1200,6 +1414,7 @@ impl UpstreamPull {
             &ledger,
             self.rate_per_mb,
             delta_bytes,
+            self.stall,
         )
         .await;
         // Copy back the committed watermark on every path: on Ok the ledger
@@ -1223,7 +1438,17 @@ impl UpstreamPull {
         if self.ended {
             return Ok(None);
         }
-        match read_client_message(&mut self.recv).await? {
+        // The inactivity bound (#1134). A per-call budget IS the stall budget
+        // here: every read that succeeds either carries bytes (#1088 bans empty
+        // `ChunkData`) or terminates the stream (`StreamEnd` / `StreamError` /
+        // anything else bails), so there is no frame a peer can send to hold this
+        // open without making progress. The clock starts when we begin waiting,
+        // not when the last chunk landed, so the caller's downstream-forward time
+        // is not charged against the upstream's budget.
+        let msg = tokio::time::timeout(self.stall, read_client_message(&mut self.recv))
+            .await
+            .map_err(|_| anyhow::Error::new(PullStalled { after: self.stall }))??;
+        match msg {
             ClientMessage::ChunkData(chunk) => {
                 // Bounds the payload on BOTH sides: the ceiling caps per-frame
                 // allocation, and the non-empty floor keeps every frame a unit of
@@ -1276,7 +1501,12 @@ impl UpstreamPull {
     /// stream/protocol error while draining to the end of the stream.
     pub async fn finish(mut self) -> anyhow::Result<VoucherProgress> {
         while !self.ended {
-            match read_client_message(&mut self.recv).await? {
+            // Same inactivity bound as `next_chunk` (#1134): an upstream that
+            // never sends its `StreamEnd` must not hold the drain open forever.
+            let msg = tokio::time::timeout(self.stall, read_client_message(&mut self.recv))
+                .await
+                .map_err(|_| anyhow::Error::new(PullStalled { after: self.stall }))??;
+            match msg {
                 ClientMessage::StreamEnd => self.ended = true,
                 ClientMessage::ChunkData(_) => {
                     anyhow::bail!("server sent ChunkData after the promised total")
@@ -1342,6 +1572,16 @@ impl Drop for UpstreamPull {
 /// rounded cumulative). The ledger commits the advanced cumulative **only after**
 /// the upstream acks, so a rejected voucher leaves the watermark at the last acked
 /// value.
+///
+/// `stall` bounds the wait for the ack (#1134). Without it, an upstream that takes
+/// our voucher and then goes silent would hang the pull forever: the caller's
+/// inactivity deadline covers only the chunk reads, and the overall `hard_cap` is
+/// off by default. Bounding it here is no more hazardous than the QUIC idle
+/// timeout that used to be the sole backstop — the voucher is already on the wire
+/// either way, and in both cases we leave without the ack, so the ledger does not
+/// commit and our persisted watermark can lag what the node accepted. That desync
+/// is pre-existing and tracked in #1122; this only makes the bound prompt and
+/// application-level rather than a transport accident.
 async fn self_pay(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -1349,6 +1589,7 @@ async fn self_pay(
     ledger: &ChannelLedger,
     rate_per_mb: u64,
     delta_bytes: u64,
+    stall: Duration,
 ) -> anyhow::Result<()> {
     ledger
         .issue(delta_bytes, rate_per_mb, |next: Cumulative| async move {
@@ -1366,7 +1607,10 @@ async fn self_pay(
                 &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
             )
             .await?;
-            match read_client_message(recv).await? {
+            let ack = tokio::time::timeout(stall, read_client_message(recv))
+                .await
+                .map_err(|_| anyhow::Error::new(PullStalled { after: stall }))??;
+            match ack {
                 // The upstream persists before it acks (ADR 003), so this is the
                 // cumulative total it has accepted — let the ledger commit it.
                 ClientMessage::VoucherAck => Ok(()),

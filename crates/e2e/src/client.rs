@@ -16,8 +16,8 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_client_pull::{
-    BlobTooLargeClaim, ChannelContext, HashMismatch, UpstreamRefused, UpstreamVoucherRejected,
-    VoucherProgress, stream_fetch_tracked,
+    BlobTooLargeClaim, ChannelContext, HashMismatch, PullDeadlines, UpstreamRefused,
+    UpstreamVoucherRejected, VoucherProgress, stream_fetch_tracked,
 };
 use decdn_incentive::{slash_judge_domain, voucher_domain};
 use decdn_protocol::client::StreamError;
@@ -161,7 +161,9 @@ impl ClientFixture {
                 *hash.as_bytes(),
                 0,
                 TIMESTAMP_US,
-                Duration::from_secs(30),
+                // Loopback fixture: wall clock on the open, inactivity on the
+                // stream, no overall cap (#1134).
+                PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30)),
                 0,
                 &mut progress,
             )
