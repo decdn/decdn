@@ -235,8 +235,11 @@ impl ClientFixture {
 /// refuses delivery up front — its channel is `UnknownChannel` until the chain
 /// watcher decodes `ChannelOpened`, which reaches us as the wire `NotFound` that
 /// `ServeRejectReason::wire_error` collapses seven reject reasons onto. That,
-/// transport errors, a per-attempt `PullTimeout`, and the node's explicit
-/// `RetryLater` resend signal are all retryable.
+/// transport errors, a per-attempt `PullTimeout`, a `PullStalled` (#1134 — an upstream
+/// that went silent mid-stream; retryable here because in a loopback fixture the node
+/// is coming up, not dying), and the node's explicit `RetryLater` resend signal are all
+/// retryable. The last three reach the closing `true` by fallthrough rather than by an
+/// arm of their own.
 ///
 /// Everything else is terminal: a corrupt delivery (`HashMismatch`), a buyer-side
 /// size-cap rejection (`BlobTooLargeClaim`), any other mid-stream voucher

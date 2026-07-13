@@ -803,7 +803,7 @@ mod tests {
             deposit_micro_usdc: None,
             max_blob_mb: 1024,
             stall_timeout_ms: 30_000,
-            timeout_ms: None,
+            timeout_ms: 3_600_000,
         }
     }
 
@@ -920,18 +920,23 @@ mod tests {
         );
     }
 
-    /// The deadlines a fetch actually runs under (#1134): an inactivity bound, and
-    /// no overall cap unless one is asked for. The blob-size ceiling no longer
-    /// feeds into either — it used to scale the deadline at an assumed 35 MiB/s,
-    /// which is what made a large-but-healthy transfer fail.
+    /// The deadlines a fetch actually runs under (#1134): an inactivity bound for
+    /// health, plus a generous overall cap that only a pathological provider can reach
+    /// (#1145 review). The blob-size ceiling feeds into NEITHER — it used to scale the
+    /// deadline at an assumed 35 MiB/s, which is what made a large-but-healthy transfer
+    /// fail.
     #[test]
-    fn deadlines_are_stall_bound_and_uncapped_by_default() {
+    fn deadlines_are_stall_bound_with_a_generous_leak_guard() {
         let mut c = common();
         assert_eq!(c.stall_timeout(), Duration::from_secs(30));
-        assert_eq!(c.hard_cap(), None);
+        assert_eq!(c.hard_cap(), Some(Duration::from_hours(1)));
         c.max_blob_mb = 4096;
-        assert_eq!(c.hard_cap(), None, "blob size must not conjure a deadline");
-        c.timeout_ms = Some(200_000);
+        assert_eq!(
+            c.hard_cap(),
+            Some(Duration::from_hours(1)),
+            "blob size must not move the deadline"
+        );
+        c.timeout_ms = 200_000;
         assert_eq!(c.hard_cap(), Some(Duration::from_secs(200)));
     }
 

@@ -126,9 +126,11 @@ pub struct BuyerReconcileConfig {
 /// looks for orphaned `ChannelOpened(client == self)` events (#763). The buyer
 /// has no scan checkpoint (unlike the seller watcher): orphans arise from the rare
 /// post-escrow failure legs in `run_open` (event-decode or `store.record` failing
-/// *after* the on-chain escrow, or an `OPEN_RECEIPT_TIMEOUT` on a tx that later
-/// mines) or a postcard-undecodable row after a binary downgrade — all of which
-/// strand a deposit seconds before the next restart. A modest fixed lookback (~1–2
+/// *after* the on-chain escrow) or a postcard-undecodable row after a binary
+/// downgrade — all of which strand a deposit seconds before the next restart.
+/// Abandoning an in-flight `openChannel` is deliberately NOT on that list: its
+/// receipt wait is unbounded precisely so a tx that later mines can never become an
+/// orphan (see `open_channel`). A modest fixed lookback (~1–2
 /// days of an Arbitrum-Sepolia-class ~0.25 s/block L2) recovers those realistic
 /// cases cheaply without re-scanning the full chain every boot. An orphan older
 /// than this window is missed (it is reclaim-able only after its long expiry
@@ -195,6 +197,33 @@ impl std::fmt::Display for ChannelOpenPending {
 
 impl std::error::Error for ChannelOpenPending {}
 
+/// Typed sentinel for a pull that arrived while the boot/idle reconcile scan holds
+/// the provider's open slot (`InFlightOpenGuard::claim`).
+///
+/// Like [`ChannelOpenPending`] it is NOT a failure — it is "retry, someone else is
+/// mid-write on this provider's row". It needs its own type for the same reason
+/// `ChannelOpenPending` does: a bare string error carries no verdict, so it fell into
+/// `record_channel_open_failure`'s unclassified arm and was counted as a real
+/// `decdn_node_pull_channel_open_failures_total` — indistinguishable from a reverting
+/// tx or an under-funded wallet. Reconcile runs at every boot, so that turned each
+/// restart into a spike of "channel open failures" an operator would go hunting for.
+#[derive(Debug)]
+pub struct OpenSlotReserved {
+    pub provider: Address,
+}
+
+impl std::fmt::Display for OpenSlotReserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a buyer-channel reconcile holds provider {}'s open slot; retry",
+            self.provider
+        )
+    }
+}
+
+impl std::error::Error for OpenSlotReserved {}
+
 /// Marker attached to any error the detached open task has ALREADY logged and
 /// metered (#1143).
 ///
@@ -248,6 +277,11 @@ type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 fn rehydrate_open_error(err: &Arc<anyhow::Error>) -> anyhow::Error {
     let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
     let reported = err.downcast_ref::<OpenReported>().is_some();
+    let reserved = err
+        .downcast_ref::<OpenSlotReserved>()
+        .map(|r| OpenSlotReserved {
+            provider: r.provider,
+        });
     // `{:#}` renders the whole context chain, so the waiter's message matches what
     // the opening task saw.
     let mut rebuilt = anyhow::anyhow!("{err:#}");
@@ -256,6 +290,12 @@ fn rehydrate_open_error(err: &Arc<anyhow::Error>) -> anyhow::Error {
     }
     if reported {
         rebuilt = rebuilt.context(OpenReported);
+    }
+    // A joiner is the ONLY consumer of a reserved slot (the reconciler never awaits
+    // its own parked future), so dropping this here would mean the sentinel is never
+    // seen by anyone — the exact failure mode the doc above warns about.
+    if let Some(reserved) = reserved {
+        rebuilt = rebuilt.context(reserved);
     }
     rebuilt
 }
@@ -307,7 +347,7 @@ impl InFlightOpenGuard {
         if in_flight.contains_key(&provider) {
             return Ok(None);
         }
-        in_flight.insert(provider, reserved_open());
+        in_flight.insert(provider, reserved_open(provider));
         Ok(Some(Self {
             map: Arc::clone(map),
             provider,
@@ -319,9 +359,9 @@ impl InFlightOpenGuard {
 /// A pull that joins it is told to retry — it must not proceed to open, because the
 /// claimant is mid-write on this provider's row; and it must not wait, because the
 /// claimant will never produce a channel for it.
-fn reserved_open() -> SharedOpen {
+fn reserved_open(provider: Address) -> SharedOpen {
     let fut: BoxFuture<'static, OpenOutcome> = Box::pin(std::future::ready(Err(Arc::new(
-        anyhow::anyhow!("a buyer-channel reconcile holds this provider's open slot; retry"),
+        anyhow::Error::new(OpenSlotReserved { provider }),
     ))));
     fut.shared()
 }
@@ -1676,7 +1716,11 @@ async fn reclaim_once<P: Provider + Clone>(
 // Linear guard-and-act sequence (reuse re-check → rotate/reclaim → open → persist);
 // the tracing macros on each failure leg inflate the metric past threshold, as on
 // `try_reclaim`. Splitting would scatter one flow across helpers.
-#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cognitive_complexity,
+    clippy::too_many_lines
+)]
 async fn run_open<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn BuyerChannelStore>,
@@ -1695,10 +1739,30 @@ async fn run_open<P: Provider + Clone>(
     // map lock alone cannot close that window: the prior open removes its map entry
     // on completion, so a caller arriving right after sees an empty map and a
     // populated store.
-    if let Some(existing) = store
-        .get_by_provider(provider_addr)
-        .context("look up existing buyer channel under the open slot")?
-    {
+    // Every failure leg below reports for itself — `warn!`/`error!`, the failure
+    // counter, and the `OpenReported` marker — for the same reason the `open_channel`
+    // leg does: this runs detached, so by the time it fails there may be nobody left
+    // waiting to observe the `Err`. A leg that only bubbles up an error is silent
+    // in the common case, not the rare one.
+    let existing = match store.get_by_provider(provider_addr) {
+        Ok(existing) => existing,
+        Err(err) => {
+            // A store read fault (corrupt page, fd exhaustion, a full or unwritable
+            // data_dir) makes this node unable to open a channel to ANY provider —
+            // i.e. unable to pay for anything. It must never be silent.
+            error!(
+                provider = %provider_addr,
+                %err,
+                "buyer channel store read failed under the open slot; cannot open a channel to \
+                 this provider"
+            );
+            metrics.node_pull_channel_open_failure();
+            return Err(anyhow::Error::new(err))
+                .context("look up existing buyer channel under the open slot")
+                .context(OpenReported);
+        }
+    };
+    if let Some(existing) = existing {
         if !existing.is_expired_at(unix_now()) {
             debug!(
                 provider = %provider_addr,
@@ -1724,16 +1788,44 @@ async fn run_open<P: Provider + Clone>(
         // The bail below still prevents an open from overwriting an unreclaimed row —
         // it just cannot be relied on to REPORT anything.
         let _ = try_reclaim(contract, store, self_address, &existing).await;
-        if store
-            .get_by_provider(provider_addr)
-            .context("re-check expired channel after reclaim")?
-            .is_some_and(|s| s.channel_id == existing.channel_id)
-        {
-            anyhow::bail!(
+        let after_reclaim = match store.get_by_provider(provider_addr) {
+            Ok(after) => after,
+            Err(err) => {
+                error!(
+                    provider = %provider_addr,
+                    %err,
+                    "buyer channel store read failed re-checking the expired channel after \
+                     reclaim; cannot rotate this provider's channel"
+                );
+                metrics.node_pull_channel_open_failure();
+                return Err(anyhow::Error::new(err))
+                    .context("re-check expired channel after reclaim")
+                    .context(OpenReported);
+            }
+        };
+        if after_reclaim.is_some_and(|s| s.channel_id == existing.channel_id) {
+            // The reclaim did not clear the row, so we must not open a replacement
+            // (it would overwrite the provider-keyed record and abandon the old
+            // deposit). Until the sweep clears it, this provider cannot be opened at
+            // ALL — and the caller is long gone: `try_reclaim`'s receipt wait is
+            // RECLAIM_RECEIPT_TIMEOUT (minutes) against a caller budget of seconds,
+            // so on this leg nobody is ever listening. Report it here or it is
+            // invisible: the operator would see only `node_pull_channel_open_pending`
+            // climbing, whose documented meaning ("a slow L2 / stuck nonce") is the
+            // wrong diagnosis entirely.
+            warn!(
+                provider = %provider_addr,
+                channel_id = %existing.channel_id,
+                "expired buyer channel is not yet reclaimable; this provider cannot be opened \
+                 until the reclaim sweep clears it"
+            );
+            metrics.node_pull_channel_open_failure();
+            return Err(anyhow::anyhow!(
                 "expired buyer channel {} (provider {provider_addr}) is not yet reclaimable; \
                  retry after the reclaim sweep clears it",
                 existing.channel_id
-            );
+            )
+            .context(OpenReported));
         }
     }
 
@@ -2556,21 +2648,59 @@ mod tests {
         );
     }
 
-    /// A slot claimed by the reconcile scan hands any joining pull a retryable
-    /// error rather than a channel (#1143). It must not resolve to `Ok`: the
-    /// claimant is not opening anything, so a caller that treated it as "the open
-    /// succeeded" would read an empty store and report a confusing failure — and it
-    /// must not leave the caller waiting out its whole budget on an open that is
-    /// never coming.
+    /// A slot claimed by the reconcile scan hands any joining pull the typed
+    /// [`OpenSlotReserved`] rather than a channel (#1143). It must not resolve to
+    /// `Ok`: the claimant is not opening anything, so a caller that treated it as
+    /// "the open succeeded" would read an empty store and report a confusing failure
+    /// — and it must not leave the caller waiting out its whole budget on an open
+    /// that is never coming.
+    ///
+    /// Driven through the REAL join path, not by awaiting `reserved_open()` directly:
+    /// the previous version did the latter and asserted `.to_string().contains("retry")`,
+    /// so it would have passed even if a joining pull never consulted the reserved slot
+    /// at all — and the look-alike string assertion is precisely what hid the fact that
+    /// the error carried no sentinel and was being metered as a hard failure.
     #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     async fn a_reserved_slot_tells_a_joining_pull_to_retry() {
-        let outcome = reserved_open().await;
-        // It must be an Err: a caller that read this as "the open succeeded" would
-        // go looking for a channel the claimant never created.
-        let message = outcome.err().map(|err| err.to_string());
+        let server = wedged_chain().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0xab);
+
+        // The reconciler claims the slot, exactly as `reconcile_one_opened` does.
+        let _claim = InFlightOpenGuard::claim(&service.opens_in_flight, provider)
+            .expect("claiming a free slot cannot fail")
+            .expect("the slot is free, so the claim must succeed");
+
+        // A pull arriving mid-reconcile joins that slot rather than racing an
+        // openChannel into the row the reconciler is rewriting.
+        let joined = service
+            .join_or_spawn_open(provider, U256::from(1u64))
+            .expect("joining a reserved slot must not error at the map layer");
+        let err = rehydrate_open_error(
+            &joined
+                .await
+                .expect_err("a reserved slot never yields a channel"),
+        );
+
+        let reserved = err.downcast_ref::<OpenSlotReserved>();
         assert!(
-            message.as_deref().is_some_and(|msg| msg.contains("retry")),
-            "a reserved slot must yield a retryable error, got: {message:?}"
+            reserved.is_some(),
+            "a joining pull must receive the typed OpenSlotReserved — a bare string lands in \
+             record_channel_open_failure's unclassified arm and is counted as a real \
+             channel-open failure on every single boot: {err:#}"
+        );
+        assert_eq!(
+            reserved.map(|r| r.provider),
+            Some(provider),
+            "the sentinel must name the provider whose slot is held"
+        );
+        // No openChannel may have been attempted: the whole point is that the pull
+        // does NOT race the reconciler into the store.
+        assert_eq!(
+            server.received_requests().await.map_or(0, |r| r.len()),
+            0,
+            "joining a reserved slot must not reach the chain"
         );
     }
 
@@ -2671,6 +2801,266 @@ mod tests {
             reconcile_decision(&v, self_addr(), None),
             ReconcileOutcome::Skip,
             "a channel whose on-chain client is not us is never reclaimed for someone else"
+        );
+    }
+
+    // ================================================================
+    // #1143 — the singleflight, driven through the REAL service.
+    //
+    // The `WedgedOpener` fixture in `tests/node_origin_pull.rs` is a mock
+    // `ChannelOpener` whose body re-implements the timeout, so it covers
+    // `node_origin`'s candidate loop but says nothing about the mechanism here.
+    // It passes with the budget bound removed from `open_or_reuse_channel`.
+    // These drive `BuyerChannelService` itself: real `join_or_spawn_open`, real
+    // `run_open` task, real `InFlightOpenGuard`.
+    //
+    // The chain is a JSON-RPC endpoint that answers nothing in time, so the open
+    // wedges on its first fill — the state that matters, because that is when a
+    // deposit is (or is about to be) escrowed and releasing the slot would let a
+    // second `openChannel` through.
+    // ================================================================
+
+    /// Longer than any budget in these tests: every RPC the open issues hangs.
+    const RPC_HANG: Duration = Duration::from_secs(30);
+    /// What a caller in these tests is willing to wait on a wedged open.
+    const CALLER_BUDGET: Duration = Duration::from_millis(200);
+    /// A ceiling on the *call*, not the open. `open_or_reuse_channel` must return
+    /// on `CALLER_BUDGET`; blowing this means it blocked on the open instead —
+    /// which is exactly the pre-#1143 bug, so the failure must be a clean assert
+    /// rather than a hung test.
+    const CALL_CEILING: Duration = Duration::from_secs(5);
+
+    async fn wedged_chain() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(RPC_HANG))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The real service, pointed at a chain that never answers. Built by struct
+    /// literal rather than `bootstrap` because `bootstrap` self-checks the
+    /// contract over RPC — which would itself wedge.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    fn service_against(
+        server: &wiremock::MockServer,
+    ) -> BuyerChannelService<impl Provider + Clone + use<>> {
+        let signer = Arc::new(PrivateKeySigner::random());
+        let self_address = signer.address();
+        let payment_channel = Address::repeat_byte(0xcc);
+        let url = server
+            .uri()
+            .parse()
+            .unwrap_or_else(|err| panic!("mock server uri must parse: {err}"));
+        let provider = alloy::providers::ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from((*signer).clone()))
+            .connect_http(url);
+
+        BuyerChannelService {
+            contract: PaymentChannel::new(payment_channel, provider),
+            store: Arc::new(decdn_incentive::MemoryBuyerChannelStore::new()),
+            signer: Arc::clone(&signer),
+            voucher_domain: decdn_incentive::voucher::voucher_domain(1, payment_channel),
+            token: Address::repeat_byte(0x11),
+            self_address,
+            min_deposit: U256::from(1u64),
+            default_deposit: U256::from(1u64),
+            opens_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            reclaim_failures: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(Metrics::new()),
+            _reclaimer: AbortOnDrop(tokio::spawn(std::future::pending())),
+            _reconciler: AbortOnDrop(tokio::spawn(std::future::pending())),
+            _idle_reconciler: None,
+        }
+    }
+
+    /// Call the real `open_or_reuse_channel` and require that it comes back on its
+    /// own budget with a `ChannelOpenPending`.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn expect_pending<P: Provider + Clone>(
+        service: &BuyerChannelService<P>,
+        provider: Address,
+    ) {
+        let call = tokio::time::timeout(
+            CALL_CEILING,
+            service.open_or_reuse_channel(provider, U256::from(1u64), CALLER_BUDGET),
+        );
+        let Ok(result) = call.await else {
+            panic!(
+                "open_or_reuse_channel blocked on the wedged open instead of returning after its \
+                 {CALLER_BUDGET:?} budget — the caller's bound is gone (#1143)"
+            );
+        };
+        let Err(err) = result else {
+            panic!("a wedged open cannot yield a live channel");
+        };
+        assert!(
+            err.downcast_ref::<ChannelOpenPending>().is_some(),
+            "a caller that outran its budget gets the typed pending sentinel, not a failure: {err:#}"
+        );
+    }
+
+    fn slot_held<P: Provider + Clone>(service: &BuyerChannelService<P>, provider: Address) -> bool {
+        service
+            .opens_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&provider)
+    }
+
+    /// Reads clean once — satisfying `open_or_reuse_channel`'s fast-path miss — then
+    /// faults on every later read, which is where `run_open`'s re-check under the
+    /// slot lands. Models a `data_dir` that goes bad (corrupt page, fd exhaustion,
+    /// disk full) rather than one that was never readable.
+    #[derive(Debug)]
+    struct StoreThatFaultsUnderTheSlot {
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BuyerChannelStore for StoreThatFaultsUnderTheSlot {
+        fn get_by_provider(&self, _p: Address) -> Result<Option<BuyerChannelState>, StoreError> {
+            if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Ok(None);
+            }
+            Err(StoreError::Backend("simulated store fault".to_string()))
+        }
+        fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn record(&self, _s: &BuyerChannelState) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn forget(&self, _p: Address) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn forget_if_channel(&self, _p: Address, _c: ChannelId) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+        fn advance_progress(
+            &self,
+            _p: Address,
+            _c: ChannelId,
+            _n: U256,
+            _b: U256,
+            _a: U256,
+        ) -> Result<AdvanceOutcome, StoreError> {
+            Ok(AdvanceOutcome::Advanced)
+        }
+        fn add_deposit(
+            &self,
+            _p: Address,
+            _c: ChannelId,
+            _additional: U256,
+        ) -> Result<decdn_incentive::DepositOutcome, StoreError> {
+            Ok(decdn_incentive::DepositOutcome::UnknownProvider)
+        }
+    }
+
+    /// Value of a `decdn_<name>` counter in the scrape, or 0 when the line is absent.
+    #[allow(clippy::expect_used)]
+    fn counter(metrics: &Metrics, name: &str) -> u64 {
+        let text = metrics.encode().expect("encode metrics");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("decdn_{name} ")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A store fault under the open slot must be LOUD (#1145 review). `run_open` is
+    /// detached, so on the rotate leg — where `try_reclaim`'s receipt wait runs for
+    /// minutes against a caller budget of seconds — every caller has already left
+    /// with `ChannelOpenPending` by the time this fires. If the leg only bubbles up
+    /// an error, nobody observes it: a node whose `data_dir` has gone bad silently
+    /// cannot open a channel to anyone, while the operator sees only the *pending*
+    /// counter climbing (whose documented meaning, "a slow L2", is the wrong
+    /// diagnosis).
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_store_fault_under_the_open_slot_is_reported_by_the_task() {
+        let server = wedged_chain().await;
+        let mut service = service_against(&server);
+        service.store = Arc::new(StoreThatFaultsUnderTheSlot {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let metrics = Arc::clone(&service.metrics);
+        let provider = Address::repeat_byte(0xab);
+
+        // The fault is raised before any RPC, so this resolves well inside the budget.
+        let err = service
+            .open_or_reuse_channel(provider, U256::from(1u64), Duration::from_secs(5))
+            .await
+            .expect_err("a faulting store cannot yield a channel");
+
+        assert!(
+            err.downcast_ref::<OpenReported>().is_some(),
+            "the open task must mark a store fault as already-reported, or a caller that happens \
+             to still be waiting double-counts it: {err:#}"
+        );
+        assert_eq!(
+            counter(&metrics, "node_pull_channel_open_failures_total"),
+            1,
+            "a store fault under the open slot must bump the channel-open failure counter from \
+             inside the task — it is the only party guaranteed to see it"
+        );
+    }
+
+    /// The load-bearing one. A caller that gives up must NOT take the provider's
+    /// open slot with it: the `openChannel` may already be in the mempool, and a
+    /// released slot lets the next miss escrow a SECOND deposit against the same
+    /// provider — which the boot reconcile scan then declines to adopt
+    /// (`DeferredSecondOpen`), stranding it past the event lookback.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_caller_that_times_out_leaves_the_open_slot_held() {
+        let server = wedged_chain().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0xab);
+
+        expect_pending(&service, provider).await;
+
+        assert!(
+            slot_held(&service, provider),
+            "the departed caller released the provider's open slot while its openChannel is still \
+             in flight — the next miss would escrow a second deposit (#1143)"
+        );
+    }
+
+    /// The other half: a second miss arriving while the first open is still wedged
+    /// must JOIN it, not start its own. Asserted on what actually reaches the
+    /// chain, because that is what costs money.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_second_caller_joins_the_in_flight_open_rather_than_opening_again() {
+        let server = wedged_chain().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0xab);
+
+        expect_pending(&service, provider).await;
+        // Every response is stalled for RPC_HANG, so the first open cannot issue
+        // any follow-up call; its request count is settled by the time it yields.
+        let after_first = server.received_requests().await.map_or(0, |r| r.len());
+        assert!(
+            after_first > 0,
+            "the first open must have actually reached the chain, or this proves nothing"
+        );
+
+        expect_pending(&service, provider).await;
+        let after_second = server.received_requests().await.map_or(0, |r| r.len());
+
+        assert_eq!(
+            after_second, after_first,
+            "the second caller started a SECOND openChannel instead of joining the one in flight \
+             — that is a duplicate escrowed deposit (#1143)"
+        );
+        assert_eq!(
+            service
+                .opens_in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "one provider mid-open must occupy exactly one slot"
         );
     }
 }

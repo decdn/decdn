@@ -116,6 +116,21 @@ struct ChannelDeliveryState {
 /// this wants `node_pull_stall_timeout_sec`, which is the actual health knob.
 pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
 
+/// Ceiling on background warms running at once (#1145 review).
+///
+/// The per-hash `inflight` claim dedups warms for the SAME blob; it says nothing about
+/// how many DISTINCT blobs can be warming. Each warm runs the buffered path, which
+/// accumulates the whole blob into memory (bounded only by `max_blob_size_mb`, 1 GiB by
+/// default) and pays vouchers for every byte — and [`BACKGROUND_FILL_HARD_CAP`] extends
+/// a warm's life from the old ~70 s to an hour, so slow upstreams now accumulate ~50×
+/// more concurrent warms for the same miss rate. Unbounded, a burst of misses against a
+/// slow peer is a memory and spend amplifier.
+///
+/// A miss that finds no slot is simply not warmed: the hash stays unclaimed, so the next
+/// miss retries it. Shedding is the right failure mode — a warm is speculative work for
+/// a FUTURE request, and dropping it costs a later cache miss, never a live one.
+pub const MAX_CONCURRENT_BACKGROUND_FILLS: usize = 8;
+
 /// Detached background cache-fill state (#859), attached post-construction via
 /// [`ClientHandler::attach_background_fill`]. When the foreground delivery
 /// deadline fires on a node-to-node miss, the handler spawns a task to keep
@@ -147,6 +162,9 @@ struct BackgroundFill {
     /// feature — the dedup set holds no torn state to fear (only `insert`/`remove`
     /// ever take it).
     inflight: Arc<std::sync::Mutex<HashSet<Hash>>>,
+    /// Concurrency ceiling across DISTINCT hashes ([`MAX_CONCURRENT_BACKGROUND_FILLS`]).
+    /// `inflight` dedups warms for one blob; this bounds how many blobs warm at once.
+    slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// RAII guard that clears a hash from [`BackgroundFill::inflight`] when its warm
@@ -624,17 +642,21 @@ impl ClientHandler {
     /// (cancelled via `cancel` on shutdown) to keep warming the cache from a slow
     /// upstream for future requests.
     ///
-    /// `budget` is an OPTIONAL overall wall-clock cap; pass `None` to let the warm
-    /// run to completion, which is what the runtime does. A cap here defeats the
-    /// purpose: the warm re-pulls from scratch, so capping it at the same budget the
-    /// foreground just exhausted means a blob too large to fetch in one deadline can
-    /// never be warmed either (#1134). Its streaming stage is bounded by inactivity,
-    /// so an uncapped warm still cannot hang on a dead upstream.
+    /// `budget` is an OPTIONAL overall wall-clock cap. The runtime passes
+    /// `Some(`[`BACKGROUND_FILL_HARD_CAP`]`)`; `None` (tests only) runs to completion.
+    ///
+    /// The cap must be far LARGER than the foreground deadline, not equal to it: the
+    /// warm re-pulls from scratch, so capping it at the budget the foreground just
+    /// exhausted means a blob too large to fetch in one deadline can never be warmed
+    /// either (#1134). But it cannot be absent — inactivity is not liveness, and a peer
+    /// trickling one byte per stall-window would keep a warm alive forever. See
+    /// [`BACKGROUND_FILL_HARD_CAP`] for the sizing argument.
     pub fn attach_background_fill(&self, cancel: CancellationToken, budget: Option<Duration>) {
         let _ = self.background_fill.set(BackgroundFill {
             cancel,
             budget,
             inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BACKGROUND_FILLS)),
         });
     }
 
@@ -668,12 +690,12 @@ impl ClientHandler {
         let _ = self.pull_origin_gate.set(dir);
     }
 
-    /// Spawn a detached background cache-fill for `hash` (#859), unless one is
-    /// already running for it or the feature is unattached. The foreground
-    /// delivery path has already given up; this re-pulls from scratch — uncapped by
-    /// default (see [`BackgroundFill::budget`]) — so a slow-but-available upstream
-    /// still warms the cache, however large the blob. Best-effort: never blocks the
-    /// caller and never affects the foreground result.
+    /// Spawn a detached background cache-fill for `hash` (#859), unless one is already
+    /// running for it, every warm slot is busy, or the feature is unattached. The
+    /// foreground delivery path has already given up; this re-pulls from scratch under
+    /// a far larger budget than the foreground had ([`BACKGROUND_FILL_HARD_CAP`]), so a
+    /// slow-but-available upstream still warms the cache, however large the blob.
+    /// Best-effort: never blocks the caller and never affects the foreground result.
     fn maybe_spawn_background_fill(&self, hash: Hash) {
         let Some(bg) = self.background_fill.get() else {
             return;
@@ -683,14 +705,28 @@ impl ClientHandler {
         let Some(guard) = arm_background_fill(&bg.inflight, hash) else {
             return;
         };
+        // Concurrency ceiling across distinct hashes. Taken AFTER the dedup claim so a
+        // repeat miss on an already-warming hash never consumes a slot — and dropped
+        // with `guard` if we shed, so the hash stays unclaimed and a later miss retries.
+        let Ok(permit) = Arc::clone(&bg.slots).try_acquire_owned() else {
+            self.metrics.node_pull_through_background_shed();
+            tracing::debug!(
+                %hash,
+                limit = MAX_CONCURRENT_BACKGROUND_FILLS,
+                "background cache-fill shed: all warm slots busy"
+            );
+            return;
+        };
         let cache = self.cache.clone();
         let metrics = Arc::clone(&self.metrics);
         let cancel = bg.cancel.clone();
         let budget = bg.budget;
         self.metrics.node_pull_through_background_spawned();
         tokio::spawn(async move {
-            // Dropped on task exit (any branch), clearing the inflight entry.
+            // Both dropped on task exit (any branch): the guard clears the inflight
+            // entry, the permit returns the warm slot.
             let _guard = guard;
+            let _permit = permit;
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {

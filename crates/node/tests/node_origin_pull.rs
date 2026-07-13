@@ -15,7 +15,7 @@
 //! A serves both ALPNs from one endpoint (one NodeId): the real
 //! [`ClientHandler`] for the paid pull and a hand-rolled signed probe responder.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,6 +49,7 @@ use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps};
 use decdn_node::probe_client::probe_once;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver};
+use decdn_node::selection::outer_pull_deadline;
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
     StreamResponse, StreamResponseBody, VoucherRejectReason,
@@ -191,17 +192,28 @@ struct FailingRecordOpener {
 /// budget — the on-chain hazard #1143 exists for (an unresponsive RPC, a
 /// `ChannelOpened` tx that never mines). Every other provider opens instantly.
 ///
-/// It honours `budget` the way the real service does: it does NOT hang forever, it
-/// returns the typed [`ChannelOpenPending`] once the caller's budget elapses,
-/// leaving the "open" notionally still running in the background. That is the
-/// contract `node_origin` relies on to reach candidates #2..N — and returning the
-/// real sentinel (rather than a bare string) is what makes the test exercise
-/// `classify_pull_failure`'s pending arm and its counter, instead of quietly
-/// falling into the generic channel-open-failure arm. Neither `StubOpener` nor
-/// `FailingRecordOpener` models any of this.
+/// It ASSUMES the budget contract rather than testing it: it sleeps for `budget`
+/// and hands back the typed [`ChannelOpenPending`], which is what the real service
+/// does — but because this body *re-implements* that behaviour, nothing here would
+/// notice if `BuyerChannelService::open_or_reuse_channel` stopped doing it. Scope
+/// this fixture to what it genuinely covers: `node_origin`'s candidate loop, i.e.
+/// that a pending open is metered, scores no reputation, and falls through to the
+/// next candidate. Returning the real sentinel (rather than a bare string) is what
+/// makes it reach `record_channel_open_failure`'s pending arm and its counter
+/// instead of the generic channel-open-failure arm.
+///
+/// The singleflight ITSELF — the caller's bound, and the open slot surviving a
+/// caller that walks away — is guarded where the mechanism lives:
+/// `a_caller_that_times_out_leaves_the_open_slot_held` and
+/// `a_second_caller_joins_the_in_flight_open_rather_than_opening_again` in
+/// `crates/node/src/buyer_channel.rs`, plus section A0 of the anvil e2e. Neither
+/// `StubOpener` nor `FailingRecordOpener` models any of this.
 #[derive(Debug)]
 struct WedgedOpener {
-    wedged: Address,
+    /// Every provider whose channel open wedges. A set, not a single address, so a
+    /// test can wedge enough candidates to prove the loop still reaches the LAST
+    /// one `MAX_PROVIDER_ATTEMPTS` allows.
+    wedged: HashSet<Address>,
     channel_id: B256,
     token: Address,
     deposit: U256,
@@ -223,17 +235,15 @@ impl ChannelOpener for WedgedOpener {
         if let Ok(mut attempted) = self.attempted.lock() {
             attempted.push(provider_addr);
         }
-        if provider_addr == self.wedged {
-            // Consume exactly the budget, then return the TYPED sentinel — precisely
-            // what `BuyerChannelService::open_or_reuse_channel` does when its
-            // detached open task has not resolved by then.
+        if self.wedged.contains(&provider_addr) {
+            // Consume exactly the budget, then return the TYPED sentinel — a stand-in
+            // for what the real service does once its detached open task has not
+            // resolved in time. This is a MODEL of that contract, not a check on it;
+            // see the doc above for where the contract itself is guarded.
             //
-            // Both halves matter. Sleeping *longer* would model a bound the real
-            // service does not have (it stops waiting AT the budget), letting this
-            // pass against code that had reintroduced the unbounded open. And a bare
-            // string error would not `downcast_ref::<ChannelOpenPending>()`, so
-            // `classify_pull_failure` would take its generic-failure arm instead of
-            // the pending one — the test would still pass (neither arm scores
+            // A bare string error would not `downcast_ref::<ChannelOpenPending>()`, so
+            // `record_channel_open_failure` would take its generic-failure arm instead
+            // of the pending one — the test would still pass (neither arm scores
             // reputation) while never exercising the path it claims to.
             tokio::time::sleep(budget).await;
             return Err(anyhow::Error::new(ChannelOpenPending {
@@ -2385,7 +2395,9 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
 /// — the hazard is entirely in the buyer's chain lane, which is also why it must
 /// cost the peer no reputation: our RPC being slow says nothing about them.
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
+// multi-node fixture setup, like its siblings above; the two wedged nodes are
+// deliberately named in parallel (`w_*` / `w2_*`) so the pair reads as a pair.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()> {
     let payload = vec![0xE1u8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
@@ -2436,9 +2448,14 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
         RATE,
     );
 
-    // --- Node W: quotes a CHEAPER rate so it ranks #1, answers probes honestly,
-    //     and holds the blob — but its channel open wedges. It is a perfectly good
-    //     provider; our chain lane to it is what is broken. --------------------
+    // --- Nodes W1 and W2: quote a CHEAPER rate so they rank ahead of A, answer
+    //     probes honestly, and hold the blob — but their channel opens wedge. They
+    //     are perfectly good providers; our chain lane to them is what is broken.
+    //
+    //     TWO of them, not one, and that is the point: `MAX_PROVIDER_ATTEMPTS` is 3,
+    //     so wedging two forces the honest node into the LAST attempt the loop is
+    //     allowed. A single wedged candidate leaves A at slot #2 and cannot tell a
+    //     loop that reaches #2 from one that reaches #3. -------------------------
     let w_sk = fresh_key();
     let w_id = w_sk.public();
     let w_eth = Arc::new(PrivateKeySigner::random());
@@ -2454,11 +2471,24 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
         STALL_RATE,
     );
 
+    let w2_sk = fresh_key();
+    let w2_id = w2_sk.public();
+    let w2_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_w2, addr_w2) =
+        local_endpoint(w2_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_w2 = spawn_a_stalling_server(
+        ep_w2.clone(),
+        Arc::clone(&w2_eth),
+        slash_domain(),
+        total_bytes,
+        STALL_RATE,
+    );
+
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    for (id, addr) in [(a_id, addr_a), (w_id, addr_w)] {
+    for (id, addr) in [(a_id, addr_a), (w_id, addr_w), (w2_id, addr_w2)] {
         let _ = probe_once(
             &ep_b,
             EndpointAddr::new(id).with_ip_addr(addr),
@@ -2476,14 +2506,16 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
     let b_metrics = Arc::new(Metrics::new());
 
     let w_dht = DhtNodeId::from_bytes(*w_id.as_bytes());
+    let w2_dht = DhtNodeId::from_bytes(*w2_id.as_bytes());
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
     let mut addr_map = HashMap::new();
     addr_map.insert(w_dht, w_eth.address());
+    addr_map.insert(w2_dht, w2_eth.address());
     addr_map.insert(a_dht, a_eth.address());
 
     let attempted: Arc<Mutex<Vec<Address>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(WedgedOpener {
-        wedged: w_eth.address(),
+        wedged: HashSet::from([w_eth.address(), w2_eth.address()]),
         channel_id,
         token: TOKEN,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
@@ -2494,6 +2526,7 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
     let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
         HashMap::from([
             (*w_id.as_bytes(), "XX".to_string()),
+            (*w2_id.as_bytes(), "XX".to_string()),
             (*a_id.as_bytes(), "DE".to_string()),
         ]),
     ))));
@@ -2507,22 +2540,28 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
         &obs_buffer,
         &b_metrics,
         &region_accountant,
-        vec![w_dht, a_dht],
+        vec![w_dht, w2_dht, a_dht],
         addr_map,
         per_candidate,
-        Duration::from_secs(20),
+        // The REAL production outer deadline, derived the way the runtime derives it,
+        // rather than an arbitrary generous number — so the loop is held to the budget
+        // it actually gets. (At this small a `per_candidate` the pre-fix formula also
+        // fits, so this is not what catches a regression in the deadline ARITHMETIC —
+        // `selection::outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost`
+        // is. What this pins is that the loop reaches the third and last candidate.)
+        outer_pull_deadline(per_candidate),
         0,
     );
 
-    // The loop must abandon W on its own budget and deliver from A. Bounding the
-    // whole fetch is the real assertion: before the fix the wedged open was
-    // unbounded, so this future never resolved at all.
+    // The loop must abandon BOTH wedged candidates on their own budgets and still
+    // deliver from A — inside the outer deadline the runtime would really give it.
+    // Before #1143 the wedged open was unbounded, so this future never resolved at all.
     let fetched = tokio::time::timeout(
-        Duration::from_secs(20),
+        outer_pull_deadline(per_candidate),
         Origin::fetch(&origin, hash, u64::MAX),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("fetch never returned: the wedged open starved the loop"))?
+    .map_err(|_| anyhow::anyhow!("fetch never returned: the wedged opens starved the loop"))?
     .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
     let bytes = fetched
         .collect_to_bytes()
@@ -2533,48 +2572,59 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
         "pulled bytes mismatch"
     );
 
-    // The loop genuinely reached candidate #2 — it did not merely happen to pick A
+    // The loop genuinely reached candidate #3 — it did not merely happen to pick A
     // first. Without this, a ranking change could make the test pass while leaving
-    // the starvation bug in place.
+    // the starvation bug in place. A is asserted LAST (not merely present): that is
+    // the slot only a loop that survived both wedged opens can reach.
     let attempted = attempted
         .lock()
         .map_err(|_| anyhow::anyhow!("attempted lock poisoned"))?
         .clone();
     anyhow::ensure!(
-        attempted == vec![w_eth.address(), a_eth.address()],
-        "expected the wedged candidate to be tried FIRST and then fallen through, got {attempted:?}"
+        attempted.len() == 3 && attempted.last() == Some(&a_eth.address()),
+        "the honest candidate must be reached in the THIRD and last allowed attempt, after both \
+         wedged opens are abandoned; got {attempted:?}"
+    );
+    anyhow::ensure!(
+        attempted.iter().take(2).copied().collect::<HashSet<_>>()
+            == HashSet::from([w_eth.address(), w2_eth.address()]),
+        "both wedged candidates must be tried BEFORE the honest one, got {attempted:?}"
     );
 
-    // A wedged open is OUR chain lane, not the peer's fault: W must take no
-    // reputation hit, locally or over gossip. This is the same exoneration
+    // A wedged open is OUR chain lane, not the peer's fault: neither wedged provider
+    // may take a reputation hit, locally or over gossip. This is the same exoneration
     // `PullTimeout` gets, and for the same reason.
     let drained = obs_buffer.drain();
-    anyhow::ensure!(
-        !drained.iter().any(|(p, _)| *p == w_id),
-        "a provider whose channel open wedged must not be gossiped about (#1143)"
-    );
-    anyhow::ensure!(
-        (local_rep.score(w_id) - 0.5).abs() < f64::EPSILON,
-        "the wedged provider's local score must stay neutral, got {}",
-        local_rep.score(w_id)
-    );
+    for (wedged_id, label) in [(w_id, "W1"), (w2_id, "W2")] {
+        anyhow::ensure!(
+            !drained.iter().any(|(p, _)| *p == wedged_id),
+            "{label}: a provider whose channel open wedged must not be gossiped about (#1143)"
+        );
+        anyhow::ensure!(
+            (local_rep.score(wedged_id) - 0.5).abs() < f64::EPSILON,
+            "{label}: the wedged provider's local score must stay neutral, got {}",
+            local_rep.score(wedged_id)
+        );
+    }
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
-    // The wedged candidate took the PENDING arm of `classify_pull_failure`, not the
-    // generic channel-open-failure arm. Both arms record no reputation, so without
-    // these two counters the assertions above would pass even if the typed
+    // Both wedged candidates took the PENDING arm of `record_channel_open_failure`,
+    // not the generic channel-open-failure arm. Both arms record no reputation, so
+    // without these two counters the assertions above would pass even if the typed
     // `ChannelOpenPending` were never produced — the test would prove nothing about
     // the mechanism it exists for. The split also matters operationally: "pending"
-    // says the node's chain lane is slower than its `node_pull_timeout_sec`, while
+    // says the node's chain lane is slower than `CHANNEL_OPEN_CALLER_BUDGET`, while
     // "failure" says the tx reverted or the wallet is under-funded.
-    assert_counter(&b_metrics, "node_pull_channel_open_pending_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_channel_open_pending_total", 2)?;
     assert_counter(&b_metrics, "node_pull_channel_open_failures_total", 0)?;
 
     ep_b.close().await;
     ep_a.close().await;
     ep_w.close().await;
+    ep_w2.close().await;
     task_a.await?;
     task_w.await?;
+    task_w2.await?;
     Ok(())
 }
 
@@ -2592,10 +2642,11 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
 /// property #859 sized the outer deadline around and #1141 broke on this path.
 ///
 /// The 12s wrapper stands in for the serve path's outer deadline (the real
-/// `selection::outer_pull_deadline` for a 3s per-candidate budget is 3×3s + 10s
-/// slack = 19s; 12s is a tighter stand-in that still admits two 3s stalls plus a
-/// healthy open). With no per-candidate bound, staller #1 eats the whole wrapper
-/// and this elapses.
+/// `selection::outer_pull_deadline` for a 3s per-candidate budget is
+/// 3×(5s channel-open + 3s) + 10s slack = 34s; 12s is a tighter stand-in that still
+/// admits two 3s stalls plus a healthy open — the opens here are instant, so no
+/// candidate spends its channel-open budget). With no per-candidate bound, staller
+/// #1 eats the whole wrapper and this elapses.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<()> {
@@ -4328,6 +4379,25 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         drained.len() == 1 && drained.iter().any(|(p, _)| *p == a_id),
         "expected exactly one observation (A's clean delivery), got {drained:?}"
     );
+
+    // …but exonerating N must not mean FORGETTING about it (#1145 review). N answered
+    // `has_blob = true` at probe and then refused the pull, so it contradicted itself;
+    // with no record of any kind it keeps its neutral score, keeps out-ranking A on
+    // rate, and burns one of `MAX_PROVIDER_ATTEMPTS` on every single miss — forever.
+    // The refusal is negative-cached against (N, hash), so a second fetch skips N
+    // entirely: the refusal counter must NOT advance again.
+    let refetched = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("second node-origin fetch failed: {e}"))?;
+    anyhow::ensure!(
+        refetched
+            .collect_to_bytes()
+            .await?
+            .is_some_and(|b| b.as_ref() == payload.as_slice()),
+        "the second fetch must still deliver the blob from A"
+    );
+    assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_success_total", 2)?;
 
     ep_b.close().await;
     ep_n.close().await;

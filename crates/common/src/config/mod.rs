@@ -4322,10 +4322,6 @@ mod tests {
         Ok(())
     }
 
-    // The FS arm of `resolve_origin` calls `expand_tilde` so a TOML
-    // like `path = "~/origin"` resolves to `<home>/origin`. The
-    // expansion happens inside resolution (not in `expand_env`),
-    // because `~` is filesystem-shaped and the `expand_env`
     /// A zero stall budget is the most dangerous value in this file (#1134 review).
     /// `PullStalled` — unlike the `PullTimeout` it replaced — SCORES the peer, and
     /// `record_outcome` writes both the local EWMA and the observation buffer the
@@ -4361,7 +4357,10 @@ mod tests {
         );
     }
 
-    // contract only handles `${VAR}` substitution.
+    // The FS arm of `resolve_origin` calls `expand_tilde` so a TOML like
+    // `path = "~/origin"` resolves to `<home>/origin`. The expansion happens inside
+    // resolution (not in `expand_env`), because `~` is filesystem-shaped and the
+    // `expand_env` contract only handles `${VAR}` substitution.
     #[test]
     fn resolve_cache_origin_fs_expands_tilde_in_path() -> anyhow::Result<()> {
         let home_dir = TempDir::new()?;

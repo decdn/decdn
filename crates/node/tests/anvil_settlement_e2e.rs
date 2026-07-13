@@ -86,7 +86,7 @@ use decdn_incentive::{
     MemoryPendingSettleStore, PendingSettleStore, bind_node_id_domain, register_node_signing_hash,
     slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::BuyerChannelService;
+use decdn_node::buyer_channel::{BuyerChannelService, ChannelOpenPending};
 use decdn_node::channel_store::{BuyerChannelStoreHandle, PersistentChannelStateStore};
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::metrics::Metrics;
@@ -1505,6 +1505,74 @@ async fn run_e2e() -> anyhow::Result<()> {
     // settlement service is alive here; these scenarios are purely on-chain
     // (open / reclaim) + the chain-log reconciliation scan, so none is needed.
     // ============================================================
+
+    // --- A0. An abandoned open still lands, and the next pull reuses it (#1143). ---
+    // Anvil mines instantly, so every other open here resolves well inside
+    // OPEN_BUDGET and the timeout arm of `open_or_reuse_channel` is never reached:
+    // the singleflight's whole reason for existing goes unexercised against a real
+    // chain. Turn automine OFF so the `openChannel` genuinely sits in the mempool
+    // — which is exactly the state in which releasing the provider's slot would let
+    // a second deposit through.
+    let _: serde_json::Value = node_provider
+        .raw_request("anvil_setAutomine".into(), (false,))
+        .await?;
+    let pend_nonce_before = pc_read.clientChannelNonce(buyer_addr).call().await?;
+    let pending_err = buyer_service
+        .open_or_reuse_channel(
+            node_addr,
+            U256::from(DEPOSIT_MICRO_USDC),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("an unmined openChannel cannot yield a live channel"))?;
+    anyhow::ensure!(
+        pending_err.downcast_ref::<ChannelOpenPending>().is_some(),
+        "a caller that outran its budget must get the typed pending sentinel, not a failure: \
+         {pending_err:#}"
+    );
+    anyhow::ensure!(
+        buyer_store.get_by_provider(node_addr)?.is_none(),
+        "nothing may be persisted while the open is still in the mempool"
+    );
+    // Mine it. The caller is long gone; the detached task still owns the tx and the
+    // provider's open slot, so it is the one that collects the receipt and persists.
+    let _: serde_json::Value = node_provider
+        .raw_request("anvil_setAutomine".into(), (true,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    let landed = poll_until(Duration::from_secs(60), || {
+        let store = Arc::clone(&buyer_store);
+        async move { store.get_by_provider(node_addr).ok().flatten() }
+    })
+    .await
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "the detached open task never persisted the channel the caller walked away from"
+        )
+    })?;
+    let pend_nonce_after = pc_read.clientChannelNonce(buyer_addr).call().await?;
+    anyhow::ensure!(
+        pend_nonce_after == pend_nonce_before + U256::from(1u64),
+        "the abandoned open must escrow exactly ONE channel (nonce {pend_nonce_before} → \
+         {pend_nonce_after})"
+    );
+    let reused = buyer_service
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC), OPEN_BUDGET)
+        .await?;
+    anyhow::ensure!(
+        reused.channel_id == landed.channel_id && buyer_store.len() == 1,
+        "the next pull must reuse the channel the detached task landed, not open a second"
+    );
+    // Clear it again so A below still starts from an untracked provider.
+    let mut spent = landed;
+    spent.expires_at = 1;
+    buyer_store.record(&spent)?;
+    let _: serde_json::Value = node_provider
+        .raw_request("evm_increaseTime".into(), (CHANNEL_EXPIRY_WARP_SECS,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    buyer_service.sweep_expired_once().await;
 
     // --- A. Concurrent same-provider opens escrow exactly one deposit (#753). ---
     // Two racing open_or_reuse for one provider. Since #1143 the loser does not

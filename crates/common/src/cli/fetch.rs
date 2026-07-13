@@ -134,22 +134,30 @@ pub struct ClientFetchArgs {
     /// timeout is *for* — without penalising transfer size or link speed. A
     /// 700 MiB blob on a slow link keeps going as long as bytes keep arriving.
     /// For `bundle pull` this applies per entry.
-    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    ///
+    /// Must be non-zero: at 0 the deadline elapses on the first poll and every fetch
+    /// fails instantly.
+    #[arg(long, value_name = "MS", default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub stall_timeout_ms: u64,
 
-    /// Optional hard cap on the total wall-clock time of a single blob fetch, in
-    /// milliseconds. **Unset by default** — normally you want `--stall-timeout-ms`,
-    /// which bounds the fetch by provider health rather than by the clock.
+    /// Hard cap on the total wall-clock time of a single blob fetch, in milliseconds.
+    /// Defaults to 1 hour. For `bundle pull` this applies per entry.
     ///
-    /// This used to be the primary (and only) mechanism, defaulting to 30 s, which
-    /// made it a poor health signal: an overall deadline has to be sized against
-    /// `blob size × link speed`, so it killed legitimate large or slow-but-healthy
-    /// transfers while a value small enough to catch a dead node quickly could not
-    /// serve a big blob at all. Set it only when you must bound total runtime
-    /// regardless of whether the transfer is making progress. For `bundle pull`
-    /// this applies per entry.
-    #[arg(long, value_name = "MS")]
-    pub timeout_ms: Option<u64>,
+    /// This is a LEAK GUARD, not the health signal — `--stall-timeout-ms` is what
+    /// catches a dead provider. It used to be the primary (and only) mechanism at a
+    /// 30 s default, which made it a poor health signal: an overall deadline has to be
+    /// sized against `blob size × link speed`, so it killed legitimate large or
+    /// slow-but-healthy transfers while a value small enough to catch a dead node
+    /// quickly could not serve a big blob at all.
+    ///
+    /// It cannot simply be removed, though, because inactivity is not liveness: the
+    /// stall clock resets on ANY byte, so a provider trickling one byte per stall
+    /// window would hang the fetch forever with no error. The default is therefore
+    /// deliberately generous — far above any honest transfer under `--max-blob-mb` —
+    /// and mirrors the node's own `BACKGROUND_FILL_HARD_CAP`. Lower it when you must
+    /// bound total runtime regardless of whether the transfer is progressing.
+    #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub timeout_ms: u64,
 }
 
 impl ClientFetchArgs {
@@ -163,10 +171,12 @@ impl ClientFetchArgs {
         Duration::from_millis(self.stall_timeout_ms)
     }
 
-    /// Optional overall wall-clock cap; `None` unless `--timeout-ms` is given.
+    /// Overall wall-clock cap on one blob fetch — always present, so a fetch always
+    /// terminates even against a provider that drip-feeds bytes to keep the stall
+    /// deadline alive.
     #[must_use]
-    pub fn hard_cap(&self) -> Option<Duration> {
-        self.timeout_ms.map(Duration::from_millis)
+    pub const fn hard_cap(&self) -> Option<Duration> {
+        Some(Duration::from_millis(self.timeout_ms))
     }
 }
 
@@ -214,20 +224,35 @@ mod tests {
         TestCli::parse_from(with_bin).common
     }
 
-    /// The headline of #1134: out of the box a fetch has NO overall deadline, so
-    /// blob size and link speed cannot kill a healthy transfer. Liveness comes
-    /// from the stall bound instead.
+    /// The headline of #1134: the default deadlines are sized so that blob size and
+    /// link speed cannot kill a healthy transfer. Liveness comes from the STALL bound;
+    /// the overall cap is a leak guard set far above any honest transfer.
     #[test]
-    fn no_overall_deadline_by_default() {
+    fn the_stall_bound_is_the_health_signal_and_the_hard_cap_is_a_leak_guard() {
         let c = parse(&[]);
-        assert_eq!(c.hard_cap(), None);
         assert_eq!(c.stall_timeout(), Duration::from_secs(30));
+        assert_eq!(c.hard_cap(), Some(Duration::from_hours(1)));
     }
 
-    /// The hard cap is opt-in, for a caller that must bound total runtime whether
-    /// or not the transfer is progressing.
+    /// A fetch must ALWAYS terminate (#1145 review). The stall clock resets on any
+    /// byte, so with no overall cap a provider trickling one byte per stall window
+    /// hangs `decdn fetch` forever, with no error and no diagnostic — and hangs the
+    /// whole manifest for `bundle pull`. The cap is what makes that impossible, so it
+    /// cannot be absent, and it cannot be zero.
     #[test]
-    fn hard_cap_is_opt_in() {
+    fn a_fetch_always_has_an_overall_cap() {
+        assert!(
+            parse(&[]).hard_cap().is_some(),
+            "an unbounded fetch can be hung forever by a drip-feeding provider"
+        );
+        assert!(
+            TestCli::try_parse_from(["test", "--timeout-ms", "0"]).is_err(),
+            "a zero hard cap would abort every fetch on the first poll"
+        );
+    }
+
+    #[test]
+    fn hard_cap_is_overridable() {
         let c = parse(&["--timeout-ms", "5000"]);
         assert_eq!(c.hard_cap(), Some(Duration::from_secs(5)));
     }
@@ -236,7 +261,14 @@ mod tests {
     fn stall_timeout_is_overridable() {
         let c = parse(&["--stall-timeout-ms", "1500"]);
         assert_eq!(c.stall_timeout(), Duration::from_millis(1500));
-        assert_eq!(c.hard_cap(), None);
+    }
+
+    /// `stall_timeout()` feeds BOTH `PullDeadlines::open` and `.stall`, so a zero here
+    /// elapses on the first poll of the stream open and kills every fetch. The node's
+    /// config resolver already rejects the equivalent knob; the CLI must too.
+    #[test]
+    fn a_zero_stall_timeout_is_rejected() {
+        assert!(TestCli::try_parse_from(["test", "--stall-timeout-ms", "0"]).is_err());
     }
 
     /// `--max-blob-mb` is a memory ceiling, nothing more. It used to also scale the
@@ -248,6 +280,5 @@ mod tests {
         let huge = parse(&["--max-blob-mb", "1048576"]);
         assert_eq!(small.stall_timeout(), huge.stall_timeout());
         assert_eq!(small.hard_cap(), huge.hard_cap());
-        assert_eq!(huge.hard_cap(), None);
     }
 }

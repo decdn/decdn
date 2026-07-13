@@ -663,6 +663,16 @@ pub struct DecdnMetrics {
     /// stopped delivering while we waited. A sustained rate points at flaky
     /// upstreams or a `node_pull_stall_timeout_sec` too tight for the network.
     pub node_pull_stalled: Counter,
+    /// `decdn_node_pull_local_fault_total` (#1145 review): a pull failed for a reason
+    /// that is OURS — a broken signer, an encode fault, a bad range computation — and
+    /// the upstream was exonerated.
+    ///
+    /// The only counter here that says nothing about the network. Any sustained rate is
+    /// an emergency: a node that cannot sign a voucher cannot pay for anything, so every
+    /// pull it attempts will fail. Before this existed those failures were scored against
+    /// whichever honest providers the node happened to try, so the symptom was a node
+    /// steadily gossiping `Unreachable` about a healthy network.
+    pub node_pull_local_fault: Counter,
     /// `decdn_node_pull_channel_open_pending_total` (#1143): a buyer channel open
     /// was still in flight when the per-candidate budget expired, so the pull moved
     /// to the next candidate while the open continued in the background.
@@ -699,6 +709,15 @@ pub struct DecdnMetrics {
     /// deadline fired, to keep warming the cache from a slow-but-available
     /// upstream for future requests.
     pub node_pull_through_background_spawned: Counter,
+    /// `decdn_node_pull_through_background_shed_total` (#1145 review): background
+    /// cache-fills NOT spawned because all `MAX_CONCURRENT_BACKGROUND_FILLS` warm
+    /// slots were busy.
+    ///
+    /// Not an error — shedding speculative work is the designed response to load, and
+    /// the hash stays unclaimed so a later miss retries it. A sustained rate means the
+    /// node is missing faster than it can warm (slow upstreams, or a miss storm); the
+    /// cost is future cache misses, never a failed live request.
+    pub node_pull_through_background_shed: Counter,
     /// `decdn_node_pull_through_background_succeeded_total` (#859): background
     /// cache-fills that populated the blob into the store.
     pub node_pull_through_background_succeeded: Counter,
@@ -1658,6 +1677,13 @@ impl Metrics {
         self.decdn.node_pull_stalled.inc();
     }
 
+    /// A pull failed for a LOCAL reason (#1145 review) — signer, encode, range — so
+    /// the upstream was exonerated. Says nothing about the network; any sustained
+    /// rate means this node cannot pay for anything.
+    pub fn node_pull_local_fault(&self) {
+        self.decdn.node_pull_local_fault.inc();
+    }
+
     /// A buyer channel open outlived the per-candidate budget (#1143). The open
     /// continues in the background; the pull moves on. No reputation effect.
     pub fn node_pull_channel_open_pending(&self) {
@@ -1684,6 +1710,12 @@ impl Metrics {
     /// delivery deadline fired (#859).
     pub fn node_pull_through_background_spawned(&self) {
         self.decdn.node_pull_through_background_spawned.inc();
+    }
+
+    /// A background cache-fill was shed because every warm slot was busy (#1145
+    /// review). Speculative work dropped under load; the hash stays unclaimed.
+    pub fn node_pull_through_background_shed(&self) {
+        self.decdn.node_pull_through_background_shed.inc();
     }
 
     /// A background cache-fill populated the blob into the store (#859).

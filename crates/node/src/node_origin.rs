@@ -60,11 +60,12 @@ use decdn_reputation::{
 
 use decdn_incentive::ChannelOpenFailureReason;
 
-use crate::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenReported};
+use crate::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenReported, OpenSlotReserved};
 use crate::client_requester::{
-    BlobTooLargeClaim, ChannelContext, HashMismatch, PullDeadlines, PullStalled, PullTimeout,
-    UpstreamPull, UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    open_progressive_pull as open_progressive_upstream, sign_client_binding, stream_fetch_tracked,
+    BlobTooLargeClaim, ChannelContext, HashMismatch, LocalPullFault, PullDeadlines, PullStalled,
+    PullTimeout, UpstreamPull, UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected,
+    VoucherProgress, open_progressive_pull as open_progressive_upstream, sign_client_binding,
+    stream_fetch_tracked,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -86,10 +87,17 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bumps the unlabeled `node_pull_channel_open_failures` total and, when the
 /// error chain carries a [`ChannelOpenFailureReason`] (attached by the
 /// `open_channel` kernel for the three `openChannel`-tx failure classes), the
-/// matching `decdn_channel_open_failures_{reason}_total` sibling counter. A
-/// failure with no attached reason — a store fault or an unreclaimed-expired
-/// channel that aborted before the `openChannel` tx — still lands in the
-/// unlabeled total and logs `reason="unclassified"`.
+/// matching `decdn_channel_open_failures_{reason}_total` sibling counter.
+///
+/// Three outcomes are NOT failures and return before that: [`ChannelOpenPending`] (the
+/// open outlived our budget and continues in the background), [`OpenSlotReserved`] (a
+/// reconcile holds the slot; retry), and anything the detached open task has already
+/// reported ([`OpenReported`]) — which since the #1145 review includes every one of
+/// `run_open`'s legs, store faults and unreclaimable-expired channels included. So the
+/// unlabeled arm below is now genuinely a *residual*: an open/reuse failure raised
+/// outside the open task itself.
+// The arms are a flat sentinel ladder; splitting it would scatter one decision.
+#[allow(clippy::cognitive_complexity)]
 fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, err: &anyhow::Error) {
     // Not a failure at all: the open ran past our per-candidate budget and is still
     // going in the background (#1143). Meter it apart from real failures — a
@@ -99,6 +107,16 @@ fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, er
     if err.downcast_ref::<ChannelOpenPending>().is_some() {
         deps.metrics.node_pull_channel_open_pending();
         debug!(%provider_addr, %err, "node-origin: channel open still in flight; trying the next candidate");
+        return;
+    }
+    // Also not a failure: a reconcile scan holds this provider's open slot while it
+    // re-hydrates the row, and tells us to retry. Self-clearing, and it happens at
+    // every boot — counting it as a channel-open FAILURE turned each restart into a
+    // spike of `unclassified` failures an operator would chase. Same verdict, and the
+    // same counter, as a pending open: try another candidate, nothing is wrong.
+    if err.downcast_ref::<OpenSlotReserved>().is_some() {
+        deps.metrics.node_pull_channel_open_pending();
+        debug!(%provider_addr, %err, "node-origin: a reconcile holds the provider's open slot; trying the next candidate");
         return;
     }
     // The detached open task already logged and metered this one (#1143). It has to
@@ -310,14 +328,16 @@ impl NodeOrigin {
         };
         let ctx = match deps
             .buyer
-            // Bounded by the SAME per-candidate budget as the rest of this
-            // attempt (#1143). A wedged open no longer consumes the whole outer
-            // deadline: we stop waiting and try candidate #2, while the open keeps
-            // running in the background and its channel is reused if it lands.
+            // Bounded by its OWN budget, not the per-candidate one (#1143). A wedged
+            // open no longer consumes the whole outer deadline: we stop waiting and try
+            // candidate #2, while the open keeps running in the background and its
+            // channel is reused if it lands. It is deliberately the smaller budget —
+            // this stage and the stream open below are sequential, and
+            // `outer_pull_deadline` has to cover both for every candidate.
             .open_or_reuse_channel(
                 provider_addr,
                 deps.config.deposit_hint,
-                deps.config.pull_timeout,
+                crate::selection::CHANNEL_OPEN_CALLER_BUDGET,
             )
             .await
         {
@@ -392,7 +412,7 @@ impl NodeOrigin {
             Err(err) => {
                 // No bytes were forwarded and no voucher was paid yet, so there is
                 // nothing to persist; just classify and try the next candidate.
-                classify_pull_failure(deps, pk, provider_addr, &err);
+                classify_pull_failure(deps, pk, provider_addr, hash_bytes, &err);
                 None
             }
         }
@@ -554,7 +574,7 @@ impl NodeProgressivePull {
                 Ok(())
             }
             Err(err) => {
-                classify_pull_failure(deps, pk, provider_addr, &err);
+                classify_pull_failure(deps, pk, provider_addr, hash_bytes, &err);
                 Err(err)
             }
         }
@@ -629,7 +649,7 @@ impl NodeProgressivePull {
             prior_bytes_delivered,
         );
         if let Some(err) = cause {
-            classify_pull_failure(deps, pk, provider_addr, err);
+            classify_pull_failure(deps, pk, provider_addr, hash_bytes, err);
         }
     }
 }
@@ -708,6 +728,7 @@ async fn probe_and_rank(
     hash_bytes: [u8; 32],
 ) -> Vec<Candidate> {
     let now_secs = crate::payment_settlement::unix_now();
+    let target = DhtHash::from_bytes(hash_bytes);
     // Probe candidates CONCURRENTLY so the probe phase is bounded by a single
     // `PROBE_TIMEOUT` rather than `fanout × PROBE_TIMEOUT`: a few slow or
     // unreachable peers must not burn the whole pull budget before a healthy
@@ -716,6 +737,16 @@ async fn probe_and_rank(
     // are safe; ranking afterwards makes result order irrelevant.
     let probes = providers
         .into_iter()
+        // Drop peers already known to answer "no" for THIS hash within the TTL.
+        // `find_providers` applies the same filter, but only to what the DHT lookup
+        // returns — it cannot cover the origin-directory fallback (which runs when the
+        // lookup converges empty), nor an entry recorded AFTER discovery, which is
+        // exactly what a pull-time refusal is (#1145 review). This is the one chokepoint
+        // every candidate passes through regardless of how it was found.
+        //
+        // Filtered BEFORE `take`, so a suppressed peer does not consume a probe-fanout
+        // slot that a viable provider could have used.
+        .filter(|peer| !deps.negative_cache.contains_active(peer, &target))
         .take(deps.config.probe_fanout)
         .map(|peer| probe_candidate(deps, peer, hash_bytes, now_secs));
     let candidates: Vec<Candidate> = futures_util::future::join_all(probes)
@@ -862,11 +893,11 @@ async fn pull_from_candidate(
     };
     let ctx = match deps
         .buyer
-        // Same per-candidate bound as the window path (#1143).
+        // Same channel-open bound as the window path (#1143) — see there.
         .open_or_reuse_channel(
             provider_addr,
             deps.config.deposit_hint,
-            deps.config.pull_timeout,
+            crate::selection::CHANNEL_OPEN_CALLER_BUDGET,
         )
         .await
     {
@@ -953,7 +984,7 @@ async fn pull_from_candidate(
             Some(bytes)
         }
         Err(err) => {
-            classify_pull_failure(deps, pk, provider_addr, &err);
+            classify_pull_failure(deps, pk, provider_addr, hash_bytes, &err);
             None
         }
     }
@@ -1030,6 +1061,7 @@ fn classify_pull_failure(
     deps: &NodeOriginDeps,
     pk: PublicKey,
     provider_addr: Address,
+    hash_bytes: [u8; 32],
     err: &anyhow::Error,
 ) {
     // An oversized-blob claim is OUR ceiling, not the provider's fault — it may
@@ -1094,18 +1126,50 @@ fn classify_pull_failure(
             debug!(%provider_addr, %err, "node-origin: upstream reports itself degraded; scoring unreachable");
             record_outcome(deps, pk, &Outcome::Unreachable);
         } else {
-            debug!(%provider_addr, %err, "node-origin: upstream honestly refused delivery; not tarring upstream reputation");
+            // Act on the negative-AVAILABILITY signal instead of merely naming it.
+            // Every candidate that got this far answered `has_blob = true` at probe
+            // (`probe_candidate`), so a refusal here is a peer contradicting itself.
+            // Reputation is still the wrong instrument — `wire_error` collapses our
+            // own faults (`InsufficientDeposit`, `UnknownChannel`) onto `NotFound`,
+            // so a refusal is not attributable — but recording nothing at all let a
+            // peer that advertises everything and serves nothing keep winning the
+            // ranker and burn one of `MAX_PROVIDER_ATTEMPTS` slots on every miss,
+            // forever. The negative cache is exactly the right instrument: scoped to
+            // (peer, hash), TTL'd, and reputation-neutral. Same call the probe path
+            // makes for `has_blob == false`.
+            deps.negative_cache.record_failure(
+                DhtNodeId::from_bytes(*pk.as_bytes()),
+                DhtHash::from_bytes(hash_bytes),
+            );
+            debug!(%provider_addr, %err, "node-origin: upstream honestly refused delivery; negative-caching this (peer, hash) without tarring reputation");
         }
         return;
     }
+    // OUR fault, not theirs (#1145 review). A broken signer, a bad encode, a bad range
+    // computation — none of it says anything about the peer, and a node in this state
+    // walks the whole candidate list tarring every honest provider it meets with an
+    // `Unreachable` (an EWMA hit AND a gossiped observation) on the strength of its own
+    // defect. `warn!`, not `debug!`: a node that cannot sign cannot pay, so this is an
+    // operator-actionable fault about US.
+    if err.downcast_ref::<LocalPullFault>().is_some() {
+        deps.metrics.node_pull_local_fault();
+        warn!(
+            %provider_addr, %err,
+            "node-origin: LOCAL buyer-side fault during a pull (signer/encode/range) — this node \
+             cannot pay; exonerating the upstream"
+        );
+        return;
+    }
     // A bao verification failure (the typed `HashMismatch` sentinel, matched by
-    // `downcast_ref` — not a brittle message string) means the peer was reachable
-    // and paid but served wrong bytes → Corruption; everything else is an
-    // unreachable/transport failure. The one residual buyer-side error that still
-    // lands here is a failure to sign/encode our OWN voucher (`self_pay`): a
-    // catastrophic local fault (a broken signer), not the routine honest-provider
-    // mis-scoring #857 fixes, so it is intentionally not exonerated — a single
-    // stray `Unreachable` is negligible next to a node whose payment side is dead.
+    // `downcast_ref` — not a brittle message string) means the peer was reachable and
+    // paid but served wrong bytes → Corruption.
+    //
+    // Everything else is attributable to the PEER: a failed dial, a dropped connection,
+    // a bad slash signature, an unexpected frame, a redirect. `Unreachable` is the right
+    // verdict, and this arm — not any of the typed ones above — is how a genuinely dead
+    // node actually gets scored. It is deliberately NOT exonerating: an unrecognised
+    // error here has already survived every "this is our fault" check above, so the
+    // remaining explanation is the upstream.
     let outcome = if err.downcast_ref::<HashMismatch>().is_some() {
         Outcome::Corruption
     } else {
@@ -1361,6 +1425,25 @@ mod tests {
         // orchestrator uses still recovers the sentinel (no `root_cause()` needed).
         let wrapped = timeout.context("added context in some future propagation path");
         assert!(wrapped.downcast_ref::<PullTimeout>().is_some());
+
+        // `LocalPullFault` (#1145 review) is the one sentinel attached as a CONTEXT
+        // layer rather than as the error itself — `anyhow!("voucher signing failed")
+        // .context(LocalPullFault)` — and it is then wrapped again on the way up. If
+        // this downcast ever stopped working, the exoneration arm would silently stop
+        // firing and a node with a broken signer would go back to gossiping
+        // `Unreachable` about every honest provider it tried. That failure is invisible
+        // at the call site, so pin it here.
+        let local = anyhow::anyhow!("voucher signing failed: bad key")
+            .context(LocalPullFault)
+            .context("self_pay");
+        assert!(
+            local.downcast_ref::<LocalPullFault>().is_some(),
+            "a local fault must stay recoverable through the context layers above it"
+        );
+        assert!(
+            local.downcast_ref::<PullStalled>().is_none(),
+            "and must not be confused with a peer-attributable sentinel"
+        );
 
         // The refusal sentinel (#1144) carries the wire code through the same
         // channel, so `classify_pull_failure` can split an honest `NotFound` from

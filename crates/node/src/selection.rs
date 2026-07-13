@@ -22,44 +22,64 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// so it doesn't materially inflate worst-case miss latency.
 pub const PULL_THROUGH_OUTER_SLACK: Duration = Duration::from_secs(10);
 
+/// How long a pull is willing to WAIT on a buyer-channel open before giving up on
+/// that candidate — not how long the open itself is allowed to take (#1143).
+///
+/// Since #1143 the `openChannel` runs in a detached task that owns the tx, so a
+/// caller that stops waiting costs nothing: the open continues, the channel lands,
+/// and the next pull to that provider reuses it. What the caller buys by waiting is
+/// only the chance to use the channel on *this* pull. That makes a short budget the
+/// right trade — a cache miss must fall through to another candidate in seconds,
+/// while an `openChannel` may legitimately need minutes to mine on a slow L2.
+///
+/// Deliberately much smaller than `cache.node_pull_timeout_sec`: the channel open
+/// and the stream open are SEQUENTIAL stages of one candidate attempt, and
+/// [`outer_pull_deadline`] has to cover both for every candidate.
+pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
+
 /// Outer deadline for a node-to-node pull-through, derived from the configured
 /// *per-candidate* timeout (`cache.node_pull_timeout_sec`).
 ///
 /// The delivery handler wraps the whole `discover → probe → rank → pull` fetch
 /// in a single `tokio::time::timeout`. For the sequential `MAX_PROVIDER_ATTEMPTS`
 /// fallback loop to actually reach candidates #2..N when candidate #1 *stalls*,
-/// this outer deadline must strictly exceed the sum of all per-candidate budgets —
+/// this outer deadline must strictly exceed the sum of all per-candidate costs —
 /// otherwise both clocks (sourced from the same config value before #859) expire
 /// together and the outer timeout cancels the whole fetch at the instant candidate
-/// #1's own timeout fires, killing the fallback. We therefore budget
-/// `MAX_PROVIDER_ATTEMPTS × per_candidate` plus [`PULL_THROUGH_OUTER_SLACK`] of
-/// one-time discovery overhead.
+/// #1's own timeout fires, killing the fallback.
 ///
-/// # What this deadline does and does not bound
+/// # What one candidate actually costs
 ///
-/// Since #1134 the per-candidate budget bounds a candidate's **open** stage
-/// (connect → channel → handshake → response); its **streaming** stage is bounded
-/// by inactivity (`node_pull_stall_timeout_sec`) rather than a wall clock, because
-/// a wall clock over the bytes caps the blob size a node can pull through. Two
-/// consequences worth being explicit about:
+/// TWO sequential bounded stages, not one:
 ///
-/// - The `MAX_PROVIDER_ATTEMPTS × per_candidate` arithmetic still holds for the
-///   case it was written for — *stalling* candidates, which is what the fallback
-///   loop exists to escape. Each one is abandoned on its own budget (its open
-///   deadline, or its stall bound once bytes start), so the loop still reaches
-///   candidates #2..N.
-/// - A candidate that is **slow but progressing** can now consume the whole outer
-///   deadline on its own. That is correct: it is succeeding, and falling through
-///   mid-stream would restart the download from zero against another peer. The
-///   foreground request gives up (a clean miss) while the transfer continues in the
-///   detached background warm, which is uncapped for exactly this reason.
+/// 1. the **channel open** — [`CHANNEL_OPEN_CALLER_BUDGET`] (#1143); then
+/// 2. the **stream open** — connect → handshake → verified `StreamResponse`,
+///    bounded by `per_candidate` (#1134).
+///
+/// So the worst case for a candidate is `CHANNEL_OPEN_CALLER_BUDGET + per_candidate`,
+/// and that — not `per_candidate` alone — is what this must budget `MAX_PROVIDER_ATTEMPTS`
+/// of, plus [`PULL_THROUGH_OUTER_SLACK`] of one-time discovery overhead. Budgeting one
+/// stage per candidate is what let a cold cache against a slow L2 burn the whole outer
+/// deadline on candidates #1 and #2 and never dial #3.
+///
+/// # What this deadline does not bound
+///
+/// A candidate's **streaming** stage is bounded by inactivity
+/// (`node_pull_stall_timeout_sec`) rather than a wall clock, because a wall clock over
+/// the bytes caps the blob size a node can pull through (#1134). So a candidate that is
+/// **slow but progressing** can consume the whole outer deadline on its own. That is
+/// correct: it is succeeding, and falling through mid-stream would restart the download
+/// from zero against another peer. The foreground request gives up (a clean miss) while
+/// the transfer continues in the detached background warm, which runs to a far larger
+/// backstop (`BACKGROUND_FILL_HARD_CAP`) for exactly this reason.
 ///
 /// So this is best read as a bound on how long a **client** waits, not on how long
 /// an acquisition takes.
 #[must_use]
 pub fn outer_pull_deadline(per_candidate: Duration) -> Duration {
     let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
-    per_candidate
+    CHANNEL_OPEN_CALLER_BUDGET
+        .saturating_add(per_candidate)
         .saturating_mul(attempts)
         .saturating_add(PULL_THROUGH_OUTER_SLACK)
 }
@@ -396,33 +416,42 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
-    // #859 regression guard: the derived outer pull-through deadline must
-    // strictly exceed the sum of all per-candidate budgets, so the outer
-    // `tokio::time::timeout` can never preempt the `MAX_PROVIDER_ATTEMPTS`
-    // fallback loop when an early candidate stalls.
+    // #859 regression guard: the derived outer pull-through deadline must strictly
+    // exceed the sum of what all `MAX_PROVIDER_ATTEMPTS` candidates can actually
+    // cost, so the outer `tokio::time::timeout` can never preempt the fallback loop
+    // when early candidates stall.
+    //
+    // Asserted against the REAL worst case per candidate — the channel open AND the
+    // stream open, which are sequential (#1143) — not against the formula's own
+    // arithmetic. Restated as `per_candidate` alone this test passes while the loop
+    // silently cannot reach candidate #3, which is precisely what shipped.
     #[test]
-    fn outer_pull_deadline_exceeds_all_per_candidate_budgets() {
+    fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
         let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
         for per_secs in [1_u64, 5, 20, 60] {
             let per = Duration::from_secs(per_secs);
             let outer = outer_pull_deadline(per);
-            let all_candidates = per.saturating_mul(attempts);
+            // One candidate = channel open, then stream open.
+            let worst_candidate = CHANNEL_OPEN_CALLER_BUDGET.saturating_add(per);
+            let all_candidates = worst_candidate.saturating_mul(attempts);
             assert!(
                 outer > all_candidates,
-                "outer {outer:?} must exceed {MAX_PROVIDER_ATTEMPTS}×{per:?}"
+                "outer {outer:?} must exceed {MAX_PROVIDER_ATTEMPTS}×{worst_candidate:?} \
+                 (channel open + stream open), or the loop cannot reach the last candidate"
             );
-            // And it equals exactly N×per + the discovery slack.
             assert_eq!(outer, all_candidates + PULL_THROUGH_OUTER_SLACK);
         }
     }
 
     // A zero per-candidate budget still yields a positive outer deadline (the
-    // slack), and a saturating multiply can't panic on absurd inputs.
+    // channel-open budgets + the slack), and a saturating multiply can't panic on
+    // absurd inputs.
     #[test]
     fn outer_pull_deadline_handles_edges() {
+        let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
         assert_eq!(
             outer_pull_deadline(Duration::ZERO),
-            PULL_THROUGH_OUTER_SLACK
+            CHANNEL_OPEN_CALLER_BUDGET.saturating_mul(attempts) + PULL_THROUGH_OUTER_SLACK
         );
         // Saturates to MAX rather than overflowing/panicking — guards against a
         // future switch to non-saturating arithmetic.

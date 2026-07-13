@@ -177,7 +177,7 @@ pub fn sign_client_binding(
     let hash = binding_signing_hash(own_node_id, EPHEMERAL_BINDING_NONCE, bind_domain);
     let binding_signature = signer
         .sign_hash_sync(&hash)
-        .map_err(|e| anyhow::anyhow!("sign client binding: {e}"))?
+        .map_err(|e| anyhow::anyhow!("sign client binding: {e}").context(LocalPullFault))?
         .as_bytes()
         .to_vec();
     Ok(ClientBinding {
@@ -442,11 +442,22 @@ impl std::error::Error for UpstreamRefused {}
 /// That IS evidence the peer is unreachable, and `classify_pull_failure` scores it
 /// as such.
 ///
-/// The bound rests on the non-empty-`ChunkData` invariant (#1088): with empty
-/// frames banned, a peer cannot hold the deadline open with padding that carries
-/// no bytes. Belt-and-braces, the deadline is reset only when `cumulative`
-/// actually advances — never merely because a frame arrived — so a run of
-/// non-chunk frames cannot refresh it either.
+/// The bound rests on the non-empty-`ChunkData` invariant (#1088): with empty frames
+/// banned, a peer cannot hold the deadline open with padding that carries no bytes.
+///
+/// The two pull paths lean on that invariant differently, and it is worth being precise
+/// about which guarantee you have where:
+///
+/// - the BUFFERED loop (`receive_and_pay`) holds one `Instant` deadline and resets it
+///   only where `cumulative` actually advances — never merely because a frame arrived —
+///   so a run of non-chunk frames cannot refresh it either. Belt-and-braces.
+/// - the PROGRESSIVE path ([`UpstreamPull::next_chunk`]) re-arms a fresh per-call
+///   `tokio::time::timeout` on every read, so it rests on the #1088 floor ALONE: it is
+///   safe because there is no frame a peer can send that makes no progress, not because
+///   of any independent progress check.
+///
+/// A change that weakened the floor would therefore break the progressive path first,
+/// and silently.
 #[derive(Debug)]
 pub struct PullStalled {
     pub after: Duration,
@@ -459,6 +470,32 @@ impl std::fmt::Display for PullStalled {
 }
 
 impl std::error::Error for PullStalled {}
+
+/// Marker for a pull failure that is OURS, not the upstream's — a broken local
+/// signer, an encode fault, a bad range computation (#1145 review).
+///
+/// Everything else that reaches `classify_pull_failure`'s catch-all is attributable
+/// to the peer: a failed dial, a dropped connection, a bad signature, an unexpected
+/// frame. Scoring the peer `Unreachable` there is correct, and is in fact the
+/// PRIMARY way a dead node is detected — so the catch-all must stay as it is.
+///
+/// The exception was this class. A node whose own signer is broken cannot pay
+/// anybody, and would previously walk the candidate list tarring every honest
+/// provider it met with an `Unreachable` — an EWMA hit AND a gossiped observation —
+/// on the strength of its own fault. Attach this marker at a local-fault site and
+/// the classifier exonerates the peer and warns about us instead.
+///
+/// It is a marker, so it composes: `.context(LocalPullFault)` on any error.
+#[derive(Debug)]
+pub struct LocalPullFault;
+
+impl std::fmt::Display for LocalPullFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local buyer-side fault (not attributable to the upstream)")
+    }
+}
+
+impl std::error::Error for LocalPullFault {}
 
 /// The bounds on a pull, each matched to the stage it governs (#1134).
 ///
@@ -540,8 +577,10 @@ impl PullDeadlines {
     /// `node_origin_mid_stream_silence_scores_stalled_upstream`, which builds its
     /// deadlines explicitly.
     ///
-    /// Retained only for the loopback helper [`stream_fetch`], whose callers move
-    /// blobs small enough that none of this matters.
+    /// TEST-ONLY. Used by the loopback helper [`stream_fetch`] and directly by the
+    /// `client_loopback` suite, whose blobs are small enough that none of this matters.
+    /// Do not reach for it in production code: a production caller wants [`Self::new`]
+    /// (stall-bounded) or [`Self::capped`] (stall-bounded with a leak guard).
     #[doc(hidden)]
     #[must_use]
     pub const fn whole_transfer(timeout: Duration) -> Self {
@@ -870,7 +909,7 @@ async fn open_stream(
         // the pre-#1115 wire (unbound node-to-node / registered-client path).
         let ext = client_binding_ext(ctx);
         let payload = decdn_protocol::encode_stream_request(&req, ext.as_ref())
-            .map_err(|e| anyhow::anyhow!("encode stream request: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("encode stream request: {e}").context(LocalPullFault))?;
         write_frame(&mut send, &payload)
             .await
             .map_err(|e| anyhow::anyhow!("write stream request: {e}"))?;
@@ -1016,7 +1055,7 @@ async fn fetch_inner(
 /// the two can't drift.
 fn aligned_wire_len(byte_offset: u64, total_bytes: u64) -> anyhow::Result<u64> {
     let aligned = align_range(byte_offset, 0, total_bytes)
-        .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("range alignment: {e}").context(LocalPullFault))?;
     Ok(aligned.wire_len())
 }
 
@@ -1025,8 +1064,11 @@ fn aligned_wire_len(byte_offset: u64, total_bytes: u64) -> anyhow::Result<u64> {
 /// `expected_wire_bytes` have arrived) through the shared `ledger`, until
 /// `StreamEnd`. Returns the assembled buffer and the cumulative byte count for
 /// the caller's completeness check (integrity is verified per bao chunk group by
-/// the decoder, not here). Enforces the chunk-size ceiling and the
-/// `cumulative <= expected_wire_bytes` overrun guard (ADR 005 §`cdn/client/v1`).
+/// the decoder, not here). Enforces `ChunkData`'s bounds — the non-empty FLOOR and the
+/// size ceiling (#1088) — plus the `cumulative <= expected_wire_bytes` overrun guard
+/// (ADR 005 §`cdn/client/v1`). The floor is the load-bearing one: it is what lets the
+/// inactivity deadline below rest on frame arrival, since an empty frame would refresh
+/// the clock while advancing nothing.
 ///
 /// `stall` bounds this loop by INACTIVITY (#1134): every read must land within
 /// `stall` of the last byte of progress, so the loop is bounded no matter how
@@ -1151,7 +1193,7 @@ fn decode_verified_range(
     bao_wire: &[u8],
 ) -> anyhow::Result<Bytes> {
     let aligned = align_range(byte_offset, byte_len, total_bytes)
-        .map_err(|e| anyhow::anyhow!("range alignment: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("range alignment: {e}").context(LocalPullFault))?;
     // A 0-byte blob (#1054) aligns to an empty range: the decoder below has no
     // chunk group to anchor and would accept the empty stream for ANY root. This
     // is the same trivial-empty-range bypass `fetch_inner` guards against for the
@@ -1629,7 +1671,7 @@ async fn self_pay(
                 token: ctx.token,
             }
             .sign(ctx.client_signer.as_ref(), &ctx.voucher_domain)
-            .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}").context(LocalPullFault))?;
             write_message(
                 send,
                 &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
@@ -1693,7 +1735,9 @@ fn verify_response(
 }
 
 async fn write_message(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Result<()> {
-    let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("encode failed: {e}"))?;
+    // The encode is ours; the write below is the peer's connection.
+    let payload = encode_message(msg)
+        .map_err(|e| anyhow::anyhow!("encode failed: {e}").context(LocalPullFault))?;
     write_frame(send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write failed: {e}"))

@@ -129,7 +129,14 @@ impl ClientMessage {
     /// trailing bytes (two-phase), so it is *not* reachable from here; validate
     /// it via [`StreamRequestExt::validate`] after [`parse_stream_request_ext`].
     /// Variants with no value invariants (`VoucherAck`, `StreamEnd`,
-    /// `StreamError`, `ChunkData`) return `Ok(())`.
+    /// `StreamError`) return `Ok(())`.
+    ///
+    /// [`ChunkData`] IS dispatched here (#1088). It has to be: this is the seam a
+    /// receive loop is told to call, so a `ChunkData` arm that returned `Ok(())`
+    /// would hand every future receive path the empty-frame spin bug back — and
+    /// silently, because the non-empty floor is what the pull paths' inactivity
+    /// deadline rests on. A peer that can send unbounded zero-length frames refreshes
+    /// that deadline forever without ever making progress.
     ///
     /// # Errors
     ///
@@ -140,8 +147,8 @@ impl ClientMessage {
             Self::StreamResponse(resp) => resp.validate(),
             Self::Voucher(voucher) => voucher.validate(),
             Self::CooperativeCloseAuth(auth) => auth.validate(),
+            Self::ChunkData(chunk) => chunk.validate(),
             Self::StreamRequest(_)
-            | Self::ChunkData(_)
             | Self::VoucherAck
             | Self::StreamEnd
             | Self::StreamError(_)
@@ -448,9 +455,8 @@ impl StreamResponse {
 /// frames banned "a frame arrived" and "bytes made progress" are the same
 /// statement, so a peer cannot refresh the deadline with padding.
 ///
-/// An honest serve side cannot emit one, but the reason differs per path and both
-/// have to hold — this is the invariant the pull paths' inactivity deadline rests
-/// on, so it is worth naming precisely:
+/// An honest serve side cannot emit one, but the reason differs per path and both have
+/// to hold, so both are worth naming precisely:
 ///
 /// - The **buffered** path chunks its payload with `slice::chunks`, which yields no
 ///   items for an empty slice. So even the empty blob (whose bao encoding is zero
@@ -1392,13 +1398,24 @@ mod tests {
             ClientMessage::Voucher(bad_voucher).validate(),
             Err(MessageValidationError::InvalidVoucherSigLen { len: 0 })
         );
+        // The aggregate seam DISPATCHES to `ChunkData::validate` (#1088) — it does not
+        // wave the variant through. This assertion was inverted (`Ok(())`) and that is
+        // exactly how the hole hid: `ClientMessage::validate` is the entry point a new
+        // receive loop is documented to call, so a permissive arm here silently returns
+        // the empty-frame spin bug to any path that trusts it.
+        assert_eq!(
+            ClientMessage::ChunkData(ChunkData { bytes: vec![] }).validate(),
+            Err(MessageValidationError::EmptyChunk),
+            "the aggregate validator must enforce the non-empty chunk floor, not just \
+             ChunkData::validate called by hand"
+        );
+        assert_eq!(
+            ClientMessage::ChunkData(ChunkData { bytes: vec![7] }).validate(),
+            Ok(())
+        );
         // Variants carrying no value invariants are unconditionally Ok.
         assert_eq!(
             ClientMessage::StreamRequest(sample_request()).validate(),
-            Ok(())
-        );
-        assert_eq!(
-            ClientMessage::ChunkData(ChunkData { bytes: vec![] }).validate(),
             Ok(())
         );
         assert_eq!(ClientMessage::VoucherAck.validate(), Ok(()));
