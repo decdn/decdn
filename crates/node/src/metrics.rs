@@ -758,13 +758,13 @@ pub struct DecdnMetrics {
     /// `decdn_reputation_indexer_rpc_failures_total` (#326): failing poll ticks —
     /// the settlement indexer's `get_logs`/head RPC errored, or a `nodeIdOf`
     /// party-resolution RPC (in the sink's `apply`) failed. Both now propagate to
-    /// the same per-tick backoff path (`on_backoff`) (a resolution failure no longer skips a
-    /// party in place; the un-credited settlement is retried), so a persistently
-    /// flaky RPC can bump this once per retry cycle. A sustained nonzero rate
-    /// means the indexer is not ingesting settlements, so reporter weights
-    /// silently stay 0 and network scores never leave neutral — exactly the
-    /// dead-indexer condition that is otherwise log-only. Field has no `_total`
-    /// suffix because the `OpenMetrics` encoder appends it.
+    /// the same per-tick backoff path (`on_backoff`): a resolution failure no
+    /// longer skips a party in place, and the un-credited settlement is retried,
+    /// so a persistently flaky RPC can bump this once per retry cycle. A
+    /// sustained nonzero rate means the indexer is not ingesting settlements, so
+    /// reporter weights silently stay 0 and network scores never leave neutral —
+    /// exactly the dead-indexer condition that is otherwise log-only. Field has
+    /// no `_total` suffix because the `OpenMetrics` encoder appends it.
     pub reputation_indexer_rpc_failures: Counter,
     /// `decdn_reputation_indexer_settlements_credited_total` (#326): party
     /// creditings applied to the settlement source (two per fully-resolved
