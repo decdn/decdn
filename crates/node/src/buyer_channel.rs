@@ -222,7 +222,10 @@ fn rehydrate_open_error(err: &Arc<anyhow::Error>) -> anyhow::Error {
     // `{:#}` renders the whole context chain, so the waiter's message matches what
     // the opening task saw.
     let rebuilt = anyhow::anyhow!("{err:#}");
-    reason.map_or_else(|| anyhow::anyhow!("{err:#}"), |r| rebuilt.context(r))
+    match reason {
+        Some(reason) => rebuilt.context(reason),
+        None => rebuilt,
+    }
 }
 
 /// RAII slot in the per-provider in-flight-open map. Dropping it removes the

@@ -36,7 +36,7 @@ use decdn_incentive::{
     ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
     signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::ChannelOpener;
+use decdn_node::buyer_channel::{ChannelOpenPending, ChannelOpener};
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::dht::negative_cache::Hash as DhtHash;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -192,9 +192,13 @@ struct FailingRecordOpener {
 /// `ChannelOpened` tx that never mines). Every other provider opens instantly.
 ///
 /// It honours `budget` the way the real service does: it does NOT hang forever, it
-/// returns `ChannelOpenPending` once the caller's budget elapses, leaving the "open"
-/// notionally still running. That is the contract `node_origin` relies on to reach
-/// candidates #2..N, and neither `StubOpener` nor `FailingRecordOpener` models it.
+/// returns the typed [`ChannelOpenPending`] once the caller's budget elapses,
+/// leaving the "open" notionally still running in the background. That is the
+/// contract `node_origin` relies on to reach candidates #2..N — and returning the
+/// real sentinel (rather than a bare string) is what makes the test exercise
+/// `classify_pull_failure`'s pending arm and its counter, instead of quietly
+/// falling into the generic channel-open-failure arm. Neither `StubOpener` nor
+/// `FailingRecordOpener` models any of this.
 #[derive(Debug)]
 struct WedgedOpener {
     wedged: Address,
@@ -220,14 +224,22 @@ impl ChannelOpener for WedgedOpener {
             attempted.push(provider_addr);
         }
         if provider_addr == self.wedged {
-            // Consume exactly the budget, then report the open as still in flight —
-            // precisely what `BuyerChannelService::open_or_reuse_channel` does when
-            // its detached open task has not resolved by then. Sleeping *longer*
-            // would model a bound the real service does not have (it stops waiting
-            // AT the budget), and would let this test pass against code that had
-            // reintroduced the unbounded open.
+            // Consume exactly the budget, then return the TYPED sentinel — precisely
+            // what `BuyerChannelService::open_or_reuse_channel` does when its
+            // detached open task has not resolved by then.
+            //
+            // Both halves matter. Sleeping *longer* would model a bound the real
+            // service does not have (it stops waiting AT the budget), letting this
+            // pass against code that had reintroduced the unbounded open. And a bare
+            // string error would not `downcast_ref::<ChannelOpenPending>()`, so
+            // `classify_pull_failure` would take its generic-failure arm instead of
+            // the pending one — the test would still pass (neither arm scores
+            // reputation) while never exercising the path it claims to.
             tokio::time::sleep(budget).await;
-            anyhow::bail!("channel open for provider {provider_addr} is still in flight");
+            return Err(anyhow::Error::new(ChannelOpenPending {
+                provider: provider_addr,
+                waited: budget,
+            }));
         }
         Ok(ChannelContext {
             channel_id: self.channel_id,
@@ -2548,6 +2560,15 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
     );
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    // The wedged candidate took the PENDING arm of `classify_pull_failure`, not the
+    // generic channel-open-failure arm. Both arms record no reputation, so without
+    // these two counters the assertions above would pass even if the typed
+    // `ChannelOpenPending` were never produced — the test would prove nothing about
+    // the mechanism it exists for. The split also matters operationally: "pending"
+    // says the node's chain lane is slower than its `node_pull_timeout_sec`, while
+    // "failure" says the tx reverted or the wallet is under-funded.
+    assert_counter(&b_metrics, "node_pull_channel_open_pending_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_channel_open_failures_total", 0)?;
 
     ep_b.close().await;
     ep_a.close().await;

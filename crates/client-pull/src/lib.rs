@@ -413,8 +413,11 @@ impl std::fmt::Display for UpstreamRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The `{:?}` rendering is load-bearing, exactly as in
         // `UpstreamVoucherRejected`: the loopback tests assert
-        // `.contains("NotFound")` / `.contains("UnknownChannel")` on this string,
-        // and `StreamError` has no `Display`.
+        // `.contains("NotFound")` on this string, and `StreamError` has no
+        // `Display`. What renders here is always a WIRE code — never a node-side
+        // `ServeRejectReason` such as `UnknownChannel`, which collapses to
+        // `NotFound` before it leaves the server (see `wire_error`). Matching on a
+        // reject-reason name would therefore never fire.
         write!(f, "delivery refused: {:?}", self.error)
     }
 }
@@ -540,11 +543,9 @@ impl PullDeadlines {
 /// on a validated response and is surfaced as the protocol violation it would be
 /// — not defaulted to some invented code, which would launder a malformed refusal
 /// into a plausible-looking one.
-fn refusal(error: Option<&StreamError>) -> anyhow::Error {
+fn refusal(error: Option<StreamError>) -> anyhow::Error {
     match error {
-        Some(error) => anyhow::Error::new(UpstreamRefused {
-            error: error.clone(),
-        }),
+        Some(error) => anyhow::Error::new(UpstreamRefused { error }),
         None => anyhow::anyhow!("delivery refused with no error code (unvalidated response?)"),
     }
 }
@@ -902,7 +903,7 @@ async fn fetch_inner(
     .await?;
 
     if !resp.body.ok {
-        return Err(refusal(resp.error.as_ref()));
+        return Err(refusal(resp.error));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
@@ -1323,7 +1324,7 @@ pub async fn open_progressive_pull(
     )
     .await?;
     if !resp.body.ok {
-        return Err(refusal(resp.error.as_ref()));
+        return Err(refusal(resp.error));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
