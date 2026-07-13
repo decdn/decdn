@@ -2281,16 +2281,23 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
 }
 
 /// The WINDOW-path counterpart of `node_origin_pull_falls_through_a_stalled_candidate`
-/// (#856). The buffered path bounds each candidate with `pull_timeout` inside
+/// (#856, #1141). The buffered path bounds each candidate with `pull_timeout` inside
 /// `stream_fetch_tracked`; `open_progressive_pull` must do the same, or the first
 /// candidate to accept the connection and go quiet consumes the caller's ENTIRE
-/// budget and candidates #2..N are never opened — the serve path then signs a
-/// `CacheMiss` for a blob the honest fallback holds.
+/// budget and candidates #2..N are never opened — the serve path then refuses a
+/// blob the honest fallback holds.
 ///
-/// The 10s wrapper stands in for the serve path's outer deadline
-/// (`selection::outer_pull_deadline`, sized to fit all `MAX_PROVIDER_ATTEMPTS`
-/// per-candidate budgets). With no per-candidate bound the staller eats it whole
-/// and this elapses; with one, S is abandoned at its 1s budget and A opens.
+/// TWO stallers, not one, and that is the point: with a single staller a
+/// regression that applied the budget to the whole LOOP rather than per-candidate
+/// still passes (one 3s stall fits under any plausible outer bound). Two stalls
+/// only fit if the budget is genuinely per-candidate — which is exactly the
+/// property #859 sized the outer deadline around and #1141 broke on this path.
+///
+/// The 12s wrapper stands in for the serve path's outer deadline (the real
+/// `selection::outer_pull_deadline` for a 3s per-candidate budget is 3×3s + 10s
+/// slack = 19s; 12s is a tighter stand-in that still admits two 3s stalls plus a
+/// healthy open). With no per-candidate bound, staller #1 eats the whole wrapper
+/// and this elapses.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<()> {
@@ -2343,16 +2350,30 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         RATE,
     );
 
-    // --- Stalling node S: quotes a CHEAPER rate so it ranks first, then accepts
-    //     the client stream and never answers. ---------------------------------
-    let s_sk = fresh_key();
-    let s_id = s_sk.public();
-    let s_eth = Arc::new(PrivateKeySigner::random());
-    let (ep_s, addr_s) =
-        local_endpoint(s_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    let task_s = spawn_a_stalling_server(
-        ep_s.clone(),
-        Arc::clone(&s_eth),
+    // --- Stalling nodes S1, S2: both quote the CHEAPER rate so they rank ahead of
+    //     A, then accept the client stream and never answer. Two of them, so the
+    //     budget must be per-candidate to reach A at all. ----------------------
+    let s1_sk = fresh_key();
+    let s1_id = s1_sk.public();
+    let s1_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s1, addr_s1) =
+        local_endpoint(s1_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_s1 = spawn_a_stalling_server(
+        ep_s1.clone(),
+        Arc::clone(&s1_eth),
+        slash_domain(),
+        total_bytes,
+        STALL_RATE,
+    );
+
+    let s2_sk = fresh_key();
+    let s2_id = s2_sk.public();
+    let s2_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s2, addr_s2) =
+        local_endpoint(s2_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_s2 = spawn_a_stalling_server(
+        ep_s2.clone(),
+        Arc::clone(&s2_eth),
         slash_domain(),
         total_bytes,
         STALL_RATE,
@@ -2362,7 +2383,7 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    for (id, addr) in [(a_id, addr_a), (s_id, addr_s)] {
+    for (id, addr) in [(a_id, addr_a), (s1_id, addr_s1), (s2_id, addr_s2)] {
         let _ = probe_once(
             &ep_b,
             EndpointAddr::new(id).with_ip_addr(addr),
@@ -2379,10 +2400,12 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
 
-    let s_dht = DhtNodeId::from_bytes(*s_id.as_bytes());
+    let s1_dht = DhtNodeId::from_bytes(*s1_id.as_bytes());
+    let s2_dht = DhtNodeId::from_bytes(*s2_id.as_bytes());
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
     let mut addr_map = HashMap::new();
-    addr_map.insert(s_dht, s_eth.address());
+    addr_map.insert(s1_dht, s1_eth.address());
+    addr_map.insert(s2_dht, s2_eth.address());
     addr_map.insert(a_dht, a_eth.address());
 
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2396,10 +2419,16 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     }) as Arc<dyn ChannelOpener>;
     let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
         HashMap::from([
-            (*s_id.as_bytes(), "XX".to_string()),
+            (*s1_id.as_bytes(), "XX".to_string()),
+            (*s2_id.as_bytes(), "XX".to_string()),
             (*a_id.as_bytes(), "DE".to_string()),
         ]),
     ))));
+    // 3s per candidate. Deliberately not 1s: this budget now bounds EVERY candidate
+    // open, including the honest one, and A's open is a real QUIC handshake +
+    // `open_or_reuse_channel` + verified-header exchange. At 1s a loaded CI runner
+    // could abandon A too and fail the test for an unrelated reason.
+    let per_candidate = Duration::from_secs(3);
     let origin = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
@@ -2409,26 +2438,26 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         &obs_buffer,
         &b_metrics,
         &region_accountant,
-        vec![s_dht, a_dht],
+        vec![s1_dht, s2_dht, a_dht],
         addr_map,
-        Duration::from_secs(1),
+        per_candidate,
         0,
     );
 
-    // The open loop must abandon the staller on ITS budget and open against A.
-    let opened = tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
+    // The open loop must abandon BOTH stallers on their own budgets and open A.
+    let opened = tokio::time::timeout(Duration::from_secs(12), origin.open_progressive_pull(hash))
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "open_progressive_pull never returned: the stalled candidate consumed the whole \
+                "open_progressive_pull never returned: a stalled candidate consumed the whole \
                  outer budget, so the honest fallback was never opened"
             )
         })?;
     let (header, _pull) = opened
         .ok_or_else(|| anyhow::anyhow!("expected an open against the honest fallback candidate"))?;
-    // A quotes `RATE`; the staller quotes the cheaper `STALL_RATE` (which is why it
-    // ranks first). The rate on the verified header therefore proves WHICH provider
-    // we opened against.
+    // A quotes `RATE`; the stallers quote the cheaper `STALL_RATE` (which is why they
+    // rank ahead of it). The rate on the verified header therefore proves WHICH
+    // provider we opened against.
     anyhow::ensure!(
         header.rate_per_mb == RATE,
         "expected the open against the honest fallback A (rate {RATE}), got rate {}",
@@ -2440,29 +2469,53 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         header.total_bytes
     );
 
-    // The staller hit OUR per-candidate deadline — a buyer-side budget, not evidence
-    // the provider is bad — so it is exonerated: no local EWMA hit, nothing gossiped
-    // (#857). Identical to the buffered path's contract.
+    // Each staller hit OUR per-candidate deadline — a buyer-side budget, not evidence
+    // the provider is bad — so both are exonerated: no local EWMA hit, nothing
+    // gossiped (#857). Identical to the buffered path's contract.
     let drained = obs_buffer.drain();
-    anyhow::ensure!(
-        !drained.iter().any(|(p, _)| *p == s_id),
-        "the timed-out staller must NOT be gossiped about (#857)"
-    );
-    anyhow::ensure!(
-        (local_rep.score(s_id) - 0.5).abs() < f64::EPSILON,
-        "the timed-out staller's local score must stay neutral, got {}",
-        local_rep.score(s_id)
-    );
-    assert_counter(&b_metrics, "node_pull_timeout_total", 1)?;
+    for (label, s_id) in [("S1", s1_id), ("S2", s2_id)] {
+        anyhow::ensure!(
+            !drained.iter().any(|(p, _)| *p == s_id),
+            "the timed-out staller {label} must NOT be gossiped about (#857)"
+        );
+        anyhow::ensure!(
+            (local_rep.score(s_id) - 0.5).abs() < f64::EPSILON,
+            "the timed-out staller {label}'s local score must stay neutral, got {}",
+            local_rep.score(s_id)
+        );
+    }
+    // TWO timeouts — the load-bearing assertion. A budget applied to the whole loop
+    // instead of per-candidate would abandon after the first and never reach A.
+    assert_counter(&b_metrics, "node_pull_timeout_total", 2)?;
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
 
+    // The abandoned opens forfeited nothing: no voucher was signed for either staller
+    // (the open dies before the first chunk), and no bytes were attributed to their
+    // region. Guards the resource half of #1141 — a per-candidate timeout that leaked
+    // spend on every stall would be a poor trade.
+    let ledger_len = {
+        let ledger = recorded.lock().expect("progress ledger not poisoned");
+        ledger.len()
+    };
+    anyhow::ensure!(
+        ledger_len == 0,
+        "a stalled open must record no voucher progress, got {ledger_len} entries"
+    );
+    anyhow::ensure!(
+        region_accountant.snapshot().is_empty(),
+        "nothing was delivered, so no region should have bytes_in; got {:?}",
+        region_accountant.snapshot()
+    );
+
     ep_b.close().await;
     ep_a.close().await;
-    ep_s.close().await;
+    ep_s1.close().await;
+    ep_s2.close().await;
     task_a.await?;
-    task_s.await?;
+    task_s1.await?;
+    task_s2.await?;
     Ok(())
 }
 

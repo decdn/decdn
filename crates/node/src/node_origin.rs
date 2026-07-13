@@ -297,12 +297,19 @@ impl NodeOrigin {
         // each candidate (`stream_fetch_tracked`). Without it, a candidate that
         // accepts the connection and then goes quiet blocks here indefinitely and
         // consumes the caller's whole outer deadline — which is deliberately sized
-        // at `MAX_PROVIDER_ATTEMPTS × pull_timeout + slack` precisely so the loop
-        // below can still reach candidates #2..N (#859) — so the serve path would
-        // sign a `CacheMiss` for a blob an honest fallback holds. The typed
-        // `PullTimeout` flows into the `Err` arm's `classify_pull_failure`, which
-        // exonerates the peer (our deadline is not evidence it is bad, #857) and
-        // meters `node_pull_timeout`, exactly as on the buffered path.
+        // at `MAX_PROVIDER_ATTEMPTS × pull_timeout + slack` precisely so the
+        // caller's fallback loop (`open_progressive_pull`, above) can still reach
+        // candidates #2..N (#859) — so the serve path would refuse a blob an honest
+        // fallback holds. The typed `PullTimeout` flows into the `Err` arm's
+        // `classify_pull_failure`, which exonerates the peer (our deadline is not
+        // evidence it is bad, #857) and meters `node_pull_timeout`, exactly as on
+        // the buffered path.
+        //
+        // NOTE this bounds the OPEN stage only. `open_or_reuse_channel` above is
+        // still unbounded (as it is on the buffered path), so a wedged on-chain RPC
+        // can still consume the outer deadline — `selection.rs`'s slack doc already
+        // concedes this. Tracked separately; do not read this timeout as "the whole
+        // candidate attempt is bounded".
         match tokio::time::timeout(
             deps.config.pull_timeout,
             open_progressive_upstream(

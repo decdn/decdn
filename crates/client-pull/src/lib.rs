@@ -332,11 +332,15 @@ impl std::error::Error for BlobTooLargeClaim {}
 /// stable `timed out` text for logs (and for the `!contains("timed out")`
 /// negative assertion in `node_to_node_pull_through`'s deadline test).
 ///
-/// Raised by BOTH upstream pull stages — the buffered [`stream_fetch_tracked`]
-/// delivery and the window-paced [`open_progressive_pull`] open (#1141) — so the
-/// message is deliberately stage-NEUTRAL. Callers that want to name the stage add
-/// a `.context(…)` layer; `downcast_ref` still recovers the sentinel through it
-/// (pinned by `buyer_side_sentinels_survive_anyhow_downcast`).
+/// Raised at BOTH upstream pull stages, so the message is deliberately
+/// stage-NEUTRAL: by the buffered [`stream_fetch_tracked`] delivery here in this
+/// crate, and — at the window-paced open stage (#1141) — by the `decdn-node`
+/// caller that wraps [`open_progressive_pull`] in its per-candidate deadline
+/// (`NodeOrigin::open_progressive_pull`; this crate's `open_progressive_pull`
+/// applies no timeout of its own). Callers that want to name the stage add a
+/// `.context(…)` layer; `downcast_ref` still recovers the sentinel through it —
+/// pinned by `buyer_side_sentinels_survive_anyhow_downcast` in
+/// `decdn-node`'s `node_origin.rs`, not in this crate.
 #[derive(Debug)]
 pub struct PullTimeout {
     pub after: Duration,
