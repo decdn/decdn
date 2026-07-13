@@ -34,7 +34,7 @@ use crate::commands::{chain_ctx, terms};
 
 /// Entry point for `decdn node register`.
 pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    let config_path = args.chain.config.as_deref().or(global_config);
+    let config_path = args.chain.common.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
     let resolved = chain_ctx::resolve(&args.chain, &file)?;
     let cb_addr =
@@ -66,7 +66,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
         &args.region,
         &args.multiaddrs,
         terms_hash,
-        args.chain.dry_run,
+        args.chain.common.dry_run,
     )
     .await?;
 
@@ -76,7 +76,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     } else {
         "failed to write dry-run output"
     };
-    write_outcome(&mut out, &outcome, args.chain.json).context(label)?;
+    write_outcome(&mut out, &outcome, args.chain.common.json).context(label)?;
     Ok(())
 }
 

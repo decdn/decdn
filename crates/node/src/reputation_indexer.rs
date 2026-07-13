@@ -53,13 +53,10 @@ use crate::metrics::Metrics;
 // `MAX_BACKFILL_BLOCK_SPAN` doubles as this watcher's head-anchored boot
 // lookback; imported (not duplicated) so the shared per-call range cap can't
 // silently diverge.
-use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS};
+use crate::chain_events::{
+    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+};
 use crate::reputation_wiring::NodeSettlementSource;
-
-/// Initial retry backoff after a watcher tick error.
-const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound for the retry backoff.
-const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Aborts the watcher task on drop so a node-restart cycle never leaks a
 /// chain-poll task. Same pattern as `chain_staker_set::AbortOnDrop`.

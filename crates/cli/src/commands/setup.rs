@@ -178,13 +178,13 @@ impl Preflight {
 // further would scatter the sequence rather than clarify it.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    let config_path = args.chain.config.as_deref().or(global_config);
+    let config_path = args.chain.common.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
     let resolved = chain_ctx::resolve(&args.chain, &file)?;
     let cb_addr =
         chain_ctx::parse_address(&resolved.capacity_bond_address, "capacity_bond_address")?;
-    let json = args.chain.json;
-    let dry_run = args.chain.dry_run;
+    let json = args.chain.common.json;
+    let dry_run = args.chain.common.dry_run;
 
     // ---- Phase 1: keys (idempotent — generate only on a clean slate). ----
     let key_path = identity::key_path(&resolved.data_dir);
@@ -209,7 +209,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             let kg = cli::KeyGenArgs {
                 output_dir: Some(resolved.data_dir.clone()),
                 force: false,
-                password_file: args.chain.keystore_password_file.clone(),
+                password_file: args.chain.common.keystore_password_file.clone(),
             };
             key_gen::key_gen(&kg).context("key generation failed")?;
             keys_generated = true;
@@ -1051,7 +1051,7 @@ async fn prepare_usdc_swap<P: Provider + Clone + 'static>(
     token_balance: U256,
     dry_run: bool,
 ) -> anyhow::Result<SwapPrep> {
-    let json = args.chain.json;
+    let json = args.chain.common.json;
     // Bound the slippage tolerance (USDC mode only): without a ceiling a
     // fat-finger like 65535 sets a ~7.5x spend cap. 10000 bps = 100%.
     anyhow::ensure!(

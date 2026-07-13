@@ -22,7 +22,7 @@ use crate::commands::chain_ctx;
 
 /// Entry point for `decdn node bond`.
 pub async fn run(args: &cli::BondArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    let config_path = args.chain.config.as_deref().or(global_config);
+    let config_path = args.chain.common.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
     let resolved = chain_ctx::resolve(&args.chain, &file)?;
     let cb_addr =
@@ -36,17 +36,23 @@ pub async fn run(args: &cli::BondArgs, global_config: Option<&Path>) -> anyhow::
     let mbps = U256::from(args.mbps);
     let plan = build_plan(&bond, operator, mbps, cb_addr).await?;
 
-    if args.chain.dry_run {
+    if args.chain.common.dry_run {
         let mut out = io::stdout().lock();
-        write_plan(&mut out, &plan, args.chain.json, &Outcome::default(), true)
-            .context("failed to write dry-run output")?;
+        write_plan(
+            &mut out,
+            &plan,
+            args.chain.common.json,
+            &Outcome::default(),
+            true,
+        )
+        .context("failed to write dry-run output")?;
         return Ok(());
     }
 
     let outcome = execute(&bond, &provider, &plan, operator, cb_addr, mbps).await?;
 
     let mut out = io::stdout().lock();
-    write_plan(&mut out, &plan, args.chain.json, &outcome, false)
+    write_plan(&mut out, &plan, args.chain.common.json, &outcome, false)
         .context("failed to write result")?;
     Ok(())
 }

@@ -101,11 +101,13 @@ use tracing::{debug, info, warn};
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, NoneFallback, WatcherConfig, WatcherHook,
 };
+use crate::chain_events::{
+    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+};
 use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
 use crate::metrics::Metrics;
-use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::origin_assignment::OriginAssignment;
@@ -128,12 +130,6 @@ const REPLAY_WINDOW_BLOCKS: u64 = 9_000;
 /// Flow). A claimed hash never resolves here; only a hash with no claiming
 /// namespace falls back to it.
 const DEFAULT_OPEN_NAMESPACE: U256 = U256::ZERO;
-
-/// Backoff between watcher retry attempts after a failed poll tick. Mirrors
-/// [`crate::dht::chain_staker_set`].
-const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound for the watcher retry backoff.
-const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// In-memory projection of the on-chain origin directory. All resolution logic
 /// lives here as pure methods over the maps so it is unit-testable without a

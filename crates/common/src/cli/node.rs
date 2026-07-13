@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+use super::common::CommonChainArgs;
+
 /// Default `--wait-timeout-secs`. Wrapped here as a `const` so the
 /// `NonZeroU64` constructor can be evaluated at compile time.
 const DEFAULT_WAIT_TIMEOUT_SECS: NonZeroU64 = match NonZeroU64::new(30) {
@@ -517,58 +519,22 @@ pub struct PeersArgs {
 
 /// Shared blockchain coordinates + keys for the on-chain `node` subcommands
 /// (`register`, `bond`). Flattened into each command's args so they expose
-/// an identical flag group. Each field is taken from a flag when present,
-/// otherwise the `[blockchain]` / `[identity]` tables of the TOML config
-/// (same file the daemon reads). `rpc_url` and `capacity_bond_address` are
-/// required (no default — the command errors if neither flag nor config
-/// supplies them); `chain_id`, `keystore`, and `data_dir` fall back to
-/// built-in defaults (see each field).
+/// an identical flag group. The common coordinates live in
+/// [`CommonChainArgs`]; this struct adds the `CapacityBond` address and the
+/// swap flags. Each field is taken from a flag when present, otherwise the
+/// `[blockchain]` / `[identity]` tables of the TOML config (same file the
+/// daemon reads). `rpc_url` and `capacity_bond_address` are required (no
+/// default — the command errors if neither flag nor config supplies them);
+/// `chain_id`, `keystore`, and `data_dir` fall back to built-in defaults.
 #[derive(Args, Debug)]
 pub struct ChainArgs {
-    /// Path to the TOML config file supplying `[blockchain]` / `[identity]`
-    /// fields not passed as flags. Takes precedence over the top-level
-    /// `decdn --config`; falls through to `~/.decdn/node.toml`.
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-
-    /// JSON-RPC endpoint URL. Overrides `blockchain.rpc_url`.
-    #[arg(long, value_name = "URL")]
-    pub rpc_url: Option<String>,
+    #[command(flatten)]
+    pub common: CommonChainArgs,
 
     /// `CapacityBond` contract address. Overrides
     /// `blockchain.capacity_bond_address`.
     #[arg(long, value_name = "ADDR")]
     pub capacity_bond_address: Option<String>,
-
-    /// EIP-712 `chainId` for signing domains. Overrides
-    /// `blockchain.chain_id`; must match the `CapacityBond` deployment chain
-    /// or any signatures are rejected on-chain.
-    #[arg(long, value_name = "ID")]
-    pub chain_id: Option<u64>,
-
-    /// Ethereum keystore file. Overrides `blockchain.eth_keystore`; defaults
-    /// to `<data_dir>/keystore.json`.
-    #[arg(long, value_name = "PATH")]
-    pub keystore: Option<PathBuf>,
-
-    /// Data directory holding `node.secret`. Overrides `identity.data_dir`;
-    /// defaults to `~/.decdn`.
-    #[arg(long, value_name = "PATH")]
-    pub data_dir: Option<PathBuf>,
-
-    /// File whose contents are the keystore password. Consulted after the
-    /// `DECDN_KEYSTORE_PASSWORD` env var and before an interactive prompt.
-    #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
-    pub keystore_password_file: Option<PathBuf>,
-
-    /// Build and print what would be submitted without sending any
-    /// transaction.
-    #[arg(long)]
-    pub dry_run: bool,
-
-    /// Emit the result as JSON instead of human-readable `key=value` lines.
-    #[arg(long)]
-    pub json: bool,
 
     /// DEX venue for `--pay-bond-with usdc`: `uniswap-v3` or `balancer-v3`.
     #[arg(long = "swap-venue", value_enum)]

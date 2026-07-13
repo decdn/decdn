@@ -43,8 +43,8 @@ use tracing::{debug, info, warn};
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
+use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF};
 use crate::metrics::Metrics;
-use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS};
 
 /// Nominal appeal filing window (ADR 028: 30 days from the slash timestamp).
 const APPEAL_FILING_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
@@ -66,11 +66,13 @@ const fn appeal_window_blocks() -> u64 {
     (APPEAL_FILING_WINDOW_SECS * 1_000).div_ceil(ARBITRUM_BLOCK_TIME_MS)
 }
 
-/// Backoff bounds for the poll-retry loop. The ceiling is deliberately lower
-/// than the other watchers' 1-minute cap: a missed `Slashed` event burns the
-/// operator's fixed 30-day appeal window, so recovery is prioritized.
-const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Ceiling for the poll-retry backoff — a deliberate override of the shared
+/// [`crate::chain_events::WATCHER_MAX_BACKOFF`]: it is lower than the other
+/// watchers' 1-minute cap because a missed `Slashed` event burns the operator's
+/// fixed 30-day appeal window, so recovery is prioritized. Named distinctly from
+/// the shared constant so the divergence is obvious at the `WatcherConfig` site.
+/// The floor is the shared [`crate::chain_events::WATCHER_INITIAL_BACKOFF`].
+const SLASH_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// One slash detected against this node's operator.
 #[derive(Debug, Clone)]
@@ -169,7 +171,7 @@ impl SlashWatcher {
                 floor: from_block,
             },
             initial_backoff: WATCHER_INITIAL_BACKOFF,
-            max_backoff: WATCHER_MAX_BACKOFF,
+            max_backoff: SLASH_MAX_BACKOFF,
             rpc_call_timeout: None,
             shutdown: CancellationToken::new(),
             seed_cursor: None,

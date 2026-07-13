@@ -72,13 +72,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{self, CursorPolicy, LogSink, WatcherConfig};
-use crate::payment_settlement::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS};
-
-/// Backoff floor after a failed poll tick.
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Backoff ceiling — matches the settlement/origin/staker-set watchers (the
-/// slash watcher caps lower, at 30s).
-const MAX_BACKOFF: Duration = Duration::from_mins(1);
+use crate::chain_events::{
+    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+};
 /// Per-call ceiling on RPC reads (scope view, log query, head) so a stalled
 /// provider — which has no request timeout configured — cannot wedge the watcher.
 const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -246,8 +242,8 @@ pub(crate) async fn run<P>(
         reorg_margin: REORG_MARGIN_BLOCKS,
         max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
         cursor: cursor_policy(from_block),
-        initial_backoff: INITIAL_BACKOFF,
-        max_backoff: MAX_BACKOFF,
+        initial_backoff: WATCHER_INITIAL_BACKOFF,
+        max_backoff: WATCHER_MAX_BACKOFF,
         rpc_call_timeout: Some(RPC_CALL_TIMEOUT),
         shutdown,
         seed_cursor: None,
