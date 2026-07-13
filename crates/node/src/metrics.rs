@@ -650,7 +650,7 @@ pub struct DecdnMetrics {
     /// wire code, including the `InternalError` that DOES tar the provider's
     /// reputation — so this is a refusal counter, not an exoneration counter, and
     /// it is deliberately not split by code (`iroh_metrics` has no label support,
-    /// and a per-code counter set is not yet worth six more series). Most refusals
+    /// and a per-code counter set is not yet worth five more series). Most refusals
     /// are honest and benign: a `NotFound` is simply a healthy-but-empty node, so
     /// a sustained rate here usually means content discovery is steering this node
     /// at upstreams that do not hold the blob — not that the upstreams are bad.

@@ -448,11 +448,23 @@ impl StreamResponse {
 /// frames banned "a frame arrived" and "bytes made progress" are the same
 /// statement, so a peer cannot refresh the deadline with padding.
 ///
-/// Emitting one is impossible by construction on the serve side: the whole-blob
-/// payload is chunked with `slice::chunks`, which yields no items for an empty
-/// slice, so even the empty blob (whose bao encoding is zero bytes — see
-/// `decdn_bao_range::align_range`) goes straight to [`ClientMessage::StreamEnd`]
-/// rather than sending an empty frame first (#1054).
+/// An honest serve side cannot emit one, but the reason differs per path and both
+/// have to hold — this is the invariant the pull paths' inactivity deadline rests
+/// on, so it is worth naming precisely:
+///
+/// - The **buffered** path chunks its payload with `slice::chunks`, which yields no
+///   items for an empty slice. So even the empty blob (whose bao encoding is zero
+///   bytes — see `decdn_bao_range::align_range`) goes straight to
+///   [`ClientMessage::StreamEnd`] rather than sending an empty frame first (#1054).
+/// - The **window-paced** path (#856) forwards upstream frames verbatim and does no
+///   re-chunking, so it inherits the guarantee rather than establishing it: the
+///   frames it relays have already passed [`ChunkData::validate`] in the requester's
+///   receive loop.
+///
+/// That second path is the fragile one. A future change that re-chunks or synthesises
+/// a frame there (say, flushing a zero-length tee write) would break the invariant
+/// with nothing to catch it, since the buffered path's `slice::chunks` argument would
+/// still read as if it covered the whole serve side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkData {
     /// Sequential blob bytes (1..=[`CHUNK_SIZE`]).

@@ -332,15 +332,22 @@ impl std::error::Error for BlobTooLargeClaim {}
 /// stable `timed out` text for logs (and for the `!contains("timed out")`
 /// negative assertion in `node_to_node_pull_through`'s deadline test).
 ///
-/// Raised at BOTH upstream pull stages, so the message is deliberately
-/// stage-NEUTRAL: by the buffered [`stream_fetch_tracked`] delivery here in this
-/// crate, and — at the window-paced open stage (#1141) — by the `decdn-node`
-/// caller that wraps [`open_progressive_pull`] in its per-candidate deadline
-/// (`NodeOrigin::open_progressive_pull`; this crate's `open_progressive_pull`
-/// applies no timeout of its own). Callers that want to name the stage add a
-/// `.context(…)` layer; `downcast_ref` still recovers the sentinel through it —
-/// pinned by `buyer_side_sentinels_survive_anyhow_downcast` in
-/// `decdn-node`'s `node_origin.rs`, not in this crate.
+/// Since #1134 it is raised by OUR OWN wall clocks only, and the message is
+/// deliberately stage-NEUTRAL because there are two of them: the shared
+/// `open_stream` open bound (`PullDeadlines::open`, on both the buffered and the
+/// progressive path), and the optional overall `hard_cap`. `decdn-node` also wraps
+/// `open_progressive_pull` in its per-candidate budget as belt-and-braces, which
+/// raises the same sentinel.
+///
+/// It is NOT raised by the streaming loops — a mid-stream stall is [`PullStalled`],
+/// which is a fact about the PEER and scores its reputation, whereas this is a fact
+/// about our own possibly mis-sized budget and must not. Keeping the two apart is
+/// the whole point of the split.
+///
+/// Callers that want to name the stage add a `.context(…)` layer; `downcast_ref`
+/// still recovers the sentinel through it — pinned by
+/// `buyer_side_sentinels_survive_anyhow_downcast` in `decdn-node`'s `node_origin.rs`,
+/// not in this crate.
 #[derive(Debug)]
 pub struct PullTimeout {
     pub after: Duration,
@@ -519,10 +526,23 @@ impl PullDeadlines {
     }
 
     /// The legacy single-deadline shape: one budget serving as the open bound, the
-    /// stall bound, AND the overall cap. Retained for the loopback/test helper
-    /// [`stream_fetch`], whose callers pass a deadline generous enough for the tiny
-    /// blobs they move. Production paths should not use it — that conflation is
-    /// exactly what #1134 set out to remove.
+    /// stall bound, AND the overall cap. **Test-only — do not reach for this in
+    /// production.** That conflation is exactly what #1134 set out to remove, and the
+    /// name reads far more like a legitimate policy choice than it is.
+    ///
+    /// Note what it quietly costs, beyond re-introducing the size-coupled deadline:
+    /// because `hard_cap == stall`, and the cap's clock starts at the top of the
+    /// exchange while the stall clock only starts once bytes begin, **the hard cap
+    /// always elapses first — so [`PullStalled`] can never fire under it.** A pull
+    /// built this way silently cannot detect a stalled peer, and so cannot score one.
+    /// Every loopback test using this helper is exercising a pull with the stall
+    /// signal disabled; the stall path is covered by
+    /// `node_origin_mid_stream_silence_scores_stalled_upstream`, which builds its
+    /// deadlines explicitly.
+    ///
+    /// Retained only for the loopback helper [`stream_fetch`], whose callers move
+    /// blobs small enough that none of this matters.
+    #[doc(hidden)]
     #[must_use]
     pub const fn whole_transfer(timeout: Duration) -> Self {
         Self {
@@ -1058,7 +1078,10 @@ async fn receive_and_pay(
                     );
                 }
                 // Bytes arrived: the upstream is alive, so extend the inactivity
-                // deadline. This is the ONLY place it moves.
+                // deadline. It also extends after a completed voucher round trip
+                // below — but both sites sit inside this `ChunkData` arm, past the
+                // point where `cumulative` advanced, so only byte progress can ever
+                // refresh it. That is the property `PullStalled` rests on.
                 deadline = tokio::time::Instant::now() + stall;
                 buf.extend_from_slice(&chunk.bytes);
                 // Surface delivery progress after each chunk. `cumulative` and
@@ -1229,11 +1252,15 @@ pub struct UpstreamPullHeader {
 /// connection if none ran, but cannot return the watermark, so the obligation
 /// stands.
 ///
-/// **Deadlines.** The caller bounds the *open* (handshake) phase with its own
-/// wall clock (the per-candidate pull-through deadline). The streaming
-/// `next_chunk`/`finish` reads are bounded here, by INACTIVITY (#1134): each read
-/// must land within `stall` of the last byte of progress. Before that they had no
-/// application-level bound at all — a silent upstream was left to the QUIC idle
+/// **Deadlines.** The *open* (handshake) phase is bounded inside
+/// [`open_progressive_pull`] by `PullDeadlines::open`, via the shared `open_stream`
+/// helper — NOT by the caller (#1134). `decdn-node` does additionally wrap the open
+/// in its per-candidate budget, but that is belt-and-braces: leaving the bound to
+/// the caller is what let the buffered handshake ship unbounded once already.
+///
+/// The streaming `next_chunk`/`finish` reads are bounded here, by INACTIVITY: each
+/// read must land within `stall` of the last byte of progress. Before that they had
+/// no application-level bound at all — a silent upstream was left to the QUIC idle
 /// timeout, with only the loop's window pacing (it recoups a downstream voucher
 /// every window, so it cannot run unboundedly ahead of unpaid demand) standing
 /// between a wedged peer and an indefinitely-held serve task.

@@ -268,12 +268,17 @@ fn rehydrate_open_error(err: &Arc<anyhow::Error>) -> anyhow::Error {
 /// The guard is held by the DETACHED OPEN TASK, not by the caller (#1143). That is
 /// the whole point: a caller whose budget expires drops its *view* of the open, but
 /// the task — and therefore the slot — lives until the `openChannel` actually
-/// resolves. If the guard were held by the caller, a timed-out caller would release
-/// the slot while its tx was still in the mempool, and the next miss would open a
-/// SECOND channel to the same provider. The boot reconcile scan deliberately does
-/// not adopt that second channel (`ReconcileOutcome::DeferredSecondOpen`), so its
-/// deposit would sit unreclaimed until the live row cleared — which, at a 90-day
-/// expiry against a ~1-2 day event lookback, means in practice never.
+/// resolves. Release the slot while a tx is still in the mempool and the next miss
+/// opens a SECOND channel to the same provider; the boot reconcile scan then
+/// declines to adopt the first (`ReconcileOutcome::DeferredSecondOpen`), leaving its
+/// deposit unreclaimed until the live row clears — by which point the orphan's
+/// `ChannelOpened` is likely outside the ~2-day event lookback
+/// (`BUYER_RECONCILE_LOOKBACK_BLOCKS`) and it is not found at all.
+///
+/// This is the same reasoning that keeps `openChannel`'s receipt wait unbounded (see
+/// `decdn_client_pull::buyer_channel::open_channel`), and the two must not drift: a
+/// bound there would release the slot for exactly the same reason and produce exactly
+/// the same stranded deposit.
 struct InFlightOpenGuard {
     map: Arc<Mutex<HashMap<Address, SharedOpen>>>,
     provider: Address,
@@ -540,14 +545,6 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// actual deposit is `max(deposit_hint, default_deposit, min_deposit)`. The
     /// hint is ignored when an existing channel is reused (call
     /// [`Self::top_up`] to add funds to a live channel).
-    ///
-    /// # Errors
-    ///
-    /// Surfaces store errors and any failure of the `openChannel` transaction
-    /// (submit, revert, or receipt). Also errors if a tracked-but-expired
-    /// channel for `provider_addr` could not be reclaimed first (so its deposit
-    /// is never silently dropped — see below); retry once the reclaim sweep
-    /// clears it.
     ///
     /// # Bounding (#1143)
     ///
@@ -1719,9 +1716,13 @@ async fn run_open<P: Provider + Clone>(
             channel_id = %existing.channel_id,
             "tracked buyer channel expired; reclaiming before opening a replacement"
         );
-        // Outcome intentionally ignored: a persistent failure here surfaces to the
-        // caller as the retryable error below. The consecutive-failure escalation
-        // (#906) is the background sweep's job, not this one-off open-path reclaim.
+        // Outcome intentionally ignored, and the guarantee that makes that safe is
+        // NOT the caller: this runs in a detached task, so the retryable error below
+        // may reach nobody (#1143). What actually covers a failure here is
+        // `try_reclaim`'s own internal `warn!` on every leg, plus the hourly reclaim
+        // sweep, which retries and carries the consecutive-failure escalation (#906).
+        // The bail below still prevents an open from overwriting an unreclaimed row —
+        // it just cannot be relied on to REPORT anything.
         let _ = try_reclaim(contract, store, self_address, &existing).await;
         if store
             .get_by_provider(provider_addr)
