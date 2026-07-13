@@ -107,3 +107,23 @@ pub enum Command {
     /// File a slash appeal, posting the appeal bond (ADR 028).
     Appeal(AppealArgs),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Clap builds subcommands lazily along the parsed path, so a malformed arg
+    /// definition (duplicate long flag, duplicate arg id) panics at *runtime* on
+    /// the first invocation of that subcommand rather than failing the build.
+    /// `debug_assert` walks the whole command tree eagerly, so it catches this
+    /// for every subcommand — including the ones no test parses.
+    ///
+    /// This matters most for the flattened [`CommonChainArgs`]: it is embedded in
+    /// both `ChainArgs` and `PublishChainArgs`, so a future struct that flattens
+    /// two of them (or re-declares a shared flag by hand) would collide.
+    #[test]
+    fn cli_command_tree_is_clap_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+}

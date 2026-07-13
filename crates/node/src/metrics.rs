@@ -395,9 +395,11 @@ pub struct DecdnMetrics {
     /// `update_channel_deposit` / `forget_channel` store write (#751), or a
     /// failed closing-reconciliation on a `ChannelCloseInitiated` (#839) — which
     /// is a `getChannel` read *or* a `record_pending` write, so this counter is
-    /// not store-writes-only. The watcher re-drives the failure (a later event,
-    /// the bring-up backfill, or — for the close arm — a re-scan on the next
-    /// poll tick), but a non-zero rate flags a struggling channel store or RPC.
+    /// not store-writes-only. Recovery differs by arm: the `ChannelOpened` /
+    /// `ChannelToppedUp` / `ChannelCloseInitiated` arms return `Err`, failing the
+    /// tick so the window re-scans on the next one; the `forget_channel` arm is
+    /// swallowed (the cursor advances past it) and is re-driven only by the settle
+    /// sweep. Either way a non-zero rate flags a struggling channel store or RPC.
     /// Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
     /// Slashes detected against this node's operator by the slash watcher
@@ -517,13 +519,13 @@ pub struct DecdnMetrics {
     /// documented mid-run degradation. Because the stake-lane probe
     /// reservation (#757) and the DHT `Store` admission path both read that
     /// cached set, sustained restarts are revenue-impacting, not just a
-    /// discovery-health blip. The paired loop-level `tracing::warn!` in
-    /// `resumable_watcher::run` (`"watcher RPC error; restarting after backoff"`,
-    /// reached via `on_backoff`) carries the underlying error; this counter is
-    /// the alertable rate. An idle poll tick (head has not advanced / no new
-    /// logs) is NOT an error and does not bump this. Field has no `_total`
-    /// suffix because the
-    /// `OpenMetrics` encoder appends it.
+    /// discovery-health blip. The loop-level `tracing::warn!` in
+    /// `resumable_watcher::run` (`"watcher RPC error; restarting after backoff"`)
+    /// is emitted in the same failed-tick `Err` arm that fires the `on_backoff`
+    /// hook this counter hangs off, and carries the underlying error; this
+    /// counter is the alertable rate. An idle poll tick (head has not advanced /
+    /// no new logs) is NOT an error and does not bump this. Field has no
+    /// `_total` suffix because the `OpenMetrics` encoder appends it.
     pub staker_set_watcher_restarts: Counter,
     /// `decdn_staker_set_watcher_resolve_failures_total` (#788): times an
     /// operator-indexed event (`Reinstated` / `UnbondingRequested`) was
@@ -1330,10 +1332,13 @@ impl Metrics {
         self.decdn.settlement_pending_persist_failures.inc();
     }
 
-    /// The settlement watcher swallowed a channel-lifecycle persist failure
+    /// The settlement watcher hit a channel-lifecycle persist failure
     /// (`register_open_channel` / `update_channel_deposit` / `forget_channel`,
-    /// #751). Pairs with the per-site `warn!`s in `SettlementSink::apply`
-    /// (`payment_settlement.rs`).
+    /// #751), in `SettlementSink::apply` (`payment_settlement.rs`). Only the
+    /// `forget_channel` arm is swallowed, and it carries the sole per-site
+    /// `warn!` ("failed to forget settled channel"); the other arms return `Err`,
+    /// so their context surfaces in `resumable_watcher::run`'s loop-level
+    /// `warn!` ("watcher RPC error; restarting after backoff") instead.
     pub fn watcher_persist_failure(&self) {
         self.decdn.watcher_persist_failures.inc();
     }

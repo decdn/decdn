@@ -485,6 +485,68 @@ mod tests {
         assert!(err.to_string().contains("rpc_url not set"), "{err}");
     }
 
+    /// Publish-side counterpart of [`empty_chain`], so the publish resolver's
+    /// precedence can be exercised as thoroughly as the node resolver's — both
+    /// now route through `resolve_common`, so a regression there hits both.
+    fn empty_publish_chain() -> cli::PublishChainArgs {
+        cli::PublishChainArgs {
+            common: cli::CommonChainArgs {
+                config: None,
+                rpc_url: None,
+                chain_id: None,
+                keystore: None,
+                data_dir: Some(PathBuf::from("/tmp/decdn-test")),
+                keystore_password_file: None,
+                dry_run: true,
+                json: false,
+            },
+            publisher_registry_address: None,
+            origin_assignment_address: None,
+        }
+    }
+
+    /// `resolve_common` returns `(String, u64, PathBuf, PathBuf)` — `data_dir`
+    /// and `keystore` are the same type, so transposing them at *any* of the
+    /// three destructure sites compiles silently. The node path is guarded by
+    /// `keystore_defaults_under_data_dir`; this is the publish path's guard.
+    /// Without it, a swap confined to `resolve_publish` would ship green and
+    /// hand the data dir to the keystore loader on every `decdn publish` submit.
+    #[test]
+    fn resolve_publish_keystore_defaults_under_data_dir() {
+        let mut args = empty_publish_chain();
+        args.common.rpc_url = Some("http://x".to_string());
+        let r = resolve_publish(&args, &FileConfig::default()).unwrap();
+        assert_eq!(r.data_dir, PathBuf::from("/tmp/decdn-test"));
+        assert_eq!(r.keystore, PathBuf::from("/tmp/decdn-test/keystore.json"));
+    }
+
+    #[test]
+    fn resolve_publish_config_fills_unset_flags() {
+        let args = empty_publish_chain();
+        let file = file_with(FileBlockchain {
+            rpc_url: Some("http://config:8545".to_string()),
+            chain_id: None,
+            eth_keystore: Some(PathBuf::from("/keys/ks.json")),
+            publisher_registry_address: Some("0xCONFIG".to_string()),
+            origin_assignment_address: Some("0xOA".to_string()),
+            ..Default::default()
+        });
+        let r = resolve_publish(&args, &file).unwrap();
+        assert_eq!(r.rpc_url, "http://config:8545");
+        // `chain_id` absent from both flag and config → the shared default.
+        assert_eq!(r.chain_id, DEFAULT_CHAIN_ID);
+        assert_eq!(r.keystore, PathBuf::from("/keys/ks.json"));
+        assert_eq!(r.publisher_registry_address.as_deref(), Some("0xCONFIG"));
+        assert_eq!(r.origin_assignment_address.as_deref(), Some("0xOA"));
+    }
+
+    #[test]
+    fn resolve_publish_missing_rpc_url_errors() {
+        let args = empty_publish_chain();
+        let err = resolve_publish(&args, &FileConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("rpc_url not set"), "{err}");
+    }
+
     #[test]
     fn resolve_publish_flag_beats_config() {
         let args = cli::PublishChainArgs {

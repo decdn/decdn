@@ -45,9 +45,11 @@ pub struct CommonChainArgs {
     #[arg(long, value_name = "URL")]
     pub rpc_url: Option<String>,
 
-    /// EIP-712 `chainId` for signing domains / the expected chain of
-    /// `--rpc-url`. Overrides `blockchain.chain_id`; must match the target
-    /// contract deployment's chain or signatures are rejected on-chain.
+    /// EIP-712 `chainId` for signing domains. Overrides `blockchain.chain_id`;
+    /// defaults to Arbitrum Sepolia. Must match the target contract
+    /// deployment's chain or signatures are rejected on-chain. The `publish`
+    /// and `setup` commands additionally read the RPC's own chain id and refuse
+    /// to submit on a mismatch; the other on-chain commands do not.
     #[arg(long, value_name = "ID")]
     pub chain_id: Option<u64>,
 

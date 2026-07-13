@@ -3,10 +3,14 @@
 //! `resumable_watcher::run` walks a `[cursor, head]` gap in bounded
 //! `eth_getLogs` windows and rewinds a shallow reorg margin on resume; the
 //! buyer-side bootstrap reconciliation scan ([`crate::buyer_channel`], #763)
-//! reuses the same math. Kept here (rather than in any one watcher) so the
-//! window span and reorg margin can't drift between consumers (#1092) — an
-//! earlier 9k-vs-10k span split between the slash and settlement watchers is
-//! exactly the divergence this shared home prevents.
+//! reuses the same math. Kept here (rather than in any one watcher) so a new
+//! consumer picks up the shared span instead of forking a fresh one (#1092).
+//!
+//! Known remaining divergence: the origin directory's genesis `ContentClaimed`
+//! replay ([`crate::dht::chain_origin_directory`], #651) still walks its own
+//! `REPLAY_WINDOW_BLOCKS = 9_000` windows by hand rather than going through
+//! [`backfill_windows`]. Migrating it onto this module is a follow-up — until
+//! then the 9k/10k span split is real, not merely historical.
 
 use anyhow::Result;
 
@@ -18,9 +22,16 @@ use anyhow::Result;
 /// few extra blocks of `eth_getLogs`. Sized for the shallow reorgs of an
 /// Arbitrum-Sepolia-class L2.
 ///
-/// Shared so the slash-detection watcher ([`crate::slash_watcher`], #1032) and
-/// the other watchers apply the same margin to their cursor resume rather than
-/// forking the sizing rationale.
+/// Only [`resumable_watcher::CursorPolicy::Persisted`] reads this (via
+/// `resolve_persisted_start`) — it is the rewind applied to a *durable* cursor,
+/// so it is inert for the `HeadMinusWindow` / `FullReplay` watchers, which
+/// re-derive their floor from head on every boot. The two consumers that
+/// actually rewind are therefore the settlement watcher
+/// ([`crate::payment_settlement`], #751) and the origin directory
+/// ([`crate::dht::chain_origin_directory`]); shared so they can't fork the
+/// sizing rationale.
+///
+/// [`resumable_watcher::CursorPolicy::Persisted`]: super::resumable_watcher::CursorPolicy
 pub(crate) const REORG_MARGIN_BLOCKS: u64 = 128;
 
 /// Maximum block span scanned per `eth_getLogs` during the resume backfill

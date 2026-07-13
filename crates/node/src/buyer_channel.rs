@@ -1854,7 +1854,8 @@ async fn reconcile_one_opened<P: Provider + Clone>(
 /// the buyer keeps no checkpoint, so the lost window is only re-covered on a
 /// later restart); per-event faults are logged and skipped. The completion log
 /// reports the failed-window count so a partial scan is observable. Mirrors the
-/// seller backfill in [`crate::payment_settlement`], reusing its window helpers.
+/// seller-side backfill (now the resumable watcher's first poll tick), reusing
+/// the shared window helpers in [`crate::chain_events::backfill`].
 // Linear scan (head → windows → query → per-event) with inline best-effort
 // guards; splitting would obscure the control flow.
 #[allow(clippy::cognitive_complexity)]
