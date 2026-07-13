@@ -99,6 +99,23 @@ struct ChannelDeliveryState {
     bytes_delivered_cumulative: U256,
 }
 
+/// Absolute backstop on a detached background cache-fill (#1134 review).
+///
+/// This is a LEAK GUARD, not a health signal, and the distinction is why it is an
+/// hour rather than a minute. The warm's streaming stage is bounded by inactivity,
+/// which resets on any byte received — so an upstream that trickles one byte per
+/// stall-window keeps the task alive indefinitely without ever tripping the stall
+/// bound. That is not merely a leaked task: `arm_background_fill` claims the hash
+/// for the task's lifetime, so a warm that never ends means the node can never warm
+/// that blob again for the life of the process.
+///
+/// Sized ~50× the derived foreground deadline (`3 × 20 s + 10 s` at defaults), so it
+/// bounds no honest transfer the node's `max_blob_size_mb` ceiling permits — a 1 GiB
+/// blob would have to average under 300 KB/s to hit it — while still guaranteeing
+/// every warm terminates. Not config-tunable (YAGNI): an operator who needs to tune
+/// this wants `node_pull_stall_timeout_sec`, which is the actual health knob.
+pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
+
 /// Detached background cache-fill state (#859), attached post-construction via
 /// [`ClientHandler::attach_background_fill`]. When the foreground delivery
 /// deadline fires on a node-to-node miss, the handler spawns a task to keep
@@ -107,20 +124,22 @@ struct BackgroundFill {
     /// Cancelled on node shutdown so in-flight warm tasks stop cooperatively at
     /// their next await rather than being left to run past drain.
     cancel: CancellationToken,
-    /// Optional overall wall-clock cap on a background fill. `None` — the wiring's
-    /// choice — means the warm runs until it completes, stalls, or is cancelled.
+    /// Optional overall wall-clock cap on a background fill. The runtime passes
+    /// [`BACKGROUND_FILL_HARD_CAP`]; `None` (tests) runs to completion.
     ///
     /// It used to reuse the derived outer pull-through deadline, and that made the
-    /// background fill useless for exactly the content it matters most for: the
-    /// warm re-pulls from scratch, so capping it at the same ~70 s the *foreground*
-    /// gave up on meant a blob that could not be pulled in one deadline could not
-    /// be warmed in one either. The node simply could not acquire any blob needing
-    /// more than a deadline's worth of transfer (#1134).
+    /// background fill useless for exactly the content it matters most for: the warm
+    /// re-pulls from scratch, so capping it at the same ~70 s the *foreground* gave
+    /// up on meant a blob that could not be pulled in one deadline could not be
+    /// warmed in one either. The node simply could not acquire any blob needing more
+    /// than a deadline's worth of transfer (#1134).
     ///
-    /// Dropping the cap is safe because the pull's streaming stage is bounded by
-    /// inactivity (`node_pull_stall_timeout_sec`) rather than a wall clock: a warm
-    /// cannot hang, it can only run as long as an upstream keeps feeding it bytes.
-    /// A dead upstream still trips the stall bound, and shutdown still cancels.
+    /// The fix is a *bigger* cap, not the absence of one. It is tempting to argue
+    /// the cap is unnecessary because the pull's streaming stage is inactivity-bounded
+    /// — but inactivity is not liveness: the deadline resets on ANY byte, so a peer
+    /// trickling one byte per stall-window keeps a warm running forever, and the
+    /// per-hash `inflight` claim then blocks that blob from ever being warmed again.
+    /// See [`BACKGROUND_FILL_HARD_CAP`].
     budget: Option<Duration>,
     /// Hashes with a background fill currently running, so repeated foreground
     /// misses on the same hash don't spawn duplicate warming tasks. A std mutex
@@ -684,16 +703,19 @@ impl ClientHandler {
                     }
                     Ok(Err(e)) => {
                         // Covers every populate error (clean miss, no origin, AND
-                        // store/I/O fault), so the message stays neutral; the
-                        // cause rides in `error`. A stalled upstream lands here too
-                        // — the pull's inactivity bound is what stops an uncapped
-                        // warm from running forever.
+                        // store/I/O fault), so the message stays neutral; the cause
+                        // rides in `error`. A stalled upstream lands here too.
                         metrics.node_pull_through_background_failed();
                         tracing::debug!(%hash, error = %e, "background cache-fill did not complete");
                     }
                     Err(_) => {
+                        // `warn!`, not `debug!`: this fires only at the absolute
+                        // backstop, which an honest transfer cannot reach. Hitting it
+                        // means an upstream trickled bytes for an hour without
+                        // finishing — a pathological peer, or a badly mis-sized
+                        // `max_blob_size_mb`. Either way the operator wants to know.
                         metrics.node_pull_through_background_failed();
-                        tracing::debug!(%hash, ?budget, "background cache-fill timed out");
+                        tracing::warn!(%hash, ?budget, "background cache-fill hit its absolute cap; abandoning");
                     }
                 },
             }

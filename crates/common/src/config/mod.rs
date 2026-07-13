@@ -1409,9 +1409,30 @@ fn resolve_cache_into(
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
+    bag.check(
+        node_pull_timeout_sec > 0,
+        "cache.node_pull_timeout_sec",
+        "cache.node_pull_timeout_sec must be > 0 (a 0 budget abandons every upstream \
+         before its handshake can complete, so no pull can ever succeed)",
+    );
     let node_pull_stall_timeout_sec = file
         .and_then(|c| c.node_pull_stall_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC);
+    // Rejecting 0 here matters more than it does for most knobs, because #1134 made
+    // a stall REPUTATION-AFFECTING. A 0 budget trips `PullStalled` on the first poll
+    // of every streaming read, and `classify_pull_failure` scores that `Unreachable`
+    // — folding it into the local EWMA *and* the observation buffer the gossip
+    // publisher drains. So a single fat-fingered value would not merely break this
+    // node: it would broadcast false `Unreachable` observations about every honest
+    // peer it touches. (Its predecessor, `PullTimeout`, was exonerating, so the
+    // blast radius of a bad value used to stop at the local node.)
+    bag.check(
+        node_pull_stall_timeout_sec > 0,
+        "cache.node_pull_stall_timeout_sec",
+        "cache.node_pull_stall_timeout_sec must be > 0 (a 0 budget marks every \
+         upstream as stalled on the first read, scoring — and gossiping — every \
+         honest peer as unreachable)",
+    );
     // Resolve the seed-leech knobs to their typed `Bytes` / `Percent` form and
     // keep them typed through the cross-field check and `ResolvedCache`
     // construction below, so a bytes<->percent (or bytes<->bytes) transposition
@@ -4305,6 +4326,41 @@ mod tests {
     // like `path = "~/origin"` resolves to `<home>/origin`. The
     // expansion happens inside resolution (not in `expand_env`),
     // because `~` is filesystem-shaped and the `expand_env`
+    /// A zero stall budget is the most dangerous value in this file (#1134 review).
+    /// `PullStalled` — unlike the `PullTimeout` it replaced — SCORES the peer, and
+    /// `record_outcome` writes both the local EWMA and the observation buffer the
+    /// gossip publisher drains. So a `0` here would not merely break this node: it
+    /// would trip on the first poll of every streaming read and broadcast false
+    /// `Unreachable` observations about every honest peer the node touches.
+    #[test]
+    fn resolve_cache_rejects_zero_stall_timeout() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            node_pull_stall_timeout_sec: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "a 0 stall budget must be rejected: it would gossip every honest peer as unreachable"
+        );
+    }
+
+    /// A zero open budget abandons every upstream before its handshake can finish,
+    /// so no pull can ever succeed. Local-only blast radius (a `PullTimeout` is
+    /// exonerating), but still a config that cannot work.
+    #[test]
+    fn resolve_cache_rejects_zero_pull_timeout() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            node_pull_timeout_sec: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "a 0 open budget must be rejected: no pull could ever complete its handshake"
+        );
+    }
+
     // contract only handles `${VAR}` substitution.
     #[test]
     fn resolve_cache_origin_fs_expands_tilde_in_path() -> anyhow::Result<()> {

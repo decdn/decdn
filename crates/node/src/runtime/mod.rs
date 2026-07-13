@@ -1108,15 +1108,30 @@ pub async fn run(
         let outer_deadline = crate::selection::outer_pull_deadline(per_candidate);
         client_handler.attach_pull_through(outer_deadline);
         // Background fill keeps warming the cache after the delivery path gives up.
-        // It runs UNCAPPED (#1134): the foreground deadline bounds how long a
-        // *client* waits, but the warm has no client waiting on it, and capping it
-        // at the same budget the foreground just exhausted meant a blob too large to
-        // fetch in one deadline could never be warmed either — the node could not
-        // acquire any blob needing more than ~`outer_deadline` of transfer. The
-        // pull's streaming stage is bounded by inactivity
-        // (`node_pull_stall_timeout_sec`), so an uncapped warm still cannot hang on
-        // a dead upstream; and shutdown cancels it.
-        client_handler.attach_background_fill(pull_through_bg_shutdown.clone(), None);
+        //
+        // It does NOT reuse `outer_deadline` (#1134): the foreground deadline bounds
+        // how long a *client* waits, but the warm has no client waiting on it, and
+        // capping it at the budget the foreground just exhausted meant a blob too
+        // large to fetch in one deadline could never be warmed either — the node
+        // could not acquire any blob needing more than ~70 s of transfer.
+        //
+        // But "not the foreground deadline" is not the same as "no bound", and the
+        // first cut of this got that wrong. The streaming stage is bounded by
+        // INACTIVITY, which resets on any byte — so an upstream trickling one byte
+        // every `stall - ε` keeps a warm alive forever without ever tripping it. And
+        // because `arm_background_fill` claims the hash for the task's lifetime, a
+        // warm that never ends means that blob can never be warmed again for the life
+        // of the process. An inactivity bound is not a liveness bound.
+        //
+        // So: a generous absolute backstop, sized as a leak guard rather than a
+        // health signal. It is ~50× the foreground deadline, so it constrains no
+        // honest transfer the node's `max_blob_size_mb` ceiling permits; it exists
+        // only so a pathological upstream cannot pin a task and poison a hash
+        // indefinitely.
+        client_handler.attach_background_fill(
+            pull_through_bg_shutdown.clone(),
+            Some(crate::handlers::client::BACKGROUND_FILL_HARD_CAP),
+        );
         // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
         // available, serve cache misses by fusing the upstream pull with
         // downstream delivery (bounded by `pull_ahead_bytes`) instead of the
