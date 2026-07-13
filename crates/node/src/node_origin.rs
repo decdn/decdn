@@ -60,7 +60,7 @@ use decdn_reputation::{
 
 use decdn_incentive::ChannelOpenFailureReason;
 
-use crate::buyer_channel::{ChannelOpenPending, ChannelOpener};
+use crate::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenReported};
 use crate::client_requester::{
     BlobTooLargeClaim, ChannelContext, HashMismatch, PullDeadlines, PullStalled, PullTimeout,
     UpstreamPull, UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
@@ -99,6 +99,15 @@ fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, er
     if err.downcast_ref::<ChannelOpenPending>().is_some() {
         deps.metrics.node_pull_channel_open_pending();
         debug!(%provider_addr, %err, "node-origin: channel open still in flight; trying the next candidate");
+        return;
+    }
+    // The detached open task already logged and metered this one (#1143). It has to
+    // be the reporter, because when an open fails, every caller may already have
+    // timed out and left — so if the caller were the reporter, the failure would go
+    // unobserved exactly when it is least affordable. This arm keeps the caller that
+    // DID happen to still be waiting from double-counting it.
+    if err.downcast_ref::<OpenReported>().is_some() {
+        debug!(%provider_addr, %err, "node-origin: buyer channel open failed (reported by the open task)");
         return;
     }
     deps.metrics.node_pull_channel_open_failure();

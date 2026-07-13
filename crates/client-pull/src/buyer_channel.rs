@@ -70,30 +70,6 @@ fn approve_decision(current: U256, amount: Option<U256>) -> Option<U256> {
 /// the `RECONCILE_IDLE_SWEEPS` convention in the node's `buyer_channel`.
 const APPROVE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// Await `fut` under an optional receipt-wait bound, naming `tx` if it expires.
-///
-/// `None` waits indefinitely — the `decdn fetch` CLI's posture, and deliberately
-/// so: the CLI has no reclaim sweep and no boot-time reconcile scan, so an open it
-/// stops waiting on that later mines would strand a deposit with nothing but a tx
-/// hash in stderr. Better for a one-shot command to keep waiting. The node passes
-/// `Some(_)`, because it *does* have that machinery and must not let a stuck tx pin
-/// a provider's open slot (#1143).
-async fn await_receipt<F, T, E>(fut: F, bound: Option<Duration>, tx: TxHash) -> Result<T>
-where
-    F: std::future::Future<Output = std::result::Result<T, E>>,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    match bound {
-        None => Ok(fut.await?),
-        Some(bound) => Ok(tokio::time::timeout(bound, fut).await.map_err(|_| {
-            anyhow::anyhow!(
-                "openChannel receipt timed out after {bound:?} (tx {tx}; it may still mine, \
-                     and the boot reconcile scan will adopt the channel if it does)"
-            )
-        })??),
-    }
-}
-
 /// A freshly opened buyer channel: the persistable [`BuyerChannelState`], a
 /// ready-to-sign [`ChannelContext`], and the open transaction hash (so a caller
 /// whose subsequent `store.record` fails can log the escrowed-but-untracked tx
@@ -200,7 +176,30 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// missing-`ChannelOpened` leg carries no reason — the deposit is escrowed but
 /// untracked, so it surfaces as an unclassified error for manual reconciliation
 /// rather than a metric bump.
-#[allow(clippy::too_many_arguments)]
+///
+/// # The receipt wait is deliberately UNBOUNDED
+///
+/// Every other tx in this module bounds its receipt wait (`APPROVE_RECEIPT_TIMEOUT`).
+/// `openChannel` must not, and the asymmetry is load-bearing rather than an
+/// oversight (#1143).
+///
+/// `approve` is idempotent: giving up on its receipt costs nothing, because the
+/// allowance read on the next run makes a re-approve a no-op. `openChannel`
+/// **escrows a deposit**. Giving up on its receipt does not cancel the tx — it only
+/// makes us stop watching a transfer of real USDC that is still in the mempool. The
+/// caller then has no row, believes no open is in flight, and the next cache miss
+/// escrows a **second** deposit against the same provider. When the first tx mines,
+/// the boot reconcile scan finds a live row already covering that provider and
+/// classifies the orphan `DeferredSecondOpen` — it declines to adopt it, and the
+/// deposit is stranded for the channel's full expiry.
+///
+/// So: while an `openChannel` is outstanding, the only safe thing to do is keep
+/// waiting. The node calls this inside a DETACHED task that holds the provider's
+/// open slot for exactly as long as this future runs, which is what makes the wait
+/// harmless — no caller is blocked by it (they time out on their own budget and get
+/// `ChannelOpenPending`), and no second open can start behind it. It is also what
+/// lets the boot scan do its job: with no second open, there is no live row, so an
+/// orphan is `Rehydrate`d rather than deferred.
 pub async fn open_channel<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     signer: Arc<PrivateKeySigner>,
@@ -209,7 +208,6 @@ pub async fn open_channel<P: Provider + Clone>(
     self_address: Address,
     provider_addr: Address,
     deposit: U256,
-    receipt_timeout: Option<Duration>,
 ) -> Result<OpenedChannel> {
     let pending = match contract.openChannel(provider_addr, deposit).send().await {
         Ok(pending) => pending,
@@ -225,15 +223,17 @@ pub async fn open_channel<P: Provider + Clone>(
                 .context(reason);
         }
     };
-    // Capture the hash before `get_receipt` consumes `pending`, so a timeout names
-    // the broadcast tx an operator (or the boot reconcile scan) needs to look up.
-    let open_tx = *pending.tx_hash();
-    let receipt = await_receipt(pending.get_receipt(), receipt_timeout, open_tx)
+    // Unbounded by design — see the `# The receipt wait is deliberately UNBOUNDED`
+    // section above. A `tokio::time::timeout` here would be worse than no bound at
+    // all: it abandons an escrowing tx that is still going to land.
+    let receipt = pending
+        .get_receipt()
         .await
         // A failed receipt wait is always a transport/RPC condition (the tx may
         // even have landed) — never a settlement decision.
         .map_err(|err| {
-            err.context("await openChannel receipt")
+            anyhow::Error::new(err)
+                .context("await openChannel receipt")
                 .context(ChannelOpenFailureReason::RpcError)
         })?;
     if !receipt.status() {
@@ -260,6 +260,17 @@ pub async fn open_channel<P: Provider + Clone>(
         .map(|decoded| decoded.inner.data)
         .find(|ev| ev.client == self_address && ev.provider == provider_addr)
     else {
+        // The deposit is escrowed on-chain and we cannot name the channel it bought.
+        // Log it HERE rather than leaving it to the caller: the node's caller is a
+        // detached task whose `Err` nobody may be waiting on (#1143), so a bare
+        // `bail!` could lose the only record of real, escrowed USDC.
+        error!(
+            %tx,
+            provider = %provider_addr,
+            %deposit,
+            "openChannel mined but its ChannelOpened event is missing from the receipt logs; \
+             the deposit is escrowed on-chain but UNTRACKED — reconcile manually against the tx"
+        );
         anyhow::bail!(
             "ChannelOpened event for provider {provider_addr} not found in openChannel receipt \
              logs (tx {tx}); the deposit is escrowed on-chain but untracked — reconcile manually"

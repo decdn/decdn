@@ -146,25 +146,26 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Bound the wait for the `openChannel` receipt inside the detached open task
-/// (#1143), so a stuck or underpriced tx cannot pin the task (and the provider's
-/// open slot) forever. Mirrors `APPROVE_RECEIPT_TIMEOUT` in the shared kernel
-/// (#1109 — ~27 min observed on a live node): sized well above a normal inclusion
-/// window, short enough that the worst case is minutes.
+/// Bound the wait for the `reclaimExpired` receipt on the open path's rotate leg.
 ///
-/// This is NOT the budget a cache-miss waits on — that is the caller's
-/// per-candidate budget, which is seconds. The two are deliberately different
-/// numbers because they answer different questions: "how long should a client wait
-/// before trying another provider?" (short) versus "how long might a broadcast tx
-/// legitimately take to mine?" (long). Conflating them is what made this hard; see
-/// [`BuyerChannelService::open_or_reuse_channel`].
+/// Bounding this one is safe, and the contrast with `openChannel` — which
+/// `decdn_client_pull::buyer_channel::open_channel` deliberately does NOT bound —
+/// is the whole point (#1143):
 ///
-/// On timeout the tx may still mine. Unlike `approve` — which is idempotent, so a
-/// re-run is free — a re-opened channel would escrow a SECOND deposit, so the
-/// timeout is logged with the tx hash for the boot-time reconcile scan
-/// (`reconcile_orphans_once`) to adopt, and the provider's slot is released only
-/// after this fires. Not config-tunable yet (YAGNI), like `RECONCILE_IDLE_SWEEPS`.
-const OPEN_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
+/// - `openChannel` **escrows** a deposit. Giving up on its receipt does not cancel
+///   the tx; it only makes us stop watching real USDC that is still going to land,
+///   which is how a second deposit gets escrowed against the same provider.
+/// - `reclaimExpired` **refunds** one. Giving up on its receipt strands nothing: the
+///   channel row is left in place, the hourly reclaim sweep retries it, and the open
+///   that triggered it fails with a retryable error.
+///
+/// So this bound exists purely so a stuck reclaim cannot pin the detached open task
+/// — and with it the provider's in-flight slot — indefinitely. That would wedge the
+/// provider for the life of the process, which is exactly the starvation #1143 set
+/// out to remove. Sized like `APPROVE_RECEIPT_TIMEOUT` (#1109): well above a normal
+/// inclusion window, short enough that the worst case is minutes. Not config-tunable
+/// yet (YAGNI), like `RECONCILE_IDLE_SWEEPS`.
+const RECLAIM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Typed sentinel for a channel open that is still IN FLIGHT when the caller's
 /// budget runs out (#1143).
@@ -194,6 +195,27 @@ impl std::fmt::Display for ChannelOpenPending {
 
 impl std::error::Error for ChannelOpenPending {}
 
+/// Marker attached to any error the detached open task has ALREADY logged and
+/// metered (#1143).
+///
+/// The task is the only party guaranteed to observe an open's outcome — every
+/// caller may have timed out and left with [`ChannelOpenPending`] — so the task,
+/// not the caller, is the reporter. But a caller that *was* still waiting receives
+/// the same error, and would otherwise log and count it a second time. This marker
+/// lets `record_channel_open_failure` recognise "already reported" and stay quiet,
+/// so `decdn_node_pull_channel_open_failures_total` counts opens that failed, not
+/// opens that failed while someone happened to be listening.
+#[derive(Debug)]
+pub struct OpenReported;
+
+impl std::fmt::Display for OpenReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reported by the buyer channel open task")
+    }
+}
+
+impl std::error::Error for OpenReported {}
+
 /// The outcome of a detached open, as seen by everyone waiting on it.
 ///
 /// `Ok(())` carries no channel: a successful open *persists* to the store, so a
@@ -217,15 +239,25 @@ type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 /// instead of logging `unclassified`. The alternative — handing every waiter the
 /// same `Arc` — would not satisfy the `anyhow::Error` return type, and stringifying
 /// would silently lose the reason.
+/// Only the markers re-attached below survive; every other typed layer (the
+/// `StoreError` from `store.record`, the underlying alloy transport error) is
+/// flattened into the message. Nothing downcasts those off this path today, but a
+/// future sentinel added to the open path MUST be re-attached here or it will
+/// silently vanish — and only for callers that *joined* an open, never for the one
+/// that started it, which is the nastiest possible way for it to fail.
 fn rehydrate_open_error(err: &Arc<anyhow::Error>) -> anyhow::Error {
     let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
+    let reported = err.downcast_ref::<OpenReported>().is_some();
     // `{:#}` renders the whole context chain, so the waiter's message matches what
     // the opening task saw.
-    let rebuilt = anyhow::anyhow!("{err:#}");
-    match reason {
-        Some(reason) => rebuilt.context(reason),
-        None => rebuilt,
+    let mut rebuilt = anyhow::anyhow!("{err:#}");
+    if let Some(reason) = reason {
+        rebuilt = rebuilt.context(reason);
     }
+    if reported {
+        rebuilt = rebuilt.context(OpenReported);
+    }
+    rebuilt
 }
 
 /// RAII slot in the per-provider in-flight-open map. Dropping it removes the
@@ -627,6 +659,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         let token = self.token;
         let self_address = self.self_address;
         let deposit = deposit_hint.max(self.default_deposit).max(self.min_deposit);
+        let metrics = Arc::clone(&self.metrics);
 
         let handle = tokio::spawn(async move {
             // Dropped when the task ends (any path), releasing the provider slot.
@@ -640,6 +673,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                 self_address,
                 provider_addr,
                 deposit,
+                &metrics,
             )
             .await
             .map_err(Arc::new)
@@ -1642,7 +1676,10 @@ async fn reclaim_once<P: Provider + Clone>(
 /// the store, and every waiter reads it back from there. That keeps "I opened it"
 /// and "someone else opened it" on one code path, which is also what makes the
 /// no-op arm below correct.
-#[allow(clippy::too_many_arguments)]
+// Linear guard-and-act sequence (reuse re-check → rotate/reclaim → open → persist);
+// the tracing macros on each failure leg inflate the metric past threshold, as on
+// `try_reclaim`. Splitting would scatter one flow across helpers.
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 async fn run_open<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn BuyerChannelStore>,
@@ -1652,6 +1689,7 @@ async fn run_open<P: Provider + Clone>(
     self_address: Address,
     provider_addr: Address,
     deposit: U256,
+    metrics: &Arc<Metrics>,
 ) -> Result<()> {
     // Re-check the store now that we hold the slot. The caller's fast-path miss
     // happened BEFORE we took the map lock, so a previous open for this provider
@@ -1699,16 +1737,19 @@ async fn run_open<P: Provider + Clone>(
     }
 
     // The openChannel tx, the authoritative ChannelOpened-from-receipt decode, and
-    // the state construction are the shared kernel (#940). `OPEN_RECEIPT_TIMEOUT`
-    // bounds the receipt wait so a stuck tx cannot pin this task — and the
-    // provider's open slot — indefinitely.
+    // the state construction are the shared kernel (#940). Its receipt wait is
+    // UNBOUNDED by design — see `open_channel`'s doc: abandoning an escrowing tx is
+    // how a second deposit gets opened against the same provider. This task holds
+    // the provider's slot for exactly as long as that wait runs, which is what makes
+    // it safe: no caller is blocked (they time out on their own budget), and no
+    // second open can start behind it.
     //
     // What stays node-specific: from the moment the kernel returns, the deposit is
     // escrowed on-chain, so a failure to persist locally leaves it tracked ONLY on
     // chain. The reclaim sweep iterates `load_all` and so never sees an unpersisted
     // channel; escalate to `error!` with the open tx for manual reconcile (the
     // bootstrap reconciliation scan, #763, also adopts it on the next restart).
-    let OpenedChannel { state, tx, .. } = open_channel(
+    let opened = open_channel(
         contract,
         signer,
         voucher_domain,
@@ -1716,9 +1757,34 @@ async fn run_open<P: Provider + Clone>(
         self_address,
         provider_addr,
         deposit,
-        Some(OPEN_RECEIPT_TIMEOUT),
     )
-    .await?;
+    .await;
+
+    let OpenedChannel { state, tx, .. } = match opened {
+        Ok(opened) => opened,
+        Err(err) => {
+            // Report HERE, not at the caller (#1143). This runs in a detached task,
+            // and by the time an open fails, every caller that was waiting on it may
+            // already have timed out and walked away with `ChannelOpenPending` — in
+            // which case nobody is left to observe the `Err`. Before this, a failed
+            // open could produce zero log lines and zero metric increments, and the
+            // legs that go silent are the ones that matter most: a reverted or
+            // under-funded open means this node cannot pay for anything.
+            let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
+            warn!(
+                provider = %provider_addr,
+                %deposit,
+                reason = reason.map_or("unclassified", ChannelOpenFailureReason::as_label),
+                err = %format!("{err:#}"),
+                "buyer channel open failed"
+            );
+            metrics.node_pull_channel_open_failure();
+            if let Some(reason) = reason {
+                metrics.channel_open_failure_by_reason(reason);
+            }
+            return Err(err.context(OpenReported));
+        }
+    };
 
     if let Err(err) = store.record(&state) {
         error!(
@@ -1731,7 +1797,10 @@ async fn run_open<P: Provider + Clone>(
              failed; the deposit is UNTRACKED and will not be auto-reclaimed — reconcile \
              manually against the tx"
         );
-        return Err(err).context("persist newly-opened buyer channel");
+        metrics.node_pull_channel_open_failure();
+        return Err(anyhow::Error::new(err))
+            .context("persist newly-opened buyer channel")
+            .context(OpenReported);
     }
     Ok(())
 }
@@ -1775,13 +1844,29 @@ async fn try_reclaim<P: Provider + Clone>(
     }
 
     let receipt = match contract.reclaimExpired(st.channel_id).send().await {
-        Ok(pending) => match pending.get_receipt().await {
-            Ok(r) => r,
-            Err(err) => {
-                warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: receipt failed");
-                return ReclaimOutcome::Failed;
+        // Bounded (#1143): `run_open` calls this on the rotate leg, INSIDE the
+        // detached open task that holds the provider's in-flight slot. An unbounded
+        // wait here would let a stuck `reclaimExpired` pin that slot for the life of
+        // the process, wedging the provider — the very starvation #1143 removes.
+        // Safe to bound precisely because a reclaim refunds rather than escrows: the
+        // row stays, the hourly sweep retries, nothing is stranded.
+        Ok(pending) => {
+            match tokio::time::timeout(RECLAIM_RECEIPT_TIMEOUT, pending.get_receipt()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(err)) => {
+                    warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: receipt failed");
+                    return ReclaimOutcome::Failed;
+                }
+                Err(_) => {
+                    warn!(
+                        channel_id = %st.channel_id,
+                        timeout = ?RECLAIM_RECEIPT_TIMEOUT,
+                        "buyer reclaim: receipt timed out; the tx may still mine and the sweep will retry"
+                    );
+                    return ReclaimOutcome::Failed;
+                }
             }
-        },
+        }
         Err(err) => {
             warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: send failed");
             return ReclaimOutcome::Failed;
