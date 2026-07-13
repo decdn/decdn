@@ -60,7 +60,7 @@ use decdn_reputation::{
 
 use decdn_incentive::ChannelOpenFailureReason;
 
-use crate::buyer_channel::ChannelOpener;
+use crate::buyer_channel::{ChannelOpenPending, ChannelOpener};
 use crate::client_requester::{
     BlobTooLargeClaim, ChannelContext, HashMismatch, PullDeadlines, PullStalled, PullTimeout,
     UpstreamPull, UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
@@ -91,6 +91,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// channel that aborted before the `openChannel` tx — still lands in the
 /// unlabeled total and logs `reason="unclassified"`.
 fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, err: &anyhow::Error) {
+    // Not a failure at all: the open ran past our per-candidate budget and is still
+    // going in the background (#1143). Meter it apart from real failures — a
+    // sustained rate means this node's chain lane is too slow for its
+    // `node_pull_timeout_sec`, which is a very different diagnosis from a reverting
+    // or under-funded open.
+    if err.downcast_ref::<ChannelOpenPending>().is_some() {
+        deps.metrics.node_pull_channel_open_pending();
+        debug!(%provider_addr, %err, "node-origin: channel open still in flight; trying the next candidate");
+        return;
+    }
     deps.metrics.node_pull_channel_open_failure();
     let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
     if let Some(reason) = reason {
@@ -291,7 +301,15 @@ impl NodeOrigin {
         };
         let ctx = match deps
             .buyer
-            .open_or_reuse_channel(provider_addr, deps.config.deposit_hint)
+            // Bounded by the SAME per-candidate budget as the rest of this
+            // attempt (#1143). A wedged open no longer consumes the whole outer
+            // deadline: we stop waiting and try candidate #2, while the open keeps
+            // running in the background and its channel is reused if it lands.
+            .open_or_reuse_channel(
+                provider_addr,
+                deps.config.deposit_hint,
+                deps.config.pull_timeout,
+            )
             .await
         {
             Ok(ctx) => ctx,
@@ -835,7 +853,12 @@ async fn pull_from_candidate(
     };
     let ctx = match deps
         .buyer
-        .open_or_reuse_channel(provider_addr, deps.config.deposit_hint)
+        // Same per-candidate bound as the window path (#1143).
+        .open_or_reuse_channel(
+            provider_addr,
+            deps.config.deposit_hint,
+            deps.config.pull_timeout,
+        )
         .await
     {
         Ok(ctx) => ctx,

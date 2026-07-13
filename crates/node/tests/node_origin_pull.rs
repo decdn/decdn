@@ -122,6 +122,7 @@ impl ChannelOpener for StubOpener {
         &self,
         provider_addr: Address,
         _deposit_hint: U256,
+        _budget: Duration,
     ) -> Result<ChannelContext> {
         let recorded = self
             .recorded
@@ -186,12 +187,80 @@ struct FailingRecordOpener {
     voucher_domain: Eip712Domain,
 }
 
+/// A [`ChannelOpener`] whose open for `wedged` never completes within the caller's
+/// budget — the on-chain hazard #1143 exists for (an unresponsive RPC, a
+/// `ChannelOpened` tx that never mines). Every other provider opens instantly.
+///
+/// It honours `budget` the way the real service does: it does NOT hang forever, it
+/// returns `ChannelOpenPending` once the caller's budget elapses, leaving the "open"
+/// notionally still running. That is the contract `node_origin` relies on to reach
+/// candidates #2..N, and neither `StubOpener` nor `FailingRecordOpener` models it.
+#[derive(Debug)]
+struct WedgedOpener {
+    wedged: Address,
+    channel_id: B256,
+    token: Address,
+    deposit: U256,
+    signer: Arc<PrivateKeySigner>,
+    voucher_domain: Eip712Domain,
+    /// Providers whose open was attempted, in order — so a test can prove the loop
+    /// actually reached the fallback rather than succeeding for some other reason.
+    attempted: Arc<Mutex<Vec<Address>>>,
+}
+
+#[async_trait]
+impl ChannelOpener for WedgedOpener {
+    async fn open_or_reuse_channel(
+        &self,
+        provider_addr: Address,
+        _deposit_hint: U256,
+        budget: Duration,
+    ) -> Result<ChannelContext> {
+        if let Ok(mut attempted) = self.attempted.lock() {
+            attempted.push(provider_addr);
+        }
+        if provider_addr == self.wedged {
+            // Consume exactly the budget, then report the open as still in flight —
+            // precisely what `BuyerChannelService::open_or_reuse_channel` does when
+            // its detached open task has not resolved by then. Sleeping *longer*
+            // would model a bound the real service does not have (it stops waiting
+            // AT the budget), and would let this test pass against code that had
+            // reintroduced the unbounded open.
+            tokio::time::sleep(budget).await;
+            anyhow::bail!("channel open for provider {provider_addr} is still in flight");
+        }
+        Ok(ChannelContext {
+            channel_id: self.channel_id,
+            token: self.token,
+            deposit: self.deposit,
+            client_signer: Arc::clone(&self.signer),
+            voucher_domain: self.voucher_domain.clone(),
+            prior_nonce: U256::ZERO,
+            prior_bytes_delivered: U256::ZERO,
+            prior_amount: U256::ZERO,
+            client_binding: None,
+        })
+    }
+
+    fn record_progress(
+        &self,
+        _provider_addr: Address,
+        _channel_id: B256,
+        _nonce: U256,
+        _bytes_delivered: U256,
+        _amount: U256,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl ChannelOpener for FailingRecordOpener {
     async fn open_or_reuse_channel(
         &self,
         _provider_addr: Address,
         _deposit_hint: U256,
+        _budget: Duration,
     ) -> Result<ChannelContext> {
         Ok(ChannelContext {
             channel_id: self.channel_id,
@@ -2287,6 +2356,204 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     ep_s.close().await;
     task_a.await?;
     task_s.await?;
+    Ok(())
+}
+
+/// A wedged CHANNEL OPEN must not starve the candidate fallback loop (#1143).
+///
+/// This is the stage #1141/#1142 did *not* bound. Those fixed the stall once a
+/// candidate accepts a QUIC connection; `open_or_reuse_channel` runs BEFORE that,
+/// and was unbounded on both the buffered and window paths — so a candidate whose
+/// on-chain open wedges (an unresponsive RPC endpoint, an `openChannel` tx that
+/// never mines) consumed the caller's entire outer deadline, candidates #2..N were
+/// never reached, and the serve path refused a blob the honest fallback held. The
+/// old `PULL_THROUGH_OUTER_SLACK` doc conceded exactly this.
+///
+/// The wedged provider here never even gets dialled, so no server is spawned for it
+/// — the hazard is entirely in the buyer's chain lane, which is also why it must
+/// cost the peer no reputation: our RPC being slow says nothing about them.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
+async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()> {
+    let payload = vec![0xE1u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Honest node A: holds the blob, opens instantly, serves it. -----------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xE1);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node W: quotes a CHEAPER rate so it ranks #1, answers probes honestly,
+    //     and holds the blob — but its channel open wedges. It is a perfectly good
+    //     provider; our chain lane to it is what is broken. --------------------
+    let w_sk = fresh_key();
+    let w_id = w_sk.public();
+    let w_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_w, addr_w) =
+        local_endpoint(w_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    // Reuse the stalling server purely as a probe responder: the pull never gets
+    // far enough to open a client stream against it, because the open wedges first.
+    let task_w = spawn_a_stalling_server(
+        ep_w.clone(),
+        Arc::clone(&w_eth),
+        slash_domain(),
+        total_bytes,
+        STALL_RATE,
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    for (id, addr) in [(a_id, addr_a), (w_id, addr_w)] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(id).with_ip_addr(addr),
+            *hash.as_bytes(),
+            1,
+            false,
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+
+    let w_dht = DhtNodeId::from_bytes(*w_id.as_bytes());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let mut addr_map = HashMap::new();
+    addr_map.insert(w_dht, w_eth.address());
+    addr_map.insert(a_dht, a_eth.address());
+
+    let attempted: Arc<Mutex<Vec<Address>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(WedgedOpener {
+        wedged: w_eth.address(),
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        attempted: Arc::clone(&attempted),
+    }) as Arc<dyn ChannelOpener>;
+    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
+        HashMap::from([
+            (*w_id.as_bytes(), "XX".to_string()),
+            (*a_id.as_bytes(), "DE".to_string()),
+        ]),
+    ))));
+    let per_candidate = Duration::from_secs(2);
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &region_accountant,
+        vec![w_dht, a_dht],
+        addr_map,
+        per_candidate,
+        Duration::from_secs(20),
+        0,
+    );
+
+    // The loop must abandon W on its own budget and deliver from A. Bounding the
+    // whole fetch is the real assertion: before the fix the wedged open was
+    // unbounded, so this future never resolved at all.
+    let fetched = tokio::time::timeout(
+        Duration::from_secs(20),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("fetch never returned: the wedged open starved the loop"))?
+    .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
+    let bytes = fetched
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("expected the blob from the honest fallback candidate"))?;
+    anyhow::ensure!(
+        bytes.as_ref() == payload.as_slice(),
+        "pulled bytes mismatch"
+    );
+
+    // The loop genuinely reached candidate #2 — it did not merely happen to pick A
+    // first. Without this, a ranking change could make the test pass while leaving
+    // the starvation bug in place.
+    let attempted = attempted
+        .lock()
+        .map_err(|_| anyhow::anyhow!("attempted lock poisoned"))?
+        .clone();
+    anyhow::ensure!(
+        attempted == vec![w_eth.address(), a_eth.address()],
+        "expected the wedged candidate to be tried FIRST and then fallen through, got {attempted:?}"
+    );
+
+    // A wedged open is OUR chain lane, not the peer's fault: W must take no
+    // reputation hit, locally or over gossip. This is the same exoneration
+    // `PullTimeout` gets, and for the same reason.
+    let drained = obs_buffer.drain();
+    anyhow::ensure!(
+        !drained.iter().any(|(p, _)| *p == w_id),
+        "a provider whose channel open wedged must not be gossiped about (#1143)"
+    );
+    anyhow::ensure!(
+        (local_rep.score(w_id) - 0.5).abs() < f64::EPSILON,
+        "the wedged provider's local score must stay neutral, got {}",
+        local_rep.score(w_id)
+    );
+    assert_counter(&b_metrics, "node_pull_success_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    ep_w.close().await;
+    task_a.await?;
+    task_w.await?;
     Ok(())
 }
 

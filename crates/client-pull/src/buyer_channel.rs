@@ -70,6 +70,30 @@ fn approve_decision(current: U256, amount: Option<U256>) -> Option<U256> {
 /// the `RECONCILE_IDLE_SWEEPS` convention in the node's `buyer_channel`.
 const APPROVE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
+/// Await `fut` under an optional receipt-wait bound, naming `tx` if it expires.
+///
+/// `None` waits indefinitely — the `decdn fetch` CLI's posture, and deliberately
+/// so: the CLI has no reclaim sweep and no boot-time reconcile scan, so an open it
+/// stops waiting on that later mines would strand a deposit with nothing but a tx
+/// hash in stderr. Better for a one-shot command to keep waiting. The node passes
+/// `Some(_)`, because it *does* have that machinery and must not let a stuck tx pin
+/// a provider's open slot (#1143).
+async fn await_receipt<F, T, E>(fut: F, bound: Option<Duration>, tx: TxHash) -> Result<T>
+where
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match bound {
+        None => Ok(fut.await?),
+        Some(bound) => Ok(tokio::time::timeout(bound, fut).await.map_err(|_| {
+            anyhow::anyhow!(
+                "openChannel receipt timed out after {bound:?} (tx {tx}; it may still mine, \
+                     and the boot reconcile scan will adopt the channel if it does)"
+            )
+        })??),
+    }
+}
+
 /// A freshly opened buyer channel: the persistable [`BuyerChannelState`], a
 /// ready-to-sign [`ChannelContext`], and the open transaction hash (so a caller
 /// whose subsequent `store.record` fails can log the escrowed-but-untracked tx
@@ -176,6 +200,7 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// missing-`ChannelOpened` leg carries no reason — the deposit is escrowed but
 /// untracked, so it surfaces as an unclassified error for manual reconciliation
 /// rather than a metric bump.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_channel<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     signer: Arc<PrivateKeySigner>,
@@ -184,6 +209,7 @@ pub async fn open_channel<P: Provider + Clone>(
     self_address: Address,
     provider_addr: Address,
     deposit: U256,
+    receipt_timeout: Option<Duration>,
 ) -> Result<OpenedChannel> {
     let pending = match contract.openChannel(provider_addr, deposit).send().await {
         Ok(pending) => pending,
@@ -199,14 +225,15 @@ pub async fn open_channel<P: Provider + Clone>(
                 .context(reason);
         }
     };
-    let receipt = pending
-        .get_receipt()
+    // Capture the hash before `get_receipt` consumes `pending`, so a timeout names
+    // the broadcast tx an operator (or the boot reconcile scan) needs to look up.
+    let open_tx = *pending.tx_hash();
+    let receipt = await_receipt(pending.get_receipt(), receipt_timeout, open_tx)
         .await
         // A failed receipt wait is always a transport/RPC condition (the tx may
         // even have landed) — never a settlement decision.
         .map_err(|err| {
-            anyhow::Error::new(err)
-                .context("await openChannel receipt")
+            err.context("await openChannel receipt")
                 .context(ChannelOpenFailureReason::RpcError)
         })?;
     if !receipt.status() {

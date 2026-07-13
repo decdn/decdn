@@ -663,6 +663,16 @@ pub struct DecdnMetrics {
     /// stopped delivering while we waited. A sustained rate points at flaky
     /// upstreams or a `node_pull_stall_timeout_sec` too tight for the network.
     pub node_pull_stalled: Counter,
+    /// `decdn_node_pull_channel_open_pending_total` (#1143): a buyer channel open
+    /// was still in flight when the per-candidate budget expired, so the pull moved
+    /// to the next candidate while the open continued in the background.
+    ///
+    /// NOT a failure — kept separate from `node_pull_channel_open_failures` because
+    /// the diagnosis is different: this says the node's own chain lane (a slow L2, a
+    /// stuck nonce) is slower than its `node_pull_timeout_sec`, whereas a failure
+    /// says the tx reverted or the wallet is under-funded. It scores no reputation:
+    /// a wedged open is our lane, not evidence about the peer.
+    pub node_pull_channel_open_pending: Counter,
     /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
     /// voucher but persisting the buyer channel's resume watermark
     /// (`record_progress`) failed. The bytes were delivered, but the channel's
@@ -1646,6 +1656,12 @@ impl Metrics {
     /// provider scored `Unreachable`.
     pub fn node_pull_stalled(&self) {
         self.decdn.node_pull_stalled.inc();
+    }
+
+    /// A buyer channel open outlived the per-candidate budget (#1143). The open
+    /// continues in the background; the pull moves on. No reputation effect.
+    pub fn node_pull_channel_open_pending(&self) {
+        self.decdn.node_pull_channel_open_pending.inc();
     }
 
     /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark

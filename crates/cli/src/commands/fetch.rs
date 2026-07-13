@@ -747,6 +747,11 @@ where
         self_address,
         provider,
         deposit,
+        // No receipt-wait bound. Unlike the node, the CLI has no reclaim sweep and
+        // no boot-time reconcile scan, so an open it gave up waiting on that later
+        // mined would strand the deposit with nothing but a tx hash in stderr
+        // (#1143). A one-shot command is better off waiting.
+        None,
     )
     .await?;
     // The deposit is escrowed on-chain; a failed local record leaves it
