@@ -17,9 +17,11 @@
 //!    [`crate::reputation_indexer::SettlementIndexer`] now feeds
 //!    [`NodeSettlementSource`] from network-wide `ChannelSettled` events, so
 //!    `compute_reporter_weight` returns real weights. Because the source is
-//!    in-memory it is rebuilt each boot from a bounded recent block window;
-//!    settlements older than that window (and during resubscribe gaps) are not
-//!    counted, and `staked_counterparty` uses *current* membership. Durable,
+//!    in-memory it is rebuilt each boot from a bounded recent block window
+//!    (a `HeadMinusWindow` poller — no live subscription); settlements older
+//!    than that window (and gaps while the watcher is backing off / node
+//!    downtime) are not counted, and `staked_counterparty` uses *current*
+//!    membership. Durable,
 //!    full-52-week indexing is a refinement.
 //! 2. **Outbound capture is not wired (tracked by #831).** The publisher drains
 //!    [`NodeReportDrain`], but the delivery/probe hot paths do not yet record

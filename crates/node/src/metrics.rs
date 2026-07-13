@@ -391,13 +391,13 @@ pub struct DecdnMetrics {
     /// visible name: `decdn_buyer_settle_deferred_total`.
     pub buyer_settle_deferred: Counter,
     /// Channel-lifecycle reconciliation the settlement watcher could not apply
-    /// from the live event stream: a failed `register_open_channel` /
+    /// from a poll tick: a failed `register_open_channel` /
     /// `update_channel_deposit` / `forget_channel` store write (#751), or a
     /// failed closing-reconciliation on a `ChannelCloseInitiated` (#839) — which
     /// is a `getChannel` read *or* a `record_pending` write, so this counter is
     /// not store-writes-only. The watcher re-drives the failure (a later event,
-    /// the bring-up backfill, or — for the close arm — an immediate re-arm +
-    /// resubscribe), but a non-zero rate flags a struggling channel store or RPC.
+    /// the bring-up backfill, or — for the close arm — a re-scan on the next
+    /// poll tick), but a non-zero rate flags a struggling channel store or RPC.
     /// Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
     /// Slashes detected against this node's operator by the slash watcher
@@ -412,7 +412,7 @@ pub struct DecdnMetrics {
     /// long outage from repeated flapping. Mirrors `staker_set_watcher_restarts`.
     pub slash_watcher_restarts: Counter,
     /// `decdn_slash_watcher_down_seconds` (#1032): seconds the slash-detection
-    /// watcher has been stuck in its resubscribe/backoff loop (`0` on a healthy
+    /// watcher has been stuck in its per-tick backoff loop (`0` on a healthy
     /// cycle), recomputed at scrape from `slash_watcher_down_since`. Mirrors the
     /// other chain watchers — since `admin_v1_slashes` is always wired, this is
     /// the only signal that a wedged watcher could be silently missing slashes.
@@ -517,10 +517,12 @@ pub struct DecdnMetrics {
     /// documented mid-run degradation. Because the stake-lane probe
     /// reservation (#757) and the DHT `Store` admission path both read that
     /// cached set, sustained restarts are revenue-impacting, not just a
-    /// discovery-health blip. The paired `tracing::warn!` in `watcher_loop`
-    /// carries the underlying error; this counter is the alertable rate. A
-    /// clean stream end (filter expiry / provider rotation) is NOT an error
-    /// and does not bump this. Field has no `_total` suffix because the
+    /// discovery-health blip. The paired loop-level `tracing::warn!` in
+    /// `resumable_watcher::run` (`"watcher RPC error; restarting after backoff"`,
+    /// reached via `on_backoff`) carries the underlying error; this counter is
+    /// the alertable rate. An idle poll tick (head has not advanced / no new
+    /// logs) is NOT an error and does not bump this. Field has no `_total`
+    /// suffix because the
     /// `OpenMetrics` encoder appends it.
     pub staker_set_watcher_restarts: Counter,
     /// `decdn_staker_set_watcher_resolve_failures_total` (#788): times an
@@ -753,10 +755,10 @@ pub struct DecdnMetrics {
     /// `0` across any established cycle; a poisoned lock reports `i64::MAX` (the
     /// conservative alerting direction).
     pub node_address_watcher_down_seconds: Gauge,
-    /// `decdn_reputation_indexer_rpc_failures_total` (#326): watcher-cycle
-    /// terminations — the settlement indexer's event-stream subscription errored
-    /// or a `nodeIdOf` party-resolution RPC failed. Both now propagate to the
-    /// same backoff-and-resubscribe path (a resolution failure no longer skips a
+    /// `decdn_reputation_indexer_rpc_failures_total` (#326): failing poll ticks —
+    /// the settlement indexer's `get_logs`/head RPC errored, or a `nodeIdOf`
+    /// party-resolution RPC (in the sink's `apply`) failed. Both now propagate to
+    /// the same per-tick backoff path (`on_backoff`) (a resolution failure no longer skips a
     /// party in place; the un-credited settlement is retried), so a persistently
     /// flaky RPC can bump this once per retry cycle. A sustained nonzero rate
     /// means the indexer is not ingesting settlements, so reporter weights
@@ -1330,7 +1332,8 @@ impl Metrics {
 
     /// The settlement watcher swallowed a channel-lifecycle persist failure
     /// (`register_open_channel` / `update_channel_deposit` / `forget_channel`,
-    /// #751). Pairs with the per-site `warn!` in `run_watcher_once`.
+    /// #751). Pairs with the per-site `warn!`s in `SettlementSink::apply`
+    /// (`payment_settlement.rs`).
     pub fn watcher_persist_failure(&self) {
         self.decdn.watcher_persist_failures.inc();
     }
@@ -1364,16 +1367,18 @@ impl Metrics {
         }
     }
 
-    /// The staker-set watcher's event stream terminated with an error and the
-    /// loop is about to back off (#783, [`crate::dht::chain_staker_set`]).
+    /// A staker-set watcher poll tick failed with an error and the loop is
+    /// about to back off (#783, [`crate::dht::chain_staker_set`]).
     /// Stamps `down_since` so `staker_set_watcher_down_seconds` begins to climb,
     /// and — on the *transition* from a healthy cycle into the error state
     /// (`down_since` was `None`) — bumps `staker_set_watcher_restarts_total`
     /// exactly once per drift window, rather than once per backoff iteration of
     /// one continuous outage. A poisoned lock is treated as "skip the update"
     /// rather than panicking (anti-panic policy); the gauge's poison fallback
-    /// (`i64::MAX`) still keeps the alert tripped. Pairs with the per-error
-    /// `warn!` in `watcher_loop`.
+    /// (`i64::MAX`) still keeps the alert tripped. This method is the
+    /// `on_backoff` hook wired in [`crate::dht::chain_staker_set`]; it pairs with
+    /// the loop-level `warn!` in `resumable_watcher::run` (`"watcher RPC error;
+    /// restarting after backoff"`).
     pub fn staker_set_watcher_backoff_started(&self) {
         if let Ok(mut down_since) = self.staker_set_watcher_down_since.lock()
             && down_since.is_none()
@@ -1392,9 +1397,10 @@ impl Metrics {
         self.decdn.staker_set_watcher_resolve_failures.inc();
     }
 
-    /// Mark the staker-set watcher's event-stream cycle as established (#783,
-    /// downtime semantics #788): the filters were (re)opened and events can
-    /// flow. Clears `down_since` to `None` so `staker_set_watcher_down_seconds`
+    /// Mark the staker-set watcher's poll cycle as established (#783,
+    /// downtime semantics #788): a poll tick succeeded and logs are flowing
+    /// again (the `on_established` hook). Clears `down_since` to `None` so
+    /// `staker_set_watcher_down_seconds`
     /// reads `0` for the entire life of this cycle, however long. A poisoned
     /// lock is treated as "skip the update" rather than panicking (anti-panic
     /// policy); the gauge then keeps climbing, which is the safe (alerting)
@@ -1682,7 +1688,7 @@ impl Metrics {
         self.decdn.reputation_indexer_amount_overflows.inc();
     }
 
-    /// The origin-directory watcher's event stream errored and the loop is
+    /// An origin-directory watcher poll tick errored and the loop is
     /// about to back off (#651). Mirrors `staker_set_watcher_backoff_started`:
     /// stamps `down_since` and counts exactly one restart per drift window.
     pub fn origin_directory_watcher_backoff_started(&self) {
@@ -1701,7 +1707,7 @@ impl Metrics {
         self.decdn.origin_directory_watcher_resolve_failures.inc();
     }
 
-    /// Mark the origin-directory watcher's event-stream cycle as established
+    /// Mark the origin-directory watcher's poll cycle as established
     /// (#651): clears `down_since` so `origin_directory_watcher_down_seconds`
     /// reads `0` for the life of this cycle.
     pub fn origin_directory_watcher_cycle_established(&self) {

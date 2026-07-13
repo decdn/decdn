@@ -811,8 +811,9 @@ impl ClientHandler {
     /// voucher path accepts vouchers for it. Persists a fresh [`ChannelState`]
     /// durably, then inserts it into the live map.
     ///
-    /// **Idempotent:** a re-observed `ChannelOpened` (e.g. after a watcher
-    /// resubscription) for an already-tracked channel is a no-op — it MUST
+    /// **Idempotent:** a re-observed `ChannelOpened` (e.g. from a poll-tick
+    /// window re-scan — reorg rewind or mid-backfill retry) for an
+    /// already-tracked channel is a no-op — it MUST
     /// NOT reset the accepted-voucher watermark and reopen the #527 replay
     /// window. The live map (hydrated from the store at construction, updated
     /// here) is the authority.
