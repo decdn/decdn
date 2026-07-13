@@ -50,15 +50,14 @@ use crate::client_requester::ChannelContext;
 // The buyer-channel open kernel (#940) — the `openChannel` tx + `ChannelOpened`
 // decode + state/ctx build, and the one-time USDC approval — now live in the
 // shared `decdn-client-pull` crate (re-exported here as `client_requester`).
+use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range};
 use crate::client_requester::buyer_channel::{OpenedChannel, ensure_allowance, open_channel};
 use crate::client_requester::cooperative_close::{
     AuthorizedWatermark, CooperativeCloseOutcome, cooperative_close,
 };
 use crate::dht::NodeAddressResolver;
 use crate::metrics::{Metrics, SettleParty};
-use crate::payment_settlement::{
-    MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range, settle_pass, unix_now,
-};
+use crate::payment_settlement::{settle_pass, unix_now};
 
 /// How often the reclaim sweep scans tracked buyer channels for expiry.
 /// Channel lifetimes are long (default 90 days), so an hourly scan is ample —

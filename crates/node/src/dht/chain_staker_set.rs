@@ -86,10 +86,10 @@ use tracing::{debug, info, warn};
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
+use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::{StakerChange, StakerSet};
 use crate::metrics::Metrics;
-use crate::payment_settlement::MAX_BACKFILL_BLOCK_SPAN;
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
 
@@ -104,11 +104,6 @@ const PAGE_SIZE: u64 = 100;
 /// (operator stakes / unstakes are infrequent), so 128 is a healthy
 /// headroom rather than a hot-path constraint.
 const CHANGES_CHANNEL_CAPACITY: usize = 128;
-
-/// Backoff between watcher retry attempts after a failed poll tick.
-const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound for the watcher retry backoff.
-const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Chain-backed staker set. Cheap to clone via the shared inner
 /// [`Arc`]; the runtime holds one `Arc<dyn StakerSet>` and consumers

@@ -35,10 +35,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-// The windowing/reorg primitives are shared with the buyer-side reconciliation
-// scan; they live in `payment_settlement` for now and are re-used here rather
-// than duplicated.
-use crate::payment_settlement::backfill_windows;
+use super::backfill_windows;
 
 /// What a first-ever boot (no persisted checkpoint) falls back to for a
 /// [`CursorPolicy::Persisted`] watcher.
@@ -427,7 +424,7 @@ mod tests {
     use super::*;
 
     // The production reorg rewind, exercised by the persisted-cursor cases.
-    const MARGIN: u64 = crate::payment_settlement::REORG_MARGIN_BLOCKS;
+    const MARGIN: u64 = crate::chain_events::REORG_MARGIN_BLOCKS;
 
     #[test]
     fn persisted_none_head_starts_at_head() {
