@@ -252,7 +252,13 @@ impl ServeRejectReason {
 enum FillOutcome {
     /// The blob is now present locally; fall through to the size gate + delivery.
     Filled,
-    /// No source had it. Terminal (when no further tier fills): signed `NotFound`.
+    /// The tier produced no blob and no evidence of a fault. Covers BOTH a genuine
+    /// clean miss (a source was asked and did not have it) and a tier that was
+    /// never attempted at all (pull-through unconfigured, or the request not
+    /// authorized to make this node spend). The two are deliberately one variant:
+    /// neither is evidence of a fault, so both leave the terminal classification to
+    /// whatever the other tiers found. Terminal (when no tier fills and none
+    /// faulted): a signed `NotFound`.
     CleanMiss,
     /// A backend/store fault, not an absence. Terminal: `InternalError`, so the
     /// client retries rather than treating the blob as gone.

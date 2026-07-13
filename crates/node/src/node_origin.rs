@@ -319,9 +319,15 @@ impl NodeOrigin {
         )
         .await
         .unwrap_or_else(|_| {
+            // Name the STAGE in the log: this is the progressive OPEN timing out
+            // (handshake + verified response header), not a mid-delivery stall on
+            // the buffered path. The `.context` layer does not affect
+            // classification — `classify_pull_failure`'s `downcast_ref` walks the
+            // anyhow chain (pinned by `buyer_side_sentinels_survive_anyhow_downcast`).
             Err(anyhow::Error::new(PullTimeout {
                 after: deps.config.pull_timeout,
-            }))
+            })
+            .context("progressive upstream open"))
         }) {
             Ok((header, pull)) => Some((
                 header,

@@ -331,6 +331,12 @@ impl std::error::Error for BlobTooLargeClaim {}
 /// not tar the provider's reputation locally or over gossip. `Display` keeps the
 /// stable `timed out` text for logs (and for the `!contains("timed out")`
 /// negative assertion in `node_to_node_pull_through`'s deadline test).
+///
+/// Raised by BOTH upstream pull stages — the buffered [`stream_fetch_tracked`]
+/// delivery and the window-paced [`open_progressive_pull`] open (#1141) — so the
+/// message is deliberately stage-NEUTRAL. Callers that want to name the stage add
+/// a `.context(…)` layer; `downcast_ref` still recovers the sentinel through it
+/// (pinned by `buyer_side_sentinels_survive_anyhow_downcast`).
 #[derive(Debug)]
 pub struct PullTimeout {
     pub after: Duration,
@@ -338,7 +344,7 @@ pub struct PullTimeout {
 
 impl std::fmt::Display for PullTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "stream_fetch timed out after {:?}", self.after)
+        write!(f, "upstream pull timed out after {:?}", self.after)
     }
 }
 
