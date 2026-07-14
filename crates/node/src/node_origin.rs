@@ -772,6 +772,7 @@ async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> Vec<DhtNodeId>
         deps.self_id,
         target,
         deps.config.lookup,
+        Some(&deps.metrics),
     )
     .await;
     if providers.is_empty() {

@@ -495,29 +495,24 @@ mod tests {
         }
     }
 
-    /// The slack must cover the thing it is NAMED for (#1145 review).
-    ///
-    /// The test above pins `outer == all_candidates + SLACK`, which proves only that the
-    /// slack is whatever the slack is — it would pass with a slack of one nanosecond. What
-    /// it never asked is whether the slack covers the `discover → probe → rank` overhead it
-    /// exists to pay for. It did not: a flat 10 s against a probe phase (5 s) plus a single
-    /// slow lookup round (8 s) is 3 s short before any lookup needing a second round, and
-    /// the round count was unbounded, so no constant could have been enough.
-    ///
-    /// Both halves are asserted, because either one alone leaves the hole open: discovery's
-    /// worst case must be FINITE, and the slack must be at least that.
-    #[test]
-    fn the_slack_covers_the_discovery_overhead_it_is_named_for() {
-        let worst_discovery = DEFAULT_ROUND_TIMEOUT.saturating_mul(MAX_LOOKUP_ROUNDS);
-        let worst_overhead = PROBE_TIMEOUT.saturating_add(worst_discovery);
-        assert!(
-            PULL_THROUGH_OUTER_SLACK >= worst_overhead,
-            "the slack ({PULL_THROUGH_OUTER_SLACK:?}) must cover a full probe phase \
-             ({PROBE_TIMEOUT:?}) plus the worst-case lookup ({worst_discovery:?}); short of \
-             that, the outer timeout fires while the last candidate is still in its stall \
-             window — the #859 fallback starvation the formula exists to prevent"
-        );
-    }
+    // There is deliberately NO unit test here asserting that the slack covers the
+    // `discover → probe → rank` overhead it is named for (#1145 review).
+    //
+    // There was one, and it could not fail. `PULL_THROUGH_OUTER_SLACK` is now DEFINED as
+    // `PROBE_TIMEOUT + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so a test that recomputes
+    // that expression and asserts the slack is at least as big is asserting `A >= A`. It
+    // would pass with any value of any of the three constants — which is precisely the sin
+    // its own doc comment accused its predecessor of ("proves only that the slack is
+    // whatever the slack is"), restated one level up. Deriving the constant is what MAKES it
+    // correct by construction; there is nothing left for arithmetic to check.
+    //
+    // What can still break is the assumption underneath: that `find_providers` actually
+    // honours `MAX_LOOKUP_ROUNDS`. An unbounded cost cannot be budgeted for by any constant,
+    // however generous, so if that loop stops terminating the slack is worthless no matter
+    // what it evaluates to. That is a property of the LOOP, not of this arithmetic, and it is
+    // guarded where it lives — `dht_lookup::find_providers_stops_at_the_round_ceiling_even_
+    // while_still_finding_closer_nodes` walks a chain of servers that keeps revealing closer
+    // nodes and asserts the lookup is cut off before it reaches a record six hops away.
 
     // The defaults an operator actually runs: `node_pull_timeout_sec = 20` and
     // `node_pull_stall_timeout_sec = 20` (both `DEFAULT_*` in decdn-common, which this

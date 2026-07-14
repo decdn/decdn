@@ -287,6 +287,99 @@ fn warm_budget_mb(max_blob_size_mb: u64) -> (u32, u32) {
     (pool, u32::try_from(reserve).unwrap_or(u32::MAX))
 }
 
+/// Is this populate error a routine MISS rather than a fault (#1145 review)?
+///
+/// The distinction the warm counters used to lack. A warm that finds no provider, or has no
+/// origin configured, has done nothing wrong and there is nothing to fix. A warm that failed
+/// because the store is corrupt, the disk is full, or an upstream served bytes that do not
+/// verify is an operator's problem. Folding the two into one counter — as
+/// `node_pull_through_background_failed` did — meant no threshold on it could distinguish
+/// them, so it could never fire *for* the emergency it would need to signal.
+///
+/// Exhaustive on purpose: a new `CacheError` must break this build and be classified, rather
+/// than silently inheriting "fault" (noisy) or "miss" (a swallowed emergency).
+const fn is_clean_miss(err: &CacheError) -> bool {
+    match err {
+        // Nothing to warm. The blob is not out there, or we have nowhere to look.
+        CacheError::NotFound { .. } | CacheError::NoOrigin { .. } => true,
+        // Every one of these is a fault someone must act on: a corrupt or full store, an
+        // upstream serving bytes that do not verify, a blob over our ceiling, a broken
+        // origin, or an eviction sweep that could not free space.
+        CacheError::Store(_)
+        | CacheError::HashMismatch { .. }
+        | CacheError::VerifyFailed { .. }
+        | CacheError::BlobTooLarge { .. }
+        | CacheError::OriginError { .. }
+        | CacheError::EvictionLimitExceeded { .. } => false,
+    }
+}
+
+/// How a background warm ended. Every variant is a TERMINAL outcome, so exactly one is
+/// recorded per spawn and the books balance:
+/// `spawned == succeeded + missed + failed + cancelled + panicked`.
+#[derive(Clone, Copy, Debug)]
+enum WarmVerdict {
+    Succeeded,
+    /// Routine: nothing to warm (see [`is_clean_miss`]).
+    Missed,
+    /// A fault an operator must act on.
+    Failed,
+    Cancelled,
+}
+
+/// Meters a background warm's outcome — including the one outcome the task itself cannot
+/// report (#1145 review).
+///
+/// The warm is `tokio::spawn`ed and its `JoinHandle` dropped on the spot, so nothing awaits
+/// it. A panic inside `cache.populate`, the tee, or the decoder therefore reaches *nobody*:
+/// no counter moves, nothing is logged, and `spawned` sits permanently one above the sum of
+/// its outcomes — a gap that reads like an in-flight warm rather than a crash.
+///
+/// `Drop` runs on the unwind, which makes it the only thing that can still see it. The same
+/// hole was already fixed for the detached channel-open task, which got a supervisor for
+/// exactly this reason; the warm task has no caller at all, so it is strictly worse off, and
+/// it got nothing.
+struct WarmOutcome<'a> {
+    hash: Hash,
+    metrics: &'a Metrics,
+    recorded: bool,
+}
+
+impl<'a> WarmOutcome<'a> {
+    const fn new(hash: Hash, metrics: &'a Metrics) -> Self {
+        Self {
+            hash,
+            metrics,
+            recorded: false,
+        }
+    }
+
+    fn record(&mut self, verdict: WarmVerdict) {
+        self.recorded = true;
+        match verdict {
+            WarmVerdict::Succeeded => self.metrics.node_pull_through_background_succeeded(),
+            WarmVerdict::Missed => self.metrics.node_pull_through_background_missed(),
+            WarmVerdict::Failed => self.metrics.node_pull_through_background_failed(),
+            WarmVerdict::Cancelled => self.metrics.node_pull_through_background_cancelled(),
+        }
+    }
+}
+
+impl Drop for WarmOutcome<'_> {
+    fn drop(&mut self) {
+        if !self.recorded {
+            // The only way to leave the select without recording a verdict is to unwind
+            // through it.
+            self.metrics.node_pull_through_background_panicked();
+            tracing::error!(
+                hash = %self.hash,
+                "background cache-fill PANICKED; nothing awaits this task, so this counter is \
+                 the only trace it leaves"
+            );
+        }
+    }
+}
+
 /// Run `fut` under an optional wall-clock deadline, keeping the `Result<_,
 /// Elapsed>` shape of [`tokio::time::timeout`] so callers branch identically
 /// whether or not a cap is set. `None` never elapses.
@@ -771,6 +864,7 @@ impl ClientHandler {
     /// a far larger budget than the foreground had ([`BACKGROUND_FILL_HARD_CAP`]), so a
     /// slow-but-available upstream still warms the cache, however large the blob.
     /// Best-effort: never blocks the caller and never affects the foreground result.
+    #[allow(clippy::too_many_lines)] // one linear spawn, every arm carrying its own rationale
     fn maybe_spawn_background_fill(&self, hash: Hash) {
         let Some(bg) = self.background_fill.get() else {
             return;
@@ -800,30 +894,42 @@ impl ClientHandler {
         let budget = bg.budget;
         self.metrics.node_pull_through_background_spawned();
         tokio::spawn(async move {
-            // Both dropped on task exit (any branch): the guard clears the inflight
-            // entry, the permit returns the warm slot.
+            // All three dropped on task exit (any branch, INCLUDING a panic): the guard
+            // clears the inflight entry, the permit returns the warm slot, and the outcome
+            // guard meters the one case no arm below can — a panic (#1145 review).
             let _guard = guard;
             let _permit = permit;
+            // Nothing awaits this task's `JoinHandle` — it is spawned and forgotten — so a
+            // panic inside `cache.populate`, the tee, or the decoder reaches nobody: no
+            // counter, no log, and `spawned` is permanently one ahead of its outcomes. The
+            // gap then reads as an in-flight warm rather than a crash. `Drop` runs on the
+            // unwind, so a guard is the one thing that can still see it.
+            let mut outcome = WarmOutcome::new(hash, &metrics);
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    // Metered, so the books balance: without this,
-                    // `spawned != succeeded + failed + shed + cancelled` and the gap is
-                    // invisible on a node that restarts often.
-                    metrics.node_pull_through_background_cancelled();
+                    outcome.record(WarmVerdict::Cancelled);
                     tracing::debug!(%hash, "background cache-fill cancelled on shutdown");
                 }
                 result = with_optional_deadline(budget, cache.populate(hash)) => match result {
                     Ok(Ok(())) => {
-                        metrics.node_pull_through_background_succeeded();
+                        outcome.record(WarmVerdict::Succeeded);
                         tracing::debug!(%hash, "background cache-fill populated blob");
                     }
+                    // A CLEAN MISS is not a fault, and folding the two together meant this
+                    // counter could never fire for the emergency it would need to signal
+                    // (#1145 review). A warm that finds no provider is routine and expected;
+                    // a warm that failed because the store is corrupt or the disk is full is
+                    // an operator's problem. Both used to increment the same counter and both
+                    // logged at `debug!` — below the project's default `RUST_LOG=info` — so
+                    // there was no threshold on it anyone could alert on.
+                    Ok(Err(e)) if is_clean_miss(&e) => {
+                        outcome.record(WarmVerdict::Missed);
+                        tracing::debug!(%hash, error = %e, "background cache-fill found nothing to warm");
+                    }
                     Ok(Err(e)) => {
-                        // Covers every populate error (clean miss, no origin, AND
-                        // store/I/O fault), so the message stays neutral; the cause
-                        // rides in `error`. A stalled upstream lands here too.
-                        metrics.node_pull_through_background_failed();
-                        tracing::debug!(%hash, error = %e, "background cache-fill did not complete");
+                        outcome.record(WarmVerdict::Failed);
+                        tracing::warn!(%hash, error = %e, "background cache-fill FAILED; this is a fault, not a miss");
                     }
                     Err(_) => {
                         // `warn!`, not `debug!`: this fires only at the absolute
@@ -831,7 +937,7 @@ impl ClientHandler {
                         // means an upstream trickled bytes for an hour without
                         // finishing — a pathological peer, or a badly mis-sized
                         // `max_blob_size_mb`. Either way the operator wants to know.
-                        metrics.node_pull_through_background_failed();
+                        outcome.record(WarmVerdict::Failed);
                         tracing::warn!(%hash, ?budget, "background cache-fill hit its absolute cap; abandoning");
                     }
                 },
@@ -2986,6 +3092,7 @@ async fn read_voucher(recv: &mut RecvStream) -> anyhow::Result<decdn_protocol::c
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -3132,6 +3239,203 @@ mod tests {
 
         let uncapped = with_optional_deadline(None, std::future::ready(7u8)).await;
         assert_eq!(uncapped.ok(), Some(7), "no cap: the future runs to its end");
+    }
+
+    /// An origin whose fetch NEVER returns, so a warm launched against it holds its memory
+    /// reservation for as long as the test needs it to.
+    ///
+    /// Required to make the shed observable at all: with any completing origin the first
+    /// warm finishes and hands its permit back, and the second one then always fits.
+    #[derive(Debug)]
+    struct HangingOrigin;
+
+    impl decdn_cache::Origin for HangingOrigin {
+        fn fetch(
+            &self,
+            _hash: Hash,
+            _max_bytes: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn kind(&self) -> decdn_cache::OriginKind {
+            decdn_cache::OriginKind::Filesystem
+        }
+    }
+
+    /// Build the smallest `ClientHandler` that can spawn a background warm.
+    async fn handler_for_warm_tests(
+        metrics: &Arc<Metrics>,
+    ) -> (Arc<ClientHandler>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheEngine::open(
+            dir.path(),
+            vec![Arc::new(HangingOrigin) as Arc<dyn decdn_cache::Origin>],
+            16,
+        )
+        .await
+        .expect("cache");
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let handler = ClientHandler::new(
+            iroh::SecretKey::generate().public(),
+            Arc::clone(metrics),
+            Arc::new(ConnectionLimiter::new(
+                &decdn_common::config::ResolvedSecurity {
+                    max_concurrent_handlers: u32::MAX,
+                    per_source_rate_per_sec: 1e9,
+                    per_source_burst: u32::MAX,
+                    max_tracked_sources: 16,
+                },
+                Arc::clone(metrics),
+            )),
+            cache,
+            Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+            domain.clone(),
+            domain.clone(),
+            domain,
+            Arc::new(decdn_incentive::store::MemoryChannelStateStore::new())
+                as Arc<dyn ChannelStateStore>,
+            Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
+                crate::receipt_log::NoopReceiptLog,
+            ))) as Arc<dyn ReceiptSink>,
+            Arc::new(AtomicU64::new(1)),
+            0,
+            u64::MAX,
+            1,
+            0,
+            16,
+        )
+        .expect("handler");
+        (Arc::new(handler), dir)
+    }
+
+    /// The warm memory budget must SHED, not just be computed (#1145 review).
+    ///
+    /// `MAX_BACKGROUND_FILL_MB` is the bound that stops the hour-long warm lifetime from
+    /// being a memory amplifier: 8 concurrent warms × a 1 GiB blob ceiling was up to 8 GiB
+    /// resident, for up to an hour each, and the old ~70 s deadline used to make that
+    /// self-limiting. Three unit tests covered `warm_budget_mb` — the SIZING function — and
+    /// nothing at all covered the code that acts on it. Deleting the whole
+    /// `try_acquire_many_owned` block left the suite green.
+    ///
+    /// So this drives the real `maybe_spawn_background_fill`, against an origin that never
+    /// returns: the first warm therefore HOLDS its reservation, and with a ceiling sized to
+    /// the whole pool there is nothing left for a second. The shed is observed on the real
+    /// counters, and the hash is left unclaimed so a later miss can retry it.
+    #[tokio::test]
+    async fn a_warm_that_cannot_reserve_its_memory_is_shed_rather_than_spawned() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_warm_tests(&metrics).await;
+        // A ceiling at (or above) the pool means each warm reserves the ENTIRE budget, so
+        // exactly one can be in flight. `warm_budget_mb` clamps it, which is what makes an
+        // operator who over-raises `max_blob_size_mb` get one warm rather than none.
+        handler.attach_background_fill(CancellationToken::new(), None, MAX_BACKGROUND_FILL_MB);
+
+        handler.maybe_spawn_background_fill(Hash::new(b"first"));
+        // The first warm is parked in `HangingOrigin::fetch`, holding its reservation. Wait
+        // for it to actually be spawned rather than sleeping on a guess.
+        for _ in 0..200u32 {
+            if metrics
+                .encode()
+                .is_ok_and(|e| e.contains("decdn_node_pull_through_background_spawned_total 1"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // A DIFFERENT hash, so the dedup claim is not what stops it — only the memory budget
+        // can be.
+        handler.maybe_spawn_background_fill(Hash::new(b"second"));
+
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_shed_total 1"),
+            "the second warm must be SHED: the first still holds the whole memory budget. \
+             Without the reservation, an hour-long warm lifetime is a memory amplifier — up \
+             to 8 GiB resident against a 1 GiB blob ceiling. Got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_spawned_total 1"),
+            "a shed warm must never be spawned — `shed` is disjoint from `spawned`, which is \
+             why it is NOT a term in `spawned == succeeded + missed + failed + cancelled + \
+             panicked`. Got:\n{encoded}"
+        );
+    }
+
+    /// A clean MISS is not a fault, and the two must not share a counter (#1145 review).
+    ///
+    /// `node_pull_through_background_failed_total` used to count both, so no threshold on it
+    /// could distinguish "the network does not have this blob" (routine) from "our store is
+    /// corrupt" (an emergency) — and both logged at `debug!`, below the project's default
+    /// `RUST_LOG=info`. There was no alert an operator could write.
+    #[test]
+    fn a_clean_miss_is_not_a_fault() {
+        let hash = Hash::new(b"warm-miss");
+        assert!(
+            is_clean_miss(&CacheError::NotFound { hash }),
+            "no provider had it: routine"
+        );
+        assert!(
+            is_clean_miss(&CacheError::NoOrigin { hash }),
+            "nowhere to look: routine"
+        );
+        assert!(
+            !is_clean_miss(&CacheError::Store(anyhow::anyhow!("disk full"))),
+            "a store fault is an EMERGENCY and must never be filed as a miss — that is what \
+             made the failure counter unalertable"
+        );
+        assert!(
+            !is_clean_miss(&CacheError::VerifyFailed { expected: hash }),
+            "an upstream serving bytes that do not verify is a fault"
+        );
+    }
+
+    /// A warm that PANICS must still be counted — it is the one outcome the task cannot
+    /// report for itself (#1145 review).
+    ///
+    /// Nothing awaits a warm's `JoinHandle`; it is spawned and forgotten. So a panic inside
+    /// `populate`, the tee, or the decoder reached nobody: no counter moved, nothing was
+    /// logged, and `spawned` sat permanently one above the sum of its outcomes — a gap that
+    /// reads like an in-flight warm rather than a crash. `Drop` runs on the unwind, which is
+    /// what makes the guard able to see it at all.
+    ///
+    /// Asserted on the REAL `Metrics`, and on both halves: a guard that recorded a verdict
+    /// must NOT also report a panic, or every warm would look like a crash.
+    #[test]
+    fn a_panicking_warm_is_counted_by_the_guard_that_outlives_it() {
+        let hash = Hash::new(b"warm-panic");
+
+        // Dropped without a verdict — exactly what an unwind does.
+        let metrics = Metrics::new();
+        drop(WarmOutcome::new(hash, &metrics));
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_panicked_total 1"),
+            "a warm that unwound must be metered; nothing else will ever see it. Got:\n{encoded}"
+        );
+
+        // A warm that ended normally is NOT a panic.
+        let metrics = Metrics::new();
+        let mut outcome = WarmOutcome::new(hash, &metrics);
+        outcome.record(WarmVerdict::Succeeded);
+        drop(outcome);
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_panicked_total 0"),
+            "a warm that recorded a verdict must not also report a panic. Got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_succeeded_total 1"),
+            "…and must record the verdict it was given. Got:\n{encoded}"
+        );
     }
 
     // #821: the reactive pull-through authorized-origin gate refuses a pull only

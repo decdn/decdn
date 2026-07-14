@@ -577,6 +577,20 @@ pub struct DecdnMetrics {
     /// (DHT plus the origin-directory fallback) surfaced no provider — the blob
     /// is unavailable on the network, not a pull failure.
     pub node_pull_no_providers: Counter,
+    /// `decdn_dht_lookup_round_ceiling_total` (#1145 review): a `find_providers` lookup was
+    /// TRUNCATED at `MAX_LOOKUP_ROUNDS` while still finding closer nodes.
+    ///
+    /// Not an error — the providers already found are usable and the pull proceeds with them
+    /// — but not nothing either, and it was previously only a `debug!`, invisible at the
+    /// project's default `RUST_LOG=info`. The ceiling exists because discovery's worst case
+    /// has to be FINITE for `PULL_THROUGH_OUTER_SLACK` to budget for it at all; the cost is
+    /// that a lookup which needs more rounds silently returns a smaller candidate set.
+    ///
+    /// So a sustained rate means this node's round ceiling is too low for its network size:
+    /// every lookup is cut short, and `MAX_PROVIDER_ATTEMPTS` is choosing from a worse set of
+    /// providers than the DHT could have offered. Kademlia converges in `O(log n)` rounds, so
+    /// this is the metric that says "your network outgrew the constant".
+    pub dht_lookup_round_ceiling: Counter,
     /// `decdn_node_pull_corruption_total` (#831): an upstream served
     /// hash-mismatched bytes for a paid pull (Byzantine / buggy provider). A
     /// sustained nonzero rate means a peer is taking payment for wrong content;
@@ -783,18 +797,49 @@ pub struct DecdnMetrics {
     /// `decdn_node_pull_through_background_succeeded_total` (#859): background
     /// cache-fills that populated the blob into the store.
     pub node_pull_through_background_succeeded: Counter,
-    /// `decdn_node_pull_through_background_failed_total` (#859): background
-    /// cache-fills that gave up (engine error, clean miss, or their own
-    /// deadline) without populating the blob. Cancellation on shutdown is not
-    /// counted as a failure — see `node_pull_through_background_cancelled`.
+    /// `decdn_node_pull_through_background_failed_total` (#859): background cache-fills
+    /// that failed on a FAULT — a store/IO error, bytes that did not verify, a blob over
+    /// the ceiling, a broken origin, or the absolute cap.
+    ///
+    /// **This is the alertable one.** It used to also count a clean miss (no provider, no
+    /// origin), which is routine and expected — so the two were indistinguishable and no
+    /// threshold on this counter could fire *for* the emergency it would need to signal
+    /// (#1145 review). A warm that finds nothing now lands on
+    /// `node_pull_through_background_missed_total` instead, and this is reserved for the
+    /// faults an operator must act on. Cancellation on shutdown is not a failure either —
+    /// see `node_pull_through_background_cancelled`.
     pub node_pull_through_background_failed: Counter,
+    /// `decdn_node_pull_through_background_missed_total` (#1145 review): background
+    /// cache-fills that found nothing to warm — no provider had the blob, or no origin is
+    /// configured.
+    ///
+    /// Routine, and split out of `..._failed_total` precisely so that counter can mean
+    /// something. A sustained rate here is a discovery/availability signal (this node keeps
+    /// missing content the network does not hold), not a fault to page on.
+    pub node_pull_through_background_missed: Counter,
+    /// `decdn_node_pull_through_background_panicked_total` (#1145 review): a background
+    /// cache-fill task PANICKED.
+    ///
+    /// Nothing awaits these tasks — they are spawned and their `JoinHandle` dropped — so a
+    /// panic inside `populate`, the tee, or the decoder reaches nobody. It moved no counter
+    /// and wrote no log, and `spawned` simply sat one above the sum of its outcomes forever,
+    /// a gap that reads like an in-flight warm rather than a crash. Recorded from a `Drop`
+    /// guard, which is the only thing that still runs on the unwind.
+    ///
+    /// **Any non-zero value is a bug in this node.** These tasks have no business panicking.
+    pub node_pull_through_background_panicked: Counter,
     /// `decdn_node_pull_through_background_cancelled_total` (#1145 review): background
     /// cache-fills abandoned because the node began shutting down.
     ///
-    /// Exists so the books balance: `spawned == succeeded + failed + cancelled` (and
-    /// `shed` counts warms that were never spawned at all). Without it a warm that dies
-    /// at drain leaves an unexplained gap between `spawned` and the terminal counters,
-    /// which on a node that restarts often looks exactly like a leak.
+    /// Exists so the books balance:
+    /// `spawned == succeeded + missed + failed + cancelled + panicked`.
+    ///
+    /// `shed` is NOT a term: a shed warm returns before `spawned` is ever incremented, so it
+    /// is disjoint from all of these (the comment that put it in the identity was wrong —
+    /// an operator building a dashboard from it got an equation that could never balance).
+    /// Without `cancelled` a warm that dies at drain leaves an unexplained gap between
+    /// `spawned` and the terminal counters, which on a node that restarts often looks
+    /// exactly like a leak.
     pub node_pull_through_background_cancelled: Counter,
     /// `decdn_node_pull_through_window_paused_total` (#856): times the
     /// window-paced serve loop paused the upstream pull because the per-request
@@ -1568,6 +1613,12 @@ impl Metrics {
         self.decdn.node_pull_no_providers.inc();
     }
 
+    /// A DHT lookup was truncated at `MAX_LOOKUP_ROUNDS` while still finding closer nodes
+    /// (#1145 review). A sustained rate means the ceiling is too low for the network size.
+    pub fn dht_lookup_round_ceiling(&self) {
+        self.decdn.dht_lookup_round_ceiling.inc();
+    }
+
     /// An upstream served hash-mismatched bytes for a paid pull (#831).
     pub fn node_pull_corruption(&self) {
         self.decdn.node_pull_corruption.inc();
@@ -1818,13 +1869,28 @@ impl Metrics {
         self.decdn.node_pull_through_background_succeeded.inc();
     }
 
-    /// A background cache-fill gave up without populating the blob (#859).
+    /// A background cache-fill failed on a FAULT — a store/IO error, unverifiable bytes, a
+    /// broken origin, or the absolute cap (#859). Alertable; a clean miss is not counted
+    /// here (#1145 review).
     pub fn node_pull_through_background_failed(&self) {
         self.decdn.node_pull_through_background_failed.inc();
     }
 
+    /// A background cache-fill found nothing to warm — no provider, or no origin (#1145
+    /// review). Routine, and kept out of `..._failed_total` so that counter can be alerted
+    /// on.
+    pub fn node_pull_through_background_missed(&self) {
+        self.decdn.node_pull_through_background_missed.inc();
+    }
+
+    /// A background cache-fill task PANICKED (#1145 review). Nothing awaits these tasks, so
+    /// this counter is the only trace one leaves. Any non-zero value is a bug in this node.
+    pub fn node_pull_through_background_panicked(&self) {
+        self.decdn.node_pull_through_background_panicked.inc();
+    }
+
     /// A background cache-fill was abandoned at shutdown (#1145 review). Not a failure —
-    /// counted so `spawned == succeeded + failed + cancelled` balances.
+    /// counted so `spawned == succeeded + missed + failed + cancelled + panicked` balances.
     pub fn node_pull_through_background_cancelled(&self) {
         self.decdn.node_pull_through_background_cancelled.inc();
     }

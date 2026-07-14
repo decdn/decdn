@@ -123,6 +123,13 @@ impl Default for LookupConfig {
 /// `warn!`; round-timeout aborts log the aborted-peer count at
 /// `warn!`. The lookup is best-effort by spec; total failure
 /// manifests as an empty return.
+/// `metrics` is optional so the DHT test suite can drive a lookup without standing one up;
+/// the production caller always passes `Some`, and it is the only way the round ceiling
+/// below becomes observable.
+// One argument over the threshold, and every one of them is a distinct collaborator the
+// lookup genuinely needs. Bundling them into a struct would move the same list one level out
+// without making any call site clearer.
+#[allow(clippy::too_many_arguments)]
 pub async fn find_providers(
     endpoint: &Endpoint,
     routing_table: &Arc<Mutex<RoutingTable>>,
@@ -131,6 +138,7 @@ pub async fn find_providers(
     requester_id: NodeId,
     target: Hash,
     cfg: LookupConfig,
+    metrics: Option<&crate::metrics::Metrics>,
 ) -> Vec<NodeId> {
     let ctx = LookupCtx {
         endpoint,
@@ -159,7 +167,17 @@ pub async fn find_providers(
         // and it runs inside the caller's outer pull deadline, whose slack term has to know
         // what discovery can cost (#1145 review). Not an error: whatever providers we have
         // are still usable, and the pull proceeds with them.
+        //
+        // But it is not nothing either, and a `debug!` alone made it invisible at the
+        // project's own default `RUST_LOG=info` (#1145 review). Truncating here shrinks the
+        // candidate set that feeds `MAX_PROVIDER_ATTEMPTS`, so a node whose network is large
+        // enough to hit the ceiling on EVERY lookup is systematically pulling from a worse
+        // provider set than it should — and had no way to know. The counter makes "my ceiling
+        // is too low for my network size" an observable fact rather than a guess.
         if round + 1 == MAX_LOOKUP_ROUNDS {
+            if let Some(metrics) = metrics {
+                metrics.dht_lookup_round_ceiling();
+            }
             tracing::debug!(
                 rounds = MAX_LOOKUP_ROUNDS,
                 providers = state.provider_count(),
