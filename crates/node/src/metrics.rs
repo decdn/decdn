@@ -645,6 +645,20 @@ pub struct DecdnMetrics {
     /// sustained rate means this node's buyer channels are drifting out of sync
     /// with what upstreams accept.
     pub node_pull_voucher_rejected: Counter,
+    /// `decdn_node_pull_channel_retired_total` (#1145 review): a voucher rejection
+    /// meant the channel can never pay again — the deposit is spent, it expired, or
+    /// our watermark has desynced from the upstream's committed nonce — so the row
+    /// was retired and the next pull to that provider opens a fresh channel.
+    ///
+    /// A subset of `node_pull_voucher_rejected_total`, and the actionable part of
+    /// it. Before this existed, every one of those rejections was a `debug!` and a
+    /// counter tick, and the drained channel was handed straight back on the next
+    /// miss: the provider stayed top-ranked, burned a `MAX_PROVIDER_ATTEMPTS` slot
+    /// on every pull, and could not serve a byte until the channel expired ~90 days
+    /// later. A steady trickle here is healthy (channels do run dry); a spike means
+    /// this node is rotating channels far faster than it should, which usually means
+    /// the deposit is sized too small for the traffic.
+    pub node_pull_channel_retired: Counter,
     /// `decdn_node_pull_refused_total` (#1144): a selected upstream refused
     /// delivery up front (a `StreamResponse` with `ok == false`). Counts every
     /// wire code, including the `InternalError` that DOES tar the provider's
@@ -701,6 +715,17 @@ pub struct DecdnMetrics {
     /// non-zero count means a provider is at risk of becoming unusable until
     /// channel rotation.
     pub node_pull_progress_persist_failures: Counter,
+    /// `decdn_node_pull_progress_dropped_total` (#1145 review): a pull paid ≥1
+    /// voucher, but by the time the watermark was written the provider's slot had
+    /// been replaced by a newer open — so the write was skipped rather than clobber
+    /// the replacement, and that voucher's progress is gone.
+    ///
+    /// Sibling of `node_pull_progress_persist_failures_total`, which only counts the
+    /// `Err` path; this is the `Ok`-but-dropped path, which is otherwise invisible.
+    /// The rare benign case is a channel rotating mid-pull. A *sustained* rate means
+    /// a `channel_id`-plumbing bug, and every tick is real USDC whose watermark was
+    /// discarded — so this is the counter to alert on, not just to look at.
+    pub node_pull_progress_dropped: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
@@ -1685,6 +1710,12 @@ impl Metrics {
         self.decdn.node_pull_voucher_rejected.inc();
     }
 
+    /// A voucher rejection retired the channel: it can never pay again, so the row
+    /// was dropped and the next pull opens a fresh one (#1145 review).
+    pub fn node_pull_channel_retired(&self) {
+        self.decdn.node_pull_channel_retired.inc();
+    }
+
     /// A selected upstream refused delivery up front (#1144). Counts every wire
     /// code; only `InternalError` also scores the provider's reputation.
     pub fn node_pull_refused(&self) {
@@ -1714,6 +1745,12 @@ impl Metrics {
     /// failed (#852); the channel's stored progress now lags the upstream.
     pub fn node_pull_progress_persist_failure(&self) {
         self.decdn.node_pull_progress_persist_failures.inc();
+    }
+
+    /// A paid voucher's watermark was DROPPED because the provider's channel slot had
+    /// been replaced by a newer open before the write landed (#1145 review).
+    pub fn node_pull_progress_dropped(&self) {
+        self.decdn.node_pull_progress_dropped.inc();
     }
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).

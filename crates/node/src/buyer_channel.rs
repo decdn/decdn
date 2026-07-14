@@ -906,9 +906,14 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             // `forget_if_channel` miss) and must not fail the already-paid pull.
             // But a delivered-and-paid voucher's progress was dropped, and a
             // *sustained* rate here would mean a `channel_id`-plumbing bug rather
-            // than the rare benign mid-pull replacement — so `warn!`, not
-            // `debug!`, to keep it observable.
+            // than the rare benign mid-pull replacement — so it is METERED, not just
+            // logged (#1145 review). It used to be a bare `warn!` + `Ok(())`, which
+            // asked an operator to watch for a trend in a signal that had no series
+            // to trend: `node_pull_progress_persist_failure` fires only on `Err`, so
+            // this path — real USDC paid, watermark discarded — was indistinguishable
+            // in metrics from a clean persist.
             AdvanceOutcome::ChannelMismatch => {
+                self.metrics.node_pull_progress_dropped();
                 warn!(
                     provider = %provider_addr,
                     %channel_id,
@@ -920,6 +925,18 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             AdvanceOutcome::Regressed(err) => Err(anyhow::Error::new(err))
                 .with_context(|| format!("advance progress for provider {provider_addr}")),
         }
+    }
+
+    /// Retire the tracked channel for `provider_addr` if it is still `channel_id`.
+    /// See [`ChannelOpener::retire_channel`] for the contract and why it exists.
+    ///
+    /// # Errors
+    ///
+    /// On store write failure.
+    pub fn retire_channel(&self, provider_addr: Address, channel_id: ChannelId) -> Result<bool> {
+        self.store
+            .forget_if_channel(provider_addr, channel_id)
+            .context("retire buyer channel")
     }
 
     /// Run one reclaim-sweep pass synchronously: reclaim the deposit of every
@@ -1017,6 +1034,29 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
         bytes_delivered: U256,
         amount: U256,
     ) -> Result<()>;
+
+    /// Retire the tracked channel for `provider_addr` so the next pull opens a fresh
+    /// one, IF the tracked row is still `channel_id` (#1145 review).
+    ///
+    /// Called when an upstream's voucher rejection proves the channel can never pay
+    /// again: the deposit is spent, it expired, or our watermark has desynced from
+    /// the nonce the upstream committed. Without this the channel is simply handed
+    /// back on the next miss — the reuse fast path gates only on expiry — so the provider
+    /// stays top-ranked and unable to serve a byte until the channel expires.
+    ///
+    /// Compare-and-delete on `channel_id`, for the same reason
+    /// [`Self::record_progress`] is: a concurrent open may already have replaced the
+    /// row, and retiring a channel we never used would strand its deposit.
+    ///
+    /// Returns whether a row was actually retired. Retiring the LOCAL row does not
+    /// touch on-chain state — the deposit remains escrowed and is recovered by the
+    /// settlement sweep / `reclaimExpired`, exactly as for any other channel we stop
+    /// using.
+    ///
+    /// # Errors
+    ///
+    /// On store write failure.
+    fn retire_channel(&self, provider_addr: Address, channel_id: ChannelId) -> Result<bool>;
 }
 
 #[async_trait::async_trait]
@@ -1046,6 +1086,10 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
             bytes_delivered,
             amount,
         )
+    }
+
+    fn retire_channel(&self, provider_addr: Address, channel_id: ChannelId) -> Result<bool> {
+        BuyerChannelService::retire_channel(self, provider_addr, channel_id)
     }
 }
 

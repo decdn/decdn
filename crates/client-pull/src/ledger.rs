@@ -44,6 +44,23 @@ fn next_voucher(cur: &Cumulative, delta_bytes: u64, rate_per_mb: u64) -> Cumulat
 #[derive(Debug)]
 pub struct ChannelLedger {
     cumulative: Mutex<Cumulative>,
+    /// A synchronously-readable mirror of the committed watermark, written under
+    /// the issuance lock in [`Self::issue`] at the same instant `cumulative` is
+    /// committed. The two never disagree about a committed voucher.
+    ///
+    /// It exists because a pull can end by being DROPPED, not only by returning,
+    /// and the watermark is the record of money already spent (#1145 review). The
+    /// buffered node pull runs with `hard_cap: None` (#1134), so what ends a
+    /// slow-but-progressing transfer is always external — the foreground
+    /// `outer_pull_deadline`, the background warm's hard cap, or the shutdown
+    /// token — and all three DROP the future. The only thing that runs on that
+    /// path is `Drop`, which cannot await, so [`Self::snapshot`] is unreachable
+    /// there and a `tokio::sync::Mutex` is the wrong instrument. Hence a
+    /// `std::sync::Mutex` a `Drop` impl can actually read.
+    ///
+    /// Held for a few instructions at a time and never across an await, so it
+    /// cannot deadlock with the issuance lock above.
+    committed: std::sync::Mutex<Cumulative>,
 }
 
 impl ChannelLedger {
@@ -54,12 +71,28 @@ impl ChannelLedger {
     pub fn new(seed: Cumulative) -> Self {
         Self {
             cumulative: Mutex::new(seed),
+            committed: std::sync::Mutex::new(seed),
         }
     }
 
     /// Read the current cumulative (for persistence after a pull completes).
     pub async fn snapshot(&self) -> Cumulative {
         *self.cumulative.lock().await
+    }
+
+    /// Read the committed cumulative WITHOUT awaiting — the drop-safe counterpart
+    /// of [`Self::snapshot`], and the only one a `Drop` impl can call.
+    ///
+    /// A poisoned lock means a prior holder panicked mid-write. Recover the inner
+    /// value and return it rather than propagating: the caller is a persist-what-we-
+    /// paid path, and refusing to read here would throw away the very watermark the
+    /// mirror exists to save.
+    #[must_use]
+    pub fn committed(&self) -> Cumulative {
+        *self
+            .committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Issue one voucher for `delta_bytes` newly delivered since the last voucher.
@@ -87,6 +120,15 @@ impl ChannelLedger {
         let next = next_voucher(&guard, delta_bytes, rate_per_mb);
         exchange(next).await?;
         *guard = next;
+        // Mirror the commit while still holding the issuance lock, so a reader that
+        // takes only the sync lock can never observe a voucher as committed here and
+        // not there (or the reverse). `exchange` has returned, so the upstream acked —
+        // and ADR 003 has it commit before it acks. The money is spent; from this line
+        // on, a drop of the pull cannot lose it.
+        *self
+            .committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
         Ok(next)
     }
 }

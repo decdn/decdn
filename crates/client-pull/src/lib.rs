@@ -258,17 +258,28 @@ impl VoucherProgress {
         }
     }
 
-    /// Set the watermark from a ledger [`Cumulative`] plus the channel's seed
-    /// nonce. `vouchers_sent` is set to the number of vouchers acked since the
-    /// seed (`cum.nonce - prior_nonce`, saturated to `u64`); `acked()` only checks
-    /// it is `> 0`, so this preserves the "acked iff the nonce advanced past the
-    /// seed" contract even when the ledger was shared across concurrent streams.
+    /// Build the watermark from a ledger [`Cumulative`] plus the channel's seed
+    /// nonce. `vouchers_sent` is the number of vouchers acked since the seed
+    /// (`cum.nonce - prior_nonce`, saturated to `u64`); `acked()` only checks it is
+    /// `> 0`, so this preserves the "acked iff the nonce advanced past the seed"
+    /// contract even when the ledger was shared across concurrent streams.
+    ///
+    /// Public because a caller that owns its ledger persists from it directly rather
+    /// than through the `&mut VoucherProgress` out-param — including from a `Drop`,
+    /// where nothing can be awaited and [`ChannelLedger::committed`] is the only
+    /// readable source (#1145 review).
+    #[must_use]
+    pub fn from_cumulative(cum: Cumulative, prior_nonce: U256) -> Self {
+        Self {
+            nonce: cum.nonce,
+            bytes_delivered: cum.bytes,
+            amount: cum.amount,
+            vouchers_sent: u64::try_from(cum.nonce.saturating_sub(prior_nonce)).unwrap_or(u64::MAX),
+        }
+    }
+
     fn set_from_cumulative(&mut self, cum: Cumulative, prior_nonce: U256) {
-        self.nonce = cum.nonce;
-        self.bytes_delivered = cum.bytes;
-        self.amount = cum.amount;
-        self.vouchers_sent =
-            u64::try_from(cum.nonce.saturating_sub(prior_nonce)).unwrap_or(u64::MAX);
+        *self = Self::from_cumulative(cum, prior_nonce);
     }
 
     /// The cumulative `(nonce, bytes_delivered, amount)` to persist via
