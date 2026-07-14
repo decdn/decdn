@@ -61,6 +61,7 @@ use decdn_reputation::{
 use decdn_incentive::ChannelOpenFailureReason;
 
 use crate::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenReported, OpenSlotReserved};
+use crate::buyer_ledgers::BuyerLedgers;
 use crate::client_requester::{
     BlobTooLargeClaim, ChannelContext, ChannelLedger, Cumulative, HashMismatch, LocalPullFault,
     PullDeadlines, PullStalled, PullTimeout, UpstreamPull, UpstreamPullHeader, UpstreamRefused,
@@ -240,6 +241,10 @@ pub struct NodeOriginDeps {
     /// Optional post-pull cost observer (#820). `None` on a node without
     /// prefetch; `Some` feeds the prefetch acquisition ledger.
     pub acquisition_observer: Option<Arc<dyn AcquisitionObserver>>,
+    /// The live voucher ledger of each provider's current channel, shared by every
+    /// concurrent pull on it (#1145 review). Not a cache — see [`BuyerLedgers`] for
+    /// why a per-pull ledger collides at `prior_nonce + 1` and what that now costs.
+    pub ledgers: Arc<BuyerLedgers>,
 }
 
 impl std::fmt::Debug for NodeOriginDeps {
@@ -383,12 +388,14 @@ impl NodeOrigin {
         // follows is bounded by inactivity instead (`stall_timeout`, carried into
         // the returned `UpstreamPull`, #1134): a wall clock over the bytes would
         // cap the blob size this node can pull through.
+        let ledger = channel_ledger(deps, provider_addr, &ctx);
         match tokio::time::timeout(
             deps.config.pull_timeout,
             open_progressive_upstream(
                 &deps.endpoint,
                 EndpointAddr::new(pk),
                 &ctx,
+                Arc::clone(&ledger),
                 &deps.slash_domain,
                 provider_addr,
                 hash_bytes,
@@ -422,8 +429,16 @@ impl NodeOrigin {
                     delivered: 0,
                     node_id: candidate.node_id,
                     hash_bytes,
-                    prior_amount: ctx.prior_amount,
-                    prior_bytes_delivered: ctx.prior_bytes_delivered,
+                    settle: SettleOnDrop {
+                        deps: SettleDeps::Shared(Arc::clone(&self.deps)),
+                        hash_bytes,
+                        provider_addr,
+                        channel_id: ctx.channel_id,
+                        prior_nonce: ctx.prior_nonce,
+                        prior_amount: ctx.prior_amount,
+                        prior_bytes_delivered: ctx.prior_bytes_delivered,
+                        ledger,
+                    },
                 },
             )),
             Err(err) => {
@@ -479,10 +494,17 @@ pub struct NodeProgressivePull {
     node_id: [u8; 32],
     /// Blob hash, for the prefetch acquisition-ledger feed (#820).
     hash_bytes: [u8; 32],
-    /// Channel cumulative amount/bytes BEFORE this pull, so the finalize path can
-    /// compute this pull's spend/byte delta for the prefetch ledger (#820).
-    prior_amount: U256,
-    prior_bytes_delivered: U256,
+    /// Settles the watermark + prefetch ledger on EVERY exit, including a drop.
+    ///
+    /// A field rather than a `Drop` impl on this struct, because the terminal methods
+    /// destructure `self` — which Rust forbids on a type that implements `Drop`. Holding the
+    /// guard as a field gets the same guarantee: every exit, terminal or not, drops it.
+    ///
+    /// This is load-bearing on THIS path specifically. The serve loop drives this pull as a
+    /// future on the iroh `accept` task (it borrows `&self`, so it cannot be `tokio::spawn`ed);
+    /// a node shutdown or a downstream connection reset drops that future outright, and no
+    /// terminal method runs (#1145 review).
+    settle: SettleOnDrop<'static>,
 }
 
 impl NodeProgressivePull {
@@ -540,30 +562,22 @@ impl NodeProgressivePull {
             delivered,
             node_id,
             hash_bytes,
-            prior_amount,
-            prior_bytes_delivered,
+            settle,
         } = self;
-        // Capture the acked watermark before `finish` consumes the pull so a
-        // paid-but-corrupt delivery is still persisted (#852).
-        let watermark = pull.progress();
         let verify = pull.finish().await;
         let elapsed = started.elapsed();
+        // Settle before scoring, and via the guard rather than by hand: it reads the
+        // watermark from the channel ledger, which outlives the consumed `pull`, so a
+        // paid-but-corrupt delivery is still persisted (#852) and the prefetch ledger (#820)
+        // is still fed. Dropped here — not left to the end of the function — so the blocking
+        // store write is not folded into `elapsed`, which feeds the delivery-speed
+        // reputation signal (same reason as the buffered path).
+        drop(settle);
         let Some(deps) = deps.get() else {
             // Unprovisioned under us (cannot happen in practice — we got here via
             // a provisioned open) — surface the verify result without scoring.
             return verify.map(|_| ());
         };
-        persist_buyer_progress(deps, provider_addr, channel_id, &watermark);
-        // Feed the prefetch ledger (#820) on both Ok and Err — see the buffered
-        // path; the window path is demand-miss today, so the observer no-ops, but
-        // wiring it keeps the ledger correct if a prefetch pull is ever routed here.
-        feed_acquisition_observer(
-            deps,
-            hash_bytes,
-            &watermark,
-            prior_amount,
-            prior_bytes_delivered,
-        );
         match verify {
             Ok(_) => {
                 match tee_verdict {
@@ -616,24 +630,17 @@ impl NodeProgressivePull {
             pull,
             pk,
             provider_addr,
-            channel_id,
-            hash_bytes,
-            prior_amount,
-            prior_bytes_delivered,
+            settle,
             ..
         } = self;
-        let watermark = pull.abort();
+        // Closes the upstream connection. The watermark it returns is redundant now: the
+        // guard reads the same value from the channel ledger, on this path and on the drop
+        // path the terminal methods cannot cover.
+        let _ = pull.abort();
+        drop(settle);
         let Some(deps) = deps.get() else {
             return;
         };
-        persist_buyer_progress(deps, provider_addr, channel_id, &watermark);
-        feed_acquisition_observer(
-            deps,
-            hash_bytes,
-            &watermark,
-            prior_amount,
-            prior_bytes_delivered,
-        );
         warn!(
             provider = %pk, %provider_addr,
             "window pull-through upstream served bao-corrupt bytes mid-stream; scoring Corruption"
@@ -653,25 +660,17 @@ impl NodeProgressivePull {
             provider_addr,
             channel_id,
             hash_bytes,
-            prior_amount,
-            prior_bytes_delivered,
+            settle,
             ..
         } = self;
-        let watermark = pull.abort();
+        // As `abandon_corrupt`: close the stream, and let the one guard settle. A
+        // paid-but-abandoned pull still advanced the watermark (#852) and still spent
+        // (#820); both are recorded by the guard, on this path and on the drop path.
+        let _ = pull.abort();
+        drop(settle);
         let Some(deps) = deps.get() else {
             return;
         };
-        persist_buyer_progress(deps, provider_addr, channel_id, &watermark);
-        // A paid-but-abandoned pull still advanced the watermark (#852); feed its
-        // spend to the prefetch ledger (#820) for the same reason as the buffered
-        // path's Err arm — see `feed_acquisition_observer`.
-        feed_acquisition_observer(
-            deps,
-            hash_bytes,
-            &watermark,
-            prior_amount,
-            prior_bytes_delivered,
-        );
         if let Some(err) = cause {
             classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(channel_id), err);
         }
@@ -892,6 +891,31 @@ fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> anyhow::Resu
     Ok(ctx.with_client_binding(binding))
 }
 
+/// The voucher ledger this pull must issue through: the CHANNEL's, shared with every other
+/// concurrent pull on it — never a fresh one per pull (#1145 review).
+///
+/// One call site per pull path, so neither can quietly go back to minting its own. Both did,
+/// and `stream_fetch_shared` (the entrypoint the buffered path calls) exists precisely
+/// because that is broken: N concurrent pulls each seeded from `ctx.prior_*` all sign
+/// `prior_nonce + 1` and collide, the upstream accepts one and rejects the rest
+/// `StaleNonce`. `ctx.prior_*` is only a SEED — it loses to a live ledger, which is at least
+/// as far along as the row it was read from. See [`BuyerLedgers`].
+fn channel_ledger(
+    deps: &NodeOriginDeps,
+    provider_addr: Address,
+    ctx: &ChannelContext,
+) -> Arc<ChannelLedger> {
+    deps.ledgers.get_or_seed(
+        provider_addr,
+        ctx.channel_id,
+        Cumulative {
+            nonce: ctx.prior_nonce,
+            bytes: ctx.prior_bytes_delivered,
+            amount: ctx.prior_amount,
+        },
+    )
+}
+
 /// Attempt a single paid pull from one candidate: resolve its operator address,
 /// open/reuse a buyer channel, `stream_fetch`, and record the reputation
 /// outcome. Returns the bytes on success, `None` (try the next) otherwise.
@@ -962,14 +986,10 @@ async fn pull_from_candidate(
     //
     // `Drop` is the one thing that runs on both paths, so the persist lives there and
     // nowhere else — one path, no second copy to forget. It reads
-    // `ChannelLedger::committed` (the sync mirror) because a `Drop` cannot await.
-    let ledger = Arc::new(ChannelLedger::new(Cumulative {
-        nonce: ctx.prior_nonce,
-        bytes: ctx.prior_bytes_delivered,
-        amount: ctx.prior_amount,
-    }));
+    // `ChannelLedger::settlement` (a sync mirror) because a `Drop` cannot await.
+    let ledger = channel_ledger(deps, provider_addr, &ctx);
     let settle = SettleOnDrop {
-        deps,
+        deps: SettleDeps::Borrowed(deps),
         hash_bytes,
         provider_addr,
         channel_id: ctx.channel_id,
@@ -1053,7 +1073,28 @@ async fn pull_from_candidate(
     }
 }
 
-/// Settles what the buffered pull paid — on EVERY way out of it, including a drop.
+/// How a [`SettleOnDrop`] reaches the deps it settles against.
+///
+/// The two pull paths hold them differently — the buffered one borrows for the length of a
+/// single call, the window one carries the runtime's `Arc` across a pull it hands to the
+/// serve loop — and the guard must work on BOTH, because both can be dropped mid-pull.
+enum SettleDeps<'a> {
+    Borrowed(&'a NodeOriginDeps),
+    Shared(Arc<OnceLock<NodeOriginDeps>>),
+}
+
+impl SettleDeps<'_> {
+    /// `None` only if the node was never provisioned — in which case there is no store to
+    /// persist to and nothing to settle.
+    fn get(&self) -> Option<&NodeOriginDeps> {
+        match self {
+            Self::Borrowed(deps) => Some(deps),
+            Self::Shared(deps) => deps.get(),
+        }
+    }
+}
+
+/// Settles what a pull paid — on EVERY way out of it, including a drop.
 ///
 /// This is a `Drop` guard rather than a pair of calls after the await because the
 /// pull can end without returning, and on that path the money is already gone
@@ -1070,8 +1111,18 @@ async fn pull_from_candidate(
 /// It deliberately does NOT record a reputation outcome. Reputation is a judgement
 /// about the peer and needs the pull's result to make it; a drop has no result, and
 /// a cancelled transfer is our decision, not the provider's misconduct.
+///
+/// `Debug` is hand-written: `NodeOriginDeps` is not `Debug`-derivable (it is a bag of trait
+/// objects), and the guard is a field of the `Debug`-deriving [`NodeProgressivePull`].
+///
+/// BOTH pull paths settle through this and only this. The window path used to settle in
+/// its three terminal methods instead (`finish` / `abandon` / `abandon_corrupt`) — which
+/// is the copy-back-on-return pattern this guard exists to replace, and it lost the
+/// watermark for the same reason: the serve loop drives that pull as a future on the iroh
+/// `accept` task, and a node shutdown or a downstream reset DROPS it, so no terminal method
+/// runs (#1145 review).
 struct SettleOnDrop<'a> {
-    deps: &'a NodeOriginDeps,
+    deps: SettleDeps<'a>,
     hash_bytes: [u8; 32],
     provider_addr: Address,
     channel_id: B256,
@@ -1081,15 +1132,31 @@ struct SettleOnDrop<'a> {
     ledger: Arc<ChannelLedger>,
 }
 
+impl std::fmt::Debug for SettleOnDrop<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettleOnDrop")
+            .field("provider_addr", &self.provider_addr)
+            .field("channel_id", &self.channel_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for SettleOnDrop<'_> {
     fn drop(&mut self) {
-        // `committed`, not `snapshot`: a `Drop` cannot await. The mirror is written
-        // under the issuance lock at the instant of commit, so it holds exactly the
-        // vouchers the upstream acked and no more.
-        let progress = VoucherProgress::from_cumulative(self.ledger.committed(), self.prior_nonce);
-        persist_buyer_progress(self.deps, self.provider_addr, self.channel_id, &progress);
+        let Some(deps) = self.deps.get() else {
+            return;
+        };
+        // `settlement`, not `snapshot`: a `Drop` cannot await. And not `committed`
+        // either — that is the watermark of what the upstream ACKED, and the drop we are
+        // handling can land inside the ack wait, where a voucher is committed upstream
+        // and unacked here (ADR 003 persists before it acks). `settlement` adds back the
+        // voucher still on the wire, which is what we actually owe (#1122). Settling at
+        // `committed` there re-signs a spent nonce on the next reuse, and `StaleNonce`
+        // now retires the channel — so the old choice ended in a stranded deposit.
+        let progress = VoucherProgress::from_cumulative(self.ledger.settlement(), self.prior_nonce);
+        persist_buyer_progress(deps, self.provider_addr, self.channel_id, &progress);
         feed_acquisition_observer(
-            self.deps,
+            deps,
             self.hash_bytes,
             &progress,
             self.prior_amount,
@@ -1218,20 +1285,35 @@ enum PullVerdict {
     /// The peer went SILENT mid-stream (#1134). Unlike [`Self::OurDeadline`] this IS about
     /// the peer: a clock that resets on every byte can only fire on one that stopped.
     Stalled,
-    /// The peer rejected a voucher we presented, and the channel is FINISHED: the deposit
-    /// is spent, it expired, the upstream has signed its cooperative close, or our
-    /// watermark has desynced from the nonce it committed (#1145 review).
+    /// The peer rejected a voucher and the channel is finished, but its deposit is NOT:
+    /// there is still an escrowed remainder, recoverable only by `reclaimExpired` at expiry
+    /// (#1145 review).
     ///
     /// Split from [`Self::OurVoucherRetryable`] because the two want opposite actions and
     /// collapsing them is what made a drained deposit invisible. `UpstreamVoucherRejected`
-    /// carries a `VoucherRejectReason` whose eleven variants prescribe *different*
-    /// remedies — resend, top up, rotate, stop — and the classifier used to discard it with
-    /// a bare `.is_some()`, so every one of them became "skip this candidate, say nothing".
-    /// The channel was then handed straight back on the next miss (`try_reuse_live` gates
-    /// only on expiry), so the provider stayed top-ranked and could not serve a byte for
-    /// the ~90 days until the channel expired — while the only signal was a `debug!` line
-    /// nobody sees at the default log level.
+    /// carries a `VoucherRejectReason` whose variants prescribe *different* remedies —
+    /// resend, top up, rotate, stop — and the classifier used to discard it with a bare
+    /// `.is_some()`, so every one of them became "skip this candidate, say nothing".
+    ///
+    /// Split AGAIN from [`Self::OurSettledChannel`], and this is the load-bearing half:
+    /// the row is the only handle this node has on the deposit. `reclaimExpired` needs the
+    /// `channel_id`, and the two recovery sweeps enumerate the store (`load_all`), so a
+    /// FORGOTTEN row is money nothing in this codebase can ever see again — the hazard
+    /// `run_open` already reclaims-before-rotating to avoid. Deleting the row here (as the
+    /// first cut of this verdict did, for every reason alike) turned an accounting desync
+    /// into a permanently stranded deposit.
+    ///
+    /// So the row survives and the provider is SUPPRESSED instead. That costs us the
+    /// provider until its channel expires — the store is provider-keyed, so we cannot open
+    /// a replacement without overwriting the very row we are keeping — and that is the
+    /// right trade: there are other providers, and there is no other copy of this deposit.
+    /// Recovering it sooner means cooperatively closing the wedged channel to settle at the
+    /// true watermark; that is the real fix for the desync, tracked in #1122.
     OurDeadChannel(VoucherRejectReason),
+    /// The peer rejected a voucher and the channel is settled ON-CHAIN — the upstream has
+    /// its cooperative close signed, so there is no remainder to reclaim and nothing the
+    /// local row can still buy us. The one case where forgetting it is safe (#1145 review).
+    OurSettledChannel(VoucherRejectReason),
     /// The peer rejected a voucher we presented, but the channel is FINE: a transient
     /// node-side persist fault upstream (`RetryLater`). ADR 003 has the upstream's state
     /// not advance in this case, so the SAME voucher can be resent on a fresh stream —
@@ -1250,20 +1332,68 @@ enum PullVerdict {
     Unreachable,
 }
 
-/// Retire a buyer channel an upstream has told us can never pay again, so the next pull to
-/// that provider opens a fresh one (#1145 review).
+/// A buyer channel that can no longer pay but whose DEPOSIT is still escrowed (#1145
+/// review). Keep the row, stop using the provider, and say so loudly.
 ///
-/// Retiring only the LOCAL row is the whole action, and it is enough: the on-chain deposit
-/// stays escrowed and is recovered by the ordinary settlement sweep / `reclaimExpired`, the
-/// same as for any channel we stop using. What we must not do is keep the row, because
-/// `try_reuse_live` gates on expiry alone and would hand the dead channel straight back.
+/// The row is not bookkeeping — it is the only handle this node has on the money.
+/// `reclaimExpired` refunds the remainder at expiry and needs the `channel_id`; both
+/// recovery sweeps find their work by enumerating the store (`load_all`). A row this
+/// function deleted would therefore be a deposit that nothing in this codebase can ever see
+/// again, which is precisely why `run_open` reclaims BEFORE it rotates an expired channel.
+///
+/// So this deliberately does NOT call `retire_channel`. What it does instead:
+///
+/// - **Suppress the provider.** The row survives, so `try_reuse_live` (which gates on expiry
+///   alone) would hand the dead channel straight back on the next miss and burn a candidate
+///   slot on a pull that cannot pay. Suppression takes the provider out of ranking for
+///   [`REFUSAL_SUPPRESSION_TTL`] instead — the same instrument this module already uses for
+///   an unattributable refusal, and for the same reason: not the peer's fault, but no use
+///   trying it either.
+/// - **Score nothing.** The peer behaved correctly; our accounting is what broke.
+///
+/// The cost is this provider until its channel expires: the store is provider-keyed, so we
+/// cannot open a replacement without overwriting the row we are keeping. That is the right
+/// side of the trade — there are other providers, and there is no second copy of the
+/// deposit. Recovering it sooner means cooperatively closing the wedged channel to settle at
+/// the true watermark, which is the real repair for the desync (#1122).
+fn wedged_channel(
+    deps: &NodeOriginDeps,
+    pk: PublicKey,
+    provider_addr: Address,
+    hash_bytes: [u8; 32],
+    reason: VoucherRejectReason,
+    channel: Option<B256>,
+) {
+    deps.metrics.node_pull_channel_wedged();
+    // Suppress the (peer, hash) pair the negative cache is keyed by, so the next miss ranks
+    // someone else rather than re-presenting a voucher this channel cannot honour.
+    deps.negative_cache.record_failure_with_ttl(
+        DhtNodeId::from_bytes(*pk.as_bytes()),
+        DhtHash::from_bytes(hash_bytes),
+        REFUSAL_SUPPRESSION_TTL,
+    );
+    warn!(
+        %provider_addr, channel_id = ?channel, ?reason,
+        "node-origin: upstream rejected our voucher on terms this channel cannot recover \
+         from. Its deposit is STILL ESCROWED, so the row is kept for the reclaim sweep and \
+         the provider is suppressed instead — it cannot be used again until the channel \
+         expires and the sweep refunds it (#1122)"
+    );
+}
+
+/// A buyer channel that is SETTLED on-chain: the upstream holds a signed cooperative close,
+/// so the deposit has already been divided and the local row can buy us nothing more.
+///
+/// The one voucher rejection for which forgetting the row is safe — and necessary, since
+/// `try_reuse_live` gates on expiry alone and would otherwise hand a closed channel straight
+/// back (#1145 review).
 ///
 /// `channel` is `None` only for failures that happen before a channel exists, which cannot
 /// produce a voucher rejection — so reaching that arm means the ladder has changed and a
-/// dead channel is about to be silently kept. Say so rather than skip quietly.
+/// closed channel is about to be silently kept. Say so rather than skip quietly.
 // As `classify_pull_failure`: the tracing macros inflate the cognitive-complexity metric.
 #[allow(clippy::cognitive_complexity)]
-fn retire_dead_channel(
+fn forget_settled_channel(
     deps: &NodeOriginDeps,
     provider_addr: Address,
     reason: VoucherRejectReason,
@@ -1283,25 +1413,28 @@ fn retire_dead_channel(
         // replacement is not ours to throw away. Nothing to do, and nothing wrong.
         Ok(false) => debug!(
             %provider_addr, %channel_id, ?reason,
-            "node-origin: dead channel was already replaced by a newer open"
+            "node-origin: settled channel was already replaced by a newer open"
         ),
         Ok(true) => {
             deps.metrics.node_pull_channel_retired();
+            // Drop the ledger too: no voucher will ever be signed against this channel
+            // again, and a future channel to this provider must not inherit its watermark.
+            deps.ledgers.forget(provider_addr, channel_id);
             warn!(
                 %provider_addr, %channel_id, ?reason,
-                "node-origin: upstream rejected our voucher on terms this channel cannot \
-                 recover from; retired it — the next pull to this provider opens a fresh one"
+                "node-origin: upstream has this channel's cooperative close signed; it is \
+                 settled on-chain, so the row is retired — the next pull opens a fresh one"
             );
         }
-        // The store write failed, so the dead row is still there and the next pull WILL
+        // The store write failed, so the settled row is still there and the next pull WILL
         // reuse it and be rejected again. Nothing here can fix that, but an operator can,
         // and this is the only place that knows.
         Err(err) => {
-            deps.metrics.node_pull_progress_persist_failure();
+            deps.metrics.node_pull_channel_retire_failure();
             warn!(
                 %provider_addr, %channel_id, ?reason, %err,
-                "node-origin: could not retire a dead buyer channel; it will be reused and \
-                 rejected again until it expires"
+                "node-origin: could not retire a settled buyer channel; it will be reused \
+                 and rejected again until it expires"
             );
         }
     }
@@ -1320,8 +1453,11 @@ fn retire_dead_channel(
 ///   payment bucket also *hid* it: the ladder checks `UpstreamVoucherRejected` before
 ///   `LocalPullFault`, so a broken buyer key produced a `debug!` about payments instead of
 ///   the `warn!` about a node that cannot pay anyone.
-/// - **The channel is finished.** Spent, expired, cooperatively closed, or desynced from
-///   the upstream's committed nonce. No future voucher on it can be accepted.
+/// - **The channel is finished, but its DEPOSIT is not.** Spent down, expired, or desynced
+///   from the upstream's committed nonce. No future voucher on it can be accepted — but an
+///   escrowed remainder survives it, and the local row is this node's only handle on that.
+/// - **The channel is settled.** `CooperativeCloseSigned` alone: the upstream holds a signed
+///   cooperative close, so the channel is finalised on-chain and there is no remainder.
 /// - **Try again.** `RetryLater` alone: the voucher was valid and the upstream's state did
 ///   not advance (ADR 003), so the same voucher can go out on a fresh stream.
 const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
@@ -1330,21 +1466,31 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
             PullVerdict::OurLocalFault
         }
         VoucherRejectReason::RetryLater => PullVerdict::OurVoucherRetryable(reason),
-        // Everything else is terminal FOR THIS CHANNEL, though for two different underlying
-        // reasons — the money ran out (`InsufficientDeposit`, `Expired`,
-        // `CooperativeCloseSigned`) or our accounting drifted from the upstream's
+        // Settled on-chain: the deposit is already divided, so the row buys us nothing.
+        VoucherRejectReason::CooperativeCloseSigned => PullVerdict::OurSettledChannel(reason),
+        // Everything else is terminal for this channel while its deposit is STILL ESCROWED.
+        //
+        // The previous cut of this match SAW the distinction and then discarded it. It said,
+        // in as many words, that these arrive "for two different underlying reasons — the
+        // money ran out (`InsufficientDeposit`, `Expired`) or our accounting drifted
         // (`StaleNonce`, `AmountRegression`, `BytesRegression`, `WrongChannel`,
-        // `WrongToken`). Both are unrecoverable on the existing row and both are repaired
-        // the same way: drop it and open a fresh channel, which re-derives the nonce, the
-        // token, and the deposit from scratch.
+        // `WrongToken`)" — and then gave both the same remedy: "drop it and open a fresh
+        // channel". Dropping the row is exactly what makes the deposit unreclaimable (see
+        // `PullVerdict::OurDeadChannel`), and NEITHER group has surrendered its money:
+        //
+        // - a desync spent nothing extra, so the deposit is very nearly intact;
+        // - `InsufficientDeposit` means too little for THIS voucher, not nothing left;
+        // - an `Expired` channel is the exact case `reclaimExpired` exists to refund, and
+        //   the reclaim sweep already does that — from the row.
+        //
+        // So none of them may forget it.
         VoucherRejectReason::WrongChannel
         | VoucherRejectReason::WrongToken
         | VoucherRejectReason::StaleNonce
         | VoucherRejectReason::AmountRegression
         | VoucherRejectReason::BytesRegression
         | VoucherRejectReason::InsufficientDeposit
-        | VoucherRejectReason::Expired
-        | VoucherRejectReason::CooperativeCloseSigned => PullVerdict::OurDeadChannel(reason),
+        | VoucherRejectReason::Expired => PullVerdict::OurDeadChannel(reason),
     }
 }
 
@@ -1436,19 +1582,25 @@ fn classify_pull_failure(
             record_outcome(deps, pk, &Outcome::Unreachable);
         }
         // Our payment-side fault either way — the provider is not scored (#857). What
-        // separates the two arms is whether the CHANNEL survives it (#1145 review).
+        // separates these three arms is what it costs the CHANNEL (#1145 review).
         //
-        // The channel is finished: spent, expired, closed, or desynced from the nonce the
-        // upstream committed. Retire the row so the next pull opens a fresh one. Without
-        // this, `try_reuse_live` — which gates only on expiry — hands the dead channel back
-        // on the very next miss, and keeps handing it back: the provider stays top-ranked,
-        // burns a `MAX_PROVIDER_ATTEMPTS` slot every time, and cannot serve a byte until the
-        // channel expires ~90 days later. `warn!`, not `debug!`, for the same reason the
-        // local-fault arm is: at the default `RUST_LOG=info` a `debug!` is invisible, and
-        // this is a node that cannot pay a provider it will keep on choosing.
+        // The channel can no longer pay, but its DEPOSIT is still escrowed: a desync, a
+        // drained-for-this-voucher balance, an expiry. The row is the only handle on that
+        // money (`reclaimExpired` needs the `channel_id`; the sweeps enumerate the store), so
+        // it is KEPT and the provider is suppressed instead of the row being deleted. This
+        // arm used to delete it, which stranded the deposit permanently. `warn!`, not
+        // `debug!`, for the same reason the local-fault arm is: at the default
+        // `RUST_LOG=info` a `debug!` is invisible, and money is at stake.
         PullVerdict::OurDeadChannel(reason) => {
             deps.metrics.node_pull_voucher_rejected();
-            retire_dead_channel(deps, provider_addr, reason, channel);
+            wedged_channel(deps, pk, provider_addr, hash_bytes, reason, channel);
+        }
+        // The channel is SETTLED on-chain — the upstream has its cooperative close signed, so
+        // the deposit is already divided and the row buys us nothing. The one rejection for
+        // which forgetting it is both safe and necessary.
+        PullVerdict::OurSettledChannel(reason) => {
+            deps.metrics.node_pull_voucher_rejected();
+            forget_settled_channel(deps, provider_addr, reason, channel);
         }
         // The channel is fine: the upstream hit a transient persist fault and its state did
         // not advance (ADR 003), so the same voucher can be resent on a fresh stream. Skip

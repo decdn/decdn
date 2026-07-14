@@ -246,18 +246,6 @@ pub struct VoucherProgress {
 }
 
 impl VoucherProgress {
-    /// Seed the watermark from the channel's prior cumulative state (the last
-    /// voucher acked on earlier streams). `vouchers_sent` starts at `0` — it
-    /// counts acks on *this* stream.
-    const fn seed(ctx: &ChannelContext) -> Self {
-        Self {
-            nonce: ctx.prior_nonce,
-            bytes_delivered: ctx.prior_bytes_delivered,
-            amount: ctx.prior_amount,
-            vouchers_sent: 0,
-        }
-    }
-
     /// Build the watermark from a ledger [`Cumulative`] plus the channel's seed
     /// nonce. `vouchers_sent` is the number of vouchers acked since the seed
     /// (`cum.nonce - prior_nonce`, saturated to `u64`); `acked()` only checks it is
@@ -1485,7 +1473,11 @@ pub struct UpstreamPull {
     send: SendStream,
     recv: RecvStream,
     ctx: ChannelContext,
-    progress: VoucherProgress,
+    /// The channel's voucher ledger, SHARED with every other concurrent pull on this
+    /// channel (#1145 review). Not a per-pull one-shot: that made two concurrent pulls
+    /// both sign `prior_nonce + 1` and collide — see [`stream_fetch_shared`], whose doc
+    /// describes the same bug on the buffered path.
+    ledger: Arc<ChannelLedger>,
     hash: [u8; 32],
     rate_per_mb: u64,
     interval_bytes: u64,
@@ -1535,11 +1527,18 @@ impl std::fmt::Debug for UpstreamPull {
 /// bound. `deadlines.stall` is the INACTIVITY budget the returned [`UpstreamPull`]
 /// carries into every streaming read; `deadlines.hard_cap` is not consulted here
 /// (the caller owns the streaming lifetime on this path).
+///
+/// `ledger` is the CHANNEL's voucher ledger, not this pull's: pass the same
+/// `Arc<ChannelLedger>` to every concurrent pull on one channel, exactly as with
+/// [`stream_fetch_shared`], or they will each sign `prior_nonce + 1` and collide
+/// (#1145 review). The caller reads what to persist from it — including after a drop —
+/// via [`ChannelLedger::settlement`].
 #[allow(clippy::too_many_arguments)]
 pub async fn open_progressive_pull(
     endpoint: &Endpoint,
     target: EndpointAddr,
     ctx: &ChannelContext,
+    ledger: Arc<ChannelLedger>,
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
@@ -1605,7 +1604,7 @@ pub async fn open_progressive_pull(
         send,
         recv,
         ctx: ctx.clone(),
-        progress: VoucherProgress::seed(ctx),
+        ledger,
         hash,
         rate_per_mb,
         interval_bytes,
@@ -1627,26 +1626,26 @@ impl UpstreamPull {
         self.expected_wire_bytes
     }
 
-    /// The current acked voucher watermark — read it on any exit (including an
-    /// error from `next_chunk`) to persist what was paid (#852).
+    /// The watermark to PERSIST on any exit — including an error from `next_chunk`, and
+    /// including a DROP (#852, #1122).
+    ///
+    /// Reads [`ChannelLedger::settlement`], not a copied-back field. A field can only be
+    /// updated on a path that RUNS, and this pull's does not always run: the serve loop
+    /// drives it as a future on the `accept` task, which is dropped on shutdown or a
+    /// downstream reset, and `settlement` additionally covers a voucher left in flight when
+    /// that happened. See the ledger's docs.
     #[must_use]
-    pub const fn progress(&self) -> VoucherProgress {
-        self.progress
+    pub fn progress(&self) -> VoucherProgress {
+        VoucherProgress::from_cumulative(self.ledger.settlement(), self.ctx.prior_nonce)
     }
 
-    /// Issue one voucher for `delta_bytes` newly delivered since the last voucher
-    /// through a one-shot ledger seeded from the current acked watermark, then copy
-    /// the committed cumulative back into `self.progress`. The progressive pull owns
-    /// a single stream, so there is no cross-stream contention to serialize here;
-    /// the one-shot ledger just reuses the shared issue → sign → ack → commit path
-    /// so the wire behavior matches `fetch_inner` exactly.
+    /// Issue one voucher for `delta_bytes` newly delivered since the last voucher, through
+    /// the CHANNEL's ledger — shared with every other concurrent pull on it, so their
+    /// vouchers are serialized into strict nonce order rather than colliding
+    /// (see [`stream_fetch_shared`]).
     async fn pay_one(&mut self, delta_bytes: u64) -> anyhow::Result<()> {
-        let ledger = ChannelLedger::new(Cumulative {
-            nonce: self.progress.nonce,
-            bytes: self.progress.bytes_delivered,
-            amount: self.progress.amount,
-        });
-        let result = self_pay(
+        let ledger = Arc::clone(&self.ledger);
+        self_pay(
             &mut self.send,
             &mut self.recv,
             &self.ctx,
@@ -1655,12 +1654,7 @@ impl UpstreamPull {
             delta_bytes,
             self.stall,
         )
-        .await;
-        // Copy back the committed watermark on every path: on Ok the ledger
-        // advanced; on a rejected voucher it stayed put, so `progress` is unchanged.
-        self.progress
-            .set_from_cumulative(ledger.snapshot().await, self.ctx.prior_nonce);
-        result
+        .await
     }
 
     /// Read the next `ChunkData`, paying the upstream at each voucher-interval
@@ -1798,7 +1792,7 @@ impl UpstreamPull {
             );
         }
         self.conn.close(0u32.into(), b"done");
-        Ok(self.progress)
+        Ok(self.progress())
     }
 
     /// Abandon the pull (e.g. the downstream client dropped, so we stop pulling
@@ -1807,7 +1801,7 @@ impl UpstreamPull {
     #[must_use]
     pub fn abort(self) -> VoucherProgress {
         self.conn.close(0u32.into(), b"client-abandoned");
-        self.progress
+        self.progress()
     }
 }
 
@@ -1818,9 +1812,16 @@ impl Drop for UpstreamPull {
     /// don't linger and keep that paid stream half-open. `Connection::close` is
     /// first-wins and idempotent, so an explicit close in `finish`/`abort` keeps
     /// its richer reason and this is a no-op when one of them ran; it only takes
-    /// effect on a dropped-without-finalize path. The acked watermark cannot be
-    /// recovered from `drop` (it can't be returned), so this bounds only the
-    /// connection leak, not the #852 watermark loss the doc contract guards.
+    /// effect on a dropped-without-finalize path.
+    ///
+    /// It closes the connection and nothing else, and that is now sufficient. It used to
+    /// note that "the acked watermark cannot be recovered from `drop` (it can't be
+    /// returned), so this bounds only the connection leak, not the #852 watermark loss" —
+    /// which was true while the watermark lived in a field of this struct. It does not:
+    /// the watermark lives in the channel's [`ChannelLedger`], which OUTLIVES the pull (it
+    /// is shared with the other pulls on the channel). A dropped pull's caller reads it
+    /// with [`ChannelLedger::settlement`] and persists it — `node_origin` does exactly that
+    /// from its own `Drop` guard (#1145 review).
     fn drop(&mut self) {
         self.conn.close(0u32.into(), b"upstream-pull-dropped");
     }

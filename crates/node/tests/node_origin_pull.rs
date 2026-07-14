@@ -734,6 +734,7 @@ fn build_origin_with_negative_cache(
             lookup: decdn_node::dht::LookupConfig::default(),
         },
         acquisition_observer: None,
+        ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
     });
     origin
 }
@@ -934,6 +935,7 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
             lookup: decdn_node::dht::LookupConfig::default(),
         },
         acquisition_observer: Some(observer),
+        ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
     });
 
     // B's cache with the NodeOrigin last in the chain — exactly how the runtime
@@ -1376,6 +1378,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
             lookup: decdn_node::dht::LookupConfig::default(),
         },
         acquisition_observer: Some(observer),
+        ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
     });
 
     let cache_dir_b = tempfile::tempdir()?;
@@ -3394,8 +3397,13 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
 /// A shared fixture because the interesting thing about `VoucherRejectReason` is that
 /// its variants must produce DIFFERENT behaviour, and the only honest way to show that
 /// is to run the same pull against different reasons and compare.
-async fn pull_against_a_voucher_rejecting_upstream(
+///
+/// `fetches` drives the pull that many times against the SAME origin. More than one is how
+/// a caller observes suppression: a provider taken out of rotation is filtered before it is
+/// probed, so a second miss must not reach it — and the counters say whether it did.
+async fn pull_against_a_voucher_rejecting_upstream_n(
     reason: VoucherRejectReason,
+    fetches: usize,
 ) -> Result<(
     Arc<Mutex<Vec<(Address, B256)>>>,
     Arc<Metrics>,
@@ -3469,13 +3477,15 @@ async fn pull_against_a_voucher_rejecting_upstream(
         0,
     );
 
-    let got = Origin::fetch(&origin, hash, u64::MAX)
-        .await
-        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
-    anyhow::ensure!(
-        matches!(got, OriginFetch::NotFound),
-        "a rejected voucher must not surface bytes (NotFound)"
-    );
+    for _ in 0..fetches {
+        let got = Origin::fetch(&origin, hash, u64::MAX)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+        anyhow::ensure!(
+            matches!(got, OriginFetch::NotFound),
+            "a rejected voucher must not surface bytes (NotFound)"
+        );
+    }
 
     ep_b.close().await;
     ep_a.close().await;
@@ -3483,61 +3493,126 @@ async fn pull_against_a_voucher_rejecting_upstream(
     Ok((retired, b_metrics, obs_buffer, local_rep, a_id, channel_id))
 }
 
-/// A voucher rejection that means the channel can never pay again must RETIRE the
-/// channel, not shrug and carry on (#1145 review).
-///
-/// This is the arm where the money is. `InsufficientDeposit` says the channel is
-/// drained: no voucher it can ever sign will be accepted again. But the classifier
-/// discarded the reason with a bare `.is_some()` and every rejection became the same
-/// no-op — one counter, one `debug!`, skip the candidate — while `try_reuse_live`
-/// gates on expiry ALONE and cheerfully handed the dead channel back on the next miss.
-///
-/// So the provider stayed top-ranked and was picked first on every subsequent miss, for
-/// every hash, until the channel expired ~90 days later. Each attempt burned a
-/// `MAX_PROVIDER_ATTEMPTS` slot, re-opened a stream, and re-received up to a voucher
-/// interval of bytes it could not pay for — leeching, while the upstream scored US. At
-/// the default `RUST_LOG=info` the only trace was a counter climbing with no log line
-/// to explain it.
-///
-/// The provider is still not tarred — a drained deposit is our fault, not its — which
-/// is the distinction that makes this subtle: the RIGHT reputation call was already
-/// being made, and it hid the fact that no other call was being made at all.
-#[tokio::test(flavor = "multi_thread")]
-async fn node_origin_a_drained_channel_is_retired_rather_than_reused() -> Result<()> {
-    let (retired, metrics, obs, local_rep, a_id, channel_id) =
-        pull_against_a_voucher_rejecting_upstream(VoucherRejectReason::InsufficientDeposit).await?;
+/// The single-fetch shape, which is what most of these tests want.
+async fn pull_against_a_voucher_rejecting_upstream(
+    reason: VoucherRejectReason,
+) -> Result<(
+    Arc<Mutex<Vec<(Address, B256)>>>,
+    Arc<Metrics>,
+    Arc<ObservationBuffer>,
+    Arc<LocalReputation>,
+    iroh::PublicKey,
+    B256,
+)> {
+    pull_against_a_voucher_rejecting_upstream_n(reason, 1).await
+}
 
-    let a_addr = {
-        let log = retired
-            .lock()
-            .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?;
-        anyhow::ensure!(
-            log.len() == 1,
-            "a drained channel must be retired exactly once so the next pull opens a fresh \
-             one; instead it was left in the store to be reused and rejected forever. Got {log:?}"
-        );
-        log.first().map(|(addr, _)| *addr)
-    };
-    anyhow::ensure!(a_addr.is_some(), "retire must name the provider");
+/// A channel that can no longer pay must KEEP its row — the deposit is still escrowed, and
+/// the row is the only thing that can ever reclaim it (#1145 review).
+///
+/// This test previously asserted the exact opposite, and that is the point of rewriting it
+/// rather than adapting it: it pinned a money-losing behaviour. It required
+/// `InsufficientDeposit` to `retire_channel` the row, on the stated grounds that "the
+/// on-chain deposit stays escrowed and is recovered by the ordinary settlement sweep /
+/// `reclaimExpired`, exactly as for any other channel we stop using."
+///
+/// That premise is false, and the codebase already knew it. `reclaimExpired` refunds the
+/// remainder and needs the `channel_id`; BOTH recovery sweeps find their work by
+/// enumerating the store (`load_all`); and the boot reconcile's lookback is ~1–2 days
+/// against a ~90-day expiry. A forgotten row is therefore a deposit nothing can ever see
+/// again — which is precisely why `run_open` reclaims BEFORE it rotates an expired channel,
+/// warning in its own comment that otherwise the sweep "would never see it again — silently
+/// abandoning a refundable deposit".
+///
+/// Nor is the money gone in the first place: `InsufficientDeposit` means too little for THIS
+/// voucher, not nothing left. So the row survives, the provider is suppressed instead, and
+/// the deposit is reclaimed at expiry.
+///
+/// What was already right is preserved: the provider is still not tarred — a drained deposit
+/// is our fault, not its.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_origin_a_drained_channel_keeps_its_row_so_the_deposit_can_be_reclaimed() -> Result<()>
+{
+    // Two fetches: the second is how suppression is observed. A wedged provider must be
+    // filtered out of ranking, so the second miss must not re-present a voucher to it.
+    let (retired, metrics, obs, local_rep, a_id, _channel_id) =
+        pull_against_a_voucher_rejecting_upstream_n(VoucherRejectReason::InsufficientDeposit, 2)
+            .await?;
+
+    let log = retired
+        .lock()
+        .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?
+        .clone();
     anyhow::ensure!(
-        retired
-            .lock()
-            .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?
-            .first()
-            .map(|(_, id)| *id)
-            == Some(channel_id),
-        "retire must name the channel the pull actually paid on — a compare-and-delete on \
-         any other id would throw away a channel a concurrent open had just created"
+        log.is_empty(),
+        "the row must SURVIVE: its deposit is still escrowed, and `reclaimExpired` needs the \
+         channel_id that only this row carries. Deleting it strands the deposit forever — no \
+         sweep enumerates a row that is gone. Got {log:?}"
     );
 
-    assert_counter(&metrics, "node_pull_channel_retired_total", 1)?;
+    // The channel is wedged, not retired — and the two are different events with different
+    // remedies, so they get different series.
+    assert_counter(&metrics, "node_pull_channel_wedged_total", 1)?;
+    assert_counter(&metrics, "node_pull_channel_retired_total", 0)?;
+
+    // Suppression, observed rather than asserted about: the provider was taken out of
+    // rotation, so the SECOND fetch never reached it. Without it, the wedged channel is
+    // handed straight back (`try_reuse_live` gates on expiry alone) and we re-present a
+    // voucher it cannot honour on every miss until it expires.
     assert_counter(&metrics, "node_pull_voucher_rejected_total", 1)?;
+
     // Still OUR fault, not the provider's: the exoneration that was already correct must
     // survive the fix.
     assert_counter(&metrics, "node_pull_unreachable_total", 0)?;
     anyhow::ensure!(
         obs.drain().is_empty(),
         "a drained deposit is our payment fault; the provider must not be scored for it"
+    );
+    anyhow::ensure!(
+        (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
+        "provider score must stay neutral, got {}",
+        local_rep.score(a_id)
+    );
+    Ok(())
+}
+
+/// The one rejection for which dropping the row IS correct: the upstream holds a signed
+/// cooperative close, so the channel is settled on-chain and there is no remainder to
+/// reclaim (#1145 review).
+///
+/// The negative twin of the test above, and the reason the verdict had to be split in two
+/// rather than made uniformly "keep the row". A settled channel kept in the store would be
+/// handed straight back by `try_reuse_live` (which gates on expiry alone) and rejected on
+/// every subsequent miss, for nothing — there is no deposit left for the row to protect.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_origin_a_cooperatively_closed_channel_is_the_one_that_may_be_forgotten() -> Result<()>
+{
+    let (retired, metrics, obs, local_rep, a_id, channel_id) =
+        pull_against_a_voucher_rejecting_upstream(VoucherRejectReason::CooperativeCloseSigned)
+            .await?;
+
+    let log = retired
+        .lock()
+        .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?
+        .clone();
+    anyhow::ensure!(
+        log.len() == 1,
+        "a settled channel must be retired exactly once so the next pull opens a fresh one; \
+         got {log:?}"
+    );
+    anyhow::ensure!(
+        log.first().map(|(_, id)| *id) == Some(channel_id),
+        "retire must name the channel the pull actually paid on — a compare-and-delete on any \
+         other id would throw away a channel a concurrent open had just created"
+    );
+
+    assert_counter(&metrics, "node_pull_channel_retired_total", 1)?;
+    assert_counter(&metrics, "node_pull_channel_wedged_total", 0)?;
+    assert_counter(&metrics, "node_pull_voucher_rejected_total", 1)?;
+    assert_counter(&metrics, "node_pull_unreachable_total", 0)?;
+    anyhow::ensure!(
+        obs.drain().is_empty(),
+        "a cooperative close is not misconduct; the provider must not be scored for it"
     );
     anyhow::ensure!(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
@@ -8331,5 +8406,214 @@ async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
     ep_a.close().await;
     task_a.await?;
     task_b.await?;
+    Ok(())
+}
+
+/// Two concurrent misses to ONE provider must both be delivered — the contract
+/// `stream_fetch_shared` documents, and which both node pull paths broke by building a
+/// fresh `ChannelLedger` per pull (#1145 review).
+///
+/// Nothing exotic is staged here. Node B misses two DIFFERENT blobs at once and both rank
+/// the same provider first, which is what an ordinary node on a tens-of-nodes network does
+/// all day: the cache engine coalesces in-flight pulls BY HASH, so distinct hashes run
+/// concurrent `NodeOrigin::fetch` calls, and both take the channel-REUSE fast path and read
+/// the same `prior_nonce`.
+///
+/// With a ledger each, both pulls sign `prior_nonce + 1`. Node A — the real `ClientHandler`,
+/// enforcing real nonce monotonicity — accepts the first and rejects the second
+/// `StaleNonce`, so one of these two fetches comes back empty. That alone was a bad day;
+/// what makes it a money bug is `retire_dead_channel`, which now treats `StaleNonce` as
+/// terminal and DELETES the channel row — out from under the winner, which is still
+/// streaming on it. Hence the two assertions beyond "both blobs arrived": nothing was
+/// retired, and the watermark advanced monotonically through both pulls rather than one
+/// pull's voucher being refused.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)]
+async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Result<()> {
+    let payload = vec![0xC1u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    // A second blob of the SAME length: the probe responder quotes one `total_bytes`.
+    let payload2 = vec![0xC2u8; PAYLOAD_LEN];
+    let hash2 = Hash::new(&payload2);
+    anyhow::ensure!(hash != hash2, "the two fixtures must be distinct blobs");
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: holds both blobs, serves the REAL client handler (so vouchers are
+    //     validated for real — a colliding nonce is genuinely rejected, not simulated).
+    let (cache_a, _tmp_a) = cache_with_blobs(&[payload.as_slice(), payload2.as_slice()]).await?;
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xC7);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics_a = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics_a);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics_a,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: one origin, both hashes discoverable on A.
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    for h in [hash, hash2] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(a_id).with_ip_addr(addr_a),
+            *h.as_bytes(),
+            1,
+            false,
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let (providers, addr_map) = one_provider(a_dht, a_eth.address());
+
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let retired: Arc<Mutex<Vec<(Address, B256)>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+        retired: Arc::clone(&retired),
+    }) as Arc<dyn ChannelOpener>;
+
+    let origin = NodeOrigin::new();
+    origin.provision(NodeOriginDeps {
+        endpoint: ep_b.clone(),
+        routing_table: Arc::new(Mutex::new(RoutingTable::new(DhtNodeId::from_bytes(
+            *b_id.as_bytes(),
+        )))),
+        staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
+        origin_directory: Arc::new(ConfigOriginDirectory::new(HashMap::from([
+            (DhtHash::from_bytes(*hash.as_bytes()), providers.clone()),
+            (DhtHash::from_bytes(*hash2.as_bytes()), providers),
+        ]))) as Arc<dyn OriginDirectory>,
+        addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
+            as Arc<dyn NodeAddressResolver>,
+        buyer,
+        self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
+        slash_domain: slash_domain(),
+        bind_domain: binding_dom(),
+        local_rep: Arc::clone(&local_rep),
+        obs_buffer: Arc::clone(&obs_buffer),
+        network_rep: Arc::new(
+            NetworkReputation::new(NetworkReputationConfig::default())
+                .expect("network reputation config"),
+        ),
+        rep_cfg: NetworkReputationConfig::default(),
+        negative_cache: NegativeProbeCache::new(),
+        metrics: Arc::clone(&b_metrics),
+        region_accountant: empty_region_accountant(),
+        config: NodeOriginConfig {
+            probe_fanout: 5,
+            pull_timeout: Duration::from_secs(20),
+            stall_timeout: Duration::from_secs(20),
+            max_blob_size_bytes: 0,
+            enable_0rtt: false,
+            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
+            lookup: decdn_node::dht::LookupConfig::default(),
+        },
+        acquisition_observer: None,
+        ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
+    });
+
+    // The two misses race, exactly as two cache misses for different blobs do.
+    let (first, second) = tokio::join!(
+        Origin::fetch(&origin, hash, u64::MAX),
+        Origin::fetch(&origin, hash2, u64::MAX),
+    );
+    let got1 = first
+        .map_err(|e| anyhow::anyhow!("first concurrent fetch failed: {e}"))?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the first concurrent pull returned NOTHING — its voucher collided with the \
+                 other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
+            )
+        })?;
+    let got2 = second
+        .map_err(|e| anyhow::anyhow!("second concurrent fetch failed: {e}"))?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the second concurrent pull returned NOTHING — its voucher collided with the \
+                 other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
+            )
+        })?;
+    anyhow::ensure!(got1.as_ref() == payload.as_slice(), "blob 1 bytes mismatch");
+    anyhow::ensure!(
+        got2.as_ref() == payload2.as_slice(),
+        "blob 2 bytes mismatch"
+    );
+
+    // The collision's real cost: `StaleNonce` is a terminal verdict, so the losing pull
+    // would have RETIRED the channel the winner was still streaming on.
+    let retired_now = retired.lock().expect("retired lock").clone();
+    anyhow::ensure!(
+        retired_now.is_empty(),
+        "no channel may be retired here — both pulls paid honestly on a live channel, got {retired_now:?}"
+    );
+
+    // Both pulls issued through one ledger, so the channel's nonces are strictly
+    // increasing across them rather than two pulls both claiming nonce 1.
+    let entries = recorded.lock().expect("recorded lock").clone();
+    let mut nonces: Vec<U256> = entries.iter().map(|(_, n, ..)| *n).collect();
+    nonces.sort_unstable();
+    nonces.dedup();
+    anyhow::ensure!(
+        nonces.len() == entries.len(),
+        "two settlements recorded the SAME nonce — the pulls did not share a ledger: {entries:?}"
+    );
+    let top = nonces.last().copied().unwrap_or(U256::ZERO);
+    anyhow::ensure!(
+        top >= U256::from(2u64),
+        "the channel must have carried at least one voucher per pull; top nonce was {top}"
+    );
+
+    ep_a.close().await;
+    task_a.await?;
     Ok(())
 }

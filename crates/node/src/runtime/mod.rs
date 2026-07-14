@@ -1698,6 +1698,12 @@ pub async fn run(
                     metrics: node_metrics_for_origin,
                     region_accountant: region_accountant_c,
                     config: node_origin_config,
+                    // One voucher ledger per provider channel, shared by every concurrent
+                    // pull on it (#1145 review). Built here, at the single place the pull
+                    // paths' deps are assembled, so both paths necessarily share it —
+                    // which is the point: a per-pull ledger makes concurrent pulls collide
+                    // on `prior_nonce + 1`. See `buyer_ledgers::BuyerLedgers`.
+                    ledgers: Arc::new(crate::buyer_ledgers::BuyerLedgers::default()),
                     // Feed the prefetch ledger when prefetch is enabled (#820);
                     // the observer records only prefetch-initiated pulls.
                     acquisition_observer: node_origin_prefetch_enabled.then(|| {

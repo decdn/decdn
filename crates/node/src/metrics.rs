@@ -645,20 +645,45 @@ pub struct DecdnMetrics {
     /// sustained rate means this node's buyer channels are drifting out of sync
     /// with what upstreams accept.
     pub node_pull_voucher_rejected: Counter,
-    /// `decdn_node_pull_channel_retired_total` (#1145 review): a voucher rejection
-    /// meant the channel can never pay again — the deposit is spent, it expired, or
-    /// our watermark has desynced from the upstream's committed nonce — so the row
-    /// was retired and the next pull to that provider opens a fresh channel.
+    /// `decdn_node_pull_channel_retired_total` (#1145 review): a channel was SETTLED
+    /// on-chain — the upstream rejected our voucher with `CooperativeCloseSigned` — so
+    /// its row was dropped and the next pull to that provider opens a fresh channel.
     ///
-    /// A subset of `node_pull_voucher_rejected_total`, and the actionable part of
-    /// it. Before this existed, every one of those rejections was a `debug!` and a
-    /// counter tick, and the drained channel was handed straight back on the next
-    /// miss: the provider stayed top-ranked, burned a `MAX_PROVIDER_ATTEMPTS` slot
-    /// on every pull, and could not serve a byte until the channel expired ~90 days
-    /// later. A steady trickle here is healthy (channels do run dry); a spike means
-    /// this node is rotating channels far faster than it should, which usually means
-    /// the deposit is sized too small for the traffic.
+    /// Only that one reject reason lands here, and the narrowness is the point. The row
+    /// is this node's only handle on the escrowed deposit (`reclaimExpired` needs the
+    /// `channel_id`; both recovery sweeps enumerate the store), so dropping it is safe
+    /// ONLY once the channel is settled and there is no remainder to reclaim. Every other
+    /// terminal rejection — a desync, a drained-for-this-voucher balance, an expiry —
+    /// keeps its row and lands on `node_pull_channel_wedged_total` instead.
+    ///
+    /// A steady trickle here is healthy: cooperative closes are the normal end of a
+    /// channel's life.
     pub node_pull_channel_retired: Counter,
+    /// `decdn_node_pull_channel_wedged_total` (#1145 review): an upstream rejected our
+    /// voucher on terms this channel cannot recover from, while its deposit is STILL
+    /// ESCROWED — a nonce/amount/bytes desync, a balance too small for this voucher, or an
+    /// expiry.
+    ///
+    /// The row is KEPT (it is the only thing that can still reclaim the deposit) and the
+    /// provider is suppressed, so this node cannot use that provider again until the
+    /// channel expires and the reclaim sweep refunds it.
+    ///
+    /// **Any sustained rate is money at rest.** Each tick is a channel whose deposit is
+    /// locked up until expiry and a provider this node has taken out of rotation. A spike
+    /// means buyer watermarks are drifting out of sync with what upstreams have committed
+    /// — the desync tracked in #1122 — and the deposit sizing and channel count should be
+    /// reviewed alongside it.
+    pub node_pull_channel_wedged: Counter,
+    /// `decdn_node_pull_channel_retire_failure_total` (#1145 review): the store write that
+    /// retires a settled channel's row FAILED, so the row survives and the next pull will
+    /// reuse the closed channel and be rejected again until it expires.
+    ///
+    /// Its own series rather than borrowing `node_pull_progress_persist_failure_total`,
+    /// which means something else entirely (a voucher WATERMARK write failed). Sharing it
+    /// made a node whose every retire write fails indistinguishable from one that never
+    /// needed to retire — `node_pull_channel_retired_total` would read `0` either way —
+    /// while its persist-failure series climbed for a reason its own docs ruled out.
+    pub node_pull_channel_retire_failure: Counter,
     /// `decdn_node_pull_refused_total` (#1144): a selected upstream refused
     /// delivery up front (a `StreamResponse` with `ok == false`). Counts every
     /// wire code, including the `InternalError` that DOES tar the provider's
@@ -1710,10 +1735,22 @@ impl Metrics {
         self.decdn.node_pull_voucher_rejected.inc();
     }
 
-    /// A voucher rejection retired the channel: it can never pay again, so the row
-    /// was dropped and the next pull opens a fresh one (#1145 review).
+    /// A channel was settled on-chain (`CooperativeCloseSigned`), so its row was dropped
+    /// and the next pull to that provider opens a fresh one (#1145 review).
     pub fn node_pull_channel_retired(&self) {
         self.decdn.node_pull_channel_retired.inc();
+    }
+
+    /// A channel can no longer pay but its deposit is still escrowed, so the row was KEPT
+    /// for the reclaim sweep and the provider suppressed instead (#1145 review). Money at
+    /// rest — see the counter's docs.
+    pub fn node_pull_channel_wedged(&self) {
+        self.decdn.node_pull_channel_wedged.inc();
+    }
+
+    /// The store write retiring a settled channel's row failed (#1145 review).
+    pub fn node_pull_channel_retire_failure(&self) {
+        self.decdn.node_pull_channel_retire_failure.inc();
     }
 
     /// A selected upstream refused delivery up front (#1144). Counts every wire
