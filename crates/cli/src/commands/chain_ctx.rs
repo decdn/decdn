@@ -623,6 +623,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_publish_rejects_unparseable_address() {
+        // A present-but-garbage address must surface as an Err, not be silently
+        // dropped to `None` by the `.map(parse).transpose()?` — guards against a
+        // future `.ok()` / `filter_map` rewrite that would swallow it and let
+        // publish proceed as if the contract were unconfigured. Each field is
+        // checked independently.
+        let mut args = empty_publish_chain();
+        args.common.rpc_url = Some("http://x".to_string());
+        args.publisher_registry_address = Some("not-an-address".to_string());
+        let err = resolve_publish(&args, &FileConfig::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("publisher_registry_address"),
+            "{err}"
+        );
+
+        let mut args = empty_publish_chain();
+        args.common.rpc_url = Some("http://x".to_string());
+        args.origin_assignment_address = Some("nope".to_string());
+        let err = resolve_publish(&args, &FileConfig::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("origin_assignment_address"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn resolve_swap_none_when_unset() {
         let chain = empty_chain();
         assert!(
