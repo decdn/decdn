@@ -96,10 +96,15 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_can
 #[allow(clippy::cognitive_complexity)]
 fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, err: &anyhow::Error) {
     // Not a failure at all: the open ran past our per-candidate budget and is still
-    // going in the background (#1143). Meter it apart from real failures — a
-    // sustained rate means this node's chain lane is too slow for its
-    // `node_pull_timeout_sec`, which is a very different diagnosis from a reverting
-    // or under-funded open.
+    // going in the background (#1143). Meter it apart from real failures — a sustained rate
+    // means this node's chain lane is too slow for `CHANNEL_OPEN_CALLER_BUDGET`, which is a
+    // very different diagnosis from a reverting or under-funded open.
+    //
+    // NOT `node_pull_timeout_sec`, which this comment used to name (#1145 review). The
+    // channel open has its OWN budget and always did; `DEFAULT_NODE_PULL_TIMEOUT_SEC`'s own
+    // doc says outright that "raising this to give a slow L2 more room does nothing: that is
+    // the channel open." So the comment was sending an operator to a knob its own config
+    // documentation calls inert for this symptom.
     if err.downcast_ref::<ChannelOpenPending>().is_some() {
         deps.metrics.node_pull_channel_open_pending();
         debug!(%provider_addr, %err, "node-origin: channel open still in flight; trying the next candidate");
@@ -1269,10 +1274,12 @@ enum RefusalVerdict {
 /// point. A probe's `has_blob: false` is an authoritative statement about content the
 /// peer just checked. A `NotFound` *refusal* is not: `ServeRejectReason::wire_error`
 /// deliberately collapses SEVEN reject reasons onto the wire `NotFound` so that a probing
-/// client cannot map out other clients' channel balances — and three of the seven are
-/// ours or transient (`InsufficientDeposit`, `UnknownChannel` while the upstream's chain
-/// watcher catches up, `CooperativeCloseSigned`). We cannot tell them apart, and we must
-/// not: the collapse is a privacy property, not an oversight.
+/// client cannot map out other clients' channel balances — and FOUR of the seven are ours or
+/// transient: `InsufficientDeposit`, `UnknownChannel` (while the upstream's chain watcher
+/// catches up), `CooperativeCloseSigned`, and `RangeNotSatisfiable` (our own bad range
+/// computation — counted three here, which undersold the case by one, #1145 review). We
+/// cannot tell them apart, and we must not: the collapse is a privacy property, not an
+/// oversight.
 ///
 /// So the refusal is suppressed on the assumption it may be *us*. At the full TTL, a
 /// deposit that ran dry for one pull — or the pre-observation window right after we open

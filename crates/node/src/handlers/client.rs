@@ -109,11 +109,16 @@ struct ChannelDeliveryState {
 /// for the task's lifetime, so a warm that never ends means the node can never warm
 /// that blob again for the life of the process.
 ///
-/// Sized ~25× the derived foreground deadline (`(5 + 20 + 20) × 3 + 10 s` at defaults),
-/// so it bounds no honest transfer the node's `max_blob_size_mb` ceiling permits — a
-/// 1 GiB blob would have to average under 300 KB/s to hit it — while still guaranteeing
-/// every warm terminates. Not config-tunable (YAGNI): an operator who needs to tune
-/// this wants `node_pull_stall_timeout_sec`, which is the actual health knob.
+/// Sized ~21× the derived foreground deadline ([`crate::selection::outer_pull_deadline`] —
+/// `(5 + 20 + 20) × 3 + 37 s = 172 s` at defaults), so it bounds no honest transfer the
+/// node's `max_blob_size_mb` ceiling permits — a 1 GiB blob would have to average under
+/// 300 KB/s to hit it — while still guaranteeing every warm terminates. Not config-tunable
+/// (YAGNI): an operator who needs to tune this wants `node_pull_stall_timeout_sec`, which is
+/// the actual health knob.
+///
+/// The ratio is stated against the deadline rather than restating its arithmetic, because
+/// restating it is how this comment went stale: it said `+ 10 s` and `~25×` after the slack
+/// became derived (5 s probe + 4 × 8 s lookup = 37 s, not 10 s), and 3600/172 is ~21, not 25.
 pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
 
 /// Ceiling on the memory background warms may hold at once, in MiB (#1145 review).
@@ -122,8 +127,13 @@ pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
 /// how many DISTINCT blobs can be warming. Each warm runs the buffered path, which
 /// accumulates the whole blob into memory and pays vouchers for every byte — and
 /// [`BACKGROUND_FILL_HARD_CAP`] extends a warm's life from the old ~70 s to an hour, so
-/// slow upstreams now accumulate ~25× more concurrent warms for the same miss rate.
-/// Unbounded, a burst of misses against a slow peer is a memory and spend amplifier.
+/// slow upstreams now accumulate roughly **50×** more concurrent warms for the same miss
+/// rate (3600/70 ≈ 51). Unbounded, a burst of misses against a slow peer is a memory and
+/// spend amplifier.
+///
+/// (This said `~25×` — the same figure as `BACKGROUND_FILL_HARD_CAP`'s ratio against the
+/// FOREGROUND deadline, which is a different denominator entirely. The two cannot both be
+/// right, and the copy understated this one by half.)
 ///
 /// # Why bytes, not tasks
 ///

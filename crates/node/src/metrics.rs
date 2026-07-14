@@ -643,14 +643,29 @@ pub struct DecdnMetrics {
     /// ceiling), so it does not tar the provider's reputation. A sustained rate
     /// means this node's ceiling is below the content it is trying to warm.
     pub node_pull_too_large: Counter,
-    /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit this
-    /// node's own per-candidate `pull_timeout` deadline. Like a channel-open
-    /// failure this is a buyer-side condition (a possibly mis-sized local
-    /// timeout), NOT evidence the provider is unreachable, so it does NOT tar the
-    /// provider's reputation locally or over gossip. Distinct from
+    /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit one of this node's
+    /// own deadlines. Like a channel-open failure this is a buyer-side condition (a possibly
+    /// mis-sized local budget), NOT evidence the provider is unreachable, so it does NOT tar
+    /// the provider's reputation locally or over gossip. Distinct from
     /// `node_pull_through_timeouts` (the delivery handler's own serving deadline).
-    /// A sustained rate means this node's `pull_timeout` is too tight for the
-    /// upstreams it selects.
+    ///
+    /// It fires on **two** budgets, and they have different remedies (#1145 review):
+    ///
+    /// - the STREAM-OPEN stage exceeding `node_pull_timeout_sec`; and
+    /// - a pull that has received no first byte within `node_pull_stall_timeout_sec`. Before
+    ///   the first chunk, that clock is measuring the server's time-to-FIRST-byte, which
+    ///   scales with blob size (the serve path materialises the whole bao encoding before it
+    ///   can emit chunk #1) — so it is our deadline, not the peer's fault, and it lands here
+    ///   rather than on `node_pull_stalled_total`.
+    ///
+    /// A sustained rate therefore means one of those two is too tight for the upstreams this
+    /// node selects — and for the large-blob case it is `node_pull_stall_timeout_sec`, not
+    /// `node_pull_timeout_sec`, that wants raising. (The doc named only the latter, which is
+    /// the wrong knob for the flagship scenario it described.)
+    ///
+    /// The peer is not scored, but it IS suppressed briefly: see `REFUSAL_SUPPRESSION_TTL`.
+    /// Exonerating a peer and ignoring it are different things, and a peer that accepts a
+    /// stream and then says nothing lands here.
     pub node_pull_timeout: Counter,
     /// `decdn_node_pull_voucher_rejected_total` (#857): an upstream rejected a
     /// voucher this node presented mid-pull (a stale nonce per #852, deposit

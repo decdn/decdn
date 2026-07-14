@@ -131,12 +131,22 @@ impl ClientMessage {
     /// Variants with no value invariants (`VoucherAck`, `StreamEnd`,
     /// `StreamError`) return `Ok(())`.
     ///
-    /// [`ChunkData`] IS dispatched here (#1088). It has to be: this is the seam a
-    /// receive loop is told to call, so a `ChunkData` arm that returned `Ok(())`
-    /// would hand every future receive path the empty-frame spin bug back — and
-    /// silently, because the non-empty floor is what the pull paths' inactivity
-    /// deadline rests on. A peer that can send unbounded zero-length frames refreshes
-    /// that deadline forever without ever making progress.
+    /// [`ChunkData`] is dispatched here for TOTALITY over the enum, and for nothing more
+    /// (#1145 review). Two things this doc used to claim are false, and both would mislead
+    /// the next reader into relying on a check that is not here:
+    ///
+    /// - *"this is the seam a receive loop is told to call"* — no receive loop calls it.
+    ///   `read_client_message` decodes and returns; only `StreamResponse::validate` runs on
+    ///   the receive path, explicitly, via `verify_response`.
+    /// - *"a `ChunkData` arm that returned `Ok(())` would hand every future receive path the
+    ///   empty-frame spin bug back"* — the arm cannot fail. Once the field went private
+    ///   behind `#[serde(try_from)]`, `ChunkData::validate` became total; its own doc says
+    ///   so ("always `Ok` for a frame that exists").
+    ///
+    /// The empty-frame floor #1088 needs is enforced by the DECODE GATE, not by this
+    /// dispatch: an empty frame cannot be constructed *or* deserialized, so no receive loop
+    /// has to remember anything. That is the whole point of having made it structural — and
+    /// the reason this aggregate is a convenience, not a load-bearing seam.
     ///
     /// # Errors
     ///

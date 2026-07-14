@@ -1128,7 +1128,8 @@ pub async fn run(
         // of the process. An inactivity bound is not a liveness bound.
         //
         // So: a generous absolute backstop, sized as a leak guard rather than a
-        // health signal. It is ~25× the foreground deadline, so it constrains no
+        // health signal. It is ~21× the foreground deadline (1 h against 172 s at the
+        // defaults — see `outer_pull_deadline`), so it constrains no
         // honest transfer the node's `max_blob_size_mb` ceiling permits; it exists
         // only so a pathological upstream cannot pin a task and poison a hash
         // indefinitely. `max_blob_size_mb` additionally bounds how much memory the

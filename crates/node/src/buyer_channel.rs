@@ -380,6 +380,17 @@ impl InFlightOpenGuard {
     /// and a caller cannot express the wrong thing: no other constructor is reachable, and
     /// the guard never exists outside the task.
     ///
+    /// `in_flight` is the CALLER'S LOCKED map, and taking it is what makes the reservation
+    /// real (#1145 review). This function's doc has always said it "reserves the slot" — but
+    /// it did not: it built the guard, and the matching `insert` lived twenty lines away in
+    /// `join_or_spawn_open`. So the pairing was asymmetric — RELEASE in the type (`Drop`,
+    /// unconditional), ACQUIRE in the caller — and the invariant "a guard exists ⇒ the slot
+    /// is occupied" was caller-maintained. A future caller who reached for `spawn_open` and
+    /// did not also remember the insert would get a guard, get no singleflight, and let the
+    /// next miss open a SECOND `openChannel`: the double-escrowed deposit this whole
+    /// mechanism exists to prevent. Doing the insert here makes guard construction and slot
+    /// reservation one indivisible statement, under the lock the caller already holds.
+    ///
     /// The `JoinError` leg is handled here for the same reason. It fires when the open
     /// task PANICS — and the wrapper it lands in is only ever polled by a caller, so with
     /// a `CHANNEL_OPEN_CALLER_BUDGET` of seconds against an unbounded receipt wait, the
@@ -388,6 +399,7 @@ impl InFlightOpenGuard {
     /// nobody at all. (The slot still releases: `Drop` runs on unwind.)
     fn spawn_open<F>(
         map: &Arc<Mutex<HashMap<Address, SharedOpen>>>,
+        in_flight: &mut HashMap<Address, SharedOpen>,
         provider: Address,
         metrics: &Arc<Metrics>,
         open: F,
@@ -456,7 +468,12 @@ impl InFlightOpenGuard {
                 )))
             })
         });
-        fut.shared()
+        let shared = fut.shared();
+        // THE reservation, and it belongs here — beside the guard whose `Drop` is what
+        // releases it. Under the caller's lock, so the check-then-insert in
+        // `join_or_spawn_open` stays atomic and two concurrent misses cannot both open.
+        in_flight.insert(provider, shared.clone());
+        shared
     }
 }
 
@@ -836,10 +853,13 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         let deposit = deposit_hint.max(self.default_deposit).max(self.min_deposit);
         let metrics = Arc::clone(&self.metrics);
 
-        // `spawn_open` reserves the slot and holds it in the task for the open's whole
-        // life — the guard is never constructible here, so this cannot release it early.
-        let shared = InFlightOpenGuard::spawn_open(
+        // `spawn_open` reserves the slot (in the map we hold locked) AND holds it in the task
+        // for the open's whole life. The guard is never constructible here, so this cannot
+        // release it early — and the reservation is no longer a separate line this caller
+        // could forget (#1145 review).
+        Ok(InFlightOpenGuard::spawn_open(
             &self.opens_in_flight,
+            &mut in_flight,
             provider_addr,
             &self.metrics,
             async move {
@@ -857,10 +877,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                 .await
                 .map_err(Arc::new)
             },
-        );
-
-        in_flight.insert(provider_addr, shared.clone());
-        Ok(shared)
+        ))
     }
 
     /// Persist the cumulative voucher totals after a delivery exchange so a

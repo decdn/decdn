@@ -1263,6 +1263,23 @@ async fn receive_and_pay(
             // The alternative — keeping the peer-blaming verdict and widening the budget —
             // cannot work, because no fixed budget can separate "large blob, honest server"
             // from "dead peer" when the honest case is unbounded in blob size.
+            //
+            // But be precise about what this does and does not fix (#1145 review). It fixes
+            // the ATTRIBUTION: an honest server with a slow first byte is no longer gossiped
+            // as unreachable. It does NOT make that blob fetchable. The pull still fails, and
+            // the background warm re-pulls through the same path with the same `stall`
+            // budget, so it fails identically — a blob whose server-side materialisation
+            // exceeds the stall window is unfetchable on this path, foreground and warm
+            // alike. The real repair is on the SERVE side: `export_bao_range` returns an
+            // owned `Bytes`, materialising the entire bao encoding before chunk #1 goes out,
+            // so TTFB scales with blob size by construction. Streaming it incrementally is
+            // what would actually close #1122/#1132; until then this comment must not be read
+            // as claiming the 708 MB blob now works.
+            //
+            // A `PullTimeout` here is metered and, since #1145, SUPPRESSED for
+            // `REFUSAL_SUPPRESSION_TTL` — reputation-neutral, but it stops a peer that
+            // accepts a stream and then says nothing from burning a candidate slot on every
+            // miss forever.
             .map_err(|_| {
                 if cumulative == 0 {
                     anyhow::Error::new(PullTimeout { after: stall })

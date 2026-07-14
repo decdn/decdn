@@ -109,9 +109,17 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 /// resets that clock on every byte and can consume the whole outer deadline on its own.
 ///
 /// That is correct: it is succeeding, and falling through mid-stream would restart the
-/// download from zero against another peer. The foreground request gives up (a clean
-/// miss) while the transfer continues in the detached background warm, which runs to a
-/// far larger backstop (`BACKGROUND_FILL_HARD_CAP`) for exactly this reason.
+/// download from zero against another peer. The foreground request gives up (a clean miss)
+/// while a detached background warm RE-PULLS the blob from scratch under a far larger
+/// backstop (`BACKGROUND_FILL_HARD_CAP`), for exactly this reason.
+///
+/// "Re-pulls from scratch", not "the transfer continues" (#1145 review): the warm calls
+/// `cache.populate(hash)`, which starts a new pull. Nothing hands it the bytes the
+/// foreground had already paid for. That does not change the conclusion — the acquisition
+/// still completes, under an hour-long cap rather than the client's — but it does undercut
+/// the "restart from zero" argument in the sentence above, which is worth being honest
+/// about: the warm restarts from zero too. What falling through actually costs is the
+/// *paid* bytes, and what it buys is the client a faster answer.
 ///
 /// So this is best read as a bound on how long a **client** waits, not on how long
 /// an acquisition takes.
@@ -516,10 +524,19 @@ mod tests {
 
     // The defaults an operator actually runs: `node_pull_timeout_sec = 20` and
     // `node_pull_stall_timeout_sec = 20` (both `DEFAULT_*` in decdn-common, which this
-    // crate does not depend on — hence the literals). Pinned because the worst-case
-    // client wait is a user-visible number quoted in the CLI help and the metrics docs,
-    // and it moved twice while the formula was being corrected — and once more when the
-    // slack stopped being a guess (#1145 review): 10 s -> 5 + 4×8 = 37 s.
+    // crate does not depend on — hence the literals). Pinned because the worst-case client
+    // wait is a user-visible number RESTATED IN PROSE elsewhere, and it moved three times
+    // while the formula was corrected — most recently when the slack stopped being a guess
+    // (#1145 review): 10 s -> 5 + 4×8 = 37 s, so 145 s -> 172 s.
+    //
+    // The sites that restate it, so the next person to move it can find them all — this list
+    // is the whole reason the number keeps going stale, and the previous version of this
+    // comment named the wrong ones ("the CLI help and the metrics docs"; the metrics docs
+    // never quoted it):
+    //
+    //   - `common::config` (the `node_pull_timeout_sec` / `node_pull_stall_timeout_sec` docs)
+    //   - `cli::commands::config` (the DEFAULT_CONFIG template)
+    //   - `handlers::client::BACKGROUND_FILL_HARD_CAP` + `runtime` (as a RATIO against it)
     #[test]
     fn outer_pull_deadline_at_defaults_is_172s() {
         let outer = outer_pull_deadline(Duration::from_secs(20), Duration::from_secs(20));
