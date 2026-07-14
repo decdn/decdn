@@ -614,17 +614,30 @@ impl PullDeadlines {
     /// and no overall cap — so a pull of any size completes as long as the upstream
     /// keeps feeding it bytes.
     ///
-    /// Infallible: with no cap there is no relational invariant to violate. A zero `open` or
+    /// # Errors
+    ///
+    /// [`DeadlineError::ZeroBudget`] for a zero `open` or `stall`.
+    ///
+    /// This constructor used to be infallible, on the reasoning that "a zero `open` or
     /// `stall` is still nonsense, but it is a bound that fires too EAGERLY — loud, and
-    /// immediately obvious — rather than one that silently never fires, so it does not earn a
-    /// `Result` on the path every production pull takes.
-    #[must_use]
-    pub const fn new(open: Duration, stall: Duration) -> Self {
-        Self {
+    /// immediately obvious — rather than one that silently never fires". That is exactly
+    /// backwards, and this same PR says so 800 lines away in `config`: a zero stall "trips
+    /// `PullStalled` on the first poll of every streaming read … it would broadcast false
+    /// `Unreachable` observations about every honest peer it touches."
+    ///
+    /// A zero stall is not loud. It is a node quietly gossiping defamation of the whole
+    /// network, at full speed. The only thing standing between config and that state was a
+    /// `> 0` check in a resolver in another crate — the same advisory-invariant shape
+    /// `ChunkData` had before #1088, and the reason this type owns its bounds at all.
+    pub const fn new(open: Duration, stall: Duration) -> Result<Self, DeadlineError> {
+        if open.is_zero() || stall.is_zero() {
+            return Err(DeadlineError::ZeroBudget);
+        }
+        Ok(Self {
             open,
             stall,
             hard_cap: None,
-        }
+        })
     }
 
     /// As [`Self::new`], plus an overall wall-clock cap on the whole exchange.
@@ -2037,6 +2050,40 @@ mod tests {
             PullDeadlines::capped(open, Duration::ZERO, Duration::from_mins(1)),
             Err(DeadlineError::ZeroBudget)
         ));
+    }
+
+    /// `new` must refuse a zero budget too — and it is the constructor that MATTERS, because
+    /// it is the one every production pull takes (#1145 review).
+    ///
+    /// It was infallible, on the reasoning that a zero bound "fires too EAGERLY — loud, and
+    /// immediately obvious". It is the opposite of loud. A zero `stall` trips `PullStalled`
+    /// on the first poll of every streaming read, and `PullStalled` is the verdict that
+    /// scores a peer `Unreachable` — locally AND over gossip. So the failure mode is not a
+    /// node that visibly stops working; it is a node that quietly defames every honest peer
+    /// it touches, as fast as it can dial them.
+    ///
+    /// `capped` refused this from the start. The invariant belongs to the type, not to a
+    /// resolver in another crate that a caller has to remember to run.
+    #[test]
+    fn new_refuses_a_zero_budget_on_the_path_every_production_pull_takes() {
+        use super::{DeadlineError, PullDeadlines};
+        use std::time::Duration;
+
+        assert!(
+            matches!(
+                PullDeadlines::new(Duration::ZERO, Duration::from_secs(20)),
+                Err(DeadlineError::ZeroBudget)
+            ),
+            "a zero open bound means the open stage can never complete"
+        );
+        assert!(
+            matches!(
+                PullDeadlines::new(Duration::from_secs(20), Duration::ZERO),
+                Err(DeadlineError::ZeroBudget)
+            ),
+            "a zero stall bound gossips `Unreachable` about every honest peer it touches"
+        );
+        assert!(PullDeadlines::new(Duration::from_secs(20), Duration::from_secs(20)).is_ok());
     }
 
     #[test]

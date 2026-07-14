@@ -162,8 +162,9 @@ impl ClientFixture {
                 0,
                 TIMESTAMP_US,
                 // Loopback fixture: wall clock on the open, inactivity on the
-                // stream, no overall cap (#1134).
-                PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30)),
+                // stream, no overall cap (#1134). Both budgets are non-zero literals, so
+                // the `ZeroBudget` arm is unreachable here — propagate rather than unwrap.
+                PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
                 0,
                 &mut progress,
             )

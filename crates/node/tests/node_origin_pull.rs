@@ -4927,7 +4927,26 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
     assert_counter(&b_metrics, "node_pull_timeout_total", 1)?;
     assert_counter(&b_metrics, "node_pull_stalled_total", 0)?;
 
-    // And therefore NOT scored — the assertion that matters. This peer answered honestly and
+    // Unscored, but NOT ignored (#1145 review). A SECOND miss must not reach this peer
+    // again: exonerating it and doing nothing are different things, and doing nothing left
+    // the cheapest griefer in the protocol unanswered — probe honestly, accept the stream,
+    // send nothing, stay top-ranked, and burn a full budget on every miss forever at no
+    // cost. Suppression is reputation-neutral, so it costs an honest-but-slow peer one TTL
+    // and costs a silent one its free lunch.
+    //
+    // If the suppression is removed this counter reaches 2: the peer is re-selected and
+    // re-waited-on, which is the bug.
+    let again = tokio::time::timeout(
+        Duration::from_secs(30),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the second fetch never returned"))?
+    .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
+    anyhow::ensure!(matches!(again, OriginFetch::NotFound), "still no bytes");
+    assert_counter(&b_metrics, "node_pull_timeout_total", 1)?;
+
+    // And still NOT scored — the assertion that matters. This peer answered honestly and
     // may simply be a slow disk with a big blob.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     anyhow::ensure!(
@@ -5061,6 +5080,144 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     anyhow::ensure!(
         local_rep.score(a_id) >= 0.5,
         "an honest mid-stream refusal must leave the local score neutral, got {}",
+        local_rep.score(a_id)
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.abort();
+    Ok(())
+}
+
+/// #1145 review — a `VoucherRejected` arriving MID-STREAM is the same event as one arriving
+/// in the ack wait, and must get the same channel remedy.
+///
+/// The fix above (typing the mid-stream `StreamError`) created this hole one arm over. Only
+/// `self_pay`'s ack wait turns the code into `UpstreamVoucherRejected`; the three mid-stream
+/// receive sites wrap ANY `StreamError` into `UpstreamRefused`. So a `VoucherRejected` that
+/// did not arrive in a voucher round trip reached `classify_refusal`, was ruled `OurFault` —
+/// score nothing, suppress nothing, *do* nothing — and skipped the entire channel remedy.
+///
+/// The consequence is the one the drained-channel test exists to prevent, reached by another
+/// road: the channel stays in the store, `try_reuse_live` (which gates on expiry alone) hands
+/// it straight back on the next miss, and this node re-presents a voucher it cannot honour on
+/// every pull until it expires — logging a `debug!` invisible at the default `RUST_LOG=info`.
+///
+/// Driven through the REAL receive loop, for the reason the sibling test above spells out: an
+/// assertion against `classify_pull_failure`'s ladder alone would pass with the bug restored,
+/// because the classifier was never the thing that was broken. The counter that proves the
+/// remedy ran is `node_pull_channel_wedged_total` — reachable only if the code survived the
+/// receive loop AND `pull_verdict` unwrapped it back out of the refusal.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
+async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_remedy() -> Result<()>
+{
+    let payload = vec![0x9Cu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    // `InsufficientDeposit` OUTSIDE a voucher round trip: the same code the drained-channel
+    // test drives through the ack wait, arriving on the other road.
+    let task_a = spawn_a_mid_stream_error_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        StreamError::VoucherRejected {
+            reason: VoucherRejectReason::InsufficientDeposit,
+        },
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let retired: Arc<Mutex<Vec<(Address, B256)>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        channel_id: B256::repeat_byte(0x9C),
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::clone(&retired),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        providers,
+        addr_map,
+        // Generous, as above: the rejection must be what ends this pull, not a deadline.
+        Duration::from_secs(20),
+        Duration::from_secs(20),
+        0,
+    );
+
+    let got = tokio::time::timeout(
+        Duration::from_secs(30),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("a mid-stream voucher rejection never ended the pull"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a rejected voucher must not surface bytes (NotFound)"
+    );
+
+    // The remedy ran: this is reachable only if the receive loop kept the wire code AND
+    // `pull_verdict` routed it to `voucher_verdict` rather than leaving it a bare refusal.
+    // With the bug, it is `node_pull_refused_total` that ticks and this stays 0 — the
+    // channel is left in the store to be handed back on every subsequent miss.
+    assert_counter(&b_metrics, "node_pull_channel_wedged_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_refused_total", 0)?;
+
+    // The row survives — the deposit is still escrowed (see the drained-channel test).
+    anyhow::ensure!(
+        retired
+            .lock()
+            .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?
+            .is_empty(),
+        "an `InsufficientDeposit` channel must keep its row so the deposit can be reclaimed"
+    );
+
+    // Our payment fault, not the peer's: it is not scored, here or over gossip.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    anyhow::ensure!(
+        obs_buffer.drain().is_empty(),
+        "a voucher rejection is our payment fault; the provider must not be gossiped"
+    );
+    anyhow::ensure!(
+        (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
+        "the provider's score must stay neutral, got {}",
         local_rep.score(a_id)
     );
 

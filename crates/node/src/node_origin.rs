@@ -193,6 +193,30 @@ pub struct NodeOriginConfig {
     pub lookup: LookupConfig,
 }
 
+impl NodeOriginConfig {
+    /// The stage bounds for one upstream pull: a wall clock on the open, inactivity on the
+    /// stream, no overall cap (#1134).
+    ///
+    /// # Errors
+    ///
+    /// `DeadlineError::ZeroBudget` if either budget is zero. `config`'s own validator
+    /// already rejects that at startup, so this is the second lock on a door that must not
+    /// open: a zero stall trips `PullStalled` on the first poll of every streaming read, and
+    /// `PullStalled` gossips `Unreachable` — so the failure mode is not a node that stops
+    /// working, it is a node that silently defames every honest peer it touches. Both call
+    /// sites route it to [`LocalPullFault`], which meters it as OUR emergency and scores no
+    /// peer (#1145 review).
+    fn deadlines(&self) -> anyhow::Result<PullDeadlines> {
+        PullDeadlines::new(self.pull_timeout, self.stall_timeout).map_err(|err| {
+            anyhow::anyhow!(
+                "node pull deadlines are unusable ({err}); \
+                 check cache.node_pull_timeout_sec and cache.node_pull_stall_timeout_sec"
+            )
+            .context(LocalPullFault)
+        })
+    }
+}
+
 /// Dependencies the orchestration needs, injected once after runtime bring-up
 /// completes (see the module docs). Built and handed to [`NodeOrigin::provision`]
 /// by the runtime.
@@ -323,6 +347,11 @@ impl NodeOrigin {
     /// one candidate. Returns the header + driver on a clean open; `None`
     /// (try the next candidate) on an unresolvable address, channel-open failure,
     /// or a declined/erroring response (classified like the buffered path).
+    // The window twin of `pull_from_candidate`, and inflated past the line threshold for the
+    // same reason: a sequential resolve → open → bind → fetch → classify pipeline whose every
+    // stage carries the comment explaining which failure it owns. Splitting it would scatter
+    // one linear flow across helpers that each mean nothing alone.
+    #[allow(clippy::too_many_lines)]
     async fn open_from_candidate(
         &self,
         deps: &NodeOriginDeps,
@@ -388,6 +417,16 @@ impl NodeOrigin {
         // follows is bounded by inactivity instead (`stall_timeout`, carried into
         // the returned `UpstreamPull`, #1134): a wall clock over the bytes would
         // cap the blob size this node can pull through.
+        // A zero budget here is OUR misconfiguration, not the peer's fault — and the loud
+        // failure mode is the wrong one to reach for, because a zero stall would gossip
+        // `Unreachable` about every honest peer this node touches (#1145 review).
+        let deadlines = match deps.config.deadlines() {
+            Ok(deadlines) => deadlines,
+            Err(err) => {
+                classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
+                return None;
+            }
+        };
         let ledger = channel_ledger(deps, provider_addr, &ctx);
         match tokio::time::timeout(
             deps.config.pull_timeout,
@@ -402,7 +441,7 @@ impl NodeOrigin {
                 0,
                 now_micros(),
                 deps.config.max_blob_size_bytes,
-                PullDeadlines::new(deps.config.pull_timeout, deps.config.stall_timeout),
+                deadlines,
             ),
         )
         .await
@@ -987,6 +1026,16 @@ async fn pull_from_candidate(
     // `Drop` is the one thing that runs on both paths, so the persist lives there and
     // nowhere else — one path, no second copy to forget. It reads
     // `ChannelLedger::settlement` (a sync mirror) because a `Drop` cannot await.
+    // As on the window path: a zero budget is our own misconfiguration, metered as ours.
+    // Checked BEFORE the ledger and the guard, so a pull that cannot legally run never
+    // reaches the wire and has nothing to settle.
+    let deadlines = match deps.config.deadlines() {
+        Ok(deadlines) => deadlines,
+        Err(err) => {
+            classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
+            return None;
+        }
+    };
     let ledger = channel_ledger(deps, provider_addr, &ctx);
     let settle = SettleOnDrop {
         deps: SettleDeps::Borrowed(deps),
@@ -1024,7 +1073,7 @@ async fn pull_from_candidate(
         hash_bytes,
         0,
         now_micros(),
-        PullDeadlines::new(deps.config.pull_timeout, deps.config.stall_timeout),
+        deadlines,
         deps.config.max_blob_size_bytes,
     )
     .await;
@@ -1244,23 +1293,16 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
         // policy says to respect rather than punish; suppressing the peer for five
         // minutes over a load spike lasting seconds is punishing it.
         StreamError::NotFound | StreamError::Overloaded => RefusalVerdict::Transient,
-        // `VoucherRejected` is OUR payment-side fault, so: score nothing, suppress nothing.
-        // The peer did nothing wrong and it still holds the blob.
+        // `VoucherRejected` never reaches here any more: `pull_verdict` unwraps it out of
+        // `UpstreamRefused` and routes it to `voucher_verdict`, which is the only place that
+        // decides what a rejected voucher costs the channel (#1145 review).
         //
-        // This arm is REACHABLE, and the comment here used to say it was not (#1145 review).
-        // The old reasoning covered only the OPEN stage, where `StreamResponse::validate`
-        // does reject `VoucherRejected` in the `error` field as a mid-stream-only code. But
-        // this same PR added three MID-STREAM arms that wrap any `ClientMessage::StreamError`
-        // into `UpstreamRefused` — and `VoucherRejected` is precisely the code designated for
-        // mid-stream. Only `self_pay`'s ack-wait special-cases it, so one arriving outside a
-        // voucher round trip lands here as a live refusal.
-        //
-        // The verdict is right either way, which is what made the false "cannot happen" worth
-        // correcting rather than shrugging at: a reader who believed it would delete this arm
-        // as dead code, and a mid-stream `VoucherRejected` would then fall to a verdict that
-        // blames the peer for our own payment fault. Note it does land on
-        // `node_pull_refused_total` rather than `node_pull_voucher_rejected_total`, which
-        // slightly understates the latter.
+        // The arm stays because the match is exhaustive on purpose — a new `StreamError` must
+        // break this build — and because `RefusalVerdict::OurFault` is still the right answer
+        // to the question THIS function asks ("what does this refusal say about the peer?"):
+        // nothing. It just is not the whole answer, and this function is not the one that can
+        // give it. Routing a mid-stream rejection through here alone is what let a wedged
+        // channel skip its remedy entirely and be handed back on every subsequent miss.
         StreamError::VoucherRejected { .. } => RefusalVerdict::OurFault,
     }
 }
@@ -1517,6 +1559,23 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
         return PullVerdict::OurLocalFault;
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
+        // A `VoucherRejected` arriving as a mid-stream refusal is the SAME event as one
+        // arriving in the ack wait, and must get the same remedy (#1145 review).
+        //
+        // Only `self_pay`'s ack wait special-cases the code into `UpstreamVoucherRejected`;
+        // the three mid-stream receive sites wrap any `StreamError` into `UpstreamRefused`.
+        // So one that arrives outside a voucher round trip reached `classify_refusal`, was
+        // ruled `OurFault` — score nothing, suppress nothing, do nothing — and skipped the
+        // whole channel remedy above. A wedged or settled channel stayed in the store and
+        // was handed straight back on the next miss, forever, on a `debug!` line invisible
+        // at the project's default `RUST_LOG=info`.
+        //
+        // Unwrap it here rather than in `classify_refusal`, because the answer is not a
+        // refusal verdict at all: it is a statement about our CHANNEL, and `voucher_verdict`
+        // is the one place that decides what a rejected voucher costs.
+        if let StreamError::VoucherRejected { reason } = refused.error {
+            return voucher_verdict(reason);
+        }
         return PullVerdict::Refused(classify_refusal(&refused.error));
     }
     if err.downcast_ref::<HashMismatch>().is_some() {
@@ -1566,10 +1625,28 @@ fn classify_pull_failure(
             debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
         }
         // A possibly mis-sized local budget, not evidence the provider is unreachable
-        // (#857).
+        // (#857). Unscored — but NOT ignored (#1145 review).
+        //
+        // Exonerating and doing nothing are different things, and collapsing them left the
+        // cheapest griefer in the protocol unanswered. A peer that probes honestly
+        // (`has_blob: true`, low rate, low RTT → ranks #1), accepts the stream, signs a
+        // valid `StreamResponse`, and then sends NOTHING lands here — our deadline fired, so
+        // it is `OurDeadline`. It was then neither scored nor suppressed, so it stayed
+        // top-ranked and burned a full budget on EVERY subsequent miss, for every hash,
+        // forever, at zero cost to itself. That is precisely the hole this PR closed for
+        // refusals ("a peer that advertises everything and serves nothing burned a candidate
+        // slot on every miss forever"), left open one stage over for a peer that does not
+        // even bother to answer.
+        //
+        // Suppression is the instrument that fits: scoped to (peer, hash), TTL'd, and
+        // reputation-neutral — so it costs an honest-but-slow peer one TTL and costs a
+        // silent one its permanent free lunch, without gossiping a judgement about either.
+        // That neutrality is what lets it be applied to a verdict we cannot attribute: we
+        // are not saying the peer is bad, only that we will not keep waiting on it.
         PullVerdict::OurDeadline => {
             deps.metrics.node_pull_timeout();
-            debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; not tarring upstream reputation");
+            suppress(Some(REFUSAL_SUPPRESSION_TTL));
+            debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; suppressing briefly, not tarring upstream reputation");
         }
         // Unlike `OurDeadline`, this DOES score the peer, and that split is the whole reason
         // the two sentinels exist. A whole-transfer deadline could not tell a dead peer from
