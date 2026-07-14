@@ -109,27 +109,38 @@ struct ChannelDeliveryState {
 /// for the task's lifetime, so a warm that never ends means the node can never warm
 /// that blob again for the life of the process.
 ///
-/// Sized ~50× the derived foreground deadline (`3 × 20 s + 10 s` at defaults), so it
-/// bounds no honest transfer the node's `max_blob_size_mb` ceiling permits — a 1 GiB
-/// blob would have to average under 300 KB/s to hit it — while still guaranteeing
+/// Sized ~25× the derived foreground deadline (`(5 + 20 + 20) × 3 + 10 s` at defaults),
+/// so it bounds no honest transfer the node's `max_blob_size_mb` ceiling permits — a
+/// 1 GiB blob would have to average under 300 KB/s to hit it — while still guaranteeing
 /// every warm terminates. Not config-tunable (YAGNI): an operator who needs to tune
 /// this wants `node_pull_stall_timeout_sec`, which is the actual health knob.
 pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
 
-/// Ceiling on background warms running at once (#1145 review).
+/// Ceiling on the memory background warms may hold at once, in MiB (#1145 review).
 ///
 /// The per-hash `inflight` claim dedups warms for the SAME blob; it says nothing about
 /// how many DISTINCT blobs can be warming. Each warm runs the buffered path, which
-/// accumulates the whole blob into memory (bounded only by `max_blob_size_mb`, 1 GiB by
-/// default) and pays vouchers for every byte — and [`BACKGROUND_FILL_HARD_CAP`] extends
-/// a warm's life from the old ~70 s to an hour, so slow upstreams now accumulate ~50×
-/// more concurrent warms for the same miss rate. Unbounded, a burst of misses against a
-/// slow peer is a memory and spend amplifier.
+/// accumulates the whole blob into memory and pays vouchers for every byte — and
+/// [`BACKGROUND_FILL_HARD_CAP`] extends a warm's life from the old ~70 s to an hour, so
+/// slow upstreams now accumulate ~25× more concurrent warms for the same miss rate.
+/// Unbounded, a burst of misses against a slow peer is a memory and spend amplifier.
 ///
-/// A miss that finds no slot is simply not warmed: the hash stays unclaimed, so the next
+/// # Why bytes, not tasks
+///
+/// The first cut of this bounded the task COUNT (8 concurrent), which is the wrong
+/// quantity: what a warm costs is its blob, and a blob is bounded only by
+/// `max_blob_size_mb` (1 GiB by default). Eight concurrent warms of near-max blobs is
+/// ~8 GiB resident for up to an hour each — while eight concurrent warms of 4 KiB blobs
+/// is nothing at all, and the count-based ceiling throttled those just as hard.
+///
+/// So the permits are MiB, and each warm reserves `max_blob_size_mb` of them up front —
+/// the blob's size is not known until it has been fetched, so the ceiling is what has to
+/// be reserved. Small-blob nodes now run many warms at once; large-blob nodes run few.
+///
+/// A miss that finds no room is simply not warmed: the hash stays unclaimed, so the next
 /// miss retries it. Shedding is the right failure mode — a warm is speculative work for
 /// a FUTURE request, and dropping it costs a later cache miss, never a live one.
-pub const MAX_CONCURRENT_BACKGROUND_FILLS: usize = 8;
+pub const MAX_BACKGROUND_FILL_MB: u64 = 2048;
 
 /// Detached background cache-fill state (#859), attached post-construction via
 /// [`ClientHandler::attach_background_fill`]. When the foreground delivery
@@ -144,7 +155,7 @@ struct BackgroundFill {
     ///
     /// It used to reuse the derived outer pull-through deadline, and that made the
     /// background fill useless for exactly the content it matters most for: the warm
-    /// re-pulls from scratch, so capping it at the same ~70 s the *foreground* gave
+    /// re-pulls from scratch, so capping it at the same deadline the *foreground* gave
     /// up on meant a blob that could not be pulled in one deadline could not be
     /// warmed in one either. The node simply could not acquire any blob needing more
     /// than a deadline's worth of transfer (#1134).
@@ -162,9 +173,16 @@ struct BackgroundFill {
     /// feature — the dedup set holds no torn state to fear (only `insert`/`remove`
     /// ever take it).
     inflight: Arc<std::sync::Mutex<HashSet<Hash>>>,
-    /// Concurrency ceiling across DISTINCT hashes ([`MAX_CONCURRENT_BACKGROUND_FILLS`]).
-    /// `inflight` dedups warms for one blob; this bounds how many blobs warm at once.
+    /// Memory ceiling across DISTINCT hashes, denominated in MiB
+    /// ([`MAX_BACKGROUND_FILL_MB`]). `inflight` dedups warms for one blob; this bounds
+    /// how much those warms can hold at once. Each warm reserves `reserve_mb` permits.
     slots: Arc<tokio::sync::Semaphore>,
+    /// MiB each warm reserves from `slots` — the node's `max_blob_size_mb`, since a
+    /// blob's true size is unknown until it has been fetched, so the ceiling is what
+    /// must be reserved. Clamped to the pool size, so a node whose `max_blob_size_mb`
+    /// exceeds [`MAX_BACKGROUND_FILL_MB`] still runs ONE warm at a time rather than
+    /// shedding every warm forever.
+    reserve_mb: u32,
 }
 
 /// RAII guard that clears a hash from [`BackgroundFill::inflight`] when its warm
@@ -227,6 +245,27 @@ fn arm_background_fill(
 /// Run `fut` under an optional wall-clock deadline, keeping the `Result<_,
 /// Elapsed>` shape of [`tokio::time::timeout`] so callers branch identically
 /// whether or not a cap is set. `None` never elapses.
+/// Size the background-warm memory budget: `(pool_mb, reserve_mb)`, both in MiB.
+///
+/// Split out from [`ClientHandler::attach_background_fill`] so the SIZING DECISION — the
+/// only part with any judgement in it — is a pure function that can be asserted on
+/// directly. A test that stands up its own semaphore and reserves from it proves only that
+/// tokio's semaphore works; this is the thing that can actually be got wrong.
+///
+/// Each warm reserves the node's whole blob ceiling, because a blob's true size is not
+/// known until it has been fetched. Two clamps matter:
+///
+/// - a floor of 1 MiB, so a `max_blob_size_mb` of 0 cannot make warms free and unbounded;
+/// - a ceiling of [`MAX_BACKGROUND_FILL_MB`], so an operator who sets a blob ceiling larger
+///   than the whole pool gets ONE warm at a time rather than none. Without it the
+///   reservation could never be granted — a semaphore cannot hand out more permits than it
+///   holds — and every warm would shed forever, silently disabling the feature.
+fn warm_budget_mb(max_blob_size_mb: u64) -> (u32, u32) {
+    let pool = u32::try_from(MAX_BACKGROUND_FILL_MB).unwrap_or(u32::MAX);
+    let reserve = max_blob_size_mb.clamp(1, MAX_BACKGROUND_FILL_MB);
+    (pool, u32::try_from(reserve).unwrap_or(u32::MAX))
+}
+
 async fn with_optional_deadline<F: std::future::Future>(
     deadline: Option<Duration>,
     fut: F,
@@ -651,12 +690,24 @@ impl ClientHandler {
     /// either (#1134). But it cannot be absent — inactivity is not liveness, and a peer
     /// trickling one byte per stall-window would keep a warm alive forever. See
     /// [`BACKGROUND_FILL_HARD_CAP`] for the sizing argument.
-    pub fn attach_background_fill(&self, cancel: CancellationToken, budget: Option<Duration>) {
+    ///
+    /// `max_blob_size_mb` is the node's blob ceiling — what each warm reserves from the
+    /// [`MAX_BACKGROUND_FILL_MB`] memory pool, since a blob's size is not known until it
+    /// has been fetched. It is clamped to the pool, so an operator who raises
+    /// `max_blob_size_mb` above the pool gets one warm at a time rather than none.
+    pub fn attach_background_fill(
+        &self,
+        cancel: CancellationToken,
+        budget: Option<Duration>,
+        max_blob_size_mb: u64,
+    ) {
+        let (pool_mb, reserve_mb) = warm_budget_mb(max_blob_size_mb);
         let _ = self.background_fill.set(BackgroundFill {
             cancel,
             budget,
             inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BACKGROUND_FILLS)),
+            slots: Arc::new(tokio::sync::Semaphore::new(pool_mb as usize)),
+            reserve_mb,
         });
     }
 
@@ -705,15 +756,17 @@ impl ClientHandler {
         let Some(guard) = arm_background_fill(&bg.inflight, hash) else {
             return;
         };
-        // Concurrency ceiling across distinct hashes. Taken AFTER the dedup claim so a
-        // repeat miss on an already-warming hash never consumes a slot — and dropped
+        // Memory ceiling across distinct hashes: reserve this warm's worst-case blob
+        // footprint up front ([`MAX_BACKGROUND_FILL_MB`]). Taken AFTER the dedup claim so
+        // a repeat miss on an already-warming hash never consumes budget — and dropped
         // with `guard` if we shed, so the hash stays unclaimed and a later miss retries.
-        let Ok(permit) = Arc::clone(&bg.slots).try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(&bg.slots).try_acquire_many_owned(bg.reserve_mb) else {
             self.metrics.node_pull_through_background_shed();
             tracing::debug!(
                 %hash,
-                limit = MAX_CONCURRENT_BACKGROUND_FILLS,
-                "background cache-fill shed: all warm slots busy"
+                reserve_mb = bg.reserve_mb,
+                pool_mb = MAX_BACKGROUND_FILL_MB,
+                "background cache-fill shed: no room in the warm memory budget"
             );
             return;
         };
@@ -730,6 +783,10 @@ impl ClientHandler {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
+                    // Metered, so the books balance: without this,
+                    // `spawned != succeeded + failed + shed + cancelled` and the gap is
+                    // invisible on a node that restarts often.
+                    metrics.node_pull_through_background_cancelled();
                     tracing::debug!(%hash, "background cache-fill cancelled on shutdown");
                 }
                 result = with_optional_deadline(budget, cache.populate(hash)) => match result {
@@ -1969,13 +2026,22 @@ impl ClientHandler {
                             self.metrics.node_pull_through_local_tee_failed();
                             return Err(anyhow::anyhow!("cache tee write failed: {e}"));
                         }
+                        // Relayed verbatim from a frame the upstream receive loop already
+                        // decoded, so it is non-empty and within `CHUNK_SIZE` — but this
+                        // path re-frames it rather than forwarding the value, so it must
+                        // re-establish that rather than assume it. `ChunkData::new` is the
+                        // gate; a zero-length relay is a bug here, not something to emit.
+                        let frame = match ChunkData::new(chunk.to_vec()) {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                self.abandon_window_serve(pull, tee);
+                                return Err(anyhow::anyhow!(
+                                    "refusing to relay an invalid chunk downstream: {e}"
+                                ));
+                            }
+                        };
                         if let Err(e) = self
-                            .write_message(
-                                send,
-                                &ClientMessage::ChunkData(ChunkData {
-                                    bytes: chunk.to_vec(),
-                                }),
-                            )
+                            .write_message(send, &ClientMessage::ChunkData(frame))
                             .await
                         {
                             // Downstream dropped mid-pull (the #856 shape): stop
@@ -2240,14 +2306,15 @@ impl ClientHandler {
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES);
         let mut unvouchered: u64 = 0;
 
+        // `slice::chunks` yields no items for an empty slice and never a zero-length
+        // chunk, so `ChunkData::new` cannot reject one here — the empty blob goes
+        // straight to `StreamEnd` (#1054). The `?` is the type carrying the invariant,
+        // not a live failure mode.
         for chunk in data.chunks(decdn_protocol::CHUNK_SIZE) {
-            self.write_message(
-                send,
-                &ClientMessage::ChunkData(ChunkData {
-                    bytes: chunk.to_vec(),
-                }),
-            )
-            .await?;
+            let frame = ChunkData::new(chunk.to_vec())
+                .map_err(|e| anyhow::anyhow!("refusing to serve an invalid chunk: {e}"))?;
+            self.write_message(send, &ClientMessage::ChunkData(frame))
+                .await?;
             unvouchered = unvouchered.saturating_add(chunk.len() as u64);
             if unvouchered >= interval_bytes {
                 match self
@@ -2928,6 +2995,104 @@ mod tests {
             "the hash re-arms once its guard releases"
         );
         drop(other_guard);
+    }
+
+    /// The warm memory budget is denominated in BYTES, not tasks (#1145 review).
+    ///
+    /// A task-count ceiling bounds the wrong quantity: what a warm costs is its blob, and
+    /// a blob is bounded only by `max_blob_size_mb`. Eight concurrent warms of near-max
+    /// (1 GiB) blobs is ~8 GiB resident for up to `BACKGROUND_FILL_HARD_CAP` — an hour —
+    /// while eight concurrent warms of 4 KiB blobs cost nothing and were throttled just as
+    /// hard.
+    ///
+    /// Each warm reserves `max_blob_size_mb` MiB up front, since a blob's true size is not
+    /// known until it has been fetched. So the concurrency a node actually gets is
+    /// `MAX_BACKGROUND_FILL_MB / max_blob_size_mb` — many for small blobs, few for large.
+    /// Concurrency a node actually gets under the real sizing function: pool ÷ reservation.
+    fn concurrent_warms(max_blob_size_mb: u64) -> u32 {
+        let (pool_mb, reserve_mb) = warm_budget_mb(max_blob_size_mb);
+        pool_mb / reserve_mb
+    }
+
+    /// The warm memory budget is denominated in BYTES, not tasks (#1145 review).
+    ///
+    /// A task-count ceiling bounds the wrong quantity: what a warm costs is its blob, and a
+    /// blob is bounded only by `max_blob_size_mb`. The old fixed ceiling of 8 meant eight
+    /// concurrent warms of near-max (1 GiB) blobs — ~8 GiB resident for up to
+    /// `BACKGROUND_FILL_HARD_CAP`, an hour — while eight concurrent warms of 4 MiB blobs
+    /// cost 32 MiB and were throttled exactly as hard.
+    ///
+    /// Asserted on `warm_budget_mb`, the real function `attach_background_fill` calls. (An
+    /// earlier draft of this test stood up its own semaphore and reserved from it, which
+    /// proves only that tokio's semaphore works — the same "assert against a copy of the
+    /// logic" mistake this review round exists to remove.)
+    #[test]
+    fn the_warm_budget_admits_by_bytes_not_by_task_count() {
+        // A node serving 1 GiB blobs: each warm reserves the whole ceiling, so two fit the
+        // 2 GiB pool and the third sheds. Memory in flight is bounded, by construction.
+        assert_eq!(warm_budget_mb(1024), (2048, 1024));
+        assert_eq!(concurrent_warms(1024), 2);
+
+        // A node serving 4 MiB blobs runs 512 at once — the count-based ceiling stopped it
+        // at 8, for no memory reason at all.
+        assert_eq!(concurrent_warms(4), 512);
+        assert!(
+            concurrent_warms(4) > 8,
+            "small-blob nodes must not inherit the old fixed task-count ceiling"
+        );
+
+        // Whatever the ceiling, the memory in flight never exceeds the pool.
+        for ceiling in [1u64, 4, 64, 512, 1024, 2048] {
+            let (pool_mb, reserve_mb) = warm_budget_mb(ceiling);
+            assert!(
+                concurrent_warms(ceiling) * reserve_mb <= pool_mb,
+                "ceiling {ceiling} MiB admits more warms than the pool can hold"
+            );
+        }
+    }
+
+    /// The two clamps in `warm_budget_mb`, each of which silently disables the feature if
+    /// dropped.
+    #[test]
+    fn the_warm_reservation_is_clamped_at_both_ends() {
+        // Above the pool: the reservation is capped, so ONE warm still runs. Unclamped, the
+        // reservation could never be granted — a semaphore cannot hand out more permits
+        // than it holds — and every warm would shed forever, with the feature looking
+        // configured and doing nothing.
+        let (pool_mb, reserve_mb) = warm_budget_mb(MAX_BACKGROUND_FILL_MB * 4);
+        assert_eq!(reserve_mb, pool_mb, "clamped to the pool");
+        assert_eq!(concurrent_warms(MAX_BACKGROUND_FILL_MB * 4), 1);
+
+        // Below 1 MiB: a zero ceiling must not make warms free and unbounded.
+        assert_eq!(
+            warm_budget_mb(0).1,
+            1,
+            "a zero ceiling still reserves 1 MiB"
+        );
+    }
+
+    /// `BACKGROUND_FILL_HARD_CAP` is a leak guard, and the guard has to actually fire: an
+    /// upstream trickling one byte per stall window never trips the inactivity bound, and
+    /// because the warm's `inflight` claim is held for the task's life, a warm that never
+    /// ends means that blob can never be warmed again for the life of the process.
+    ///
+    /// `with_optional_deadline` is the seam. `None` (tests) runs to completion; `Some`
+    /// terminates a future that otherwise never would.
+    #[tokio::test]
+    async fn a_background_warm_cannot_outlive_its_cap() {
+        let capped = with_optional_deadline(
+            Some(Duration::from_millis(20)),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(
+            capped.is_err(),
+            "a warm that never completes must be abandoned at its cap — inactivity is not \
+             liveness, and an uncapped warm poisons its hash for the life of the process"
+        );
+
+        let uncapped = with_optional_deadline(None, std::future::ready(7u8)).await;
+        assert_eq!(uncapped.ok(), Some(7), "no cap: the future runs to its end");
     }
 
     // #821: the reactive pull-through authorized-origin gate refuses a pull only

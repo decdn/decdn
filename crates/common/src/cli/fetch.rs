@@ -143,19 +143,9 @@ pub struct ClientFetchArgs {
     /// Hard cap on the total wall-clock time of a single blob fetch, in milliseconds.
     /// Defaults to 1 hour. For `bundle pull` this applies per entry.
     ///
-    /// This is a LEAK GUARD, not the health signal — `--stall-timeout-ms` is what
-    /// catches a dead provider. It used to be the primary (and only) mechanism at a
-    /// 30 s default, which made it a poor health signal: an overall deadline has to be
-    /// sized against `blob size × link speed`, so it killed legitimate large or
-    /// slow-but-healthy transfers while a value small enough to catch a dead node
-    /// quickly could not serve a big blob at all.
-    ///
-    /// It cannot simply be removed, though, because inactivity is not liveness: the
-    /// stall clock resets on ANY byte, so a provider trickling one byte per stall
-    /// window would hang the fetch forever with no error. The default is therefore
-    /// deliberately generous — far above any honest transfer under `--max-blob-mb` —
-    /// and mirrors the node's own `BACKGROUND_FILL_HARD_CAP`. Lower it when you must
-    /// bound total runtime regardless of whether the transfer is progressing.
+    /// This is a leak guard, not the health signal — `--stall-timeout-ms` is what catches
+    /// a dead provider. Lower it when you must bound total runtime regardless of whether
+    /// the transfer is progressing. It must be larger than `--stall-timeout-ms`.
     #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_ms: u64,
 }
@@ -174,9 +164,48 @@ impl ClientFetchArgs {
     /// Overall wall-clock cap on one blob fetch — always present, so a fetch always
     /// terminates even against a provider that drip-feeds bytes to keep the stall
     /// deadline alive.
+    ///
+    /// # Why it exists, and why it is not the health signal
+    ///
+    /// It used to be the primary (and only) mechanism, at a 30 s default, which made it a
+    /// poor health signal: an overall deadline has to be sized against
+    /// `blob size × link speed`, so it killed legitimate large or slow-but-healthy
+    /// transfers, while a value small enough to catch a dead node quickly could not serve
+    /// a big blob at all (#1134).
+    ///
+    /// It cannot simply be removed, though, because inactivity is not liveness: the stall
+    /// clock resets on ANY byte, so a provider trickling one byte per stall window would
+    /// hang the fetch forever with no error. The default is therefore deliberately
+    /// generous — far above any honest transfer under `--max-blob-mb` — and mirrors the
+    /// node's own `BACKGROUND_FILL_HARD_CAP`.
     #[must_use]
     pub const fn hard_cap(&self) -> Option<Duration> {
         Some(Duration::from_millis(self.timeout_ms))
+    }
+
+    /// Reject a deadline pair whose hard cap would silently disable stall detection.
+    ///
+    /// Clap enforces each knob is non-zero, but the two are only meaningful in relation to
+    /// each other: the cap's clock starts at the top of the exchange and the stall clock
+    /// starts once the open completes, so a cap at or below the stall budget always
+    /// elapses first and `PullStalled` can never fire. `--stall-timeout-ms 60000
+    /// --timeout-ms 1000` parsed cleanly and produced a fetch with its health signal dead
+    /// — no error, no warning, just a bound that could not do its job. This is the same
+    /// hazard `PullDeadlines::whole_transfer` documents and confines to tests.
+    ///
+    /// # Errors
+    ///
+    /// When `--timeout-ms` is not greater than `--stall-timeout-ms`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.timeout_ms > self.stall_timeout_ms,
+            "--timeout-ms ({}) must be greater than --stall-timeout-ms ({}): the hard cap \
+             is an overall leak guard, and at or below the inactivity budget it always \
+             elapses first — so a stalled provider could never be detected",
+            self.timeout_ms,
+            self.stall_timeout_ms,
+        );
+        Ok(())
     }
 }
 
@@ -257,6 +286,40 @@ mod tests {
         assert_eq!(c.hard_cap(), Some(Duration::from_secs(5)));
     }
 
+    /// The two deadlines are only meaningful in relation to each other (#1145 review).
+    ///
+    /// Clap enforces each is non-zero, which is not enough: the cap's clock starts at the
+    /// top of the exchange and the stall clock starts once the open completes, so a cap at
+    /// or below the stall budget ALWAYS elapses first and `PullStalled` can never fire.
+    /// Both knobs then look configured and the health signal is quietly dead — no error, no
+    /// warning. This is the same hazard `PullDeadlines::whole_transfer` documents and
+    /// confines to tests; a user could reach it from the command line.
+    #[test]
+    fn a_hard_cap_that_would_disable_stall_detection_is_rejected() {
+        assert!(
+            parse(&["--stall-timeout-ms", "60000", "--timeout-ms", "1000"])
+                .validate()
+                .is_err(),
+            "a cap below the stall budget makes a stalled provider undetectable"
+        );
+        assert!(
+            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5000"])
+                .validate()
+                .is_err(),
+            "equal is no better: the cap's clock starts first, so it still always wins"
+        );
+        assert!(
+            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5001"])
+                .validate()
+                .is_ok(),
+            "a cap above the stall budget leaves the stall bound able to fire"
+        );
+        assert!(
+            parse(&[]).validate().is_ok(),
+            "the defaults (30s stall, 1h cap) must be a legal pair"
+        );
+    }
+
     #[test]
     fn stall_timeout_is_overridable() {
         let c = parse(&["--stall-timeout-ms", "1500"]);
@@ -280,5 +343,33 @@ mod tests {
         let huge = parse(&["--max-blob-mb", "1048576"]);
         assert_eq!(small.stall_timeout(), huge.stall_timeout());
         assert_eq!(small.hard_cap(), huge.hard_cap());
+    }
+
+    /// A hard cap at or below the stall budget silently disables stall detection: the cap
+    /// runs from the top of the exchange and the stall clock only once the open completes,
+    /// so the cap always elapses first and `PullStalled` can never fire. Both flags parse
+    /// individually, so only a CROSS-FIELD check catches it — clap cannot.
+    ///
+    /// This is a real command line a user would write ("I want a 1-second fetch"), and it
+    /// produced a fetch whose health signal was dead, with no error and no warning.
+    #[test]
+    fn a_hard_cap_at_or_below_the_stall_budget_is_rejected() {
+        // The reported shape: a generous stall budget under a tight overall cap.
+        let dead = parse(&["--stall-timeout-ms", "60000", "--timeout-ms", "1000"]);
+        assert!(
+            dead.validate().is_err(),
+            "a hard cap below the stall budget must be rejected: it elapses first, so a \
+             stalled provider can never be detected"
+        );
+        // Equal is just as dead — the cap still wins the race.
+        let equal = parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5000"]);
+        assert!(equal.validate().is_err(), "equal budgets are still dead");
+        // And the ordinary case must keep working, including the defaults.
+        assert!(parse(&[]).validate().is_ok(), "the defaults must be valid");
+        assert!(
+            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5001"])
+                .validate()
+                .is_ok()
+        );
     }
 }

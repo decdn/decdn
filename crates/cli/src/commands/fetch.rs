@@ -503,6 +503,9 @@ pub(crate) async fn fetch_blob(
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
+    // Before any network or keystore work: a hard cap at or below the stall budget parses
+    // fine and silently disables stall detection (#1145 review).
+    common.validate()?;
 
     // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
     // `[network.discovery]` composes operator resolution legs, else N0 (#936).
@@ -825,11 +828,10 @@ mod tests {
         }
     }
 
-    /// The refusal these tests annotate, built the way the fetch path builds it —
-    /// the typed `UpstreamRefused` sentinel (#1144), not a look-alike string. The
-    /// annotation now downcasts, so a synthetic `anyhow!("delivery refused: …")`
-    /// would no longer match and the test would pass vacuously against a hint that
-    /// never fires in production.
+    /// The refusal these tests annotate, built the way the fetch path builds it: the typed
+    /// `UpstreamRefused` sentinel (#1144). Never hand-roll one with
+    /// `anyhow!("delivery refused: …")` — the annotation downcasts, so a look-alike string
+    /// would exercise nothing and pass against a hint that never fires in production.
     fn refusal(error: StreamError) -> anyhow::Error {
         anyhow::Error::new(UpstreamRefused { error })
     }

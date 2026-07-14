@@ -455,35 +455,94 @@ impl StreamResponse {
 /// frames banned "a frame arrived" and "bytes made progress" are the same
 /// statement, so a peer cannot refresh the deadline with padding.
 ///
-/// An honest serve side cannot emit one, but the reason differs per path and both have
-/// to hold, so both are worth naming precisely:
+/// # The bounds are enforced by construction
+///
+/// The field is private and [`ChunkData::new`] is the only constructor, so an invalid
+/// frame cannot be built — and `#[serde(try_from)]` routes decoding through the same
+/// check, so it cannot be *decoded* either. A receive loop therefore holds a valid frame
+/// by having one at all, and a serve path cannot emit an empty frame even by accident.
+///
+/// It was not always so, and the reason it is now is worth keeping. The floor used to be
+/// an advisory `validate()` that two receive loops remembered to call and neither emitter
+/// called at all; the serve side was correct only *incidentally*, and differently on each
+/// path:
 ///
 /// - The **buffered** path chunks its payload with `slice::chunks`, which yields no
 ///   items for an empty slice. So even the empty blob (whose bao encoding is zero
 ///   bytes — see `decdn_bao_range::align_range`) goes straight to
 ///   [`ClientMessage::StreamEnd`] rather than sending an empty frame first (#1054).
 /// - The **window-paced** path (#856) forwards upstream frames verbatim and does no
-///   re-chunking, so it inherits the guarantee rather than establishing it: the
-///   frames it relays have already passed [`ChunkData::validate`] in the requester's
-///   receive loop.
+///   re-chunking, so it *inherited* the guarantee rather than establishing it.
 ///
-/// That second path is the fragile one. A future change that re-chunks or synthesises
-/// a frame there (say, flushing a zero-length tee write) would break the invariant
-/// with nothing to catch it, since the buffered path's `slice::chunks` argument would
-/// still read as if it covered the whole serve side.
+/// Both facts are true, both are about unrelated code, and either could change without
+/// anyone noticing which invariant they had just removed — while the reputation system
+/// silently depends on it, since a false `PullStalled` gossips an honest peer as
+/// unreachable. That is a lot of weight for a convention. Now the type carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ChunkDataWire")]
 pub struct ChunkData {
-    /// Sequential blob bytes (1..=[`CHUNK_SIZE`]).
-    pub bytes: Vec<u8>,
+    /// Sequential blob bytes (1..=[`CHUNK_SIZE`]). Private: see the type's docs — this
+    /// is the invariant the inactivity deadline and, through it, `PullStalled` rest on.
+    bytes: Vec<u8>,
+}
+
+/// Decode shape for [`ChunkData`], which cannot deserialize directly without giving up
+/// its private field and with it the invariant. Structurally identical, so the wire
+/// format is unchanged; it exists only to be validated on the way in.
+#[derive(Deserialize)]
+struct ChunkDataWire {
+    bytes: Vec<u8>,
+}
+
+impl TryFrom<ChunkDataWire> for ChunkData {
+    type Error = MessageValidationError;
+
+    fn try_from(wire: ChunkDataWire) -> Result<Self, Self::Error> {
+        Self::new(wire.bytes)
+    }
 }
 
 impl ChunkData {
-    /// Enforce the payload bounds: non-empty and within [`CHUNK_SIZE`].
+    /// The only constructor. Enforces the payload bounds: non-empty and within
+    /// [`CHUNK_SIZE`].
     ///
     /// # Errors
     ///
     /// [`MessageValidationError::EmptyChunk`] for a zero-length payload;
     /// [`MessageValidationError::ChunkTooLarge`] above the ceiling.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, MessageValidationError> {
+        if bytes.is_empty() {
+            return Err(MessageValidationError::EmptyChunk);
+        }
+        if bytes.len() > CHUNK_SIZE {
+            return Err(MessageValidationError::ChunkTooLarge { len: bytes.len() });
+        }
+        Ok(Self { bytes })
+    }
+
+    /// The payload. Non-empty and within [`CHUNK_SIZE`] by construction.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the frame for its payload, avoiding a copy on the receive path.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Re-check the payload bounds.
+    ///
+    /// Always `Ok` for a frame that exists — [`Self::new`] and the `try_from` decode gate
+    /// are the only ways to obtain one. Retained because [`ClientMessage::validate`]
+    /// dispatches to it, so the aggregate validator stays total over the message enum
+    /// rather than silently skipping this variant.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageValidationError::EmptyChunk`] / [`MessageValidationError::ChunkTooLarge`],
+    /// neither of which a constructed frame can produce.
     pub const fn validate(&self) -> Result<(), MessageValidationError> {
         if self.bytes.is_empty() {
             return Err(MessageValidationError::EmptyChunk);
@@ -844,10 +903,8 @@ mod tests {
     }
 
     #[test]
-    fn chunk_data_roundtrip() -> Result<(), postcard::Error> {
-        let chunk = ChunkData {
-            bytes: vec![0x42u8; CHUNK_SIZE],
-        };
+    fn chunk_data_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let chunk = ChunkData::new(vec![0x42u8; CHUNK_SIZE])?;
         let bytes = postcard::to_allocvec(&chunk)?;
         let decoded: ChunkData = postcard::from_bytes(&bytes)?;
         assert_eq!(chunk, decoded);
@@ -881,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn client_message_discriminants_are_frozen() -> Result<(), postcard::Error> {
+    fn client_message_discriminants_are_frozen() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             first_byte(&ClientMessage::StreamRequest(sample_request()))?,
             0
@@ -891,7 +948,7 @@ mod tests {
             1
         );
         assert_eq!(
-            first_byte(&ClientMessage::ChunkData(ChunkData { bytes: vec![] }))?,
+            first_byte(&ClientMessage::ChunkData(ChunkData::new(vec![0x1u8])?))?,
             2
         );
         assert_eq!(first_byte(&ClientMessage::Voucher(sample_voucher()))?, 3);
@@ -1150,45 +1207,68 @@ mod tests {
     }
 
     #[test]
-    fn chunk_data_empty_decodes_but_does_not_validate() -> Result<(), postcard::Error> {
-        // An empty chunk is NOT a legal on-wire frame (#1088) — but rejecting it
-        // is a receiver-loop obligation, not a decode-time one, matching the
-        // convention the rest of this module follows (see `MessageValidationError`'s
-        // doc: validation is deliberately separate from decode so a handler can
-        // build a message before signing it). So the codec must still round-trip
-        // postcard's length-prefix-0 path without choking, and `validate` is what
-        // refuses the frame.
-        let chunk = ChunkData { bytes: Vec::new() };
-        let bytes = postcard::to_allocvec(&chunk)?;
-        let decoded: ChunkData = postcard::from_bytes(&bytes)?;
-        assert_eq!(chunk, decoded);
-        assert!(decoded.bytes.is_empty());
-        assert_eq!(decoded.validate(), Err(MessageValidationError::EmptyChunk));
+    fn an_empty_chunk_cannot_be_decoded_at_all() -> Result<(), Box<dyn std::error::Error>> {
+        // An empty chunk is not a legal frame (#1088), and since the #1145 review it is
+        // not a REPRESENTABLE one: rejecting it is the decoder's job, not a receive
+        // loop's obligation to remember.
+        //
+        // This test used to assert the opposite — that an empty frame decodes cleanly and
+        // only a later `validate()` call refuses it — and that assertion is exactly how
+        // the hole hid: it reads as a considered separation of decode from validation,
+        // while what it actually pinned was that a receive loop which forgot to call
+        // `validate()` would spin on empty frames forever. Two of the three loops
+        // remembered; neither emitter did.
+        //
+        // So: forge the bytes an adversary would send (a length-prefix of 0, which no
+        // constructor will produce) and require the decoder to refuse them.
+        // postcard encodes `Vec<u8>` as a varint length then the bytes, so `[0x00]` is a
+        // length of 0 and nothing else.
+        assert!(
+            postcard::from_bytes::<ChunkData>(&[0x00]).is_err(),
+            "an empty ChunkData must not decode — the receive loops' stall detection, and \
+             through it the reputation system, rest on every frame carrying bytes"
+        );
+        // And the same through the message enum, which is what the wire actually carries.
+        let mut msg = encode_message(&ClientMessage::ChunkData(ChunkData::new(vec![0x00])?))?;
+        assert_eq!(msg.pop(), Some(0x00), "payload byte");
+        assert_eq!(msg.pop(), Some(0x01), "length prefix of 1");
+        msg.push(0x00); // rewrite the length to 0
+        assert!(
+            decode_message::<ClientMessage>(&msg).is_err(),
+            "an empty ChunkData must not decode inside a ClientMessage either"
+        );
         Ok(())
     }
 
     #[test]
-    fn chunk_data_validate_bounds_both_sides() {
-        // The floor is what makes every frame a unit of progress (#1088); the
-        // ceiling bounds per-frame allocation. A 1-byte and a full-size chunk are
-        // both legal — "partial final chunk" means smaller, not empty.
-        assert_eq!(ChunkData { bytes: vec![0u8] }.validate(), Ok(()));
+    fn chunk_data_new_is_the_only_way_in_and_it_enforces_both_bounds() {
+        // The floor is what makes every frame a unit of progress (#1088); the ceiling
+        // bounds per-frame allocation. A 1-byte and a full-size chunk are both legal —
+        // "partial final chunk" means smaller, not empty.
         assert_eq!(
-            ChunkData {
-                bytes: vec![0u8; CHUNK_SIZE],
-            }
-            .validate(),
-            Ok(())
+            ChunkData::new(Vec::new()),
+            Err(MessageValidationError::EmptyChunk)
         );
         assert_eq!(
-            ChunkData {
-                bytes: vec![0u8; CHUNK_SIZE + 1],
-            }
-            .validate(),
+            ChunkData::new(vec![0u8; CHUNK_SIZE + 1]),
             Err(MessageValidationError::ChunkTooLarge {
                 len: CHUNK_SIZE + 1
             })
         );
+        assert!(ChunkData::new(vec![0u8]).is_ok());
+        assert!(ChunkData::new(vec![0u8; CHUNK_SIZE]).is_ok());
+    }
+
+    #[test]
+    fn chunk_data_validate_agrees_with_the_constructor() -> Result<(), MessageValidationError> {
+        // `validate` survives only as the arm `ClientMessage::validate` dispatches to, so
+        // the aggregate validator stays total over the enum. It can no longer FAIL — a
+        // `ChunkData` that exists came through `new` or the decode gate — and that is the
+        // assertion worth making: if this ever returns `Err`, some construction path has
+        // gone around the constructor.
+        assert_eq!(ChunkData::new(vec![0u8])?.validate(), Ok(()));
+        assert_eq!(ChunkData::new(vec![0u8; CHUNK_SIZE])?.validate(), Ok(()));
+        Ok(())
     }
 
     #[test]
@@ -1374,7 +1454,7 @@ mod tests {
     // --- ClientMessage dispatcher + StreamError domain split -----------------
 
     #[test]
-    fn client_message_validate_dispatches_to_payload() {
+    fn client_message_validate_dispatches_to_payload() -> Result<(), MessageValidationError> {
         // Valid payloads pass through.
         assert_eq!(
             ClientMessage::StreamResponse(sample_response()).validate(),
@@ -1398,19 +1478,12 @@ mod tests {
             ClientMessage::Voucher(bad_voucher).validate(),
             Err(MessageValidationError::InvalidVoucherSigLen { len: 0 })
         );
-        // The aggregate seam DISPATCHES to `ChunkData::validate` (#1088) — it does not
-        // wave the variant through. This assertion was inverted (`Ok(())`) and that is
-        // exactly how the hole hid: `ClientMessage::validate` is the entry point a new
-        // receive loop is documented to call, so a permissive arm here silently returns
-        // the empty-frame spin bug to any path that trusts it.
+        // The aggregate seam dispatches to `ChunkData::validate` rather than waving the
+        // variant through (#1088). It can no longer catch an empty frame — none can be
+        // built to hand it — but the arm must stay, so the validator remains total over
+        // the enum and a future payload invariant on this variant is not silently skipped.
         assert_eq!(
-            ClientMessage::ChunkData(ChunkData { bytes: vec![] }).validate(),
-            Err(MessageValidationError::EmptyChunk),
-            "the aggregate validator must enforce the non-empty chunk floor, not just \
-             ChunkData::validate called by hand"
-        );
-        assert_eq!(
-            ClientMessage::ChunkData(ChunkData { bytes: vec![7] }).validate(),
+            ClientMessage::ChunkData(ChunkData::new(vec![7])?).validate(),
             Ok(())
         );
         // Variants carrying no value invariants are unconditionally Ok.
@@ -1424,6 +1497,7 @@ mod tests {
             ClientMessage::StreamError(StreamError::NotFound).validate(),
             Ok(())
         );
+        Ok(())
     }
 
     #[test]
@@ -1448,13 +1522,11 @@ mod tests {
     // --- Full framing stack --------------------------------------------------
 
     #[tokio::test]
-    async fn client_message_full_stack_roundtrip() -> Result<(), crate::framing::FrameError> {
+    async fn client_message_full_stack_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         let messages = [
             ClientMessage::StreamRequest(sample_request()),
             ClientMessage::StreamResponse(sample_response()),
-            ClientMessage::ChunkData(ChunkData {
-                bytes: vec![0x7u8; 1000],
-            }),
+            ClientMessage::ChunkData(ChunkData::new(vec![0x7u8; 1000])?),
             ClientMessage::Voucher(sample_voucher()),
             ClientMessage::VoucherAck,
             ClientMessage::StreamEnd,

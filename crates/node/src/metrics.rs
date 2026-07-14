@@ -678,10 +678,20 @@ pub struct DecdnMetrics {
     /// to the next candidate while the open continued in the background.
     ///
     /// NOT a failure — kept separate from `node_pull_channel_open_failures` because
-    /// the diagnosis is different: this says the node's own chain lane (a slow L2, a
-    /// stuck nonce) is slower than its `node_pull_timeout_sec`, whereas a failure
-    /// says the tx reverted or the wallet is under-funded. It scores no reputation:
-    /// a wedged open is our lane, not evidence about the peer.
+    /// the diagnosis is different: a failure says the tx reverted or the wallet is
+    /// under-funded, whereas this says the open is simply *not done yet*. It scores no
+    /// reputation: a wedged open is our lane, not evidence about the peer.
+    ///
+    /// # Two distinct causes, one counter
+    ///
+    /// 1. the node's own chain lane (a slow L2, a stuck nonce) is slower than
+    ///    `CHANNEL_OPEN_CALLER_BUDGET` — the interesting one; and
+    /// 2. a boot or idle **reconcile** holds the provider's open slot (`OpenSlotReserved`).
+    ///
+    /// The verdict is the same for both — try the next candidate, score nothing — which
+    /// is why they share a counter. But the *diagnosis* is not: reconcile runs at every
+    /// boot, so a restart produces a burst here that means nothing is wrong. Read a
+    /// sustained rate as a chain-lane signal only once it outlives a restart.
     pub node_pull_channel_open_pending: Counter,
     /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
     /// voucher but persisting the buyer channel's resume watermark
@@ -710,13 +720,15 @@ pub struct DecdnMetrics {
     /// upstream for future requests.
     pub node_pull_through_background_spawned: Counter,
     /// `decdn_node_pull_through_background_shed_total` (#1145 review): background
-    /// cache-fills NOT spawned because all `MAX_CONCURRENT_BACKGROUND_FILLS` warm
-    /// slots were busy.
+    /// cache-fills NOT spawned because the in-flight warms already reserve the whole
+    /// `MAX_BACKGROUND_FILL_MB` memory budget.
     ///
     /// Not an error — shedding speculative work is the designed response to load, and
     /// the hash stays unclaimed so a later miss retries it. A sustained rate means the
     /// node is missing faster than it can warm (slow upstreams, or a miss storm); the
-    /// cost is future cache misses, never a failed live request.
+    /// cost is future cache misses, never a failed live request. Since each warm reserves
+    /// `max_blob_size_mb`, a node with a large blob ceiling sheds sooner — that is the
+    /// intended trade, not a fault.
     pub node_pull_through_background_shed: Counter,
     /// `decdn_node_pull_through_background_succeeded_total` (#859): background
     /// cache-fills that populated the blob into the store.
@@ -724,8 +736,16 @@ pub struct DecdnMetrics {
     /// `decdn_node_pull_through_background_failed_total` (#859): background
     /// cache-fills that gave up (engine error, clean miss, or their own
     /// deadline) without populating the blob. Cancellation on shutdown is not
-    /// counted as a failure.
+    /// counted as a failure — see `node_pull_through_background_cancelled`.
     pub node_pull_through_background_failed: Counter,
+    /// `decdn_node_pull_through_background_cancelled_total` (#1145 review): background
+    /// cache-fills abandoned because the node began shutting down.
+    ///
+    /// Exists so the books balance: `spawned == succeeded + failed + cancelled` (and
+    /// `shed` counts warms that were never spawned at all). Without it a warm that dies
+    /// at drain leaves an unexplained gap between `spawned` and the terminal counters,
+    /// which on a node that restarts often looks exactly like a leak.
+    pub node_pull_through_background_cancelled: Counter,
     /// `decdn_node_pull_through_window_paused_total` (#856): times the
     /// window-paced serve loop paused the upstream pull because the per-request
     /// unrecouped frontier (`bytes pulled − bytes paid`) reached the effective
@@ -1712,8 +1732,9 @@ impl Metrics {
         self.decdn.node_pull_through_background_spawned.inc();
     }
 
-    /// A background cache-fill was shed because every warm slot was busy (#1145
-    /// review). Speculative work dropped under load; the hash stays unclaimed.
+    /// A background cache-fill was shed because the in-flight warms already reserve the
+    /// whole memory budget (#1145 review). Speculative work dropped under load; the hash
+    /// stays unclaimed, so a later miss retries it.
     pub fn node_pull_through_background_shed(&self) {
         self.decdn.node_pull_through_background_shed.inc();
     }
@@ -1726,6 +1747,12 @@ impl Metrics {
     /// A background cache-fill gave up without populating the blob (#859).
     pub fn node_pull_through_background_failed(&self) {
         self.decdn.node_pull_through_background_failed.inc();
+    }
+
+    /// A background cache-fill was abandoned at shutdown (#1145 review). Not a failure —
+    /// counted so `spawned == succeeded + failed + cancelled` balances.
+    pub fn node_pull_through_background_cancelled(&self) {
+        self.decdn.node_pull_through_background_cancelled.inc();
     }
 
     /// Open a drift window for the `NodeId → address` resolver watcher (#831):

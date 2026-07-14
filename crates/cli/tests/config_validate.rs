@@ -436,6 +436,30 @@ fn summary_includes_prefetch_enabled() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The node→node pull-through summary is gated on the feature being ENABLED, so with the
+/// fixture's default `false` none of it renders and every knob on that line is unexercised
+/// — including `stall_timeout_sec`, added by #1134. A knob an operator cannot see is a knob
+/// they cannot check, and `decdn config validate` is where they look.
+#[test]
+fn summary_reports_the_pull_through_deadlines_when_enabled() -> anyhow::Result<()> {
+    let cfg = sample_resolved(|c| {
+        c.cache.node_to_node_pull_through_enabled = true;
+        c.cache.node_pull_timeout_sec = 25;
+        c.cache.node_pull_stall_timeout_sec = 15;
+    });
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        out.contains("pull_timeout_sec=25"),
+        "the summary must report the resolved stream-open budget: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("stall_timeout_sec=15"),
+        "the summary must report the resolved inactivity budget — it is the primary health \
+         signal, and it is a term of the derived outer deadline: {out}"
+    );
+    Ok(())
+}
+
 #[test]
 fn summary_reports_discovery_without_leaking_secrets() -> anyhow::Result<()> {
     // #818: the summary names dns_origin and the peer count, redacts the

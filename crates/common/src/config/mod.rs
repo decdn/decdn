@@ -189,16 +189,21 @@ pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
 /// (#831). Five is enough to find a healthy upstream in a tens-of-nodes
 /// network without spending the miss-latency budget on a wide probe fan-out.
 pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
-/// Default wall-clock bound (seconds) on the OPEN stage of a single upstream pull
-/// during a node-to-node cache-miss fill (#831) — connect, channel open,
-/// handshake, signed `StreamResponse`. Matches the integration-test budget; a slow
-/// upstream is abandoned for the next ranked candidate at this deadline.
-/// This is the *per-upstream* budget: the node derives the overall pull-through
-/// deadline as roughly `MAX_PROVIDER_ATTEMPTS ×` it plus a fixed discovery
-/// allowance, so the fallback loop can reach every ranked candidate before the
-/// serving path gives up (#859).
+/// Default wall-clock bound (seconds) on the STREAM-OPEN stage of a single upstream
+/// pull during a node-to-node cache-miss fill (#831) — connect, handshake, signed
+/// `StreamResponse`. Matches the integration-test budget; a slow upstream is abandoned
+/// for the next ranked candidate at this deadline.
 ///
-/// Does not bound the streaming stage — see [`DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`].
+/// It does NOT cover the buyer-channel open, which precedes it on its own 5 s budget
+/// (`CHANNEL_OPEN_CALLER_BUDGET`), nor the streaming that follows it, which is bounded by
+/// inactivity ([`DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`]). All three are sequential stages
+/// of ONE candidate attempt, and the node derives the overall pull-through deadline as
+/// `MAX_PROVIDER_ATTEMPTS × (channel open + this + stall) + a fixed discovery allowance`,
+/// so the fallback loop can reach every ranked candidate before the serving path gives up
+/// (#859).
+///
+/// Raising this to give a slow L2 more room does nothing: that is the channel open, on the
+/// budget named above.
 pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 /// Default INACTIVITY bound (seconds) on the streaming stage of an upstream pull
 /// (#1134). The clock resets on every byte received, so it trips only when an
@@ -208,6 +213,14 @@ pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 /// question ("how long do we wait on an unresponsive upstream?"), just at
 /// different stages; they are separate knobs because only one of them can be
 /// safely raised for large content.
+///
+/// Raising it is not free, even though it does not scale with blob size. A candidate that
+/// goes SILENT costs one full window of this before the pull abandons it, and
+/// `outer_pull_deadline` must budget that window for each of `MAX_PROVIDER_ATTEMPTS`
+/// candidates — otherwise a single silent peer eats the whole deadline and the fallback
+/// loop never reaches the others (#859, and the reason this knob is an argument to that
+/// function). So each second added here adds ~3 to the worst-case wait a client can see on
+/// a total miss: 145 s at defaults.
 pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 
 /// Default window-paced pull-through pipeline window (#856, ADR 037

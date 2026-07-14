@@ -455,15 +455,16 @@ pub struct CacheConfig {
     /// probes none, so no pull can succeed (a way to disable the pull while
     /// keeping the feature flag on).
     pub node_pull_probe_fanout: Option<usize>,
-    /// Wall-clock timeout in seconds for the OPEN stage of a single upstream pull
-    /// on a node-to-node miss (#831) — connect, channel open, handshake, and the
-    /// signed `StreamResponse`. Absent =>
+    /// Wall-clock timeout in seconds for the STREAM-OPEN stage of a single upstream pull
+    /// on a node-to-node miss (#831) — connect, handshake, and the
+    /// signed `StreamResponse`. It does NOT bound the buyer-channel open, which precedes
+    /// it on its own 5 s budget. Absent =>
     /// [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`] (20). Bounds how long a
     /// miss blocks the serving path on one upstream before falling through to
     /// the next ranked candidate (or `NotFound`). This is the *per-upstream*
     /// budget; the overall pull-through deadline is derived as roughly
-    /// `MAX_PROVIDER_ATTEMPTS ×` it plus a fixed discovery allowance, so the
-    /// fallback loop reaches every ranked candidate (#859).
+    /// `MAX_PROVIDER_ATTEMPTS × (channel open + it + stall)` plus a fixed discovery
+    /// allowance, so the fallback loop reaches every ranked candidate (#859).
     ///
     /// It does NOT bound the streaming stage (#1134) — that is
     /// [`Self::node_pull_stall_timeout_sec`]. A wall clock over the bytes would
@@ -480,6 +481,10 @@ pub struct CacheConfig {
     /// brief network hiccup abandons a healthy transfer (and scores the upstream
     /// `Unreachable`); too high and a dead upstream is held onto for longer than
     /// necessary before the fallback loop moves on.
+    ///
+    /// "Longer" is multiplied, not added. A silent candidate costs one full window of
+    /// this, and the derived outer deadline budgets that for EVERY candidate, so a second
+    /// here is ~3 seconds of worst-case client wait on a total miss (145 s at defaults).
     pub node_pull_stall_timeout_sec: Option<u64>,
     /// Window-paced pull-through per-request pipeline window in bytes (#856, ADR
     /// 037 `pull_ahead_bytes`). Absent =>

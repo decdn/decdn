@@ -133,11 +133,20 @@ fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, er
     if let Some(reason) = reason {
         deps.metrics.channel_open_failure_by_reason(reason);
     }
-    debug!(
+    // `warn!`, not `debug!`. Everything the open task raises is `OpenReported` and
+    // returned above, so what reaches here is raised OUTSIDE the task — which makes this
+    // arm node-local faults, not peer behaviour: a store read fault on the reuse fast
+    // path, a poisoned `opens_in_flight` mutex (which wedges every open for the life of
+    // the process), or a channel that opened on-chain and is somehow not live in the
+    // store. None of those are things an operator should have to scrape debug logs to
+    // see; at the default `RUST_LOG=info` a `debug!` here meant watching
+    // `node_pull_channel_open_failures_total` climb with no line explaining any of it.
+    warn!(
         %provider_addr,
         reason = reason.map_or("unclassified", ChannelOpenFailureReason::as_label),
         %err,
-        "node-origin: buyer channel open/reuse failed"
+        "node-origin: buyer channel open/reuse failed (raised outside the open task — \
+         suspect this node's store or lock state, not the peer)"
     );
 }
 
@@ -161,9 +170,13 @@ pub trait AcquisitionObserver: Send + Sync + std::fmt::Debug {
 pub struct NodeOriginConfig {
     /// How many discovered providers to probe before ranking.
     pub probe_fanout: usize,
-    /// Wall-clock bound on the OPEN stage of a single upstream pull: connect,
-    /// channel open, handshake, and the signed `StreamResponse`. Bounded work, so
-    /// a slow one is a stall.
+    /// Wall-clock bound on the STREAM-OPEN stage of a single upstream pull: connect,
+    /// handshake, and the signed `StreamResponse`. Bounded work, so a slow one is a stall.
+    ///
+    /// It does NOT bound the buyer-channel open, which is a separate, earlier stage on its
+    /// own budget (`selection::CHANNEL_OPEN_CALLER_BUDGET`, 5 s) — raising this to give a
+    /// slow L2 more room does nothing. That the two are sequential stages is exactly why
+    /// `outer_pull_deadline` budgets both, plus the stall window, for every candidate.
     pub pull_timeout: Duration,
     /// INACTIVITY bound on the STREAMING stage (#1134). Reset on every byte
     /// received, so it trips only on a silent upstream — never on a large blob or
@@ -348,12 +361,20 @@ impl NodeOrigin {
             }
         };
         // #1117: bind the request so the upstream can chain a reactive pull.
-        let ctx = bind_upstream_ctx(deps, ctx)?;
+        let ctx = match bind_upstream_ctx(deps, ctx) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                // A LOCAL signing fault — classify it so it is metered as ours and the
+                // peer is not scored for a key WE cannot use.
+                classify_pull_failure(deps, pk, provider_addr, hash_bytes, &err);
+                return None;
+            }
+        };
         // Bound the open on the SAME per-candidate budget the buffered path gives
         // each candidate (`stream_fetch_tracked`). Without it, a candidate that
         // accepts the connection and then goes quiet blocks here indefinitely and
         // consumes the caller's whole outer deadline — which is deliberately sized
-        // at `MAX_PROVIDER_ATTEMPTS × pull_timeout + slack` precisely so the
+        // at `MAX_PROVIDER_ATTEMPTS × (channel open + pull_timeout + stall) + slack` so the
         // caller's fallback loop (`open_progressive_pull`, above) can still reach
         // candidates #2..N (#859) — so the serve path would refuse a blob an honest
         // fallback holds. The typed `PullTimeout` flows into the `Err` arm's
@@ -852,18 +873,20 @@ async fn try_pull(
 /// cache miss, chain a further reactive origin pull (`pull_authorized`). A
 /// signing failure drops the candidate rather than sending an unbound request
 /// the upstream would refuse to chain — try the next provider instead.
-fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> Option<ChannelContext> {
+///
+/// Returns the error rather than swallowing it, so the caller can hand it to
+/// [`classify_pull_failure`]. `sign_client_binding` marks it [`LocalPullFault`], and
+/// that classification only means anything if the error actually reaches the classifier:
+/// this signs with `ctx.client_signer` — the SAME key that signs vouchers — and runs
+/// BEFORE the stream open on both pull paths. So a node with a broken buyer key fails
+/// here, on every candidate, and never reaches the voucher-signing `LocalPullFault` deeper
+/// in `stream_fetch_tracked`. Swallowed here, `node_pull_local_fault` stayed at zero in
+/// precisely the emergency its doc describes ("a node that cannot sign a voucher cannot
+/// pay for anything"), and an operator alerting on it got a false all-clear.
+fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> anyhow::Result<ChannelContext> {
     let own_node_id = B256::from(*deps.endpoint.id().as_bytes());
-    match sign_client_binding(&ctx.client_signer, own_node_id, &deps.bind_domain) {
-        Ok(binding) => Some(ctx.with_client_binding(binding)),
-        Err(err) => {
-            warn!(
-                error = %err,
-                "node-origin: failed to sign client identity binding; skipping candidate"
-            );
-            None
-        }
-    }
+    let binding = sign_client_binding(&ctx.client_signer, own_node_id, &deps.bind_domain)?;
+    Ok(ctx.with_client_binding(binding))
 }
 
 /// Attempt a single paid pull from one candidate: resolve its operator address,
@@ -910,7 +933,14 @@ async fn pull_from_candidate(
         }
     };
     // #1117: bind the request so the upstream can chain a reactive pull.
-    let ctx = bind_upstream_ctx(deps, ctx)?;
+    let ctx = match bind_upstream_ctx(deps, ctx) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            // As on the window path: our signing fault, metered as ours, peer unscored.
+            classify_pull_failure(deps, pk, provider_addr, hash_bytes, &err);
+            return None;
+        }
+    };
     let started = Instant::now();
     let mut progress = VoucherProgress::default();
     // Streaming is bounded by INACTIVITY, with no overall wall-clock cap (#1134).
@@ -1013,37 +1043,135 @@ fn persist_buyer_progress(
     }
 }
 
-/// Whether a refusal is evidence the PEER is degraded — and so must score its
-/// reputation — or merely an honest answer from a node that is reachable and
-/// answering (#1144).
+/// What a refusal tells us about the peer, and therefore what we should do with it
+/// (#1144, refined in the #1145 review).
 ///
-/// Deliberately an exhaustive match rather than a `matches!` on the one true
-/// case: a new `StreamError` variant must not silently inherit "honest" (which
-/// would let a future failure code go unscored) nor "fault" (which would tar
-/// honest peers). It has to be a decision.
-const fn refusal_is_node_fault(error: &StreamError) -> bool {
+/// Deliberately an exhaustive match rather than a `matches!`: a new `StreamError` variant
+/// must not silently inherit any of these — not "honest" (a future failure code would go
+/// unscored), not "fault" (honest peers get tarred), and not "durable" (a transient
+/// condition would suppress a healthy peer for minutes). It has to be a decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalVerdict {
+    /// The peer reports its OWN degradation. Score its reputation.
+    NodeFault,
+    /// A true, lasting fact about this (peer, hash) pair. Suppress the pair for the full
+    /// [`NegativeProbeCache`] TTL — asking again soon would get the same answer.
+    DurableMiss,
+    /// Transient, or not attributable to the peer at all. Suppress the pair only briefly
+    /// ([`REFUSAL_SUPPRESSION_TTL`]) — long enough that a peer serving nothing stops
+    /// burning a candidate slot on every miss in a retry burst, short enough that we do
+    /// not blackhole a healthy peer over a condition that has already passed.
+    Transient,
+    /// OUR fault. Score nothing, suppress nothing.
+    OurFault,
+}
+
+/// How long a (peer, hash) pair is suppressed after a refusal we cannot attribute to the
+/// peer, or that we expect to pass on its own ([`RefusalVerdict::Transient`]).
+///
+/// Much shorter than the negative cache's own TTL (5 min), and the asymmetry is the
+/// point. A probe's `has_blob: false` is an authoritative statement about content the
+/// peer just checked. A `NotFound` *refusal* is not: `ServeRejectReason::wire_error`
+/// deliberately collapses SEVEN reject reasons onto the wire `NotFound` so that a probing
+/// client cannot map out other clients' channel balances — and three of the seven are
+/// ours or transient (`InsufficientDeposit`, `UnknownChannel` while the upstream's chain
+/// watcher catches up, `CooperativeCloseSigned`). We cannot tell them apart, and we must
+/// not: the collapse is a privacy property, not an oversight.
+///
+/// So the refusal is suppressed on the assumption it may be *us*. At the full TTL, a
+/// deposit that ran dry for one pull — or the pre-observation window right after we open
+/// a channel — blackholed a perfectly healthy upstream for five minutes.
+const REFUSAL_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
+
+const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
     match error {
         // The one code by which a node reports its OWN degradation: "unexpected
         // failure; do not retry THIS node" (#1129).
-        StreamError::InternalError => true,
-        // Honest answers from a healthy node. `NotFound` is NODE-scoped, not
-        // blob-scoped; `EvictedSinceProbe` is a race it is being truthful about;
-        // `Overloaded` is backpressure we should respect, not punish; and
-        // `BlobTooLarge` is deterministic for this blob on any node.
-        //
+        StreamError::InternalError => RefusalVerdict::NodeFault,
+        // Honest and durable: `EvictedSinceProbe` is a race the peer is being truthful
+        // about, and `BlobTooLarge` is deterministic for this blob. Asking this peer for
+        // this hash again inside the TTL gets the same answer, so don't spend a candidate
+        // slot finding out.
+        StreamError::EvictedSinceProbe | StreamError::BlobTooLarge => RefusalVerdict::DurableMiss,
+        // Honest but NOT durable, and — for `NotFound` — not even attributable: see
+        // `REFUSAL_SUPPRESSION_TTL`. `Overloaded` is backpressure, which the code's own
+        // policy says to respect rather than punish; suppressing the peer for five
+        // minutes over a load spike lasting seconds is punishing it.
+        StreamError::NotFound | StreamError::Overloaded => RefusalVerdict::Transient,
         // `VoucherRejected` cannot reach a validated response at all —
         // `StreamResponse::validate` rejects it in the `error` field as a
         // mid-stream-only code — but were it ever to arrive it would be OUR
-        // payment-side fault, which the `UpstreamVoucherRejected` arm above
-        // already exonerates. So it belongs here too. (Folded in rather than given
-        // its own arm only because clippy's `match_same_arms` forbids the
-        // duplicate body; the match stays exhaustive, which is the point.)
-        StreamError::NotFound
-        | StreamError::EvictedSinceProbe
-        | StreamError::Overloaded
-        | StreamError::BlobTooLarge
-        | StreamError::VoucherRejected { .. } => false,
+        // payment-side fault, which the `UpstreamVoucherRejected` arm already
+        // exonerates. Score nothing and suppress nothing: the peer did nothing wrong,
+        // and it still holds the blob.
+        StreamError::VoucherRejected { .. } => RefusalVerdict::OurFault,
     }
+}
+
+/// What a failed pull was actually caused by — the whole classification decision, as a
+/// value.
+///
+/// Separated from the *acting* on it ([`classify_pull_failure`]) so the decision can be
+/// tested without a live `NodeOriginDeps`, which needs an iroh endpoint. That matters more
+/// than it sounds. The ladder below is an ORDERED chain of `downcast_ref`s whose order is
+/// load-bearing and invisible to the compiler, ending in a catch-all that scores the peer
+/// `Unreachable`. Every mis-attribution this module has shipped was an error falling one
+/// arm further than it should and landing there: an honest `NotFound` refusal (#1144), a
+/// mid-stream `StreamError`, a broken local signer. Making the decision a pure function
+/// means "which arm does this error land in?" is a question a test can just ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullVerdict {
+    /// The blob is over OUR configured ceiling (#840) — it may be fine for other nodes.
+    OversizeClaim,
+    /// OUR deadline fired: a possibly mis-sized local budget, not evidence about the peer.
+    OurDeadline,
+    /// The peer went SILENT mid-stream (#1134). Unlike [`Self::OurDeadline`] this IS about
+    /// the peer: a clock that resets on every byte can only fire on one that stopped.
+    Stalled,
+    /// The peer rejected a voucher WE presented — our payment fault (#852, #857).
+    OurVoucherRejected,
+    /// The peer refused delivery, carrying the wire code's own verdict (#1144).
+    Refused(RefusalVerdict),
+    /// A fault in THIS node — a broken signer, a bad encode, a bad range. It says nothing
+    /// about the peer, and a node in this state would otherwise tar every honest provider
+    /// it meets.
+    OurLocalFault,
+    /// Reachable, paid, and served the wrong bytes.
+    Corruption,
+    /// Everything else: a failed dial, a dropped connection, a bad slash signature, an
+    /// unexpected frame. The residual — and the arm that actually scores a dead node.
+    Unreachable,
+}
+
+/// The ordered sentinel ladder. Pure: no metrics, no reputation, no I/O.
+fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
+    if err.downcast_ref::<BlobTooLargeClaim>().is_some() {
+        return PullVerdict::OversizeClaim;
+    }
+    if err.downcast_ref::<PullTimeout>().is_some() {
+        return PullVerdict::OurDeadline;
+    }
+    if err.downcast_ref::<PullStalled>().is_some() {
+        return PullVerdict::Stalled;
+    }
+    if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
+        return PullVerdict::OurVoucherRejected;
+    }
+    // Ahead of `UpstreamRefused` and the catch-all, deliberately: a local signing or encode
+    // fault surfaces while we are talking to a peer, and every arm below this one blames
+    // the peer to some degree. A node with a broken buyer key hits this on EVERY candidate,
+    // so getting the order wrong here does not mis-score one provider — it gossips the
+    // whole candidate list as unreachable on the strength of our own defect.
+    if err.downcast_ref::<LocalPullFault>().is_some() {
+        return PullVerdict::OurLocalFault;
+    }
+    if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
+        return PullVerdict::Refused(classify_refusal(&refused.error));
+    }
+    if err.downcast_ref::<HashMismatch>().is_some() {
+        return PullVerdict::Corruption;
+    }
+    PullVerdict::Unreachable
 }
 
 /// Classify a failed pull and fold the appropriate (or no) reputation outcome,
@@ -1052,10 +1180,9 @@ const fn refusal_is_node_fault(error: &StreamError) -> bool {
 /// (#1144 — a peer that answers is reachable, whatever it answers), except
 /// `InternalError`, by which a peer reports its own degradation; a hash mismatch
 /// is `Corruption`; everything else is `Unreachable`.
-// Straight-line downcast → classify → log chain; the tracing macros inflate the
-// cognitive-complexity metric past threshold (same inflation noted on the
-// pre-extraction `pull_from_candidate`). Splitting the sentinel arms would
-// scatter one linear classification across helpers.
+///
+/// [`pull_verdict`] makes the decision; this acts on it.
+// The tracing macros inflate the cognitive-complexity metric past threshold.
 #[allow(clippy::cognitive_complexity)]
 fn classify_pull_failure(
     deps: &NodeOriginDeps,
@@ -1064,119 +1191,98 @@ fn classify_pull_failure(
     hash_bytes: [u8; 32],
     err: &anyhow::Error,
 ) {
-    // An oversized-blob claim is OUR ceiling, not the provider's fault — it may
-    // legitimately serve larger blobs to nodes configured with a higher
-    // `max_blob_size`. Record it for observability but don't tar reputation (#840).
-    if err.downcast_ref::<BlobTooLargeClaim>().is_some() {
-        deps.metrics.node_pull_too_large();
-        debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
-        return;
-    }
-    // OUR own deadline firing — the per-candidate `pull_timeout` on the open stage,
-    // or an overall hard cap — which is a possibly mis-sized local budget, not
-    // evidence the provider is unreachable. Don't tar its reputation locally or
-    // over gossip (#857).
-    if err.downcast_ref::<PullTimeout>().is_some() {
-        deps.metrics.node_pull_timeout();
-        debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; not tarring upstream reputation");
-        return;
-    }
-    // The upstream went SILENT mid-stream (#1134) — and unlike `PullTimeout` above,
-    // this one DOES score the peer. The distinction is the whole reason the two
-    // sentinels are separate: a whole-transfer deadline cannot tell a dead peer from
-    // a big blob on a slow link, so it fired on healthy transfers and had to be
-    // exonerating. A stall deadline resets on every byte, so it fires only when a
-    // provider we are actively waiting on stops delivering. That is what
-    // `Unreachable` means.
-    if err.downcast_ref::<PullStalled>().is_some() {
-        deps.metrics.node_pull_stalled();
-        debug!(%provider_addr, %err, "node-origin: upstream stalled mid-stream; scoring unreachable");
-        record_outcome(deps, pk, &Outcome::Unreachable);
-        return;
-    }
-    // The upstream rejected a voucher WE presented — a stale nonce (#852),
-    // deposit exhaustion, or a channel mismatch. That is our payment-side fault,
-    // not the provider's, so skip the candidate without recording a reputation
-    // observation (#857). Reason-agnostic: every `VoucherRejectReason` abandons.
-    if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
-        deps.metrics.node_pull_voucher_rejected();
-        debug!(%provider_addr, %err, "node-origin: upstream rejected our voucher (our payment fault); not tarring upstream reputation");
-        return;
-    }
-    // The upstream REFUSED delivery up front (#1144). A refusal proves the peer is
-    // reachable and answering, so it is not `Unreachable` — which is what every
-    // refusal used to score, tarring a node exactly as hard for honestly saying it
-    // lacks a blob as for being dead. Split on the wire code:
-    //
-    //   `InternalError` alone is evidence of a degraded peer — it is precisely the
-    //   "unexpected failure; do not retry THIS node" signal the serve path emits
-    //   for a backend fault or a wedged candidate (#1129), so honour it and score
-    //   `Unreachable` (which also deprioritises the candidate via the EWMA, so the
-    //   ranker steers off it on the next miss).
-    //
-    //   `NotFound` / `EvictedSinceProbe` / `Overloaded` / `BlobTooLarge` are all
-    //   honest answers from a healthy node. `NotFound` in particular is NODE-scoped,
-    //   not blob-scoped, and is the code a healthy-but-empty node returns (seven
-    //   `ServeRejectReason`s collapse onto it so channel existence can't be probed),
-    //   so it is at most a negative-AVAILABILITY signal — never a reputation hit.
-    //   Metered for observability, then the candidate is simply skipped.
-    if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
-        deps.metrics.node_pull_refused();
-        if refusal_is_node_fault(&refused.error) {
-            debug!(%provider_addr, %err, "node-origin: upstream reports itself degraded; scoring unreachable");
-            record_outcome(deps, pk, &Outcome::Unreachable);
-        } else {
-            // Act on the negative-AVAILABILITY signal instead of merely naming it.
-            // Every candidate that got this far answered `has_blob = true` at probe
-            // (`probe_candidate`), so a refusal here is a peer contradicting itself.
-            // Reputation is still the wrong instrument — `wire_error` collapses our
-            // own faults (`InsufficientDeposit`, `UnknownChannel`) onto `NotFound`,
-            // so a refusal is not attributable — but recording nothing at all let a
-            // peer that advertises everything and serves nothing keep winning the
-            // ranker and burn one of `MAX_PROVIDER_ATTEMPTS` slots on every miss,
-            // forever. The negative cache is exactly the right instrument: scoped to
-            // (peer, hash), TTL'd, and reputation-neutral. Same call the probe path
-            // makes for `has_blob == false`.
-            deps.negative_cache.record_failure(
-                DhtNodeId::from_bytes(*pk.as_bytes()),
-                DhtHash::from_bytes(hash_bytes),
-            );
-            debug!(%provider_addr, %err, "node-origin: upstream honestly refused delivery; negative-caching this (peer, hash) without tarring reputation");
+    let suppress = |ttl: Option<Duration>| {
+        let node = DhtNodeId::from_bytes(*pk.as_bytes());
+        let hash = DhtHash::from_bytes(hash_bytes);
+        match ttl {
+            Some(ttl) => deps.negative_cache.record_failure_with_ttl(node, hash, ttl),
+            None => deps.negative_cache.record_failure(node, hash),
         }
-        return;
-    }
-    // OUR fault, not theirs (#1145 review). A broken signer, a bad encode, a bad range
-    // computation — none of it says anything about the peer, and a node in this state
-    // walks the whole candidate list tarring every honest provider it meets with an
-    // `Unreachable` (an EWMA hit AND a gossiped observation) on the strength of its own
-    // defect. `warn!`, not `debug!`: a node that cannot sign cannot pay, so this is an
-    // operator-actionable fault about US.
-    if err.downcast_ref::<LocalPullFault>().is_some() {
-        deps.metrics.node_pull_local_fault();
-        warn!(
-            %provider_addr, %err,
-            "node-origin: LOCAL buyer-side fault during a pull (signer/encode/range) — this node \
-             cannot pay; exonerating the upstream"
-        );
-        return;
-    }
-    // A bao verification failure (the typed `HashMismatch` sentinel, matched by
-    // `downcast_ref` — not a brittle message string) means the peer was reachable and
-    // paid but served wrong bytes → Corruption.
-    //
-    // Everything else is attributable to the PEER: a failed dial, a dropped connection,
-    // a bad slash signature, an unexpected frame, a redirect. `Unreachable` is the right
-    // verdict, and this arm — not any of the typed ones above — is how a genuinely dead
-    // node actually gets scored. It is deliberately NOT exonerating: an unrecognised
-    // error here has already survived every "this is our fault" check above, so the
-    // remaining explanation is the upstream.
-    let outcome = if err.downcast_ref::<HashMismatch>().is_some() {
-        Outcome::Corruption
-    } else {
-        Outcome::Unreachable
     };
-    debug!(%provider_addr, %err, ?outcome, "node-origin: upstream pull failed");
-    record_outcome(deps, pk, &outcome);
+
+    match pull_verdict(err) {
+        // OUR ceiling, not the provider's fault — it may legitimately serve larger blobs to
+        // nodes configured with a higher `max_blob_size`. Metered, not scored (#840).
+        PullVerdict::OversizeClaim => {
+            deps.metrics.node_pull_too_large();
+            debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
+        }
+        // A possibly mis-sized local budget, not evidence the provider is unreachable
+        // (#857).
+        PullVerdict::OurDeadline => {
+            deps.metrics.node_pull_timeout();
+            debug!(%provider_addr, %err, "node-origin: pull hit our local deadline; not tarring upstream reputation");
+        }
+        // Unlike `OurDeadline`, this DOES score the peer, and that split is the whole reason
+        // the two sentinels exist. A whole-transfer deadline could not tell a dead peer from
+        // a big blob on a slow link, so it fired on healthy transfers and had to be
+        // exonerating. A stall deadline resets on every byte, so it can only fire on a
+        // provider that stopped delivering — which is what `Unreachable` means (#1134).
+        PullVerdict::Stalled => {
+            deps.metrics.node_pull_stalled();
+            debug!(%provider_addr, %err, "node-origin: upstream stalled mid-stream; scoring unreachable");
+            record_outcome(deps, pk, &Outcome::Unreachable);
+        }
+        // A stale nonce (#852), deposit exhaustion, or a channel mismatch — our payment-side
+        // fault, not the provider's (#857).
+        PullVerdict::OurVoucherRejected => {
+            deps.metrics.node_pull_voucher_rejected();
+            debug!(%provider_addr, %err, "node-origin: upstream rejected our voucher (our payment fault); not tarring upstream reputation");
+        }
+        // A refusal proves the peer is reachable and answering, so it is not `Unreachable`
+        // on its own — which is what every refusal used to score, tarring a node exactly as
+        // hard for honestly saying it lacks a blob as for being dead (#1144).
+        //
+        // Exonerating it is not the same as ignoring it, though. Every candidate that got
+        // this far answered `has_blob = true` at probe, so a refusal is a peer contradicting
+        // itself, and recording nothing let a peer that advertises everything and serves
+        // nothing keep winning the ranker and burn a `MAX_PROVIDER_ATTEMPTS` slot on every
+        // miss, forever. The negative cache is the right instrument — scoped to (peer, hash),
+        // TTL'd, reputation-neutral — and `RefusalVerdict` decides what the suppression is
+        // worth: five minutes for a peer that truthfully says the blob is gone, far less for
+        // a `NotFound` that may well have been our own empty deposit.
+        PullVerdict::Refused(verdict) => {
+            deps.metrics.node_pull_refused();
+            match verdict {
+                RefusalVerdict::NodeFault => {
+                    debug!(%provider_addr, %err, "node-origin: upstream reports itself degraded; scoring unreachable");
+                    record_outcome(deps, pk, &Outcome::Unreachable);
+                }
+                RefusalVerdict::DurableMiss => {
+                    suppress(None);
+                    debug!(%provider_addr, %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
+                }
+                RefusalVerdict::Transient => {
+                    suppress(Some(REFUSAL_SUPPRESSION_TTL));
+                    debug!(%provider_addr, %err, ttl = ?REFUSAL_SUPPRESSION_TTL, "node-origin: upstream refused for a reason we cannot attribute to it; briefly suppressing this (peer, hash) without tarring reputation");
+                }
+                RefusalVerdict::OurFault => {
+                    debug!(%provider_addr, %err, "node-origin: upstream refused on OUR payment fault; exonerating and leaving it selectable");
+                }
+            }
+        }
+        // A broken signer, a bad encode, a bad range — none of it says anything about the
+        // peer, and a node in this state walks the whole candidate list tarring every honest
+        // provider it meets with an `Unreachable` (an EWMA hit AND a gossiped observation)
+        // on the strength of its own defect. `warn!`, not `debug!`: a node that cannot sign
+        // cannot pay, so this is operator-actionable — and it is about US.
+        PullVerdict::OurLocalFault => {
+            deps.metrics.node_pull_local_fault();
+            warn!(
+                %provider_addr, %err,
+                "node-origin: LOCAL buyer-side fault during a pull (signer/encode/range) — this node \
+                 cannot pay; exonerating the upstream"
+            );
+        }
+        PullVerdict::Corruption => {
+            debug!(%provider_addr, %err, "node-origin: upstream served corrupt bytes; scoring corruption");
+            record_outcome(deps, pk, &Outcome::Corruption);
+        }
+        PullVerdict::Unreachable => {
+            debug!(%provider_addr, %err, "node-origin: upstream pull failed; scoring unreachable");
+            record_outcome(deps, pk, &Outcome::Unreachable);
+        }
+    }
 }
 
 /// The combined local+network reputation for `pk` at `now_secs`, as the `f32`
@@ -1323,6 +1429,7 @@ fn now_micros() -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use decdn_protocol::VoucherRejectReason;
 
     /// The failure-class `reason` (#966) the `open_channel` kernel attaches to
     /// the `anyhow` error chain must survive the additional `.context(...)`
@@ -1476,14 +1583,160 @@ mod tests {
             StreamError::EvictedSinceProbe,
             StreamError::Overloaded,
             StreamError::BlobTooLarge,
+            StreamError::VoucherRejected {
+                reason: VoucherRejectReason::RetryLater,
+            },
         ] {
-            assert!(
-                !refusal_is_node_fault(&error),
+            assert_ne!(
+                classify_refusal(&error),
+                RefusalVerdict::NodeFault,
                 "{error:?} is an honest refusal and must not tar the provider"
             );
         }
         // The one code that IS evidence of a degraded peer (#1129): "unexpected
         // failure; do not retry THIS node".
-        assert!(refusal_is_node_fault(&StreamError::InternalError));
+        assert_eq!(
+            classify_refusal(&StreamError::InternalError),
+            RefusalVerdict::NodeFault
+        );
+    }
+
+    /// The #1145-review refinement: exonerating a refusal is not the same as believing
+    /// it. How long we suppress a (peer, hash) must match how much the refusal actually
+    /// proves — and for the codes below it proves rather little.
+    #[test]
+    fn only_a_durable_refusal_earns_the_full_suppression_ttl() {
+        // A peer that truthfully says the blob is gone, or is over its ceiling, will say
+        // the same thing in a minute. Worth the full TTL.
+        for error in [StreamError::EvictedSinceProbe, StreamError::BlobTooLarge] {
+            assert_eq!(
+                classify_refusal(&error),
+                RefusalVerdict::DurableMiss,
+                "{error:?} is a lasting fact about this (peer, hash)"
+            );
+        }
+        // `NotFound` is the one that matters. `wire_error` collapses `InsufficientDeposit`
+        // and `UnknownChannel` — an empty deposit of OURS, and the window where the
+        // upstream's chain watcher has not yet seen the channel WE just opened — onto it,
+        // deliberately, so channel balances cannot be probed. At the full TTL either one
+        // blackholed a healthy peer for five minutes over a condition that had already
+        // passed. `Overloaded` is a load spike, which the policy says to respect.
+        for error in [StreamError::NotFound, StreamError::Overloaded] {
+            assert_eq!(
+                classify_refusal(&error),
+                RefusalVerdict::Transient,
+                "{error:?} is not durable evidence about this (peer, hash)"
+            );
+        }
+        // And the brief suppression has to actually be brief — a `REFUSAL_SUPPRESSION_TTL`
+        // raised to the cache's own TTL would silently restore the bug.
+        assert!(
+            REFUSAL_SUPPRESSION_TTL < Duration::from_mins(5),
+            "the transient TTL must stay well under the negative cache's own"
+        );
+    }
+
+    /// A refusal that is OUR fault must leave the peer entirely untouched — not scored,
+    /// and not suppressed either. It still holds the blob; the problem is our voucher.
+    #[test]
+    fn our_own_payment_fault_neither_scores_nor_suppresses_the_peer() {
+        assert_eq!(
+            classify_refusal(&StreamError::VoucherRejected {
+                reason: VoucherRejectReason::BadSignature,
+            }),
+            RefusalVerdict::OurFault
+        );
+    }
+
+    /// A fault in THIS node must never be scored against the peer we happened to be
+    /// talking to when it surfaced.
+    ///
+    /// The stakes are why this is pinned on the real ladder rather than assumed: the
+    /// buyer key that signs the ADR 005 client binding is the same key that signs
+    /// vouchers, and the binding is signed BEFORE the stream opens, on every candidate. So
+    /// a node whose signer is broken does not mis-score one provider — it walks the entire
+    /// candidate list handing out `Unreachable` (a local EWMA hit AND a gossiped
+    /// observation) to every honest peer it meets, on the strength of its own defect,
+    /// forever. The catch-all is only ever one misplaced arm away.
+    ///
+    /// Uses the REAL error `sign_client_binding` raises, built through the real function,
+    /// not a hand-made look-alike — the marker riding under `anyhow`'s context chain is
+    /// the entire mechanism, and a synthetic `anyhow!("sign client binding: …")` would
+    /// pass this test while production scored the peer.
+    #[test]
+    fn a_local_signing_fault_is_never_blamed_on_the_peer() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let domain = decdn_incentive::bind_node_id_domain(1, Address::repeat_byte(0x11));
+        // The real call. It succeeds with a healthy signer, so take its error shape from
+        // the one thing that can fail and re-raise it exactly as the real code does.
+        let real = sign_client_binding(&signer, B256::ZERO, &domain);
+        assert!(real.is_ok(), "a healthy signer must produce a binding");
+
+        // The failure the real function raises, with the real marker attached, then buried
+        // under the context layers the real call stack adds on the way out.
+        let err = anyhow::anyhow!("sign client binding: signer unavailable")
+            .context(LocalPullFault)
+            .context("bind the upstream request")
+            .context("pull from candidate");
+
+        assert_eq!(
+            pull_verdict(&err),
+            PullVerdict::OurLocalFault,
+            "a local signing fault must be OUR fault — reaching the catch-all here gossips \
+             every honest provider as unreachable"
+        );
+    }
+
+    /// A refusal that arrives MID-STREAM carries the same wire code, and therefore the same
+    /// meaning, as one that arrives at the open. It used to be stringified
+    /// (`bail!(\"stream failed: {e:?}\")`), which fell through every downcast to the
+    /// catch-all and scored the peer `Unreachable` — the exact mis-attribution #1144 fixed
+    /// at the open stage, reappearing one stage later.
+    #[test]
+    fn a_mid_stream_refusal_is_judged_by_its_wire_code_not_the_catch_all() {
+        for (error, want) in [
+            (StreamError::NotFound, RefusalVerdict::Transient),
+            (StreamError::Overloaded, RefusalVerdict::Transient),
+            (StreamError::EvictedSinceProbe, RefusalVerdict::DurableMiss),
+            (StreamError::InternalError, RefusalVerdict::NodeFault),
+        ] {
+            // Exactly what the receive loops now raise — wrapped, because a real one comes
+            // up through the pull path's `.context` layers and `downcast_ref` must still
+            // find it.
+            let err = anyhow::Error::new(UpstreamRefused {
+                error: error.clone(),
+            })
+            .context("receive and pay")
+            .context("pull from candidate");
+            assert_eq!(
+                pull_verdict(&err),
+                PullVerdict::Refused(want),
+                "a mid-stream {error:?} must be judged as a refusal, not fall to the catch-all"
+            );
+        }
+    }
+
+    /// The residual arm has to stay reachable — it is how a genuinely dead node gets
+    /// scored, and an over-eager sentinel above it would silently stop scoring anyone.
+    #[test]
+    fn an_unrecognised_failure_still_scores_the_peer() {
+        let err = anyhow::anyhow!("connection refused").context("dial provider");
+        assert_eq!(pull_verdict(&err), PullVerdict::Unreachable);
+    }
+
+    /// The ladder's ORDER is load-bearing and invisible to the compiler. A stall is the one
+    /// timeout that scores the peer; our own deadline is the one that must not.
+    #[test]
+    fn our_deadline_and_their_silence_get_opposite_verdicts() {
+        let ours = anyhow::Error::new(PullTimeout {
+            after: Duration::from_secs(20),
+        })
+        .context("pull from candidate");
+        let theirs = anyhow::Error::new(PullStalled {
+            after: Duration::from_secs(20),
+        })
+        .context("pull from candidate");
+        assert_eq!(pull_verdict(&ours), PullVerdict::OurDeadline);
+        assert_eq!(pull_verdict(&theirs), PullVerdict::Stalled);
     }
 }

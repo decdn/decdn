@@ -2498,8 +2498,9 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
 // deadline was set EQUAL to the per-candidate budget (`node_pull_timeout_sec`),
 // so a pull needing more than one per-candidate budget's wall-clock (e.g.
 // candidate #1 stalls a full budget, then #2 delivers) was cancelled before it
-// could finish. The derived `outer_pull_deadline` (N×per + slack) must
-// accommodate it. A single slow origin taking longer than one per-candidate
+// could finish. The derived `outer_pull_deadline` (N × each candidate's three
+// sequential stages, + slack) must accommodate it. A single slow origin taking
+// longer than one per-candidate
 // budget models that scenario through the real handler — the layer the bug
 // actually lived in (the NodeOrigin-level fallthrough test cannot, since
 // `NodeOrigin::fetch` has no outer wrapper).
@@ -2626,7 +2627,8 @@ async fn pull_through_fills_under_deadline(
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Result<()> {
     let per = Duration::from_secs(1);
-    let slow = Duration::from_millis(1500); // > per, well under outer_pull_deadline(per)
+    let stall = Duration::from_secs(1);
+    let slow = Duration::from_millis(1500); // > per, well under outer_pull_deadline(per, stall)
 
     // Pre-#859 wiring: outer == per_candidate cancels the slow pull → store empty.
     anyhow::ensure!(
@@ -2635,8 +2637,11 @@ async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Resul
     );
     // Fixed wiring: the derived outer deadline accommodates it → store filled.
     anyhow::ensure!(
-        pull_through_fills_under_deadline(decdn_node::selection::outer_pull_deadline(per), slow)
-            .await?,
+        pull_through_fills_under_deadline(
+            decdn_node::selection::outer_pull_deadline(per, stall),
+            slow
+        )
+        .await?,
         "the derived outer deadline must let a pull exceeding one per-candidate budget complete"
     );
     Ok(())

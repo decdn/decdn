@@ -14,7 +14,7 @@ use std::time::Duration;
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
 /// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential
-/// per-candidate OPEN budgets when computing the outer pull-through deadline
+/// per-candidate costs when computing the outer pull-through deadline
 /// (#859). It covers the *one-time* discover → probe → rank overhead that runs
 /// under the outer deadline but is not per-candidate (probing is concurrent,
 /// bounded by a single probe timeout, so it does not scale with the attempt
@@ -32,13 +32,14 @@ pub const PULL_THROUGH_OUTER_SLACK: Duration = Duration::from_secs(10);
 /// right trade — a cache miss must fall through to another candidate in seconds,
 /// while an `openChannel` may legitimately need minutes to mine on a slow L2.
 ///
-/// Deliberately much smaller than `cache.node_pull_timeout_sec`: the channel open
-/// and the stream open are SEQUENTIAL stages of one candidate attempt, and
-/// [`outer_pull_deadline`] has to cover both for every candidate.
+/// Deliberately much smaller than `cache.node_pull_timeout_sec`: the channel open, the
+/// stream open, and the streaming stage are SEQUENTIAL stages of one candidate attempt,
+/// and [`outer_pull_deadline`] has to cover all three for every candidate.
 pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 
-/// Outer deadline for a node-to-node pull-through, derived from the configured
-/// *per-candidate* timeout (`cache.node_pull_timeout_sec`).
+/// Outer deadline for a node-to-node pull-through, derived from the two configured
+/// per-candidate budgets: the stream-open timeout (`cache.node_pull_timeout_sec`) and
+/// the streaming inactivity timeout (`cache.node_pull_stall_timeout_sec`).
 ///
 /// The delivery handler wraps the whole `discover → probe → rank → pull` fetch
 /// in a single `tokio::time::timeout`. For the sequential `MAX_PROVIDER_ATTEMPTS`
@@ -50,36 +51,48 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 ///
 /// # What one candidate actually costs
 ///
-/// TWO sequential bounded stages, not one:
+/// THREE sequential bounded stages:
 ///
 /// 1. the **channel open** — [`CHANNEL_OPEN_CALLER_BUDGET`] (#1143); then
 /// 2. the **stream open** — connect → handshake → verified `StreamResponse`,
-///    bounded by `per_candidate` (#1134).
+///    bounded by `per_candidate` (#1134); then
+/// 3. **streaming**, which for a peer that opens honestly and then goes SILENT costs
+///    one full inactivity window (`stall`) before the pull gives up on it (#1134).
 ///
-/// So the worst case for a candidate is `CHANNEL_OPEN_CALLER_BUDGET + per_candidate`,
-/// and that — not `per_candidate` alone — is what this must budget `MAX_PROVIDER_ATTEMPTS`
-/// of, plus [`PULL_THROUGH_OUTER_SLACK`] of one-time discovery overhead. Budgeting one
-/// stage per candidate is what let a cold cache against a slow L2 burn the whole outer
-/// deadline on candidates #1 and #2 and never dial #3.
+/// So the worst case for a candidate is `CHANNEL_OPEN_CALLER_BUDGET + per_candidate + stall`,
+/// and that is what this must budget `MAX_PROVIDER_ATTEMPTS` of, plus
+/// [`PULL_THROUGH_OUTER_SLACK`] of one-time discovery overhead.
+///
+/// Every stage has to be a term here, and each one was learned the same way. Budgeting
+/// only `per_candidate` let a cold cache against a slow L2 burn the whole deadline on
+/// candidates #1 and #2 and never dial #3. Adding the channel open but not the stall
+/// window left the same hole for a peer that goes silent mid-stream instead of failing
+/// to open — and made it *worse*, because `stall` is operator-tunable: at
+/// `node_pull_stall_timeout_sec = 120` a single silent candidate outlasts the whole
+/// two-term deadline on its own. Taking `stall` as an argument is what keeps the two
+/// from drifting apart again.
 ///
 /// # What this deadline does not bound
 ///
-/// A candidate's **streaming** stage is bounded by inactivity
-/// (`node_pull_stall_timeout_sec`) rather than a wall clock, because a wall clock over
-/// the bytes caps the blob size a node can pull through (#1134). So a candidate that is
-/// **slow but progressing** can consume the whole outer deadline on its own. That is
-/// correct: it is succeeding, and falling through mid-stream would restart the download
-/// from zero against another peer. The foreground request gives up (a clean miss) while
-/// the transfer continues in the detached background warm, which runs to a far larger
-/// backstop (`BACKGROUND_FILL_HARD_CAP`) for exactly this reason.
+/// A candidate's streaming stage is bounded by *inactivity* rather than a wall clock,
+/// because a wall clock over the bytes caps the blob size a node can pull through
+/// (#1134). The `stall` term above is therefore the cost of a candidate that **stops**
+/// — not a ceiling on one that keeps going. A candidate that is **slow but progressing**
+/// resets that clock on every byte and can consume the whole outer deadline on its own.
+///
+/// That is correct: it is succeeding, and falling through mid-stream would restart the
+/// download from zero against another peer. The foreground request gives up (a clean
+/// miss) while the transfer continues in the detached background warm, which runs to a
+/// far larger backstop (`BACKGROUND_FILL_HARD_CAP`) for exactly this reason.
 ///
 /// So this is best read as a bound on how long a **client** waits, not on how long
 /// an acquisition takes.
 #[must_use]
-pub fn outer_pull_deadline(per_candidate: Duration) -> Duration {
+pub fn outer_pull_deadline(per_candidate: Duration, stall: Duration) -> Duration {
     let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
     CHANNEL_OPEN_CALLER_BUDGET
         .saturating_add(per_candidate)
+        .saturating_add(stall)
         .saturating_mul(attempts)
         .saturating_add(PULL_THROUGH_OUTER_SLACK)
 }
@@ -421,26 +434,48 @@ mod tests {
     // cost, so the outer `tokio::time::timeout` can never preempt the fallback loop
     // when early candidates stall.
     //
-    // Asserted against the REAL worst case per candidate — the channel open AND the
-    // stream open, which are sequential (#1143) — not against the formula's own
-    // arithmetic. Restated as `per_candidate` alone this test passes while the loop
-    // silently cannot reach candidate #3, which is precisely what shipped.
+    // Asserted against the REAL worst case per candidate — all THREE sequential stages
+    // (channel open, stream open, one silent streaming window) — not against the
+    // formula's own arithmetic. Restated with any stage missing, this test passes while
+    // the loop silently cannot reach the last candidate. Both of the deadline's shipped
+    // versions were wrong in exactly that way, one stage apart.
+    //
+    // `stall` is swept independently of `per` because it is the term an operator can
+    // raise on its own: a formula that ignores it looks fine at defaults and starves the
+    // loop at `node_pull_stall_timeout_sec = 120`.
     #[test]
     fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
         let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
         for per_secs in [1_u64, 5, 20, 60] {
-            let per = Duration::from_secs(per_secs);
-            let outer = outer_pull_deadline(per);
-            // One candidate = channel open, then stream open.
-            let worst_candidate = CHANNEL_OPEN_CALLER_BUDGET.saturating_add(per);
-            let all_candidates = worst_candidate.saturating_mul(attempts);
-            assert!(
-                outer > all_candidates,
-                "outer {outer:?} must exceed {MAX_PROVIDER_ATTEMPTS}×{worst_candidate:?} \
-                 (channel open + stream open), or the loop cannot reach the last candidate"
-            );
-            assert_eq!(outer, all_candidates + PULL_THROUGH_OUTER_SLACK);
+            for stall_secs in [1_u64, 5, 20, 120] {
+                let per = Duration::from_secs(per_secs);
+                let stall = Duration::from_secs(stall_secs);
+                let outer = outer_pull_deadline(per, stall);
+                // One candidate = channel open, then stream open, then a silent stream.
+                let worst_candidate = CHANNEL_OPEN_CALLER_BUDGET
+                    .saturating_add(per)
+                    .saturating_add(stall);
+                let all_candidates = worst_candidate.saturating_mul(attempts);
+                assert!(
+                    outer > all_candidates,
+                    "outer {outer:?} must exceed {MAX_PROVIDER_ATTEMPTS}×{worst_candidate:?} \
+                     (channel open + stream open + stall), or the loop cannot reach the \
+                     last candidate"
+                );
+                assert_eq!(outer, all_candidates + PULL_THROUGH_OUTER_SLACK);
+            }
         }
+    }
+
+    // The defaults an operator actually runs: `node_pull_timeout_sec = 20` and
+    // `node_pull_stall_timeout_sec = 20` (both `DEFAULT_*` in decdn-common, which this
+    // crate does not depend on — hence the literals). Pinned because the worst-case
+    // client wait is a user-visible number quoted in the CLI help and the metrics docs,
+    // and it moved twice while the formula was being corrected.
+    #[test]
+    fn outer_pull_deadline_at_defaults_is_145s() {
+        let outer = outer_pull_deadline(Duration::from_secs(20), Duration::from_secs(20));
+        assert_eq!(outer, Duration::from_secs(145), "(5 + 20 + 20) × 3 + 10");
     }
 
     // A zero per-candidate budget still yields a positive outer deadline (the
@@ -450,12 +485,20 @@ mod tests {
     fn outer_pull_deadline_handles_edges() {
         let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
         assert_eq!(
-            outer_pull_deadline(Duration::ZERO),
+            outer_pull_deadline(Duration::ZERO, Duration::ZERO),
             CHANNEL_OPEN_CALLER_BUDGET.saturating_mul(attempts) + PULL_THROUGH_OUTER_SLACK
         );
         // Saturates to MAX rather than overflowing/panicking — guards against a
-        // future switch to non-saturating arithmetic.
-        assert_eq!(outer_pull_deadline(Duration::MAX), Duration::MAX);
+        // future switch to non-saturating arithmetic. Checked on each term
+        // independently, since either one alone can saturate the sum.
+        assert_eq!(
+            outer_pull_deadline(Duration::MAX, Duration::ZERO),
+            Duration::MAX
+        );
+        assert_eq!(
+            outer_pull_deadline(Duration::ZERO, Duration::MAX),
+            Duration::MAX
+        );
     }
 
     // ADR 001 multiplier table: rep=1.0 → 1×, 0.8 → 1.56×, 0.5 → 4×, 0.3 → 11.1×, 0.1 → 100×.

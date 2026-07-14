@@ -413,6 +413,9 @@ impl std::error::Error for UpstreamVoucherRejected {}
 /// cache-miss annotation, and the loopback tests match on.
 #[derive(Debug)]
 pub struct UpstreamRefused {
+    /// The wire code the upstream signed. Always a `StreamError` as it appeared on the
+    /// wire — never a server-side `ServeRejectReason`, whose seven-way collapse onto
+    /// `NotFound` is deliberate and one-way (`handlers::client::wire_error`).
     pub error: StreamError,
 }
 
@@ -442,24 +445,34 @@ impl std::error::Error for UpstreamRefused {}
 /// That IS evidence the peer is unreachable, and `classify_pull_failure` scores it
 /// as such.
 ///
-/// The bound rests on the non-empty-`ChunkData` invariant (#1088): with empty frames
-/// banned, a peer cannot hold the deadline open with padding that carries no bytes.
+/// # What the bound rests on
 ///
-/// The two pull paths lean on that invariant differently, and it is worth being precise
-/// about which guarantee you have where:
+/// Entirely on the non-empty-`ChunkData` invariant (#1088), on BOTH pull paths. With
+/// empty frames banned, "a frame arrived" and "bytes made progress" are the same
+/// statement, so a peer cannot hold the deadline open with padding — which is the only
+/// reason a stall is attributable to the peer at all, and therefore the only reason this
+/// may score reputation where [`PullTimeout`] may not.
 ///
-/// - the BUFFERED loop (`receive_and_pay`) holds one `Instant` deadline and resets it
-///   only where `cumulative` actually advances — never merely because a frame arrived —
-///   so a run of non-chunk frames cannot refresh it either. Belt-and-braces.
-/// - the PROGRESSIVE path ([`UpstreamPull::next_chunk`]) re-arms a fresh per-call
-///   `tokio::time::timeout` on every read, so it rests on the #1088 floor ALONE: it is
-///   safe because there is no frame a peer can send that makes no progress, not because
-///   of any independent progress check.
+/// Neither path has an independent progress check behind that floor. The buffered loop
+/// (`receive_and_pay`) resets its deadline inside the `ChunkData` arm, and the
+/// progressive path ([`UpstreamPull::next_chunk`]) re-arms a fresh per-call
+/// `tokio::time::timeout` on every read; both are safe because no frame a peer can send
+/// makes zero progress, not because either one verifies that it did.
 ///
-/// A change that weakened the floor would therefore break the progressive path first,
-/// and silently.
+/// This doc used to claim the buffered loop reset "only where `cumulative` actually
+/// advances — belt-and-braces", contrasted with the progressive path resting on the floor
+/// "ALONE". That was false: the reset was unconditional within the arm, and both paths
+/// rested on the floor alone. The claim is worth remembering as a hazard, because its
+/// effect was to advertise slack that did not exist — a future reader, told the buffered
+/// loop was independently protected, could have relaxed #1088 and silently broken the
+/// stall detector on every path at once.
+///
+/// Since the #1145 review the floor is structural rather than advisory — `ChunkData`'s
+/// field is private, and its constructor and decode gate both reject an empty payload —
+/// so it can no longer be relaxed by forgetting to call a validator.
 #[derive(Debug)]
 pub struct PullStalled {
+    /// The inactivity budget that elapsed with no byte of progress.
     pub after: Duration,
 }
 
@@ -568,9 +581,9 @@ impl PullDeadlines {
     /// name reads far more like a legitimate policy choice than it is.
     ///
     /// Note what it quietly costs, beyond re-introducing the size-coupled deadline:
-    /// because `hard_cap == stall`, and the cap's clock starts at the top of the
-    /// exchange while the stall clock only starts once bytes begin, **the hard cap
-    /// always elapses first — so [`PullStalled`] can never fire under it.** A pull
+    /// because `hard_cap == stall`, and the cap's clock starts at the top of the whole
+    /// exchange while the stall clock starts only once the open has completed, **the hard
+    /// cap always elapses first — so [`PullStalled`] can never fire under it.** A pull
     /// built this way silently cannot detect a stalled peer, and so cannot score one.
     /// Every loopback test using this helper is exercising a pull with the stall
     /// signal disabled; the stall path is covered by
@@ -1092,10 +1105,11 @@ async fn receive_and_pay(
     // handed to the ledger (which accumulates deltas across this and any concurrent
     // streams on the channel, advancing only after the upstream acks).
     let mut bytes_since_voucher: u64 = 0;
-    // The inactivity deadline (#1134). Reset ONLY where `cumulative` advances —
-    // not on every frame — so neither a run of non-chunk frames nor (were #1088's
-    // floor ever relaxed) a run of empty ones could hold it open without
-    // delivering anything.
+    // The inactivity deadline (#1134). Reset only inside the `ChunkData` arm below —
+    // never on a non-chunk frame — and a `ChunkData` that exists carries at least one
+    // byte, because `ChunkData::new` and the decode gate are the only ways to obtain
+    // one (#1088). So every refresh of this clock is paid for in bytes, which is the
+    // property `PullStalled` rests on: a peer cannot hold the deadline open with padding.
     let mut deadline = tokio::time::Instant::now() + stall;
 
     loop {
@@ -1104,35 +1118,29 @@ async fn receive_and_pay(
             .map_err(|_| anyhow::Error::new(PullStalled { after: stall }))??;
         match msg {
             ClientMessage::ChunkData(chunk) => {
-                // A chunk must carry 1..=CHUNK_SIZE bytes, and the running total
-                // must not exceed what the response promised — otherwise a
-                // malicious server could stream unbounded bytes (OOM) and we
-                // would overpay (ADR 005 §`cdn/client/v1`). The non-empty floor
-                // (#1088) is what makes every frame a unit of progress: an empty
-                // one advances neither `cumulative` nor `bytes_since_voucher`, so
-                // a run of them would spin this loop below the overrun guard (and
-                // below the inactivity deadline, which resets only on bytes).
-                chunk.validate()?;
-                cumulative = cumulative.saturating_add(chunk.bytes.len() as u64);
+                // The running total must not exceed what the response promised —
+                // otherwise a malicious server could stream unbounded bytes (OOM) and
+                // we would overpay (ADR 005 §`cdn/client/v1`). The 1..=CHUNK_SIZE bounds
+                // needed no check here: the frame could not have been decoded otherwise.
+                let chunk_len = chunk.bytes().len() as u64;
+                cumulative = cumulative.saturating_add(chunk_len);
                 if cumulative > expected_wire_bytes {
                     anyhow::bail!(
                         "server sent {cumulative} bytes, more than the {expected_wire_bytes} promised"
                     );
                 }
                 // Bytes arrived: the upstream is alive, so extend the inactivity
-                // deadline. It also extends after a completed voucher round trip
-                // below — but both sites sit inside this `ChunkData` arm, past the
-                // point where `cumulative` advanced, so only byte progress can ever
-                // refresh it. That is the property `PullStalled` rests on.
+                // deadline. It also extends after a completed voucher round trip below;
+                // both sites are inside this arm, and reaching this arm means bytes.
                 deadline = tokio::time::Instant::now() + stall;
-                buf.extend_from_slice(&chunk.bytes);
+                buf.extend_from_slice(chunk.bytes());
                 // Surface delivery progress after each chunk. `cumulative` and
                 // `expected_wire_bytes` are both wire bytes, so the readout is
                 // consistent (and can't overshoot — the guard above caps it).
                 if let Some(cb) = on_progress {
                     cb(cumulative, expected_wire_bytes);
                 }
-                bytes_since_voucher = bytes_since_voucher.saturating_add(chunk.bytes.len() as u64);
+                bytes_since_voucher = bytes_since_voucher.saturating_add(chunk_len);
                 // Pay at each interval boundary, and a closing voucher once all
                 // expected bytes have arrived — matching the node's pacing.
                 let boundary = bytes_since_voucher >= interval_bytes && interval_bytes > 0;
@@ -1156,7 +1164,15 @@ async fn receive_and_pay(
                 }
             }
             ClientMessage::StreamEnd => break,
-            ClientMessage::StreamError(e) => anyhow::bail!("stream failed: {e:?}"),
+            ClientMessage::StreamError(e) => {
+                // TYPED, exactly as at the open stage (#1144). Stringified, a mid-stream
+                // refusal fell through every `downcast_ref` in `classify_pull_failure` to
+                // the catch-all and scored the peer `Unreachable` — the very
+                // mis-attribution #1144 fixed, reappearing one stage later. The wire code
+                // carries the same meaning here as it does in a `StreamResponse`, so let
+                // the one classifier judge both.
+                return Err(anyhow::Error::new(UpstreamRefused { error: e }));
+            }
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
     }
@@ -1520,13 +1536,14 @@ impl UpstreamPull {
             .map_err(|_| anyhow::Error::new(PullStalled { after: self.stall }))??;
         match msg {
             ClientMessage::ChunkData(chunk) => {
-                // Bounds the payload on BOTH sides: the ceiling caps per-frame
-                // allocation, and the non-empty floor keeps every frame a unit of
-                // progress, so a peer cannot spin this loop (or refresh its
-                // inactivity deadline) with an unbounded run of empty frames
-                // (#1088).
-                chunk.validate()?;
-                self.cumulative = self.cumulative.saturating_add(chunk.bytes.len() as u64);
+                // The payload is bounded on both sides by construction (#1088): the
+                // ceiling caps per-frame allocation, and the non-empty floor keeps every
+                // frame a unit of progress, so a peer cannot spin this loop — or refresh
+                // the inactivity deadline above — with a run of empty frames. This path
+                // has no belt-and-braces byte-progress check behind that floor, and does
+                // not need one now the floor is structural.
+                let chunk_len = chunk.bytes().len() as u64;
+                self.cumulative = self.cumulative.saturating_add(chunk_len);
                 if self.cumulative > self.expected_wire_bytes {
                     anyhow::bail!(
                         "server sent {} bytes, more than the {} promised",
@@ -1539,7 +1556,7 @@ impl UpstreamPull {
                 // verifying decoder (`import_and_verify_stream`), which checks the
                 // cached copy against the root (ADR 038); the downstream client
                 // verifies its own copy with its decoder.
-                self.unvouchered = self.unvouchered.saturating_add(chunk.bytes.len() as u64);
+                self.unvouchered = self.unvouchered.saturating_add(chunk_len);
                 let boundary = self.unvouchered >= self.interval_bytes && self.interval_bytes > 0;
                 let closing = self.cumulative >= self.expected_wire_bytes && self.unvouchered > 0;
                 if boundary || closing {
@@ -1547,13 +1564,21 @@ impl UpstreamPull {
                     self.pay_one(delta).await?;
                     self.unvouchered = 0;
                 }
-                Ok(Some(Bytes::from(chunk.bytes)))
+                Ok(Some(Bytes::from(chunk.into_bytes())))
             }
             ClientMessage::StreamEnd => {
                 self.ended = true;
                 Ok(None)
             }
-            ClientMessage::StreamError(e) => anyhow::bail!("stream failed: {e:?}"),
+            ClientMessage::StreamError(e) => {
+                // TYPED, exactly as at the open stage (#1144). Stringified, a mid-stream
+                // refusal fell through every `downcast_ref` in `classify_pull_failure` to
+                // the catch-all and scored the peer `Unreachable` — the very
+                // mis-attribution #1144 fixed, reappearing one stage later. The wire code
+                // carries the same meaning here as it does in a `StreamResponse`, so let
+                // the one classifier judge both.
+                Err(anyhow::Error::new(UpstreamRefused { error: e }))
+            }
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
     }
@@ -1581,7 +1606,15 @@ impl UpstreamPull {
                 ClientMessage::ChunkData(_) => {
                     anyhow::bail!("server sent ChunkData after the promised total")
                 }
-                ClientMessage::StreamError(e) => anyhow::bail!("stream failed: {e:?}"),
+                ClientMessage::StreamError(e) => {
+                    // TYPED, exactly as at the open stage (#1144). Stringified, a mid-stream
+                    // refusal fell through every `downcast_ref` in `classify_pull_failure` to
+                    // the catch-all and scored the peer `Unreachable` — the very
+                    // mis-attribution #1144 fixed, reappearing one stage later. The wire code
+                    // carries the same meaning here as it does in a `StreamResponse`, so let
+                    // the one classifier judge both.
+                    return Err(anyhow::Error::new(UpstreamRefused { error: e }));
+                }
                 other => {
                     anyhow::bail!("unexpected message at stream end: {}", variant_name(&other))
                 }

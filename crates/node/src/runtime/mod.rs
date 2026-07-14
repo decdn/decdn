@@ -1074,7 +1074,8 @@ pub async fn run(
     // so an outer deadline equal to the per-candidate timeout would cancel the
     // fetch the instant candidate #1 stalls, before the `MAX_PROVIDER_ATTEMPTS`
     // fallback loop ever reaches candidates #2..N (#859). `outer_pull_deadline`
-    // budgets all N per-candidate budgets plus one-time discovery slack. Whether
+    // budgets all three of each candidate's sequential stages — channel open, stream
+    // open, and one silent-streaming window — plus one-time discovery slack. Whether
     // the pull can actually succeed additionally depends on the `NodeOrigin`
     // being provisioned below (buyer service + address resolver bootstrapped);
     // an unprovisioned origin just makes the `get` a fast miss.
@@ -1096,16 +1097,18 @@ pub async fn run(
         // A single local origin-chain walk (fs/http/s3), NOT a provider fan-out —
         // so budget it at the per-attempt `node_pull_timeout_sec`, not
         // `outer_pull_deadline` (which budgets `MAX_PROVIDER_ATTEMPTS ×
-        // per_candidate + PULL_THROUGH_OUTER_SLACK` for the sequential node→node
-        // pull). Using the outer deadline would let a wedged local origin block
-        // several times longer (>3×, and more at small per-attempt budgets where
-        // the fixed slack dominates) before falling through to the node→node paths.
+        // (CHANNEL_OPEN_CALLER_BUDGET + per_candidate + stall) + PULL_THROUGH_OUTER_SLACK`
+        // for the sequential node→node pull). Using the outer deadline would let a
+        // wedged local origin block many times longer (>7× at defaults, and more at
+        // small per-attempt budgets where the fixed slack dominates) before falling
+        // through to the node→node paths.
         let local_deadline = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
         client_handler.attach_local_populate(local_deadline);
     }
     if cfg.cache.node_to_node_pull_through_enabled {
         let per_candidate = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
-        let outer_deadline = crate::selection::outer_pull_deadline(per_candidate);
+        let stall = Duration::from_secs(cfg.cache.node_pull_stall_timeout_sec);
+        let outer_deadline = crate::selection::outer_pull_deadline(per_candidate, stall);
         client_handler.attach_pull_through(outer_deadline);
         // Background fill keeps warming the cache after the delivery path gives up.
         //
@@ -1113,7 +1116,8 @@ pub async fn run(
         // how long a *client* waits, but the warm has no client waiting on it, and
         // capping it at the budget the foreground just exhausted meant a blob too
         // large to fetch in one deadline could never be warmed either — the node
-        // could not acquire any blob needing more than ~70 s of transfer.
+        // could not acquire any blob needing more transfer time than the derived
+        // deadline (145 s at defaults) allows.
         //
         // But "not the foreground deadline" is not the same as "no bound", and the
         // first cut of this got that wrong. The streaming stage is bounded by
@@ -1124,13 +1128,15 @@ pub async fn run(
         // of the process. An inactivity bound is not a liveness bound.
         //
         // So: a generous absolute backstop, sized as a leak guard rather than a
-        // health signal. It is ~50× the foreground deadline, so it constrains no
+        // health signal. It is ~25× the foreground deadline, so it constrains no
         // honest transfer the node's `max_blob_size_mb` ceiling permits; it exists
         // only so a pathological upstream cannot pin a task and poison a hash
-        // indefinitely.
+        // indefinitely. `max_blob_size_mb` additionally bounds how much memory the
+        // concurrent warms can hold (see `MAX_BACKGROUND_FILL_BYTES`).
         client_handler.attach_background_fill(
             pull_through_bg_shutdown.clone(),
             Some(crate::handlers::client::BACKGROUND_FILL_HARD_CAP),
+            cfg.cache.max_blob_size_mb,
         );
         // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
         // available, serve cache misses by fusing the upstream pull with

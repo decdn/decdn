@@ -1701,9 +1701,7 @@ async fn serve_wrong_bytes(
     for chunk in served.chunks(CHUNK_SIZE) {
         write_frame(
             &mut send,
-            &encode_message(&ClientMessage::ChunkData(ChunkData {
-                bytes: chunk.to_vec(),
-            }))?,
+            &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
         )
         .await
         .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
@@ -1828,9 +1826,7 @@ async fn serve_gated_correct_bytes(
     for chunk in served.chunks(CHUNK_SIZE) {
         write_frame(
             &mut send,
-            &encode_message(&ClientMessage::ChunkData(ChunkData {
-                bytes: chunk.to_vec(),
-            }))?,
+            &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
         )
         .await
         .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
@@ -2021,9 +2017,7 @@ async fn serve_then_reject_voucher(
     for chunk in served.chunks(CHUNK_SIZE) {
         write_frame(
             &mut send,
-            &encode_message(&ClientMessage::ChunkData(ChunkData {
-                bytes: chunk.to_vec(),
-            }))?,
+            &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
         )
         .await
         .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
@@ -2530,6 +2524,10 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
             (*a_id.as_bytes(), "DE".to_string()),
         ]),
     ))));
+    // Generous: this fixture wedges at the CHANNEL-OPEN stage, so the streaming
+    // inactivity bound must never be what ends a candidate here. It still has to be a
+    // real value — it is a term of the outer deadline.
+    let stall_budget = Duration::from_secs(20);
     let per_candidate = Duration::from_secs(2);
     let origin = build_origin_with_timeout(
         &ep_b,
@@ -2543,21 +2541,21 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
         vec![w_dht, w2_dht, a_dht],
         addr_map,
         per_candidate,
-        // The REAL production outer deadline, derived the way the runtime derives it,
-        // rather than an arbitrary generous number — so the loop is held to the budget
-        // it actually gets. (At this small a `per_candidate` the pre-fix formula also
-        // fits, so this is not what catches a regression in the deadline ARITHMETIC —
-        // `selection::outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost`
-        // is. What this pins is that the loop reaches the third and last candidate.)
-        outer_pull_deadline(per_candidate),
+        stall_budget,
         0,
     );
 
     // The loop must abandon BOTH wedged candidates on their own budgets and still
-    // deliver from A — inside the outer deadline the runtime would really give it.
+    // deliver from A — inside the outer deadline the runtime would really give it,
+    // derived the way the runtime derives it rather than an arbitrary generous number.
     // Before #1143 the wedged open was unbounded, so this future never resolved at all.
+    //
+    // At these small budgets both of the deadline's earlier (under-counting) formulas
+    // also fit, so this is not what catches a regression in the deadline ARITHMETIC —
+    // `selection::outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost`
+    // is. What this pins is that the loop reaches the third and last candidate.
     let fetched = tokio::time::timeout(
-        outer_pull_deadline(per_candidate),
+        outer_pull_deadline(per_candidate, stall_budget),
         Origin::fetch(&origin, hash, u64::MAX),
     )
     .await
@@ -3450,6 +3448,29 @@ fn honest_bao_wire(payload: &[u8]) -> Result<Vec<u8>> {
 /// instead of failing it. Pacing the frames makes each read genuinely pend, so
 /// the spin stays a spin but the test can observe it and fail. An empty frame
 /// every millisecond is exactly as unbounded, and advances exactly as little.
+/// Hand-forge the wire bytes of a zero-length `ChunkData` frame — the thing #1088 bans.
+///
+/// It cannot be built through the type any more: `ChunkData`'s field is private and both
+/// `ChunkData::new` and its `#[serde(try_from)]` decode gate reject an empty payload. That
+/// is precisely the fix, and it is why this helper exists rather than a struct literal: a
+/// hostile peer is not a Rust caller and is not bound by our constructors. It writes
+/// whatever it likes on the wire, so the adversary has to be modelled there.
+///
+/// Postcard encodes the payload as a length-prefixed byte slice, so a valid single-byte
+/// frame is `<variant><len=1><byte>` and the empty one we want is `<variant><len=0>`.
+/// Derived from a real encoding rather than a literal so it cannot drift if the variant
+/// index or framing changes.
+fn encode_empty_chunk_frame() -> Result<Vec<u8>> {
+    let mut frame = encode_message(&ClientMessage::ChunkData(ChunkData::new(vec![0x00])?))?;
+    anyhow::ensure!(
+        frame.len() >= 2 && frame.pop() == Some(0x00) && frame.pop() == Some(0x01),
+        "expected a one-byte ChunkData to encode as <variant><len=1><byte>; \
+         the framing changed and this forgery needs rewriting"
+    );
+    frame.push(0x00); // len = 0
+    Ok(frame)
+}
+
 async fn serve_empty_chunks(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
@@ -3469,7 +3490,7 @@ async fn serve_empty_chunks(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-    let empty = encode_message(&ClientMessage::ChunkData(ChunkData { bytes: Vec::new() }))?;
+    let empty = encode_empty_chunk_frame()?;
     loop {
         tokio::time::sleep(EMPTY_CHUNK_GAP).await;
         if write_frame(&mut send, &empty).await.is_err() {
@@ -3544,9 +3565,10 @@ async fn serve_then_go_silent(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-    let chunk = encode_message(&ClientMessage::ChunkData(ChunkData {
-        bytes: vec![0x5Au8; CHUNK_SIZE],
-    }))?;
+    let chunk = encode_message(&ClientMessage::ChunkData(ChunkData::new(vec![
+        0x5Au8;
+        CHUNK_SIZE
+    ])?))?;
     for _ in 0..prefix_chunks {
         write_frame(&mut send, &chunk)
             .await
@@ -3586,6 +3608,97 @@ fn spawn_a_mid_stream_silent_server(
                     let _ =
                         serve_then_go_silent(conn, &eth, &dom, total_bytes, rate, prefix_chunks)
                             .await;
+                });
+            }
+        }
+    })
+}
+
+/// A provider that opens honestly, delivers a few real frames, and then sends a
+/// `StreamError` MID-STREAM (#1145 review).
+///
+/// The stage is what makes this distinct. A refusal at the OPEN arrives in the
+/// `StreamResponse` (`ok: false`) and has been typed since #1144. The same wire code
+/// arriving *mid-delivery* took a different code path entirely — three
+/// `bail!("stream failed: {e:?}")` sites that stringified it — so it fell through every
+/// `downcast_ref` in `classify_pull_failure` to the catch-all and scored the peer
+/// `Unreachable`. Same code, same meaning, opposite verdict, decided by nothing but which
+/// frame it rode in on.
+async fn serve_then_error_mid_stream(
+    conn: Connection,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    total_bytes: u64,
+    rate: u64,
+    error: StreamError,
+) -> Result<()> {
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
+    let req = read_stream_request(&mut recv).await?;
+    // An HONEST open: ok == true, signed. The peer has proven it is reachable and
+    // answering — everything after this is about how it stops.
+    let resp = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    write_frame(
+        &mut send,
+        &encode_message(&ClientMessage::StreamResponse(resp))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    let chunk = encode_message(&ClientMessage::ChunkData(ChunkData::new(vec![
+        0x77u8;
+        CHUNK_SIZE
+    ])?))?;
+    // Two real frames, well under the 1 MiB voucher interval, so no voucher round trip
+    // intrudes and the loop is unambiguously mid-delivery when the error lands.
+    for _ in 0..2 {
+        write_frame(&mut send, &chunk)
+            .await
+            .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
+    }
+    write_frame(
+        &mut send,
+        &encode_message(&ClientMessage::StreamError(error))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write stream error: {e}"))?;
+    // Flush and hold the connection until the peer closes it. Dropping `conn` here would
+    // RESET the stream, and the requester would see a transport error instead of the frame
+    // — which lands in the catch-all and scores `Unreachable`, i.e. it would look exactly
+    // like the bug this test is here to catch, for entirely the wrong reason.
+    let _ = send.finish();
+    conn.closed().await;
+    Ok(())
+}
+
+/// Spawn a provider that answers probes truthfully, opens honestly, and then fails the
+/// delivery with a mid-stream `StreamError` (see [`serve_then_error_mid_stream`]).
+fn spawn_a_mid_stream_error_server(
+    ep: iroh::Endpoint,
+    a_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    total_bytes: u64,
+    rate: u64,
+    error: StreamError,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let eth = Arc::clone(&a_eth);
+            let dom = slash.clone();
+            let err = error.clone();
+            if conn.alpn() == ALPN_PROBE {
+                tokio::spawn(async move {
+                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    let _ =
+                        serve_then_error_mid_stream(conn, &eth, &dom, total_bytes, rate, err).await;
                 });
             }
         }
@@ -3718,7 +3831,7 @@ const EMPTY_CHUNK_ASSERT_WINDOW: Duration = Duration::from_secs(10);
 ///
 /// `ChunkData::validate` has a unit test; this is the one that proves the receive
 /// loop CALLS it. With the call reverted to the old ceiling-only check
-/// (`if chunk.bytes.len() > CHUNK_SIZE { bail }`), an empty frame passes every
+/// (`if chunk.bytes().len() > CHUNK_SIZE { bail }`), an empty frame passes every
 /// other guard in the loop (see [`serve_empty_chunks`]) and the fetch spins until
 /// the 30 s inactivity deadline — so the timeout below, not the `NotFound`, is
 /// the assertion.
@@ -4051,6 +4164,342 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
     ep_b.close().await;
     ep_a.close().await;
     task_a.abort();
+    Ok(())
+}
+
+/// #1145 review — a `StreamError` that arrives MID-STREAM must be judged by its wire code,
+/// exactly as one that arrives at the open is (#1144).
+///
+/// The three mid-stream receive sites used to `bail!("stream failed: {e:?}")`, throwing the
+/// typed code away. The resulting error matched no sentinel in `classify_pull_failure` and
+/// landed in the catch-all, scoring the peer `Unreachable` — so a node that honestly
+/// reported `NotFound` after an eviction race mid-delivery was punished exactly as hard as
+/// a dead one. That is the bug #1144 fixed at the open stage, alive one stage downstream.
+///
+/// Driven through the REAL receive loop against a real upstream that opens honestly and
+/// then errors, so the assertion is on what the loop actually raises. Asserting on
+/// `classify_pull_failure`'s ladder alone would pass with the `bail!`s restored — the
+/// classifier is not the thing that was broken.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
+async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
+    let payload = vec![0x8Bu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    // `NotFound` mid-stream: the eviction-race shape. An honest answer from a reachable
+    // peer, and the one whose mis-scoring #1144 was filed about.
+    let task_a = spawn_a_mid_stream_error_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        StreamError::NotFound,
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let buyer = Arc::new(StubOpener {
+        channel_id: B256::repeat_byte(0x8B),
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        providers,
+        addr_map,
+        // Both budgets generous: the error must be what ends this pull, not a deadline.
+        // Sized so a regression cannot pass by accidentally timing out into an exonerating
+        // `PullTimeout` arm instead.
+        Duration::from_secs(20),
+        Duration::from_secs(20),
+        0,
+    );
+
+    let got = tokio::time::timeout(
+        Duration::from_secs(30),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("a mid-stream refusal never ended the pull"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a refused delivery must not surface bytes (NotFound)"
+    );
+
+    // Classified as a REFUSAL — which is only possible if the receive loop kept the wire
+    // code. With the code stringified, this counter stays 0.
+    assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
+    // …and NOT as an unreachable peer. This is the assertion the bug fails: a stringified
+    // mid-stream error falls to the catch-all, and the catch-all scores `Unreachable`.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_stalled_total", 0)?;
+
+    // Nothing gossiped, and the local score untouched: the peer answered honestly.
+    anyhow::ensure!(
+        obs_buffer.drain().is_empty(),
+        "an honest mid-stream refusal must not be gossiped as an observation"
+    );
+    // The mirror of the stall test's `< 0.5`: a stall drops the score below neutral, an
+    // honest refusal must not touch it.
+    anyhow::ensure!(
+        local_rep.score(a_id) >= 0.5,
+        "an honest mid-stream refusal must leave the local score neutral, got {}",
+        local_rep.score(a_id)
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.abort();
+    Ok(())
+}
+
+/// #1145 review — the deadline formula must budget the STALL stage, or a peer that goes
+/// silent mid-stream starves the fallback loop exactly as a wedged channel open used to.
+///
+/// This is the third time the same hole has been dug. A candidate costs three sequential
+/// stages — channel open, stream open, then streaming — and each time a stage was left out
+/// of `outer_pull_deadline`, early candidates burned a budget the outer clock had not
+/// allowed for and the loop died before reaching the last one. #859 was the missing stream
+/// open; #1143 was the missing channel open; this is the missing stall window.
+///
+/// The existing starvation guard (`a_wedged_channel_open_does_not_starve_the_candidate_loop`)
+/// cannot catch it: its candidates wedge at the channel OPEN, so they never reach the
+/// streaming stage whose budget is in question. Its candidates cost
+/// `CHANNEL_OPEN_CALLER_BUDGET` each; these cost `CHANNEL_OPEN + open + stall`.
+///
+/// # What this does and does NOT guard
+///
+/// It guards the BEHAVIOUR: a candidate that goes silent mid-stream is abandoned on the
+/// stall bound and the loop moves on, twice over, and still delivers from candidate #3.
+///
+/// It does NOT pin the deadline ARITHMETIC, and saying so is the whole point of this
+/// paragraph — a comment claiming otherwise would be the same false claim this review
+/// round was convened to remove. Verified by experiment: reverting `outer_pull_deadline`
+/// to the two-term formula leaves this test GREEN. It cannot be otherwise at any
+/// affordable runtime. The reverted budget still allows `(5 + per) × 3 + 10` ≥ 28 s, so to
+/// starve the loop the silent candidates must burn more than that between them — which
+/// means a stall budget of ~15 s and a test that sleeps for half a minute.
+///
+/// The arithmetic is pinned exactly, exhaustively and instantly by
+/// `selection::outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost`, which
+/// sweeps `per × stall` and asserts the derived deadline against an independently computed
+/// worst case. That test DOES fail on revert. This one is its end-to-end companion, not
+/// its substitute.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
+async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
+    // Small budgets: the deadline arithmetic is asserted in the unit test named above, so
+    // what these buy is a fast, non-flaky exercise of the real failover path.
+    let per_candidate = Duration::from_secs(2);
+    let stall_budget = Duration::from_secs(2);
+
+    let payload = vec![0x5Eu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Two candidates that open honestly, deliver 3 frames, then go silent. ---
+    let s1_sk = fresh_key();
+    let s1_id = s1_sk.public();
+    let s1_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s1, addr_s1) =
+        local_endpoint(s1_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_s1 = spawn_a_mid_stream_silent_server(
+        ep_s1.clone(),
+        Arc::clone(&s1_eth),
+        slash_domain(),
+        total_bytes,
+        STALL_RATE,
+        3,
+    );
+
+    let s2_sk = fresh_key();
+    let s2_id = s2_sk.public();
+    let s2_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_s2, addr_s2) =
+        local_endpoint(s2_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_s2 = spawn_a_mid_stream_silent_server(
+        ep_s2.clone(),
+        Arc::clone(&s2_eth),
+        slash_domain(),
+        total_bytes,
+        STALL_RATE,
+        3,
+    );
+
+    // --- Candidate #3: healthy, and the one the loop must actually reach. -------
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xC7);
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let a_metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&a_metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &a_metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: the requester. ------------------------------------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    for (id, addr) in [(s1_id, addr_s1), (s2_id, addr_s2), (a_id, addr_a)] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(id).with_ip_addr(addr),
+            *hash.as_bytes(),
+            1,
+            false,
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let s1_dht = DhtNodeId::from_bytes(*s1_id.as_bytes());
+    let s2_dht = DhtNodeId::from_bytes(*s2_id.as_bytes());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let mut addr_map = HashMap::new();
+    addr_map.insert(s1_dht, s1_eth.address());
+    addr_map.insert(s2_dht, s2_eth.address());
+    addr_map.insert(a_dht, a_eth.address());
+
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        vec![s1_dht, s2_dht, a_dht],
+        addr_map,
+        per_candidate,
+        stall_budget,
+        0,
+    );
+
+    // The REAL production deadline, derived exactly as the runtime derives it. This is the
+    // whole point: an assertion against a generously hand-picked number would pass with a
+    // formula that cannot reach candidate #3 in production.
+    let fetched = tokio::time::timeout(
+        outer_pull_deadline(per_candidate, stall_budget),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "the outer deadline expired before the loop could try every candidate — the \
+             stall window is a per-candidate cost and `outer_pull_deadline` must budget it"
+        )
+    })?
+    .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
+
+    let bytes = fetched
+        .collect_to_bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("collect: {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the loop gave up before reaching the healthy candidate #3 — two silent \
+                 candidates consumed a budget the outer deadline had not allowed for"
+            )
+        })?;
+    anyhow::ensure!(bytes == payload, "wrong bytes from candidate #3");
+
+    // Both silent candidates were classified as stalls (not as our own deadline firing),
+    // which is what proves they were abandoned on the STALL bound — the stage whose budget
+    // this test exists to protect — rather than on some other clock.
+    assert_counter(&b_metrics, "node_pull_stalled_total", 2)?;
+    assert_counter(&b_metrics, "node_pull_timeout_total", 0)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    ep_s1.close().await;
+    ep_s2.close().await;
+    task_a.abort();
+    task_s1.abort();
+    task_s2.abort();
     Ok(())
 }
 
@@ -4413,9 +4862,9 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
 /// `InternalError` is the one wire code by which a node reports its OWN
 /// degradation — "unexpected failure; do not retry THIS node" (#1129, the backend
 /// fault / wedged-candidate signal). Exonerating every refusal would have been the
-/// easy over-correction to #1144, and nothing outside the isolated
-/// `refusal_is_node_fault` unit test would have noticed: this test is what makes
-/// the predicate's verdict observable through the real wire + classification path.
+/// easy over-correction to #1144, and nothing outside the isolated `classify_refusal`
+/// unit test would have noticed: this test is what makes the predicate's verdict
+/// observable through the real wire + classification path.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
     let payload = vec![0x1Eu8; 4096];
@@ -5041,8 +5490,8 @@ async fn leaf_paced_pull(
     loop {
         match read_client(&mut recv).await? {
             ClientMessage::ChunkData(chunk) => {
-                buf.extend_from_slice(&chunk.bytes);
-                let len = chunk.bytes.len() as u64;
+                buf.extend_from_slice(chunk.bytes());
+                let len = chunk.bytes().len() as u64;
                 cumulative = cumulative.saturating_add(len);
                 unvouchered = unvouchered.saturating_add(len);
                 let boundary = unvouchered >= interval_bytes && interval_bytes > 0;
@@ -6168,9 +6617,7 @@ async fn serve_wire_paced(
         }
         write_frame(
             &mut send,
-            &encode_message(&ClientMessage::ChunkData(ChunkData {
-                bytes: chunk.to_vec(),
-            }))?,
+            &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
         )
         .await
         .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
@@ -6633,7 +7080,7 @@ async fn leaf_underpays_first_voucher(
     loop {
         match read_client(&mut recv).await? {
             ClientMessage::ChunkData(chunk) => {
-                cumulative = cumulative.saturating_add(chunk.bytes.len() as u64);
+                cumulative = cumulative.saturating_add(chunk.bytes().len() as u64);
                 if cumulative >= interval_bytes {
                     break;
                 }

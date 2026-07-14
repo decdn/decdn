@@ -87,6 +87,8 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     if args.dry_run {
         return dry_run(args);
     }
+    // As in `fetch`: reject a hard cap that would silently disable stall detection.
+    args.common.validate()?;
 
     // A local manifest is read up front (no network): an empty bundle then needs
     // no endpoint or keystore password at all.
