@@ -1132,7 +1132,11 @@ pub async fn run(
         // honest transfer the node's `max_blob_size_mb` ceiling permits; it exists
         // only so a pathological upstream cannot pin a task and poison a hash
         // indefinitely. `max_blob_size_mb` additionally bounds how much memory the
-        // concurrent warms can hold (see `MAX_BACKGROUND_FILL_BYTES`).
+        // concurrent warms can hold: each reserves its whole blob ceiling from the
+        // `MAX_BACKGROUND_FILL_MB` pool, so at the defaults (1 GiB ceiling, 2 GiB pool) a
+        // node runs TWO warms at once — fewer than the 8 the old task-count ceiling
+        // allowed, but with a bounded memory footprint rather than an 8 GiB one. A node
+        // serving small blobs runs far more than 8.
         client_handler.attach_background_fill(
             pull_through_bg_shutdown.clone(),
             Some(crate::handlers::client::BACKGROUND_FILL_HARD_CAP),

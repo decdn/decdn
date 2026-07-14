@@ -137,6 +137,12 @@ pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
 /// the blob's size is not known until it has been fetched, so the ceiling is what has to
 /// be reserved. Small-blob nodes now run many warms at once; large-blob nodes run few.
 ///
+/// **At the defaults this means TWO concurrent warms** (a 1 GiB `max_blob_size_mb` against
+/// this 2 GiB pool), down from the old fixed 8 — but bounded at 2 GiB resident instead of
+/// 8 GiB. An operator who wants more concurrency lowers `max_blob_size_mb`; one who raises
+/// it is explicitly trading warm concurrency for blob size, which is the honest trade the
+/// task-count ceiling hid.
+///
 /// A miss that finds no room is simply not warmed: the hash stays unclaimed, so the next
 /// miss retries it. Shedding is the right failure mode — a warm is speculative work for
 /// a FUTURE request, and dropping it costs a later cache miss, never a live one.

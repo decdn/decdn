@@ -399,30 +399,61 @@ impl InFlightOpenGuard {
             map: Arc::clone(map),
             provider,
         };
-        let handle = tokio::spawn(async move {
+        let opening = tokio::spawn(async move {
             // Dropped when the task ends (any path, including a panic unwind),
             // releasing the provider slot — and NOT before.
             let _guard = guard;
             open.await
         });
 
+        // A SPAWNED supervisor, not a combinator on the returned future.
+        //
+        // This distinction is the whole fix, and getting it wrong is subtle enough that the
+        // first attempt did. A `Shared` advances only when some clone is POLLED, and after
+        // the caller's budget expires the only clone left is the one parked in
+        // `opens_in_flight`, which nobody polls. So a `handle.await.unwrap_or_else(report)`
+        // written here would fire the report exactly when a caller was still waiting — and
+        // stay silent in the no-caller case it exists for. Worse, when the panicking task's
+        // guard then removes the map entry, the last clone drops and the future is
+        // destroyed having never run at all.
+        //
+        // A spawned task is driven by the runtime whether or not anyone awaits it, so the
+        // report happens either way. The panic that matters lands during the unbounded
+        // receipt wait — minutes long, no caller by construction — which is precisely when
+        // an `openChannel` may already be in the mempool: an escrowed deposit with no
+        // persisted row, recoverable only by the boot reconcile scan. Making that visible
+        // is this leg's entire purpose.
         let metrics = Arc::clone(metrics);
+        let supervised = tokio::spawn(async move {
+            match opening.await {
+                Ok(outcome) => outcome,
+                Err(join_err) => {
+                    metrics.node_pull_channel_open_failure();
+                    error!(
+                        %provider,
+                        %join_err,
+                        "buyer channel open task died (panicked or was aborted); if its \
+                         openChannel had already been broadcast the deposit is escrowed with \
+                         no persisted row, and only the boot reconcile scan will recover it"
+                    );
+                    // `OpenReported` so a caller that IS still waiting doesn't count this a
+                    // second time — the supervisor above is the report.
+                    Err(Arc::new(
+                        anyhow::anyhow!("buyer channel open task failed: {join_err}")
+                            .context(OpenReported),
+                    ))
+                }
+            }
+        });
+
         let fut: BoxFuture<'static, OpenOutcome> = Box::pin(async move {
-            handle.await.unwrap_or_else(|join_err| {
-                metrics.node_pull_channel_open_failure();
-                error!(
-                    %provider,
-                    %join_err,
-                    "buyer channel open task died (panicked or was aborted); if its \
-                     openChannel had already been broadcast the deposit is escrowed with \
-                     no persisted row, and only the boot reconcile scan will recover it"
-                );
-                // `OpenReported` so a caller that IS still waiting doesn't count this a
-                // second time — the leg above is the report.
-                Err(Arc::new(
-                    anyhow::anyhow!("buyer channel open task failed: {join_err}")
-                        .context(OpenReported),
-                ))
+            // The supervisor only awaits and reports, so it cannot panic; this arm is
+            // reachable only if the runtime aborts it at shutdown, where a caller is the
+            // one party that could still be listening.
+            supervised.await.unwrap_or_else(|join_err| {
+                Err(Arc::new(anyhow::anyhow!(
+                    "buyer channel open supervisor failed: {join_err}"
+                )))
             })
         });
         fut.shared()
@@ -3115,6 +3146,9 @@ mod tests {
     #[derive(Debug)]
     struct StoreThatPanicsUnderTheSlot {
         reads: std::sync::atomic::AtomicUsize,
+        /// Stall before panicking, so the caller's budget expires first and the panic lands
+        /// with NOBODY polling the shared open — the case that actually matters.
+        delay: Duration,
     }
 
     impl BuyerChannelStore for StoreThatPanicsUnderTheSlot {
@@ -3123,6 +3157,7 @@ mod tests {
             if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 return Ok(None);
             }
+            std::thread::sleep(self.delay);
             panic!("simulated panic inside the detached open task");
         }
         fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
@@ -3180,6 +3215,7 @@ mod tests {
         let mut service = service_against(&server);
         service.store = Arc::new(StoreThatPanicsUnderTheSlot {
             reads: std::sync::atomic::AtomicUsize::new(0),
+            delay: Duration::ZERO,
         });
         let metrics = Arc::clone(&service.metrics);
         let provider = Address::repeat_byte(0xab);
@@ -3204,6 +3240,68 @@ mod tests {
             !slot_held(&service, provider),
             "the guard must release the provider's slot on unwind — otherwise one panic \
              wedges that provider for the life of the process"
+        );
+    }
+
+    /// …and the case that actually matters: the open panics with **nobody left polling**.
+    ///
+    /// The test above keeps a caller waiting the whole time, which is the EASY half. The
+    /// half that protects money is this one: a panic during the unbounded receipt wait —
+    /// minutes long, so no caller is still there by construction — is exactly when an
+    /// `openChannel` may already be in the mempool, i.e. a deposit escrowed against no
+    /// persisted row.
+    ///
+    /// The first attempt at this fix reported from a combinator on the returned future, and
+    /// it fired only when a caller was still waiting: a `Shared` advances only when a clone
+    /// is POLLED, and once the caller's budget expires the sole remaining clone is the one
+    /// parked in `opens_in_flight`, which nobody polls. So the report was unreachable in
+    /// precisely the case its own comment invoked, and the suite stayed green — the exact
+    /// shape of defect this whole review round exists to remove. Hence a supervisor task,
+    /// which the runtime drives whether or not anyone awaits it, and hence this test, which
+    /// lets the caller LEAVE before the panic lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_panicking_open_is_reported_even_when_no_caller_is_left_to_see_it() {
+        let server = wedged_chain().await;
+        let mut service = service_against(&server);
+        service.store = Arc::new(StoreThatPanicsUnderTheSlot {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            delay: Duration::from_millis(300),
+        });
+        let metrics = Arc::clone(&service.metrics);
+        let provider = Address::repeat_byte(0xab);
+
+        // The caller gives up long before the task panics, and drops its clone of the
+        // shared open — so from here on nothing polls it.
+        let err = service
+            .open_or_reuse_channel(provider, U256::from(1u64), Duration::from_millis(30))
+            .await
+            .expect_err("the caller must give up on its budget");
+        assert!(
+            err.downcast_ref::<ChannelOpenPending>().is_some(),
+            "the caller left on its budget, so it holds a pending sentinel: {err:#}"
+        );
+
+        // Now let the task panic, with no caller in sight. Polled rather than slept on a
+        // fixed delay: the store blocks a worker thread for 300 ms, and under a loaded
+        // full-suite run a fixed sleep is a flake waiting to happen.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while counter(&metrics, "node_pull_channel_open_failures_total") == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert_eq!(
+            counter(&metrics, "node_pull_channel_open_failures_total"),
+            1,
+            "a panicking open must be metered even when NOBODY is polling the shared open — \
+             this is the leg where an escrowed deposit goes missing, and a report that only \
+             fires for a caller who is still waiting is no report at all"
+        );
+        assert!(
+            !slot_held(&service, provider),
+            "the guard must still release the provider's slot on unwind"
         );
     }
 
