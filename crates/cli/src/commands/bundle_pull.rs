@@ -327,11 +327,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             provider,
             self.store,
             hash,
-            PullDeadlines {
-                open: self.common.stall_timeout(),
-                stall: self.common.stall_timeout(),
-                hard_cap: self.common.hard_cap(),
-            },
+            // Same shape as `fetch` (#1134): a node that accepts the connection and never
+            // answers is as dead as one that stops mid-stream, so the same budget bounds
+            // both stages, under a cap that must outlast them both.
+            PullDeadlines::capped(
+                self.common.stall_timeout(),
+                self.common.stall_timeout(),
+                self.common.hard_cap(),
+            )?,
             max_blob_bytes,
             // Per-entry byte bars would interleave illegibly across a manifest's
             // many concurrent pulls; `bundle pull` reports at entry granularity

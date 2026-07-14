@@ -617,13 +617,16 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         provider,
         &store,
         hash,
-        PullDeadlines {
-            // A node that accepts the connection and never answers is as dead as
-            // one that stops mid-stream, so the same budget answers both (#1134).
-            open: common.stall_timeout(),
-            stall: common.stall_timeout(),
-            hard_cap: common.hard_cap(),
-        },
+        // A node that accepts the connection and never answers is as dead as one that
+        // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
+        // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
+        // said so in the user's own flags, so this `?` is the belt to that braces (#1145
+        // review).
+        PullDeadlines::capped(
+            common.stall_timeout(),
+            common.stall_timeout(),
+            common.hard_cap(),
+        )?,
         max_blob_bytes,
         Some(&on_progress),
     )
@@ -931,15 +934,15 @@ mod tests {
     fn deadlines_are_stall_bound_with_a_generous_leak_guard() {
         let mut c = common();
         assert_eq!(c.stall_timeout(), Duration::from_secs(30));
-        assert_eq!(c.hard_cap(), Some(Duration::from_hours(1)));
+        assert_eq!(c.hard_cap(), Duration::from_hours(1));
         c.max_blob_mb = 4096;
         assert_eq!(
             c.hard_cap(),
-            Some(Duration::from_hours(1)),
+            Duration::from_hours(1),
             "blob size must not move the deadline"
         );
         c.timeout_ms = 200_000;
-        assert_eq!(c.hard_cap(), Some(Duration::from_secs(200)));
+        assert_eq!(c.hard_cap(), Duration::from_secs(200));
     }
 
     #[test]

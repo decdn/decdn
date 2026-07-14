@@ -4745,6 +4745,134 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
     Ok(())
 }
 
+/// The mirror image of the test above, and the line between them is the whole point: a peer
+/// that never sent a FIRST byte must NOT be scored `Unreachable` (#1145 review).
+///
+/// `PullStalled` earns the right to gossip about a peer from the deadline's reset — a clock
+/// that resets on every byte can only fire on a peer that stopped delivering. That argument
+/// needs a byte to have arrived. Before the first one there has been no reset, and the clock
+/// is measuring something else entirely: the server's TIME TO FIRST BYTE, which scales with
+/// blob size, because the serve path writes the `StreamResponse` and only then materialises
+/// the whole bao wire encoding (`export_bao_range`) before it can emit chunk #1.
+///
+/// So a 1 GiB blob — the default `max_blob_size_mb` — read off a cold disk, or served by a
+/// node already streaming to several peers, could blow the 20 s default stall budget doing
+/// exactly what it was asked. The requester then scored it `Unreachable`: a local EWMA hit
+/// AND a gossiped observation, against an honest server, for the crime of being big.
+///
+/// The fix gives that wait the same verdict the OPEN stage already gives an identical wait —
+/// `PullTimeout`, exonerating — on the same grounds: a bound of ours elapsing over bounded
+/// server work says nothing about the peer. Nothing is given up that the open stage has not
+/// already given up, and the pull still fails and still yields the candidate slot.
+///
+/// Zero prefix chunks is the entire fixture. Its sibling above sends three, and must still
+/// score — the two together pin the boundary at exactly one byte.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
+async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -> Result<()> {
+    let payload = vec![0x7Eu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    // ZERO chunks: a signed, honest `StreamResponse`, and then nothing — the shape of a
+    // server still grinding through a large `export_bao_range`.
+    let task_a = spawn_a_mid_stream_silent_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        0,
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let buyer = Arc::new(StubOpener {
+        channel_id: B256::repeat_byte(0x7E),
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        providers,
+        addr_map,
+        // A generous OPEN budget, so the open stage is provably not what ends this: the peer
+        // does answer, promptly and correctly. Only the first-chunk wait can be what fires.
+        Duration::from_secs(20),
+        Duration::from_secs(2),
+        0,
+    );
+
+    let got = tokio::time::timeout(
+        Duration::from_secs(30),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("a silent upstream was never abandoned"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a first-byte timeout must not surface bytes (NotFound)"
+    );
+
+    // Classified as OUR deadline, not as the peer stalling.
+    assert_counter(&b_metrics, "node_pull_timeout_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_stalled_total", 0)?;
+
+    // And therefore NOT scored — the assertion that matters. This peer answered honestly and
+    // may simply be a slow disk with a big blob.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    anyhow::ensure!(
+        obs_buffer.drain().is_empty(),
+        "a peer that has not yet sent its first byte must not be gossiped as unreachable — \
+         time-to-first-byte scales with blob size, so this defames honest servers for \
+         serving large blobs"
+    );
+    anyhow::ensure!(
+        (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
+        "the local score must stay neutral, got {}",
+        local_rep.score(a_id)
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.abort();
+    Ok(())
+}
+
 /// #1145 review — a `StreamError` that arrives MID-STREAM must be judged by its wire code,
 /// exactly as one that arrives at the open is (#1144).
 ///

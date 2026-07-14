@@ -445,45 +445,43 @@ impl std::fmt::Display for UpstreamRefused {
 
 impl std::error::Error for UpstreamRefused {}
 
-/// Typed sentinel for an upstream that went SILENT mid-stream — no byte of
-/// progress for the stall budget (#1134). Distinct from [`PullTimeout`], which is
-/// our own overall wall-clock cap firing, and the distinction is load-bearing:
+/// Typed sentinel for an upstream that went SILENT mid-stream — bytes were flowing, and
+/// then no byte of progress for the stall budget (#1134). Distinct from [`PullTimeout`],
+/// which is a bound of OURS elapsing, and the distinction is load-bearing:
 ///
-/// A whole-transfer deadline cannot tell "the provider is dead" from "this blob
-/// is big" or "this link is slow", so `PullTimeout` must NOT tar the provider —
-/// it fires on perfectly healthy transfers. A stall deadline resets on every byte
-/// received, so it fires ONLY when a provider stops delivering while we wait.
-/// That IS evidence the peer is unreachable, and `classify_pull_failure` scores it
-/// as such.
+/// A whole-transfer deadline cannot tell "the provider is dead" from "this blob is big" or
+/// "this link is slow", so `PullTimeout` must NOT tar the provider — it fires on perfectly
+/// healthy transfers. A stall deadline resets on every byte received, so it fires ONLY when
+/// a provider stops delivering while we wait. That IS evidence the peer is unreachable, and
+/// `classify_pull_failure` scores it as such — a local EWMA hit AND a gossiped observation.
 ///
 /// # What the bound rests on
 ///
-/// Entirely on the non-empty-`ChunkData` invariant (#1088), on BOTH pull paths. With
-/// empty frames banned, "a frame arrived" and "bytes made progress" are the same
-/// statement, so a peer cannot hold the deadline open with padding — which is the only
-/// reason a stall is attributable to the peer at all, and therefore the only reason this
-/// may score reputation where [`PullTimeout`] may not.
+/// Two things, and it is worth being precise about both, because scoring a peer on a bound
+/// that does not hold is how an honest node gets defamed network-wide.
 ///
-/// Neither path has an independent progress check behind that floor. The buffered loop
-/// (`receive_and_pay`) resets its deadline inside the `ChunkData` arm, and the
-/// progressive path ([`UpstreamPull::next_chunk`]) re-arms a fresh per-call
-/// `tokio::time::timeout` on every read; both are safe because no frame a peer can send
-/// makes zero progress, not because either one verifies that it did.
+/// **The non-empty-`ChunkData` invariant (#1088), on BOTH pull paths.** With empty frames
+/// banned, "a frame arrived" and "bytes made progress" are the same statement, so a peer
+/// cannot hold the deadline open with padding. Neither path has an independent progress
+/// check behind that floor: the buffered loop (`receive_and_pay`) resets its deadline inside
+/// the `ChunkData` arm, and the progressive path ([`UpstreamPull::next_chunk`]) re-arms a
+/// fresh per-call `tokio::time::timeout` on every read. Both are safe because no frame a
+/// peer can send makes zero progress, not because either verifies that it did. Since the
+/// #1145 review the floor is structural rather than advisory — `ChunkData`'s field is
+/// private, and its constructor and decode gate both reject an empty payload — so it cannot
+/// be relaxed by forgetting to call a validator.
 ///
-/// This doc used to claim the buffered loop reset "only where `cumulative` actually
-/// advances — belt-and-braces", contrasted with the progressive path resting on the floor
-/// "ALONE". That was false: the reset was unconditional within the arm, and both paths
-/// rested on the floor alone. The claim is worth remembering as a hazard, because its
-/// effect was to advertise slack that did not exist — a future reader, told the buffered
-/// loop was independently protected, could have relaxed #1088 and silently broken the
-/// stall detector on every path at once.
-///
-/// Since the #1145 review the floor is structural rather than advisory — `ChunkData`'s
-/// field is private, and its constructor and decode gate both reject an empty payload —
-/// so it can no longer be relaxed by forgetting to call a validator.
+/// **At least one byte having already arrived.** The reset is what makes a stall the peer's
+/// fault, so before the FIRST byte there has been no reset and the argument does not apply:
+/// the clock is measuring the server's time-to-first-byte, which scales with blob size
+/// (the serve path materialises the whole bao wire via `export_bao_range` before it can emit
+/// chunk #1). Both loops therefore raise [`PullTimeout`] — exonerating — when the budget
+/// elapses at `cumulative == 0`, and this sentinel only once bytes have flowed (#1145
+/// review). Without that split, a 1 GiB blob off a cold disk gossiped an honest server as
+/// unreachable for the crime of being big.
 #[derive(Debug)]
 pub struct PullStalled {
-    /// The inactivity budget that elapsed with no byte of progress.
+    /// The inactivity budget that elapsed after bytes had been flowing.
     pub after: Duration,
 }
 
@@ -551,22 +549,78 @@ impl std::error::Error for LocalPullFault {}
 /// sets `hard_cap: None` would leave the `StreamResponse` read with no bound at
 /// all, and a peer that accepts a connection and then says nothing would hang the
 /// pull forever. `open` exists so that cannot be expressed.
+/// # The relational invariant
+///
+/// `hard_cap`, when set, must STRICTLY EXCEED `open + stall`. Both clocks below run inside
+/// the cap's, and in the worst case consecutively — the open can legitimately consume its
+/// whole budget before the inactivity clock even starts — so a cap that does not outlast
+/// both means the cap always fires first and [`PullStalled`] can never fire under it. The
+/// pull then looks fully configured while its peer-health signal is dead.
+///
+/// [`Self::capped`] is fallible and the fields are private BECAUSE of that (#1145 review).
+/// The invariant was previously enforced nowhere on this type: the fields were `pub`, both
+/// production call sites built it with a struct literal, and the check lived in the CLI's
+/// `ClientFetchArgs::validate` as a hardcoded `timeout > 2 × stall` — correct only because
+/// those two call sites happened to set `open` from the same knob as `stall`. Adding an
+/// `--open-timeout-ms` flag would have made it silently wrong, in the direction that reopens
+/// the hole. The invariant belongs to the type that has the three values.
 #[derive(Debug, Clone, Copy)]
 pub struct PullDeadlines {
     /// Wall-clock bound on the open stage: dial, request, and the signed
     /// `StreamResponse`. Bounded work — a slow one is a stall.
-    pub open: Duration,
+    open: Duration,
     /// Inactivity bound on the streaming stage. Reset on every byte of progress.
-    pub stall: Duration,
+    stall: Duration,
     /// Optional overall wall-clock cap on the whole exchange. `None` = uncapped;
     /// `open` and `stall` between them are what keep an uncapped pull from hanging.
-    pub hard_cap: Option<Duration>,
+    hard_cap: Option<Duration>,
 }
+
+/// A [`PullDeadlines`] whose bounds cannot do their job. Carries the three values so a CLI
+/// can render the arithmetic back to the user rather than just saying "invalid".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineError {
+    /// A zero budget elapses on its first poll, so the stage it bounds can never run.
+    ZeroBudget,
+    /// The cap does not outlast `open + stall`, so it always fires first and the stall
+    /// bound — the only signal that says anything about the PEER — can never fire.
+    CapCannotOutlastItsStages {
+        open: Duration,
+        stall: Duration,
+        hard_cap: Duration,
+    },
+}
+
+impl std::fmt::Display for DeadlineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroBudget => write!(f, "a deadline of zero elapses before any work can run"),
+            Self::CapCannotOutlastItsStages {
+                open,
+                stall,
+                hard_cap,
+            } => write!(
+                f,
+                "the overall cap ({hard_cap:?}) must exceed the open bound ({open:?}) plus the \
+                 stall bound ({stall:?}): both run inside it and in the worst case \
+                 consecutively, so below that the cap always elapses first and a stalled \
+                 provider can never be detected"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeadlineError {}
 
 impl PullDeadlines {
     /// The recommended shape: a wall clock on the open, inactivity on the stream,
     /// and no overall cap — so a pull of any size completes as long as the upstream
     /// keeps feeding it bytes.
+    ///
+    /// Infallible: with no cap there is no relational invariant to violate. A zero `open` or
+    /// `stall` is still nonsense, but it is a bound that fires too EAGERLY — loud, and
+    /// immediately obvious — rather than one that silently never fires, so it does not earn a
+    /// `Result` on the path every production pull takes.
     #[must_use]
     pub const fn new(open: Duration, stall: Duration) -> Self {
         Self {
@@ -577,13 +631,50 @@ impl PullDeadlines {
     }
 
     /// As [`Self::new`], plus an overall wall-clock cap on the whole exchange.
-    #[must_use]
-    pub const fn capped(open: Duration, stall: Duration, hard_cap: Duration) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`DeadlineError::CapCannotOutlastItsStages`] if `hard_cap` does not strictly exceed
+    /// `open + stall`, and [`DeadlineError::ZeroBudget`] for a zero `open` or `stall`. See
+    /// the type's own docs for why this is the one constructor that must be fallible.
+    pub fn capped(
+        open: Duration,
+        stall: Duration,
+        hard_cap: Duration,
+    ) -> Result<Self, DeadlineError> {
+        if open.is_zero() || stall.is_zero() {
+            return Err(DeadlineError::ZeroBudget);
+        }
+        if hard_cap <= open.saturating_add(stall) {
+            return Err(DeadlineError::CapCannotOutlastItsStages {
+                open,
+                stall,
+                hard_cap,
+            });
+        }
+        Ok(Self {
             open,
             stall,
             hard_cap: Some(hard_cap),
-        }
+        })
+    }
+
+    /// The open-stage wall clock.
+    #[must_use]
+    pub const fn open(&self) -> Duration {
+        self.open
+    }
+
+    /// The streaming-stage inactivity bound.
+    #[must_use]
+    pub const fn stall(&self) -> Duration {
+        self.stall
+    }
+
+    /// The overall cap, if any.
+    #[must_use]
+    pub const fn hard_cap(&self) -> Option<Duration> {
+        self.hard_cap
     }
 
     /// The legacy single-deadline shape: one budget serving as the open bound, the
@@ -1126,7 +1217,39 @@ async fn receive_and_pay(
     loop {
         let msg = tokio::time::timeout_at(deadline, read_client_message(recv))
             .await
-            .map_err(|_| anyhow::Error::new(PullStalled { after: stall }))??;
+            // Which fault this is depends on whether a byte has EVER arrived (#1145 review).
+            //
+            // `PullStalled` scores the peer `Unreachable` — a local EWMA hit and a GOSSIPED
+            // observation — and it earns that right from the reset above: a clock that
+            // resets on every byte can only fire on a peer that stopped delivering. That
+            // reasoning holds for every chunk but the first, where no byte has reset it yet
+            // and the clock is measuring something else entirely.
+            //
+            // What it measures before the first chunk is the server's time-to-first-byte,
+            // and that scales with BLOB SIZE: the serve path writes the `StreamResponse`
+            // first, then materialises the whole bao wire encoding via `export_bao_range`
+            // before it can emit chunk #1. A 1 GiB blob off a cold disk can exceed the 20 s
+            // default — so an honest server, doing exactly what it was asked, got gossiped as
+            // unreachable for being big.
+            //
+            // A wait on bounded-but-unpredictable server work is what the OPEN stage already
+            // is, and the open bound already answers this the right way: it raises
+            // `PullTimeout`, which is exonerating, on the grounds that our own budget
+            // elapsing says nothing about the peer. This is the same wait one stage later, so
+            // it gets the same answer. Nothing is lost that the open stage has not already
+            // given up: a peer that accepts and then says nothing is unscored there too, and
+            // it still fails the pull and yields the candidate slot.
+            //
+            // The alternative — keeping the peer-blaming verdict and widening the budget —
+            // cannot work, because no fixed budget can separate "large blob, honest server"
+            // from "dead peer" when the honest case is unbounded in blob size.
+            .map_err(|_| {
+                if cumulative == 0 {
+                    anyhow::Error::new(PullTimeout { after: stall })
+                } else {
+                    anyhow::Error::new(PullStalled { after: stall })
+                }
+            })??;
         match msg {
             ClientMessage::ChunkData(chunk) => {
                 // The running total must not exceed what the response promised —
@@ -1544,7 +1667,17 @@ impl UpstreamPull {
         // is not charged against the upstream's budget.
         let msg = tokio::time::timeout(self.stall, read_client_message(&mut self.recv))
             .await
-            .map_err(|_| anyhow::Error::new(PullStalled { after: self.stall }))??;
+            // Before the first byte this is the server's time-to-first-byte, which scales
+            // with blob size, not an inactivity signal — so it is OUR deadline, not the
+            // peer's fault. Same reasoning, and the same split, as the buffered loop in
+            // `receive_and_pay`; see the long comment there (#1145 review).
+            .map_err(|_| {
+                if self.cumulative == 0 {
+                    anyhow::Error::new(PullTimeout { after: self.stall })
+                } else {
+                    anyhow::Error::new(PullStalled { after: self.stall })
+                }
+            })??;
         match msg {
             ClientMessage::ChunkData(chunk) => {
                 // The payload is bounded on both sides by construction (#1088): the
@@ -1840,6 +1973,52 @@ mod tests {
     /// node is not evidence about a provider, and a node in this state meets every candidate
     /// in turn, so losing the marker does not mis-score one peer: it defames the whole
     /// candidate list on the strength of our own defect.
+    /// `capped` must refuse a cap that cannot outlast its own stages (#1145 review).
+    ///
+    /// This is the enforcement of record. The CLI's `ClientFetchArgs::validate` restates the
+    /// rule as `timeout > 2 × stall` to give the user an early error in their own flags, but
+    /// that `2 ×` is only correct because both call sites set the open bound from the stall
+    /// knob — an assumption the compiler does not hold and an `--open-timeout-ms` flag would
+    /// break. Here the three values are all in hand, so the real relation can be checked, and
+    /// a `PullDeadlines` whose stall bound could never fire simply cannot be constructed.
+    #[test]
+    fn a_cap_that_cannot_outlast_its_stages_is_refused() {
+        use super::{DeadlineError, PullDeadlines};
+        use std::time::Duration;
+
+        let open = Duration::from_secs(5);
+        let stall = Duration::from_secs(5);
+
+        // At and below `open + stall` the cap always wins the race, so `PullStalled` — the
+        // only signal that says anything about the PEER — could never fire.
+        for cap in [Duration::from_secs(1), stall, open + stall] {
+            assert!(
+                matches!(
+                    PullDeadlines::capped(open, stall, cap),
+                    Err(DeadlineError::CapCannotOutlastItsStages { .. })
+                ),
+                "a cap of {cap:?} against open {open:?} + stall {stall:?} leaves the stall \
+                 bound unable to fire, and must not be constructible"
+            );
+        }
+
+        // One tick past it, the inactivity deadline can actually fire.
+        assert!(
+            PullDeadlines::capped(open, stall, open + stall + Duration::from_millis(1)).is_ok(),
+            "past open + stall the stall bound can fire, so this is a legitimate pull"
+        );
+
+        // A zero budget elapses on its first poll: the stage it bounds can never run.
+        assert!(matches!(
+            PullDeadlines::capped(Duration::ZERO, stall, Duration::from_mins(1)),
+            Err(DeadlineError::ZeroBudget)
+        ));
+        assert!(matches!(
+            PullDeadlines::capped(open, Duration::ZERO, Duration::from_mins(1)),
+            Err(DeadlineError::ZeroBudget)
+        ));
+    }
+
     #[test]
     fn the_range_helpers_mark_their_own_faults_as_local() {
         // A 4 KiB blob cannot be resumed from byte 8192 — `align_range` errors rather than

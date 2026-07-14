@@ -484,7 +484,7 @@ pub struct CacheConfig {
     ///
     /// "Longer" is multiplied, not added. A silent candidate costs one full window of
     /// this, and the derived outer deadline budgets that for EVERY candidate, so a second
-    /// here is ~3 seconds of worst-case client wait on a total miss (145 s at defaults).
+    /// here is ~3 seconds of worst-case client wait on a total miss (172 s at defaults).
     pub node_pull_stall_timeout_sec: Option<u64>,
     /// Window-paced pull-through per-request pipeline window in bytes (#856, ADR
     /// 037 `pull_ahead_bytes`). Absent =>

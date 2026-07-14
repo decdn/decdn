@@ -248,9 +248,6 @@ fn arm_background_fill(
     })
 }
 
-/// Run `fut` under an optional wall-clock deadline, keeping the `Result<_,
-/// Elapsed>` shape of [`tokio::time::timeout`] so callers branch identically
-/// whether or not a cap is set. `None` never elapses.
 /// Size the background-warm memory budget: `(pool_mb, reserve_mb)`, both in MiB.
 ///
 /// Split out from [`ClientHandler::attach_background_fill`] so the SIZING DECISION — the
@@ -259,19 +256,41 @@ fn arm_background_fill(
 /// tokio's semaphore works; this is the thing that can actually be got wrong.
 ///
 /// Each warm reserves the node's whole blob ceiling, because a blob's true size is not
-/// known until it has been fetched. Two clamps matter:
+/// known until it has been fetched. So the reserve is a PROXY for the worst-case blob, and
+/// the only question this function answers is what that proxy should be:
 ///
-/// - a floor of 1 MiB, so a `max_blob_size_mb` of 0 cannot make warms free and unbounded;
+/// - **`0` is the "unlimited" sentinel**, not "a zero-byte ceiling". Every blob-size gate in
+///   the node reads it that way (`max_blob_size_bytes > 0 && …`, five sites), and config
+///   resolution accepts it — it only enforces `max_blob_size_mb < cache_size_mb`. So at `0`
+///   the worst-case blob is UNBOUNDED, and the honest proxy for an unbounded blob is the
+///   whole pool: one warm at a time (#1145 review).
+///
+///   This used to clamp to a 1 MiB FLOOR instead, on the reasoning that "a zero ceiling must
+///   not make warms free and unbounded" — which inverted the guard at the one value it
+///   named. A 1 MiB reserve against a 2 GiB pool admits 2048 concurrent warms, each
+///   buffering an arbitrarily large blob into memory for up to `BACKGROUND_FILL_HARD_CAP`.
+///   The byte-based pool was then strictly WORSE than the fixed task-count ceiling it
+///   replaced.
 /// - a ceiling of [`MAX_BACKGROUND_FILL_MB`], so an operator who sets a blob ceiling larger
 ///   than the whole pool gets ONE warm at a time rather than none. Without it the
 ///   reservation could never be granted — a semaphore cannot hand out more permits than it
 ///   holds — and every warm would shed forever, silently disabling the feature.
+///
+/// The two land in the same place, which is the tell that it is the right answer: an
+/// unlimited ceiling IS a ceiling larger than the pool.
 fn warm_budget_mb(max_blob_size_mb: u64) -> (u32, u32) {
     let pool = u32::try_from(MAX_BACKGROUND_FILL_MB).unwrap_or(u32::MAX);
-    let reserve = max_blob_size_mb.clamp(1, MAX_BACKGROUND_FILL_MB);
+    let reserve = if max_blob_size_mb == 0 {
+        MAX_BACKGROUND_FILL_MB
+    } else {
+        max_blob_size_mb.min(MAX_BACKGROUND_FILL_MB)
+    };
     (pool, u32::try_from(reserve).unwrap_or(u32::MAX))
 }
 
+/// Run `fut` under an optional wall-clock deadline, keeping the `Result<_,
+/// Elapsed>` shape of [`tokio::time::timeout`] so callers branch identically
+/// whether or not a cap is set. `None` never elapses.
 async fn with_optional_deadline<F: std::future::Future>(
     deadline: Option<Duration>,
     fut: F,
@@ -3057,23 +3076,38 @@ mod tests {
         }
     }
 
-    /// The two clamps in `warm_budget_mb`, each of which silently disables the feature if
-    /// dropped.
+    /// Both ends of `warm_budget_mb`, each of which silently disables the feature if dropped.
+    ///
+    /// The zero case is asserted on the PROPERTY — how many warms it admits — and not on the
+    /// mechanism, because the version this replaces pinned the mechanism and mistook it for
+    /// the property (#1145 review). It asserted `warm_budget_mb(0).1 == 1` under the comment
+    /// "a zero ceiling must not make warms free and unbounded", which is exactly backwards:
+    /// `0` is the UNLIMITED sentinel, so reserving 1 MiB for an unbounded blob is what makes
+    /// warms free and unbounded. The assertion passed while the property it named was false,
+    /// and 2048 concurrent warms of arbitrarily large blobs were admitted at that setting.
     #[test]
-    fn the_warm_reservation_is_clamped_at_both_ends() {
-        // Above the pool: the reservation is capped, so ONE warm still runs. Unclamped, the
+    fn the_warm_reservation_is_bounded_at_both_ends() {
+        // Above the pool: the reservation is capped, so ONE warm still runs. Uncapped, the
         // reservation could never be granted — a semaphore cannot hand out more permits
         // than it holds — and every warm would shed forever, with the feature looking
         // configured and doing nothing.
         let (pool_mb, reserve_mb) = warm_budget_mb(MAX_BACKGROUND_FILL_MB * 4);
-        assert_eq!(reserve_mb, pool_mb, "clamped to the pool");
+        assert_eq!(reserve_mb, pool_mb, "capped at the pool");
         assert_eq!(concurrent_warms(MAX_BACKGROUND_FILL_MB * 4), 1);
 
-        // Below 1 MiB: a zero ceiling must not make warms free and unbounded.
+        // Unlimited (`0`): the worst-case blob is unbounded, so exactly one warm may run —
+        // the same answer as a ceiling above the pool, because that is the same situation.
         assert_eq!(
-            warm_budget_mb(0).1,
+            concurrent_warms(0),
             1,
-            "a zero ceiling still reserves 1 MiB"
+            "an unlimited blob ceiling must admit ONE warm at a time: the reserve is a proxy \
+             for the worst-case blob, and here that blob is unbounded. Reserving anything \
+             smaller lets N warms each buffer an arbitrarily large blob into memory."
+        );
+        let (pool_mb, reserve_mb) = warm_budget_mb(0);
+        assert_eq!(
+            reserve_mb, pool_mb,
+            "an unlimited ceiling IS a ceiling larger than the pool, and must reserve like one"
         );
     }
 

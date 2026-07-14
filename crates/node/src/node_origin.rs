@@ -74,12 +74,7 @@ use crate::dht::{
 };
 use crate::metrics::Metrics;
 use crate::probe_client::probe_once;
-use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, rank_candidates};
-
-/// Per-candidate probe timeout. Short relative to the pull timeout — a probe is
-/// a single unpaid round trip, so a slow candidate is dropped quickly rather
-/// than burning the caller's miss-latency budget on it.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_candidates};
 
 /// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
 /// emitting a structured-log line with the failure-class `reason` (#966).

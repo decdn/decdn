@@ -9,18 +9,46 @@ use rand::RngExt;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use crate::dht::lookup::{DEFAULT_ROUND_TIMEOUT, MAX_LOOKUP_ROUNDS};
+
 /// Maximum providers to attempt before reporting a fetch failure to the
 /// caller (issue #322 — "max 3 provider attempts before returning error").
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
-/// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential
-/// per-candidate costs when computing the outer pull-through deadline
-/// (#859). It covers the *one-time* discover → probe → rank overhead that runs
-/// under the outer deadline but is not per-candidate (probing is concurrent,
-/// bounded by a single probe timeout, so it does not scale with the attempt
-/// count). A tunable judgement value: small relative to one per-candidate budget
-/// so it doesn't materially inflate worst-case miss latency.
-pub const PULL_THROUGH_OUTER_SLACK: Duration = Duration::from_secs(10);
+/// Per-candidate probe timeout. Short relative to the pull timeout — a probe is a single
+/// unpaid round trip, so a slow candidate is dropped quickly rather than burning the
+/// caller's miss-latency budget on it.
+///
+/// Lives here, beside the deadline arithmetic that has to budget for it, rather than in
+/// `node_origin` where it is used (#1145 review). Every term of [`outer_pull_deadline`] is
+/// then visible in one file, which is what stops the next one from being guessed.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential per-candidate
+/// costs when computing the outer pull-through deadline (#859). It covers the *one-time*
+/// `discover → probe → rank` overhead: work that runs under the outer deadline but does not
+/// scale with the attempt count.
+///
+/// **Derived, not chosen** (#1145 review). This used to be a flat 10 s described as "a
+/// tunable judgement value… small relative to one per-candidate budget", and it was smaller
+/// than the thing it was named for:
+///
+/// - probing is concurrent, so it costs one [`PROBE_TIMEOUT`] — 5 s; but
+/// - discovery is `find_providers`, whose rounds are each bounded by
+///   [`DEFAULT_ROUND_TIMEOUT`] (8 s) and whose ROUND COUNT was unbounded.
+///
+/// So a single slow round plus the probe phase already cost 13 s against a 10 s budget,
+/// before any lookup that needed a second round. The outer deadline was therefore short of
+/// what the fetch could actually spend, and the `tokio::time::timeout` around
+/// `discover → probe → rank → pull` could fire while candidate #3 was still in its stall
+/// window — the #859 fallback starvation this whole formula exists to prevent, reachable at
+/// the defaults.
+///
+/// The fix is in two halves, and both are necessary: [`MAX_LOOKUP_ROUNDS`] makes discovery's
+/// worst case finite, and this makes it a TERM. An unbounded cost cannot be budgeted for by
+/// any constant, however generous.
+pub const PULL_THROUGH_OUTER_SLACK: Duration =
+    PROBE_TIMEOUT.saturating_add(DEFAULT_ROUND_TIMEOUT.saturating_mul(MAX_LOOKUP_ROUNDS));
 
 /// How long a pull is willing to WAIT on a buyer-channel open before giving up on
 /// that candidate — not how long the open itself is allowed to take (#1143).
@@ -467,15 +495,40 @@ mod tests {
         }
     }
 
+    /// The slack must cover the thing it is NAMED for (#1145 review).
+    ///
+    /// The test above pins `outer == all_candidates + SLACK`, which proves only that the
+    /// slack is whatever the slack is — it would pass with a slack of one nanosecond. What
+    /// it never asked is whether the slack covers the `discover → probe → rank` overhead it
+    /// exists to pay for. It did not: a flat 10 s against a probe phase (5 s) plus a single
+    /// slow lookup round (8 s) is 3 s short before any lookup needing a second round, and
+    /// the round count was unbounded, so no constant could have been enough.
+    ///
+    /// Both halves are asserted, because either one alone leaves the hole open: discovery's
+    /// worst case must be FINITE, and the slack must be at least that.
+    #[test]
+    fn the_slack_covers_the_discovery_overhead_it_is_named_for() {
+        let worst_discovery = DEFAULT_ROUND_TIMEOUT.saturating_mul(MAX_LOOKUP_ROUNDS);
+        let worst_overhead = PROBE_TIMEOUT.saturating_add(worst_discovery);
+        assert!(
+            PULL_THROUGH_OUTER_SLACK >= worst_overhead,
+            "the slack ({PULL_THROUGH_OUTER_SLACK:?}) must cover a full probe phase \
+             ({PROBE_TIMEOUT:?}) plus the worst-case lookup ({worst_discovery:?}); short of \
+             that, the outer timeout fires while the last candidate is still in its stall \
+             window — the #859 fallback starvation the formula exists to prevent"
+        );
+    }
+
     // The defaults an operator actually runs: `node_pull_timeout_sec = 20` and
     // `node_pull_stall_timeout_sec = 20` (both `DEFAULT_*` in decdn-common, which this
     // crate does not depend on — hence the literals). Pinned because the worst-case
     // client wait is a user-visible number quoted in the CLI help and the metrics docs,
-    // and it moved twice while the formula was being corrected.
+    // and it moved twice while the formula was being corrected — and once more when the
+    // slack stopped being a guess (#1145 review): 10 s -> 5 + 4×8 = 37 s.
     #[test]
-    fn outer_pull_deadline_at_defaults_is_145s() {
+    fn outer_pull_deadline_at_defaults_is_172s() {
         let outer = outer_pull_deadline(Duration::from_secs(20), Duration::from_secs(20));
-        assert_eq!(outer, Duration::from_secs(145), "(5 + 20 + 20) × 3 + 10");
+        assert_eq!(outer, Duration::from_secs(172), "(5 + 20 + 20) × 3 + 37");
     }
 
     // A zero per-candidate budget still yields a positive outer deadline (the

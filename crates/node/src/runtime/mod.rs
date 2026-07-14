@@ -1117,7 +1117,7 @@ pub async fn run(
         // capping it at the budget the foreground just exhausted meant a blob too
         // large to fetch in one deadline could never be warmed either — the node
         // could not acquire any blob needing more transfer time than the derived
-        // deadline (145 s at defaults) allows.
+        // deadline (172 s at defaults) allows.
         //
         // But "not the foreground deadline" is not the same as "no bound", and the
         // first cut of this got that wrong. The streaming stage is bounded by

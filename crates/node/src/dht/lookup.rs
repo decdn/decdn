@@ -68,6 +68,21 @@ pub const DEFAULT_K: NonZeroUsize = match NonZeroUsize::new(K_BUCKET_SIZE) {
 /// iteration even if a few peers hang.
 pub const DEFAULT_ROUND_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Hard ceiling on the number of rounds one lookup may run (#1145 review).
+///
+/// Each round is individually bounded by `round_timeout`, but the LOOP was not: it exits on
+/// convergence (no closer node observed, no candidates left, or K providers found), never on
+/// a count. So the lookup's worst case was `round_timeout × (unbounded)`, and it runs INSIDE
+/// the caller's outer pull deadline — which is derived from a slack term that has to know
+/// what discovery can cost. An unbounded term cannot be budgeted for, and
+/// [`crate::selection::PULL_THROUGH_OUTER_SLACK`] budgeted 10 s for something that could
+/// exceed that in a single slow round.
+///
+/// Kademlia converges in `O(log n)` rounds — for a network of tens to thousands of nodes
+/// that is a handful — so a ceiling this far above the expected count does not truncate a
+/// healthy lookup. It bounds the pathological one, which is all a deadline needs.
+pub const MAX_LOOKUP_ROUNDS: u32 = 4;
+
 /// Lookup tuning knobs. `alpha` and `k` are `NonZeroUsize` so the
 /// type system rules out the silent-no-op states a zero would
 /// produce — empty batches from `pick_round_batch`, instant
@@ -127,7 +142,7 @@ pub async fn find_providers(
     };
     let mut state = LookupState::new(routing_table, &target, requester_id, cfg);
 
-    loop {
+    for round in 0..MAX_LOOKUP_ROUNDS {
         if state.have_enough_providers() {
             break;
         }
@@ -138,6 +153,18 @@ pub async fn find_providers(
         let observed_closer = run_round(&ctx, &batch, &mut state).await;
         if !observed_closer {
             break;
+        }
+        // Cut off a lookup that keeps finding closer nodes without saturating. The loop used
+        // to run until it converged, with no count bound, so its worst case was unbounded —
+        // and it runs inside the caller's outer pull deadline, whose slack term has to know
+        // what discovery can cost (#1145 review). Not an error: whatever providers we have
+        // are still usable, and the pull proceeds with them.
+        if round + 1 == MAX_LOOKUP_ROUNDS {
+            tracing::debug!(
+                rounds = MAX_LOOKUP_ROUNDS,
+                providers = state.provider_count(),
+                "dht lookup: hit the round ceiling; proceeding with the providers found so far"
+            );
         }
     }
 
@@ -458,6 +485,12 @@ impl LookupState {
 
     fn have_enough_providers(&self) -> bool {
         self.providers.len() >= self.k
+    }
+
+    /// Providers accumulated so far — for the round-ceiling log line, which is only useful
+    /// if it says what the truncated lookup came away with.
+    fn provider_count(&self) -> usize {
+        self.providers.len()
     }
 
     /// Consume state, return the surviving provider set with order

@@ -145,7 +145,12 @@ pub struct ClientFetchArgs {
     ///
     /// This is a leak guard, not the health signal — `--stall-timeout-ms` is what catches
     /// a dead provider. Lower it when you must bound total runtime regardless of whether
-    /// the transfer is progressing. It must be larger than `--stall-timeout-ms`.
+    /// the transfer is progressing.
+    ///
+    /// It must exceed TWICE `--stall-timeout-ms`. The cap bounds the whole exchange, and the
+    /// open stage is bounded by the same stall budget, so both can run inside it
+    /// consecutively; below `2 ×` the cap always elapses first and a stalled provider could
+    /// never be detected.
     #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_ms: u64,
 }
@@ -178,9 +183,15 @@ impl ClientFetchArgs {
     /// hang the fetch forever with no error. The default is therefore deliberately
     /// generous — far above any honest transfer under `--max-blob-mb` — and mirrors the
     /// node's own `BACKGROUND_FILL_HARD_CAP`.
+    ///
+    /// Returns a `Duration`, not an `Option<Duration>`. `--timeout-ms` has a default and clap
+    /// rejects a zero, so the cap is ALWAYS present on this path; the `Option` this used to
+    /// return was structurally always `Some`, and existed only to shape-match
+    /// `PullDeadlines`'s optional cap — misinforming every reader and forcing a pointless
+    /// match (#1145 review). A caller that wants the optional form wraps it.
     #[must_use]
-    pub const fn hard_cap(&self) -> Option<Duration> {
-        Some(Duration::from_millis(self.timeout_ms))
+    pub const fn hard_cap(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
     }
 
     /// Reject a deadline pair whose hard cap would silently disable stall detection.
@@ -199,9 +210,22 @@ impl ClientFetchArgs {
     ///
     /// A check of merely `timeout_ms > stall_timeout_ms` admits the whole band up to
     /// `2 × stall_timeout_ms`, where the health signal is still dead — no error, no
-    /// warning, just a bound that cannot do its job. That is the hazard
-    /// `PullDeadlines::whole_transfer` documents and confines to tests, and a user could
-    /// otherwise reach it from the command line.
+    /// warning, just a bound that cannot do its job.
+    ///
+    /// # This is the early check, not the enforcement
+    ///
+    /// `PullDeadlines::capped` is what actually enforces `hard_cap > open + stall`, on the
+    /// type that holds all three values, and both CLI call sites go through it (#1145
+    /// review). This exists so the user gets the error at argument-parse time — naming the
+    /// flags they typed — rather than several frames into a fetch.
+    ///
+    /// It restates the rule rather than calling it because `decdn-common` sits UPSTREAM of
+    /// `decdn-client-pull` in the dependency flow and cannot import `PullDeadlines`. The
+    /// `2 ×` is that rule specialised to these two call sites, which set the open bound from
+    /// `--stall-timeout-ms` as well. If a future `--open-timeout-ms` breaks that assumption,
+    /// this check goes stale — but it can no longer go WRONG, because the constructor
+    /// downstream still refuses to build a `PullDeadlines` whose cap cannot outlast its
+    /// stages. That is the whole reason the invariant was moved onto the type.
     ///
     /// # Errors
     ///
@@ -273,7 +297,7 @@ mod tests {
     fn the_stall_bound_is_the_health_signal_and_the_hard_cap_is_a_leak_guard() {
         let c = parse(&[]);
         assert_eq!(c.stall_timeout(), Duration::from_secs(30));
-        assert_eq!(c.hard_cap(), Some(Duration::from_hours(1)));
+        assert_eq!(c.hard_cap(), Duration::from_hours(1));
     }
 
     /// A fetch must ALWAYS terminate (#1145 review). The stall clock resets on any
@@ -281,10 +305,14 @@ mod tests {
     /// hangs `decdn fetch` forever, with no error and no diagnostic — and hangs the
     /// whole manifest for `bundle pull`. The cap is what makes that impossible, so it
     /// cannot be absent, and it cannot be zero.
+    ///
+    /// "Cannot be absent" is now a fact about the TYPE — `hard_cap()` returns a `Duration`,
+    /// not an `Option<Duration>` — so the only thing left for a test to pin is that it cannot
+    /// be zero, which is clap's job.
     #[test]
     fn a_fetch_always_has_an_overall_cap() {
         assert!(
-            parse(&[]).hard_cap().is_some(),
+            !parse(&[]).hard_cap().is_zero(),
             "an unbounded fetch can be hung forever by a drip-feeding provider"
         );
         assert!(
@@ -296,7 +324,7 @@ mod tests {
     #[test]
     fn hard_cap_is_overridable() {
         let c = parse(&["--timeout-ms", "5000"]);
-        assert_eq!(c.hard_cap(), Some(Duration::from_secs(5)));
+        assert_eq!(c.hard_cap(), Duration::from_secs(5));
     }
 
     /// The two deadlines are only meaningful in relation to each other, and the threshold
