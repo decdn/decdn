@@ -238,8 +238,9 @@ impl ClientFixture {
 /// transport errors, a per-attempt `PullTimeout`, a `PullStalled` (#1134 — an upstream
 /// that went silent mid-stream; retryable here because in a loopback fixture the node
 /// is coming up, not dying), and the node's explicit `RetryLater` resend signal are all
-/// retryable. The last three reach the closing `true` by fallthrough rather than by an
-/// arm of their own.
+/// retryable. `NotFound` and `RetryLater` are decided by explicit arms (the
+/// `UpstreamRefused` and `UpstreamVoucherRejected` downcasts below); transport errors,
+/// `PullTimeout`, and `PullStalled` reach the closing `true` by fallthrough.
 ///
 /// Everything else is terminal: a corrupt delivery (`HashMismatch`), a buyer-side
 /// size-cap rejection (`BlobTooLargeClaim`), any other mid-stream voucher

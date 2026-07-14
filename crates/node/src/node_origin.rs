@@ -1177,12 +1177,23 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
         // policy says to respect rather than punish; suppressing the peer for five
         // minutes over a load spike lasting seconds is punishing it.
         StreamError::NotFound | StreamError::Overloaded => RefusalVerdict::Transient,
-        // `VoucherRejected` cannot reach a validated response at all —
-        // `StreamResponse::validate` rejects it in the `error` field as a
-        // mid-stream-only code — but were it ever to arrive it would be OUR
-        // payment-side fault, which the `UpstreamVoucherRejected` arm already
-        // exonerates. Score nothing and suppress nothing: the peer did nothing wrong,
-        // and it still holds the blob.
+        // `VoucherRejected` is OUR payment-side fault, so: score nothing, suppress nothing.
+        // The peer did nothing wrong and it still holds the blob.
+        //
+        // This arm is REACHABLE, and the comment here used to say it was not (#1145 review).
+        // The old reasoning covered only the OPEN stage, where `StreamResponse::validate`
+        // does reject `VoucherRejected` in the `error` field as a mid-stream-only code. But
+        // this same PR added three MID-STREAM arms that wrap any `ClientMessage::StreamError`
+        // into `UpstreamRefused` — and `VoucherRejected` is precisely the code designated for
+        // mid-stream. Only `self_pay`'s ack-wait special-cases it, so one arriving outside a
+        // voucher round trip lands here as a live refusal.
+        //
+        // The verdict is right either way, which is what made the false "cannot happen" worth
+        // correcting rather than shrugging at: a reader who believed it would delete this arm
+        // as dead code, and a mid-stream `VoucherRejected` would then fall to a verdict that
+        // blames the peer for our own payment fault. Note it does land on
+        // `node_pull_refused_total` rather than `node_pull_voucher_rejected_total`, which
+        // slightly understates the latter.
         StreamError::VoucherRejected { .. } => RefusalVerdict::OurFault,
     }
 }

@@ -179,13 +179,14 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 ///
 /// # The receipt wait is deliberately UNBOUNDED
 ///
-/// Every other tx in this module bounds its receipt wait (`APPROVE_RECEIPT_TIMEOUT`).
-/// `openChannel` must not, and the asymmetry is load-bearing rather than an
-/// oversight (#1143).
+/// `ensure_allowance`'s `approve` bounds its receipt wait (`APPROVE_RECEIPT_TIMEOUT`).
+/// `openChannel` must not — and neither does `top_up`, the module's third tx, which awaits
+/// its receipt unbounded for exactly the reason below. The line is not "one tx is special";
+/// it is ESCROWING vs idempotent, and it is load-bearing rather than an oversight (#1143).
 ///
 /// `approve` is idempotent: giving up on its receipt costs nothing, because the
-/// allowance read on the next run makes a re-approve a no-op. `openChannel`
-/// **escrows a deposit**. Giving up on its receipt does not cancel the tx — it only
+/// allowance read on the next run makes a re-approve a no-op. `openChannel` and `top_up`
+/// **escrow funds**. Giving up on the receipt does not cancel the tx — it only
 /// makes us stop watching a transfer of real USDC that is still in the mempool. The
 /// caller then has no row, believes no open is in flight, and the next cache miss
 /// escrows a **second** deposit against the same provider. When the first tx mines,

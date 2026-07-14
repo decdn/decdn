@@ -336,8 +336,8 @@ mod tests {
     /// still leaves `PullStalled` unable to fire in practice: the health signal is quietly
     /// dead while both knobs look configured.
     ///
-    /// The first version of this guard checked `timeout > stall` and pinned `5000/5001` as
-    /// GOOD, which is the very band where the bug lives.
+    /// Hence the `5000/5001` case below: it clears a naive `timeout > stall` check while
+    /// sitting squarely in the dead band, so it is pinned as an ERROR.
     #[test]
     fn a_hard_cap_that_would_disable_stall_detection_is_rejected() {
         assert!(

@@ -127,11 +127,10 @@ pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
 ///
 /// # Why bytes, not tasks
 ///
-/// The first cut of this bounded the task COUNT (8 concurrent), which is the wrong
-/// quantity: what a warm costs is its blob, and a blob is bounded only by
-/// `max_blob_size_mb` (1 GiB by default). Eight concurrent warms of near-max blobs is
-/// ~8 GiB resident for up to an hour each — while eight concurrent warms of 4 KiB blobs
-/// is nothing at all, and the count-based ceiling throttled those just as hard.
+/// A task COUNT is the wrong quantity to bound: what a warm costs is its blob, and a blob
+/// is bounded only by `max_blob_size_mb` (1 GiB by default). Eight concurrent warms of
+/// near-max blobs is ~8 GiB resident for up to an hour each — while eight concurrent warms
+/// of 4 KiB blobs is nothing at all, and a count-based ceiling throttles those just as hard.
 ///
 /// So the permits are MiB, and each warm reserves `max_blob_size_mb` of them up front —
 /// the blob's size is not known until it has been fetched, so the ceiling is what has to

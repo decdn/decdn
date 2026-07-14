@@ -503,8 +503,11 @@ pub(crate) async fn fetch_blob(
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
-    // Before any network or keystore work: a hard cap at or below the stall budget parses
-    // fine and silently disables stall detection (#1145 review).
+    // Before any network or keystore work: a hard cap at or below TWICE the stall budget
+    // parses fine and silently disables stall detection — the open stage is bounded by that
+    // same budget, so both can run inside the cap consecutively (#1145 review). The
+    // `PullDeadlines::capped` below refuses it too; this is the early error, in the flags the
+    // user actually typed.
     common.validate()?;
 
     // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:

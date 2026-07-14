@@ -450,10 +450,11 @@ impl StreamResponse {
 /// voucher accounting. An unbounded run of them therefore drives the receive
 /// loops without making application-level progress, and the `cumulative >
 /// expected_wire` overrun guard — which only ever trips on bytes — never fires.
-/// Receivers reject an empty frame outright ([`ChunkData::validate`]); it is the
-/// invariant the pull paths' inactivity deadline rests on, since with empty
-/// frames banned "a frame arrived" and "bytes made progress" are the same
-/// statement, so a peer cannot refresh the deadline with padding.
+/// An empty frame cannot be obtained at all — [`ChunkData::new`] and the `try_from` decode
+/// gate both reject one, and they are the only two doors. That is the invariant the pull
+/// paths' inactivity deadline rests on: with empty frames banned, "a frame arrived" and
+/// "bytes made progress" are the same statement, so a peer cannot refresh the deadline
+/// with padding.
 ///
 /// # The bounds are enforced by construction
 ///
@@ -539,11 +540,17 @@ impl ChunkData {
     /// dispatches to it, so the aggregate validator stays total over the message enum
     /// rather than silently skipping this variant.
     ///
+    /// `pub(crate)`, deliberately: it is total by construction, and a public function that
+    /// cannot fail is a check the API advertises and does not have (#1145 review). Leaving it
+    /// on the committed surface would invite a caller to depend on it and make removing it a
+    /// breaking change — for a validator whose only honest answer is `Ok`. The dispatcher is
+    /// in this crate, so `pub(crate)` costs nothing and says the truth.
+    ///
     /// # Errors
     ///
     /// [`MessageValidationError::EmptyChunk`] / [`MessageValidationError::ChunkTooLarge`],
     /// neither of which a constructed frame can produce.
-    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+    pub(crate) const fn validate(&self) -> Result<(), MessageValidationError> {
         if self.bytes.is_empty() {
             return Err(MessageValidationError::EmptyChunk);
         }

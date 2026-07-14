@@ -44,7 +44,6 @@ impl decdn_protocol::client::ChunkData
 pub fn decdn_protocol::client::ChunkData::bytes(&self) -> &[u8]
 pub fn decdn_protocol::client::ChunkData::into_bytes(self) -> alloc::vec::Vec<u8>
 pub fn decdn_protocol::client::ChunkData::new(alloc::vec::Vec<u8>) -> core::result::Result<Self, decdn_protocol::message::MessageValidationError>
-pub const fn decdn_protocol::client::ChunkData::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::ClientBinding
 pub decdn_protocol::client::ClientBinding::binding_signature: alloc::vec::Vec<u8>
 pub decdn_protocol::client::ClientBinding::ethereum_address: [u8; 20]
@@ -346,7 +345,6 @@ impl decdn_protocol::client::ChunkData
 pub fn decdn_protocol::client::ChunkData::bytes(&self) -> &[u8]
 pub fn decdn_protocol::client::ChunkData::into_bytes(self) -> alloc::vec::Vec<u8>
 pub fn decdn_protocol::client::ChunkData::new(alloc::vec::Vec<u8>) -> core::result::Result<Self, decdn_protocol::message::MessageValidationError>
-pub const fn decdn_protocol::client::ChunkData::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::ClientBinding
 pub decdn_protocol::ClientBinding::binding_signature: alloc::vec::Vec<u8>
 pub decdn_protocol::ClientBinding::ethereum_address: [u8; 20]

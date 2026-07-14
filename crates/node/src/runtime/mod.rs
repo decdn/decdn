@@ -1119,9 +1119,9 @@ pub async fn run(
         // could not acquire any blob needing more transfer time than the derived
         // deadline (172 s at defaults) allows.
         //
-        // But "not the foreground deadline" is not the same as "no bound", and the
-        // first cut of this got that wrong. The streaming stage is bounded by
-        // INACTIVITY, which resets on any byte — so an upstream trickling one byte
+        // But "not the foreground deadline" is not the same as "no bound". The
+        // streaming stage is bounded by INACTIVITY, which resets on any byte — so an
+        // upstream trickling one byte
         // every `stall - ε` keeps a warm alive forever without ever tripping it. And
         // because `arm_background_fill` claims the hash for the task's lifetime, a
         // warm that never ends means that blob can never be warmed again for the life

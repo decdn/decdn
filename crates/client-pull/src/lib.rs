@@ -413,10 +413,19 @@ impl std::error::Error for UpstreamVoucherRejected {}
 ///   blob-scoped (`ServeRejectReason::wire_error` deliberately collapses seven
 ///   reasons onto it so channel existence cannot be probed). Scoring it as
 ///   `Unreachable` punished a node for truthfully saying it lacks a blob.
-/// - `EvictedSinceProbe` / `Overloaded` / `BlobTooLarge` — likewise honest, and
-///   the latter is deterministic (it recurs for this blob on any node).
+/// - `EvictedSinceProbe` / `BlobTooLarge` — likewise honest, and DURABLE for this
+///   (peer, hash): asking again soon gets the same answer, so the consumer suppresses
+///   the pair for the full negative-cache TTL rather than burning a candidate slot on it.
+/// - `Overloaded` — honest but transient. Backpressure is to be respected, not punished,
+///   so it earns only the short `REFUSAL_SUPPRESSION_TTL`.
+/// - `VoucherRejected` — OUR payment fault, not the peer's. Listed because it genuinely
+///   arrives here: it is the code designated for MID-stream, and the mid-stream receive
+///   arms wrap any `StreamError` into this sentinel (#1145 review).
 /// - `InternalError` — the one code that IS evidence of a degraded peer; it means
 ///   "unexpected failure, do not retry THIS node" (#1129).
+///
+/// `node_origin::classify_refusal` is the consumer and matches this exhaustively, so a new
+/// wire code breaks that build rather than silently inheriting a verdict.
 ///
 /// Only the wire code is recoverable here, never the finer server-side
 /// `ServeRejectReason` — that collapse is intentional and must not be reversed.
@@ -691,6 +700,16 @@ impl PullDeadlines {
     /// signal disabled; the stall path is covered by
     /// `node_origin_mid_stream_silence_scores_stalled_upstream`, which builds its
     /// deadlines explicitly.
+    ///
+    /// That is a statement about the BUFFERED path, where `with_hard_cap` wraps the whole
+    /// exchange. The progressive path never consults `hard_cap` at all (see
+    /// [`open_progressive_pull`]), so a `whole_transfer` used there would leave `PullStalled`
+    /// perfectly able to fire — which is not a reprieve, just a different reason not to
+    /// reach for this (#1145 review).
+    ///
+    /// It is also the reason this constructor stays infallible while [`Self::capped`] is not:
+    /// it deliberately builds the very state `capped` refuses. Test-only, `#[doc(hidden)]`,
+    /// and named to be hard to reach for by accident.
     ///
     /// TEST-ONLY. Used by the loopback helper [`stream_fetch`] and directly by the
     /// `client_loopback` suite, whose blobs are small enough that none of this matters.

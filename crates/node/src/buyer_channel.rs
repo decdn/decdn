@@ -408,8 +408,8 @@ impl InFlightOpenGuard {
 
         // A SPAWNED supervisor, not a combinator on the returned future.
         //
-        // This distinction is the whole fix, and getting it wrong is subtle enough that the
-        // first attempt did. A `Shared` advances only when some clone is POLLED, and after
+        // This distinction is the whole fix, and it is subtle enough to be worth spelling
+        // out. A `Shared` advances only when some clone is POLLED, and after
         // the caller's budget expires the only clone left is the one parked in
         // `opens_in_flight`, which nobody polls. So a `handle.await.unwrap_or_else(report)`
         // written here would fire the report exactly when a caller was still waiting — and
@@ -3295,14 +3295,14 @@ mod tests {
     /// `openChannel` may already be in the mempool, i.e. a deposit escrowed against no
     /// persisted row.
     ///
-    /// The first attempt at this fix reported from a combinator on the returned future, and
-    /// it fired only when a caller was still waiting: a `Shared` advances only when a clone
-    /// is POLLED, and once the caller's budget expires the sole remaining clone is the one
-    /// parked in `opens_in_flight`, which nobody polls. So the report was unreachable in
-    /// precisely the case its own comment invoked, and the suite stayed green — the exact
-    /// shape of defect this whole review round exists to remove. Hence a supervisor task,
-    /// which the runtime drives whether or not anyone awaits it, and hence this test, which
-    /// lets the caller LEAVE before the panic lands.
+    /// So the report must come from a SPAWNED supervisor, and this test is what holds it
+    /// there. Reporting from a combinator on the returned future would fire only while a
+    /// caller was still waiting: a `Shared` advances only when a clone is POLLED, and once
+    /// the caller's budget expires the sole remaining clone is the one parked in
+    /// `opens_in_flight`, which nobody polls. The report would then be unreachable in exactly
+    /// the case it exists for, and its sibling test above — which keeps a caller waiting
+    /// throughout — would stay green and say nothing. Hence this one, which lets the caller
+    /// LEAVE before the panic lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     async fn a_panicking_open_is_reported_even_when_no_caller_is_left_to_see_it() {
