@@ -1815,7 +1815,56 @@ mod tests {
     use bao_tree::io::outboard::PreOrderMemOutboard;
     use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 
-    use super::{HashMismatch, decode_verified_range};
+    use super::{HashMismatch, LocalPullFault, aligned_wire_len, decode_verified_range};
+
+    /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
+    /// raise — not on one a test hand-built (#1145 review).
+    ///
+    /// This distinction is the whole point of the test, and the version it replaces got it
+    /// backwards. That one called the real `sign_client_binding`, asserted it was `Ok`,
+    /// threw the result away, and then hand-built `anyhow!("...").context(LocalPullFault)`
+    /// before asserting the ladder found `LocalPullFault` in it. Attaching the marker and
+    /// then finding it is true by construction: the test could not fail, and stripping every
+    /// `.context(LocalPullFault)` from the crate left the whole suite green. Its own doc
+    /// comment warned that "a synthetic `anyhow!(...)` would pass this test while production
+    /// scored the peer" — and then did exactly that.
+    ///
+    /// So: real functions, real errors, marker never touched by the test. `align_range`
+    /// rejects an offset at or past the end of the blob (never clamps — ADR 005), which is
+    /// the one local-fault trigger reachable without mocking a signer, and it is shared by
+    /// both the buffered and window-paced paths.
+    ///
+    /// The stakes, and why an unguarded marker here is not cosmetic: every arm BELOW
+    /// `LocalPullFault` in the ladder blames the peer to some degree, and the catch-all
+    /// scores `Unreachable` — a local EWMA hit AND a gossiped observation. A fault in this
+    /// node is not evidence about a provider, and a node in this state meets every candidate
+    /// in turn, so losing the marker does not mis-score one peer: it defames the whole
+    /// candidate list on the strength of our own defect.
+    #[test]
+    fn the_range_helpers_mark_their_own_faults_as_local() {
+        // A 4 KiB blob cannot be resumed from byte 8192 — `align_range` errors rather than
+        // clamping (ADR 005), and both callers must own that as OURS. Each assertion covers
+        // both halves at once: `None` here means the call wrongly SUCCEEDED, and a `Some`
+        // without the marker means it failed and blamed the peer.
+        let aligned = aligned_wire_len(8192, 4096).err();
+        assert!(
+            aligned
+                .as_ref()
+                .is_some_and(|e| e.downcast_ref::<LocalPullFault>().is_some()),
+            "aligned_wire_len must reject an out-of-range offset and mark it OUR fault; \
+             without the marker it falls through every downcast to the catch-all and \
+             gossips the peer as unreachable. Got: {aligned:?}"
+        );
+
+        let decoded = decode_verified_range([0u8; 32], 4096, 8192, 0, &[]).err();
+        assert!(
+            decoded
+                .as_ref()
+                .is_some_and(|e| e.downcast_ref::<LocalPullFault>().is_some()),
+            "decode_verified_range must reject an out-of-range offset and mark it OUR fault, \
+             for the same reason. Got: {decoded:?}"
+        );
+    }
 
     /// `client_binding_ext` maps an unbound context to `None` (so
     /// `encode_stream_request` appends no ext bytes — byte-for-byte the pre-#1115

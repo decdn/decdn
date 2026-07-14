@@ -1877,30 +1877,34 @@ mod tests {
     /// A fault in THIS node must never be scored against the peer we happened to be
     /// talking to when it surfaced.
     ///
-    /// The stakes are why this is pinned on the real ladder rather than assumed: the
-    /// buyer key that signs the ADR 005 client binding is the same key that signs
-    /// vouchers, and the binding is signed BEFORE the stream opens, on every candidate. So
-    /// a node whose signer is broken does not mis-score one provider — it walks the entire
-    /// candidate list handing out `Unreachable` (a local EWMA hit AND a gossiped
-    /// observation) to every honest peer it meets, on the strength of its own defect,
-    /// forever. The catch-all is only ever one misplaced arm away.
+    /// The stakes are why this is pinned rather than assumed: the buyer key that signs the
+    /// ADR 005 client binding is the same key that signs vouchers, and the binding is signed
+    /// BEFORE the stream opens, on every candidate. So a node whose signer is broken does not
+    /// mis-score one provider — it walks the entire candidate list handing out `Unreachable`
+    /// (a local EWMA hit AND a gossiped observation) to every honest peer it meets, on the
+    /// strength of its own defect. The catch-all is only ever one misplaced arm away.
     ///
-    /// Uses the REAL error `sign_client_binding` raises, built through the real function,
-    /// not a hand-made look-alike — the marker riding under `anyhow`'s context chain is
-    /// the entire mechanism, and a synthetic `anyhow!("sign client binding: …")` would
-    /// pass this test while production scored the peer.
+    /// **What this test does and does not prove.** It pins the LADDER: that a `LocalPullFault`
+    /// buried under the context layers the real call stack adds still beats every arm below
+    /// it. It does NOT prove any production site attaches the marker — a pure function over
+    /// an `anyhow::Error` cannot, and the version of this test that pretended otherwise was
+    /// the reason the whole review round exists. That one hand-built the error WITH
+    /// `.context(LocalPullFault)` and then asserted the ladder found `LocalPullFault`: true
+    /// by construction, unfailable, and green even with every marker stripped from the crate.
+    ///
+    /// The wiring is guarded where the wiring lives:
+    /// - `the_range_helpers_mark_their_own_faults_as_local` (in `decdn-client-pull`) drives
+    ///   the REAL `aligned_wire_len` / `decode_verified_range` into their REAL errors and
+    ///   asserts the marker is on them, never attaching it itself.
+    /// - `node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one` drives a
+    ///   real pull whose signature the upstream cannot verify — the production shape of "our
+    ///   buyer key is broken" — and asserts `node_pull_local_fault_total` moves while the
+    ///   peer is left unscored.
     #[test]
-    fn a_local_signing_fault_is_never_blamed_on_the_peer() {
-        let signer = alloy::signers::local::PrivateKeySigner::random();
-        let domain = decdn_incentive::bind_node_id_domain(1, Address::repeat_byte(0x11));
-        // The real call. It succeeds with a healthy signer, so take its error shape from
-        // the one thing that can fail and re-raise it exactly as the real code does.
-        let real = sign_client_binding(&signer, B256::ZERO, &domain);
-        assert!(real.is_ok(), "a healthy signer must produce a binding");
-
-        // The failure the real function raises, with the real marker attached, then buried
-        // under the context layers the real call stack adds on the way out.
-        let err = anyhow::anyhow!("sign client binding: signer unavailable")
+    fn a_local_fault_outranks_every_arm_that_blames_the_peer() {
+        // Marker under the context layers the real call stack adds on the way out — the
+        // shape production produces, though (necessarily) assembled here.
+        let err = anyhow::anyhow!("voucher signing failed: signer unavailable")
             .context(LocalPullFault)
             .context("bind the upstream request")
             .context("pull from candidate");
@@ -1908,8 +1912,24 @@ mod tests {
         assert_eq!(
             pull_verdict(&err),
             PullVerdict::OurLocalFault,
-            "a local signing fault must be OUR fault — reaching the catch-all here gossips \
-             every honest provider as unreachable"
+            "a local fault must outrank the catch-all — reaching it gossips every honest \
+             provider as unreachable"
+        );
+
+        // And it must outrank the arm that sits directly below it. `UpstreamRefused` is the
+        // one that would otherwise catch a local fault raised while a refusal was in flight,
+        // and it exonerates the peer for the WRONG reason — quietly, and without the
+        // `node_pull_local_fault_total` an operator needs to see that this node is broken.
+        let refused_too = anyhow::anyhow!("encode failed")
+            .context(LocalPullFault)
+            .context(UpstreamRefused {
+                error: StreamError::NotFound,
+            });
+        assert_eq!(
+            pull_verdict(&refused_too),
+            PullVerdict::OurLocalFault,
+            "a local fault must win over a refusal on the same chain: the refusal is a \
+             symptom, the broken node is the cause"
         );
     }
 

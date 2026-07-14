@@ -36,7 +36,7 @@ use decdn_incentive::{
     ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
     signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::{ChannelOpenPending, ChannelOpener};
+use decdn_node::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenSlotReserved};
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::dht::negative_cache::Hash as DhtHash;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -257,6 +257,22 @@ struct WedgedOpener {
     /// Providers whose open was attempted, in order — so a test can prove the loop
     /// actually reached the fallback rather than succeeding for some other reason.
     attempted: Arc<Mutex<Vec<Address>>>,
+    /// Which typed sentinel a wedged provider raises. The two are handled by DIFFERENT
+    /// arms of `record_channel_open_failure` and mean different things, so a fixture that
+    /// could only produce one of them left the other arm unexercised (#1145 review).
+    stall: OpenStall,
+}
+
+/// The two ways an open can fail to hand back a channel WITHOUT anything being wrong.
+#[derive(Debug, Clone, Copy)]
+enum OpenStall {
+    /// The open outlived the caller's budget and continues in a detached task (#1143).
+    Pending,
+    /// A reconcile scan holds this provider's open slot while it re-hydrates the row, and
+    /// tells us to retry. Self-clearing — and it happens at EVERY boot, which is what makes
+    /// its arm load-bearing: counting it as a channel-open failure turns each restart into a
+    /// spike of `unclassified` failures an operator would chase.
+    SlotReserved,
 }
 
 #[async_trait]
@@ -281,10 +297,15 @@ impl ChannelOpener for WedgedOpener {
             // of the pending one — the test would still pass (neither arm scores
             // reputation) while never exercising the path it claims to.
             tokio::time::sleep(budget).await;
-            return Err(anyhow::Error::new(ChannelOpenPending {
-                provider: provider_addr,
-                waited: budget,
-            }));
+            return Err(match self.stall {
+                OpenStall::Pending => anyhow::Error::new(ChannelOpenPending {
+                    provider: provider_addr,
+                    waited: budget,
+                }),
+                OpenStall::SlotReserved => anyhow::Error::new(OpenSlotReserved {
+                    provider: provider_addr,
+                }),
+            });
         }
         Ok(ChannelContext {
             channel_id: self.channel_id,
@@ -634,6 +655,50 @@ fn build_origin_with_timeout(
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
 ) -> NodeOrigin {
+    build_origin_with_negative_cache(
+        ep_b,
+        b_dht,
+        hash,
+        buyer,
+        local_rep,
+        obs_buffer,
+        metrics,
+        region_accountant,
+        providers,
+        addr_map,
+        pull_timeout,
+        stall_timeout,
+        max_blob_size_bytes,
+        NegativeProbeCache::new(),
+    )
+}
+
+/// [`build_origin_with_timeout`] with the negative cache injected, so a test can pick its
+/// CACHE-WIDE TTL.
+///
+/// That knob is what makes the refusal-TTL split observable at all. The cache anchors expiry
+/// on `Instant`, so `tokio::time` cannot fast-forward it, and the production values (5 min
+/// cache-wide vs 30 s `REFUSAL_SUPPRESSION_TTL`) are far too long to wait out. Shrinking the
+/// cache-wide TTL below `REFUSAL_SUPPRESSION_TTL` INVERTS their order, which is exactly what
+/// a test wants: the two arms then have visibly different lifetimes in opposite directions,
+/// and no single implementation can satisfy both assertions by accident.
+#[allow(clippy::too_many_arguments, clippy::expect_used)]
+fn build_origin_with_negative_cache(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    hash: Hash,
+    buyer: Arc<dyn ChannelOpener>,
+    local_rep: &Arc<LocalReputation>,
+    obs_buffer: &Arc<ObservationBuffer>,
+    metrics: &Arc<Metrics>,
+    region_accountant: &Arc<RegionAccountant>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+    pull_timeout: Duration,
+    stall_timeout: Duration,
+    max_blob_size_bytes: u64,
+    negative_cache: NegativeProbeCache,
+) -> NodeOrigin {
     let mut dir = HashMap::new();
     dir.insert(DhtHash::from_bytes(*hash.as_bytes()), providers);
 
@@ -656,7 +721,7 @@ fn build_origin_with_timeout(
                 .expect("network reputation config"),
         ),
         rep_cfg: NetworkReputationConfig::default(),
-        negative_cache: NegativeProbeCache::new(),
+        negative_cache,
         metrics: Arc::clone(metrics),
         region_accountant: Arc::clone(region_accountant),
         config: NodeOriginConfig {
@@ -2442,11 +2507,17 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
 /// The wedged provider here never even gets dialled, so no server is spawned for it
 /// — the hazard is entirely in the buyer's chain lane, which is also why it must
 /// cost the peer no reputation: our RPC being slow says nothing about them.
-#[tokio::test]
+///
+/// Run against BOTH stalls (#1145 review). They are handled by different arms of
+/// `record_channel_open_failure` and mean different things — one says our chain lane is
+/// slow, the other that a reconcile is re-hydrating the row — but they must produce the
+/// SAME outcome here: the loop moves on, the peer is not scored, and neither counts as a
+/// channel-open FAILURE. Only the `Pending` arm was ever exercised; deleting the
+/// `OpenSlotReserved` arm outright left 749/749 green, even though it fires at every boot.
 // multi-node fixture setup, like its siblings above; the two wedged nodes are
 // deliberately named in parallel (`w_*` / `w2_*`) so the pair reads as a pair.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
-async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()> {
+async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Result<()> {
     let payload = vec![0xE1u8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
@@ -2570,6 +2641,7 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         attempted: Arc::clone(&attempted),
+        stall,
     }) as Arc<dyn ChannelOpener>;
     let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
         HashMap::from([
@@ -2678,6 +2750,23 @@ async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()
     task_w.await?;
     task_w2.await?;
     Ok(())
+}
+
+/// The open outlived the caller's budget and continues in a detached task (#1143).
+#[tokio::test]
+async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()> {
+    wedged_open_does_not_starve_the_candidate_loop(OpenStall::Pending).await
+}
+
+/// A reconcile holds the provider's open slot and tells us to retry (#1145 review).
+///
+/// Its own arm, and an unexercised one until now. It is not interchangeable with the
+/// pending arm even though both end in the same counter: reaching the generic
+/// channel-open-FAILURE arm instead would turn every single boot — when the reconcile scan
+/// runs — into a spike of `unclassified` failures for an operator to chase.
+#[tokio::test]
+async fn a_reserved_open_slot_does_not_starve_the_candidate_loop() -> Result<()> {
+    wedged_open_does_not_starve_the_candidate_loop(OpenStall::SlotReserved).await
 }
 
 /// The WINDOW-path counterpart of `node_origin_pull_falls_through_a_stalled_candidate`
@@ -5358,6 +5447,173 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
 /// easy over-correction to #1144, and nothing outside the isolated `classify_refusal`
 /// unit test would have noticed: this test is what makes the predicate's verdict
 /// observable through the real wire + classification path.
+/// The cache-wide TTL these refusal tests inject. Deliberately far BELOW
+/// `REFUSAL_SUPPRESSION_TTL` (30 s), inverting the production order (5 min vs 30 s) so the
+/// two suppression arms have visibly opposite lifetimes and no single implementation can
+/// satisfy both assertions by accident.
+const TINY_CACHE_TTL: Duration = Duration::from_millis(100);
+
+/// Long enough that `TINY_CACHE_TTL` has certainly elapsed, short enough that
+/// `REFUSAL_SUPPRESSION_TTL` certainly has not.
+const PAST_THE_TINY_TTL: Duration = Duration::from_millis(600);
+
+/// Refuse one pull with `error`, wait `wait`, then pull again — and report whether the
+/// second pull was SUPPRESSED (the peer was never re-probed) or went through.
+///
+/// The suppression is observed behaviourally, through `probe_and_rank`'s filter, rather
+/// than by reading the cache: a suppressed (peer, hash) is dropped from the candidate list
+/// before it can be probed, so the second fetch never becomes a second refusal. That is the
+/// property that actually matters — the cache entry is only the means.
+///
+/// `wait` is the discriminator. At zero it asks "is this refusal suppressed AT ALL"; past
+/// [`TINY_CACHE_TTL`] it asks "on whose budget". Both questions are needed: with a tiny
+/// cache TTL, an arm that never suppresses and an arm whose cache-TTL suppression has
+/// expired are indistinguishable after the wait, so a test that only waits cannot tell that
+/// `DurableMiss`'s suppression was deleted outright.
+async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result<bool> {
+    let payload = vec![0x6Bu8; 4096];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_refusing_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        error,
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let buyer = Arc::new(StubOpener {
+        channel_id: B256::repeat_byte(0x6B),
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin_with_negative_cache(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        providers,
+        addr_map,
+        Duration::from_secs(20),
+        Duration::from_secs(20),
+        0,
+        NegativeProbeCache::with_capacity_and_ttl(16, TINY_CACHE_TTL),
+    );
+
+    // Pull #1: refused, and the refusal records a suppression whose TTL is the thing under
+    // test.
+    let _ = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
+    assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
+
+    tokio::time::sleep(wait).await;
+
+    // Pull #2: if the suppression is still live the candidate is filtered out before it can
+    // be probed, so no second refusal is ever recorded.
+    let _ = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
+    let text = b_metrics
+        .encode()
+        .map_err(|e| anyhow::anyhow!("encode metrics: {e}"))?;
+    let refused_twice = text.lines().any(|l| l == "decdn_node_pull_refused_total 2");
+
+    task_a.abort();
+    ep_b.close().await;
+    ep_a.close().await;
+    Ok(!refused_twice)
+}
+
+/// The two refusal suppressions must have DIFFERENT lifetimes, and this is the only test
+/// that can tell (#1145 review).
+///
+/// `84c09dc` split them for a concrete reason: at the full 5-minute TTL, "a deposit that ran
+/// dry for one pull — or the pre-observation window right after we open a channel —
+/// blackholed a perfectly healthy upstream for five minutes". A `NotFound` refusal is not
+/// even attributable to the peer (`ServeRejectReason::wire_error` collapses seven reasons
+/// onto it, three of them ours), so it gets `REFUSAL_SUPPRESSION_TTL` — 30 s, long enough to
+/// stop a retry burst re-probing a peer that just said no, short enough not to blackhole it.
+/// An `EvictedSinceProbe` is a durable, honest fact about this (peer, hash), so it earns the
+/// full cache TTL.
+///
+/// Nothing guarded the mapping. `only_a_durable_refusal_earns_the_full_suppression_ttL`
+/// asserts what `classify_refusal` RETURNS and that the constant is under five minutes — but
+/// not that the verdict reaches the right `suppress(...)` call. Restoring the precise bug the
+/// commit was written to fix (giving `Transient` the full TTL) left the suite 1080/1080 green,
+/// and removing `DurableMiss`'s suppression outright passed 38/38.
+///
+/// So three things are asserted, against an INVERTED cache TTL (see `TINY_CACHE_TTL`). Each
+/// one is load-bearing, and dropping any of them lets one of the two mutations back in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transient_refusal_is_suppressed_briefly_and_a_durable_one_for_the_full_ttl() -> Result<()>
+{
+    // 1. `NotFound` — transient, and maybe not even about the peer. Suppressed on its OWN
+    //    fixed budget, so it OUTLIVES a (tiny) cache TTL. This is the assertion that catches
+    //    the restored bug.
+    anyhow::ensure!(
+        refusal_suppression_after(StreamError::NotFound, PAST_THE_TINY_TTL).await?,
+        "a transient refusal must be suppressed on REFUSAL_SUPPRESSION_TTL, not the cache TTL \
+         — routing it through the cache-wide TTL is exactly the bug that blackholed a healthy \
+         upstream for five minutes over one dry deposit"
+    );
+
+    // 2. `EvictedSinceProbe` — a durable, honest fact about this (peer, hash). It must be
+    //    suppressed AT ALL. Without this, deleting the durable arm's `suppress(None)`
+    //    outright is invisible: with a tiny cache TTL, "never suppressed" and "suppression
+    //    already expired" look identical after any wait.
+    anyhow::ensure!(
+        refusal_suppression_after(StreamError::EvictedSinceProbe, Duration::ZERO).await?,
+        "a durable refusal must suppress the (peer, hash) pair — otherwise a peer that \
+         advertises everything and serves nothing keeps winning the ranker and burns a \
+         MAX_PROVIDER_ATTEMPTS slot on every miss, forever"
+    );
+
+    // 3. …and on the CACHE-WIDE TTL, so it expires with it rather than on the transient
+    //    budget. Together with (1) this pins the two arms to different calls: no single
+    //    implementation satisfies both.
+    anyhow::ensure!(
+        !refusal_suppression_after(StreamError::EvictedSinceProbe, PAST_THE_TINY_TTL).await?,
+        "a durable refusal must ride the cache-wide TTL; outliving one this long means it is \
+         being given the transient budget instead"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
     let payload = vec![0x1Eu8; 4096];
