@@ -40,7 +40,7 @@ use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
     AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, ChannelOpenFailureReason,
-    PendingSettle, PendingSettleStore, StoreError, Voucher,
+    DepositOutcome, PendingSettle, PendingSettleStore, StoreError, Voucher,
 };
 use futures_util::FutureExt;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
@@ -52,7 +52,9 @@ use crate::client_requester::ChannelContext;
 // decode + state/ctx build, and the one-time USDC approval — now live in the
 // shared `decdn-client-pull` crate (re-exported here as `client_requester`).
 use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range};
-use crate::client_requester::buyer_channel::{OpenedChannel, ensure_allowance, open_channel};
+use crate::client_requester::buyer_channel::{
+    LOW_WATER_DIVISOR, OpenedChannel, ensure_allowance, open_channel, refill_amount,
+};
 use crate::client_requester::cooperative_close::{
     AuthorizedWatermark, CooperativeCloseOutcome, cooperative_close,
 };
@@ -526,6 +528,66 @@ impl Drop for InFlightOpenGuard {
     }
 }
 
+/// RAII claim on a provider's slot in [`BuyerChannelService::topups_in_flight`]
+/// (#1146). Held by the detached refill task; its `Drop` frees the provider so a
+/// task that finishes OR panics never wedges future refills to that provider.
+struct RefillSlot {
+    set: Arc<Mutex<HashSet<Address>>>,
+    provider: Address,
+}
+
+impl Drop for RefillSlot {
+    fn drop(&mut self) {
+        // Recover a poisoned lock (a prior holder panicked) and still release the
+        // slot, mirroring `InFlightOpenGuard`.
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.provider);
+    }
+}
+
+/// Claim the background-refill slot for `provider`, or `None` if a refill is
+/// already in flight for it (per-provider dedup, #1146). A low-water refill is
+/// best-effort, so it must never propagate a panic into the pull path: a poisoned
+/// lock (a prior holder panicked while holding it) is RECOVERED via
+/// `PoisonError::into_inner` and the claim proceeds, mirroring [`RefillSlot::drop`].
+/// The critical section is a single `HashSet` insert that cannot leave the set
+/// inconsistent, so recovering is safe — and, unlike declining on poison, keeps
+/// refills self-healing rather than permanently disabled after the first panic.
+fn claim_refill_slot(set: &Arc<Mutex<HashSet<Address>>>, provider: Address) -> Option<RefillSlot> {
+    let mut guard = set
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !guard.insert(provider) {
+        return None; // a refill for this provider is already running
+    }
+    drop(guard);
+    Some(RefillSlot {
+        set: Arc::clone(set),
+        provider,
+    })
+}
+
+/// The low-water top-up amount for a reused channel (#1146, #1103): `U256::ZERO`
+/// when the remaining deposit still has headroom, else the amount that restores
+/// it to the working `target`. `target = max(deposit_hint, default_deposit,
+/// min_deposit)` — the same deposit a fresh open would fund (see
+/// [`BuyerChannelService::join_or_spawn_open`]) — and the trigger is
+/// `target / LOW_WATER_DIVISOR` (20% remaining). Pure so the policy is
+/// unit-testable; the shared [`refill_amount`] kernel is the same one the CLI
+/// fetch auto-refill uses.
+fn refill_decision(
+    state: &BuyerChannelState,
+    deposit_hint: U256,
+    default_deposit: U256,
+    min_deposit: U256,
+) -> U256 {
+    let target = deposit_hint.max(default_deposit).max(min_deposit);
+    let low_water = target / U256::from(LOW_WATER_DIVISOR);
+    refill_amount(state.deposit, state.last_amount, target, low_water)
+}
+
 /// Buyer-side `PaymentChannel` service. Generic over the alloy [`Provider`]
 /// (a wallet-filled provider is required for the `approve` / `openChannel` /
 /// `topUp` / `reclaimExpired` write paths). Cheap to construct; owns its
@@ -553,6 +615,16 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     /// restart is the persisted channel row (and, for an open that landed without
     /// one, the boot-time `reconcile_orphans_once` scan).
     opens_in_flight: Arc<Mutex<HashMap<Address, SharedOpen>>>,
+    /// Providers with a background low-water top-up currently in flight (#1146).
+    ///
+    /// A reused channel whose remaining deposit has run below its low-water mark
+    /// is topped up by a detached, best-effort task so a sustained series of miss
+    /// pulls to one provider is never silently stranded by a spent-down deposit.
+    /// This set dedups those tasks per provider: many concurrent reuse pulls to
+    /// the same provider fire at most one `topUp` tx. In-memory only — a
+    /// process-local dedup, not a durable ledger; the slot is freed when the task
+    /// finishes or panics (see [`RefillSlot`]).
+    topups_in_flight: Arc<Mutex<HashSet<Address>>>,
     /// Per-channel consecutive `try_reclaim`-failure tally (#906), shared between
     /// the background reclaim loop and [`Self::sweep_expired_once`]. In-memory
     /// only: a restart resets it, so a persistent failure re-escalates after
@@ -647,6 +719,8 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         // slots the live open path uses, so its re-hydration can never overwrite a
         // channel a concurrent cache-miss open just recorded.
         let opens_in_flight = Arc::new(Mutex::new(HashMap::new()));
+        // Per-provider dedup for background low-water top-ups (#1146).
+        let topups_in_flight = Arc::new(Mutex::new(HashSet::new()));
 
         // One-shot bootstrap reconciliation (#763): re-hydrate any on-chain
         // channel this node opened but lost track of (record/decode failed
@@ -692,6 +766,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             min_deposit,
             default_deposit,
             opens_in_flight,
+            topups_in_flight,
             reclaim_failures,
             metrics,
             _reclaimer: AbortOnDrop(reclaimer),
@@ -784,6 +859,11 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         // Fast path: reuse a live channel without touching the in-flight map, so
         // many concurrent pulls to an already-open provider never serialize.
         if let Some(ctx) = self.reuse_live_or_report(provider_addr)? {
+            // Non-blocking: if this channel has run below its low-water mark, kick
+            // off a detached top-up (#1146) so a later reuse isn't stranded, and
+            // hand THIS pull the current channel immediately — the refill must not
+            // sit in the hot reuse path behind an on-chain `topUp`.
+            self.spawn_refill_if_low(provider_addr, deposit_hint);
             return Ok(ctx);
         }
 
@@ -837,6 +917,136 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             );
             err.context(OpenReported)
         })
+    }
+
+    /// The synchronous decision behind [`Self::spawn_refill_if_low`]: read the live
+    /// channel for `provider_addr` and, if its remaining deposit is below the
+    /// low-water mark, claim the per-provider refill slot and return it with the
+    /// top-up amount. `None` means nothing to do — no live channel (or an
+    /// already-expired one, which the open path replaces since `topUp` cannot extend
+    /// expiry), a store-read fault (advisory here — the reuse path already surfaced
+    /// it loudly), still-has-headroom, or a refill already in flight for this
+    /// provider. Split out from the spawn so every branch is unit-testable without a
+    /// live chain.
+    fn plan_refill(
+        &self,
+        provider_addr: Address,
+        deposit_hint: U256,
+    ) -> Option<(RefillSlot, U256)> {
+        let state = match self.store.get_by_provider(provider_addr) {
+            Ok(Some(state)) if !state.is_expired_at(unix_now()) => state,
+            // No live channel to refill (the reuse read already returned the real
+            // ctx); an already-expired channel is skipped here — the next pull's
+            // reuse check opens a fresh one, since `topUp` cannot extend expiry.
+            Ok(_) => return None,
+            Err(err) => {
+                // The reuse path surfaces this same read at error severity; here it
+                // is only advisory, so log softly and skip.
+                debug!(
+                    provider = %provider_addr,
+                    error = %format!("{err:#}"),
+                    "buyer refill: store read failed; skipping low-water check"
+                );
+                return None;
+            }
+        };
+
+        let additional =
+            refill_decision(&state, deposit_hint, self.default_deposit, self.min_deposit);
+        if additional.is_zero() {
+            return None; // still above the low-water mark
+        }
+
+        // `None` here = a refill for this provider is already in flight (dedup).
+        let slot = claim_refill_slot(&self.topups_in_flight, provider_addr)?;
+        Some((slot, additional))
+    }
+
+    /// Best-effort background top-up of a reused channel that has run below its
+    /// low-water mark (#1146). Spawns a detached task and returns immediately — it
+    /// NEVER blocks the pull: a synchronous on-chain `topUp` (seconds-to-minutes on
+    /// a slow L2) must not sit in the non-serializing reuse fast path, so the
+    /// current pull proceeds on the existing deposit and the refill lands for a
+    /// later reuse. Deduped per provider via [`Self::topups_in_flight`], so many
+    /// concurrent reuse pulls fire at most one `topUp`.
+    ///
+    /// Every leg is advisory: a store-read fault, an already-in-flight refill, an
+    /// allowance failure, or a reverted `topUp` all just skip the refill (logged /
+    /// metered), leaving the pre-#1146 behavior — the channel is simply not topped
+    /// up, which is strictly no worse. A channel already fully drained *now* still
+    /// fails *this* pull and heals on the next; the 20% low-water trigger means the
+    /// refill normally fires with headroom to spare.
+    fn spawn_refill_if_low(&self, provider_addr: Address, deposit_hint: U256) {
+        let Some((slot, additional)) = self.plan_refill(provider_addr, deposit_hint) else {
+            return;
+        };
+
+        let contract = self.contract.clone();
+        let store = Arc::clone(&self.store);
+        let rpc = self.contract.provider().clone();
+        let token = self.token;
+        let self_address = self.self_address;
+        let payment_channel_addr = *self.contract.address();
+        let metrics = Arc::clone(&self.metrics);
+
+        tokio::spawn(async move {
+            // Freed on task completion OR panic, so a wedged refill never blocks
+            // future refills to this provider.
+            let _slot = slot;
+
+            // Daemon posture: ensure the standing unlimited allowance (idempotent —
+            // skips when already granted) so `topUp`'s `transferFrom` can pull the
+            // funds even if the standing approval was revoked. Mirrors bootstrap and
+            // the CLI refill's allowance step.
+            if let Err(err) =
+                ensure_allowance(&rpc, token, self_address, payment_channel_addr, None).await
+            {
+                warn!(
+                    provider = %provider_addr,
+                    %additional,
+                    error = %format!("{err:#}"),
+                    "buyer refill: ensure_allowance failed; reused channel not topped up"
+                );
+                metrics.buyer_topup_failure();
+                return;
+            }
+
+            match decdn_client_pull::buyer_channel::top_up(
+                &contract,
+                store.as_ref(),
+                provider_addr,
+                additional,
+            )
+            .await
+            {
+                Ok(DepositOutcome::Added(_)) => {
+                    info!(
+                        provider = %provider_addr,
+                        %additional,
+                        "buyer refill: topped up reused channel below its low-water mark (#1146)"
+                    );
+                    metrics.buyer_topup_ok();
+                }
+                // The topUp landed on-chain but the local row vanished or rotated
+                // during the RPC (`top_up` already logged it at error!/warn! with
+                // the tx for reconcile). Funds are escrowed-but-untracked — NOT a
+                // clean success, so meter it as a failure rather than
+                // `buyer_topup_ok`, or an operator watching the failure metric
+                // would miss stranded deposits (#1146 review).
+                Ok(DepositOutcome::UnknownProvider | DepositOutcome::ChannelMismatch) => {
+                    metrics.buyer_topup_failure();
+                }
+                Err(err) => {
+                    warn!(
+                        provider = %provider_addr,
+                        %additional,
+                        error = %format!("{err:#}"),
+                        "buyer refill: topUp failed; reused channel not topped up"
+                    );
+                    metrics.buyer_topup_failure();
+                }
+            }
+        });
     }
 
     /// Join the in-flight open for `provider_addr`, or spawn one.
@@ -1039,6 +1249,10 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             additional,
         )
         .await
+        // This manual entry point (used by tests / operator tooling) does not
+        // grade the escrowed-but-untracked outcomes the way the background refill
+        // does — `top_up` already logs them; drop the outcome to keep `Result<()>`.
+        .map(|_| ())
     }
 }
 
@@ -2662,6 +2876,234 @@ mod tests {
         assert_eq!(ctx.prior_amount, U256::from(30u64));
     }
 
+    // ---- low-water refill decision (#1146) ------------------------------
+
+    #[test]
+    fn refill_decision_no_topup_with_headroom() {
+        // Fresh channel: deposit 10 USDC, nothing spent → remaining == target,
+        // well above the 20% low-water mark, so no top-up.
+        let s = sample(1); // deposit 10_000_000, last_amount 0
+        let ten = U256::from(10_000_000u64);
+        let one = U256::from(1_000_000u64);
+        assert_eq!(refill_decision(&s, ten, ten, one), U256::ZERO);
+    }
+
+    #[test]
+    fn refill_decision_tops_up_to_target_when_below_low_water() {
+        // Spent down so remaining (1 USDC) is below the 2 USDC low-water mark
+        // (target 10 / LOW_WATER_DIVISOR) → refill restores to the full target.
+        let mut s = sample(1);
+        s.last_amount = U256::from(9_000_000u64); // remaining == 1 USDC
+        let ten = U256::from(10_000_000u64);
+        let one = U256::from(1_000_000u64);
+        assert_eq!(refill_decision(&s, ten, ten, one), U256::from(9_000_000u64));
+    }
+
+    #[test]
+    fn refill_decision_target_is_max_of_hint_default_and_min() {
+        // A tiny deposit_hint must not shrink the target: it is
+        // max(hint, default_deposit, min_deposit), exactly the fresh-open deposit.
+        let mut s = sample(1);
+        s.last_amount = U256::from(9_999_999u64); // remaining == 1 µUSDC
+        let default_deposit = U256::from(10_000_000u64);
+        let min_deposit = U256::from(2_000_000u64);
+        // hint below both → target = default (10 USDC), low_water = 2 USDC.
+        let additional = refill_decision(&s, U256::from(1u64), default_deposit, min_deposit);
+        assert_eq!(additional, U256::from(10_000_000u64) - U256::from(1u64));
+
+        // min_deposit as the DECIDING term of the max(): min > default > hint.
+        let additional_min = refill_decision(
+            &s,
+            U256::from(1u64),          // hint
+            U256::from(10_000_000u64), // default
+            U256::from(20_000_000u64), // min — the largest, so target == 20 USDC
+        );
+        assert_eq!(
+            additional_min,
+            U256::from(20_000_000u64) - U256::from(1u64),
+            "min_deposit must be able to raise the target above default/hint"
+        );
+    }
+
+    #[test]
+    fn claim_refill_slot_dedups_per_provider_and_frees_on_drop() {
+        let set: Arc<Mutex<HashSet<Address>>> = Arc::new(Mutex::new(HashSet::new()));
+        let p = Address::repeat_byte(7);
+        let first = claim_refill_slot(&set, p);
+        assert!(first.is_some(), "first claim must succeed");
+        assert!(
+            claim_refill_slot(&set, p).is_none(),
+            "a second claim while the first is held is deduped"
+        );
+        assert!(
+            claim_refill_slot(&set, Address::repeat_byte(8)).is_some(),
+            "a distinct provider is independent"
+        );
+        drop(first);
+        assert!(
+            claim_refill_slot(&set, p).is_some(),
+            "the slot frees on drop so a later refill can run"
+        );
+    }
+
+    // ---- plan_refill wiring (#1146): the synchronous branch logic behind
+    //      spawn_refill_if_low, driven without spawning the on-chain task ----
+
+    /// Seed a live channel for `provider` with a 10 USDC deposit spent down to
+    /// 1 USDC remaining — below the 2 USDC (20%) low-water mark at a 10 USDC target.
+    #[allow(clippy::expect_used)]
+    fn seed_below_low_water(store: &Arc<dyn BuyerChannelStore>, provider: Address, id: B256) {
+        store
+            .record(&BuyerChannelState::new(
+                id,
+                provider,
+                Address::repeat_byte(0x11),
+                U256::from(10_000_000u64),
+                4_000_000_000, // expires far in the future → not expired
+            ))
+            .expect("seed channel");
+        let _ = store
+            .advance_progress(
+                provider,
+                id,
+                U256::from(1u64),
+                U256::from(1u64),
+                U256::from(9_000_000u64), // last_amount → remaining == 1 USDC
+            )
+            .expect("advance to a low watermark");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn plan_refill_claims_slot_and_amount_below_low_water() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x71);
+        seed_below_low_water(&service.store, provider, B256::repeat_byte(0x71));
+
+        let hint = U256::from(10_000_000u64); // target 10 USDC, low_water 2 USDC
+        let (slot, additional) = service
+            .plan_refill(provider, hint)
+            .expect("a below-low-water channel must plan a refill");
+        // remaining == 1 USDC → restore to the 10 USDC target.
+        assert_eq!(additional, U256::from(9_000_000u64));
+        assert!(
+            service.topups_in_flight.lock().unwrap().contains(&provider),
+            "planning a refill claims the provider's slot"
+        );
+        drop(slot);
+        assert!(
+            !service.topups_in_flight.lock().unwrap().contains(&provider),
+            "dropping the plan frees the slot"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn plan_refill_none_with_headroom() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x72);
+        // 10 USDC deposit, nothing spent → remaining above the 2 USDC low-water mark.
+        service
+            .store
+            .record(&BuyerChannelState::new(
+                B256::repeat_byte(0x72),
+                provider,
+                Address::repeat_byte(0x11),
+                U256::from(10_000_000u64),
+                4_000_000_000,
+            ))
+            .expect("seed channel");
+
+        assert!(
+            service
+                .plan_refill(provider, U256::from(10_000_000u64))
+                .is_none(),
+            "a channel with headroom must not plan a refill"
+        );
+        assert!(
+            service.topups_in_flight.lock().unwrap().is_empty(),
+            "no slot is claimed when above the low-water mark"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn plan_refill_none_when_channel_expired() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x73);
+        // Below low-water AND already expired: `topUp` cannot extend expiry, so the
+        // open path replaces it — plan_refill must skip rather than top up.
+        service
+            .store
+            .record(&BuyerChannelState::new(
+                B256::repeat_byte(0x73),
+                provider,
+                Address::repeat_byte(0x11),
+                U256::from(10_000_000u64),
+                1, // expired (unix second 1)
+            ))
+            .expect("seed channel");
+        let _ = service
+            .store
+            .advance_progress(
+                provider,
+                B256::repeat_byte(0x73),
+                U256::from(1u64),
+                U256::from(1u64),
+                U256::from(9_000_000u64),
+            )
+            .expect("advance");
+
+        assert!(
+            service
+                .plan_refill(provider, U256::from(10_000_000u64))
+                .is_none(),
+            "an already-expired channel must not be topped up"
+        );
+        assert!(service.topups_in_flight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn plan_refill_none_when_no_channel() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        assert!(
+            service
+                .plan_refill(Address::repeat_byte(0x74), U256::from(10_000_000u64))
+                .is_none(),
+            "no live channel → nothing to refill"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn plan_refill_dedups_concurrent_reuse() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x75);
+        seed_below_low_water(&service.store, provider, B256::repeat_byte(0x75));
+        let hint = U256::from(10_000_000u64);
+
+        let first = service.plan_refill(provider, hint);
+        assert!(
+            first.is_some(),
+            "first reuse below low-water plans a refill"
+        );
+        assert!(
+            service.plan_refill(provider, hint).is_none(),
+            "a concurrent reuse while the first refill is in flight is deduped"
+        );
+        drop(first);
+        assert!(
+            service.plan_refill(provider, hint).is_some(),
+            "once the in-flight refill completes, a later reuse can plan again"
+        );
+    }
+
     /// A channel observed for the first time is tracked but never immediately
     /// idle — reconcile only fires after sustained inactivity (#972).
     #[test]
@@ -3239,6 +3681,7 @@ mod tests {
             min_deposit: U256::from(1u64),
             default_deposit: U256::from(1u64),
             opens_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            topups_in_flight: Arc::new(Mutex::new(HashSet::new())),
             reclaim_failures: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
             _reclaimer: AbortOnDrop(tokio::spawn(std::future::pending())),

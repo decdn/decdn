@@ -31,7 +31,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
+use decdn_client_pull::buyer_channel::{
+    LOW_WATER_DIVISOR, ensure_allowance, open_channel, refill_amount, top_up,
+};
 use decdn_client_pull::{
     ChannelContext, ProgressCallback, PullDeadlines, UpstreamRefused, VoucherProgress,
     sign_client_binding, stream_fetch_tracked_with_progress,
@@ -55,36 +57,6 @@ use decdn_client_pull::provider;
 /// Default deposit when opening a new channel: 10 USDC (ADR 003 § Deposit
 /// Economics recommended minimum). Clamped up to the on-chain `minDeposit`.
 const DEFAULT_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-
-/// Low-water divisor for auto-refill (#1103): a reused channel is topped up once
-/// its remaining deposit falls below `1/N` of the configured working deposit.
-/// `5` → refill triggers below 20% remaining, then restores to a full deposit.
-const LOW_WATER_DIVISOR: u64 = 5;
-
-/// Decide how much USDC to add to a reused channel so a sustained series of
-/// fetches against one provider isn't stranded by a spent-down deposit (#1103).
-///
-/// Pure decision (no I/O) so the policy is unit-testable. `deposit` is the
-/// channel's current on-chain deposit and `prior_amount` the cumulative amount
-/// already vouchered, so the remaining spendable is `deposit - prior_amount`.
-/// When that remaining balance has fallen below `low_water`, return the top-up
-/// that restores it to `target_deposit` (the configured working deposit);
-/// otherwise return `U256::ZERO` (no refill).
-///
-/// The exact cost of the *next* fetch is not known here — the per-MB `rate` is
-/// only learned from the provider's probe / `StreamResponse`, and the explicit
-/// `--node-id` path does no probe — so this uses a rate-independent low-water
-/// refill: keep at least `low_water` of headroom, and refill to a full
-/// `target_deposit` when it runs low. Hysteresis (`low_water < target_deposit`)
-/// keeps a busy channel from topping up on every reuse. `topUp` does not extend
-/// expiry, so a near-expiry channel is replaced (not refilled) by the caller.
-fn refill_amount(deposit: U256, prior_amount: U256, target_deposit: U256, low_water: U256) -> U256 {
-    let remaining = deposit.saturating_sub(prior_amount);
-    if remaining >= low_water {
-        return U256::ZERO;
-    }
-    target_deposit.saturating_sub(remaining)
-}
 
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
 /// concurrently, so this bounds selection latency rather than the overall fetch
@@ -701,7 +673,9 @@ where
                     if max_approve { None } else { Some(additional) },
                 )
                 .await?;
-                top_up(contract, store, provider, additional).await?;
+                // The escrowed-but-untracked outcomes are logged inside `top_up`;
+                // the CLI re-reads the row below and reflects whatever landed.
+                let _ = top_up(contract, store, provider, additional).await?;
                 // Re-read so the returned context's deposit reflects the top-up
                 // (and any concurrent watermark advance the store folded in);
                 // fall back to the pre-top-up state if the row vanished.
@@ -1012,84 +986,5 @@ mod tests {
         );
         assert_eq!(parse_hash(&hex).unwrap(), *digest.as_bytes());
         assert!(parse_hash("deadbeef").is_err());
-    }
-
-    // ---- auto-refill decision (#1103) -----------------------------------
-
-    // Configured working deposit + its derived low-water mark, mirroring what
-    // `open_or_reuse` passes (`low_water = target / LOW_WATER_DIVISOR`).
-    fn target() -> U256 {
-        U256::from(10_000_000u64) // 10 USDC
-    }
-    fn low_water() -> U256 {
-        target() / U256::from(LOW_WATER_DIVISOR) // 2 USDC (20%)
-    }
-
-    #[test]
-    fn refill_amount_no_top_up_when_remaining_at_or_above_low_water() {
-        // Fresh channel (nothing spent): remaining == deposit == target.
-        assert_eq!(
-            refill_amount(target(), U256::ZERO, target(), low_water()),
-            U256::ZERO,
-            "a full channel must not be topped up"
-        );
-        // Spent down to exactly the low-water mark: still sufficient (>=).
-        let prior = target() - low_water(); // remaining == low_water
-        assert_eq!(
-            refill_amount(target(), prior, target(), low_water()),
-            U256::ZERO,
-            "remaining exactly at the low-water mark is still sufficient"
-        );
-    }
-
-    #[test]
-    fn refill_amount_restores_to_target_when_low() {
-        // Spent so remaining is just below the low-water mark.
-        let remaining = low_water() - U256::from(1u64);
-        let prior = target() - remaining;
-        assert_eq!(
-            refill_amount(target(), prior, target(), low_water()),
-            target() - remaining,
-            "refill must restore the remaining deposit back up to the target"
-        );
-
-        // Nearly drained: remaining ~0 → top up ~a full target's worth.
-        let prior_drained = target() - U256::from(1u64); // remaining == 1
-        assert_eq!(
-            refill_amount(target(), prior_drained, target(), low_water()),
-            target() - U256::from(1u64),
-        );
-    }
-
-    #[test]
-    fn refill_amount_has_hysteresis_after_a_prior_top_up() {
-        // A channel that was already topped up (on-chain deposit == 2*target)
-        // and has spent back down to just above low-water must NOT top up again.
-        let deposit = target() * U256::from(2u64);
-        let prior = deposit - low_water(); // remaining == low_water
-        assert_eq!(
-            refill_amount(deposit, prior, target(), low_water()),
-            U256::ZERO,
-            "a topped-up channel with headroom must not refill on every reuse"
-        );
-    }
-
-    #[test]
-    fn refill_amount_saturates_and_never_underflows() {
-        // Pathological: prior_amount above deposit (never happens on-chain, but
-        // the math must not panic under the anti-panic policy) → remaining 0.
-        assert_eq!(
-            refill_amount(target(), target() * U256::from(3u64), target(), low_water()),
-            target(),
-            "remaining saturates to zero, so refill is a full target"
-        );
-        // Low-water above target (misconfiguration): remaining below low-water
-        // but at/above target → nothing to add (saturating).
-        let deposit = target() * U256::from(2u64);
-        assert_eq!(
-            refill_amount(deposit, U256::ZERO, target(), deposit),
-            U256::ZERO,
-            "remaining already >= target yields no top-up even below low-water"
-        );
     }
 }

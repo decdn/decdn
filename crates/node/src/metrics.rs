@@ -406,6 +406,25 @@ pub struct DecdnMetrics {
     /// deposits are not reclaiming early (check gas wallet / RPC). Operator-
     /// visible name: `decdn_buyer_settle_deferred_total`.
     pub buyer_settle_deferred: Counter,
+    /// Background low-water top-ups (#1146) that landed: a reused buyer channel
+    /// whose remaining deposit had fallen below its 20% low-water mark was
+    /// re-funded to the working deposit, so sustained miss pulls to that provider
+    /// keep flowing instead of silently stranding on a spent-down channel. The
+    /// healthy signal of the auto-refill path. Operator-visible name:
+    /// `decdn_buyer_topup_ok_total`.
+    pub buyer_topup_ok: Counter,
+    /// Background low-water top-ups (#1146) that did NOT cleanly land: the standing
+    /// allowance re-approval failed, the `topUp` submission/receipt errored or
+    /// reverted, OR the `topUp` landed on-chain but the local channel row vanished
+    /// or rotated during the RPC (escrowed-but-untracked — `top_up` logs the tx at
+    /// error!/warn! for reconcile). Folding the untracked case in here — rather than
+    /// counting it as `buyer_topup_ok` — means an operator alerting on this metric
+    /// sees stranded deposits. The refill is best-effort (the channel is simply left
+    /// un-topped, the pre-#1146 behavior), but a sustained rate means reused channels
+    /// are not being refilled and pull-through to busy providers will degrade as
+    /// their deposits drain (check the gas wallet / RPC / USDC balance). Operator-
+    /// visible name: `decdn_buyer_topup_failure_total`.
+    pub buyer_topup_failure: Counter,
     /// Channel-lifecycle reconciliation the settlement watcher could not apply
     /// from a poll tick: a failed `register_open_channel` /
     /// `update_channel_deposit` / `forget_channel` store write (#751), or a
@@ -1457,6 +1476,20 @@ impl Metrics {
     /// an unresolved revert, or a pending store-write failure (#988).
     pub fn buyer_settle_deferred(&self) {
         self.decdn.buyer_settle_deferred.inc();
+    }
+
+    /// A background low-water top-up (#1146) landed: a reused buyer channel below
+    /// its 20% low-water mark was re-funded to the working deposit. Pairs with the
+    /// `info!` in `spawn_refill_if_low`.
+    pub fn buyer_topup_ok(&self) {
+        self.decdn.buyer_topup_ok.inc();
+    }
+
+    /// A background low-water top-up (#1146) failed — the allowance re-approval or
+    /// the `topUp` submit/receipt errored or reverted. Best-effort, so the channel
+    /// is left un-topped; pairs with the `warn!` in `spawn_refill_if_low`.
+    pub fn buyer_topup_failure(&self) {
+        self.decdn.buyer_topup_failure.inc();
     }
 
     /// An auto-settlement trigger fired and the seller path `closeChannel`d a
