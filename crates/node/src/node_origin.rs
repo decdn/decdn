@@ -444,26 +444,27 @@ impl NodeOrigin {
                 return None;
             }
         };
-        // Bound the open on the SAME per-candidate budget the buffered path gives
-        // each candidate (`stream_fetch_tracked`). Without it, a candidate that
-        // accepts the connection and then goes quiet blocks here indefinitely and
-        // consumes the caller's whole outer deadline — which is deliberately sized
-        // at `MAX_PROVIDER_ATTEMPTS × (channel open + pull_timeout + stall) + slack` so the
-        // caller's fallback loop (`open_progressive_pull`, above) can still reach
-        // candidates #2..N (#859) — so the serve path would refuse a blob an honest
-        // fallback holds. The typed `PullTimeout` flows into the `Err` arm's
-        // `classify_pull_failure`, which exonerates the peer (our deadline is not
-        // evidence it is bad, #857) and meters `node_pull_timeout`, exactly as on
-        // the buffered path.
+        // The OPEN stage is bounded by `deadlines.open` INSIDE `open_progressive_upstream`
+        // (→ `open_stream`, #1134): a candidate that accepts the connection and then goes
+        // quiet during the handshake / verified response is cut off at `deadlines.open`,
+        // which emits a typed `PullTimeout { after: deadlines.open }`. That is the SOLE
+        // per-candidate open bound — the buffered path (`stream_fetch_shared`, below) drives
+        // its open the same way with no outer wrap. We used to add a second, redundant
+        // `tokio::time::timeout(pull_timeout, …)` wrap here (belt-and-braces); it is dropped
+        // (#1147) because both clocks were sourced from `pull_timeout`, so the double-bound
+        // did nothing but risk drift — an open-specific timeout knob could make a candidate
+        // cost up to `pull_timeout + deadlines.open` while `outer_pull_deadline`
+        // (`MAX_PROVIDER_ATTEMPTS × (channel open + pull_timeout + stall) + slack`, #859)
+        // still budgets a single `pull_timeout`, starving the fallback loop.
         //
-        // This bounds the OPEN stage — bounded work (connect, handshake, verified
-        // response), so a slow one really is a stall. The STREAMING stage that
-        // follows is bounded by inactivity instead (`stall_timeout`, carried into
-        // the returned `UpstreamPull`, #1134): a wall clock over the bytes would
-        // cap the blob size this node can pull through.
-        // A zero budget here is OUR misconfiguration, not the peer's fault — and the loud
-        // failure mode is the wrong one to reach for, because a zero stall would gossip
-        // `Unreachable` about every honest peer this node touches (#1145 review).
+        // The typed `PullTimeout` flows into the `Err` arm's `classify_pull_failure`, which
+        // exonerates the peer (our deadline is not evidence it is bad, #857) and meters
+        // `node_pull_timeout`. The STREAMING stage that follows is bounded by inactivity
+        // instead (`stall_timeout`, carried into the returned `UpstreamPull`, #1134): a wall
+        // clock over the bytes would cap the blob size this node can pull through.
+        // A zero budget is OUR misconfiguration, not the peer's fault — and the loud failure
+        // mode is the wrong one to reach for, because a zero stall would gossip `Unreachable`
+        // about every honest peer this node touches (#1145 review).
         let deadlines = match deps.config.deadlines() {
             Ok(deadlines) => deadlines,
             Err(err) => {
@@ -472,34 +473,21 @@ impl NodeOrigin {
             }
         };
         let ledger = channel_ledger(deps, provider_addr, &ctx);
-        match tokio::time::timeout(
-            deps.config.pull_timeout,
-            open_progressive_upstream(
-                &deps.endpoint,
-                EndpointAddr::new(pk),
-                &ctx,
-                Arc::clone(&ledger),
-                &deps.slash_domain,
-                provider_addr,
-                hash_bytes,
-                0,
-                now_micros(),
-                deps.config.max_blob_size_bytes,
-                deadlines,
-            ),
+        match open_progressive_upstream(
+            &deps.endpoint,
+            EndpointAddr::new(pk),
+            &ctx,
+            Arc::clone(&ledger),
+            &deps.slash_domain,
+            provider_addr,
+            hash_bytes,
+            0,
+            now_micros(),
+            deps.config.max_blob_size_bytes,
+            deadlines,
         )
         .await
-        .unwrap_or_else(|_| {
-            // Name the STAGE in the log: this is the progressive OPEN timing out
-            // (handshake + verified response header), not a mid-delivery stall on
-            // the buffered path. The `.context` layer does not affect
-            // classification — `classify_pull_failure`'s `downcast_ref` walks the
-            // anyhow chain (pinned by `buyer_side_sentinels_survive_anyhow_downcast`).
-            Err(anyhow::Error::new(PullTimeout {
-                after: deps.config.pull_timeout,
-            })
-            .context("progressive upstream open"))
-        }) {
+        {
             Ok((header, pull)) => Some((
                 header,
                 NodeProgressivePull {

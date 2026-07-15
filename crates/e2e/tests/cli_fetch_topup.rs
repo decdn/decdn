@@ -164,7 +164,7 @@ async fn run() -> anyhow::Result<()> {
     // remaining == 1). Drive the shared kernel with that amount.
     let remaining = deposit - prior_amount; // == 1
     let additional = deposit - remaining; // restore to a full `deposit`
-    top_up(&pc, &store, provider_addr, additional)
+    let _ = top_up(&pc, &store, provider_addr, additional)
         .await
         .context("top_up")?;
 
