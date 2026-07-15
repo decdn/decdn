@@ -8,7 +8,7 @@
 
 use clap::{Args, Subcommand};
 
-use crate::cli::node::ChainArgs;
+use crate::cli::common::CommonChainArgs;
 
 /// `decdn appeal` — file a slash appeal.
 #[derive(Args, Debug)]
@@ -49,7 +49,9 @@ pub struct AppealSlashArgs {
     pub slash_appeal_address: Option<String>,
 
     /// Shared chain coordinates (rpc, keystore, chain id, `--dry-run`,
-    /// `--json`). The `--capacity-bond-address` flag is unused by this command.
+    /// `--json`). Only the [`CommonChainArgs`] subset is flattened here — the
+    /// appeal path reads nothing from the `CapacityBond` / swap flag group, so
+    /// exposing it would advertise flags this command silently ignores.
     #[command(flatten)]
-    pub chain: ChainArgs,
+    pub chain: CommonChainArgs,
 }

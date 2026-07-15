@@ -57,7 +57,7 @@ struct FileIdentity {
 pub struct Resolved {
     pub rpc_url: String,
     pub chain_id: u64,
-    pub capacity_bond_address: String,
+    pub capacity_bond_address: Address,
     pub keystore: PathBuf,
     pub data_dir: PathBuf,
 }
@@ -133,7 +133,7 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
     // `resolve_common` first so `rpc_url` is the first missing-field reported
     // (preserves the original error priority before the shared extraction).
     let (rpc_url, chain_id, data_dir, keystore) = resolve_common(&chain.common, file)?;
-    let capacity_bond_address = chain
+    let capacity_bond_raw = chain
         .capacity_bond_address
         .clone()
         .or_else(|| bc.and_then(|b| b.capacity_bond_address.clone()))
@@ -143,6 +143,7 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
                  blockchain.capacity_bond_address)"
             )
         })?;
+    let capacity_bond_address = parse_address(&capacity_bond_raw, "capacity_bond_address")?;
     Ok(Resolved {
         rpc_url,
         chain_id,
@@ -160,7 +161,7 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
 pub struct ResolvedAppeal {
     pub rpc_url: String,
     pub chain_id: u64,
-    pub slash_appeal_address: String,
+    pub slash_appeal_address: Address,
     pub keystore: PathBuf,
     pub data_dir: PathBuf,
 }
@@ -168,12 +169,12 @@ pub struct ResolvedAppeal {
 /// Resolve appeal-command coordinates. Pure so precedence is unit-testable.
 /// `slash_appeal_flag` is the command's `--slash-appeal-address` override.
 pub fn resolve_appeal(
-    chain: &cli::ChainArgs,
+    chain: &cli::CommonChainArgs,
     slash_appeal_flag: Option<&str>,
     file: &FileConfig,
 ) -> anyhow::Result<ResolvedAppeal> {
     let bc = file.blockchain.as_ref();
-    let slash_appeal_address = slash_appeal_flag
+    let slash_appeal_raw = slash_appeal_flag
         .map(str::to_string)
         .or_else(|| bc.and_then(|b| b.slash_appeal_address.clone()))
         .ok_or_else(|| {
@@ -182,18 +183,16 @@ pub fn resolve_appeal(
                  blockchain.slash_appeal_address)"
             )
         })?;
+    let slash_appeal_address = parse_address(&slash_appeal_raw, "slash_appeal_address")?;
     // Guard the *consumer*: a zero address parses fine but is never a real
     // deployment (it would surface only as an opaque on-chain revert at appeal
     // time). This is the sole validation site for the appeal address.
     anyhow::ensure!(
-        slash_appeal_address
-            .trim_start_matches("0x")
-            .bytes()
-            .any(|b| b != b'0'),
+        slash_appeal_address != Address::ZERO,
         "slash_appeal_address must not be the zero address — \
          set it to the deployed SlashAppeal contract (ADR 028)"
     );
-    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(&chain.common, file)?;
+    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
     Ok(ResolvedAppeal {
         rpc_url,
         chain_id,
@@ -218,17 +217,18 @@ pub fn parse_address(value: &str, label: &str) -> anyhow::Result<Address> {
 /// (hundreds of ms); it is offloaded to `spawn_blocking` so it doesn't stall
 /// the async executor, matching `decdn-node`'s runtime keystore load.
 pub async fn load_operator_signer(
-    chain: &cli::ChainArgs,
+    chain: &cli::CommonChainArgs,
     keystore: &Path,
 ) -> anyhow::Result<PrivateKeySigner> {
-    load_signer_with_password_file(chain.common.keystore_password_file.as_deref(), keystore).await
+    load_signer_with_password_file(chain.keystore_password_file.as_deref(), keystore).await
 }
 
 /// Load an Ethereum keystore signer, sourcing the password from the
 /// `DECDN_KEYSTORE_PASSWORD` env var, then `password_file`, then an interactive
 /// prompt. The scrypt KDF is offloaded to `spawn_blocking` so it doesn't stall
-/// the async executor. Shared by the `node` commands (via
-/// [`load_operator_signer`]) and the `publish` commands.
+/// the async executor. The `node`, `appeal`, and `publish` commands all reach
+/// it through [`load_operator_signer`], which pulls the password-file path off
+/// the shared [`cli::CommonChainArgs`].
 pub async fn load_signer_with_password_file(
     password_file: Option<&Path>,
     keystore: &Path,
@@ -254,8 +254,8 @@ pub async fn load_signer_with_password_file(
 pub struct ResolvedPublish {
     pub rpc_url: String,
     pub chain_id: u64,
-    pub publisher_registry_address: Option<String>,
-    pub origin_assignment_address: Option<String>,
+    pub publisher_registry_address: Option<Address>,
+    pub origin_assignment_address: Option<Address>,
     pub keystore: PathBuf,
     pub data_dir: PathBuf,
 }
@@ -273,11 +273,15 @@ pub fn resolve_publish(
     let publisher_registry_address = args
         .publisher_registry_address
         .clone()
-        .or_else(|| bc.and_then(|b| b.publisher_registry_address.clone()));
+        .or_else(|| bc.and_then(|b| b.publisher_registry_address.clone()))
+        .map(|raw| parse_address(&raw, "publisher_registry_address"))
+        .transpose()?;
     let origin_assignment_address = args
         .origin_assignment_address
         .clone()
-        .or_else(|| bc.and_then(|b| b.origin_assignment_address.clone()));
+        .or_else(|| bc.and_then(|b| b.origin_assignment_address.clone()))
+        .map(|raw| parse_address(&raw, "origin_assignment_address"))
+        .transpose()?;
     Ok(ResolvedPublish {
         rpc_url,
         chain_id,
@@ -368,7 +372,18 @@ pub fn resolve_swap(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use alloy::primitives::address;
+
     use super::*;
+
+    // Distinct valid 20-byte addresses standing in for the pre-#1140 placeholder
+    // strings ("0xFLAG"/"0xCONFIG"/…). `resolve*` now parse their address fields,
+    // so the fixtures must be real addresses; the mnemonic last byte maps back to
+    // the old placeholder. Inputs use `ADDR.to_string()` (round-trips through
+    // `parse`), expectations compare the `Address` directly.
+    const FLAG_ADDR: Address = address!("0x00000000000000000000000000000000000000F1");
+    const CONFIG_ADDR: Address = address!("0x00000000000000000000000000000000000000C0");
+    const OA_ADDR: Address = address!("0x000000000000000000000000000000000000000A");
 
     fn empty_chain() -> cli::ChainArgs {
         cli::ChainArgs {
@@ -404,12 +419,12 @@ mod tests {
     fn flags_override_config() {
         let mut chain = empty_chain();
         chain.common.rpc_url = Some("http://flag:8545".to_string());
-        chain.capacity_bond_address = Some("0xFLAG".to_string());
+        chain.capacity_bond_address = Some(FLAG_ADDR.to_string());
         chain.common.chain_id = Some(99);
         let file = file_with(FileBlockchain {
             rpc_url: Some("http://config:8545".to_string()),
             chain_id: Some(1),
-            capacity_bond_address: Some("0xCONFIG".to_string()),
+            capacity_bond_address: Some(CONFIG_ADDR.to_string()),
             eth_keystore: None,
             publisher_registry_address: None,
             origin_assignment_address: None,
@@ -424,7 +439,7 @@ mod tests {
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");
-        assert_eq!(r.capacity_bond_address, "0xFLAG");
+        assert_eq!(r.capacity_bond_address, FLAG_ADDR);
         assert_eq!(r.chain_id, 99);
     }
 
@@ -434,7 +449,7 @@ mod tests {
         let file = file_with(FileBlockchain {
             rpc_url: Some("http://config:8545".to_string()),
             chain_id: None,
-            capacity_bond_address: Some("0xCONFIG".to_string()),
+            capacity_bond_address: Some(CONFIG_ADDR.to_string()),
             eth_keystore: Some(PathBuf::from("/keys/ks.json")),
             publisher_registry_address: None,
             origin_assignment_address: None,
@@ -449,7 +464,7 @@ mod tests {
         });
         let r = resolve(&chain, &file).unwrap();
         assert_eq!(r.rpc_url, "http://config:8545");
-        assert_eq!(r.capacity_bond_address, "0xCONFIG");
+        assert_eq!(r.capacity_bond_address, CONFIG_ADDR);
         // chain_id absent everywhere → default.
         assert_eq!(r.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(r.keystore, PathBuf::from("/keys/ks.json"));
@@ -461,7 +476,7 @@ mod tests {
         let file = file_with(FileBlockchain {
             rpc_url: Some("http://x".to_string()),
             chain_id: None,
-            capacity_bond_address: Some("0xY".to_string()),
+            capacity_bond_address: Some(CONFIG_ADDR.to_string()),
             eth_keystore: None,
             publisher_registry_address: None,
             origin_assignment_address: None,
@@ -483,6 +498,28 @@ mod tests {
         let chain = empty_chain();
         let err = resolve(&chain, &FileConfig::default()).unwrap_err();
         assert!(err.to_string().contains("rpc_url not set"), "{err}");
+    }
+
+    #[test]
+    fn resolve_appeal_parses_flag_address() {
+        let mut chain = empty_chain();
+        chain.common.rpc_url = Some("http://x".to_string());
+        let flag = FLAG_ADDR.to_string();
+        let r = resolve_appeal(&chain.common, Some(flag.as_str()), &FileConfig::default()).unwrap();
+        assert_eq!(r.slash_appeal_address, FLAG_ADDR);
+    }
+
+    #[test]
+    fn resolve_appeal_rejects_zero_address() {
+        let mut chain = empty_chain();
+        chain.common.rpc_url = Some("http://x".to_string());
+        let zero = Address::ZERO.to_string();
+        let err =
+            resolve_appeal(&chain.common, Some(zero.as_str()), &FileConfig::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("must not be the zero address"),
+            "{err}"
+        );
     }
 
     /// Publish-side counterpart of [`empty_chain`], so the publish resolver's
@@ -527,8 +564,8 @@ mod tests {
             rpc_url: Some("http://config:8545".to_string()),
             chain_id: None,
             eth_keystore: Some(PathBuf::from("/keys/ks.json")),
-            publisher_registry_address: Some("0xCONFIG".to_string()),
-            origin_assignment_address: Some("0xOA".to_string()),
+            publisher_registry_address: Some(CONFIG_ADDR.to_string()),
+            origin_assignment_address: Some(OA_ADDR.to_string()),
             ..Default::default()
         });
         let r = resolve_publish(&args, &file).unwrap();
@@ -536,8 +573,8 @@ mod tests {
         // `chain_id` absent from both flag and config → the shared default.
         assert_eq!(r.chain_id, DEFAULT_CHAIN_ID);
         assert_eq!(r.keystore, PathBuf::from("/keys/ks.json"));
-        assert_eq!(r.publisher_registry_address.as_deref(), Some("0xCONFIG"));
-        assert_eq!(r.origin_assignment_address.as_deref(), Some("0xOA"));
+        assert_eq!(r.publisher_registry_address, Some(CONFIG_ADDR));
+        assert_eq!(r.origin_assignment_address, Some(OA_ADDR));
     }
 
     #[test]
@@ -560,7 +597,7 @@ mod tests {
                 dry_run: true,
                 json: false,
             },
-            publisher_registry_address: Some("0xFLAG".to_string()),
+            publisher_registry_address: Some(FLAG_ADDR.to_string()),
             origin_assignment_address: None,
         };
         let file = file_with(FileBlockchain {
@@ -568,8 +605,8 @@ mod tests {
             chain_id: Some(1),
             capacity_bond_address: None,
             eth_keystore: None,
-            publisher_registry_address: Some("0xCONFIG".to_string()),
-            origin_assignment_address: Some("0xOA".to_string()),
+            publisher_registry_address: Some(CONFIG_ADDR.to_string()),
+            origin_assignment_address: Some(OA_ADDR.to_string()),
             swap_venue: None,
             swap_router_address: None,
             swap_quoter_address: None,
@@ -582,9 +619,35 @@ mod tests {
         let r = resolve_publish(&args, &file).unwrap();
         assert_eq!(r.rpc_url, "http://flag:8545");
         assert_eq!(r.chain_id, 42);
-        assert_eq!(r.publisher_registry_address.as_deref(), Some("0xFLAG"));
+        assert_eq!(r.publisher_registry_address, Some(FLAG_ADDR));
         // unset flag falls through to config
-        assert_eq!(r.origin_assignment_address.as_deref(), Some("0xOA"));
+        assert_eq!(r.origin_assignment_address, Some(OA_ADDR));
+    }
+
+    #[test]
+    fn resolve_publish_rejects_unparseable_address() {
+        // A present-but-garbage address must surface as an Err, not be silently
+        // dropped to `None` by the `.map(parse).transpose()?` — guards against a
+        // future `.ok()` / `filter_map` rewrite that would swallow it and let
+        // publish proceed as if the contract were unconfigured. Each field is
+        // checked independently.
+        let mut args = empty_publish_chain();
+        args.common.rpc_url = Some("http://x".to_string());
+        args.publisher_registry_address = Some("not-an-address".to_string());
+        let err = resolve_publish(&args, &FileConfig::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("publisher_registry_address"),
+            "{err}"
+        );
+
+        let mut args = empty_publish_chain();
+        args.common.rpc_url = Some("http://x".to_string());
+        args.origin_assignment_address = Some("nope".to_string());
+        let err = resolve_publish(&args, &FileConfig::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("origin_assignment_address"),
+            "{err}"
+        );
     }
 
     #[test]

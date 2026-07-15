@@ -31,7 +31,7 @@ pub enum InsertOutcome {
     /// inline TTL sweep failed to free a slot; existing entries are
     /// always refreshed regardless of the cap so legitimate peers
     /// don't lose their slot under a fresh-keypair flood. Subscriber-
-    /// loop callers should bump a `peer_table_full` rejection metric.
+    /// loop callers should bump a `table_full` rejection metric.
     RejectedFull,
 }
 
@@ -69,9 +69,11 @@ pub const MIN_INLINE_SWEEP_INTERVAL_US: u64 = 1_000_000;
 pub struct PeerTable {
     entries: HashMap<[u8; 32], PeerEntry>,
     ttl_us: u64,
-    /// Hard cap on entry count (#577 H3). `0` disables the cap; the
-    /// resolved-config validator rejects `0` so production paths never
-    /// hit the unbounded branch, but in-process tests use it.
+    /// Hard cap on entry count. `0` disables the cap (unlimited). This is a
+    /// production path: `gossip.max_peer_entries` defaults to unlimited
+    /// (`None`), which the runtime maps to `0` here. A configured
+    /// `Some(n)` is validated `> 0`, so a set cap never collapses into the
+    /// unlimited sentinel by accident.
     max_entries: usize,
     /// Wall-clock microseconds of the last inline TTL sweep fired from
     /// [`Self::insert_or_refresh`]'s cap path. `0` is the never-swept
@@ -86,8 +88,10 @@ impl PeerTable {
     ///
     /// * `ttl_us` — how long an unrefreshed entry may live; `0` disables TTL.
     /// * `max_entries` — hard cap on entry count enforced by
-    ///   [`Self::insert_or_refresh`]; `0` disables the cap (test-only,
-    ///   the config resolver rejects `0` on the production path).
+    ///   [`Self::insert_or_refresh`]; `0` disables the cap (unlimited). The
+    ///   runtime passes `0` when `gossip.max_peer_entries` is unset (the
+    ///   default), so this is a production configuration, not just a test
+    ///   escape hatch; a configured cap is validated `> 0`.
     pub fn new(ttl_us: u64, max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
@@ -146,7 +150,8 @@ impl PeerTable {
         // most once per `MIN_INLINE_SWEEP_INTERVAL_US` so the attacker
         // can't force an O(N) `HashMap::retain` per signature-valid
         // announce — rejected inserts in between are O(1). `max_entries
-        // == 0` disables the cap (test-only escape hatch).
+        // == 0` disables the cap (unlimited — the default when
+        // `gossip.max_peer_entries` is unset).
         if self.max_entries > 0 && self.entries.len() >= self.max_entries {
             // `0` is the never-swept sentinel; otherwise gate on elapsed.
             // `saturating_sub` keeps this safe under a clock reversal.

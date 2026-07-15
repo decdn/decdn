@@ -968,12 +968,15 @@ pub async fn run(
     // safe to construct this early.
     let peer_table = Arc::new(RwLock::new(PeerTable::new(
         cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
-        // Saturate at `usize::MAX` on 32-bit targets where the configured
-        // `u64` cap might not fit; mirrors the saturating cast pattern
-        // already used on `i64::try_from(table.len())` in the sweeper
-        // path. The config resolver rejects `0`, so the runtime never
-        // hits the unbounded escape hatch.
-        usize::try_from(cfg.gossip.max_peer_table_entries).unwrap_or(usize::MAX),
+        // `None` => no cap: map to the peer table's `0`-means-unlimited
+        // sentinel. `Some(n)` saturates at `usize::MAX` on 32-bit targets
+        // where the configured `u64` cap might not fit; mirrors the
+        // saturating cast pattern already used on `i64::try_from(table.len())`
+        // in the sweeper path. The resolver rejects `Some(0)`, so a set cap
+        // never collapses into the unlimited sentinel by accident.
+        cfg.gossip
+            .max_peer_entries
+            .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
     )));
 
     // Per-region bandwidth accountant (#750). Resolves regions from the shared
@@ -2590,6 +2593,9 @@ impl GossipMetrics for NodeGossipMetrics {
     fn inc_reconnected(&self, topic: &str) {
         self.metrics.gossip_reconnected(topic);
     }
+    fn add_evicted_ttl(&self, n: u64) {
+        self.metrics.peer_table_evicted_ttl(n);
+    }
 }
 
 /// Log a `JoinError` from a shutdown-drained task with a phase label.
@@ -3317,7 +3323,7 @@ mod tests {
                 subscribe_reputation: true,
                 reputation_publish_interval_sec: 3600,
                 allowlist: Vec::new(),
-                max_peer_table_entries: 100_000,
+                max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,

@@ -25,10 +25,9 @@ pub async fn run(args: &cli::BondArgs, global_config: Option<&Path>) -> anyhow::
     let config_path = args.chain.common.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
     let resolved = chain_ctx::resolve(&args.chain, &file)?;
-    let cb_addr =
-        chain_ctx::parse_address(&resolved.capacity_bond_address, "capacity_bond_address")?;
+    let cb_addr = resolved.capacity_bond_address;
 
-    let signer = chain_ctx::load_operator_signer(&args.chain, &resolved.keystore).await?;
+    let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let operator = signer.address();
     let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
     let bond = CapacityBond::new(cb_addr, &provider);

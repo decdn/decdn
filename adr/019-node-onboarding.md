@@ -92,7 +92,7 @@ This single transaction atomically:
 
 - Requires `termsHash == currentTermsHash` and verifies the EIP-712 `bindingSignature` over `RegisterNode(nodeId, bindingNonce[ethAddress], termsHash)`, establishing the `nodeId → ethAddress` mapping for slash evidence and payment attribution and recording the operator's terms acceptance ([§ Operator Safety Obligations](#operator-safety-obligations)).
 - Verifies the `ed25519Signature` over `keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId]))`, proving the operator controls the iroh private key (prevents NodeId squatting). (`ethAddress` is `msg.sender` and `chainId` is `block.chainid` on-chain; this ADR uses operator-perspective names for consistency with the signing pseudo-code below.)
-- Records `NodeInfo` (including `firstBondedAt` if this is the node's first-ever registration — used for cold-start bootstrap eligibility in [ADR 008](008-reputation.md#cold-start-bootstrap)).
+- Records `NodeInfo` (including `firstBondedAt` if this is the node's first-ever registration — the immutable anchor of the operator's `age_ramp` governance weight per [ADR 026 § Governance](026-tokenomics.md#governance)).
 - Sets `active = true` in the registry.
 - Emits `TermsAccepted(nodeId, termsHash, timestamp)`.
 
@@ -233,7 +233,7 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 A node that voluntarily deregistered or was auto-ejected (bond dropped below 50% of the minimum bond for its declared tier due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
 
-1. **`firstBondedAt` is preserved.** The cold-start bootstrap bonus ([ADR 008](008-reputation.md#adr-008-reputation-system)) is not re-granted — the `firstBondedAt` field in `CapacityBond` is immutable once set, and the bonus is one-time per operator address. The `age_ramp` ([ADR 026 § Governance](026-tokenomics.md#governance)) similarly resumes from the original bonded date, so a re-onboarding operator does not restart the age-ramp clock.
+1. **`firstBondedAt` is preserved.** The `firstBondedAt` field in `CapacityBond` is immutable once set. The `age_ramp` ([ADR 026 § Governance](026-tokenomics.md#governance)) therefore resumes from the original bonded date, so a re-onboarding operator does not restart the age-ramp clock.
 
 2. **`registrationNonce` is incremented.** On deregistration, `registrationNonce[nodeId]` is incremented. The operator must sign fresh `ed25519Signature` and `bindingSignature` parameters with the new nonce before calling `registerNode` again.
 
@@ -281,7 +281,7 @@ Mechanism-specific guidance — particular hash-match databases, reporting endpo
 
 - Phase 2 requires three ordered on-chain transactions (`approve`, `stake`, `registerNode`), each confirmed before the node can start. Sub-second L2 block times keep this fast, but operator tooling must handle nonce management across them.
 - Multiaddr registration before iroh starts requires either a static IP/port (suitable for most VPS deployments) or a two-step workflow (start node, observe addresses, then register or update).
-- Cold-start reputation (0.5, a 4× score penalty vs. a reputable node) means new nodes must price aggressively or wait out the 7-day bootstrap period to compete for traffic. This is a known and accepted property of [ADR 008](008-reputation.md#adr-008-reputation-system).
+- Cold-start reputation (0.5, a 4× score penalty vs. a reputable node) means new nodes must price aggressively or build a track record before they compete for traffic. This is a known and accepted property of [ADR 008](008-reputation.md#adr-008-reputation-system).
 - The `TermsAccepted` record evidences assent, not compliance; substantive screening remains unverifiable on-chain and is enforced only by the operator's jurisdiction.
 - Enforcing the current terms hash at registration means an un-upgraded CLI carrying a stale `termsHash` cannot register until it updates to the current terms text.
 

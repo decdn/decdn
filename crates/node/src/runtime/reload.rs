@@ -848,7 +848,7 @@ impl RuntimeReloadState {
                 subscribe_reputation: true,
                 reputation_publish_interval_sec: 3600,
                 allowlist: Vec::new(),
-                max_peer_table_entries: 100_000,
+                max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,
@@ -1362,7 +1362,7 @@ mod tests {
                 subscribe_reputation: true,
                 reputation_publish_interval_sec: 3600,
                 allowlist: Vec::new(),
-                max_peer_table_entries: 100_000,
+                max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,

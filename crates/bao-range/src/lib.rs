@@ -108,6 +108,22 @@ pub enum RangeVerifyError {
         /// Known blob size.
         blob_size: u64,
     },
+    /// `range_data` is not exactly the aligned fetch window's length — the origin
+    /// served a 206 whose body is shorter or longer than `[fetch_start, fetch_end)`
+    /// (e.g. a corrupt/extra tail). Rejected rather than silently ignoring the
+    /// surplus (or short-reading the deficit) inside the offset-mapped reader.
+    #[error(
+        "range_data is {got} bytes, expected {expected} for the aligned fetch window \
+         of a {blob_size}-byte blob"
+    )]
+    RangeDataSize {
+        /// Aligned fetch-window length the range body must have (`fetch_len`).
+        expected: u64,
+        /// Length actually supplied.
+        got: usize,
+        /// Known blob size.
+        blob_size: u64,
+    },
     /// The fetched range or the outboard did not verify against the wanted root
     /// `H` — a tampered range, a tampered/foreign outboard, or a wrong root.
     /// Carries the bao codec's typed cause so a caller can distinguish an
@@ -287,6 +303,8 @@ impl ReadAt for OffsetReadAt<'_> {
 ///
 /// # Errors
 ///
+/// - [`RangeVerifyError::RangeDataSize`] if `range_data` is not exactly
+///   `aligned.fetch_len()` bytes (a corrupt/extra or truncated origin 206 body).
 /// - [`RangeVerifyError::OutboardSize`] if `outboard` is the wrong length for the
 ///   aligned range's blob size (`aligned.blob_size()`).
 /// - [`RangeVerifyError::Verification`] if the range/outboard do not verify
@@ -298,6 +316,18 @@ pub fn encode_verified_range(
     outboard: Bytes,
 ) -> Result<Bytes, RangeVerifyError> {
     let blob_size = aligned.blob_size();
+    // Guard the one seam the crypto never sees: the offset-mapped reader below only
+    // exposes `[fetch_start, fetch_end)`, so a `range_data` longer than the aligned
+    // fetch window would have its tail silently dropped (and a shorter one would
+    // surface only as an opaque verification short-read). Reject either up front so
+    // a malformed origin 206 is a typed error, not a silent truncation.
+    if u64::try_from(range_data.len()).ok() != Some(aligned.fetch_len()) {
+        return Err(RangeVerifyError::RangeDataSize {
+            expected: aligned.fetch_len(),
+            got: range_data.len(),
+            blob_size,
+        });
+    }
     let tree = BaoTree::new(blob_size, IROH_BLOCK_SIZE);
     let expected = usize::try_from(tree.outboard_size()).unwrap_or(usize::MAX);
     if outboard.len() != expected {
@@ -331,4 +361,52 @@ pub fn encode_verified_range(
     encode_ranges_validated(&reader, &ob, aligned.chunk_ranges.as_ref(), &mut encoded)
         .map_err(|source| RangeVerifyError::Verification { source })?;
     Ok(Bytes::from(encoded))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
+mod tests {
+    use super::*;
+
+    // A blob spanning several chunk groups so the aligned fetch window has a
+    // non-trivial length we can over- and under-shoot.
+    const BLOB_SIZE: u64 = 5 * CHUNK_GROUP_BYTES + 123;
+
+    // `encode_verified_range` rejects a `range_data` longer than the aligned fetch
+    // window before any verification, so the surplus tail can never be silently
+    // dropped. The bogus outboard is never reached — the size guard fires first.
+    #[test]
+    fn rejects_overlong_range_data() {
+        let aligned = align_range(0, CHUNK_GROUP_BYTES, BLOB_SIZE).expect("align");
+        let fetch_len = aligned.fetch_len();
+        let too_long = usize::try_from(fetch_len).expect("fits usize") + 1;
+        let range_data = vec![0u8; too_long];
+        let err = encode_verified_range([0u8; 32], &aligned, &range_data, Bytes::new())
+            .expect_err("overlong range_data must be rejected");
+        assert!(matches!(
+            err,
+            RangeVerifyError::RangeDataSize {
+                expected,
+                got,
+                blob_size,
+            } if expected == fetch_len && got == too_long && blob_size == BLOB_SIZE
+        ));
+    }
+
+    // The mirror case: a truncated 206 body is a typed error, not an opaque
+    // verification short-read.
+    #[test]
+    fn rejects_too_short_range_data() {
+        let aligned = align_range(0, CHUNK_GROUP_BYTES, BLOB_SIZE).expect("align");
+        let fetch_len = aligned.fetch_len();
+        let too_short = usize::try_from(fetch_len).expect("fits usize") - 1;
+        let range_data = vec![0u8; too_short];
+        let err = encode_verified_range([0u8; 32], &aligned, &range_data, Bytes::new())
+            .expect_err("short range_data must be rejected");
+        assert!(matches!(
+            err,
+            RangeVerifyError::RangeDataSize { expected, got, .. }
+                if expected == fetch_len && got == too_short
+        ));
+    }
 }

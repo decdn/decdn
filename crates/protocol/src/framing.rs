@@ -63,6 +63,60 @@ pub fn decode_message<M: DeserializeOwned>(frame: &[u8]) -> Result<(M, &[u8]), F
     Ok(postcard::take_from_bytes::<M>(frame)?)
 }
 
+/// A top-level ALPN protocol enum (one per ALPN — [`crate::ProbeMessage`],
+/// [`crate::ClientMessage`], [`crate::DhtMessage`]). Serialized as the
+/// outermost postcard value in a frame, so its variant discriminant is the
+/// frame's leading varint.
+///
+/// Implementors expose their declared-variant count so the framing layer can
+/// tell an *unknown* discriminant (a variant this build does not know —
+/// ADR 013 `UNSUPPORTED_MESSAGE`, `0x01`) apart from a genuine parse fault
+/// (`MALFORMED_MESSAGE`, `0x03`) after a failed [`decode_message`].
+pub trait TopLevelEnum {
+    /// Number of declared variants. Postcard assigns discriminants
+    /// `0..VARIANT_COUNT` in declaration order, so any leading discriminant
+    /// `>= VARIANT_COUNT` names a variant this build does not know.
+    const VARIANT_COUNT: u32;
+}
+
+/// Classify a failed top-level-enum decode per ADR 013: return `true` iff the
+/// frame's leading discriminant names a variant at or beyond
+/// `M::VARIANT_COUNT` — i.e. an unknown/unsupported variant the receiver must
+/// answer with `UNSUPPORTED_MESSAGE` (`0x01`) rather than `MALFORMED_MESSAGE`
+/// (`0x03`).
+///
+/// A frame that does not begin with a well-formed varint (empty, a
+/// non-terminating continuation run, or a 5th byte that overflows `u32`) is a
+/// genuine parse fault, so this returns `false` and the caller keeps the
+/// `MALFORMED` classification. Callers should only consult this after
+/// [`decode_message`] has actually failed; a valid in-range discriminant whose
+/// inner payload is malformed also stays `MALFORMED` (this returns `false`).
+pub fn is_unknown_variant<M: TopLevelEnum>(frame: &[u8]) -> bool {
+    matches!(leading_varint_u32(frame), Some(d) if d >= M::VARIANT_COUNT)
+}
+
+/// Decode the leading postcard `u32` varint from `frame` (the top-level enum
+/// discriminant) without consuming the remainder. Returns `None` when the
+/// bytes do not begin with a well-formed varint — the synchronous mirror of
+/// [`read_varint_u32`]'s validation, over an in-memory slice.
+fn leading_varint_u32(frame: &[u8]) -> Option<u32> {
+    let mut result: u32 = 0;
+    for (i, &byte) in frame.iter().take(5).enumerate() {
+        let data = u32::from(byte & 0x7F);
+        // On the 5th byte (i == 4) only the low 4 bits are valid; reject overflow.
+        if i == 4 && byte & 0x70 != 0 {
+            return None;
+        }
+        let shift = u32::try_from(i).ok()?.saturating_mul(7);
+        let shifted = data.checked_shl(shift)?;
+        result |= shifted;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+    }
+    None
+}
+
 /// Read one length-prefixed frame from an async reader.
 ///
 /// The length prefix is validated against [`MAX_MESSAGE_SIZE`] *before* any
@@ -358,6 +412,61 @@ mod tests {
             matches!(&r, Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
             "expected Io(UnexpectedEof), got {r:?}"
         );
+    }
+
+    // A minimal 2-variant top-level enum standing in for the real ALPN enums,
+    // so the framing-layer classifier can be tested without pulling in the
+    // message/client/dht modules.
+    struct TwoVariant;
+    impl TopLevelEnum for TwoVariant {
+        const VARIANT_COUNT: u32 = 2;
+    }
+
+    #[test]
+    fn leading_varint_reads_single_byte_discriminants() {
+        assert_eq!(leading_varint_u32(&[0u8]), Some(0));
+        assert_eq!(leading_varint_u32(&[1u8, 0xAB, 0xCD]), Some(1));
+        assert_eq!(leading_varint_u32(&[99u8, 0, 0]), Some(99));
+    }
+
+    #[test]
+    fn leading_varint_reads_multibyte_discriminant() {
+        // 300 = 0xAC 0x02 in postcard varint; must match the length-prefix codec.
+        assert_eq!(leading_varint_u32(&[0xACu8, 0x02, 0xFF]), Some(300));
+    }
+
+    #[test]
+    fn leading_varint_rejects_malformed() {
+        // Empty frame → no discriminant.
+        assert_eq!(leading_varint_u32(&[]), None);
+        // Continuation bit set with no terminating byte.
+        assert_eq!(leading_varint_u32(&[0x80u8]), None);
+        assert_eq!(leading_varint_u32(&[0x80u8, 0x80, 0x80, 0x80, 0x80]), None);
+        // 5th byte carries overflow bits beyond u32 range.
+        assert_eq!(leading_varint_u32(&[0x80u8, 0x80, 0x80, 0x80, 0x10]), None);
+    }
+
+    #[test]
+    fn unknown_variant_flags_out_of_range_discriminant() {
+        // Discriminant 2 is the first index past a 2-variant enum → unknown.
+        assert!(is_unknown_variant::<TwoVariant>(&[2u8, 0, 0]));
+        assert!(is_unknown_variant::<TwoVariant>(&[99u8]));
+    }
+
+    #[test]
+    fn unknown_variant_false_for_in_range_discriminant() {
+        // In-range discriminants (0, 1) are known variants — a decode failure
+        // on their payload is MALFORMED, not UNSUPPORTED.
+        assert!(!is_unknown_variant::<TwoVariant>(&[0u8]));
+        assert!(!is_unknown_variant::<TwoVariant>(&[1u8, 0xFF]));
+    }
+
+    #[test]
+    fn unknown_variant_false_for_malformed_leading_varint() {
+        // A frame that cannot even yield a discriminant is a genuine parse
+        // fault → stays MALFORMED (classifier returns false).
+        assert!(!is_unknown_variant::<TwoVariant>(&[]));
+        assert!(!is_unknown_variant::<TwoVariant>(&[0x80u8]));
     }
 
     #[tokio::test]

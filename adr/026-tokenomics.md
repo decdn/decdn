@@ -145,7 +145,7 @@ bond_required(Mbps) = k × Mbps^α
 
 The super-linear curve makes high-capacity operators pay more per Mbps. At α=1.2 the 100G tier pays 2.5× the 1G per-Mbps rate — the curve's decentralization-pressure target.
 
-**Capacity floor.** `MIN_CAPACITY_PER_OPERATOR` bounds the curve from below, symmetric to `MAX_CAPACITY_PER_OPERATOR`. Without a floor the curve evaluates to ~13 TOKEN at 1 Mbps — far below the value of the registered-operator slot that bond buys. A slot counts toward operator-set cardinality (reputation diversity) and the governance vote-cap denominator (see [§ Governance](#governance) and [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), and it stamps the `firstBondedAt` that gates the [ADR 008](008-reputation.md#cold-start-bootstrap) cold-start bonus. The 10 Mbps default sets that entry bond at ~200 TOKEN: cheap enough for small and residential operators to test the waters, an order of magnitude above the sub-floor dust cost. Because the floor's governable lower bound equals its default, governance can only raise it — the sub-floor case never reopens — while the 1 Gbps ceiling on the floor keeps it far below `MAX_CAPACITY_PER_OPERATOR`'s 50 Gbps minimum, so the two bounds cannot cross.
+**Capacity floor.** `MIN_CAPACITY_PER_OPERATOR` bounds the curve from below, symmetric to `MAX_CAPACITY_PER_OPERATOR`. Without a floor the curve evaluates to ~13 TOKEN at 1 Mbps — far below the value of the registered-operator slot that bond buys. A slot counts toward operator-set cardinality (reputation diversity) and the governance vote-cap denominator (see [§ Governance](#governance) and [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), and it stamps the `firstBondedAt` that anchors the operator's `age_ramp` governance weight (see [§ Governance](#governance)). The 10 Mbps default sets that entry bond at ~200 TOKEN: cheap enough for small and residential operators to test the waters, an order of magnitude above the sub-floor dust cost. Because the floor's governable lower bound equals its default, governance can only raise it — the sub-floor case never reopens — while the 1 Gbps ceiling on the floor keeps it far below `MAX_CAPACITY_PER_OPERATOR`'s 50 Gbps minimum, so the two bounds cannot cross.
 
 **Bond lifecycle.**
 
@@ -309,7 +309,7 @@ N                          = windowEpochs                                       
 The voting set is narrow at launch (likely <50 operators in the first 6–12 months). Direct application of capacity-weighted governance pre-bootstrap risks hostile takeover via a cheap operator-fleet setup.
 
 - For the first 6–12 months, governance runs through a multisig with hard-cap pause powers (extends [ADR 009](009-governance.md#adr-009-governance-model)'s emergency-multisig pattern).
-- Transition to full operator-weighted governance is auto-triggered when **active operator count ≥ 30** AND **total declared capacity ≥ 100 Gbps**. Both thresholds governable.
+- Transition to full operator-weighted governance is triggered by the one-shot `transitionToGovernor` setter the multisig executes manually when it judges the operator set broad enough (see [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase)).
 - Before transition, the multisig can execute parameter changes within the safety bounds in [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds).
 
 ### Operator economics
@@ -370,8 +370,6 @@ Router shares and capacity-curve parameters are governable, gated by 48-hour tim
 | `age_ramp_months` | 6 | 1 | 24 |
 | Per-operator voting cap | 5% | 1% | 25% |
 | `windowEpochs` (served-bytes voting window, on `FeeRouter`) | 13 | 4 | 26 |
-| Multisig-bootstrap transition: operator-count threshold | 30 | 10 | 200 |
-| Multisig-bootstrap transition: capacity threshold | 100 Gbps | 10 Gbps | 1000 Gbps |
 | Unbonding window | 14 days | 7 days | 60 days |
 
 The 40% floor on the operator base share preserves the cashflow invariant — operators always receive enough liquid USDC to cover infrastructure costs even under extreme governance proposals. The 5% floor on burn and 0% floor on treasury let governance simplify the launch configuration without dropping deflationary pressure entirely.
@@ -396,7 +394,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 ### Negative
 
 - **Capital-cost-to-operate at edge tier.** The super-linear curve makes 100 Gbps + tiers expensive: ~12.6M TOKEN bond at the 100G tier. Mitigated by α-tunability and by the off-chain USDC infrastructure subsidies for early operators; operators must otherwise buy TOKEN on market to climb tiers, by design (there is no on-chain TOKEN credit).
-- **Governance bootstrap depends on multisig discipline.** First 6–12 months run through a multisig; capacity-weighted DAO voting kicks in only when the transition thresholds are met. Pre-transition parameter changes are constrained to the [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds).
+- **Governance bootstrap depends on multisig discipline.** First 6–12 months run through a multisig; served-bytes-weighted DAO voting kicks in when the multisig executes the one-shot transition. Pre-transition parameter changes are constrained to the [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds).
 - **Smaller external LP base in year 1.** No Liquidity Mining subsidy means external LP growth depends on organic trading-fee yield. POL provides the depth.
 - **Per-byte burn flow may exceed market depth at low TOKEN prices.** [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)'s per-epoch liquidity cap on `BuybackBurner` is load-bearing.
 - **Operator-only DAO is politically narrow.** Investors, team, and treasury hold TOKEN but cannot vote unless they also operate. This is the deliberate regulatory-cleanliness commitment; consistent with the entity design Pattern A.
@@ -410,7 +408,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 ## Cross-ADR Impact
 
 - **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model):** `FeeRouter.routeSettlement` distributes to three buckets, and the same-tx settlement invariant holds across all three (see §FeeRouter Integration).
-- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source is `FeeRouter`-derived served-bytes weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders carry zero weight. The multisig bootstrap phase has explicit transition thresholds.
+- **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source is `FeeRouter`-derived served-bytes weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders carry zero weight. The multisig bootstrap phase ends with a manual one-shot transition the multisig executes.
 - **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Defines the canonical DAO voting-weight formula the §Governance "Voting weight" section above points to. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, capped per-operator at `voteCapBps` against the bytes-weighted total, zeroed if `CapacityBond.slashedAtEpoch` falls inside the trailing window. `windowEpochs` (default 13) is a governable parameter. Because vote weight derives from proven delivered bytes rather than declared capacity, the design has no capacity-shortfall slashing path, no `min_delivery_ratio`, and no registration probe gate; the `cdn/probe/v1` ALPN serves [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) phantom-blob evidence and operator latency/availability discovery, not declared-capacity enforcement.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** `CapacityBond` is the operator registry / capacity-curve bond and exposes the escrow-on-slash settle hooks consumed by `SlashAppeal`. `FeeRouter` is the three-bucket settlement distributor. Class diagrams reflect this surface.
 - **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol):** POL is 10% (group 3); MM is 5% (group 7); combined Liquidity-Provision category is 15%. `BuybackBurner` receives 30% of routed USDC at every settlement. §POL Governance formalizes rebalance / withdraw / fee-accounting rules.

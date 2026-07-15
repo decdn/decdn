@@ -24,11 +24,11 @@ use crate::commands::chain_ctx;
 
 /// Entry point for `decdn appeal slash`.
 pub async fn run(args: &cli::AppealSlashArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    let config_path = args.chain.common.config.as_deref().or(global_config);
+    let config_path = args.chain.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
     let resolved =
         chain_ctx::resolve_appeal(&args.chain, args.slash_appeal_address.as_deref(), &file)?;
-    let sa_addr = chain_ctx::parse_address(&resolved.slash_appeal_address, "slash_appeal_address")?;
+    let sa_addr = resolved.slash_appeal_address;
     let slash_id = parse_slash_id(&args.slash_id)?;
     let evidence = parse_bytes32(&args.evidence_bundle_hash)?;
 
@@ -39,23 +39,17 @@ pub async fn run(args: &cli::AppealSlashArgs, global_config: Option<&Path>) -> a
 
     let plan = build_plan(&appeal, operator, slash_id, evidence, sa_addr).await?;
 
-    if args.chain.common.dry_run {
+    if args.chain.dry_run {
         let mut out = io::stdout().lock();
-        write_plan(
-            &mut out,
-            &plan,
-            args.chain.common.json,
-            &Outcome::default(),
-            true,
-        )
-        .context("failed to write dry-run output")?;
+        write_plan(&mut out, &plan, args.chain.json, &Outcome::default(), true)
+            .context("failed to write dry-run output")?;
         return Ok(());
     }
 
     let outcome = execute(&appeal, &provider, &plan, operator, sa_addr).await?;
 
     let mut out = io::stdout().lock();
-    write_plan(&mut out, &plan, args.chain.common.json, &outcome, false)
+    write_plan(&mut out, &plan, args.chain.json, &outcome, false)
         .context("failed to write result")?;
     Ok(())
 }

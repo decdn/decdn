@@ -5,13 +5,11 @@
 //! buyer-side bootstrap reconciliation scan ([`crate::buyer_channel`], #763)
 //! reuses the same math. Kept here (rather than in any one watcher) so a new
 //! consumer picks up the shared span instead of forking a fresh one (#1092).
-//!
-//! Known remaining divergence: the origin directory's genesis `ContentClaimed`
-//! replay ([`crate::dht::chain_origin_directory`], #651) still walks its own
-//! `REPLAY_WINDOW_BLOCKS = 9_000` windows by hand rather than going through
-//! [`backfill_windows`]. That 9k is a deliberate margin under the common
-//! provider 10k `eth_getLogs` cap, not drift — the defect is the hand-rolled
-//! loop, not the value. Migrating it onto this module is tracked by #1139.
+//! The origin directory's genesis `ContentClaimed` replay
+//! ([`crate::dht::chain_origin_directory`], #651) also windows through
+//! [`backfill_windows`], passing its own deliberate `REPLAY_WINDOW_BLOCKS = 9_000`
+//! span (a margin under the provider 10k `eth_getLogs` cap) rather than
+//! [`MAX_BACKFILL_BLOCK_SPAN`] (#1139).
 
 use anyhow::Result;
 

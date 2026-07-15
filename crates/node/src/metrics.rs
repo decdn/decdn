@@ -46,8 +46,24 @@ pub struct DecdnMetrics {
     pub gossip_announces_received_total: Counter,
     /// Incoming gossip envelopes rejected by validation (any reason).
     pub gossip_announces_rejected_total: Counter,
+    /// Incoming gossip envelopes rejected specifically for clock skew
+    /// (ADR 001 § Clock synchronization). A sibling of the generic
+    /// `gossip_announces_rejected_total` — since `iroh_metrics` carries no
+    /// label dimension, the ADR-named `reason=clock_skew` breakdown is
+    /// realized as this distinct counter (same pattern as
+    /// `dispatch_rejected_{global,per_source}`). Field has no `_total`
+    /// suffix because the `OpenMetrics` encoder appends it; operator-visible
+    /// name: `decdn_gossip_messages_rejected_clock_skew_total`. Lets
+    /// operators alert on NTP-drift-induced peer invisibility without it
+    /// being buried in the aggregate rejection count.
+    pub gossip_messages_rejected_clock_skew: Counter,
     /// Current peer-table size.
     pub gossip_peer_table_size: Gauge,
+    /// Peer-table entries removed by the TTL sweeper
+    /// (appendix-peer-table-eviction § Observability). Field has no `_total`
+    /// suffix because the `OpenMetrics` encoder appends it; operator-visible
+    /// name: `decdn_peer_table_evicted_ttl_total`.
+    pub peer_table_evicted_ttl: Counter,
     /// Successful subscriber reconnections after a stream drop.
     pub gossip_subscriber_reconnections_total: Counter,
     /// JSON-RPC endpoint reachability per the watchdog task. `1` =
@@ -2024,12 +2040,26 @@ impl Metrics {
         self.decdn.gossip_announces_received_total.inc();
     }
 
-    pub fn gossip_rejected(&self, _reason: &'static str) {
+    pub fn gossip_rejected(&self, reason: &'static str) {
         self.decdn.gossip_announces_rejected_total.inc();
+        // Break out the clock-skew signal into its own counter (ADR 001
+        // § Clock synchronization). Compare against the canonical
+        // `AnnounceReject::ClockSkew.label()` rather than a bare literal so
+        // a label rename in the gossip crate can't silently desync this
+        // branch. The aggregate above still counts every rejection, so this
+        // is purely additive.
+        if reason == decdn_gossip::AnnounceReject::ClockSkew.label() {
+            self.decdn.gossip_messages_rejected_clock_skew.inc();
+        }
     }
 
     pub fn gossip_peer_table_size(&self, n: i64) {
         self.decdn.gossip_peer_table_size.set(n);
+    }
+
+    /// Increment the TTL-eviction counter by the sweeper's evicted count.
+    pub fn peer_table_evicted_ttl(&self, n: u64) {
+        self.decdn.peer_table_evicted_ttl.inc_by(n);
     }
 
     pub fn gossip_reconnected(&self, _topic: &str) {
@@ -2743,6 +2773,50 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_voucher_nonce_gaps_total", 2),
             "expected 2 gap events (one bump each, not gap-size weighted):\n{text}"
+        );
+    }
+
+    #[test]
+    fn gossip_clock_skew_and_ttl_eviction_counters_start_at_zero_and_increment() {
+        // #1191 / #1192. Both fields omit the `_total` suffix; the
+        // OpenMetrics encoder appends it, so the operator-visible names are
+        // `decdn_gossip_messages_rejected_clock_skew_total` and
+        // `decdn_peer_table_evicted_ttl_total`. Pin the suffixed forms so a
+        // rename that re-added `_total` (emitting `..._total_total`) or the
+        // canonical name drifting from the ADR fails here.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_gossip_messages_rejected_clock_skew_total",
+            "decdn_peer_table_evicted_ttl_total",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "counter {name} should be exposed at zero on a fresh registry:\n{text}"
+            );
+        }
+
+        // A non-clock-skew rejection bumps only the aggregate, not the
+        // clock-skew sibling.
+        metrics.gossip_rejected("invalid_signature");
+        // Two clock-skew rejections bump both the aggregate and the sibling.
+        metrics.gossip_rejected("clock_skew");
+        metrics.gossip_rejected("clock_skew");
+        // TTL sweeper reports its evicted count in one weighted bump.
+        metrics.peer_table_evicted_ttl(5);
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_gossip_messages_rejected_clock_skew_total", 2),
+            "clock-skew counter should count only clock_skew rejections:\n{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_gossip_announces_rejected_total", 3),
+            "aggregate rejection counter still counts every rejection:\n{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_peer_table_evicted_ttl_total", 5),
+            "TTL-eviction counter is weighted by the evicted count:\n{text}"
         );
     }
 

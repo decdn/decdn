@@ -321,8 +321,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  gossip.max_peer_table_entries: {}",
-        resolved.gossip.max_peer_table_entries
+        "  gossip.max_peer_entries: {}",
+        resolved
+            .gossip
+            .max_peer_entries
+            .map_or_else(|| "unlimited".to_string(), |n| n.to_string())
     )?;
     // Download-receipt audit log (#802). The log lives at a fixed filename
     // inside data_dir; surface the resolved path so an operator can confirm
@@ -485,7 +488,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # subscribe_reputation = true               # subscribe/publish on cdn/reputation/v1 (ADR 008)
 # reputation_publish_interval_sec = 3600    # reputation-report publish cadence; matches the ADR 008 1-hour rate limit
 # allowlist = []                            # accepted announcer node IDs (64-char hex); empty = accept any signature-valid announce
-# max_peer_table_entries = 100000           # hard cap on PeerTable entries (#577); must be > 0
+# max_peer_entries = 100000                 # optional hard cap on PeerTable entries; omit = unlimited; must be > 0 when set
 
 [security]
 # max_concurrent_handlers = 256             # global cap on in-flight QUIC handler tasks; 0 disables the cap

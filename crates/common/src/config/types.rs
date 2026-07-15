@@ -761,15 +761,14 @@ pub struct GossipConfig {
     /// announce. Local stand-in for ADR 001 rule 2 (staked-node check)
     /// until the on-chain staking registry contract lands.
     pub allowlist: Option<Vec<String>>,
-    /// Hard cap on `PeerTable` entry count (#577 H3). Once the table is at
-    /// the cap, new announces from previously-unseen node IDs are
+    /// Optional hard cap on `PeerTable` entry count
+    /// (appendix-peer-table-eviction § No hard size cap). Once the table is
+    /// at the cap, new announces from previously-unseen node IDs are
     /// rejected after a one-shot inline TTL sweep; existing entries are
-    /// still refreshed. Absent => default 100 000. Must be `> 0`. A
-    /// generous default sized for a ~tens-of-MB memory budget at the
-    /// ~few-hundred-byte `PeerEntry` size, while still capping the
-    /// fresh-keypair memory-DoS that the empty-allowlist `PoC` stand-in
-    /// would otherwise leave unbounded.
-    pub max_peer_table_entries: Option<u64>,
+    /// still refreshed. Absent => no cap (unlimited); `decdn_peer_table_size`
+    /// is the early-warning signal operators watch to set the ceiling
+    /// reactively. Must be `> 0` when set.
+    pub max_peer_entries: Option<u64>,
 }
 
 /// Security / rate-limiting section of the config file.
