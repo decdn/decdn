@@ -376,13 +376,16 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     ) external {
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp > expiry) revert DelegationSignatureExpired(expiry);
+        // Validate the (public) nonce before the signature so a bad/stale nonce
+        // fails fast, without paying for the potential EIP-1271 staticcall in
+        // `SignatureChecker` — closes a cheap griefing vector.
+        uint256 expected = _delegationNonces[delegator];
+        if (nonce != expected) revert InvalidDelegationNonce(delegator, expected, nonce);
         bytes32 digest =
             _hashTypedDataV4(keccak256(abi.encode(DELEGATION_TYPEHASH, delegator, delegatee, nonce, expiry)));
         if (!SignatureChecker.isValidSignatureNow(delegator, digest, signature)) {
             revert InvalidDelegationSignature(delegator);
         }
-        uint256 expected = _delegationNonces[delegator];
-        if (nonce != expected) revert InvalidDelegationNonce(delegator, expected, nonce);
         _delegationNonces[delegator] = expected + 1;
         _delegate(delegator, delegatee);
     }
