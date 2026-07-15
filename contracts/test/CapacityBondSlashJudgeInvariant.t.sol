@@ -35,7 +35,8 @@ contract CapacityBondSlashJudgeInvariantTest is Test {
 
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant CHALLENGE_BOND = 100e18;
-    // 20 days in microseconds: valid (< 30d unbonding ceiling, within [1d,30d]).
+    // 20 days in microseconds: valid (< the fixture's 30d unbonding period, and
+    // within the SlashJudge evidence-age bounds [1d,30d]).
     uint256 internal constant MAX_EVIDENCE_AGE_US = 20 days * 1_000_000;
 
     function setUp() public {
@@ -43,7 +44,8 @@ contract CapacityBondSlashJudgeInvariantTest is Test {
         ed25519 = new MockEd25519Verifier();
         blacklist = new MockBlacklistView();
 
-        // Construct the real CapacityBond at the unbonding ceiling (30 days).
+        // Construct the real CapacityBond with a 30-day unbonding period
+        // (within the [7d,60d] bound).
         bond = new CapacityBond({
             token_: token,
             ed25519Verifier_: ed25519,
