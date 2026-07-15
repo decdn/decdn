@@ -659,15 +659,18 @@ where
     // yield no windows for that inverted range, skipping the replay with no
     // signal. Do not propagate the error: `bootstrap` is one-shot (no retry) and
     // a fatal startup crash is strictly worse than graceful degradation. Instead
-    // warn + bump a counter and keep the routing-only posture — `namespaces_of`
-    // stays empty until the live tail re-surfaces claims; membership is always
-    // authoritative via `getOrigins` below (#1152). Mirrors the buyer-reconcile
-    // consumer of the same range check in `buyer_channel`.
+    // warn + bump a counter and degrade to default-open routing. `namespaces_of`
+    // stays empty, so the `getOrigins` loop below is a no-op and per-namespace
+    // membership is absent this boot — every claimed hash falls back to the
+    // default-open set (namespace 0, still authoritative via `getOrigins(0)`).
+    // Per-namespace membership is restored once the live tail re-surfaces the
+    // claims (#1152). Mirrors the buyer-reconcile consumer of the same range
+    // check in `buyer_channel`.
     if let Err(err) = check_backfill_range(replay_from_block, latest) {
         warn!(
             %err, replay_from_block, latest,
             "origin-directory genesis replay: invalid range; skipping replay this boot \
-             (routing-only until re-surfaced by the live tail)"
+             (default-open routing until claims re-surface via the live tail)"
         );
         metrics.origin_directory_bootstrap_range_anomaly();
     } else {

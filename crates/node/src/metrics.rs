@@ -808,9 +808,10 @@ pub struct DecdnMetrics {
     /// which the `ContentClaimed` replay range was inverted
     /// (`replay_from > latest`) — the persisted replay checkpoint (#1108) sat
     /// ahead of a stale / lagging RPC head (replication lag or a reorg). The
-    /// genesis replay is skipped that boot (routing-only until the live tail
-    /// re-surfaces claims; membership stays authoritative via `getOrigins`), so
-    /// without this counter the anomaly would move no metric. Pairs with the
+    /// genesis replay is skipped that boot (per-namespace membership absent —
+    /// claimed hashes fall back to the default-open set until the live tail
+    /// re-surfaces claims), so without this counter the anomaly would move no
+    /// metric. Pairs with the
     /// warn! in `bootstrap_cache`. The `OpenMetrics` encoder appends `_total`.
     pub origin_directory_bootstrap_range_anomaly: Counter,
     /// `decdn_origin_directory_watcher_resolve_failures_total` (#651): times a
@@ -1740,7 +1741,8 @@ impl Metrics {
     /// The origin-directory bootstrap replay range was inverted
     /// (`replay_from > latest`) — a stale / lagging RPC head vs. the persisted
     /// replay checkpoint (#1152). The genesis replay was skipped this boot;
-    /// membership stays authoritative via `getOrigins`. Bumps
+    /// claimed hashes fall back to the default-open set until the live tail
+    /// re-surfaces claims. Bumps
     /// `origin_directory_bootstrap_range_anomaly_total`. Pairs with the warn! in
     /// `bootstrap_cache`.
     pub fn origin_directory_bootstrap_range_anomaly(&self) {

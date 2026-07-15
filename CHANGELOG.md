@@ -151,10 +151,10 @@ since project inception and will roll into the first tagged release.
   range, so the replay was silently skipped with no signal. The anomaly now
   emits a `warn!` and bumps a new
   `decdn_origin_directory_bootstrap_range_anomaly_total` counter. Behaviour is
-  otherwise unchanged — the replay is still skipped that boot (routing-only
-  until the live tail re-surfaces claims; membership stays authoritative via
-  `getOrigins`) rather than crashing startup, since the bootstrap call site is
-  one-shot with no retry.
+  otherwise unchanged — the replay is still skipped that boot (per-namespace
+  membership absent, so claimed hashes fall back to the default-open set until
+  the live tail re-surfaces claims) rather than crashing startup, since the
+  bootstrap call site is one-shot with no retry.
 
 ### Changed
 
