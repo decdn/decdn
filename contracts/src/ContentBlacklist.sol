@@ -175,12 +175,28 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     /// @notice Per-(region, hash) entry. `region = GLOBAL_REGION` is the
     ///         global scope. `addedAt == 0` means "not blacklisted".
+    /// @dev    Deliberately kept to two statically-sized fields: `getHashEntry`
+    ///         returns this struct and `IContentBlacklistHashView` /
+    ///         `SlashJudge` decode it as the ABI-identical `(uint64, bool)`
+    ///         tuple on the hot slash-eligibility path. The audit-trail `reason`
+    ///         string (ADR 011 § Reason field) is stored out-of-band in
+    ///         `hashReason` so it cannot perturb that tuple's ABI shape.
     struct HashEntry {
         uint64 addedAt;
         bool suspended;
     }
 
     mapping(bytes32 region => mapping(bytes32 hash => HashEntry)) internal _hashEntries;
+
+    /// @notice Free-form audit-trail reason per (region, hash) — legal notice
+    ///         identifiers (DMCA case numbers, DSA notice IDs) or short category
+    ///         labels (ADR 011 § Reason field). Persisted on-chain so takedowns
+    ///         carry a DMCA/DSA-defensible provenance record. Kept out of
+    ///         `HashEntry` to preserve that struct's static ABI shape (see its
+    ///         doc). Public auto-getter `hashReason(region, hash)`; cleared on
+    ///         `removeHash*`. Set to `""` for legacy entries added before this
+    ///         field existed.
+    mapping(bytes32 region => mapping(bytes32 hash => string)) public hashReason;
 
     /// @notice Operator-level blacklist (ADR 011 § Decision — operator-level
     ///         blacklist evicts the operator from `CapacityBond` via
@@ -254,7 +270,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // Events
     // -----------------------------------------------------------------
 
-    event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash);
+    event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, string reason);
     event HashRemoved(bytes32 indexed region, bytes32 indexed hash);
     event OperatorBlacklisted(address indexed operator);
     event OperatorBlacklistCleared(address indexed operator);
@@ -287,6 +303,10 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     error ZeroAddress();
     error ZeroHash();
+    /// @notice `openBlacklistAppeal` rejects an all-zero `evidenceBundleHash`:
+    ///         an appeal must reference an off-chain evidence bundle (ADR 031
+    ///         § Evidence), so filing with no bundle is inadmissible.
+    error EmptyEvidenceBundleHash();
     error MissingRegion();
     error EntryNotBlacklisted(bytes32 region, bytes32 hash);
     /// @notice Raised by `openBlacklistAppeal` when the (region, hash) entry
@@ -344,16 +364,23 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // -----------------------------------------------------------------
 
     /// @notice Add `hash` to the global blacklist. `GOVERNANCE_ROLE` only.
-    function addHashGlobal(bytes32 hash) external onlyRole(GOVERNANCE_ROLE) {
-        _addHash(GLOBAL_REGION, hash);
+    /// @param  reason Free-form audit-trail note (DMCA/DSA notice id or label);
+    ///         persisted on the entry per ADR 011 § Reason field.
+    function addHashGlobal(bytes32 hash, string calldata reason) external onlyRole(GOVERNANCE_ROLE) {
+        _addHash(GLOBAL_REGION, hash, reason);
     }
 
     /// @notice Add `hash` to the regional blacklist for `region`. Carries
     ///         `REGIONAL_BODY_ROLE` — granted per-region in
     ///         `registerRegionalBody` per ADR 016 § Post-Deployment, step 8.
-    function addHashRegional(bytes32 region, bytes32 hash) external onlyRole(REGIONAL_BODY_ROLE) {
+    /// @param  reason Free-form audit-trail note (DMCA/DSA notice id or label);
+    ///         persisted on the entry per ADR 011 § Reason field.
+    function addHashRegional(bytes32 region, bytes32 hash, string calldata reason)
+        external
+        onlyRole(REGIONAL_BODY_ROLE)
+    {
         if (region == bytes32(0) || region == GLOBAL_REGION) revert MissingRegion();
-        _addHash(region, hash);
+        _addHash(region, hash, reason);
     }
 
     function removeHashGlobal(bytes32 hash) external onlyRole(GOVERNANCE_ROLE) {
@@ -465,6 +492,10 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         uint256 namespaceId
     ) external nonReentrant returns (uint256 appealId) {
         if (hash == bytes32(0)) revert ZeroHash();
+        // An appeal must cite an off-chain evidence bundle (ADR 031 § Evidence);
+        // an all-zero digest references nothing, so reject it before escrowing
+        // the bond or writing any appeal state.
+        if (evidenceBundleHash == bytes32(0)) revert EmptyEvidenceBundleHash();
         // SF-M1 fix: callers must pass GLOBAL_REGION explicitly. Silently
         // rewriting `bytes32(0)` to global would burn the bond + 90-day
         // cooldown on the wrong scope for a caller who forgot the arg.
@@ -692,37 +723,79 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         emit BlacklistAppealReversed(appealId, bondBurned);
     }
 
+    /// @notice Permissionlessly settle a stuck appeal. Three admissibility
+    ///         conditions, mapped 1:1 to the `BlacklistAppealLapsed` reason code
+    ///         (ADR 031 § cleanupExpiredBlacklistAppeal):
+    ///           (a) `MultisigTimeout` (reason 1): `Open` past its review window;
+    ///           (b) `RatificationTimeout` (reason 2): `FastTracked` past its
+    ///               ratification window;
+    ///           (c) `GlobalOverride` (reason 3): `Open` or `FastTracked` whose
+    ///               underlying (region, hash) entry was removed by a slow-path
+    ///               `removeHash*` global override (ADR 011 § Global Override)
+    ///               while the appeal was live, rendering it moot — admissible
+    ///               regardless of window.
+    ///         Conditions (a)/(b) burn the bond; condition (c) REFUNDS it — the
+    ///         override granted the appellant's relief through another channel,
+    ///         so a burn would be punitive (ADR 011 § Global Override: "treated
+    ///         as lapsed, not reversed … the bond is refunded").
     function cleanupExpiredBlacklistAppeal(uint256 appealId) external nonReentrant {
         BlacklistAppeal storage a = _appeals[appealId];
-        if (a.status == AppealStatus.Open) {
+        AppealStatus status = a.status;
+        if (status != AppealStatus.Open && status != AppealStatus.FastTracked) {
+            revert AppealNotOpen(appealId);
+        }
+
+        // Cache the repeatedly-read fields to avoid redundant warm SLOADs
+        // (mirrors `fastTrackBlacklistAppeal`).
+        bytes32 region = a.region;
+        bytes32 hash = a.hash;
+        address filer = a.filer;
+
+        // Condition (c) takes precedence and skips the window gate: a global
+        // override removed the entry (`addedAt == 0`) mid-appeal, so there is
+        // nothing left to adjudicate and no reason to make the filer wait out
+        // the review/ratification window.
+        bool entryGone = _hashEntries[region][hash].addedAt == 0;
+        uint8 reason;
+        if (entryGone) {
+            reason = 3; // GlobalOverride
+        } else if (status == AppealStatus.Open) {
             uint64 readyAt = a.openedAt + uint64(APPEAL_REVIEW_WINDOW);
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp < readyAt) revert ReviewWindowOpen(readyAt);
-            uint256 bondBurned = a.bond;
-            a.bond = 0;
-            a.status = AppealStatus.Lapsed;
-            // Open appeals never charged the relief cap (M-1) — nothing to release.
-            hasActiveAppeal[a.region][a.hash] = false;
-            if (bondBurned != 0) token.burn(bondBurned);
-            emit BlacklistAppealLapsed(appealId, 1);
-            return;
-        }
-        if (a.status == AppealStatus.FastTracked) {
+            reason = 1; // MultisigTimeout
+        } else {
             uint64 readyAt = a.fastTrackedAt + uint64(APPEAL_RATIFICATION_WINDOW);
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp < readyAt) revert RatificationWindowOpen(readyAt);
-            uint256 bondBurned = a.bond;
-            a.bond = 0;
-            a.status = AppealStatus.Lapsed;
-            _hashEntries[a.region][a.hash].suspended = false;
-            if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
-            if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
-            hasActiveAppeal[a.region][a.hash] = false;
-            if (bondBurned != 0) token.burn(bondBurned);
-            emit BlacklistAppealLapsed(appealId, 2);
-            return;
+            reason = 2; // RatificationTimeout
         }
-        revert AppealNotOpen(appealId);
+
+        // Fast-tracked appeals hold an interim-relief slot and a suspended entry;
+        // release both. Open appeals never charged the cap (M-1). When the entry
+        // is already gone (condition c on a fast-tracked appeal), there is no
+        // `suspended` flag to clear — the slot release still applies.
+        if (status == AppealStatus.FastTracked) {
+            if (!entryGone) _hashEntries[region][hash].suspended = false;
+            if (regionActiveReliefCount[region] != 0) regionActiveReliefCount[region] -= 1;
+            if (filerRegionActiveRelief[region][filer] != 0) filerRegionActiveRelief[region][filer] -= 1;
+        }
+
+        uint256 bond = a.bond;
+        a.bond = 0;
+        a.status = AppealStatus.Lapsed;
+        hasActiveAppeal[region][hash] = false;
+
+        // Effects complete above (CEI); the token call is last and this function
+        // is `nonReentrant`. Global override refunds; the timeout lapses burn.
+        if (bond != 0) {
+            if (reason == 3) {
+                IERC20(address(token)).safeTransfer(filer, bond);
+            } else {
+                token.burn(bond);
+            }
+        }
+        emit BlacklistAppealLapsed(appealId, reason);
     }
 
     function getAppeal(uint256 appealId) external view returns (BlacklistAppeal memory) {
@@ -771,7 +844,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // Internal helpers
     // -----------------------------------------------------------------
 
-    function _addHash(bytes32 region, bytes32 hash) internal {
+    function _addHash(bytes32 region, bytes32 hash, string calldata reason) internal {
         if (hash == bytes32(0)) revert ZeroHash();
         // A re-add while an appeal is live would clear `suspended` and refresh
         // `addedAt`, orphaning the in-flight appeal and resetting the slash-
@@ -779,16 +852,19 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // first (reject / reverse / ratify) before re-adding.
         if (hasActiveAppeal[region][hash]) revert HashHasActiveAppeal(region, hash);
         HashEntry storage e = _hashEntries[region][hash];
-        // Re-adding refreshes `addedAt` (resets the filing window).
+        // Re-adding refreshes `addedAt` (resets the filing window) and overwrites
+        // the audit-trail reason with the current notice's.
         e.addedAt = uint64(block.timestamp);
         e.suspended = false;
-        emit HashBlacklisted(region, hash);
+        hashReason[region][hash] = reason;
+        emit HashBlacklisted(region, hash, reason);
     }
 
     function _removeHashRegional(bytes32 region, bytes32 hash) internal {
         HashEntry storage e = _hashEntries[region][hash];
         if (e.addedAt == 0) revert EntryNotBlacklisted(region, hash);
         delete _hashEntries[region][hash];
+        delete hashReason[region][hash];
         emit HashRemoved(region, hash);
     }
 
