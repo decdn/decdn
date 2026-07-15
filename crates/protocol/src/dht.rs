@@ -643,10 +643,15 @@ mod tests {
     #[test]
     fn dht_message_variant_count_matches_discriminants() -> Result<(), postcard::Error> {
         use crate::framing::TopLevelEnum;
+        assert_eq!(DhtMessage::VARIANT_COUNT, 8);
+        // The last declared variant (`FindNodeResponse`) must encode to
+        // discriminant VARIANT_COUNT - 1. Compare against postcard's own varint
+        // encoding of that index (not `bytes.first()`) so the pin survives a
+        // future multi-byte discriminant (> 127 variants).
         let last = DhtMessage::FindNodeResponse(sample_find_node_response());
         let bytes = postcard::to_allocvec(&last)?;
-        assert_eq!(bytes.first().copied(), Some(7u8));
-        assert_eq!(DhtMessage::VARIANT_COUNT, 8);
+        let expected_disc = postcard::to_allocvec(&(DhtMessage::VARIANT_COUNT - 1))?;
+        assert!(bytes.starts_with(&expected_disc));
         Ok(())
     }
 

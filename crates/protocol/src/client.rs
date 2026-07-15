@@ -943,6 +943,11 @@ mod tests {
     #[test]
     fn client_message_variant_count_matches_discriminants() -> Result<(), postcard::Error> {
         use crate::framing::TopLevelEnum;
+        assert_eq!(ClientMessage::VARIANT_COUNT, 9);
+        // The last declared variant (`CooperativeCloseAuth`) must encode to
+        // discriminant VARIANT_COUNT - 1. Compare against postcard's own varint
+        // encoding of that index (not `first_byte`/`bytes.first()`) so the pin
+        // survives a future multi-byte discriminant (> 127 variants).
         let last = ClientMessage::CooperativeCloseAuth(CooperativeCloseAuth {
             channel_id: [0u8; 32],
             amount: [0u8; 32],
@@ -950,8 +955,9 @@ mod tests {
             bytes_delivered: [0u8; 32],
             signature: vec![0u8; COOPERATIVE_CLOSE_SIG_LEN],
         });
-        assert_eq!(first_byte(&last)?, 8);
-        assert_eq!(ClientMessage::VARIANT_COUNT, 9);
+        let bytes = postcard::to_allocvec(&last)?;
+        let expected_disc = postcard::to_allocvec(&(ClientMessage::VARIANT_COUNT - 1))?;
+        assert!(bytes.starts_with(&expected_disc));
         Ok(())
     }
 

@@ -381,12 +381,15 @@ mod tests {
     #[test]
     fn probe_message_variant_count_matches_discriminants() -> Result<(), postcard::Error> {
         use crate::framing::TopLevelEnum;
-        // The last declared variant (`Response`, discriminant 1) must be exactly
-        // VARIANT_COUNT - 1.
+        assert_eq!(ProbeMessage::VARIANT_COUNT, 2);
+        // The last declared variant (`Response`) must encode to discriminant
+        // VARIANT_COUNT - 1. Compare against postcard's own varint encoding of
+        // that index (not `bytes.first()`) so the pin stays correct even if the
+        // enum ever grows a multi-byte discriminant (> 127 variants).
         let last = ProbeMessage::Response(sample_response());
         let bytes = postcard::to_allocvec(&last)?;
-        assert_eq!(bytes.first().copied(), Some(1u8));
-        assert_eq!(ProbeMessage::VARIANT_COUNT, 2);
+        let expected_disc = postcard::to_allocvec(&(ProbeMessage::VARIANT_COUNT - 1))?;
+        assert!(bytes.starts_with(&expected_disc));
         Ok(())
     }
 
