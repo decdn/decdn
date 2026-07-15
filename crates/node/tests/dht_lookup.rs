@@ -34,7 +34,7 @@ use std::time::Duration;
 use decdn_common::config::ResolvedSecurity;
 use decdn_node::dht::{
     ConfigStakerSet, DhtRateLimiter, InsertOutcome, LookupConfig, NegativeProbeCache, RecordStore,
-    RecordStoreConfig, RoutingTable, StakerSet, client, find_providers,
+    RecordStoreConfig, RoutingTable, StakerSet, client, find_providers, lookup::MAX_LOOKUP_ROUNDS,
     rate_limit::DhtRateLimitConfig,
 };
 use decdn_node::dispatch::ConnectionLimiter;
@@ -266,6 +266,7 @@ async fn find_providers_returns_directly_reachable_provider() -> anyhow::Result<
         NodeId::from_bytes(*client_id.as_bytes()),
         ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
+        None,
     )
     .await;
 
@@ -317,6 +318,7 @@ async fn find_providers_drops_providers_in_negative_cache() -> anyhow::Result<()
         NodeId::from_bytes(*client_id.as_bytes()),
         ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
+        None,
     )
     .await;
 
@@ -368,6 +370,7 @@ async fn find_providers_drops_non_staked_provider() -> anyhow::Result<()> {
         NodeId::from_bytes(*client_id.as_bytes()),
         ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
+        None,
     )
     .await;
 
@@ -403,11 +406,148 @@ async fn find_providers_with_empty_routing_table_returns_empty() -> anyhow::Resu
         NodeId::from_bytes(*client_id.as_bytes()),
         ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
+        None,
     )
     .await;
 
     assert!(providers.is_empty());
 
     client_ep.close().await;
+    Ok(())
+}
+
+/// XOR distance between a node id and the target, as a big-endian magnitude — the same
+/// ordering the routing table uses. Only comparisons matter here.
+fn xor_distance(id: &[u8; 32], target: &[u8; 32]) -> [u8; 32] {
+    let mut d = [0u8; 32];
+    for i in 0..32 {
+        // Indexing is bounded by the array length on both sides.
+        if let (Some(slot), Some(a), Some(b)) = (d.get_mut(i), id.get(i), target.get(i)) {
+            *slot = a ^ b;
+        }
+    }
+    d
+}
+
+/// `find_providers` must TERMINATE at `MAX_LOOKUP_ROUNDS`, even while every round is still
+/// finding strictly-closer nodes (#1145 review).
+///
+/// This is the load-bearing half of the outer-pull-deadline formula, and it had no test at
+/// all. `PULL_THROUGH_OUTER_SLACK` is now DERIVED as
+/// `PROBE_TIMEOUT + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so the slack is only a valid
+/// budget if the lookup really honours that ceiling. An arithmetic assertion cannot check
+/// that — it would just restate the definition (`A >= A`), which is exactly what the test
+/// this replaces did. The only thing that can break is the LOOP, so the loop is what is
+/// driven.
+///
+/// The fixture is a CHAIN: six servers ordered by XOR distance to the target, each one's
+/// routing table holding only the next-closer node. A chain reveals exactly one new
+/// candidate per round, so walking it end to end needs six rounds — two more than the
+/// ceiling allows.
+///
+/// The record sits on the LAST server, deliberately out of reach. That makes the assertion
+/// behavioural rather than a counter check: the lookup must come back EMPTY, because it was
+/// cut off before it got there. Remove the ceiling and the walk continues, the record is
+/// found, and this test fails on a non-empty result — which is the point. It fails on the
+/// revert in both directions: the ceiling counter also stops firing.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_providers_stops_at_the_round_ceiling_even_while_still_finding_closer_nodes()
+-> anyhow::Result<()> {
+    let target: [u8; 32] = [0x5C; 32];
+
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let (client_ep, _client_addr) = local_endpoint(client_sk, vec![ALPN_DHT.to_vec()]).await?;
+
+    // Six servers, then SORTED by distance to the target — so the chain is strictly
+    // converging without having to grind keys for it. Six because the ceiling is four: the
+    // walk must want more rounds than it is allowed.
+    let mut servers = Vec::new();
+    for _ in 0..6 {
+        servers.push(spin_up_server(HashSet::new()).await?);
+    }
+    servers.sort_by_key(|s| xor_distance(s.id.as_bytes(), &target));
+    // Farthest first: the client starts at the far end and walks inward.
+    servers.reverse();
+
+    // Every server is staked and dialable-by-id from the client's view.
+    let mut staked = HashSet::new();
+    for s in &servers {
+        staked.insert(NodeId::from_bytes(*s.id.as_bytes()));
+        prime_iroh_cache(&client_ep, client_id.as_bytes(), s).await?;
+    }
+    let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
+
+    // The chain: each server knows only the next, strictly-closer one.
+    for i in 0..servers.len() - 1 {
+        let (Some(here), Some(next)) = (servers.get(i), servers.get(i + 1)) else {
+            anyhow::bail!("chain index out of range");
+        };
+        here.routing
+            .lock()
+            .expect("routing mutex poisoned")
+            .insert(NodeId::from_bytes(*next.id.as_bytes()));
+    }
+
+    // The prize, placed beyond the ceiling's reach: only a lookup that walks the WHOLE chain
+    // ever sees it.
+    let last = servers.last().expect("six servers");
+    insert_record(&last.records, target, *last.id.as_bytes());
+
+    // The client knows only the far end of the chain.
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
+    let first = servers.first().expect("six servers");
+    routing
+        .lock()
+        .expect("routing mutex poisoned")
+        .insert(NodeId::from_bytes(*first.id.as_bytes()));
+
+    let neg = NegativeProbeCache::new();
+    let metrics = Arc::new(Metrics::new());
+    let providers = tokio::time::timeout(
+        Duration::from_mins(1),
+        find_providers(
+            &client_ep,
+            &routing,
+            &staker_set,
+            &neg,
+            NodeId::from_bytes(*client_id.as_bytes()),
+            ContentHash::from_bytes(target),
+            lookup_cfg_for_test(),
+            Some(&metrics),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "the lookup never returned: with no round ceiling, a chain that keeps revealing \
+             closer nodes has no bound at all — and it runs inside the caller's outer pull \
+             deadline"
+        )
+    })?;
+
+    // Cut off before the record: the ceiling held.
+    assert!(
+        providers.is_empty(),
+        "the lookup reached a record six hops away, so it ran more than MAX_LOOKUP_ROUNDS \
+         ({MAX_LOOKUP_ROUNDS}) rounds — the bound `PULL_THROUGH_OUTER_SLACK` is derived from \
+         does not hold, and the outer pull deadline is budgeting for a cost discovery can \
+         exceed. Got {providers:?}"
+    );
+
+    // …and said so. The counter is the operator's only signal that their round ceiling is
+    // too low for their network size; a `debug!` is invisible at the default RUST_LOG=info.
+    let encoded = metrics.encode().expect("metrics encode");
+    assert!(
+        encoded.contains("decdn_dht_lookup_round_ceiling_total 1"),
+        "a truncated lookup must be metered, not just logged at debug!; got:\n{encoded}"
+    );
+
+    client_ep.close().await;
+    for s in servers {
+        s.shutdown();
+    }
     Ok(())
 }

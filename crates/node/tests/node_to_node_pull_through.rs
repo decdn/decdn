@@ -573,9 +573,7 @@ async fn lying_upstream(
     for chunk in served.chunks(decdn_protocol::CHUNK_SIZE) {
         write_client_msg(
             &mut send,
-            &ClientMessage::ChunkData(ChunkData {
-                bytes: chunk.to_vec(),
-            }),
+            &ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?),
         )
         .await?;
     }

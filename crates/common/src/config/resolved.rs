@@ -244,7 +244,15 @@ pub struct ResolvedCache {
     pub node_pull_probe_fanout: usize,
     /// Per-pull wall-clock timeout in seconds for a node-to-node miss fill
     /// (#831). Default [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`].
+    ///
+    /// Bounds the OPEN stage only; the streaming stage is bounded by
+    /// [`Self::node_pull_stall_timeout_sec`] (#1134).
     pub node_pull_timeout_sec: u64,
+    /// Inactivity bound (seconds) on the streaming stage of an upstream pull; the
+    /// clock resets on every byte received, so it trips only on a silent upstream,
+    /// never on a large blob or a slow link (#1134). Default
+    /// [`crate::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`].
+    pub node_pull_stall_timeout_sec: u64,
     /// Window-paced pull-through pipeline window in bytes (#856, ADR 037
     /// `pull_ahead_bytes`). Default [`crate::config::DEFAULT_PULL_AHEAD_BYTES`].
     /// Bounds per-request speculative loss to this window.
@@ -418,10 +426,12 @@ pub struct ResolvedGossip {
     /// signature-valid announce (local substitute for ADR 001 rule 2 until
     /// the on-chain staking registry contract lands).
     pub allowlist: Vec<[u8; 32]>,
-    /// Hard cap on `PeerTable` entry count (#577 H3). Always positive
-    /// (the resolver rejects `0`); the runtime casts to `usize` when
-    /// constructing the table.
-    pub max_peer_table_entries: u64,
+    /// Optional hard cap on `PeerTable` entry count
+    /// (appendix-peer-table-eviction § No hard size cap). `None` => no cap
+    /// (unlimited); `Some(n)` is always positive (the resolver rejects `0`).
+    /// The runtime maps `None` to the peer table's `0`-means-unlimited
+    /// sentinel and casts `Some(n)` to `usize` when constructing the table.
+    pub max_peer_entries: Option<u64>,
 }
 
 /// Resolved observability fields.

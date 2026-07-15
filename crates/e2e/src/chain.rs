@@ -503,7 +503,7 @@ impl ChainFixture {
         self.impersonate(self.addrs.timelock).await?;
         let raw = self.raw_provider();
         let receipt = ContentBlacklist::new(self.addrs.content_blacklist, &raw)
-            .addHashGlobal(hash)
+            .addHashGlobal(hash, "e2e-takedown".to_string())
             .from(self.addrs.timelock)
             .send()
             .await
@@ -532,7 +532,7 @@ impl ChainFixture {
             .context("grantRole receipt")?;
         crate::ensure_mined(&grant, "grantRole")?;
         let receipt = ContentBlacklist::new(self.addrs.content_blacklist, &raw)
-            .addHashRegional(region, hash)
+            .addHashRegional(region, hash, "e2e-takedown".to_string())
             .from(self.addrs.timelock)
             .send()
             .await

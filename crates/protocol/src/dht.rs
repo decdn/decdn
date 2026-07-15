@@ -189,6 +189,12 @@ pub enum DhtMessage {
     FindNodeResponse(FindNodeResponse),
 }
 
+impl crate::framing::TopLevelEnum for DhtMessage {
+    /// `FindValue` (0) … `FindNodeResponse` (7). Pinned by
+    /// `dht_message_variant_count_matches_discriminants`.
+    const VARIANT_COUNT: u32 = 8;
+}
+
 /// Query for providers of a specific content hash (ADR 022 §Message Types).
 ///
 /// The responder returns any known providers for `hash` and the K closest
@@ -629,6 +635,32 @@ mod tests {
         let decoded: DhtMessage = postcard::from_bytes(&bytes)?;
         assert_eq!(decoded, msg);
         Ok(())
+    }
+
+    // Pins `TopLevelEnum::VARIANT_COUNT` to the highest discriminant so a future
+    // variant addition must update the count the ADR 013 unknown/known
+    // classifier relies on.
+    #[test]
+    fn dht_message_variant_count_matches_discriminants() -> Result<(), postcard::Error> {
+        use crate::framing::TopLevelEnum;
+        assert_eq!(DhtMessage::VARIANT_COUNT, 8);
+        // The last declared variant (`FindNodeResponse`) must encode to
+        // discriminant VARIANT_COUNT - 1. Compare against postcard's own varint
+        // encoding of that index (not `bytes.first()`) so the pin survives a
+        // future multi-byte discriminant (> 127 variants).
+        let last = DhtMessage::FindNodeResponse(sample_find_node_response());
+        let bytes = postcard::to_allocvec(&last)?;
+        let expected_disc = postcard::to_allocvec(&(DhtMessage::VARIANT_COUNT - 1))?;
+        assert!(bytes.starts_with(&expected_disc));
+        Ok(())
+    }
+
+    #[test]
+    fn dht_message_unknown_discriminant_is_flagged_unsupported() {
+        // Discriminant 8 is the first index past the known set → UNSUPPORTED.
+        assert!(crate::is_unknown_variant::<DhtMessage>(&[8u8, 0, 0]));
+        // A known in-range discriminant (7) with a bad payload stays MALFORMED.
+        assert!(!crate::is_unknown_variant::<DhtMessage>(&[7u8, 0xFF]));
     }
 
     #[test]

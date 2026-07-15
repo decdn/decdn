@@ -237,8 +237,8 @@ async fn ranged_paid_pull(
     loop {
         match read_client_msg(&mut recv).await? {
             ClientMessage::ChunkData(chunk) => {
-                buf.extend_from_slice(&chunk.bytes);
-                let len = u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX);
+                buf.extend_from_slice(chunk.bytes());
+                let len = u64::try_from(chunk.bytes().len()).unwrap_or(u64::MAX);
                 cumulative = cumulative.saturating_add(len);
                 unvouchered = unvouchered.saturating_add(len);
                 let boundary = interval_bytes > 0 && unvouchered >= interval_bytes;

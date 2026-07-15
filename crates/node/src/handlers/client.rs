@@ -51,7 +51,7 @@ use decdn_protocol::client::{
 };
 use decdn_protocol::{
     ALPN_CLIENT, APP_ERR_RATE_LIMITED, FrameError, MB_BYTES, decode_message, encode_message,
-    read_frame, write_frame,
+    is_unknown_variant, read_frame, write_frame,
 };
 use futures_util::StreamExt as _;
 use iroh::PublicKey;
@@ -87,6 +87,7 @@ const WINDOW_PULL_FALLBACK_DEADLINE: Duration = Duration::from_mins(1);
 // voucher rejection does NOT use these — it writes a `StreamError` frame and
 // finishes the stream so the reason survives.
 const APP_ERR_NO_ERROR: u32 = 0x00;
+const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
 const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 
 /// Per-channel delivery state: the validated voucher state plus the channel-wide
@@ -99,6 +100,64 @@ struct ChannelDeliveryState {
     bytes_delivered_cumulative: U256,
 }
 
+/// Absolute backstop on a detached background cache-fill (#1134 review).
+///
+/// This is a LEAK GUARD, not a health signal, and the distinction is why it is an
+/// hour rather than a minute. The warm's streaming stage is bounded by inactivity,
+/// which resets on any byte received — so an upstream that trickles one byte per
+/// stall-window keeps the task alive indefinitely without ever tripping the stall
+/// bound. That is not merely a leaked task: `arm_background_fill` claims the hash
+/// for the task's lifetime, so a warm that never ends means the node can never warm
+/// that blob again for the life of the process.
+///
+/// Sized ~21× the derived foreground deadline ([`crate::selection::outer_pull_deadline`] —
+/// `(5 + 20 + 20) × 3 + 37 s = 172 s` at defaults), so it bounds no honest transfer the
+/// node's `max_blob_size_mb` ceiling permits — a 1 GiB blob would have to average under
+/// 300 KB/s to hit it — while still guaranteeing every warm terminates. Not config-tunable
+/// (YAGNI): an operator who needs to tune this wants `node_pull_stall_timeout_sec`, which is
+/// the actual health knob.
+///
+/// The ratio is stated against the deadline rather than restating its arithmetic, because
+/// restating it is how this comment went stale: it said `+ 10 s` and `~25×` after the slack
+/// became derived (5 s probe + 4 × 8 s lookup = 37 s, not 10 s), and 3600/172 is ~21, not 25.
+pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
+
+/// Ceiling on the memory background warms may hold at once, in MiB (#1145 review).
+///
+/// The per-hash `inflight` claim dedups warms for the SAME blob; it says nothing about
+/// how many DISTINCT blobs can be warming. Each warm runs the buffered path, which
+/// accumulates the whole blob into memory and pays vouchers for every byte — and
+/// [`BACKGROUND_FILL_HARD_CAP`] extends a warm's life from the old ~70 s to an hour, so
+/// slow upstreams now accumulate roughly **50×** more concurrent warms for the same miss
+/// rate (3600/70 ≈ 51). Unbounded, a burst of misses against a slow peer is a memory and
+/// spend amplifier.
+///
+/// (This said `~25×` — the same figure as `BACKGROUND_FILL_HARD_CAP`'s ratio against the
+/// FOREGROUND deadline, which is a different denominator entirely. The two cannot both be
+/// right, and the copy understated this one by half.)
+///
+/// # Why bytes, not tasks
+///
+/// A task COUNT is the wrong quantity to bound: what a warm costs is its blob, and a blob
+/// is bounded only by `max_blob_size_mb` (1 GiB by default). Eight concurrent warms of
+/// near-max blobs is ~8 GiB resident for up to an hour each — while eight concurrent warms
+/// of 4 KiB blobs is nothing at all, and a count-based ceiling throttles those just as hard.
+///
+/// So the permits are MiB, and each warm reserves `max_blob_size_mb` of them up front —
+/// the blob's size is not known until it has been fetched, so the ceiling is what has to
+/// be reserved. Small-blob nodes now run many warms at once; large-blob nodes run few.
+///
+/// **At the defaults this means TWO concurrent warms** (a 1 GiB `max_blob_size_mb` against
+/// this 2 GiB pool), down from the old fixed 8 — but bounded at 2 GiB resident instead of
+/// 8 GiB. An operator who wants more concurrency lowers `max_blob_size_mb`; one who raises
+/// it is explicitly trading warm concurrency for blob size, which is the honest trade the
+/// task-count ceiling hid.
+///
+/// A miss that finds no room is simply not warmed: the hash stays unclaimed, so the next
+/// miss retries it. Shedding is the right failure mode — a warm is speculative work for
+/// a FUTURE request, and dropping it costs a later cache miss, never a live one.
+pub const MAX_BACKGROUND_FILL_MB: u64 = 2048;
+
 /// Detached background cache-fill state (#859), attached post-construction via
 /// [`ClientHandler::attach_background_fill`]. When the foreground delivery
 /// deadline fires on a node-to-node miss, the handler spawns a task to keep
@@ -107,16 +166,39 @@ struct BackgroundFill {
     /// Cancelled on node shutdown so in-flight warm tasks stop cooperatively at
     /// their next await rather than being left to run past drain.
     cancel: CancellationToken,
-    /// Fresh budget granted to a background fill (it re-pulls from scratch — the
-    /// foreground future was dropped, taking its partial work). Reuses the
-    /// derived outer pull-through deadline.
-    budget: Duration,
+    /// Optional overall wall-clock cap on a background fill. The runtime passes
+    /// [`BACKGROUND_FILL_HARD_CAP`]; `None` (tests) runs to completion.
+    ///
+    /// It used to reuse the derived outer pull-through deadline, and that made the
+    /// background fill useless for exactly the content it matters most for: the warm
+    /// re-pulls from scratch, so capping it at the same deadline the *foreground* gave
+    /// up on meant a blob that could not be pulled in one deadline could not be
+    /// warmed in one either. The node simply could not acquire any blob needing more
+    /// than a deadline's worth of transfer (#1134).
+    ///
+    /// The fix is a *bigger* cap, not the absence of one. It is tempting to argue
+    /// the cap is unnecessary because the pull's streaming stage is inactivity-bounded
+    /// — but inactivity is not liveness: the deadline resets on ANY byte, so a peer
+    /// trickling one byte per stall-window keeps a warm running forever, and the
+    /// per-hash `inflight` claim then blocks that blob from ever being warmed again.
+    /// See [`BACKGROUND_FILL_HARD_CAP`].
+    budget: Option<Duration>,
     /// Hashes with a background fill currently running, so repeated foreground
     /// misses on the same hash don't spawn duplicate warming tasks. A std mutex
     /// (no await held); a poisoned lock is recovered rather than disabling the
     /// feature — the dedup set holds no torn state to fear (only `insert`/`remove`
     /// ever take it).
     inflight: Arc<std::sync::Mutex<HashSet<Hash>>>,
+    /// Memory ceiling across DISTINCT hashes, denominated in MiB
+    /// ([`MAX_BACKGROUND_FILL_MB`]). `inflight` dedups warms for one blob; this bounds
+    /// how much those warms can hold at once. Each warm reserves `reserve_mb` permits.
+    slots: Arc<tokio::sync::Semaphore>,
+    /// MiB each warm reserves from `slots` — the node's `max_blob_size_mb`, since a
+    /// blob's true size is unknown until it has been fetched, so the ceiling is what
+    /// must be reserved. Clamped to the pool size, so a node whose `max_blob_size_mb`
+    /// exceeds [`MAX_BACKGROUND_FILL_MB`] still runs ONE warm at a time rather than
+    /// shedding every warm forever.
+    reserve_mb: u32,
 }
 
 /// RAII guard that clears a hash from [`BackgroundFill::inflight`] when its warm
@@ -176,6 +258,162 @@ fn arm_background_fill(
     })
 }
 
+/// Size the background-warm memory budget: `(pool_mb, reserve_mb)`, both in MiB.
+///
+/// Split out from [`ClientHandler::attach_background_fill`] so the SIZING DECISION — the
+/// only part with any judgement in it — is a pure function that can be asserted on
+/// directly. A test that stands up its own semaphore and reserves from it proves only that
+/// tokio's semaphore works; this is the thing that can actually be got wrong.
+///
+/// Each warm reserves the node's whole blob ceiling, because a blob's true size is not
+/// known until it has been fetched. So the reserve is a PROXY for the worst-case blob, and
+/// the only question this function answers is what that proxy should be:
+///
+/// - **`0` is the "unlimited" sentinel**, not "a zero-byte ceiling". Every blob-size gate in
+///   the node reads it that way (`max_blob_size_bytes > 0 && …`, five sites), and config
+///   resolution accepts it — it only enforces `max_blob_size_mb < cache_size_mb`. So at `0`
+///   the worst-case blob is UNBOUNDED, and the honest proxy for an unbounded blob is the
+///   whole pool: one warm at a time (#1145 review).
+///
+///   This used to clamp to a 1 MiB FLOOR instead, on the reasoning that "a zero ceiling must
+///   not make warms free and unbounded" — which inverted the guard at the one value it
+///   named. A 1 MiB reserve against a 2 GiB pool admits 2048 concurrent warms, each
+///   buffering an arbitrarily large blob into memory for up to `BACKGROUND_FILL_HARD_CAP`.
+///   The byte-based pool was then strictly WORSE than the fixed task-count ceiling it
+///   replaced.
+/// - a ceiling of [`MAX_BACKGROUND_FILL_MB`], so an operator who sets a blob ceiling larger
+///   than the whole pool gets ONE warm at a time rather than none. Without it the
+///   reservation could never be granted — a semaphore cannot hand out more permits than it
+///   holds — and every warm would shed forever, silently disabling the feature.
+///
+/// The two land in the same place, which is the tell that it is the right answer: an
+/// unlimited ceiling IS a ceiling larger than the pool.
+fn warm_budget_mb(max_blob_size_mb: u64) -> (u32, u32) {
+    let pool = u32::try_from(MAX_BACKGROUND_FILL_MB).unwrap_or(u32::MAX);
+    let reserve = if max_blob_size_mb == 0 {
+        MAX_BACKGROUND_FILL_MB
+    } else {
+        max_blob_size_mb.min(MAX_BACKGROUND_FILL_MB)
+    };
+    (pool, u32::try_from(reserve).unwrap_or(u32::MAX))
+}
+
+/// Is this populate error a routine MISS rather than a fault (#1145 review)?
+///
+/// The distinction the warm counters used to lack. A warm that finds no provider, or has no
+/// origin configured, has done nothing wrong and there is nothing to fix. A warm that failed
+/// because the store is corrupt, the disk is full, or an upstream served bytes that do not
+/// verify is an operator's problem. Folding the two into one counter — as
+/// `node_pull_through_background_failed` did — meant no threshold on it could distinguish
+/// them, so it could never fire *for* the emergency it would need to signal.
+///
+/// Exhaustive on purpose: a new `CacheError` must break this build and be classified, rather
+/// than silently inheriting "fault" (noisy) or "miss" (a swallowed emergency).
+const fn is_clean_miss(err: &CacheError) -> bool {
+    match err {
+        // Nothing to warm. The blob is not out there, or we have nowhere to look.
+        CacheError::NotFound { .. } | CacheError::NoOrigin { .. } => true,
+        // Every one of these is a fault someone must act on: a corrupt or full store, an
+        // upstream serving bytes that do not verify, a blob over our ceiling, a broken
+        // origin, or an eviction sweep that could not free space.
+        CacheError::Store(_)
+        | CacheError::HashMismatch { .. }
+        | CacheError::VerifyFailed { .. }
+        | CacheError::BlobTooLarge { .. }
+        | CacheError::OriginError { .. }
+        | CacheError::EvictionLimitExceeded { .. } => false,
+    }
+}
+
+/// How a background warm ended. Every variant is a TERMINAL outcome, so exactly one is
+/// recorded per spawn and the books balance:
+/// `spawned == succeeded + missed + failed + cancelled + panicked`.
+#[derive(Clone, Copy, Debug)]
+enum WarmVerdict {
+    Succeeded,
+    /// Routine: nothing to warm (see [`is_clean_miss`]).
+    Missed,
+    /// A fault an operator must act on.
+    Failed,
+    Cancelled,
+}
+
+/// Meters a background warm's outcome — including the one outcome the task itself cannot
+/// report (#1145 review).
+///
+/// The warm is `tokio::spawn`ed and its `JoinHandle` dropped on the spot, so nothing awaits
+/// it. A panic inside `cache.populate`, the tee, or the decoder therefore reaches *nobody*:
+/// no counter moves, nothing is logged, and `spawned` sits permanently one above the sum of
+/// its outcomes — a gap that reads like an in-flight warm rather than a crash.
+///
+/// `Drop` runs on the unwind, which makes it the only thing that can still see it. The same
+/// hole was already fixed for the detached channel-open task, which got a supervisor for
+/// exactly this reason; the warm task has no caller at all, so it is strictly worse off, and
+/// it got nothing.
+struct WarmOutcome<'a> {
+    hash: Hash,
+    metrics: &'a Metrics,
+    recorded: bool,
+}
+
+impl<'a> WarmOutcome<'a> {
+    const fn new(hash: Hash, metrics: &'a Metrics) -> Self {
+        Self {
+            hash,
+            metrics,
+            recorded: false,
+        }
+    }
+
+    fn record(&mut self, verdict: WarmVerdict) {
+        self.recorded = true;
+        match verdict {
+            WarmVerdict::Succeeded => self.metrics.node_pull_through_background_succeeded(),
+            WarmVerdict::Missed => self.metrics.node_pull_through_background_missed(),
+            WarmVerdict::Failed => self.metrics.node_pull_through_background_failed(),
+            WarmVerdict::Cancelled => self.metrics.node_pull_through_background_cancelled(),
+        }
+    }
+}
+
+impl Drop for WarmOutcome<'_> {
+    fn drop(&mut self) {
+        if self.recorded {
+            return;
+        }
+        // A verdict was never recorded — two very different reasons, told apart by
+        // `thread::panicking()`: a real panic unwinds THROUGH this Drop (so it is true), whereas
+        // a task dropped UNPOLLED at runtime teardown does not (#1145 review). Conflating them
+        // fired a false `error!("PANICKED")` on every clean shutdown against a counter whose
+        // doc says any non-zero value is a bug.
+        if std::thread::panicking() {
+            // Nothing awaits the warm's `JoinHandle`, so this counter is the panic's only trace.
+            self.metrics.node_pull_through_background_panicked();
+            tracing::error!(
+                hash = %self.hash,
+                "background cache-fill PANICKED; nothing awaits this task, so this counter is \
+                 the only trace it leaves"
+            );
+        } else {
+            // Cancelled / dropped unpolled at shutdown — expected, not a crash.
+            self.metrics.node_pull_through_background_cancelled();
+        }
+    }
+}
+
+/// Run `fut` under an optional wall-clock deadline, keeping the `Result<_,
+/// Elapsed>` shape of [`tokio::time::timeout`] so callers branch identically
+/// whether or not a cap is set. `None` never elapses.
+async fn with_optional_deadline<F: std::future::Future>(
+    deadline: Option<Duration>,
+    fut: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    match deadline {
+        Some(d) => tokio::time::timeout(d, fut).await,
+        None => Ok(fut.await),
+    }
+}
+
 /// Server-side classification of a `serve_stream` refusal, used to pick the
 /// per-reason reject counter (#876). Finer-grained than the wire `StreamError`:
 /// `CacheMiss`, `UnknownChannel`, and `OwnerMismatch` all ship as `NotFound` on
@@ -203,6 +441,13 @@ impl ServeRejectReason {
     /// finer split survives only in the per-reason metric (#876). Keeping the
     /// mapping on the type makes an inconsistent error/reason pairing
     /// unrepresentable at the call sites.
+    ///
+    /// The requester side of this mapping is `decdn_client_pull::UpstreamRefused`,
+    /// which recovers the wire code — and ONLY the wire code — from a refusal
+    /// (#1144). So the `NotFound` collapse is what a requester sees for all seven
+    /// reasons below, and the reputation consequences it draws must hold for the
+    /// weakest of them. They do: it scores `NotFound` as no fault at all, and only
+    /// `InternalError` as a degraded peer.
     const fn wire_error(self) -> StreamError {
         match self {
             // `InsufficientDeposit` collapses to `NotFound` alongside the other
@@ -216,10 +461,10 @@ impl ServeRejectReason {
             // `RangeNotSatisfiable` collapses to `NotFound` alongside the other
             // "won't serve this" reasons: an out-of-bounds bounded range is a
             // client error, but signalling it as `NotFound` (rather than
-            // `InternalError`) keeps it reputation-benign — the requester folds
-            // a node fault into the node's score, and a client's own malformed
-            // range must not penalise the node. The distinction survives in the
-            // per-reason metric.
+            // `InternalError`) keeps it reputation-benign — a requester scores
+            // `InternalError` as a degraded peer (#1144), and a client's own
+            // malformed range must not penalise the node for it. The distinction
+            // survives in the per-reason metric.
             Self::CacheMiss
             | Self::UnknownChannel
             | Self::OwnerMismatch
@@ -571,13 +816,36 @@ impl ClientHandler {
     /// Attach background cache-fill (#859). Called once during runtime wiring
     /// when pull-through is enabled; a second call is ignored. After this, a
     /// foreground pull-through deadline additionally spawns a detached task
-    /// (cancelled via `cancel` on shutdown, bounded by `budget`) to keep warming
-    /// the cache from a slow upstream for future requests.
-    pub fn attach_background_fill(&self, cancel: CancellationToken, budget: Duration) {
+    /// (cancelled via `cancel` on shutdown) to keep warming the cache from a slow
+    /// upstream for future requests.
+    ///
+    /// `budget` is an OPTIONAL overall wall-clock cap. The runtime passes
+    /// `Some(`[`BACKGROUND_FILL_HARD_CAP`]`)`; `None` (tests only) runs to completion.
+    ///
+    /// The cap must be far LARGER than the foreground deadline, not equal to it: the
+    /// warm re-pulls from scratch, so capping it at the budget the foreground just
+    /// exhausted means a blob too large to fetch in one deadline can never be warmed
+    /// either (#1134). But it cannot be absent — inactivity is not liveness, and a peer
+    /// trickling one byte per stall-window would keep a warm alive forever. See
+    /// [`BACKGROUND_FILL_HARD_CAP`] for the sizing argument.
+    ///
+    /// `max_blob_size_mb` is the node's blob ceiling — what each warm reserves from the
+    /// [`MAX_BACKGROUND_FILL_MB`] memory pool, since a blob's size is not known until it
+    /// has been fetched. It is clamped to the pool, so an operator who raises
+    /// `max_blob_size_mb` above the pool gets one warm at a time rather than none.
+    pub fn attach_background_fill(
+        &self,
+        cancel: CancellationToken,
+        budget: Option<Duration>,
+        max_blob_size_mb: u64,
+    ) {
+        let (pool_mb, reserve_mb) = warm_budget_mb(max_blob_size_mb);
         let _ = self.background_fill.set(BackgroundFill {
             cancel,
             budget,
             inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            slots: Arc::new(tokio::sync::Semaphore::new(pool_mb as usize)),
+            reserve_mb,
         });
     }
 
@@ -611,11 +879,13 @@ impl ClientHandler {
         let _ = self.pull_origin_gate.set(dir);
     }
 
-    /// Spawn a detached background cache-fill for `hash` (#859), unless one is
-    /// already running for it or the feature is unattached. The foreground
-    /// delivery path has already given up; this re-pulls from scratch on a fresh
-    /// budget so a slow-but-available upstream still warms the cache. Best-effort
-    /// — never blocks the caller and never affects the foreground result.
+    /// Spawn a detached background cache-fill for `hash` (#859), unless one is already
+    /// running for it, every warm slot is busy, or the feature is unattached. The
+    /// foreground delivery path has already given up; this re-pulls from scratch under
+    /// a far larger budget than the foreground had ([`BACKGROUND_FILL_HARD_CAP`]), so a
+    /// slow-but-available upstream still warms the cache, however large the blob.
+    /// Best-effort: never blocks the caller and never affects the foreground result.
+    #[allow(clippy::too_many_lines)] // one linear spawn, every arm carrying its own rationale
     fn maybe_spawn_background_fill(&self, hash: Hash) {
         let Some(bg) = self.background_fill.get() else {
             return;
@@ -625,34 +895,71 @@ impl ClientHandler {
         let Some(guard) = arm_background_fill(&bg.inflight, hash) else {
             return;
         };
+        // Memory ceiling across distinct hashes: reserve this warm's worst-case blob
+        // footprint up front ([`MAX_BACKGROUND_FILL_MB`]). Taken AFTER the dedup claim so
+        // a repeat miss on an already-warming hash never consumes budget — and dropped
+        // with `guard` if we shed, so the hash stays unclaimed and a later miss retries.
+        let Ok(permit) = Arc::clone(&bg.slots).try_acquire_many_owned(bg.reserve_mb) else {
+            self.metrics.node_pull_through_background_shed();
+            tracing::debug!(
+                %hash,
+                reserve_mb = bg.reserve_mb,
+                pool_mb = MAX_BACKGROUND_FILL_MB,
+                "background cache-fill shed: no room in the warm memory budget"
+            );
+            return;
+        };
         let cache = self.cache.clone();
         let metrics = Arc::clone(&self.metrics);
         let cancel = bg.cancel.clone();
         let budget = bg.budget;
         self.metrics.node_pull_through_background_spawned();
         tokio::spawn(async move {
-            // Dropped on task exit (any branch), clearing the inflight entry.
+            // All three dropped on task exit (any branch, INCLUDING a panic): the guard
+            // clears the inflight entry, the permit returns the warm slot, and the outcome
+            // guard meters the one case no arm below can — a panic (#1145 review).
             let _guard = guard;
+            let _permit = permit;
+            // Nothing awaits this task's `JoinHandle` — it is spawned and forgotten — so a
+            // panic inside `cache.populate`, the tee, or the decoder reaches nobody: no
+            // counter, no log, and `spawned` is permanently one ahead of its outcomes. The
+            // gap then reads as an in-flight warm rather than a crash. `Drop` runs on the
+            // unwind, so a guard is the one thing that can still see it.
+            let mut outcome = WarmOutcome::new(hash, &metrics);
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
+                    outcome.record(WarmVerdict::Cancelled);
                     tracing::debug!(%hash, "background cache-fill cancelled on shutdown");
                 }
-                result = tokio::time::timeout(budget, cache.populate(hash)) => match result {
+                result = with_optional_deadline(budget, cache.populate(hash)) => match result {
                     Ok(Ok(())) => {
-                        metrics.node_pull_through_background_succeeded();
+                        outcome.record(WarmVerdict::Succeeded);
                         tracing::debug!(%hash, "background cache-fill populated blob");
                     }
+                    // A CLEAN MISS is not a fault, and folding the two together meant this
+                    // counter could never fire for the emergency it would need to signal
+                    // (#1145 review). A warm that finds no provider is routine and expected;
+                    // a warm that failed because the store is corrupt or the disk is full is
+                    // an operator's problem. Both used to increment the same counter and both
+                    // logged at `debug!` — below the project's default `RUST_LOG=info` — so
+                    // there was no threshold on it anyone could alert on.
+                    Ok(Err(e)) if is_clean_miss(&e) => {
+                        outcome.record(WarmVerdict::Missed);
+                        tracing::debug!(%hash, error = %e, "background cache-fill found nothing to warm");
+                    }
                     Ok(Err(e)) => {
-                        // Covers every populate error (clean miss, no origin, AND
-                        // store/I/O fault), so the message stays neutral; the
-                        // cause rides in `error`.
-                        metrics.node_pull_through_background_failed();
-                        tracing::debug!(%hash, error = %e, "background cache-fill did not complete");
+                        outcome.record(WarmVerdict::Failed);
+                        tracing::warn!(%hash, error = %e, "background cache-fill FAILED; this is a fault, not a miss");
                     }
                     Err(_) => {
-                        metrics.node_pull_through_background_failed();
-                        tracing::debug!(%hash, ?budget, "background cache-fill timed out");
+                        // `warn!`, not `debug!`: this fires only at the absolute
+                        // backstop, which an honest transfer cannot reach. Hitting it
+                        // means an upstream trickled bytes for an hour without
+                        // finishing — a pathological peer, or a badly mis-sized
+                        // `max_blob_size_mb`. Either way the operator wants to know.
+                        outcome.record(WarmVerdict::Failed);
+                        tracing::warn!(%hash, ?budget, "background cache-fill hit its absolute cap; abandoning");
                     }
                 },
             }
@@ -1870,13 +2177,22 @@ impl ClientHandler {
                             self.metrics.node_pull_through_local_tee_failed();
                             return Err(anyhow::anyhow!("cache tee write failed: {e}"));
                         }
+                        // Relayed verbatim from a frame the upstream receive loop already
+                        // decoded, so it is non-empty and within `CHUNK_SIZE` — but this
+                        // path re-frames it rather than forwarding the value, so it must
+                        // re-establish that rather than assume it. `ChunkData::new` is the
+                        // gate; a zero-length relay is a bug here, not something to emit.
+                        let frame = match ChunkData::new(chunk.to_vec()) {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                self.abandon_window_serve(pull, tee);
+                                return Err(anyhow::anyhow!(
+                                    "refusing to relay an invalid chunk downstream: {e}"
+                                ));
+                            }
+                        };
                         if let Err(e) = self
-                            .write_message(
-                                send,
-                                &ClientMessage::ChunkData(ChunkData {
-                                    bytes: chunk.to_vec(),
-                                }),
-                            )
+                            .write_message(send, &ClientMessage::ChunkData(frame))
                             .await
                         {
                             // Downstream dropped mid-pull (the #856 shape): stop
@@ -2141,14 +2457,15 @@ impl ClientHandler {
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES);
         let mut unvouchered: u64 = 0;
 
+        // `slice::chunks` yields no items for an empty slice and never a zero-length
+        // chunk, so `ChunkData::new` cannot reject one here — the empty blob goes
+        // straight to `StreamEnd` (#1054). The `?` is the type carrying the invariant,
+        // not a live failure mode.
         for chunk in data.chunks(decdn_protocol::CHUNK_SIZE) {
-            self.write_message(
-                send,
-                &ClientMessage::ChunkData(ChunkData {
-                    bytes: chunk.to_vec(),
-                }),
-            )
-            .await?;
+            let frame = ChunkData::new(chunk.to_vec())
+                .map_err(|e| anyhow::anyhow!("refusing to serve an invalid chunk: {e}"))?;
+            self.write_message(send, &ClientMessage::ChunkData(frame))
+                .await?;
             unvouchered = unvouchered.saturating_add(chunk.len() as u64);
             if unvouchered >= interval_bytes {
                 match self
@@ -2773,12 +3090,23 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
         }
         Ok((_, _)) => Err(StreamReadError {
             err: anyhow::anyhow!("expected StreamRequest or CooperativeCloseRequest"),
-            app_code: 0x01, // UNSUPPORTED_MESSAGE
+            app_code: APP_ERR_UNSUPPORTED_MESSAGE,
         }),
-        Err(e) => Err(StreamReadError {
-            err: anyhow::anyhow!("stream request decode failed: {e}"),
-            app_code: APP_ERR_MALFORMED_MESSAGE,
-        }),
+        Err(e) => {
+            // ADR 013: an unknown enum discriminant closes with
+            // UNSUPPORTED_MESSAGE (0x01), not MALFORMED_MESSAGE (0x03). A
+            // genuine parse fault (in-range discriminant, bad payload) stays
+            // MALFORMED.
+            let app_code = if is_unknown_variant::<ClientMessage>(&frame) {
+                APP_ERR_UNSUPPORTED_MESSAGE
+            } else {
+                APP_ERR_MALFORMED_MESSAGE
+            };
+            Err(StreamReadError {
+                err: anyhow::anyhow!("stream request decode failed: {e}"),
+                app_code,
+            })
+        }
     }
 }
 
@@ -2796,6 +3124,7 @@ async fn read_voucher(recv: &mut RecvStream) -> anyhow::Result<decdn_protocol::c
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -2829,6 +3158,341 @@ mod tests {
             "the hash re-arms once its guard releases"
         );
         drop(other_guard);
+    }
+
+    /// The warm memory budget is denominated in BYTES, not tasks (#1145 review).
+    ///
+    /// A task-count ceiling bounds the wrong quantity: what a warm costs is its blob, and
+    /// a blob is bounded only by `max_blob_size_mb`. Eight concurrent warms of near-max
+    /// (1 GiB) blobs is ~8 GiB resident for up to `BACKGROUND_FILL_HARD_CAP` — an hour —
+    /// while eight concurrent warms of 4 KiB blobs cost nothing and were throttled just as
+    /// hard.
+    ///
+    /// Each warm reserves `max_blob_size_mb` MiB up front, since a blob's true size is not
+    /// known until it has been fetched. So the concurrency a node actually gets is
+    /// `MAX_BACKGROUND_FILL_MB / max_blob_size_mb` — many for small blobs, few for large.
+    /// Concurrency a node actually gets under the real sizing function: pool ÷ reservation.
+    fn concurrent_warms(max_blob_size_mb: u64) -> u32 {
+        let (pool_mb, reserve_mb) = warm_budget_mb(max_blob_size_mb);
+        pool_mb / reserve_mb
+    }
+
+    /// The warm memory budget is denominated in BYTES, not tasks (#1145 review).
+    ///
+    /// A task-count ceiling bounds the wrong quantity: what a warm costs is its blob, and a
+    /// blob is bounded only by `max_blob_size_mb`. The old fixed ceiling of 8 meant eight
+    /// concurrent warms of near-max (1 GiB) blobs — ~8 GiB resident for up to
+    /// `BACKGROUND_FILL_HARD_CAP`, an hour — while eight concurrent warms of 4 MiB blobs
+    /// cost 32 MiB and were throttled exactly as hard.
+    ///
+    /// Asserted on `warm_budget_mb`, the real function `attach_background_fill` calls. (An
+    /// earlier draft of this test stood up its own semaphore and reserved from it, which
+    /// proves only that tokio's semaphore works — the same "assert against a copy of the
+    /// logic" mistake this review round exists to remove.)
+    #[test]
+    fn the_warm_budget_admits_by_bytes_not_by_task_count() {
+        // A node serving 1 GiB blobs: each warm reserves the whole ceiling, so two fit the
+        // 2 GiB pool and the third sheds. Memory in flight is bounded, by construction.
+        assert_eq!(warm_budget_mb(1024), (2048, 1024));
+        assert_eq!(concurrent_warms(1024), 2);
+
+        // A node serving 4 MiB blobs runs 512 at once — the count-based ceiling stopped it
+        // at 8, for no memory reason at all.
+        assert_eq!(concurrent_warms(4), 512);
+        assert!(
+            concurrent_warms(4) > 8,
+            "small-blob nodes must not inherit the old fixed task-count ceiling"
+        );
+
+        // Whatever the ceiling, the memory in flight never exceeds the pool.
+        for ceiling in [1u64, 4, 64, 512, 1024, 2048] {
+            let (pool_mb, reserve_mb) = warm_budget_mb(ceiling);
+            assert!(
+                concurrent_warms(ceiling) * reserve_mb <= pool_mb,
+                "ceiling {ceiling} MiB admits more warms than the pool can hold"
+            );
+        }
+    }
+
+    /// Both ends of `warm_budget_mb`, each of which silently disables the feature if dropped.
+    ///
+    /// The zero case is asserted on the PROPERTY — how many warms it admits — and not on the
+    /// mechanism, because the version this replaces pinned the mechanism and mistook it for
+    /// the property (#1145 review). It asserted `warm_budget_mb(0).1 == 1` under the comment
+    /// "a zero ceiling must not make warms free and unbounded", which is exactly backwards:
+    /// `0` is the UNLIMITED sentinel, so reserving 1 MiB for an unbounded blob is what makes
+    /// warms free and unbounded. The assertion passed while the property it named was false,
+    /// and 2048 concurrent warms of arbitrarily large blobs were admitted at that setting.
+    #[test]
+    fn the_warm_reservation_is_bounded_at_both_ends() {
+        // Above the pool: the reservation is capped, so ONE warm still runs. Uncapped, the
+        // reservation could never be granted — a semaphore cannot hand out more permits
+        // than it holds — and every warm would shed forever, with the feature looking
+        // configured and doing nothing.
+        let (pool_mb, reserve_mb) = warm_budget_mb(MAX_BACKGROUND_FILL_MB * 4);
+        assert_eq!(reserve_mb, pool_mb, "capped at the pool");
+        assert_eq!(concurrent_warms(MAX_BACKGROUND_FILL_MB * 4), 1);
+
+        // Unlimited (`0`): the worst-case blob is unbounded, so exactly one warm may run —
+        // the same answer as a ceiling above the pool, because that is the same situation.
+        assert_eq!(
+            concurrent_warms(0),
+            1,
+            "an unlimited blob ceiling must admit ONE warm at a time: the reserve is a proxy \
+             for the worst-case blob, and here that blob is unbounded. Reserving anything \
+             smaller lets N warms each buffer an arbitrarily large blob into memory."
+        );
+        let (pool_mb, reserve_mb) = warm_budget_mb(0);
+        assert_eq!(
+            reserve_mb, pool_mb,
+            "an unlimited ceiling IS a ceiling larger than the pool, and must reserve like one"
+        );
+    }
+
+    /// `BACKGROUND_FILL_HARD_CAP` is a leak guard, and the guard has to actually fire: an
+    /// upstream trickling one byte per stall window never trips the inactivity bound, and
+    /// because the warm's `inflight` claim is held for the task's life, a warm that never
+    /// ends means that blob can never be warmed again for the life of the process.
+    ///
+    /// `with_optional_deadline` is the seam. `None` (tests) runs to completion; `Some`
+    /// terminates a future that otherwise never would.
+    #[tokio::test]
+    async fn a_background_warm_cannot_outlive_its_cap() {
+        let capped = with_optional_deadline(
+            Some(Duration::from_millis(20)),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(
+            capped.is_err(),
+            "a warm that never completes must be abandoned at its cap — inactivity is not \
+             liveness, and an uncapped warm poisons its hash for the life of the process"
+        );
+
+        let uncapped = with_optional_deadline(None, std::future::ready(7u8)).await;
+        assert_eq!(uncapped.ok(), Some(7), "no cap: the future runs to its end");
+    }
+
+    /// An origin whose fetch NEVER returns, so a warm launched against it holds its memory
+    /// reservation for as long as the test needs it to.
+    ///
+    /// Required to make the shed observable at all: with any completing origin the first
+    /// warm finishes and hands its permit back, and the second one then always fits.
+    #[derive(Debug)]
+    struct HangingOrigin;
+
+    impl decdn_cache::Origin for HangingOrigin {
+        fn fetch(
+            &self,
+            _hash: Hash,
+            _max_bytes: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn kind(&self) -> decdn_cache::OriginKind {
+            decdn_cache::OriginKind::Filesystem
+        }
+    }
+
+    /// Build the smallest `ClientHandler` that can spawn a background warm.
+    async fn handler_for_warm_tests(
+        metrics: &Arc<Metrics>,
+    ) -> (Arc<ClientHandler>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheEngine::open(
+            dir.path(),
+            vec![Arc::new(HangingOrigin) as Arc<dyn decdn_cache::Origin>],
+            16,
+        )
+        .await
+        .expect("cache");
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let handler = ClientHandler::new(
+            iroh::SecretKey::generate().public(),
+            Arc::clone(metrics),
+            Arc::new(ConnectionLimiter::new(
+                &decdn_common::config::ResolvedSecurity {
+                    max_concurrent_handlers: u32::MAX,
+                    per_source_rate_per_sec: 1e9,
+                    per_source_burst: u32::MAX,
+                    max_tracked_sources: 16,
+                },
+                Arc::clone(metrics),
+            )),
+            cache,
+            Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+            domain.clone(),
+            domain.clone(),
+            domain,
+            Arc::new(decdn_incentive::store::MemoryChannelStateStore::new())
+                as Arc<dyn ChannelStateStore>,
+            Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
+                crate::receipt_log::NoopReceiptLog,
+            ))) as Arc<dyn ReceiptSink>,
+            Arc::new(AtomicU64::new(1)),
+            0,
+            u64::MAX,
+            1,
+            0,
+            16,
+        )
+        .expect("handler");
+        (Arc::new(handler), dir)
+    }
+
+    /// The warm memory budget must SHED, not just be computed (#1145 review).
+    ///
+    /// `MAX_BACKGROUND_FILL_MB` is the bound that stops the hour-long warm lifetime from
+    /// being a memory amplifier: 8 concurrent warms × a 1 GiB blob ceiling was up to 8 GiB
+    /// resident, for up to an hour each, and the old ~70 s deadline used to make that
+    /// self-limiting. Three unit tests covered `warm_budget_mb` — the SIZING function — and
+    /// nothing at all covered the code that acts on it. Deleting the whole
+    /// `try_acquire_many_owned` block left the suite green.
+    ///
+    /// So this drives the real `maybe_spawn_background_fill`, against an origin that never
+    /// returns: the first warm therefore HOLDS its reservation, and with a ceiling sized to
+    /// the whole pool there is nothing left for a second. The shed is observed on the real
+    /// counters, and the hash is left unclaimed so a later miss can retry it.
+    #[tokio::test]
+    async fn a_warm_that_cannot_reserve_its_memory_is_shed_rather_than_spawned() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_warm_tests(&metrics).await;
+        // A ceiling at (or above) the pool means each warm reserves the ENTIRE budget, so
+        // exactly one can be in flight. `warm_budget_mb` clamps it, which is what makes an
+        // operator who over-raises `max_blob_size_mb` get one warm rather than none.
+        handler.attach_background_fill(CancellationToken::new(), None, MAX_BACKGROUND_FILL_MB);
+
+        handler.maybe_spawn_background_fill(Hash::new(b"first"));
+        // The first warm is parked in `HangingOrigin::fetch`, holding its reservation. Wait
+        // for it to actually be spawned rather than sleeping on a guess.
+        for _ in 0..200u32 {
+            if metrics
+                .encode()
+                .is_ok_and(|e| e.contains("decdn_node_pull_through_background_spawned_total 1"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // A DIFFERENT hash, so the dedup claim is not what stops it — only the memory budget
+        // can be.
+        handler.maybe_spawn_background_fill(Hash::new(b"second"));
+
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_shed_total 1"),
+            "the second warm must be SHED: the first still holds the whole memory budget. \
+             Without the reservation, an hour-long warm lifetime is a memory amplifier — up \
+             to 8 GiB resident against a 1 GiB blob ceiling. Got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_spawned_total 1"),
+            "a shed warm must never be spawned — `shed` is disjoint from `spawned`, which is \
+             why it is NOT a term in `spawned == succeeded + missed + failed + cancelled + \
+             panicked`. Got:\n{encoded}"
+        );
+    }
+
+    /// A clean MISS is not a fault, and the two must not share a counter (#1145 review).
+    ///
+    /// `node_pull_through_background_failed_total` used to count both, so no threshold on it
+    /// could distinguish "the network does not have this blob" (routine) from "our store is
+    /// corrupt" (an emergency) — and both logged at `debug!`, below the project's default
+    /// `RUST_LOG=info`. There was no alert an operator could write.
+    #[test]
+    fn a_clean_miss_is_not_a_fault() {
+        let hash = Hash::new(b"warm-miss");
+        assert!(
+            is_clean_miss(&CacheError::NotFound { hash }),
+            "no provider had it: routine"
+        );
+        assert!(
+            is_clean_miss(&CacheError::NoOrigin { hash }),
+            "nowhere to look: routine"
+        );
+        assert!(
+            !is_clean_miss(&CacheError::Store(anyhow::anyhow!("disk full"))),
+            "a store fault is an EMERGENCY and must never be filed as a miss — that is what \
+             made the failure counter unalertable"
+        );
+        assert!(
+            !is_clean_miss(&CacheError::VerifyFailed { expected: hash }),
+            "an upstream serving bytes that do not verify is a fault"
+        );
+    }
+
+    /// A warm that PANICS must still be counted — it is the one outcome the task cannot
+    /// report for itself (#1145 review) — but a warm merely DROPPED unpolled at shutdown is
+    /// NOT a panic and must not fire the `PANICKED` error.
+    ///
+    /// Nothing awaits a warm's `JoinHandle`; it is spawned and forgotten. So a panic inside
+    /// `populate`, the tee, or the decoder reached nobody: no counter moved, nothing was
+    /// logged, and `spawned` sat permanently one above the sum of its outcomes — a gap that
+    /// reads like an in-flight warm rather than a crash. `Drop` runs on the unwind, which is
+    /// what makes the guard able to see it. But it also runs on a clean teardown drop, so the
+    /// guard must distinguish the two via `thread::panicking()`, or every restart cries wolf.
+    ///
+    /// Asserted on the REAL `Metrics`, across three cases: a genuine unwind → `panicked`; a
+    /// drop-unpolled (no panic) → `cancelled`, NOT `panicked`; a recorded verdict → neither.
+    #[test]
+    #[allow(clippy::panic, clippy::expect_used)] // deliberately panics to test the unwind path
+    fn a_panicking_warm_is_counted_but_a_dropped_one_is_not() {
+        let hash = Hash::new(b"warm-panic");
+
+        // (1) A GENUINE unwind: the guard is dropped while `thread::panicking()` is true.
+        let metrics = Metrics::new();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic's backtrace
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _outcome = WarmOutcome::new(hash, &metrics);
+            panic!("warm body exploded");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(unwound.is_err(), "the closure must have panicked");
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_panicked_total 1"),
+            "a warm that unwound must be metered as a panic. Got:\n{encoded}"
+        );
+
+        // (2) A DROP WITHOUT A PANIC — a task cancelled/dropped unpolled at teardown. This is
+        // the false-alarm case: it must count `cancelled`, not `panicked`. Fails on revert.
+        let metrics = Metrics::new();
+        drop(WarmOutcome::new(hash, &metrics));
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_panicked_total 0"),
+            "a clean drop must NOT report a panic. Got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_cancelled_total 1"),
+            "a clean drop-unpolled must count as cancelled. Got:\n{encoded}"
+        );
+
+        // (3) A warm that recorded a verdict is neither a panic nor a cancel.
+        let metrics = Metrics::new();
+        let mut outcome = WarmOutcome::new(hash, &metrics);
+        outcome.record(WarmVerdict::Succeeded);
+        drop(outcome);
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_panicked_total 0")
+                && encoded.contains("decdn_node_pull_through_background_cancelled_total 0"),
+            "a warm that recorded a verdict must not also report a panic or a cancel. Got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_succeeded_total 1"),
+            "…and must record the verdict it was given. Got:\n{encoded}"
+        );
     }
 
     // #821: the reactive pull-through authorized-origin gate refuses a pull only

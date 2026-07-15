@@ -12,7 +12,7 @@ use decdn_cache::{CacheEngine, Hash, ProbeHoldOutcome};
 use decdn_incentive::ProbeSlashData;
 use decdn_protocol::{
     ALPN_PROBE, APP_ERR_RATE_LIMITED, FrameError, ProbeMessage, ProbeResponseBody, decode_message,
-    encode_message, message::ProbeResponse, read_frame, write_frame,
+    encode_message, is_unknown_variant, message::ProbeResponse, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Accepting, Connection, RecvStream, SendStream, VarInt};
@@ -677,15 +677,24 @@ async fn read_probe_request(
 
     match decode_message::<ProbeMessage>(&frame) {
         Err(e) => {
-            reset(send, recv, APP_ERR_MALFORMED_MESSAGE);
+            // ADR 013: an unknown enum discriminant is a Tier-2
+            // graceful-evolution signal — close with UNSUPPORTED_MESSAGE
+            // (0x01), not MALFORMED_MESSAGE (0x03). A genuine postcard/varint
+            // parse fault (in-range discriminant, bad payload) stays MALFORMED.
+            let app_code = if is_unknown_variant::<ProbeMessage>(&frame) {
+                APP_ERR_UNSUPPORTED_MESSAGE
+            } else {
+                APP_ERR_MALFORMED_MESSAGE
+            };
+            reset(send, recv, app_code);
             tracing::warn!(
-                app_code = APP_ERR_MALFORMED_MESSAGE,
+                app_code,
                 error = %e,
                 "probe message decode failed"
             );
             Err(ProbeReadError {
                 err: anyhow::anyhow!("probe decode failed: {e}"),
-                app_code: APP_ERR_MALFORMED_MESSAGE,
+                app_code,
             })
         }
         Ok((ProbeMessage::Request(req), _rest)) => Ok(req),

@@ -36,8 +36,8 @@ use decdn_incentive::{
     slash_judge_domain, voucher_domain,
 };
 use decdn_node::client_requester::{
-    ChannelContext, ChannelLedger, Cumulative, UpstreamVoucherRejected, VoucherProgress,
-    sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
+    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, UpstreamVoucherRejected,
+    VoucherProgress, sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
     stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
@@ -387,7 +387,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
         *hash.as_bytes(),
         0,
         0x00c0_ffee,
-        Duration::from_secs(20),
+        PullDeadlines::whole_transfer(Duration::from_secs(20)),
         0,
         &mut progress,
     )
@@ -1701,7 +1701,7 @@ async fn buyer_rejects_oversized_total_bytes() -> anyhow::Result<()> {
         *hash.as_bytes(),
         0,
         0x00c1,
-        Duration::from_secs(10),
+        PullDeadlines::whole_transfer(Duration::from_secs(10)),
         4096,
         &mut progress,
     )
@@ -1750,7 +1750,7 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
         *hash.as_bytes(),
         0,
         0x00c2,
-        Duration::from_secs(10),
+        PullDeadlines::whole_transfer(Duration::from_secs(10)),
         8192,
         &mut progress,
     )
@@ -1802,7 +1802,7 @@ async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
         *hash.as_bytes(),
         0,
         0x00c3,
-        Duration::from_secs(10),
+        PullDeadlines::whole_transfer(Duration::from_secs(10)),
         0, // unlimited buyer ceiling
         &mut progress,
         Some(&record),
@@ -2080,7 +2080,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
             *hash_a.as_bytes(),
             0,
             0x00aa,
-            Duration::from_secs(15),
+            PullDeadlines::whole_transfer(Duration::from_secs(15)),
             0,
         ),
         stream_fetch_shared(
@@ -2093,7 +2093,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
             *hash_b.as_bytes(),
             0,
             0x00bb,
-            Duration::from_secs(15),
+            PullDeadlines::whole_transfer(Duration::from_secs(15)),
             0,
         ),
     );
@@ -2498,8 +2498,9 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
 // deadline was set EQUAL to the per-candidate budget (`node_pull_timeout_sec`),
 // so a pull needing more than one per-candidate budget's wall-clock (e.g.
 // candidate #1 stalls a full budget, then #2 delivers) was cancelled before it
-// could finish. The derived `outer_pull_deadline` (N×per + slack) must
-// accommodate it. A single slow origin taking longer than one per-candidate
+// could finish. The derived `outer_pull_deadline` (N × each candidate's three
+// sequential stages, + slack) must accommodate it. A single slow origin taking
+// longer than one per-candidate
 // budget models that scenario through the real handler — the layer the bug
 // actually lived in (the NodeOrigin-level fallthrough test cannot, since
 // `NodeOrigin::fetch` has no outer wrapper).
@@ -2626,7 +2627,8 @@ async fn pull_through_fills_under_deadline(
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Result<()> {
     let per = Duration::from_secs(1);
-    let slow = Duration::from_millis(1500); // > per, well under outer_pull_deadline(per)
+    let stall = Duration::from_secs(1);
+    let slow = Duration::from_millis(1500); // > per, well under outer_pull_deadline(per, stall)
 
     // Pre-#859 wiring: outer == per_candidate cancels the slow pull → store empty.
     anyhow::ensure!(
@@ -2635,8 +2637,11 @@ async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Resul
     );
     // Fixed wiring: the derived outer deadline accommodates it → store filled.
     anyhow::ensure!(
-        pull_through_fills_under_deadline(decdn_node::selection::outer_pull_deadline(per), slow)
-            .await?,
+        pull_through_fills_under_deadline(
+            decdn_node::selection::outer_pull_deadline(per, stall),
+            slow
+        )
+        .await?,
         "the derived outer deadline must let a pull exceeding one per-candidate budget complete"
     );
     Ok(())

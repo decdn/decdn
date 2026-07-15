@@ -462,9 +462,9 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     function test_lifecycle_CapacityBond_setUnbondingPeriod_outOfBounds() public {
         _runLifecycleExpectExecuteRevert(
             address(bond),
-            abi.encodeCall(CapacityBond.setUnbondingPeriod, (31 days)),
+            abi.encodeCall(CapacityBond.setUnbondingPeriod, (61 days)),
             abi.encodeWithSelector(
-                CapacityBond.ParamOutOfBounds.selector, uint256(31 days), uint256(3 days), uint256(30 days)
+                CapacityBond.ParamOutOfBounds.selector, uint256(61 days), uint256(7 days), uint256(60 days)
             )
         );
     }
@@ -576,21 +576,21 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
 
     function test_lifecycle_ContentBlacklist_addHashGlobal_happy() public {
         bytes32 h = keccak256("bad-content");
-        _runLifecycle(address(blacklist), abi.encodeCall(ContentBlacklist.addHashGlobal, (h)));
+        _runLifecycle(address(blacklist), abi.encodeCall(ContentBlacklist.addHashGlobal, (h, "DMCA-2026-001")));
         assertTrue(blacklist.isHashBlacklisted(h));
     }
 
     function test_lifecycle_ContentBlacklist_addHashGlobal_outOfBounds() public {
         _runLifecycleExpectExecuteRevert(
             address(blacklist),
-            abi.encodeCall(ContentBlacklist.addHashGlobal, (bytes32(0))),
+            abi.encodeCall(ContentBlacklist.addHashGlobal, (bytes32(0), "DMCA-2026-001")),
             abi.encodeWithSelector(ContentBlacklist.ZeroHash.selector)
         );
     }
 
     function test_lifecycle_ContentBlacklist_removeHashGlobal_happy() public {
         bytes32 h = keccak256("removable");
-        _runLifecycle(address(blacklist), abi.encodeCall(ContentBlacklist.addHashGlobal, (h)));
+        _runLifecycle(address(blacklist), abi.encodeCall(ContentBlacklist.addHashGlobal, (h, "DMCA-2026-001")));
         _runLifecycle(address(blacklist), abi.encodeCall(ContentBlacklist.removeHashGlobal, (h)));
         assertFalse(blacklist.isHashBlacklisted(h));
     }

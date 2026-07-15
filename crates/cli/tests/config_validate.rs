@@ -361,6 +361,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             node_to_node_pull_through_enabled: false,
             node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
+            node_pull_stall_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
             pull_ahead_bytes: decdn_cache::Bytes::new(
                 decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
             ),
@@ -395,7 +396,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             subscribe_reputation: true,
             reputation_publish_interval_sec: 3600,
             allowlist: Vec::new(),
-            max_peer_table_entries: 100_000,
+            max_peer_entries: Some(100_000),
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,
@@ -431,6 +432,30 @@ fn summary_includes_prefetch_enabled() -> anyhow::Result<()> {
     anyhow::ensure!(
         out.contains("prefetch_enabled:         true"),
         "prefetch_enabled should reflect the resolved value: {out}"
+    );
+    Ok(())
+}
+
+/// The node→node pull-through summary is gated on the feature being ENABLED, so with the
+/// fixture's default `false` none of it renders and every knob on that line is unexercised
+/// — including `stall_timeout_sec`, added by #1134. A knob an operator cannot see is a knob
+/// they cannot check, and `decdn config validate` is where they look.
+#[test]
+fn summary_reports_the_pull_through_deadlines_when_enabled() -> anyhow::Result<()> {
+    let cfg = sample_resolved(|c| {
+        c.cache.node_to_node_pull_through_enabled = true;
+        c.cache.node_pull_timeout_sec = 25;
+        c.cache.node_pull_stall_timeout_sec = 15;
+    });
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        out.contains("pull_timeout_sec=25"),
+        "the summary must report the resolved stream-open budget: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("stall_timeout_sec=15"),
+        "the summary must report the resolved inactivity budget — it is the primary health \
+         signal, and it is a term of the derived outer deadline: {out}"
     );
     Ok(())
 }

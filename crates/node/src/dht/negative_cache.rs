@@ -132,10 +132,30 @@ impl NegativeProbeCache {
     /// least-recently-used entry on cap overflow. Producer-side hook
     /// for the outbound probe client; the lookup module never calls
     /// this directly.
+    ///
+    /// Uses the cache-wide TTL, which suits an AUTHORITATIVE negative:
+    /// a probe's `has_blob: false` is the peer having just looked. For
+    /// a weaker signal, pass its own TTL — see
+    /// [`Self::record_failure_with_ttl`].
     pub fn record_failure(&self, node_id: NodeId, hash: Hash) {
+        let ttl = self.lock().ttl;
+        self.record_failure_with_ttl(node_id, hash, ttl);
+    }
+
+    /// [`Self::record_failure`] with an explicit TTL, for a negative
+    /// that is weaker than a probe's.
+    ///
+    /// Entries store an absolute expiry, so mixing TTLs is free: a
+    /// short-lived entry simply falls out sooner, and
+    /// [`Self::contains_active`] cannot tell the two apart (nor does it
+    /// need to). The caller owns the judgement of how much its evidence
+    /// is worth — see `node_origin::REFUSAL_SUPPRESSION_TTL`, which is
+    /// far shorter because a delivery refusal, unlike a probe answer,
+    /// may not be about the peer at all.
+    pub fn record_failure_with_ttl(&self, node_id: NodeId, hash: Hash, ttl: Duration) {
         let key = (node_id, hash);
         let mut guard = self.lock();
-        let expiry = Instant::now() + guard.ttl;
+        let expiry = Instant::now() + ttl;
         // `shift_insert` moves an existing key to the new index and
         // updates the value (returning the old) — which is exactly
         // the MRU bump we want on the refresh path.
@@ -210,6 +230,34 @@ mod tests {
         assert!(!c.contains_active(&nid(2), &h(1)));
         assert!(!c.contains_active(&nid(1), &h(2)));
         assert_eq!(c.len(), 1);
+    }
+
+    /// Entries carry their own expiry, so a caller with weaker evidence can suppress a
+    /// (peer, hash) for less time than the cache's default (#1145 review). This is what
+    /// lets an unattributable delivery refusal — a wire `NotFound`, onto which seven
+    /// reject reasons deliberately collapse, three of them ours or transient — cost a peer
+    /// seconds of suppression rather than the five minutes an authoritative probe answer
+    /// earns.
+    #[test]
+    fn a_short_ttl_entry_expires_while_a_default_one_is_still_active() {
+        let c = NegativeProbeCache::new(); // 5-minute default
+        c.record_failure(nid(1), h(1)); // authoritative: the full TTL
+        c.record_failure_with_ttl(nid(2), h(1), Duration::from_millis(30)); // weak evidence
+
+        assert!(c.contains_active(&nid(1), &h(1)));
+        assert!(c.contains_active(&nid(2), &h(1)));
+
+        thread::sleep(Duration::from_millis(60));
+
+        assert!(
+            c.contains_active(&nid(1), &h(1)),
+            "the default-TTL entry must outlive the short one"
+        );
+        assert!(
+            !c.contains_active(&nid(2), &h(1)),
+            "a short-TTL entry must expire on its OWN clock — if it inherited the cache \
+             default, a healthy peer stays blackholed long after the transient cause passed"
+        );
     }
 
     #[test]

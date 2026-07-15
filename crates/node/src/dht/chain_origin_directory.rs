@@ -103,6 +103,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+    backfill_windows,
 };
 use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
@@ -121,9 +122,12 @@ use decdn_incentive::origin_assignment::OriginAssignment::{
 use decdn_incentive::publisher_registry::PublisherRegistry;
 use decdn_incentive::publisher_registry::PublisherRegistry::ContentClaimed;
 
-/// Block-window size for the genesis `ContentClaimed` log replay. Kept well
-/// under the common provider `eth_getLogs` 10k-block cap so bootstrap works on
-/// range-limited RPCs without a per-provider knob.
+/// Block-window size for the genesis `ContentClaimed` log replay, passed as the
+/// `span` to [`backfill_windows`]. Kept well under the common provider
+/// `eth_getLogs` 10k-block cap so bootstrap works on range-limited RPCs without
+/// a per-provider knob. This is a *deliberate* override of the shared
+/// [`MAX_BACKFILL_BLOCK_SPAN`] (10k), not drift — the extra 1k of margin is the
+/// point; don't "fix" the divergence by unifying the constant.
 const REPLAY_WINDOW_BLOCKS: u64 = 9_000;
 
 /// The default-open allow-list lives at namespace 0 (ADR 022 § FIND\_VALUE
@@ -648,9 +652,7 @@ where
         .get_block_number()
         .await
         .context("get_block_number for ContentClaimed replay")?;
-    let mut from = replay_from_block;
-    while from <= latest {
-        let to = from.saturating_add(REPLAY_WINDOW_BLOCKS - 1).min(latest);
+    for (from, to) in backfill_windows(replay_from_block, latest, REPLAY_WINDOW_BLOCKS) {
         let logs = contracts
             .publisher
             .ContentClaimed_filter()
@@ -666,7 +668,6 @@ where
                 .or_default()
                 .insert(event.namespaceId);
         }
-        from = to.saturating_add(1);
     }
 
     // 2. namespace → operators, via getOrigins point reads (authoritative

@@ -18,6 +18,11 @@ pub trait GossipMetrics: Send + Sync + 'static {
     fn set_peer_table_size(&self, n: i64);
     /// Called each time a subscriber successfully reconnects after a stream drop.
     fn inc_reconnected(&self, topic: &str);
+    /// Called once per TTL sweep that evicted at least one entry, with the
+    /// number of entries the sweeper removed. Backs the unlabeled
+    /// `decdn_peer_table_evicted_ttl_total` counter
+    /// (appendix-peer-table-eviction § Observability).
+    fn add_evicted_ttl(&self, n: u64);
 }
 
 /// A no-op implementation convenient for tests.
@@ -30,4 +35,5 @@ impl GossipMetrics for NoopMetrics {
     fn inc_rejected(&self, _reason: &'static str) {}
     fn set_peer_table_size(&self, _n: i64) {}
     fn inc_reconnected(&self, _topic: &str) {}
+    fn add_evicted_ttl(&self, _n: u64) {}
 }
