@@ -39,7 +39,7 @@ Three layers, with the first as the primary mechanism:
 
 1. **Local in-process dispute monitor** ([ADR 003](003-payments.md#adr-003-payment-model) Option C). A lightweight thread in the node binary that watches the chain for `ChannelCloseInitiated` events on its channels and auto-submits the latest voucher. Handles the common online case.
 2. **Operator-arranged redundancy.** Multi-instance node deployments sharing voucher state, hot-standby relays, or peer agreements to hold latest vouchers. The protocol defines no wire format for this; it is node-operations responsibility, like running redundant origin backends.
-3. **Dispute window** (48h PoC default, governable 12h–72h per [ADR 009](009-governance.md#adr-009-governance-model)). The time budget for layers 1 and 2 to respond. The forced-inclusion deadline extension in the payment-channel contract preserves an effective response window even under L2 sequencer censorship — see [ADR 003](003-payments.md#adr-003-payment-model).
+3. **Dispute window** (48h PoC default, governable 48h–72h per [ADR 009](009-governance.md#adr-009-governance-model)). The time budget for layers 1 and 2 to respond. The baseline window sits above the L2 force-inclusion delay, preserving an effective response window even under L2 sequencer censorship — see [ADR 003](003-payments.md#adr-003-payment-model).
 
 ## Privacy
 
@@ -51,6 +51,6 @@ A protocol decision establishes a participant role with a defined wire interface
 
 ## Cross-ADR Impact
 
-- [ADR 003 — Payments](003-payments.md#adr-003-payment-model) — `closeChannel` / `disputeChannel` flow, dispute window, local-monitor Option C, forced-inclusion deadline extension
+- [ADR 003 — Payments](003-payments.md#adr-003-payment-model) — `closeChannel` / `disputeChannel` flow, dispute window, local-monitor Option C
 - [ADR 014 — On-chain Verification](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) — `SlashJudge` challenge-bond mechanism (Bond Handling) for the three signature-dependent offenses
 - [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target) — gas-cost context for detector economics

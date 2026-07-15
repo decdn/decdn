@@ -147,42 +147,6 @@ contract MockERC1271Wallet {
     }
 }
 
-/// @notice Subclass exposing the forced-inclusion seam so the deadline-extension
-///         branch (ADR 003 § L2 sequencer censorship) is testable.
-contract ForcedInclusionHarness is PaymentChannel {
-    bool public forced;
-
-    constructor(
-        IERC20 usdc_,
-        ICapacityBondActivity capacityBond_,
-        address feeRouter_,
-        uint256 disputeWindow_,
-        uint256 maxChannelDuration_,
-        uint256 deliveryFloor_,
-        uint256 deliveryCeiling_,
-        address admin
-    )
-        PaymentChannel(
-            usdc_,
-            capacityBond_,
-            feeRouter_,
-            disputeWindow_,
-            maxChannelDuration_,
-            deliveryFloor_,
-            deliveryCeiling_,
-            admin
-        )
-    { }
-
-    function setForced(bool f) external {
-        forced = f;
-    }
-
-    function _arrivedViaForcedInclusion() internal view override returns (bool) {
-        return forced;
-    }
-}
-
 contract PaymentChannelTest is Test {
     MockUSDC internal usdc;
     MockActiveBond internal bond;
@@ -352,16 +316,6 @@ contract PaymentChannelTest is Test {
     function _openKeyed() internal returns (bytes32 channelId) {
         vm.prank(client);
         channelId = channel.openChannel(keyedProvider, DEPOSIT);
-    }
-
-    /// @dev Deploy a forced-inclusion harness and fund/approve the client against it.
-    function _newForcedHarness() internal returns (ForcedInclusionHarness h) {
-        h = new ForcedInclusionHarness(
-            usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin
-        );
-        usdc.transfer(client, 10_000e6);
-        vm.prank(client);
-        usdc.approve(address(h), type(uint256).max);
     }
 
     // -----------------------------------------------------------------
@@ -742,37 +696,6 @@ contract PaymentChannelTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Forced-inclusion deadline extension
-    // -----------------------------------------------------------------
-
-    function test_forcedInclusion_extendsDeadlineOnce() public {
-        ForcedInclusionHarness h = new ForcedInclusionHarness(
-            usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin
-        );
-        usdc.transfer(client, 10_000e6);
-        vm.prank(client);
-        usdc.approve(address(h), type(uint256).max);
-
-        vm.prank(client);
-        bytes32 id = h.openChannel(provider, DEPOSIT);
-
-        bytes memory sig1 = _signFor(address(h), id, 100e6, 1, 1_000_000);
-        vm.prank(client);
-        h.closeChannel(id, 100e6, 1, 1_000_000, sig1);
-
-        // Warp to within 24h of the deadline, then a forced-inclusion dispute.
-        vm.warp(block.timestamp + DISPUTE_WINDOW - 1 hours);
-        h.setForced(true);
-        bytes memory sig2 = _signFor(address(h), id, 200e6, 2, 2_000_000);
-        vm.prank(stranger);
-        h.disputeChannel(id, 200e6, 2, 2_000_000, sig2);
-
-        PaymentChannel.Channel memory ch = h.getChannel(id);
-        assertTrue(ch.extended);
-        assertEq(uint256(ch.disputeDeadline), block.timestamp + 24 hours);
-    }
-
-    // -----------------------------------------------------------------
     // Governance setters
     // -----------------------------------------------------------------
 
@@ -832,13 +755,13 @@ contract PaymentChannelTest is Test {
         vm.prank(admin);
         vm.expectRevert(
             abi.encodeWithSelector(
-                PaymentChannel.ParamOutOfBounds.selector, uint256(1 hours), uint256(12 hours), uint256(72 hours)
+                PaymentChannel.ParamOutOfBounds.selector, uint256(1 hours), uint256(48 hours), uint256(72 hours)
             )
         );
         channel.setDisputeWindow(1 hours);
         vm.prank(admin);
-        channel.setDisputeWindow(24 hours);
-        assertEq(channel.disputeWindow(), 24 hours);
+        channel.setDisputeWindow(60 hours);
+        assertEq(channel.disputeWindow(), 60 hours);
     }
 
     function test_setters_onlyGovernance() public {
@@ -1653,7 +1576,7 @@ contract PaymentChannelTest is Test {
     function test_constructor_revertsOnDisputeWindowOutOfBounds() public {
         vm.expectRevert(
             abi.encodeWithSelector(
-                PaymentChannel.ParamOutOfBounds.selector, uint256(1 hours), uint256(12 hours), uint256(72 hours)
+                PaymentChannel.ParamOutOfBounds.selector, uint256(1 hours), uint256(48 hours), uint256(72 hours)
             )
         );
         new PaymentChannel(usdc, bond, address(router), 1 hours, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin);
@@ -1690,60 +1613,22 @@ contract PaymentChannelTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Forced-inclusion extension: negative branches
+    // disputeChannel: deadline is fixed for the window
     // -----------------------------------------------------------------
 
-    function test_forcedInclusion_doesNotExtendTwice() public {
-        ForcedInclusionHarness h = _newForcedHarness();
-        vm.prank(client);
-        bytes32 id = h.openChannel(provider, DEPOSIT);
-        vm.prank(client);
-        h.closeChannel(id, 100e6, 1, 1_000_000, _signFor(address(h), id, 100e6, 1, 1_000_000));
-
-        // First forced-inclusion dispute near the deadline → extends once.
-        vm.warp(block.timestamp + DISPUTE_WINDOW - 1 hours);
-        h.setForced(true);
-        vm.prank(stranger);
-        h.disputeChannel(id, 200e6, 2, 2_000_000, _signFor(address(h), id, 200e6, 2, 2_000_000));
-        assertTrue(h.getChannel(id).extended);
-        uint64 deadlineAfterFirst = h.getChannel(id).disputeDeadline;
-
-        // Second forced-inclusion dispute must NOT extend again.
-        vm.warp(block.timestamp + 1 hours);
-        vm.prank(stranger);
-        h.disputeChannel(id, 300e6, 3, 3_000_000, _signFor(address(h), id, 300e6, 3, 3_000_000));
-        assertEq(uint256(h.getChannel(id).disputeDeadline), uint256(deadlineAfterFirst));
-    }
-
-    function test_forcedInclusion_noExtendWhenAmpleTimeRemains() public {
-        ForcedInclusionHarness h = _newForcedHarness();
-        vm.prank(client);
-        bytes32 id = h.openChannel(provider, DEPOSIT);
-        vm.prank(client);
-        h.closeChannel(id, 100e6, 1, 1_000_000, _signFor(address(h), id, 100e6, 1, 1_000_000));
-        uint64 originalDeadline = h.getChannel(id).disputeDeadline;
-
-        // Forced inclusion but with > FORCED_INCLUSION_GUARANTEE (24h) remaining.
-        vm.warp(block.timestamp + 1 hours);
-        h.setForced(true);
-        vm.prank(stranger);
-        h.disputeChannel(id, 200e6, 2, 2_000_000, _signFor(address(h), id, 200e6, 2, 2_000_000));
-        assertFalse(h.getChannel(id).extended);
-        assertEq(uint256(h.getChannel(id).disputeDeadline), uint256(originalDeadline));
-    }
-
-    function test_normalDispute_doesNotExtend() public {
+    function test_dispute_doesNotMoveDeadline() public {
         bytes32 id = _open();
         vm.prank(client);
         channel.closeChannel(id, 100e6, 1, 1_000_000, _sign(id, 100e6, 1, 1_000_000));
         uint64 originalDeadline = channel.getChannel(id).disputeDeadline;
 
-        // Near the deadline, but a normal (non-forced) dispute never extends.
+        // Even a dispute landing near the deadline leaves it untouched — the
+        // baseline window (kept above the L2 force-inclusion delay) is the sole
+        // censorship guarantee.
         vm.warp(block.timestamp + DISPUTE_WINDOW - 1 hours);
         vm.prank(stranger);
         channel.disputeChannel(id, 200e6, 2, 2_000_000, _sign(id, 200e6, 2, 2_000_000));
         assertEq(uint256(channel.getChannel(id).disputeDeadline), uint256(originalDeadline));
-        assertFalse(channel.getChannel(id).extended);
     }
 
     // -----------------------------------------------------------------

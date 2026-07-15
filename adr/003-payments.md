@@ -22,7 +22,7 @@ The same channel mechanism operates at two tiers:
 - **Client → node**: a client opens a payment-token channel with a node, signs cumulative vouchers as MB are delivered, and the node initiates channel close on-chain and settles to claim payment after the dispute window.
 - **Node → node**: when a node pulls content from another node (typically an origin-backed node) for the first time, it pays via the same channel mechanism. The origin-backed node is paid wholesale; the pulling node recoups this by serving multiple clients from its cache at a markup.
 
-A channel is opened by depositing the payment token into the `PaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A delivering node may also `withdraw` its accrued earnings against the latest signed voucher **while the channel stays open** — redeeming a client-signed, monotonic claim needs no dispute window (see [`withdraw` behavior](#paymentchannel) and [Operator early withdrawal](#operator-early-withdrawal-no-dispute-window)). A dispute window (default 48 hours, governable within 12h–72h — see [ADR 009](009-governance.md#adr-009-governance-model)) allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
+A channel is opened by depositing the payment token into the `PaymentChannel` contract. As content is delivered, the payer signs cumulative vouchers off-chain — one voucher per MB received (default cadence; negotiable for large transfers). The delivering node holds the latest voucher and submits it on-chain to initiate channel close. A delivering node may also `withdraw` its accrued earnings against the latest signed voucher **while the channel stays open** — redeeming a client-signed, monotonic claim needs no dispute window (see [`withdraw` behavior](#paymentchannel) and [Operator early withdrawal](#operator-early-withdrawal-no-dispute-window)). A dispute window (default 48 hours, governable within 48h–72h — see [ADR 009](009-governance.md#adr-009-governance-model)) allows either party to counter a stale or fraudulent close attempt. After the dispute window expires, the channel is settled and funds are distributed.
 
 Key parameters:
 
@@ -225,7 +225,7 @@ The griefing attacker's financial cost stays bounded: at the recommended 10 USDC
 
 Client submits an old voucher (lower amount) to close the channel, underpaying the node.
 
-The dispute window (default 48 hours, raised from 24 hours to account for L2 forced-inclusion delay; see [L2 sequencer censorship](#l2-sequencer-censorship) below) covers this if the node is online. **Defense layers:**
+The dispute window (default 48 hours, sized above the L2 force-inclusion delay; see [L2 sequencer censorship](#l2-sequencer-censorship) below) covers this if the node is online. **Defense layers:**
 
 1. **In-process dispute monitor.** A lightweight thread inside the node binary watches the chain for `ChannelCloseInitiated` events on its channels and auto-submits the latest voucher via `disputeChannel`. Zero-latency to the local voucher store; handles the common case where the node is online. Implementation is a SHOULD for production node binaries.
 2. **Operator-arranged redundancy.** Multi-instance deployments, hot-standby relays, peer agreements to relay vouchers. Out of protocol scope; the protocol does not define a wire format for voucher-relay arrangements between operators.
@@ -380,8 +380,7 @@ struct Channel {
     uint256 openedAt;
     uint256 expiresAt;
     uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
-    uint256 disputeDeadline;  // set when close is initiated; may be extended once via the forced-inclusion path (see § L2 sequencer censorship)
-    bool    extended;         // true if disputeDeadline has been extended once via the forced-inclusion path; reset to false on closeChannel
+    uint256 disputeDeadline;  // set when close is initiated; fixed for the dispute window
 }
 ```
 
@@ -405,7 +404,7 @@ struct Channel {
 | View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-tokenomics.md#adr-026-tokenomics)). |
 | Governance | `setFeeRouter(addr)` | Replace router target. `GOVERNANCE_ROLE`-gated; routed through the standard 48h `TimelockController` delay; emits `FeeRouterUpdated(address oldRouter, address newRouter)`. See [§ Governance setter: setFeeRouter](#governance-setter-setfeerouter) below. |
 | Governance | `setMinDeposit(amount)` | Minimum channel deposit. |
-| Governance | `setDisputeWindow(seconds)` | Dispute window (bounded 43200–259200 — 12h–72h). |
+| Governance | `setDisputeWindow(seconds)` | Dispute window (bounded 172800–259200 — 48h–72h). |
 | Governance | `setRateBounds(floor, ceiling)` | Rate floor and ceiling in payment-token base units. |
 | Governance | `setMaxVoucherIntervalMb(mb)` | Max negotiable voucher interval (bounded 1–1024 MB). |
 
@@ -456,22 +455,13 @@ Because `withdraw` advances `claimedNonce` above zero, the zero-voucher close ca
 
 The constructor takes `(usdc, capacityBond, feeRouter, disputeWindow, maxChannelDuration, deliveryFloor, deliveryCeiling, admin)` per [ADR 016 § step 8](016-contract-interactions.md#post-deployment-initialization) and defaults the parameters not passed as args: `minDeposit = 1_000_000` (1 USDC) and `maxVoucherIntervalMb = 1` (1 MB). `disputeWindow` and `maxChannelDuration` are constructor arguments validated against the hardcoded safety bounds (deployment defaults: 48h and 90d respectively — see the bounds table below and [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject any zero address among `(usdc, capacityBond, feeRouter, admin)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
-Default deployment value for `disputeWindow`: **172800 seconds (48 hours)** — raised from 24 hours to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md#adr-009-governance-model): 43200–259200 seconds (12h–72h). Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) the constructor carries no `feePercentage` / `discountedFeePercentage` / treasury-address parameters; bucket shares are governed on `FeeRouter`, and the treasury bucket is one of `FeeRouter`'s three buckets (see [FeeRouter Integration](#feerouter-integration)).
+Default deployment value for `disputeWindow`: **172800 seconds (48 hours)** — sized to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md#adr-009-governance-model): 172800–259200 seconds (48h–72h). Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) the constructor carries no `feePercentage` / `discountedFeePercentage` / treasury-address parameters; bucket shares are governed on `FeeRouter`, and the treasury bucket is one of `FeeRouter`'s three buckets (see [FeeRouter Integration](#feerouter-integration)).
 
 #### L2 sequencer censorship
 
-A malicious closer (or colluding sequencer) submits `closeChannel` with a stale voucher and ensures all `disputeChannel` transactions are censored for the full dispute window. Counterparties fall back to L1 forced inclusion, but this takes up to ~24 hours on Arbitrum (similar paths on other OP-Stack chains). If the dispute window is also 24 hours, effective dispute response time is zero by the time the forced-inclusion transaction is processed.
+A malicious closer (or colluding sequencer) submits `closeChannel` with a stale voucher and ensures all `disputeChannel` transactions are censored for the full dispute window. Counterparties fall back to L1 forced inclusion, but this takes up to ~24 hours on Arbitrum (similar paths on other OP-Stack chains). If the dispute window is no longer than that delay, effective dispute response time is zero by the time the forced-inclusion transaction is processed.
 
-**Mitigation — layered defense.** The dispute window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective dispute response time on any L2 with a forced-inclusion delay ≤ 24 hours. The setting is L2-agnostic and stays within the [ADR 009](009-governance.md#adr-009-governance-model) governance bounds (12h–72h).
-
-On top of that baseline, `disputeChannel` implements a **forced-inclusion deadline extension**: if a `disputeChannel` transaction arrives via L1 forced inclusion, the remaining dispute time is less than 24 hours, and `channel.extended == false`, `disputeDeadline` is set to `block.timestamp + 24 hours` and `channel.extended` is set to `true` — guaranteeing 24 hours of dispute time from the moment the forced-inclusion transaction is processed. `closeChannel` resets `channel.extended` to `false` so a new close cycle starts fresh.
-
-Constraints on the extension mechanism:
-
-- **One extension per close.** Enforced on-chain by the `channel.extended` flag: once set, subsequent forced-inclusion `disputeChannel` calls do not trigger a further extension. This bounds worst-case settlement delay to `disputeWindow + 24h`.
-- **Only forced-inclusion transactions.** Normal sequencer-included `disputeChannel` calls do not trigger the extension, preventing abuse.
-- **L2-specific detection.** Identifying a forced-inclusion transaction is L2-specific. On Arbitrum, this can be detected via `ArbSys` precompile or delayed-inbox origin; on OP Stack, via L1 message origin. Exact detection logic is finalized at L2 selection — see [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target).
-- **Governance must not set the dispute window below the L2's maximum forced-inclusion delay.** On an L2 with ~24h forced inclusion the 12h governance floor is not safe — the extension never executes because `settleChannel` becomes callable before the forced-inclusion `disputeChannel` arrives. The 12h floor remains as a hardcoded safety bound for L2s with shorter forced-inclusion paths.
+**Mitigation — baseline dispute window.** Censorship resistance comes solely from keeping the baseline dispute window above the L2's maximum force-inclusion delay: the dispute window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective dispute response time on any L2 with a force-inclusion delay ≤ 24 hours. There is no on-chain forced-inclusion detection or deadline extension — a signed force-included `disputeChannel` is indistinguishable on-chain from a sequencer-included one, so the window itself carries the guarantee. The setting is L2-agnostic and the governance floor equals the 48h default (bounds 48h–72h per [ADR 009](009-governance.md#adr-009-governance-model)), so the baseline can only be tightened upward and never dropped below the force-inclusion delay.
 
 #### Events
 
@@ -505,7 +495,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 
 | Parameter | Minimum | Maximum |
 | --- | --- | --- |
-| Dispute window | 43200 seconds (12 hours) | 259200 seconds (3 days) |
+| Dispute window | 172800 seconds (48 hours) | 259200 seconds (3 days) |
 | Min deposit | 1 base unit | No max |
 | Rate floor | 1 base unit | Must be < ceiling |
 | Rate ceiling | Must be > floor | No max |
