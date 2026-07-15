@@ -283,7 +283,7 @@ mod tests {
         // Free-form labels passed directly to `inc_rejected` aren't covered
         // by `AnnounceReject::label`; keep them pinned here too.
         assert_eq!(crate::service::SUBSCRIBE_FAILED_LABEL, "subscribe_failed");
-        assert_eq!(crate::service::PEER_TABLE_FULL_LABEL, "peer_table_full");
+        assert_eq!(crate::service::PEER_TABLE_FULL_LABEL, "table_full");
         assert_eq!(
             crate::service::RESUBSCRIBE_FAILED_LABEL,
             "resubscribe_failed"
