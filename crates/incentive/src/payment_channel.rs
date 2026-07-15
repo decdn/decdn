@@ -68,22 +68,23 @@ mod sol_types {
             }
 
             /// Per-channel on-chain state. Mirrors the on-chain `Channel`
-            /// struct verbatim (including the packed trailing fields).
+            /// struct verbatim — including field order, which packs each
+            /// `address` with a `uint64` timestamp (and `status`) into shared
+            /// slots. Field order is part of the `getChannel` ABI tuple.
             struct Channel {
                 address client;
+                uint64 openedAt;
+                Status status;
                 address provider;
+                uint64 expiresAt;
                 address token;
+                uint64 disputeDeadline;
                 uint256 deposit;
                 uint256 claimedAmount;
                 uint256 claimedNonce;
                 uint256 claimedBytes;
                 uint256 withdrawnAmount;
                 uint256 withdrawnBytes;
-                uint64 openedAt;
-                uint64 expiresAt;
-                uint64 disputeDeadline;
-                Status status;
-                bool extended;
             }
 
             // -----------------------------------------------------------------

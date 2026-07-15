@@ -65,7 +65,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     // Safety bounds (ADR 003 § Safety bounds, ADR 009)
     // -----------------------------------------------------------------
 
-    uint256 internal constant DISPUTE_WINDOW_FLOOR = 12 hours;
+    uint256 internal constant DISPUTE_WINDOW_FLOOR = 48 hours;
     uint256 internal constant DISPUTE_WINDOW_CEILING = 72 hours;
     uint256 internal constant MAX_CHANNEL_DURATION_FLOOR = 7 days;
     uint256 internal constant MAX_CHANNEL_DURATION_CEILING = 365 days;
@@ -84,10 +84,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      = 1 MB cadence default.
     uint256 internal constant DEFAULT_MIN_DEPOSIT = 1_000_000;
     uint256 internal constant DEFAULT_MAX_VOUCHER_INTERVAL_MB = 1;
-
-    /// @dev Dispute time guaranteed from the moment a forced-inclusion
-    ///      `disputeChannel` lands (ADR 003 § L2 sequencer censorship).
-    uint256 internal constant FORCED_INCLUSION_GUARANTEE = 24 hours;
 
     // -----------------------------------------------------------------
     // EIP-712 voucher typing (ADR 003 § EIP-712 Voucher Signature)
@@ -126,7 +122,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     /// @notice Settlement router target; governance-re-pointable via `setFeeRouter`.
     address public feeRouter;
 
-    /// @notice Dispute window in seconds (default 48h; bounded [12h, 72h]).
+    /// @notice Dispute window in seconds (default 48h; bounded [48h, 72h]).
     uint256 public disputeWindow;
 
     /// @notice Channel lifetime in seconds (default 90d; bounded [7d, 365d]).
@@ -152,22 +148,24 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     mapping(address client => uint256) public clientChannelNonce;
 
     struct Channel {
+        // Each `address` (20 bytes) shares its slot with a `uint64` timestamp (8
+        // bytes) — and `client`'s slot also carries the 1-byte `Status` enum — so
+        // the three addresses, three timestamps, and status pack into 3 slots
+        // instead of 4. `uint64` holds timestamps for ~584 billion years, matching
+        // the `SlashRecord`/`Appeal` convention.
         address client;
+        uint64 openedAt;
+        Status status;
         address provider;
+        uint64 expiresAt;
         address token;
+        uint64 disputeDeadline;
         uint256 deposit;
         uint256 claimedAmount;
         uint256 claimedNonce;
         uint256 claimedBytes;
         uint256 withdrawnAmount;
         uint256 withdrawnBytes;
-        // Packed into one slot (8+8+8+1+1 = 26 bytes): timestamps fit `uint64`
-        // for ~584 billion years, matching the `SlashRecord`/`Appeal` convention.
-        uint64 openedAt;
-        uint64 expiresAt;
-        uint64 disputeDeadline;
-        Status status;
-        bool extended;
     }
 
     mapping(bytes32 channelId => Channel) internal channels;
@@ -277,7 +275,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     /// @param usdc_               Settlement token (USDC), fixed for the contract's life.
     /// @param capacityBond_       Operator registry for the `openChannel` active gate.
     /// @param feeRouter_          Initial settlement router; must be a deployed contract.
-    /// @param disputeWindow_      Initial dispute window (seconds; bounded [12h, 72h]).
+    /// @param disputeWindow_      Initial dispute window (seconds; bounded [48h, 72h]).
     /// @param maxChannelDuration_ Initial channel lifetime (seconds; bounded [7d, 365d]).
     /// @param deliveryFloor_      Per-byte price floor enforced at settlement
     ///                            (USDC base units per MB; >= 1).
@@ -474,7 +472,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         }
 
         ch.status = Status.Closing;
-        ch.extended = false;
         ch.disputeDeadline = uint64(block.timestamp + disputeWindow);
 
         emit ChannelCloseInitiated(
@@ -483,9 +480,9 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     }
 
     /// @notice Any address: submit a strictly-higher-nonce voucher during the
-    ///         dispute window. A forced-inclusion submission with under
-    ///         `FORCED_INCLUSION_GUARANTEE` left (once per close) extends the
-    ///         deadline (ADR 003 § L2 sequencer censorship).
+    ///         dispute window. Censorship resistance comes from the baseline
+    ///         window sitting above the L2 force-inclusion delay (ADR 003 § L2
+    ///         sequencer censorship), not from any on-chain deadline extension.
     /// @dev `_verifyVoucher` may staticcall an ERC-1271 client before the watermark
     ///      writes; safe under `nonReentrant` + checks-effects-interactions.
     // slither-disable-next-line reentrancy-no-eth
@@ -504,15 +501,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.client, signature);
         _advanceClaimWatermark(ch, amount, nonce, bytesDelivered, true);
         _requireBytesTrackPayment(ch);
-
-        if (_arrivedViaForcedInclusion() && !ch.extended) {
-            // forge-lint: disable-next-line(block-timestamp)
-            uint256 remaining = ch.disputeDeadline > block.timestamp ? ch.disputeDeadline - block.timestamp : 0;
-            if (remaining < FORCED_INCLUSION_GUARANTEE) {
-                ch.disputeDeadline = uint64(block.timestamp + FORCED_INCLUSION_GUARANTEE);
-                ch.extended = true;
-            }
-        }
 
         emit ChannelDisputed(channelId, msg.sender, amount, nonce, bytesDelivered);
     }
@@ -946,16 +934,5 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         // re-pointed or buggy one pulling less would otherwise leave a standing
         // allowance over this contract's USDC. Reset closes that surface.
         usdc.forceApprove(feeRouter, 0);
-    }
-
-    /// @dev L2-specific forced-inclusion detection seam. Returns `false` in this
-    ///      base contract — the deadline extension is disabled and the 48h base
-    ///      window is the censorship protection. The concrete L2 adapter overrides
-    ///      this once the deployment L2 is finalized (ADR 003 § L2 sequencer
-    ///      censorship — "Exact detection logic is finalized at L2 selection").
-    ///      `virtual` keeps solc from folding the `disputeChannel` extension
-    ///      branch to dead code.
-    function _arrivedViaForcedInclusion() internal view virtual returns (bool) {
-        return false;
     }
 }

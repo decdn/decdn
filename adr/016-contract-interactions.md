@@ -596,7 +596,7 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 | Parameter | Min | Max | Contract |
 | --- | --- | --- | --- |
 | Slash % per offense | 5% | 50% | CapacityBond |
-| Dispute window | 12h | 72h | PaymentChannel |
+| Dispute window | 48h | 72h | PaymentChannel |
 | Challenge bond | 1 TOKEN | 1,000 TOKEN | SlashJudge |
 | **Unbonding period** | **7 days** | **60 days** | **CapacityBond (default 14d)** |
 | **α (capacity-curve exponent)** | **1.0** | **1.8** | **CapacityBond (default 1.2)** |

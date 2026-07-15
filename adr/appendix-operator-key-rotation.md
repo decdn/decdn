@@ -105,7 +105,7 @@ cast code <addr>      # EOA → returns 0x ; Safe → returns deployed proxy cod
 Procedure:
 
 1. **Drain** and **stop** the node (same as [§ iroh node-key rotation only](#iroh-node-key-rotation-only) steps 2–3).
-2. **Wait** for all open inbound channels to settle. Watch `decdn_channels_open`. If any channel is in the dispute window, do **not** rotate — settling a stale state in step 7 requires the old keystore. Dispute window 48h ([ADR 003](003-payments.md#adr-003-payment-model)); production governable 12h–72h ([ADR 009](009-governance.md#adr-009-governance-model)).
+2. **Wait** for all open inbound channels to settle. Watch `decdn_channels_open`. If any channel is in the dispute window, do **not** rotate — settling a stale state in step 7 requires the old keystore. Dispute window 48h ([ADR 003](003-payments.md#adr-003-payment-model)); production governable 48h–72h ([ADR 009](009-governance.md#adr-009-governance-model)).
 3. **`CapacityBond.deregisterNode()`** from the old address. Sets `active = false`, increments `registrationNonce[nodeId]`. Does **not** start unbonding by itself — `deregisterNode` only deactivates; bond exit is a separate operation ([ADR 003 § Node Registry](003-payments.md#node-registry)).
 4. **`CapacityBond.unbond()`** to start the 14-day unbonding window (default per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve); governable `[7, 60]` days). Bond remains slashable here — do not relax monitoring.
 5. **Wait the full unbonding window**, then `CapacityBond.withdraw()` (or whatever the released-bond reclaim entry point is named in the final interface) to the old address.
