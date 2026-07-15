@@ -42,7 +42,7 @@ contract CapacityBondTest is Test {
     // registers against (stand-in for `keccak256(TERMS.md)`).
     bytes32 internal constant TERMS_HASH = keccak256("decdn operator terms v1");
     // 10 days in microseconds — a valid evidence-age ceiling (within [1d,30d])
-    // that is also >= the [3d,30d] unbonding floor, so the mirror check and the
+    // that is also >= the [7d,60d] unbonding floor, so the mirror check and the
     // individual bound can be exercised independently.
     uint256 internal constant MOCK_EVIDENCE_AGE_US = 10 days * 1_000_000;
 
@@ -1630,7 +1630,7 @@ contract CapacityBondTest is Test {
         // Raise unbonding to 20 days first so the 10-day judge can be wired.
         bond.setUnbondingPeriod(20 days);
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        // 9 days is within [3d,30d] but 9d*1e6 < 10d*1e6 -> mirror check reverts.
+        // 9 days is within [7d,60d] but 9d*1e6 < 10d*1e6 -> mirror check reverts.
         vm.expectRevert(
             abi.encodeWithSelector(
                 CapacityBond.UnbondingBelowEvidenceAge.selector, uint256(9 days) * 1_000_000, MOCK_EVIDENCE_AGE_US
@@ -1646,7 +1646,7 @@ contract CapacityBondTest is Test {
         // Raise unbonding to 20 days first so the 10-day judge can be wired.
         bond.setUnbondingPeriod(20 days);
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        // 11 days: within [3d,30d] AND 11d*1e6 > 10d*1e6 -> passes both checks.
+        // 11 days: within [7d,60d] AND 11d*1e6 > 10d*1e6 -> passes both checks.
         bond.setUnbondingPeriod(11 days);
         vm.stopPrank();
         assertEq(bond.unbondingPeriod(), 11 days);
@@ -1658,10 +1658,10 @@ contract CapacityBondTest is Test {
         // Raise unbonding to 20 days first so the 10-day judge can be wired.
         bond.setUnbondingPeriod(20 days);
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        // 61 days exceeds UNBONDING_PERIOD_CEILING (30 days) -> the bound check reverts FIRST.
+        // 61 days exceeds UNBONDING_PERIOD_CEILING (60 days) -> the bound check reverts FIRST.
         vm.expectRevert(
             abi.encodeWithSelector(
-                CapacityBond.ParamOutOfBounds.selector, uint256(61 days), uint256(3 days), uint256(30 days)
+                CapacityBond.ParamOutOfBounds.selector, uint256(61 days), uint256(7 days), uint256(60 days)
             )
         );
         bond.setUnbondingPeriod(61 days);
@@ -1672,45 +1672,45 @@ contract CapacityBondTest is Test {
         // No setSlashJudge call: slashJudge == address(0).
         assertEq(address(bond.slashJudge()), address(0));
         vm.prank(admin);
-        bond.setUnbondingPeriod(8 days); // within [3d,30d], no judge -> succeeds
+        bond.setUnbondingPeriod(8 days); // within [7d,60d], no judge -> succeeds
         assertEq(bond.unbondingPeriod(), 8 days);
     }
 
     function test_setUnbondingPeriod_floorWithLowEvidenceAgeSucceeds() public {
-        // Tightest valid corner: unbonding at the floor (UNBONDING_PERIOD_FLOOR == 3 days)
+        // Tightest valid corner: unbonding at the floor (UNBONDING_PERIOD_FLOOR == 7 days)
         // with a 1-day evidence-age judge. The fixture bond starts at UNBONDING (7 days),
-        // so wiring a 1-day judge passes (7d*1e6 > 1d*1e6); lowering to 3 days then passes
-        // both the [3d,30d] bound (3 days is the floor) and the mirror (3d*1e6 > 1d*1e6).
+        // so wiring a 1-day judge passes (7d*1e6 > 1d*1e6); setting to 7 days then passes
+        // both the [7d,60d] bound (7 days is the floor) and the mirror (7d*1e6 > 1d*1e6).
         MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(1 days) * 1_000_000);
         vm.startPrank(admin);
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        bond.setUnbondingPeriod(3 days); // floor; 3d*1e6 > 1d*1e6 and within [3d,30d]
+        bond.setUnbondingPeriod(7 days); // floor; 7d*1e6 > 1d*1e6 and within [7d,60d]
         vm.stopPrank();
-        assertEq(bond.unbondingPeriod(), 3 days);
+        assertEq(bond.unbondingPeriod(), 7 days);
     }
 
     // Drives the full regime change in one test: a value accepted while the
     // judge is unset becomes rejected once a judge is wired, with no other
     // change. Proves wiring is what tightens the constraint (not the bound).
     function test_setUnbondingPeriod_sameValueRejectedAfterWiring() public {
-        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(6 days) * 1_000_000);
+        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(9 days) * 1_000_000);
         vm.startPrank(admin);
-        // Unwired: 5 days is within [3d,30d] and there is no judge -> accepted.
-        bond.setUnbondingPeriod(5 days);
-        assertEq(bond.unbondingPeriod(), 5 days);
-        // Raise to 20 days so the 6-day judge satisfies the wire-time invariant
-        // (20d*1e6 > 6d*1e6) and can be wired.
+        // Unwired: 8 days is within [7d,60d] and there is no judge -> accepted.
+        bond.setUnbondingPeriod(8 days);
+        assertEq(bond.unbondingPeriod(), 8 days);
+        // Raise to 20 days so the 9-day judge satisfies the wire-time invariant
+        // (20d*1e6 > 9d*1e6) and can be wired.
         bond.setUnbondingPeriod(20 days);
         bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        // The same 5-day value is now rejected: 5d*1e6 < 6d*1e6 violates the mirror.
+        // The same 8-day value is now rejected: 8d*1e6 < 9d*1e6 violates the mirror.
         vm.expectRevert(
             abi.encodeWithSelector(
                 CapacityBond.UnbondingBelowEvidenceAge.selector,
-                uint256(5 days) * 1_000_000,
-                uint256(6 days) * 1_000_000
+                uint256(8 days) * 1_000_000,
+                uint256(9 days) * 1_000_000
             )
         );
-        bond.setUnbondingPeriod(5 days);
+        bond.setUnbondingPeriod(8 days);
         vm.stopPrank();
     }
 }
