@@ -5,13 +5,12 @@
 
 ## Context
 
-Clients are referenced throughout ADRs 001–011 — they pay for content, hold Ethereum keys that authorize fund movement, maintain peer tables, validate gossip, and decrypt content envelopes — but no ADR defines the client as a coherent entity. Five gaps block PoC functionality:
+Clients are referenced throughout ADRs 001–011 — they pay for content, hold Ethereum keys that authorize fund movement, maintain peer tables, and decrypt content envelopes — but no ADR defines the client as a coherent entity. Four gaps block PoC functionality:
 
-1. **Bootstrap** — how does a client discover initial peers? [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) specifies registry query and retry but interleaves it with node-specific concerns and is incomplete for clients (no gossip subscription policy, no identity loading).
+1. **Bootstrap** — how does a client discover initial peers? [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) specifies registry query and retry but interleaves it with node-specific concerns and is incomplete for clients (no identity loading).
 2. **Key management** — clients hold an iroh Ed25519 key (NodeId) and an Ethereum secp256k1 key (voucher signing, channel operations). Generation, storage, and rotation are unspecified.
 3. **Identity lifecycle** — [ADR 005](005-protocol.md#adr-005-wire-protocol) defines ephemeral NodeId-to-Ethereum bindings in `StreamRequest` but does not specify creation, rotation, or expiry.
-4. **Eclipse attack resolution** — [ADR 003](003-payments.md#adr-003-payment-model) lists Options A/B/C with no decision.
-5. **Trust boundary** — what does the client verify vs. trust? Implied across multiple ADRs but never stated explicitly.
+4. **Trust boundary** — what does the client verify vs. trust? Implied across multiple ADRs but never stated explicitly.
 
 This ADR consolidates all client-specific behavior into a single canonical specification.
 
@@ -23,10 +22,9 @@ This ADR targets **desktop and server clients** — POSIX or Windows hosts with 
 
 - A writable home directory for `~/.decdn/` keys, peer cache, and download state.
 - Direct UDP socket access for iroh QUIC and iroh-relay traversal.
-- Local NTP synchronization (required for gossip validation per [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)).
 - Either an OS keychain (production) or a local encrypted keystore file (PoC) for Ethereum key storage.
 
-**Mobile clients (iOS, Android) and web clients (browser) are out of scope.** They require fundamentally different choices for key custody (platform secure enclave / WalletConnect rather than filesystem keystore), transport (WebTransport rather than raw QUIC; no UDP on browsers), and storage (platform sandbox rather than `~/.decdn/`). The voucher-signing UX (high-frequency session-key signatures per [ADR 024 § Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions)) and the bootstrap procedure (registry RPC + DNS seeds) both assume desktop-class capabilities.
+**Mobile clients (iOS, Android) and web clients (browser) are out of scope.** They require fundamentally different choices for key custody (platform secure enclave / WalletConnect rather than filesystem keystore), transport (WebTransport rather than raw QUIC; no UDP on browsers), and storage (platform sandbox rather than `~/.decdn/`). The voucher-signing UX (high-frequency session-key signatures per [ADR 024 § Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions)) and the bootstrap procedure (registry RPC) both assume desktop-class capabilities.
 
 ### Client Roles and Capabilities
 
@@ -34,10 +32,8 @@ A client is a lightweight QUIC endpoint that streams content and pays per MB. It
 
 - Opens `cdn/client/v1` connections to nodes for paid content delivery
 - Uses `cdn/dht/v1` FIND_VALUE for content discovery; falls back to `cdn/probe/v1` broadcast during bootstrap (see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
-- **Subscribes** to gossip topics to receive `NodeAnnounce` messages
-- Does **not** publish `NodeAnnounce` (not a bonded node)
-- Does **not** publish `ReputationReport` via gossip ([ADR 008](008-reputation.md#adr-008-reputation-system) — clients contribute local observations only)
-- Maintains a local peer table (`NodeId → NodeAnnounce`) and reputation scores
+- Contributes only local reputation observations ([ADR 008](008-reputation.md#adr-008-reputation-system)); it is not a bonded node and publishes nothing to the mesh
+- Maintains a local peer table (from the on-chain registry) and reputation scores
 - Signs vouchers authorizing off-chain USDC payments
 
 ### Bootstrap Procedure
@@ -45,47 +41,23 @@ A client is a lightweight QUIC endpoint that streams content and pays per MB. It
 Startup sequence from first launch to ready state:
 
 ```
- 1. Load or generate iroh identity key (see Key Management below)
- 2. Load Ethereum key from encrypted keystore
- 3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
-      starting at offset 0, incrementing until a page returns fewer than 100
-      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
- 4. (Production only) Resolve DNS bootstrap seeds from configured seed domains
-      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
- 5. Merge peers: registry results ∪ DNS seed results (registry metadata
-      takes precedence when the same NodeId appears in both — see
-      DNS Seed Specification below)
- 6. If no usable peers from live sources:
-      On cached peers present: fall back to ~/.decdn/peers.json
-      On no cache: exit with error —
-        "Cannot reach bootstrap sources. Check network connectivity
-         and RPC endpoint configuration."
- 7. Connect to iroh relay (for NAT traversal)
- 8. Subscribe to gossip topics:
-      - cdn/global/v1  (mandatory)
-      - cdn/region/{region}/v1  (if region configured)
- 9. Build peer table from merged bootstrap peers + incoming NodeAnnounce messages
-10. Persist peer list to ~/.decdn/peers.json
-11. Begin periodic registry refresh (every 10 minutes)
+1. Load or generate iroh identity key (see Key Management below)
+2. Load Ethereum key from encrypted keystore
+3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
+     starting at offset 0, incrementing until a page returns fewer than 100
+     On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
+4. If the registry query yields no usable peers:
+     On cached peers present: fall back to ~/.decdn/peers.json
+     On no cache: exit with error —
+       "Cannot reach bootstrap sources. Check network connectivity
+        and RPC endpoint configuration."
+5. Connect to iroh relay (for NAT traversal)
+6. Build peer table from the registry results
+7. Persist peer list to ~/.decdn/peers.json
+8. Begin periodic registry refresh (every 10 minutes)
 ```
 
-For PoC, steps 4–5 are skipped (no DNS seeds configured). The registry is the sole bootstrap source.
-
-**Gossip participation policy:**
-
-| Behavior | Client | Node |
-| --- | --- | --- |
-| Subscribe to gossip topics | Yes | Yes |
-| Publish `NodeAnnounce` | No | Yes |
-| Relay (forward) received gossip messages | No | Yes |
-| Validate incoming gossip (signature, registry, timestamp) | Yes | Yes |
-| Publish `ReputationReport` | No | Yes (bonded only) |
-| Maintain peer table | Yes | Yes |
-| Require NTP synchronization | Yes (for gossip validation) | Yes |
-
-The client validates gossip using the same rules as nodes: signature verification, registry membership check, and ±60-second timestamp freshness ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)). This requires NTP synchronization, as already mandated for "validating clients" in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh).
-
-Clients participate as gossip *leaves*: they subscribe and validate but never forward received messages back into the mesh. iroh-gossip propagation is the responsibility of bonded nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; clients carry none. This applies to both PoC and production — not a deployment-time toggle.
+The on-chain registry is the sole discovery source; a cached `~/.decdn/peers.json` from the last successful query covers a transient RPC outage. Clients do not join the iroh-gossip mesh — they neither subscribe to nor relay `NodeAnnounce`. Gossip propagation is the responsibility of bonded nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; a client stays online only long enough to fetch and gains nothing from mesh participation.
 
 Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry).
 
@@ -138,22 +110,9 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 | Compromised key | Impact | Response |
 | --- | --- | --- |
-| iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes, receive gossip) but cannot sign vouchers or move funds. | Generate new iroh key, reconnect |
+| iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes) but cannot sign vouchers or move funds. | Generate new iroh key, reconnect |
 | Ethereum secp256k1 | Attacker can sign vouchers draining the payment channel balance | Race to close channels: call `closeChannel` with the latest voucher nonce. If attacker has already submitted a close with a higher-nonce voucher, dispute within the challenge window ([ADR 003](003-payments.md#adr-003-payment-model)). No revocation mechanism exists beyond racing to close. |
 | Both | Full impersonation | Close all channels immediately. Generate new iroh key. Use a new Ethereum address for future sessions. |
-
-### Eclipse Attack Mitigation
-
-At small mesh scale, eclipse attacks require both Sybil-scale capital (bonding enough nodes to dominate the registry) and RPC endpoint compromise (returning a fabricated node list); the on-chain registry alone suffices as the discovery source. As the mesh grows and operator-set diversity increases, clients adopt **multi-source bootstrap (Option B)** — discovering initial peers from at least two independent sources:
-
-1. **On-chain registry** — `CapacityBond.getActiveNodes()` via the configured RPC endpoint.
-2. **DNS seed list** — TXT records at `_decdn-seeds.{domain}` for each domain in a governance-maintained seed list. Record format: `nodeId=<hex>; addrs=<multiaddr>,<multiaddr>`.
-
-Each client release ships with a built-in default seed list compiled into the binary; the `dns_seeds` configuration key (see [Client Configuration](#client-configuration)) provides a runtime override. Seed domains are maintained by governance ([ADR 009](009-governance.md#adr-009-governance-model)) and updated via new client releases or local config. An attacker must compromise both the RPC endpoint and all effective DNS seed domains to fully eclipse a client.
-
-**Supplementary: Option C — Minimum honest-peer diversity** is adopted as a client-side policy (not protocol-enforced). The client maintains connections to at least `min_peer_diversity` nodes (default: 3) discovered via different sources (registry vs. DNS vs. gossip). If all connected nodes share one discovery source, the client logs a warning. Advisory — not blocking.
-
-**Option A — Origin-backed nodes as fallback** is rejected as a *trust* mechanism. Whether a node has an origin backend is an opaque deployment choice and origin URLs are never exposed (design invariant preserved by [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority): only operator Ethereum addresses are recorded on-chain via `OriginAssignment`, never backend URLs), and having one is no guarantee of honesty. The DAO-ratified authorized-origin set surfaced via `OriginAssignment.getOrigins(namespaceId)` is an *availability commitment* (publishers commit to serving via specific operators), not a trust ranking — clients still verify content integrity via BLAKE3 and apply standard reputation / probe scoring regardless of authorized-origin status.
 
 ### Trust Boundary
 
@@ -167,15 +126,13 @@ Each client release ships with a built-in default seed list compiled into the bi
 
 #### Trusted — the client relies on external guarantees
 
-- **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list (eclipse). Mitigated in production by multi-source bootstrap (Option B above).
+- **RPC endpoint:** Returns correct registry data. A compromised RPC can return a fabricated node list.
 - **Registry correctness:** The `CapacityBond` contract accurately reflects bonded operators. Enforced by EVM execution — trust in the chain, not any specific party.
-- **Gossip integrity:** `NodeAnnounce` messages are signed by the announcing node's registered key and validated against the registry. A node cannot forge another's announcement.
-- **Clock:** NTP-synchronized local clock, used for gossip validation (±60 s freshness). Drift beyond this window causes the client to reject valid gossip.
 
 #### Not trusted — the client does not rely on these
 
 - Any individual node's self-reported metadata (region) beyond what is signed and slashable. The region claim itself is mitigated by latency-based reputation: a node whose observed RTT contradicts its claimed region is penalized ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)).
-- Network-level reputation scores (30% gossip weight in [ADR 008](008-reputation.md#adr-008-reputation-system); local observations dominate at 70%).
+- Reputation reported by other peers. The client scores nodes solely from its own local observations ([ADR 008](008-reputation.md#adr-008-reputation-system)).
 - Node availability promises beyond signed probe responses.
 
 ### Client Configuration
@@ -199,9 +156,6 @@ region = ""                                  # optional ISO 3166-1 alpha-2
 
 [bootstrap]
 registry_refresh_secs = 600                  # 10 minutes
-# Production only — empty in PoC
-dns_seeds = []
-min_peer_diversity = 3                       # Option C threshold (production)
 
 [keys]
 # Paths use ~ as shorthand; the client MUST perform home-directory expansion.
@@ -217,127 +171,27 @@ probe_cache_ttl_secs = 15                    # per ADR 001
 voucher_interval_mb = 1                      # per ADR 003
 ```
 
-### DNS Seed Specification (Production)
-
-Each governance-managed domain publishes TXT records at `_decdn-seeds.{domain}`:
-
-```
-_decdn-seeds.seeds.decdn.network. 300 IN TXT "nodeId=a1b2...;addrs=/ip4/1.2.3.4/udp/4433/quic-v1"
-```
-
-The client queries all configured seed domains, cross-checks returned NodeIds against the on-chain registry (seeds must be bonded operators), and merges valid entries into the peer table. For matching NodeIds, registry multiaddrs are the canonical source of truth — DNS addresses are discarded in favour of registry data, preventing a compromised seed domain from redirecting traffic for a valid NodeId. Seeds whose NodeId is not in the registry are discarded entirely with a warning.
-
 ## Consequences
 
 ### Positive
 
 - Consolidates client behavior scattered across ADRs 001, 003, 005, and 008 into a single canonical specification
-- Specifies multi-source bootstrap (Option B) as the production eclipse-attack defense
 - Establishes an explicit trust boundary, making security assumptions auditable
 - PoC key management is simple (file-based EOA or Safe wallet) with a clear production upgrade path (Safe multisig with session keys — see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support))
 - Bootstrap procedure is fully specified end-to-end, unblocking PoC implementation
 
 ### Negative
 
-- DNS seed list introduces a governance-maintained out-of-band dependency for production
 - File-based key storage in PoC is not suitable for production (acceptable for testnet with test funds)
-- NTP synchronization is a hard requirement for gossip validation — clients without NTP will reject valid gossip and build stale peer tables
 - Hardware wallet voucher signing is confirmed infeasible — resolved by Safe session keys ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support))
 
-## Multi-Node Parallel Download
+## Multi-Source Download
 
-A client can split a large blob across N nodes and download each byte range in parallel (BitTorrent-style), opt-in via a CLI flag:
+Splitting a large blob across multiple nodes and fetching byte ranges in parallel is specified in [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1). Sequential single-source delivery is the default.
 
-```
-decdn pull <hash> --max-channels <N> -o <output>
-```
+## Download Resume
 
-**Default:** `--max-channels 1` (sequential, existing behavior).
-
-### Economic threshold
-
-Opening, closing, and settling a payment channel costs ~$0.23 at the production L2's typical gas prices ([ADR 003](003-payments.md#adr-003-payment-model)). For N nodes that is N × $0.23 in fixed overhead before a byte is delivered. At $0.01/GB this overhead is significant, so parallelism is recommended only for large blobs (e.g., > 10 GiB) to amortize the per-channel cost. The `--min-blob-size` flag (default: 10 GiB) disables parallelism for smaller blobs.
-
-### Range assignment
-
-1. Probe N candidates; confirm `has_blob: true` and collect latency.
-2. Learn `total_bytes` from the first `StreamResponse` (or from the manifest — see below).
-3. Divide `total_bytes` into N ranges aligned to the 256 MiB chunk boundary; last range absorbs the remainder. Minimum range: 256 MiB — reduce N if necessary.
-4. Assign lowest-latency node to first range (minimises time-to-first-byte).
-
-One payment channel per node; channel deposit sized for its assigned range plus a 5% buffer. A shared multi-provider channel is not supported by the contract.
-
-### Streaming incompatibility
-
-`--streaming` (or piped output) forces single-channel sequential delivery. Multi-channel mode buffers all range parts to disk before producing output — the output file is only available after all ranges complete.
-
-### Failure handling
-
-Node failure mid-range: re-probe for a replacement, resume from last BLAKE3-verified byte within the range via `byte_offset`, open a new channel for the remaining bytes.
-
-## Download Resume and Crash Recovery
-
-The client persists download state to disk so that a crash, kill, or network drop never requires re-downloading already-verified bytes.
-
-### On-disk layout
-
-```
-~/.decdn/downloads/<hash>/
-  state.json        # authoritative resume state (atomically written)
-  blob.partial      # bytes written sequentially (single-channel mode)
-  range-0.part      # [multi-channel] bytes for range 0
-  range-1.part      # [multi-channel] bytes for range 1
-  ...
-```
-
-`<hash>` is the BLAKE3 hash of the requested blob (or manifest — see below). Location overridden by `DECDN_DOWNLOADS_DIR` env var or `--downloads-dir` flag.
-
-### State file (`state.json`)
-
-```jsonc
-{
-  "version": 1,
-  "hash": "<BLAKE3 hex>",
-  "total_bytes": 52428800000,   // null until first StreamResponse
-  "mode": "single",             // or "parallel" or "manifest"
-  "ranges": [
-    {
-      "start_byte": 0,
-      "end_byte": 17476266666,
-      "verified_offset": 8738133333,  // next byte to fetch; 0 = start of range
-      "channel_id": "0xabc...def",    // null if not yet opened
-      "voucher_nonce": 42,            // -1 = no vouchers sent yet
-      "node_id": "..."
-    }
-  ],
-  "updated_at": "2026-04-10T14:23:01Z"
-}
-```
-
-### Atomic writes
-
-State is written atomically: write to `state.json.tmp`, `fsync`, then `rename` (POSIX atomic). A crash during the write never corrupts the previous state.
-
-State is flushed after each 64 MiB of BLAKE3-verified bytes. The voucher nonce is flushed on **every voucher send** (nonces must be strictly monotone and must never be reused after resume). Worst-case re-download after a crash: 64 MiB per range.
-
-### Resume procedure
-
-On startup, `decdn pull <hash>` checks for an existing download directory:
-
-- **Not found:** start fresh.
-- **Found:** load `state.json`; for each range with `verified_offset > 0`, reconnect to the same node (or re-probe a replacement), open or reuse the channel, send `StreamRequest{byte_offset: verified_offset}`, and continue writing from that offset.
-
-If the original channel is still open on-chain, the client reuses it (avoids the $0.23 lifecycle cost). If the channel is already settled, a new channel is opened sized for the remaining bytes only.
-
-### Cleanup commands
-
-```
-decdn downloads list              # show in-progress downloads
-decdn downloads clean             # remove completed and failed downloads
-decdn downloads clean --all       # remove all downloads including in-progress
-```
-
-State directories older than 30 days with no progress (`verified_offset = -1`) are treated as abandoned and purged by `clean`.
+A `decdn pull` interrupted by a crash, kill, or network drop resumes from the partial output file already on disk: the client re-hashes the bytes it has, discards any trailing unverified remainder, and continues the fetch from the last BLAKE3-verified offset via `StreamRequest{byte_offset}`. If the original payment channel is still open on-chain, the client reuses it; if it has settled, a new channel is opened sized for the remaining bytes only.
 
 ## File Manifests and Reconstruction
 
