@@ -177,7 +177,7 @@ Lower is better. Reputation is clamped to a minimum of 0.1 to prevent division b
 | 0.3 | 11.1× |
 | 0.1 | 100× |
 
-For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md#adr-008-reputation-system)), the 4× multiplier means they must be ~4× cheaper or faster to compete with established nodes — a bootstrap barrier softened by the cold-start bonus in [ADR 008](008-reputation.md#adr-008-reputation-system).
+For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md#adr-008-reputation-system)), the 4× multiplier means they must be ~4× cheaper or faster to compete with established nodes — a bootstrap barrier they clear by pricing or performing competitively until they accrue reputation.
 
 **Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)). `reputation` is the node's `final_score` from [ADR 008 § Combined Score](008-reputation.md#combined-score).
 
