@@ -104,11 +104,7 @@ async fn signer_and_provider(
     chain: &cli::PublishChainArgs,
 ) -> anyhow::Result<(PrivateKeySigner, impl Provider + Clone)> {
     preflight_chain_id(&resolved.rpc_url, resolved.chain_id).await?;
-    let signer = chain_ctx::load_signer_with_password_file(
-        chain.common.keystore_password_file.as_deref(),
-        &resolved.keystore,
-    )
-    .await?;
+    let signer = chain_ctx::load_operator_signer(&chain.common, &resolved.keystore).await?;
     let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
     Ok((signer, provider))
 }
