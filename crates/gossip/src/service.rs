@@ -33,9 +33,12 @@ pub(crate) const SUBSCRIBE_FAILED_LABEL: &str = "subscribe_failed";
 
 /// Label passed to [`GossipMetrics::inc_rejected`] when an inbound
 /// signature-valid announce is dropped because the peer table is at its
-/// hard cap and the inline TTL sweep couldn't free a slot (#577 H3).
-/// Pinned by the label-stability test in `validation::tests`.
-pub(crate) const PEER_TABLE_FULL_LABEL: &str = "peer_table_full";
+/// hard cap and the inline TTL sweep couldn't free a slot. Matches the
+/// `reason=table_full` label value documented in
+/// appendix-peer-table-eviction § Observability and appendix-observability
+/// so operator dashboards resolve. Pinned by the label-stability test in
+/// `validation::tests`.
+pub(crate) const PEER_TABLE_FULL_LABEL: &str = "table_full";
 
 /// Label passed to [`GossipMetrics::inc_rejected`] when a subscriber's
 /// reconnect attempt to `gossip.subscribe(topic_id, ...)` fails (#577 H2
@@ -965,12 +968,23 @@ fn ttl_sweeper_task(
                 _ = ticker.tick() => {}
             }
             let mut table = peer_table.write().await;
-            let evicted = table.evict_expired(now_us());
-            if evicted > 0 {
-                metrics.set_peer_table_size(i64::try_from(table.len()).unwrap_or(i64::MAX));
-            }
+            sweep_expired(&mut table, now_us(), metrics.as_ref());
         }
     })
+}
+
+/// Evict TTL-expired entries once and reflect the result in metrics. On a
+/// non-empty sweep, bump the unlabeled `decdn_peer_table_evicted_ttl_total`
+/// counter by the evicted count and refresh the peer-table-size gauge. A
+/// no-op sweep touches neither metric so silence stays meaningful. Split out
+/// of [`ttl_sweeper_task`] so the metric wiring is unit-testable without the
+/// real clock/interval.
+fn sweep_expired(table: &mut PeerTable, now_us: u64, metrics: &dyn GossipMetrics) {
+    let evicted = table.evict_expired(now_us);
+    if evicted > 0 {
+        metrics.add_evicted_ttl(u64::try_from(evicted).unwrap_or(u64::MAX));
+        metrics.set_peer_table_size(i64::try_from(table.len()).unwrap_or(i64::MAX));
+    }
 }
 
 /// Set on the first observed `SystemTime::duration_since(UNIX_EPOCH)` failure
@@ -1148,6 +1162,7 @@ mod tests {
         struct RecorderState {
             reject_labels: Vec<&'static str>,
             size_gauge_writes: Vec<i64>,
+            evicted_ttl: Vec<u64>,
         }
         impl GossipMetrics for Recorder {
             fn inc_published(&self, _topic: &str) {}
@@ -1164,6 +1179,9 @@ mod tests {
                 self.inner.lock().unwrap().size_gauge_writes.push(n);
             }
             fn inc_reconnected(&self, _topic: &str) {}
+            fn add_evicted_ttl(&self, n: u64) {
+                self.inner.lock().unwrap().evicted_ttl.push(n);
+            }
         }
 
         fn mk_announce(id: u8, ts_us: u64) -> NodeAnnounce {
@@ -1189,7 +1207,7 @@ mod tests {
         assert_eq!(
             state.reject_labels.as_slice(),
             &[PEER_TABLE_FULL_LABEL],
-            "exactly one rejection with the peer_table_full label"
+            "exactly one rejection with the table_full label"
         );
         assert_eq!(
             state.size_gauge_writes,
@@ -1201,6 +1219,66 @@ mod tests {
         assert!(table.get(&[1u8; 32]).is_some());
         assert!(table.get(&[2u8; 32]).is_some());
         assert!(table.get(&[3u8; 32]).is_none());
+    }
+
+    /// #1191: a TTL sweep that removes entries bumps
+    /// `decdn_peer_table_evicted_ttl_total` (via `add_evicted_ttl`) by the
+    /// evicted count and refreshes the size gauge; an empty sweep touches
+    /// neither metric so silence stays meaningful.
+    #[test]
+    fn sweep_expired_reports_evicted_count_and_size() {
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct Recorder {
+            evicted: Mutex<Vec<u64>>,
+            sizes: Mutex<Vec<i64>>,
+        }
+        impl GossipMetrics for Recorder {
+            fn inc_published(&self, _topic: &str) {}
+            fn inc_received(&self, _topic: &str) {}
+            fn inc_rejected(&self, _reason: &'static str) {}
+            fn set_peer_table_size(&self, n: i64) {
+                self.sizes.lock().unwrap().push(n);
+            }
+            fn inc_reconnected(&self, _topic: &str) {}
+            fn add_evicted_ttl(&self, n: u64) {
+                self.evicted.lock().unwrap().push(n);
+            }
+        }
+
+        fn mk_announce(id: u8, ts_us: u64) -> NodeAnnounce {
+            NodeAnnounce {
+                body: NodeAnnounceBody {
+                    node_id: [id; 32],
+                    region: "US".to_string(),
+                    timestamp_us: ts_us,
+                },
+                signature: vec![0u8; 64],
+            }
+        }
+
+        // ttl = 100us. Insert two entries at t=1000, then sweep far enough
+        // ahead that both fall past the cutoff.
+        let mut table = PeerTable::new(100, 8);
+        let metrics = Recorder::default();
+        table
+            .insert_or_refresh(mk_announce(1, 1), 1_000)
+            .expect("insert 1");
+        table
+            .insert_or_refresh(mk_announce(2, 1), 1_000)
+            .expect("insert 2");
+
+        // A no-op sweep (nothing expired yet) records nothing.
+        sweep_expired(&mut table, 1_050, &metrics);
+        assert!(metrics.evicted.lock().unwrap().is_empty());
+        assert!(metrics.sizes.lock().unwrap().is_empty());
+
+        // Now both entries are past `now - ttl`; the sweep evicts both.
+        sweep_expired(&mut table, 2_000, &metrics);
+        assert_eq!(metrics.evicted.lock().unwrap().as_slice(), &[2]);
+        assert_eq!(metrics.sizes.lock().unwrap().as_slice(), &[0]);
+        assert_eq!(table.len(), 0);
     }
 
     /// #845: the subscriber's self-announce guard drops an echo of this node's
