@@ -365,7 +365,7 @@ contract CapacityBondRegionE2ETest is Test {
 
     function _blacklistRegional(bytes32 region, bytes32 hash) internal {
         vm.prank(admin);
-        deployedBlacklist.addHashRegional(region, hash);
+        deployedBlacklist.addHashRegional(region, hash, "DMCA-TEST");
     }
 
     /// @dev Submit a blacklist challenge with a node-signed stream response at
