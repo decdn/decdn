@@ -115,7 +115,7 @@ Procedure:
 9. **Restart** the node with config pointing at the new EVM keystore. Confirm `/health` reports `ready` and `decdn_channel_deposit_usdc` is zero (no channels yet).
 10. **Re-open outbound channels** as needed for cache-miss pulls — no carry-over.
 
-**Real cost:** `firstBondedAt` resets to the new registration timestamp; the operator's `age_ramp` resets to zero and rebuilds to full weight at 6 months per [ADR 026 § Governance](026-tokenomics.md#governance); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score decay](008-reputation.md#adr-008-reputation-system).
+**Real cost:** `firstBondedAt` resets to the new registration timestamp; the operator's `age_ramp` resets to zero and rebuilds to full weight at 6 months per [ADR 026 § Governance](026-tokenomics.md#governance); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score Decay](008-reputation.md#score-decay-production-only).
 
 > **Recommendation.** Treat EOA rotation as a last resort. Prefer the **one-time migration to a Safe** ([§ EOA → Safe migration (one-time, recommended)](#eoa--safe-migration-one-time-recommended)) — once on a Safe, all future "rotations" are owner/session-key swaps with no on-chain identity change.
 
