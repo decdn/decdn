@@ -31,10 +31,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
+use decdn_client_pull::buyer_channel::{
+    LOW_WATER_DIVISOR, ensure_allowance, open_channel, refill_amount, top_up,
+};
 use decdn_client_pull::{
-    ChannelContext, ProgressCallback, VoucherProgress, sign_client_binding,
-    stream_fetch_tracked_with_progress,
+    ChannelContext, ProgressCallback, PullDeadlines, UpstreamRefused, VoucherProgress,
+    sign_client_binding, stream_fetch_tracked_with_progress,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -43,6 +45,7 @@ use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
+use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
 use super::chain_ctx;
@@ -54,36 +57,6 @@ use decdn_client_pull::provider;
 /// Default deposit when opening a new channel: 10 USDC (ADR 003 § Deposit
 /// Economics recommended minimum). Clamped up to the on-chain `minDeposit`.
 const DEFAULT_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-
-/// Low-water divisor for auto-refill (#1103): a reused channel is topped up once
-/// its remaining deposit falls below `1/N` of the configured working deposit.
-/// `5` → refill triggers below 20% remaining, then restores to a full deposit.
-const LOW_WATER_DIVISOR: u64 = 5;
-
-/// Decide how much USDC to add to a reused channel so a sustained series of
-/// fetches against one provider isn't stranded by a spent-down deposit (#1103).
-///
-/// Pure decision (no I/O) so the policy is unit-testable. `deposit` is the
-/// channel's current on-chain deposit and `prior_amount` the cumulative amount
-/// already vouchered, so the remaining spendable is `deposit - prior_amount`.
-/// When that remaining balance has fallen below `low_water`, return the top-up
-/// that restores it to `target_deposit` (the configured working deposit);
-/// otherwise return `U256::ZERO` (no refill).
-///
-/// The exact cost of the *next* fetch is not known here — the per-MB `rate` is
-/// only learned from the provider's probe / `StreamResponse`, and the explicit
-/// `--node-id` path does no probe — so this uses a rate-independent low-water
-/// refill: keep at least `low_water` of headroom, and refill to a full
-/// `target_deposit` when it runs low. Hysteresis (`low_water < target_deposit`)
-/// keeps a busy channel from topping up on every reuse. `topUp` does not extend
-/// expiry, so a near-expiry channel is replaced (not refilled) by the caller.
-fn refill_amount(deposit: U256, prior_amount: U256, target_deposit: U256, low_water: U256) -> U256 {
-    let remaining = deposit.saturating_sub(prior_amount);
-    if remaining >= low_water {
-        return U256::ZERO;
-    }
-    target_deposit.saturating_sub(remaining)
-}
 
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
 /// concurrently, so this bounds selection latency rather than the overall fetch
@@ -417,9 +390,10 @@ pub(crate) async fn resolve_target_node(
 /// is not fixed by a binding) and to unbound contexts, so a bound fetch's error
 /// is passed through untouched. Every other error is returned verbatim.
 fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyhow::Error {
-    let msg = err.to_string();
-    if ctx.client_binding.is_none() && msg.contains("delivery refused") && msg.contains("NotFound")
-    {
+    let refused_not_found = err
+        .downcast_ref::<UpstreamRefused>()
+        .is_some_and(|refused| matches!(refused.error, StreamError::NotFound));
+    if ctx.client_binding.is_none() && refused_not_found {
         err.context(
             "no client identity binding was sent because \
              blockchain.capacity_bond_address is unset, so the node could not \
@@ -440,7 +414,7 @@ pub(crate) async fn fetch_blob(
     provider: Address,
     store: &RedbBuyerChannelStore,
     hash: [u8; 32],
-    timeout: Duration,
+    deadlines: PullDeadlines,
     max_blob_bytes: u64,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Vec<u8>> {
@@ -461,7 +435,7 @@ pub(crate) async fn fetch_blob(
         hash,
         0,
         timestamp_us,
-        timeout,
+        deadlines,
         max_blob_bytes,
         &mut progress,
         on_progress,
@@ -501,6 +475,12 @@ pub(crate) async fn fetch_blob(
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
+    // Before any network or keystore work: a hard cap at or below TWICE the stall budget
+    // parses fine and silently disables stall detection — the open stage is bounded by that
+    // same budget, so both can run inside the cap consecutively (#1145 review). The
+    // `PullDeadlines::capped` below refuses it too; this is the early error, in the flags the
+    // user actually typed.
+    common.validate()?;
 
     // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
     // `[network.discovery]` composes operator resolution legs, else N0 (#936).
@@ -612,7 +592,16 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         provider,
         &store,
         hash,
-        common.effective_timeout(),
+        // A node that accepts the connection and never answers is as dead as one that
+        // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
+        // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
+        // said so in the user's own flags, so this `?` is the belt to that braces (#1145
+        // review).
+        PullDeadlines::capped(
+            common.stall_timeout(),
+            common.stall_timeout(),
+            common.hard_cap(),
+        )?,
         max_blob_bytes,
         Some(&on_progress),
     )
@@ -684,7 +673,9 @@ where
                     if max_approve { None } else { Some(additional) },
                 )
                 .await?;
-                top_up(contract, store, provider, additional).await?;
+                // The escrowed-but-untracked outcomes are logged inside `top_up`;
+                // the CLI re-reads the row below and reflects whatever landed.
+                let _ = top_up(contract, store, provider, additional).await?;
                 // Re-read so the returned context's deposit reflects the top-up
                 // (and any concurrent watermark advance the store folded in);
                 // fall back to the pre-top-up state if the row vanished.
@@ -794,7 +785,8 @@ mod tests {
             data_dir: Some(PathBuf::from("/tmp/d")),
             deposit_micro_usdc: None,
             max_blob_mb: 1024,
-            timeout_ms: 30_000,
+            stall_timeout_ms: 30_000,
+            timeout_ms: 3_600_000,
         }
     }
 
@@ -816,14 +808,20 @@ mod tests {
         }
     }
 
+    /// The refusal these tests annotate, built the way the fetch path builds it: the typed
+    /// `UpstreamRefused` sentinel (#1144). Never hand-roll one with
+    /// `anyhow!("delivery refused: …")` — the annotation downcasts, so a look-alike string
+    /// would exercise nothing and pass against a hint that never fires in production.
+    fn refusal(error: StreamError) -> anyhow::Error {
+        anyhow::Error::new(UpstreamRefused { error })
+    }
+
     /// An unbound (no `capacity_bond_address`) fetch refused with `NotFound` gets
     /// the actionable hint attached, reconnecting the opaque refusal to its cause.
     #[test]
     fn unbound_notfound_refusal_gets_actionable_hint() {
-        let annotated = annotate_unbound_cache_miss(
-            anyhow::anyhow!("delivery refused: Some(NotFound)"),
-            &ctx_with(None),
-        );
+        let annotated =
+            annotate_unbound_cache_miss(refusal(StreamError::NotFound), &ctx_with(None));
         assert!(
             annotated.to_string().contains("capacity_bond_address"),
             "expected the binding hint, got: {annotated}"
@@ -838,11 +836,25 @@ mod tests {
         let binding =
             sign_client_binding(&signer, B256::ZERO, &bind_node_id_domain(1, Address::ZERO))
                 .expect("sign binding");
-        let annotated = annotate_unbound_cache_miss(
-            anyhow::anyhow!("delivery refused: Some(NotFound)"),
-            &ctx_with(Some(binding)),
-        );
+        let annotated =
+            annotate_unbound_cache_miss(refusal(StreamError::NotFound), &ctx_with(Some(binding)));
         assert!(!annotated.to_string().contains("capacity_bond_address"));
+    }
+
+    /// A refusal that is NOT `NotFound` gets no binding hint even when unbound: a
+    /// client binding authorizes reactive pull-through, so it cannot fix a node
+    /// that is degraded (`InternalError`) or a blob that is over the ceiling.
+    /// Previously indistinguishable — the string sniff matched any refusal whose
+    /// text happened to contain `NotFound`.
+    #[test]
+    fn unbound_non_notfound_refusal_is_untouched() {
+        for error in [StreamError::InternalError, StreamError::BlobTooLarge] {
+            let annotated = annotate_unbound_cache_miss(refusal(error.clone()), &ctx_with(None));
+            assert!(
+                !annotated.to_string().contains("capacity_bond_address"),
+                "{error:?} must not get the binding hint"
+            );
+        }
     }
 
     /// A non-`NotFound` failure (e.g. a transport error) is never mislabeled as a
@@ -890,15 +902,24 @@ mod tests {
         );
     }
 
+    /// The deadlines a fetch actually runs under (#1134): an inactivity bound for
+    /// health, plus a generous overall cap that only a pathological provider can reach
+    /// (#1145 review). The blob-size ceiling feeds into NEITHER — it used to scale the
+    /// deadline at an assumed 35 MiB/s, which is what made a large-but-healthy transfer
+    /// fail.
     #[test]
-    fn effective_timeout_delegates_with_correct_arg_order() {
-        // Default pair (1024 MiB, 30_000 ms): scaled ≈ 29_257 < floor → 30 s.
+    fn deadlines_are_stall_bound_with_a_generous_leak_guard() {
         let mut c = common();
-        assert_eq!(c.effective_timeout(), Duration::from_secs(30));
-        // Larger blob scales the timeout up (proves max_blob_mb, not timeout_ms,
-        // is the scaled term — a transposed delegation would fail here).
+        assert_eq!(c.stall_timeout(), Duration::from_secs(30));
+        assert_eq!(c.hard_cap(), Duration::from_hours(1));
         c.max_blob_mb = 4096;
-        assert_eq!(c.effective_timeout(), Duration::from_millis(117_028));
+        assert_eq!(
+            c.hard_cap(),
+            Duration::from_hours(1),
+            "blob size must not move the deadline"
+        );
+        c.timeout_ms = 200_000;
+        assert_eq!(c.hard_cap(), Duration::from_secs(200));
     }
 
     #[test]
@@ -965,84 +986,5 @@ mod tests {
         );
         assert_eq!(parse_hash(&hex).unwrap(), *digest.as_bytes());
         assert!(parse_hash("deadbeef").is_err());
-    }
-
-    // ---- auto-refill decision (#1103) -----------------------------------
-
-    // Configured working deposit + its derived low-water mark, mirroring what
-    // `open_or_reuse` passes (`low_water = target / LOW_WATER_DIVISOR`).
-    fn target() -> U256 {
-        U256::from(10_000_000u64) // 10 USDC
-    }
-    fn low_water() -> U256 {
-        target() / U256::from(LOW_WATER_DIVISOR) // 2 USDC (20%)
-    }
-
-    #[test]
-    fn refill_amount_no_top_up_when_remaining_at_or_above_low_water() {
-        // Fresh channel (nothing spent): remaining == deposit == target.
-        assert_eq!(
-            refill_amount(target(), U256::ZERO, target(), low_water()),
-            U256::ZERO,
-            "a full channel must not be topped up"
-        );
-        // Spent down to exactly the low-water mark: still sufficient (>=).
-        let prior = target() - low_water(); // remaining == low_water
-        assert_eq!(
-            refill_amount(target(), prior, target(), low_water()),
-            U256::ZERO,
-            "remaining exactly at the low-water mark is still sufficient"
-        );
-    }
-
-    #[test]
-    fn refill_amount_restores_to_target_when_low() {
-        // Spent so remaining is just below the low-water mark.
-        let remaining = low_water() - U256::from(1u64);
-        let prior = target() - remaining;
-        assert_eq!(
-            refill_amount(target(), prior, target(), low_water()),
-            target() - remaining,
-            "refill must restore the remaining deposit back up to the target"
-        );
-
-        // Nearly drained: remaining ~0 → top up ~a full target's worth.
-        let prior_drained = target() - U256::from(1u64); // remaining == 1
-        assert_eq!(
-            refill_amount(target(), prior_drained, target(), low_water()),
-            target() - U256::from(1u64),
-        );
-    }
-
-    #[test]
-    fn refill_amount_has_hysteresis_after_a_prior_top_up() {
-        // A channel that was already topped up (on-chain deposit == 2*target)
-        // and has spent back down to just above low-water must NOT top up again.
-        let deposit = target() * U256::from(2u64);
-        let prior = deposit - low_water(); // remaining == low_water
-        assert_eq!(
-            refill_amount(deposit, prior, target(), low_water()),
-            U256::ZERO,
-            "a topped-up channel with headroom must not refill on every reuse"
-        );
-    }
-
-    #[test]
-    fn refill_amount_saturates_and_never_underflows() {
-        // Pathological: prior_amount above deposit (never happens on-chain, but
-        // the math must not panic under the anti-panic policy) → remaining 0.
-        assert_eq!(
-            refill_amount(target(), target() * U256::from(3u64), target(), low_water()),
-            target(),
-            "remaining saturates to zero, so refill is a full target"
-        );
-        // Low-water above target (misconfiguration): remaining below low-water
-        // but at/above target → nothing to add (saturating).
-        let deposit = target() * U256::from(2u64);
-        assert_eq!(
-            refill_amount(deposit, U256::ZERO, target(), deposit),
-            U256::ZERO,
-            "remaining already >= target yields no top-up even below low-water"
-        );
     }
 }

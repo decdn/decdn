@@ -6,6 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 description = "Shared client-side paid-pull machinery used by both the node (node-to-node miss pulls) and the CLI (client fetch / bundle pull): the cdn/client/v1 requester and the buyer PaymentChannel open kernel"
 
+[features]
+# Exposes the legacy single-deadline test helpers (`PullDeadlines::whole_transfer`,
+# `stream_fetch`) that deliberately build the zero-stall / uncapped state the production
+# constructors reject. Gated so a production caller cannot even name them (#1145 review);
+# enabled by downstream test suites via `dev-dependencies`.
+test-util = []
+
 [dependencies]
 decdn-protocol = { workspace = true }
 decdn-incentive = { workspace = true }

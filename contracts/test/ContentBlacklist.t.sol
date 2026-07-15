@@ -129,13 +129,13 @@ contract ContentBlacklistTest is Test {
 
     function test_addHashGlobal_andQuery() public {
         vm.prank(admin);
-        blacklist.addHashGlobal(SAMPLE_HASH);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST");
         assertTrue(blacklist.isHashBlacklisted(SAMPLE_HASH));
     }
 
     function test_addHashRegional_globalTakesPrecedence() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         assertTrue(blacklist.isHashBlacklistedInRegion(SAMPLE_HASH, REGION_US));
         assertFalse(blacklist.isHashBlacklisted(SAMPLE_HASH));
     }
@@ -195,7 +195,7 @@ contract ContentBlacklistTest is Test {
     function test_fullAppealFlow_ratifyRemovesHash() public {
         // Seed regional blacklist.
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
 
         // Filer opens appeal.
         vm.prank(filer);
@@ -220,7 +220,7 @@ contract ContentBlacklistTest is Test {
 
     function test_rejectAppeal_burnsBond() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         vm.prank(filer);
         uint256 appealId = blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -234,7 +234,7 @@ contract ContentBlacklistTest is Test {
 
     function test_reverseAppeal_clearsSuspendedAndBurnsBond() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         vm.prank(filer);
         uint256 appealId = blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -275,7 +275,7 @@ contract ContentBlacklistTest is Test {
         // Seed 4 hashes in REGION_US.
         for (uint256 i = 0; i < 4; i++) {
             vm.prank(regionalBody);
-            blacklist.addHashRegional(REGION_US, bytes32(i + 1));
+            blacklist.addHashRegional(REGION_US, bytes32(i + 1), "DMCA-TEST");
         }
         // Open 4 appeals — ALL succeed (Open appeals do not charge the cap):
         // filer takes 1,2; filerB takes 3,4.
@@ -312,7 +312,7 @@ contract ContentBlacklistTest is Test {
     ///         (and reset the slash-eligibility boundary).
     function test_addHash_revertsWhileAppealActive() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         vm.prank(filer);
         uint256 appealId = blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -322,20 +322,20 @@ contract ContentBlacklistTest is Test {
         // Re-add blocked while the appeal is live.
         vm.prank(regionalBody);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.HashHasActiveAppeal.selector, REGION_US, SAMPLE_HASH));
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
 
         // Once the appeal terminates, the re-add is allowed again.
         vm.prank(multisig);
         blacklist.rejectBlacklistAppeal(appealId);
         assertFalse(blacklist.hasActiveAppeal(REGION_US, SAMPLE_HASH));
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
     }
 
     /// @notice T-3 — concurrent appeals on the same (region, hash) revert.
     function test_openBlacklistAppeal_revertsDuplicatePerHash() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
 
         vm.prank(filer);
         blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32("e1"), ContentBlacklist.StandingPath.Operator, 0);
@@ -359,7 +359,7 @@ contract ContentBlacklistTest is Test {
     ///         appeal to be filed afterwards.
     function test_hasActiveAppeal_clearedOnReject() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         vm.prank(filer);
         uint256 appealId = blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -379,7 +379,7 @@ contract ContentBlacklistTest is Test {
     /// @notice T-3 — `hasActiveAppeal` clears on reverse.
     function test_hasActiveAppeal_clearedOnReverse() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         vm.prank(filer);
         uint256 appealId = blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -398,13 +398,13 @@ contract ContentBlacklistTest is Test {
     function test_addHashGlobal_revertsWithoutGovernanceRole() public {
         _expectMissingRole(filer, blacklist.GOVERNANCE_ROLE());
         vm.prank(filer);
-        blacklist.addHashGlobal(SAMPLE_HASH);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST");
     }
 
     function test_addHashRegional_revertsWithoutRegionalBodyRole() public {
         _expectMissingRole(filer, blacklist.REGIONAL_BODY_ROLE());
         vm.prank(filer);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
     }
 
     function test_registerRegionalBody_revertsWithoutGovernanceRole() public {
@@ -430,7 +430,7 @@ contract ContentBlacklistTest is Test {
     function test_removeHashRegional_blocksGlobalRegionEntries() public {
         // Seed a global entry.
         vm.prank(admin);
-        blacklist.addHashGlobal(SAMPLE_HASH);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST");
 
         // Regional body tries to delete via removeHashRegional with the
         // GLOBAL_REGION sentinel (must revert with MissingRegion).
@@ -447,7 +447,7 @@ contract ContentBlacklistTest is Test {
     ///         FastTracked branches.
     function test_hasActiveAppeal_clearedOnLapseOpen() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         vm.prank(filer);
         uint256 appealId = blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -467,7 +467,7 @@ contract ContentBlacklistTest is Test {
         // filer's attested region is "US" (set in setUp); appealing an "EU"
         // regional entry under Operator standing must hard-revert.
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_EU, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_EU, SAMPLE_HASH, "DMCA-TEST");
         vm.prank(filer);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.OperatorRegionMismatch.selector, REGION_EU, REGION_US));
         blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0);
@@ -480,7 +480,7 @@ contract ContentBlacklistTest is Test {
         // — the ripening window is a soft norm left to multisig (ADR 011).
         bondMock.setRegion(filer, "EU", "US", uint64(block.timestamp - 1 days));
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_EU, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_EU, SAMPLE_HASH, "DMCA-TEST");
         vm.prank(filer);
         uint256 appealId = blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -494,7 +494,7 @@ contract ContentBlacklistTest is Test {
         // (an in-scope operator can appeal a global entry regardless of region).
         bondMock.setRegion(filer, "ZZ", "", 0); // deliberately non-matching
         vm.prank(admin);
-        blacklist.addHashGlobal(SAMPLE_HASH);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST");
         bytes32 globalRegion = bytes32("GLOBAL");
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
@@ -506,7 +506,7 @@ contract ContentBlacklistTest is Test {
     function test_openBlacklistAppeal_nonOperatorStanding_skipsRegionCheck() public {
         // Publisher standing is not region-gated even on a mismatched region.
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_EU, SAMPLE_HASH); // filer region is "US"
+        blacklist.addHashRegional(REGION_EU, SAMPLE_HASH, "DMCA-TEST"); // filer region is "US"
         // Establish Publisher standing: filer owns a namespace that claimed the hash.
         vm.prank(filer);
         uint256 nsId = registry.createNamespace();
@@ -525,7 +525,7 @@ contract ContentBlacklistTest is Test {
 
     function test_isHashBlacklistedForOperator_global() public {
         vm.prank(admin);
-        blacklist.addHashGlobal(SAMPLE_HASH);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST");
         // Global applies to any operator regardless of region.
         assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
     }
@@ -533,7 +533,7 @@ contract ContentBlacklistTest is Test {
     function test_isHashBlacklistedForOperator_currentRegion() public {
         bondMock.setRegion(operator, "US", "", 0);
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
         // An operator in a different region is out of scope.
         bondMock.setRegion(operator, "EU", "", 0);
@@ -543,7 +543,7 @@ contract ContentBlacklistTest is Test {
     function test_isHashBlacklistedForOperator_suspendedRegional_false() public {
         bondMock.setRegion(operator, "US", "", 0);
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
         // Fast-tracking an appeal suspends the entry → lifts it from scope.
         vm.prank(filer); // filer region "US" (setUp) satisfies path-2 standing
@@ -558,7 +558,7 @@ contract ContentBlacklistTest is Test {
     function test_isHashBlacklistedForOperator_prevRegionWindow() public {
         vm.warp(30 days); // headroom for the `- N days` stamps below
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         // Flipped US -> EU one day ago: prev (US) entry still in scope.
         bondMock.setRegion(operator, "EU", "US", uint64(block.timestamp - 1 days));
         assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
@@ -570,7 +570,7 @@ contract ContentBlacklistTest is Test {
     function test_isHashBlacklistedForOperator_neverChangedFallback_ripensFromMaxBondGate() public {
         vm.warp(30 days); // headroom for the `- N days` stamps below
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         // `regionLastChanged == 0` (never changed on-chain) routes the window
         // through the `max(firstBondedAt, gate)` fallback — the path the
         // lastChanged tests above never reach via the real `regionScopeData` read.
@@ -597,7 +597,7 @@ contract ContentBlacklistTest is Test {
     ///      on it, and has the multisig reject that appeal.
     function _openAndReject(bytes32 h) internal {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, h);
+        blacklist.addHashRegional(REGION_US, h, "DMCA-TEST");
         vm.prank(filer);
         uint256 id =
             blacklist.openBlacklistAppeal(h, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0);
@@ -620,7 +620,7 @@ contract ContentBlacklistTest is Test {
 
         // A fresh appeal on a distinct live entry is rejected at intake.
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)), "DMCA-TEST");
         vm.prank(filer);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerInRejectionCooldown.selector, cooldownUntil));
         blacklist.openBlacklistAppeal(
@@ -636,7 +636,7 @@ contract ContentBlacklistTest is Test {
         assertEq(blacklist.getFilerRejectionWindow(filer).cooldownUntilAt, 0);
 
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(3)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(3)), "DMCA-TEST");
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
             bytes32(uint256(3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -655,7 +655,7 @@ contract ContentBlacklistTest is Test {
 
         vm.warp(uint256(cooldownUntil) + 1);
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)), "DMCA-TEST");
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
             bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -675,7 +675,7 @@ contract ContentBlacklistTest is Test {
         assertEq(blacklist.getFilerRejectionWindow(filer).cooldownUntilAt, 0);
 
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)), "DMCA-TEST");
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
             bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -699,7 +699,7 @@ contract ContentBlacklistTest is Test {
         bondMock.setRegion(filer2, "US", "", 0);
 
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(4)), "DMCA-TEST");
         vm.prank(filer2);
         blacklist.openBlacklistAppeal(
             bytes32(uint256(4)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -752,7 +752,7 @@ contract ContentBlacklistTest is Test {
 
     function _open(bytes32 h) internal returns (uint256 appealId) {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, h);
+        blacklist.addHashRegional(REGION_US, h, "DMCA-TEST");
         vm.prank(filer);
         appealId = blacklist.openBlacklistAppeal(h, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0);
     }
@@ -795,7 +795,7 @@ contract ContentBlacklistTest is Test {
 
         // A fresh appeal on a distinct live entry reverts while denylisted.
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(2)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(2)), "DMCA-TEST");
         vm.prank(filer);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerPerjuryDenylisted.selector, until));
         blacklist.openBlacklistAppeal(
@@ -806,7 +806,7 @@ contract ContentBlacklistTest is Test {
         // 14-day filing window (the entry above ages out across the warp).
         vm.warp(uint256(until) - 1);
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(2)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(2)), "DMCA-TEST");
         vm.prank(filer);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.FilerPerjuryDenylisted.selector, until));
         blacklist.openBlacklistAppeal(
@@ -866,7 +866,7 @@ contract ContentBlacklistTest is Test {
 
         assertEq(blacklist.perjuryDenylistUntilAt(filer2), 0);
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(2)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(2)), "DMCA-TEST");
         vm.prank(filer2);
         blacklist.openBlacklistAppeal(
             bytes32(uint256(2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -894,7 +894,7 @@ contract ContentBlacklistTest is Test {
     ///         REGION_US, returning the two fast-tracked appeal ids.
     function _filerAtReliefCap() internal returns (uint256 id1, uint256 id2) {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA1)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA1)), "DMCA-TEST");
         vm.prank(filer);
         id1 = blacklist.openBlacklistAppeal(
             bytes32(uint256(0xA1)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -903,7 +903,7 @@ contract ContentBlacklistTest is Test {
         blacklist.fastTrackBlacklistAppeal(id1);
 
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA2)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA2)), "DMCA-TEST");
         vm.prank(filer);
         id2 = blacklist.openBlacklistAppeal(
             bytes32(uint256(0xA2)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -924,7 +924,7 @@ contract ContentBlacklistTest is Test {
         // A 3rd fast-track for the SAME filer reverts on the per-filer sub-cap,
         // not the region ceiling.
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA3)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA3)), "DMCA-TEST");
         vm.prank(filer);
         uint256 id3 = blacklist.openBlacklistAppeal(
             bytes32(uint256(0xA3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -975,7 +975,7 @@ contract ContentBlacklistTest is Test {
 
         // Freed slot lets the filer fast-track a fresh appeal again.
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA3)));
+        blacklist.addHashRegional(REGION_US, bytes32(uint256(0xA3)), "DMCA-TEST");
         vm.prank(filer);
         uint256 id3 = blacklist.openBlacklistAppeal(
             bytes32(uint256(0xA3)), REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Operator, 0
@@ -1001,7 +1001,7 @@ contract ContentBlacklistTest is Test {
 
     function test_publisherStanding_ownerOfClaimingNamespace_succeeds() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         uint256 nsId = _publisherStanding(filer, SAMPLE_HASH);
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
@@ -1012,7 +1012,7 @@ contract ContentBlacklistTest is Test {
 
     function test_publisherStanding_nonOwner_reverts() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         // Namespace owned by someone else (admin), even though it claimed the hash.
         uint256 nsId = _publisherStanding(admin, SAMPLE_HASH);
         vm.prank(filer);
@@ -1028,7 +1028,7 @@ contract ContentBlacklistTest is Test {
 
     function test_publisherStanding_ownerButHashNotClaimed_reverts() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         // Filer owns a namespace, but it never claimed SAMPLE_HASH.
         vm.prank(filer);
         uint256 nsId = registry.createNamespace();
@@ -1045,7 +1045,7 @@ contract ContentBlacklistTest is Test {
 
     function test_publisherStanding_wrongNamespaceId_reverts() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         _publisherStanding(filer, SAMPLE_HASH);
         // A namespaceId the filer does not own (unassigned id 999 → ownerOf == 0).
         vm.prank(filer);
@@ -1067,7 +1067,7 @@ contract ContentBlacklistTest is Test {
     ///         credential gate (so nothing for a flash loan to fake).
     function test_tokenHolderStanding_bondIsStanding_succeedsAndEscrows() public {
         vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         // Fund a fresh holder with exactly the bond and nothing more — far below
         // any prior threshold — so success can only come from the bond itself.
         address smallHolder = address(0x5A11);
@@ -1089,5 +1089,164 @@ contract ContentBlacklistTest is Test {
         ContentBlacklist.BlacklistAppeal memory a = blacklist.getAppeal(appealId);
         assertEq(a.bond, APPEAL_BOND);
         assertEq(uint8(a.standingPath), uint8(ContentBlacklist.StandingPath.TokenHolder));
+    }
+
+    // -----------------------------------------------------------------
+    // #1180 — on-chain `reason` audit trail (ADR 011 § Reason field)
+    // -----------------------------------------------------------------
+
+    bytes32 internal constant GLOBAL_REGION = bytes32("GLOBAL");
+
+    /// @notice `addHashGlobal` persists the reason and emits it on the event.
+    function test_addHashGlobal_persistsReason() public {
+        vm.expectEmit(true, true, false, true, address(blacklist));
+        emit ContentBlacklist.HashBlacklisted(GLOBAL_REGION, SAMPLE_HASH, "DMCA-2026-001");
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-2026-001");
+        assertEq(blacklist.hashReason(GLOBAL_REGION, SAMPLE_HASH), "DMCA-2026-001");
+    }
+
+    /// @notice `addHashRegional` persists the reason under the entry's region.
+    function test_addHashRegional_persistsReason() public {
+        vm.expectEmit(true, true, false, true, address(blacklist));
+        emit ContentBlacklist.HashBlacklisted(REGION_US, SAMPLE_HASH, "DSA-DE-001");
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DSA-DE-001");
+        assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "DSA-DE-001");
+    }
+
+    /// @notice Removing an entry clears its stored reason (no stale audit trail).
+    function test_removeHash_clearsReason() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DSA-DE-001");
+        assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "DSA-DE-001");
+        vm.prank(regionalBody);
+        blacklist.removeHashRegional(REGION_US, SAMPLE_HASH);
+        assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "");
+    }
+
+    /// @notice A re-add overwrites the stored reason with the new notice's.
+    function test_addHash_reAdd_overwritesReason() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-OLD");
+        vm.prank(regionalBody);
+        blacklist.removeHashRegional(REGION_US, SAMPLE_HASH);
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-NEW");
+        assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "DMCA-NEW");
+    }
+
+    // -----------------------------------------------------------------
+    // #1194 — reject an all-zero evidenceBundleHash
+    // -----------------------------------------------------------------
+
+    function test_openBlacklistAppeal_revertsOnEmptyEvidence() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
+        vm.prank(filer);
+        vm.expectRevert(ContentBlacklist.EmptyEvidenceBundleHash.selector);
+        blacklist.openBlacklistAppeal(SAMPLE_HASH, REGION_US, bytes32(0), ContentBlacklist.StandingPath.Operator, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // #1182 — cleanupExpiredBlacklistAppeal condition (c) global override
+    // -----------------------------------------------------------------
+
+    /// @notice Condition (a) — an `Open` appeal past its review window lapses and
+    ///         BURNS the bond (reason 1), unchanged by the global-override work.
+    function test_cleanup_openTimeout_burnsBond() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        vm.warp(block.timestamp + 14 days + 1);
+
+        uint256 supplyBefore = token.totalSupply();
+        vm.expectEmit(true, false, false, true, address(blacklist));
+        emit ContentBlacklist.BlacklistAppealLapsed(appealId, 1);
+        blacklist.cleanupExpiredBlacklistAppeal(appealId);
+        // Bond burned (supply drops), not refunded.
+        assertEq(supplyBefore - token.totalSupply(), APPEAL_BOND);
+    }
+
+    /// @notice Condition (b) — a `FastTracked` appeal past its ratification window
+    ///         lapses and BURNS the bond (reason 2).
+    function test_cleanup_fastTrackedTimeout_burnsBond() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+        vm.warp(block.timestamp + 14 days + 1);
+
+        uint256 supplyBefore = token.totalSupply();
+        vm.expectEmit(true, false, false, true, address(blacklist));
+        emit ContentBlacklist.BlacklistAppealLapsed(appealId, 2);
+        blacklist.cleanupExpiredBlacklistAppeal(appealId);
+        assertEq(supplyBefore - token.totalSupply(), APPEAL_BOND);
+    }
+
+    /// @notice Condition (c) — an `Open` appeal whose entry was removed by a
+    ///         slow-path global override is cleanable IMMEDIATELY (window not
+    ///         elapsed) and REFUNDS the bond (reason 3, ADR 011 § Global Override).
+    function test_cleanup_globalOverride_open_refunds() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        assertTrue(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(1))));
+
+        // Global override removes the entry while the appeal is still live.
+        vm.prank(regionalBody);
+        blacklist.removeHashRegional(REGION_US, bytes32(uint256(1)));
+
+        uint256 filerBalBefore = token.balanceOf(filer);
+        uint256 supplyBefore = token.totalSupply();
+
+        // No warp — the window has NOT elapsed, yet condition (c) admits cleanup.
+        vm.expectEmit(true, false, false, true, address(blacklist));
+        emit ContentBlacklist.BlacklistAppealLapsed(appealId, 3);
+        blacklist.cleanupExpiredBlacklistAppeal(appealId);
+
+        // Bond refunded, not burned: filer balance up by the bond, supply flat.
+        assertEq(token.balanceOf(filer) - filerBalBefore, APPEAL_BOND);
+        assertEq(token.totalSupply(), supplyBefore);
+        assertFalse(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(1))));
+        ContentBlacklist.BlacklistAppeal memory a = blacklist.getAppeal(appealId);
+        assertEq(uint8(a.status), uint8(ContentBlacklist.AppealStatus.Lapsed));
+        assertEq(a.bond, 0);
+    }
+
+    /// @notice Condition (c) on a `FastTracked` appeal: refunds the bond AND
+    ///         releases the interim-relief slot, immediately (no warp).
+    function test_cleanup_globalOverride_fastTracked_refundsAndReleasesSlot() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+        assertEq(blacklist.regionActiveReliefCount(REGION_US), 1);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 1);
+
+        // Global override deletes the suspended entry mid-appeal.
+        vm.prank(regionalBody);
+        blacklist.removeHashRegional(REGION_US, bytes32(uint256(1)));
+
+        uint256 filerBalBefore = token.balanceOf(filer);
+        uint256 supplyBefore = token.totalSupply();
+
+        vm.expectEmit(true, false, false, true, address(blacklist));
+        emit ContentBlacklist.BlacklistAppealLapsed(appealId, 3);
+        blacklist.cleanupExpiredBlacklistAppeal(appealId);
+
+        assertEq(token.balanceOf(filer) - filerBalBefore, APPEAL_BOND);
+        assertEq(token.totalSupply(), supplyBefore);
+        // Both relief tiers released even though the entry no longer exists.
+        assertEq(blacklist.regionActiveReliefCount(REGION_US), 0);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 0);
+        assertFalse(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(1))));
+    }
+
+    /// @notice A terminal appeal is still inadmissible for cleanup even after a
+    ///         global override (guard unchanged).
+    function test_cleanup_globalOverride_terminalAppeal_reverts() public {
+        uint256 appealId = _open(bytes32(uint256(1)));
+        vm.prank(multisig);
+        blacklist.rejectBlacklistAppeal(appealId);
+        // Entry re-activates after reject; remove it via override.
+        vm.prank(regionalBody);
+        blacklist.removeHashRegional(REGION_US, bytes32(uint256(1)));
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.AppealNotOpen.selector, appealId));
+        blacklist.cleanupExpiredBlacklistAppeal(appealId);
     }
 }

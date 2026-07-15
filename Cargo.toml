@@ -203,7 +203,7 @@ insta = "1"
 # (signing, retry, body framing) but stub the network — exactly the
 # granularity we need to validate `OriginPullError` classification without
 # standing up MinIO.
-aws-smithy-mocks = "0.2"
+aws-smithy-mocks = "0.3"
 
 # Rate limiting (per-source connection rate limits in `node`)
 governor = "0.10"

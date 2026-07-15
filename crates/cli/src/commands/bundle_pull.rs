@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use super::chain_ctx;
 use super::fetch;
+use decdn_client_pull::PullDeadlines;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::provider;
@@ -86,6 +87,8 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     if args.dry_run {
         return dry_run(args);
     }
+    // As in `fetch`: reject a hard cap that would silently disable stall detection.
+    args.common.validate()?;
 
     // A local manifest is read up front (no network): an empty bundle then needs
     // no endpoint or keystore password at all.
@@ -324,7 +327,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             provider,
             self.store,
             hash,
-            self.common.effective_timeout(),
+            // Same shape as `fetch` (#1134): a node that accepts the connection and never
+            // answers is as dead as one that stops mid-stream, so the same budget bounds
+            // both stages, under a cap that must outlast them both.
+            PullDeadlines::capped(
+                self.common.stall_timeout(),
+                self.common.stall_timeout(),
+                self.common.hard_cap(),
+            )?,
             max_blob_bytes,
             // Per-entry byte bars would interleave illegibly across a manifest's
             // many concurrent pulls; `bundle pull` reports at entry granularity

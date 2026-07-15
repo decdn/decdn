@@ -21,7 +21,9 @@ pub mod observation;
 pub mod settlement;
 
 pub use coverage::{CoverageBucket, RegionalCoverage};
-pub use local::{ConfigError, LocalReputation, LocalReputationConfig, Outcome};
+pub use local::{
+    ConfigError, LOCAL_SCORE_MAX_DELTA_PER_REPORT, LocalReputation, LocalReputationConfig, Outcome,
+};
 pub use network::{NetworkReputation, NetworkReputationConfig, ReportInput, combined_score};
 pub use observation::ObservationBuffer;
 pub use settlement::{

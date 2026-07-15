@@ -27,24 +27,6 @@ use std::time::Duration;
 
 use clap::Args;
 
-/// Assumed floor client bandwidth (MiB/s) used to scale the per-blob fetch
-/// timeout to `--max-blob-mb` (see [`ClientFetchArgs::effective_timeout`]).
-/// Chosen so the default pair (1024 MiB, `30_000` ms) stays consistent:
-/// `1024 * 1000 / 35 ≈ 29_257 ms < 30_000`, so the default `--timeout-ms` still
-/// dominates and only larger `--max-blob-mb` overrides lengthen the timeout.
-const FETCH_FLOOR_BANDWIDTH_MIB_S: u64 = 35;
-
-/// Pure timeout formula shared by [`ClientFetchArgs::effective_timeout`]: the
-/// larger of the `timeout_ms` floor and the size-scaled value derived from
-/// `max_blob_mb` at [`FETCH_FLOOR_BANDWIDTH_MIB_S`]. Saturating throughout so no
-/// override can panic or overflow.
-fn scaled_timeout(max_blob_mb: u64, timeout_ms: u64) -> Duration {
-    let scaled_ms = max_blob_mb
-        .saturating_mul(1000)
-        .saturating_div(FETCH_FLOOR_BANDWIDTH_MIB_S);
-    Duration::from_millis(timeout_ms.max(scaled_ms))
-}
-
 /// The network, chain, target, and per-blob-limit flags shared by the paid
 /// client commands (`decdn fetch` and `decdn bundle pull`, #391). Flattened into
 /// each command's args so the resolution (`flag > config > default`) and
@@ -142,30 +124,125 @@ pub struct ClientFetchArgs {
     /// **before** buffering it — guards client memory against a provider that
     /// over-claims `total_bytes`. Defaults to 1024 MiB (the node's default
     /// serve ceiling); raise it to fetch larger blobs. For `bundle pull` this is
-    /// the per-entry ceiling. Also scales the effective fetch timeout (see
-    /// `--timeout-ms`).
+    /// the per-entry ceiling.
     #[arg(long, value_name = "MB", default_value_t = 1024)]
     pub max_blob_mb: u64,
 
-    /// Minimum overall timeout for a single blob fetch, in milliseconds. For
-    /// `bundle pull` this is the per-entry timeout. Acts as a floor: the
-    /// effective timeout is the larger of this and a value scaled from
-    /// `--max-blob-mb` (assuming ~35 MiB/s), so raising `--max-blob-mb` can't
-    /// leave a large blob unable to finish within a stale 30 s window.
-    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    /// Abandon a fetch when the provider sends no data for this long, in
+    /// milliseconds. This is the primary timeout (#1134): the clock resets on
+    /// every byte received, so it catches a dead or stalled provider — what a
+    /// timeout is *for* — without penalising transfer size or link speed. A
+    /// 700 MiB blob on a slow link keeps going as long as bytes keep arriving.
+    /// For `bundle pull` this applies per entry.
+    ///
+    /// Must be non-zero: at 0 the deadline elapses on the first poll and every fetch
+    /// fails instantly.
+    #[arg(long, value_name = "MS", default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub stall_timeout_ms: u64,
+
+    /// Hard cap on the total wall-clock time of a single blob fetch, in milliseconds.
+    /// Defaults to 1 hour. For `bundle pull` this applies per entry.
+    ///
+    /// This is a leak guard, not the health signal — `--stall-timeout-ms` is what catches
+    /// a dead provider. Lower it when you must bound total runtime regardless of whether
+    /// the transfer is progressing.
+    ///
+    /// It must exceed TWICE `--stall-timeout-ms`. The cap bounds the whole exchange, and the
+    /// open stage is bounded by the same stall budget, so both can run inside it
+    /// consecutively; below `2 ×` the cap always elapses first and a stalled provider could
+    /// never be detected.
+    #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_ms: u64,
 }
 
 impl ClientFetchArgs {
-    /// Effective per-blob (per-entry) fetch timeout: the larger of the
-    /// `--timeout-ms` floor and a size-scaled value derived from `--max-blob-mb`
-    /// at `FETCH_FLOOR_BANDWIDTH_MIB_S`. `--timeout-ms` stays a minimum so a
-    /// small blob never times out below the connect/discovery budget, while a
-    /// raised `--max-blob-mb` automatically lengthens the timeout instead of
-    /// silently guaranteeing failure.
+    /// Inactivity bound for the streaming stage — the primary timeout (#1134).
+    ///
+    /// Returned as its own value (rather than a `decdn_client_pull::PullDeadlines`)
+    /// because `decdn-common` is upstream of the pull crate in the dependency flow;
+    /// the CLI assembles the two halves into a `PullDeadlines`.
     #[must_use]
-    pub fn effective_timeout(&self) -> Duration {
-        scaled_timeout(self.max_blob_mb, self.timeout_ms)
+    pub const fn stall_timeout(&self) -> Duration {
+        Duration::from_millis(self.stall_timeout_ms)
+    }
+
+    /// Overall wall-clock cap on one blob fetch — always present, so a fetch always
+    /// terminates even against a provider that drip-feeds bytes to keep the stall
+    /// deadline alive.
+    ///
+    /// # Why it exists, and why it is not the health signal
+    ///
+    /// It used to be the primary (and only) mechanism, at a 30 s default, which made it a
+    /// poor health signal: an overall deadline has to be sized against
+    /// `blob size × link speed`, so it killed legitimate large or slow-but-healthy
+    /// transfers, while a value small enough to catch a dead node quickly could not serve
+    /// a big blob at all (#1134).
+    ///
+    /// It cannot simply be removed, though, because inactivity is not liveness: the stall
+    /// clock resets on ANY byte, so a provider trickling one byte per stall window would
+    /// hang the fetch forever with no error. The default is therefore deliberately
+    /// generous — far above any honest transfer under `--max-blob-mb` — and mirrors the
+    /// node's own `BACKGROUND_FILL_HARD_CAP`.
+    ///
+    /// Returns a `Duration`, not an `Option<Duration>`. `--timeout-ms` has a default and clap
+    /// rejects a zero, so the cap is ALWAYS present on this path; the `Option` this used to
+    /// return was structurally always `Some`, and existed only to shape-match
+    /// `PullDeadlines`'s optional cap — misinforming every reader and forcing a pointless
+    /// match (#1145 review). A caller that wants the optional form wraps it.
+    #[must_use]
+    pub const fn hard_cap(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+
+    /// Reject a deadline pair whose hard cap would silently disable stall detection.
+    ///
+    /// Clap enforces each knob is non-zero, but the two are only meaningful in relation to
+    /// each other, and the relation is not the obvious one. `--timeout-ms` is a cap on the
+    /// WHOLE exchange, and both CLI call sites build `PullDeadlines` with the open bound
+    /// ALSO set from `--stall-timeout-ms` (a node that accepts a connection and never
+    /// answers is as dead as one that stops mid-stream, so the same budget answers both).
+    /// So before the stall clock even starts, up to `stall_timeout_ms` may already have
+    /// gone on the open — and `PullStalled` can only fire if the cap outlasts both:
+    ///
+    /// ```text
+    /// timeout_ms > open (= stall_timeout_ms) + stall_timeout_ms  =  2 × stall_timeout_ms
+    /// ```
+    ///
+    /// A check of merely `timeout_ms > stall_timeout_ms` admits the whole band up to
+    /// `2 × stall_timeout_ms`, where the health signal is still dead — no error, no
+    /// warning, just a bound that cannot do its job.
+    ///
+    /// # This is the early check, not the enforcement
+    ///
+    /// `PullDeadlines::capped` is what actually enforces `hard_cap > open + stall`, on the
+    /// type that holds all three values, and both CLI call sites go through it (#1145
+    /// review). This exists so the user gets the error at argument-parse time — naming the
+    /// flags they typed — rather than several frames into a fetch.
+    ///
+    /// It restates the rule rather than calling it because `decdn-common` sits UPSTREAM of
+    /// `decdn-client-pull` in the dependency flow and cannot import `PullDeadlines`. The
+    /// `2 ×` is that rule specialised to these two call sites, which set the open bound from
+    /// `--stall-timeout-ms` as well. If a future `--open-timeout-ms` breaks that assumption,
+    /// this check goes stale — but it can no longer go WRONG, because the constructor
+    /// downstream still refuses to build a `PullDeadlines` whose cap cannot outlast its
+    /// stages. That is the whole reason the invariant was moved onto the type.
+    ///
+    /// # Errors
+    ///
+    /// When `--timeout-ms` does not exceed twice `--stall-timeout-ms`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let need = self.stall_timeout_ms.saturating_mul(2);
+        anyhow::ensure!(
+            self.timeout_ms > need,
+            "--timeout-ms ({}) must exceed twice --stall-timeout-ms ({} × 2 = {}): the hard \
+             cap bounds the whole exchange, and the open stage is bounded by the SAME stall \
+             budget — so below that, the cap always elapses before the inactivity deadline \
+             can fire and a stalled provider could never be detected",
+            self.timeout_ms,
+            self.stall_timeout_ms,
+            need,
+        );
+        Ok(())
     }
 }
 
@@ -194,34 +271,134 @@ pub struct FetchArgs {
     clippy::panic
 )]
 mod tests {
-    use super::scaled_timeout;
+    use super::ClientFetchArgs;
+    use clap::Parser;
     use std::time::Duration;
 
+    /// Parse `ClientFetchArgs` the way clap will at runtime, so the tests below
+    /// assert on the real defaults rather than a hand-built struct that could
+    /// drift from them.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        common: ClientFetchArgs,
+    }
+
+    fn parse(args: &[&str]) -> ClientFetchArgs {
+        let mut with_bin = vec!["test"];
+        with_bin.extend_from_slice(args);
+        TestCli::parse_from(with_bin).common
+    }
+
+    /// The headline of #1134: the default deadlines are sized so that blob size and
+    /// link speed cannot kill a healthy transfer. Liveness comes from the STALL bound;
+    /// the overall cap is a leak guard set far above any honest transfer.
     #[test]
-    fn default_pair_preserves_30s() {
-        // 1024 * 1000 / 35 ≈ 29_257 < 30_000, so the floor wins.
-        assert_eq!(scaled_timeout(1024, 30_000), Duration::from_secs(30));
+    fn the_stall_bound_is_the_health_signal_and_the_hard_cap_is_a_leak_guard() {
+        let c = parse(&[]);
+        assert_eq!(c.stall_timeout(), Duration::from_secs(30));
+        assert_eq!(c.hard_cap(), Duration::from_hours(1));
+    }
+
+    /// A fetch must ALWAYS terminate (#1145 review). The stall clock resets on any
+    /// byte, so with no overall cap a provider trickling one byte per stall window
+    /// hangs `decdn fetch` forever, with no error and no diagnostic — and hangs the
+    /// whole manifest for `bundle pull`. The cap is what makes that impossible, so it
+    /// cannot be absent, and it cannot be zero.
+    ///
+    /// "Cannot be absent" is now a fact about the TYPE — `hard_cap()` returns a `Duration`,
+    /// not an `Option<Duration>` — so the only thing left for a test to pin is that it cannot
+    /// be zero, which is clap's job.
+    #[test]
+    fn a_fetch_always_has_an_overall_cap() {
+        assert!(
+            !parse(&[]).hard_cap().is_zero(),
+            "an unbounded fetch can be hung forever by a drip-feeding provider"
+        );
+        assert!(
+            TestCli::try_parse_from(["test", "--timeout-ms", "0"]).is_err(),
+            "a zero hard cap would abort every fetch on the first poll"
+        );
     }
 
     #[test]
-    fn large_blob_scales_up() {
-        // 4096 * 1000 / 35 = 117_028 > 30_000, so the scaled value wins.
-        assert_eq!(scaled_timeout(4096, 30_000), Duration::from_millis(117_028));
+    fn hard_cap_is_overridable() {
+        let c = parse(&["--timeout-ms", "5000"]);
+        assert_eq!(c.hard_cap(), Duration::from_secs(5));
+    }
+
+    /// The two deadlines are only meaningful in relation to each other, and the threshold
+    /// is `2 × stall`, not `1 × stall` (#1145 review).
+    ///
+    /// Both CLI call sites set the OPEN bound from `--stall-timeout-ms` too, and
+    /// `--timeout-ms` caps the whole exchange — so up to one stall budget can be spent on
+    /// the open before the inactivity clock even starts. A cap of `stall + 1ms` therefore
+    /// still leaves `PullStalled` unable to fire in practice: the health signal is quietly
+    /// dead while both knobs look configured.
+    ///
+    /// Hence the `5000/5001` case below: it clears a naive `timeout > stall` check while
+    /// sitting squarely in the dead band, so it is pinned as an ERROR.
+    #[test]
+    fn a_hard_cap_that_would_disable_stall_detection_is_rejected() {
+        assert!(
+            parse(&["--stall-timeout-ms", "60000", "--timeout-ms", "1000"])
+                .validate()
+                .is_err(),
+            "a cap below the stall budget makes a stalled provider undetectable"
+        );
+        assert!(
+            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5000"])
+                .validate()
+                .is_err(),
+            "equal is no better: the cap's clock starts first, so it still always wins"
+        );
+        assert!(
+            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "5001"])
+                .validate()
+                .is_err(),
+            "a cap of stall+1ms leaves nothing for the stall clock: the open stage alone is \
+             bounded by the same 5000ms, so the cap fires first unless the open took <1ms"
+        );
+        assert!(
+            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "10000"])
+                .validate()
+                .is_err(),
+            "exactly 2× is still not enough — the cap must strictly exceed open + stall"
+        );
+        assert!(
+            parse(&["--stall-timeout-ms", "5000", "--timeout-ms", "10001"])
+                .validate()
+                .is_ok(),
+            "past open + stall, the inactivity deadline can actually fire"
+        );
+        assert!(
+            parse(&[]).validate().is_ok(),
+            "the defaults (30s stall, 1h cap) must be a legal pair"
+        );
     }
 
     #[test]
-    fn small_blob_holds_floor() {
-        assert_eq!(scaled_timeout(10, 30_000), Duration::from_secs(30));
+    fn stall_timeout_is_overridable() {
+        let c = parse(&["--stall-timeout-ms", "1500"]);
+        assert_eq!(c.stall_timeout(), Duration::from_millis(1500));
     }
 
+    /// `stall_timeout()` feeds BOTH `PullDeadlines::open` and `.stall`, so a zero here
+    /// elapses on the first poll of the stream open and kills every fetch. The node's
+    /// config resolver already rejects the equivalent knob; the CLI must too.
     #[test]
-    fn explicit_timeout_above_scaled_wins() {
-        assert_eq!(scaled_timeout(2048, 200_000), Duration::from_secs(200));
+    fn a_zero_stall_timeout_is_rejected() {
+        assert!(TestCli::try_parse_from(["test", "--stall-timeout-ms", "0"]).is_err());
     }
 
+    /// `--max-blob-mb` is a memory ceiling, nothing more. It used to also scale the
+    /// timeout (at an assumed 35 MiB/s), which is precisely the coupling #1134
+    /// removed: a size flag has no business setting a deadline.
     #[test]
-    fn saturates_without_panic() {
-        // No overflow/panic on an extreme --max-blob-mb.
-        let _ = scaled_timeout(u64::MAX, 30_000);
+    fn max_blob_mb_does_not_influence_the_deadlines() {
+        let small = parse(&["--max-blob-mb", "1"]);
+        let huge = parse(&["--max-blob-mb", "1048576"]);
+        assert_eq!(small.stall_timeout(), huge.stall_timeout());
+        assert_eq!(small.hard_cap(), huge.hard_cap());
     }
 }

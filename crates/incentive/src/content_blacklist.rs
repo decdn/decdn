@@ -69,11 +69,13 @@ mod sol_types {
             // Write functions (governance — driven by the e2e harness)
             // -----------------------------------------------------------------
 
-            /// Add `hash` to the global blacklist (`GOVERNANCE_ROLE`).
-            function addHashGlobal(bytes32 hash) external;
+            /// Add `hash` to the global blacklist (`GOVERNANCE_ROLE`). `reason`
+            /// is the free-form on-chain audit-trail note (DMCA/DSA notice id).
+            function addHashGlobal(bytes32 hash, string reason) external;
 
-            /// Add `hash` to `region`'s blacklist (`REGIONAL_BODY_ROLE`).
-            function addHashRegional(bytes32 region, bytes32 hash) external;
+            /// Add `hash` to `region`'s blacklist (`REGIONAL_BODY_ROLE`). `reason`
+            /// is the free-form on-chain audit-trail note (DMCA/DSA notice id).
+            function addHashRegional(bytes32 region, bytes32 hash, string reason) external;
 
             /// Remove `hash` from the global blacklist (`GOVERNANCE_ROLE`).
             function removeHashGlobal(bytes32 hash) external;
@@ -83,8 +85,10 @@ mod sol_types {
             // -----------------------------------------------------------------
 
             /// A `(region, hash)` entry was added (or re-added). `region` is
-            /// `bytes32("GLOBAL")` for the global scope.
-            event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash);
+            /// `bytes32("GLOBAL")` for the global scope. `reason` carries the
+            /// free-form on-chain audit-trail note (unused by the watcher, but
+            /// part of the event signature so topic0 matches the contract).
+            event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, string reason);
 
             /// A `(region, hash)` entry was removed.
             event HashRemoved(bytes32 indexed region, bytes32 indexed hash);

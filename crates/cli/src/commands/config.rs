@@ -209,8 +209,10 @@ pub fn write_validate_summary<W: std::io::Write>(
     if resolved.cache.node_to_node_pull_through_enabled {
         writeln!(
             w,
-            "  node_to_node_pull:        enabled (probe_fanout={}, pull_timeout_sec={})",
-            resolved.cache.node_pull_probe_fanout, resolved.cache.node_pull_timeout_sec
+            "  node_to_node_pull:        enabled (probe_fanout={}, pull_timeout_sec={}, stall_timeout_sec={})",
+            resolved.cache.node_pull_probe_fanout,
+            resolved.cache.node_pull_timeout_sec,
+            resolved.cache.node_pull_stall_timeout_sec
         )?;
         writeln!(
             w,
@@ -458,7 +460,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
 # node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
-# node_pull_timeout_sec = 20               # per-upstream pull timeout on a node-to-node miss; the overall pull-through deadline is derived to allow trying every ranked upstream before falling back (#831, #859)
+# node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the channel open, which has its own 5s budget. The overall pull-through deadline is derived from this, the channel-open budget, and the stall timeout, so every ranked upstream can be tried before falling back (#831, #859)
+# node_pull_stall_timeout_sec = 20         # per-upstream INACTIVITY timeout while streaming (#1134); the clock resets on every byte, so it trips only on a silent upstream — not on a large blob or a slow link. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (172s at defaults)
 # pull_ahead_bytes = 1048576               # window-paced pull-through pipeline window (#856, ADR 037); per-request speculative loss is bounded to this many bytes
 # max_unrecouped_leech_bytes = 268435456   # node-wide unrecouped-leech budget in bytes (#856, ADR 037); aggregate speculative spend above this pauses until served bytes recoup it; 0 disables
 # pull_share_ratio_percent = 400           # per-peer pull ceiling as a percent of bytes served to that peer (#856, ADR 037); 100 == 1.0x, plus an opening pull_ahead_bytes allowance

@@ -20,10 +20,9 @@ import { MockBlacklistView } from "./SlashJudge.t.sol";
 ///         `CapacityBond` and the REAL `SlashJudge` pointed at it, wires them,
 ///         and asserts the boundary from the CapacityBond side so both real
 ///         contracts are proven to agree on the strict-inequality boundary.
-/// @dev    Values are chosen against the live testnet bounds (which deviate
-///         from ADR 014/009's `[7d,60d]` spec — see CapacityBond's
-///         `UNBONDING_PERIOD_FLOOR`/`_CEILING` note): CapacityBond
-///         `unbondingPeriod ∈ [3 days, 30 days]`; SlashJudge
+/// @dev    Values are chosen against the live bounds (ADR 014/009's `[7d,60d]`
+///         spec — see CapacityBond's `UNBONDING_PERIOD_FLOOR`/`_CEILING`
+///         note): CapacityBond `unbondingPeriod ∈ [7 days, 60 days]`; SlashJudge
 ///         `maxEvidenceAgeUs ∈ [1 day, 30 days]` (microseconds).
 contract CapacityBondSlashJudgeInvariantTest is Test {
     Token internal token;
@@ -36,7 +35,8 @@ contract CapacityBondSlashJudgeInvariantTest is Test {
 
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant CHALLENGE_BOND = 100e18;
-    // 20 days in microseconds: valid (< 30d unbonding ceiling, within [1d,30d]).
+    // 20 days in microseconds: valid (< the fixture's 30d unbonding period, and
+    // within the SlashJudge evidence-age bounds [1d,30d]).
     uint256 internal constant MAX_EVIDENCE_AGE_US = 20 days * 1_000_000;
 
     function setUp() public {
@@ -44,7 +44,8 @@ contract CapacityBondSlashJudgeInvariantTest is Test {
         ed25519 = new MockEd25519Verifier();
         blacklist = new MockBlacklistView();
 
-        // Construct the real CapacityBond at the unbonding ceiling (30 days).
+        // Construct the real CapacityBond with a 30-day unbonding period
+        // (within the [7d,60d] bound).
         bond = new CapacityBond({
             token_: token,
             ed25519Verifier_: ed25519,
@@ -77,7 +78,7 @@ contract CapacityBondSlashJudgeInvariantTest is Test {
 
     /// @notice Equal case: `20d*1e6 == maxEvidenceAgeUs`. The strict invariant
     ///         (`maxEvidenceAgeUs < unbondingPeriod*1e6`) means equality MUST
-    ///         revert. 20 days ∈ [3d,30d] so the bound check passes first and
+    ///         revert. 20 days ∈ [7d,60d] so the bound check passes first and
     ///         the cross-parameter mirror check is the one that fires.
     function test_realSlashJudge_unbondingEqualToEvidenceAge_reverts() public {
         vm.prank(admin);

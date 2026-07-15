@@ -86,7 +86,7 @@ use decdn_incentive::{
     MemoryPendingSettleStore, PendingSettleStore, bind_node_id_domain, register_node_signing_hash,
     slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::BuyerChannelService;
+use decdn_node::buyer_channel::{BuyerChannelService, ChannelOpenPending};
 use decdn_node::channel_store::{BuyerChannelStoreHandle, PersistentChannelStateStore};
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::metrics::Metrics;
@@ -103,6 +103,12 @@ use support::{
 // Test-only chain id in the `deployments/3133769*.json` gitignore range so the
 // forge-script manifest never collides with (or is committed alongside) a real
 // chain's manifest.
+/// Caller budget for `open_or_reuse_channel` in these tests (#1143). Generous:
+/// anvil mines instantly, and the budget bounds how long a CALLER waits, not how
+/// long the open may take — a tight value here would make the tests flaky on a
+/// loaded runner without testing anything the unit tests don't already cover.
+const OPEN_BUDGET: Duration = Duration::from_secs(60);
+
 const CHAIN_ID: u64 = 31_337_690;
 // Default anvil dev account #0 (mnemonic "test test … junk") — funded with ETH
 // at genesis, used to broadcast the deploy. Not the forge-default sender the
@@ -874,7 +880,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // Lazy open against the provider → a fresh on-chain channel (the buyer's
     // first, nonce 0) + a persisted buyer record.
     let buyer_ctx = buyer_service
-        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC), OPEN_BUDGET)
         .await?;
     let buyer_id = buyer_ctx.channel_id;
     let on_chain = pc_read.getChannel(buyer_id).call().await?;
@@ -929,7 +935,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         U256::from(5u64),
     )?;
     let reuse_ctx = buyer_service
-        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC), OPEN_BUDGET)
         .await?;
     anyhow::ensure!(
         reuse_ctx.channel_id == buyer_id,
@@ -1500,19 +1506,89 @@ async fn run_e2e() -> anyhow::Result<()> {
     // (open / reclaim) + the chain-log reconciliation scan, so none is needed.
     // ============================================================
 
+    // --- A0. An abandoned open still lands, and the next pull reuses it (#1143). ---
+    // Anvil mines instantly, so every other open here resolves well inside
+    // OPEN_BUDGET and the timeout arm of `open_or_reuse_channel` is never reached:
+    // the singleflight's whole reason for existing goes unexercised against a real
+    // chain. Turn automine OFF so the `openChannel` genuinely sits in the mempool
+    // — which is exactly the state in which releasing the provider's slot would let
+    // a second deposit through.
+    let _: serde_json::Value = node_provider
+        .raw_request("anvil_setAutomine".into(), (false,))
+        .await?;
+    let pend_nonce_before = pc_read.clientChannelNonce(buyer_addr).call().await?;
+    let pending_err = buyer_service
+        .open_or_reuse_channel(
+            node_addr,
+            U256::from(DEPOSIT_MICRO_USDC),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("an unmined openChannel cannot yield a live channel"))?;
+    anyhow::ensure!(
+        pending_err.downcast_ref::<ChannelOpenPending>().is_some(),
+        "a caller that outran its budget must get the typed pending sentinel, not a failure: \
+         {pending_err:#}"
+    );
+    anyhow::ensure!(
+        buyer_store.get_by_provider(node_addr)?.is_none(),
+        "nothing may be persisted while the open is still in the mempool"
+    );
+    // Mine it. The caller is long gone; the detached task still owns the tx and the
+    // provider's open slot, so it is the one that collects the receipt and persists.
+    let _: serde_json::Value = node_provider
+        .raw_request("anvil_setAutomine".into(), (true,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    let landed = poll_until(Duration::from_secs(60), || {
+        let store = Arc::clone(&buyer_store);
+        async move { store.get_by_provider(node_addr).ok().flatten() }
+    })
+    .await
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "the detached open task never persisted the channel the caller walked away from"
+        )
+    })?;
+    let pend_nonce_after = pc_read.clientChannelNonce(buyer_addr).call().await?;
+    anyhow::ensure!(
+        pend_nonce_after == pend_nonce_before + U256::from(1u64),
+        "the abandoned open must escrow exactly ONE channel (nonce {pend_nonce_before} → \
+         {pend_nonce_after})"
+    );
+    let reused = buyer_service
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC), OPEN_BUDGET)
+        .await?;
+    anyhow::ensure!(
+        reused.channel_id == landed.channel_id && buyer_store.len() == 1,
+        "the next pull must reuse the channel the detached task landed, not open a second"
+    );
+    // Clear it again so A below still starts from an untracked provider.
+    let mut spent = landed;
+    spent.expires_at = 1;
+    buyer_store.record(&spent)?;
+    let _: serde_json::Value = node_provider
+        .raw_request("evm_increaseTime".into(), (CHANNEL_EXPIRY_WARP_SECS,))
+        .await?;
+    let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
+    buyer_service.sweep_expired_once().await;
+
     // --- A. Concurrent same-provider opens escrow exactly one deposit (#753). ---
-    // Two racing open_or_reuse for one provider: the InFlightOpenGuard lets one
-    // escrow a channel and makes the other bail-for-retry (or reuse the winner),
-    // so the on-chain client nonce advances by EXACTLY one and only one channel
-    // is ever tracked — never two deposits.
+    // Two racing open_or_reuse for one provider. Since #1143 the loser does not
+    // bail for retry — it JOINS the winner's in-flight open and receives the same
+    // channel — so both calls now succeed. What must not change is the invariant:
+    // the on-chain client nonce advances by EXACTLY one and only one channel is
+    // ever tracked. Two deposits for one provider would orphan the first, and the
+    // boot reconcile scan deliberately declines to adopt it.
     anyhow::ensure!(
         buyer_store.get_by_provider(node_addr)?.is_none(),
         "precondition: no buyer channel tracked for the provider after the reclaim above"
     );
     let nonce_before = pc_read.clientChannelNonce(buyer_addr).call().await?;
     let (r1, r2) = tokio::join!(
-        buyer_service.open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC)),
-        buyer_service.open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC)),
+        buyer_service.open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC), OPEN_BUDGET),
+        buyer_service.open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC), OPEN_BUDGET),
     );
     let nonce_after = pc_read.clientChannelNonce(buyer_addr).call().await?;
     anyhow::ensure!(
@@ -1536,7 +1612,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         "concurrent opens must never surface two distinct channels"
     );
     let reuse_ctx = buyer_service
-        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC), OPEN_BUDGET)
         .await?;
     anyhow::ensure!(
         reuse_ctx.channel_id == win_id && buyer_store.len() == 1,
@@ -1558,7 +1634,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         .await?;
     let _: serde_json::Value = node_provider.raw_request("evm_mine".into(), ()).await?;
     let rotated = buyer_service
-        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .open_or_reuse_channel(node_addr, U256::from(DEPOSIT_MICRO_USDC), OPEN_BUDGET)
         .await?;
     anyhow::ensure!(
         rotated.channel_id != win_id && buyer_store.len() == 1,

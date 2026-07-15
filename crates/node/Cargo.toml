@@ -73,6 +73,10 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Enable the client-pull test helpers (`stream_fetch`, `PullDeadlines::whole_transfer`) for
+# the loopback/e2e suites. Dev-only, so a normal `cargo build -p decdn-node` never sees them
+# and a production caller cannot reach the zero-stall/uncapped deadline shape (#1145 review).
+decdn-client-pull = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 # Property-based tests for the DHT routing table (`src/dht/routing.rs`):
 # xor_distance metric laws and the fixed-bucket / within-K invariants under

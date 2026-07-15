@@ -385,6 +385,7 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
         NodeId::from_bytes(*client_id.as_bytes()),
         ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
+        None,
     )
     .await;
 
@@ -466,6 +467,7 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
             NodeId::from_bytes(*client_id.as_bytes()),
             ContentHash::from_bytes(target),
             lookup_cfg_for_test(),
+            None,
         ),
     )
     .await
@@ -536,6 +538,7 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
         NodeId::from_bytes(*client_id.as_bytes()),
         ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
+        None,
     )
     .await;
 
@@ -600,6 +603,7 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
         NodeId::from_bytes(*client_id.as_bytes()),
         ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
+        None,
     )
     .await;
     assert!(
@@ -620,6 +624,7 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
         NodeId::from_bytes(*client_id.as_bytes()),
         ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
+        None,
     )
     .await;
     assert_eq!(

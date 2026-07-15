@@ -138,6 +138,15 @@ impl RegionAccountant {
         out
     }
 
+    /// The peer's self-attested region, or `None` if it is not in the peer
+    /// table. Exposes the shared [`RegionResolver`] so the pull path can read a
+    /// candidate's region (ADR 030) without wiring a second resolver — unlike the
+    /// private `region_for`, it does not fold an unknown peer into the
+    /// [`UNKNOWN_REGION`] bucket.
+    pub async fn region_of(&self, peer: &[u8; 32]) -> Option<String> {
+        self.resolver.region_of(peer).await
+    }
+
     async fn region_for(&self, peer: &[u8; 32]) -> String {
         self.resolver
             .region_of(peer)
@@ -204,6 +213,18 @@ mod tests {
         assert_eq!(de.region, "DE");
         assert_eq!(de.bytes_out, 1500);
         assert_eq!(de.bytes_in, 0);
+    }
+
+    #[tokio::test]
+    async fn region_of_returns_claim_or_none() {
+        let peer = [5u8; 32];
+        let mut map = HashMap::new();
+        map.insert(peer, "DE".to_string());
+        let acc = accountant_with(map);
+        // Known peer → its self-attested region; unlike `region_for`, an unknown
+        // peer resolves to `None` rather than the UNKNOWN_REGION bucket.
+        assert_eq!(acc.region_of(&peer).await, Some("DE".to_string()));
+        assert_eq!(acc.region_of(&[0u8; 32]).await, None);
     }
 
     #[tokio::test]

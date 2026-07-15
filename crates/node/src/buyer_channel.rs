@@ -39,9 +39,10 @@ use anyhow::{Context, Result};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, PendingSettle,
-    PendingSettleStore, StoreError, Voucher,
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, ChannelOpenFailureReason,
+    DepositOutcome, PendingSettle, PendingSettleStore, StoreError, Voucher,
 };
+use futures_util::FutureExt;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -51,7 +52,9 @@ use crate::client_requester::ChannelContext;
 // decode + state/ctx build, and the one-time USDC approval — now live in the
 // shared `decdn-client-pull` crate (re-exported here as `client_requester`).
 use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range};
-use crate::client_requester::buyer_channel::{OpenedChannel, ensure_allowance, open_channel};
+use crate::client_requester::buyer_channel::{
+    LOW_WATER_DIVISOR, OpenedChannel, ensure_allowance, open_channel, refill_amount,
+};
 use crate::client_requester::cooperative_close::{
     AuthorizedWatermark, CooperativeCloseOutcome, cooperative_close,
 };
@@ -123,15 +126,26 @@ pub struct BuyerReconcileConfig {
 
 /// How many blocks back from head the one-shot bootstrap reconciliation scan
 /// looks for orphaned `ChannelOpened(client == self)` events (#763). The buyer
-/// has no scan checkpoint (unlike the seller watcher): orphans only arise from
-/// the two rare post-escrow failure legs in [`BuyerChannelService::open_and_persist`]
-/// (event-decode or `store.record` failing *after* the on-chain escrow) or a
-/// postcard-undecodable row after a binary downgrade — all of which strand a
-/// deposit seconds before the next restart. A modest fixed lookback (~1–2 days
-/// of an Arbitrum-Sepolia-class ~0.25 s/block L2) recovers those realistic cases
-/// cheaply without re-scanning the full chain every boot. An orphan older than
-/// this window is missed (it is reclaim-able only after its long expiry anyway);
-/// promote to config if operators need a full-lifetime scan.
+/// has no scan checkpoint (unlike the seller watcher): orphans arise from the rare
+/// post-escrow failure legs in `run_open` (event-decode or `store.record` failing
+/// *after* the on-chain escrow) or a postcard-undecodable row after a binary
+/// downgrade — all of which strand a deposit seconds before the next restart.
+/// Abandoning an in-flight `openChannel` is deliberately not on that list *within a
+/// process lifetime*: its receipt wait is unbounded precisely so a tx that later mines can
+/// never become an orphan, and the caller giving up does not cancel it (see
+/// `open_channel`, and `InFlightOpenGuard`, which is why the slot outlives the caller).
+///
+/// It IS on the list across a restart, though, and the distinction is easy to lose: the
+/// open task is a bare `tokio::spawn` with no drain participation, so a SIGTERM while an
+/// `openChannel` sits in the mempool escrows a deposit with no persisted row — exactly the
+/// orphan shape above, which is why this scan must keep covering it. That is a real hazard
+/// but a bounded one: the reconcile below recovers it on the next boot, well inside this
+/// lookback.
+///
+/// A modest fixed lookback (~1–2 days of an Arbitrum-Sepolia-class ~0.25 s/block L2)
+/// recovers those realistic cases cheaply without re-scanning the full chain every boot.
+/// An orphan older than this window is missed (it is reclaim-able only after its long
+/// expiry anyway); promote to config if operators need a full-lifetime scan.
 const BUYER_RECONCILE_LOOKBACK_BLOCKS: u64 = 700_000;
 
 /// Aborts the wrapped task on drop so a node-restart cycle never leaks the
@@ -145,50 +159,436 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// RAII slot in the per-provider in-flight-open set. Dropping it removes the
-/// provider so every path out of the open routine — success, error, or early
-/// return — releases the slot and the provider is never wedged. See
+/// Bound the wait for the `reclaimExpired` receipt on the open path's rotate leg.
+///
+/// Bounding this one is safe, and the contrast with `openChannel` — which
+/// `decdn_client_pull::buyer_channel::open_channel` deliberately does NOT bound —
+/// is the whole point (#1143):
+///
+/// - `openChannel` **escrows** a deposit. Giving up on its receipt does not cancel
+///   the tx; it only makes us stop watching real USDC that is still going to land,
+///   which is how a second deposit gets escrowed against the same provider.
+/// - `reclaimExpired` **refunds** one. Giving up on its receipt strands nothing: the
+///   channel row is left in place, the hourly reclaim sweep retries it, and the open
+///   that triggered it fails with a retryable error.
+///
+/// So this bound exists purely so a stuck reclaim cannot pin the detached open task
+/// — and with it the provider's in-flight slot — indefinitely. That would wedge the
+/// provider for the life of the process, which is exactly the starvation #1143 set
+/// out to remove. Sized like `APPROVE_RECEIPT_TIMEOUT` (#1109): well above a normal
+/// inclusion window, short enough that the worst case is minutes. Not config-tunable
+/// yet (YAGNI), like `RECONCILE_IDLE_SWEEPS`.
+const RECLAIM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// Typed sentinel for a channel open that is still IN FLIGHT when the caller's
+/// budget runs out (#1143).
+///
+/// It is not a failure: a detached task still owns the `openChannel`, and if it
+/// lands, the channel is persisted and the next pull to this provider reuses it.
+/// It means only "not ready in time — try another provider". `node_origin` meters
+/// it and moves to the next candidate WITHOUT scoring reputation: a wedged
+/// channel open is our own chain lane (a slow L2, a stuck nonce), not evidence of
+/// anything about the peer.
+#[derive(Debug)]
+pub struct ChannelOpenPending {
+    /// The provider whose channel is still opening.
+    pub provider: Address,
+    /// How long the caller waited before giving up — its budget, NOT the age of the
+    /// open, which continues in a detached task and may run far longer.
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for ChannelOpenPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "channel open for provider {} still in flight after {:?}; it continues in the \
+             background and will be reused once it lands",
+            self.provider, self.waited
+        )
+    }
+}
+
+impl std::error::Error for ChannelOpenPending {}
+
+/// Typed sentinel for a pull that arrived while the boot/idle reconcile scan holds
+/// the provider's open slot (`InFlightOpenGuard::claim`).
+///
+/// Like [`ChannelOpenPending`] it is NOT a failure — it is "retry, someone else is
+/// mid-write on this provider's row". It needs its own type for the same reason
+/// `ChannelOpenPending` does: a bare string error carries no verdict, so it fell into
+/// `record_channel_open_failure`'s unclassified arm and was counted as a real
+/// `decdn_node_pull_channel_open_failures_total` — indistinguishable from a reverting
+/// tx or an under-funded wallet. Reconcile runs at every boot, so that turned each
+/// restart into a spike of "channel open failures" an operator would go hunting for.
+#[derive(Debug)]
+pub struct OpenSlotReserved {
+    /// The provider whose open slot a reconcile is holding. Retry; do not open.
+    pub provider: Address,
+}
+
+impl std::fmt::Display for OpenSlotReserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a buyer-channel reconcile holds provider {}'s open slot; retry",
+            self.provider
+        )
+    }
+}
+
+impl std::error::Error for OpenSlotReserved {}
+
+/// Marker attached to any error the detached open task has ALREADY logged and
+/// metered (#1143).
+///
+/// The task is the only party guaranteed to observe an open's outcome — every
+/// caller may have timed out and left with [`ChannelOpenPending`] — so the task,
+/// not the caller, is the reporter. But a caller that *was* still waiting receives
+/// the same error, and would otherwise log and count it a second time. This marker
+/// lets `record_channel_open_failure` recognise "already reported" and stay quiet,
+/// so `decdn_node_pull_channel_open_failures_total` counts opens that failed, not
+/// opens that failed while someone happened to be listening.
+#[derive(Debug)]
+pub struct OpenReported;
+
+impl std::fmt::Display for OpenReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reported by the buyer channel open task")
+    }
+}
+
+impl std::error::Error for OpenReported {}
+
+/// The outcome of a detached open, as seen by everyone waiting on it.
+///
+/// `Ok(())` carries no channel: a successful open *persists* to the store, so a
+/// waiter simply re-reads it (`try_reuse_live`). The error side is an
+/// `Arc<anyhow::Error>` because [`SharedOpen`] hands the same outcome to every
+/// waiter and `anyhow::Error` is not `Clone`; [`rehydrate_open_error`] turns it
+/// back into a per-waiter error that still `downcast_ref`s to its
+/// [`ChannelOpenFailureReason`].
+type OpenOutcome = Result<(), Arc<anyhow::Error>>;
+
+/// A cloneable handle to an in-flight open. Every caller that arrives while an
+/// open for the provider is running joins THIS future rather than starting a
+/// second `openChannel` (which would escrow a second deposit).
+type SharedOpen = futures_util::future::Shared<BoxFuture<'static, OpenOutcome>>;
+
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Rebuild a per-waiter `anyhow::Error` from the shared outcome, preserving the
+/// [`ChannelOpenFailureReason`] so `record_channel_open_failure`'s `downcast_ref`
+/// still classifies it (`insufficient_deposit` / `contract_revert` / `rpc_error`)
+/// instead of logging `unclassified`. The alternative — handing every waiter the
+/// same `Arc` — would not satisfy the `anyhow::Error` return type, and stringifying
+/// would silently lose the reason.
+/// Only the markers re-attached below survive; every other typed layer (the
+/// `StoreError` from `store.record`, the underlying alloy transport error) is
+/// flattened into the message. Nothing downcasts those off this path today, but a
+/// future sentinel added to the open path MUST be re-attached here or it will
+/// silently vanish — and only for callers that *joined* an open, never for the one
+/// that started it, which is the nastiest possible way for it to fail.
+fn rehydrate_open_error(err: &Arc<anyhow::Error>) -> anyhow::Error {
+    let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
+    let reported = err.downcast_ref::<OpenReported>().is_some();
+    let reserved = err
+        .downcast_ref::<OpenSlotReserved>()
+        .map(|r| OpenSlotReserved {
+            provider: r.provider,
+        });
+    // `{:#}` renders the whole context chain, so the waiter's message matches what
+    // the opening task saw.
+    let mut rebuilt = anyhow::anyhow!("{err:#}");
+    if let Some(reason) = reason {
+        rebuilt = rebuilt.context(reason);
+    }
+    if reported {
+        rebuilt = rebuilt.context(OpenReported);
+    }
+    // A joiner is the ONLY consumer of a reserved slot (the reconciler never awaits
+    // its own parked future), so dropping this here would mean the sentinel is never
+    // seen by anyone — the exact failure mode the doc above warns about.
+    if let Some(reserved) = reserved {
+        rebuilt = rebuilt.context(reserved);
+    }
+    rebuilt
+}
+
+/// RAII slot in the per-provider in-flight-open map. Dropping it removes the
+/// provider so every path out of the open task — success, error, or panic —
+/// releases the slot and the provider is never wedged. See
 /// [`BuyerChannelService::opens_in_flight`].
+///
+/// The guard is held by the DETACHED OPEN TASK, not by the caller (#1143). That is
+/// the whole point: a caller whose budget expires drops its *view* of the open, but
+/// the task — and therefore the slot — lives until the `openChannel` actually
+/// resolves. Release the slot while a tx is still in the mempool and the next miss
+/// opens a SECOND channel to the same provider; the boot reconcile scan then
+/// declines to adopt the first (`ReconcileOutcome::DeferredSecondOpen`), leaving its
+/// deposit unreclaimed until the live row clears — by which point the orphan's
+/// `ChannelOpened` is likely outside the ~2-day event lookback
+/// (`BUYER_RECONCILE_LOOKBACK_BLOCKS`) and it is not found at all.
+///
+/// This is the same reasoning that keeps `openChannel`'s receipt wait unbounded (see
+/// `decdn_client_pull::buyer_channel::open_channel`), and the two must not drift: a
+/// bound there would release the slot for exactly the same reason and produce exactly
+/// the same stranded deposit.
 struct InFlightOpenGuard {
-    set: Arc<Mutex<HashSet<Address>>>,
+    map: Arc<Mutex<HashMap<Address, SharedOpen>>>,
     provider: Address,
 }
 
 impl InFlightOpenGuard {
-    /// Claim the open slot for `provider`. Returns `Ok(None)` when an open for
-    /// that provider is already in flight (the caller bails for retry), or
-    /// `Ok(Some(guard))` holding the slot until drop. Folding the set-insert and
-    /// the guard into one constructor makes the one-open-per-provider invariant
-    /// impossible to violate by construction: a guard cannot exist without a
-    /// successful claim, and a claim cannot succeed without yielding a guard.
-    fn claim(set: &Arc<Mutex<HashSet<Address>>>, provider: Address) -> Result<Option<Self>> {
+    /// Claim a provider's open slot for a writer that is NOT performing an
+    /// `openChannel` — the boot reconcile scan, which re-hydrates an orphaned
+    /// channel's row and so is a second writer to the provider-keyed store.
+    /// Returns `Ok(None)` when a real open is already in flight, in which case the
+    /// reconciler skips (that open will persist the authoritative channel).
+    ///
+    /// The slot is parked with [`reserved_open`] rather than a live open, so a
+    /// cache-miss arriving mid-reconcile is told to retry instead of racing a
+    /// competing `openChannel` into the same provider row.
+    fn claim(
+        map: &Arc<Mutex<HashMap<Address, SharedOpen>>>,
+        provider: Address,
+    ) -> Result<Option<Self>> {
         // Acquisition treats a poisoned lock as fatal (`?`-bail) — unlike `Drop`
-        // below, which must still release the slot. The set carries no
-        // cross-element invariant, but refusing to *acquire* on a poisoned lock
-        // surfaces the prior panic instead of papering over it.
-        let mut in_flight = set
+        // below, which must still release the slot. Refusing to *acquire* on a
+        // poisoned lock surfaces the prior panic instead of papering over it.
+        let mut in_flight = map
             .lock()
             .map_err(|err| anyhow::anyhow!("opens_in_flight mutex poisoned: {err}"))?;
-        if !in_flight.insert(provider) {
+        if in_flight.contains_key(&provider) {
             return Ok(None);
         }
+        in_flight.insert(provider, reserved_open(provider));
         Ok(Some(Self {
-            set: Arc::clone(set),
+            map: Arc::clone(map),
             provider,
         }))
     }
+
+    /// Run `body` under `provider`'s open slot, releasing it when `body` returns — the ONLY
+    /// safe way for a non-opening writer (the reconcile scan) to hold a claim.
+    ///
+    /// The guard is never bound at the call site, so it cannot be dropped early: the
+    /// `let Some(_open_guard) = claim(..)` → `let Some(_) = claim(..)` edit — one character
+    /// from releasing the slot with a live open racing the reconciler onto the same provider
+    /// row, orphaning one of the two channels and stranding its deposit — is simply
+    /// unavailable, exactly as [`Self::spawn_open`] makes it unavailable on the opening path
+    /// (#1145 review). `Ok(None)` means a real open is already in flight; the caller skips,
+    /// because that open persists the authoritative channel.
+    fn under_claim<T>(
+        map: &Arc<Mutex<HashMap<Address, SharedOpen>>>,
+        provider: Address,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let Some(_guard) = Self::claim(map, provider)? else {
+            return Ok(None);
+        };
+        // `_guard` is in scope for the whole call and drops here, after `body` — so the slot
+        // is held for exactly the body's lifetime and released on every exit (including a
+        // panic unwind, via `Drop`).
+        body().map(Some)
+    }
+
+    /// Reserve `provider`'s slot and run `open` under it in a DETACHED task, returning the
+    /// joinable outcome. This is the ONLY way to obtain a guard for a real open.
+    ///
+    /// It exists to make the invariant in this type's doc — *the task owns the guard* —
+    /// structural rather than remembered. Written out at the call site it is
+    /// `let _guard = guard;` inside the spawned future, one character from
+    /// `let _ = guard;`, which drops the guard on the task's first line and releases the
+    /// slot with an `openChannel` still in the mempool. That is the stranded-deposit bug
+    /// this guard exists to prevent, it is a change a reader would wave through, and no
+    /// compiler diagnostic stands between the two. Here it is written once, under test, and a
+    /// caller cannot express the wrong thing: this is the only way to obtain a guard for a real
+    /// OPEN, and the guard never exists outside the task. (The non-opening reconcile scan takes
+    /// a guard via [`Self::claim`], but only through [`Self::under_claim`], which likewise never
+    /// binds it at a call site — see there.)
+    ///
+    /// `in_flight` is the CALLER'S LOCKED map, and taking it is what makes the reservation
+    /// real (#1145 review). This function's doc has always said it "reserves the slot" — but
+    /// it did not: it built the guard, and the matching `insert` lived twenty lines away in
+    /// `join_or_spawn_open`. So the pairing was asymmetric — RELEASE in the type (`Drop`,
+    /// unconditional), ACQUIRE in the caller — and the invariant "a guard exists ⇒ the slot
+    /// is occupied" was caller-maintained. A future caller who reached for `spawn_open` and
+    /// did not also remember the insert would get a guard, get no singleflight, and let the
+    /// next miss open a SECOND `openChannel`: the double-escrowed deposit this whole
+    /// mechanism exists to prevent. Doing the insert here makes guard construction and slot
+    /// reservation one indivisible statement, under the lock the caller already holds.
+    ///
+    /// The `JoinError` leg is handled here for the same reason. It fires when the open
+    /// task PANICS — and the wrapper it lands in is only ever polled by a caller, so with
+    /// a `CHANNEL_OPEN_CALLER_BUDGET` of seconds against an unbounded receipt wait, the
+    /// overwhelmingly likely case is that nobody is left to poll it. Reporting here rather
+    /// than in the returned error is what stops a panicking open from being observed by
+    /// nobody at all. (The slot still releases: `Drop` runs on unwind.)
+    fn spawn_open<F>(
+        map: &Arc<Mutex<HashMap<Address, SharedOpen>>>,
+        in_flight: &mut HashMap<Address, SharedOpen>,
+        provider: Address,
+        metrics: &Arc<Metrics>,
+        open: F,
+    ) -> SharedOpen
+    where
+        F: Future<Output = Result<(), Arc<anyhow::Error>>> + Send + 'static,
+    {
+        let guard = Self {
+            map: Arc::clone(map),
+            provider,
+        };
+        let opening = tokio::spawn(async move {
+            // Dropped when the task ends (any path, including a panic unwind),
+            // releasing the provider slot — and NOT before.
+            let _guard = guard;
+            open.await
+        });
+
+        // A SPAWNED supervisor, not a combinator on the returned future.
+        //
+        // This distinction is the whole fix, and it is subtle enough to be worth spelling
+        // out. A `Shared` advances only when some clone is POLLED, and after
+        // the caller's budget expires the only clone left is the one parked in
+        // `opens_in_flight`, which nobody polls. So a `handle.await.unwrap_or_else(report)`
+        // written here would fire the report exactly when a caller was still waiting — and
+        // stay silent in the no-caller case it exists for. Worse, when the panicking task's
+        // guard then removes the map entry, the last clone drops and the future is
+        // destroyed having never run at all.
+        //
+        // A spawned task is driven by the runtime whether or not anyone awaits it, so the
+        // report happens either way. The panic that matters lands during the unbounded
+        // receipt wait — minutes long, no caller by construction — which is precisely when
+        // an `openChannel` may already be in the mempool: an escrowed deposit with no
+        // persisted row, recoverable only by the boot reconcile scan. Making that visible
+        // is this leg's entire purpose.
+        let metrics = Arc::clone(metrics);
+        let supervised = tokio::spawn(async move {
+            match opening.await {
+                Ok(outcome) => outcome,
+                Err(join_err) => {
+                    metrics.node_pull_channel_open_failure();
+                    error!(
+                        %provider,
+                        %join_err,
+                        "buyer channel open task died (panicked or was aborted); if its \
+                         openChannel had already been broadcast the deposit is escrowed with \
+                         no persisted row, and only the boot reconcile scan will recover it"
+                    );
+                    // `OpenReported` so a caller that IS still waiting doesn't count this a
+                    // second time — the supervisor above is the report.
+                    Err(Arc::new(
+                        anyhow::anyhow!("buyer channel open task failed: {join_err}")
+                            .context(OpenReported),
+                    ))
+                }
+            }
+        });
+
+        let fut: BoxFuture<'static, OpenOutcome> = Box::pin(async move {
+            // The supervisor only awaits and reports, so it cannot panic; this arm is
+            // reachable only if the runtime aborts it at shutdown, where a caller is the
+            // one party that could still be listening.
+            supervised.await.unwrap_or_else(|join_err| {
+                Err(Arc::new(anyhow::anyhow!(
+                    "buyer channel open supervisor failed: {join_err}"
+                )))
+            })
+        });
+        let shared = fut.shared();
+        // THE reservation, and it belongs here — beside the guard whose `Drop` is what
+        // releases it. Under the caller's lock, so the check-then-insert in
+        // `join_or_spawn_open` stays atomic and two concurrent misses cannot both open.
+        in_flight.insert(provider, shared.clone());
+        shared
+    }
+}
+
+/// The slot value parked by a non-opening claimant ([`InFlightOpenGuard::claim`]).
+/// A pull that joins it is told to retry — it must not proceed to open, because the
+/// claimant is mid-write on this provider's row; and it must not wait, because the
+/// claimant will never produce a channel for it.
+fn reserved_open(provider: Address) -> SharedOpen {
+    let fut: BoxFuture<'static, OpenOutcome> = Box::pin(std::future::ready(Err(Arc::new(
+        anyhow::Error::new(OpenSlotReserved { provider }),
+    ))));
+    fut.shared()
 }
 
 impl Drop for InFlightOpenGuard {
     fn drop(&mut self) {
-        // A poisoned lock means a prior holder panicked; recover the inner set
+        // A poisoned lock means a prior holder panicked; recover the inner map
         // and still release the slot rather than leaving the provider stuck.
-        let mut set = self
-            .set
+        let mut map = self
+            .map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set.remove(&self.provider);
+        map.remove(&self.provider);
     }
+}
+
+/// RAII claim on a provider's slot in [`BuyerChannelService::topups_in_flight`]
+/// (#1146). Held by the detached refill task; its `Drop` frees the provider so a
+/// task that finishes OR panics never wedges future refills to that provider.
+struct RefillSlot {
+    set: Arc<Mutex<HashSet<Address>>>,
+    provider: Address,
+}
+
+impl Drop for RefillSlot {
+    fn drop(&mut self) {
+        // Recover a poisoned lock (a prior holder panicked) and still release the
+        // slot, mirroring `InFlightOpenGuard`.
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.provider);
+    }
+}
+
+/// Claim the background-refill slot for `provider`, or `None` if a refill is
+/// already in flight for it (per-provider dedup, #1146). A low-water refill is
+/// best-effort, so it must never propagate a panic into the pull path: a poisoned
+/// lock (a prior holder panicked while holding it) is RECOVERED via
+/// `PoisonError::into_inner` and the claim proceeds, mirroring [`RefillSlot::drop`].
+/// The critical section is a single `HashSet` insert that cannot leave the set
+/// inconsistent, so recovering is safe — and, unlike declining on poison, keeps
+/// refills self-healing rather than permanently disabled after the first panic.
+fn claim_refill_slot(set: &Arc<Mutex<HashSet<Address>>>, provider: Address) -> Option<RefillSlot> {
+    let mut guard = set
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !guard.insert(provider) {
+        return None; // a refill for this provider is already running
+    }
+    drop(guard);
+    Some(RefillSlot {
+        set: Arc::clone(set),
+        provider,
+    })
+}
+
+/// The low-water top-up amount for a reused channel (#1146, #1103): `U256::ZERO`
+/// when the remaining deposit still has headroom, else the amount that restores
+/// it to the working `target`. `target = max(deposit_hint, default_deposit,
+/// min_deposit)` — the same deposit a fresh open would fund (see
+/// [`BuyerChannelService::join_or_spawn_open`]) — and the trigger is
+/// `target / LOW_WATER_DIVISOR` (20% remaining). `deposit` / `prior_amount` are
+/// the reused channel's on-chain deposit and cumulative vouchered amount, read
+/// straight off the [`ChannelContext`] the reuse path already built — no extra
+/// store read. Pure so the policy is unit-testable; the shared [`refill_amount`]
+/// kernel is the same one the CLI fetch auto-refill uses.
+fn refill_decision(
+    deposit: U256,
+    prior_amount: U256,
+    deposit_hint: U256,
+    default_deposit: U256,
+    min_deposit: U256,
+) -> U256 {
+    let target = deposit_hint.max(default_deposit).max(min_deposit);
+    let low_water = target / U256::from(LOW_WATER_DIVISOR);
+    refill_amount(deposit, prior_amount, target, low_water)
 }
 
 /// Buyer-side `PaymentChannel` service. Generic over the alloy [`Provider`]
@@ -204,14 +604,30 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     self_address: Address,
     min_deposit: U256,
     default_deposit: U256,
-    /// Providers with an `openChannel` currently in flight. Makes the
-    /// one-channel-per-provider invariant real (PR #753 review): a concurrent
-    /// [`Self::open_or_reuse_channel`] for a provider already mid-open bails for
-    /// retry instead of escrowing a second deposit whose `record` would orphan
-    /// the first. Only the open path touches this set — pure reuse never
-    /// contends, so many concurrent pulls to an already-open provider proceed
+    /// Providers with an `openChannel` currently in flight, each mapped to a
+    /// cloneable handle on the detached task performing it (#1143).
+    ///
+    /// Makes the one-channel-per-provider invariant real (PR #753 review): a
+    /// concurrent [`Self::open_or_reuse_channel`] for a provider already mid-open
+    /// JOINS the running open instead of escrowing a second deposit whose `record`
+    /// would orphan the first. Only the open path touches this map — pure reuse
+    /// never contends, so many concurrent pulls to an already-open provider proceed
     /// freely.
-    opens_in_flight: Arc<Mutex<HashSet<Address>>>,
+    ///
+    /// In-memory: it is a process-local dedup, not a durable ledger. What survives a
+    /// restart is the persisted channel row (and, for an open that landed without
+    /// one, the boot-time `reconcile_orphans_once` scan).
+    opens_in_flight: Arc<Mutex<HashMap<Address, SharedOpen>>>,
+    /// Providers with a background low-water top-up currently in flight (#1146).
+    ///
+    /// A reused channel whose remaining deposit has run below its low-water mark
+    /// is topped up by a detached, best-effort task so a sustained series of miss
+    /// pulls to one provider is never silently stranded by a spent-down deposit.
+    /// This set dedups those tasks per provider: many concurrent reuse pulls to
+    /// the same provider fire at most one `topUp` tx. In-memory only — a
+    /// process-local dedup, not a durable ledger; the slot is freed when the task
+    /// finishes or panics (see [`RefillSlot`]).
+    topups_in_flight: Arc<Mutex<HashSet<Address>>>,
     /// Per-channel consecutive `try_reclaim`-failure tally (#906), shared between
     /// the background reclaim loop and [`Self::sweep_expired_once`]. In-memory
     /// only: a restart resets it, so a persistent failure re-escalates after
@@ -305,7 +721,9 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         // Shared per-provider in-flight-open set: the reconciler claims the same
         // slots the live open path uses, so its re-hydration can never overwrite a
         // channel a concurrent cache-miss open just recorded.
-        let opens_in_flight = Arc::new(Mutex::new(HashSet::new()));
+        let opens_in_flight = Arc::new(Mutex::new(HashMap::new()));
+        // Per-provider dedup for background low-water top-ups (#1146).
+        let topups_in_flight = Arc::new(Mutex::new(HashSet::new()));
 
         // One-shot bootstrap reconciliation (#763): re-hydrate any on-chain
         // channel this node opened but lost track of (record/decode failed
@@ -351,6 +769,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             min_deposit,
             default_deposit,
             opens_in_flight,
+            topups_in_flight,
             reclaim_failures,
             metrics,
             _reclaimer: AbortOnDrop(reclaimer),
@@ -393,144 +812,313 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// hint is ignored when an existing channel is reused (call
     /// [`Self::top_up`] to add funds to a live channel).
     ///
-    /// # Errors
+    /// # Bounding (#1143)
     ///
-    /// Surfaces store errors and any failure of the `openChannel` transaction
-    /// (submit, revert, or receipt). Also errors if a tracked-but-expired
-    /// channel for `provider_addr` could not be reclaimed first (so its deposit
-    /// is never silently dropped — see below); retry once the reclaim sweep
-    /// clears it.
+    /// `budget` bounds how long the CALLER waits — not how long the open runs. When
+    /// it expires this returns [`ChannelOpenPending`] and the open **keeps going**
+    /// in a detached task.
+    ///
+    /// That split exists because the two clocks want incompatible values. A
+    /// cache-miss must give up on a provider in seconds so the candidate loop can
+    /// try the next one; a broadcast `openChannel` tx may legitimately need minutes
+    /// to mine on a slow L2. Shortening the wait cannot satisfy both. The obvious
+    /// fix — `tokio::time::timeout` around the whole thing — is worse than useless
+    /// here: it drops the future mid-flight, abandoning an `openChannel` that can
+    /// still land, so the deposit is escrowed for a channel nobody is tracking.
+    ///
+    /// So: don't cancel the open, just stop waiting on it. The task owns the tx and
+    /// persists the channel if it lands, and the next pull to this provider reuses
+    /// it. Nothing is abandoned; the caller is merely told "not yet".
     ///
     /// # Concurrency
     ///
-    /// Opens are serialized per provider via an in-flight-open set. Concurrent
-    /// `open_or_reuse_channel` calls for the *same* `provider_addr` that both
-    /// miss the reuse fast-path race for one open slot: the winner opens, the
-    /// others bail with a retryable error (the resulting channel is reused on
-    /// retry). This enforces the one-channel-per-provider invariant — two racing
-    /// opens would otherwise each escrow a deposit and the second `record` would
-    /// orphan the first. Pure reuse of an already-open channel never contends,
-    /// and opens for *distinct* providers run in parallel.
-    // Fast-path reuse → per-provider open guard → re-check → reclaim-expired →
-    // open → decode → persist; the early-return guards read more clearly inline.
-    #[allow(clippy::cognitive_complexity)]
+    /// Opens are singleflighted per provider. A caller that arrives while an open is
+    /// running JOINS it rather than starting a second `openChannel` — two racing
+    /// opens would each escrow a deposit, and the provider-keyed store means the
+    /// second `record` would orphan the first. Pure reuse of a live channel never
+    /// contends (it does not even take the map lock), and opens for *distinct*
+    /// providers run in parallel.
+    ///
+    /// The in-flight slot is held by the TASK, not the caller. A caller that times
+    /// out must not release it: its tx may still be in the mempool, and the next
+    /// miss would then open a second channel to the same provider — one the boot
+    /// reconcile scan explicitly declines to adopt (`DeferredSecondOpen`), stranding
+    /// its deposit indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// [`ChannelOpenPending`] when `budget` expires with the open still running.
+    /// Otherwise: store errors, any failure of the `openChannel` transaction
+    /// (submit, revert, or receipt — carrying a [`ChannelOpenFailureReason`] the
+    /// caller can `downcast_ref`), or a tracked-but-expired channel that could not
+    /// be reclaimed first (so its deposit is never silently dropped; retry once the
+    /// reclaim sweep clears it).
     pub async fn open_or_reuse_channel(
         &self,
         provider_addr: Address,
         deposit_hint: U256,
+        budget: Duration,
     ) -> Result<ChannelContext> {
-        // Fast path: reuse a live channel without touching the in-flight set, so
+        // Fast path: reuse a live channel without touching the in-flight map, so
         // many concurrent pulls to an already-open provider never serialize.
-        if let Some(ctx) = self.try_reuse_live(provider_addr)? {
+        if let Some(ctx) = self.reuse_live_or_report(provider_addr)? {
+            // Non-blocking: if this channel has run below its low-water mark, kick
+            // off a detached top-up (#1146) so a later reuse isn't stranded, and
+            // hand THIS pull the current channel immediately — the refill must not
+            // sit in the hot reuse path behind an on-chain `topUp`. The decision
+            // reads the deposit/watermark off `ctx` (already built by the reuse
+            // read above), so the fast path takes no second store read.
+            self.spawn_refill_if_low(provider_addr, deposit_hint, &ctx);
             return Ok(ctx);
         }
 
-        // No live channel — we are about to open (or rotate an expired one).
-        // Claim the per-provider open slot; if another open is already in flight
-        // for this provider, bail for retry rather than escrow a second deposit
-        // whose `record` would orphan the first.
-        let Some(_open_guard) = InFlightOpenGuard::claim(&self.opens_in_flight, provider_addr)?
-        else {
-            anyhow::bail!(
-                "openChannel for provider {provider_addr} is already in flight; retry once it \
-                 completes (the resulting channel will be reused)"
-            );
-        };
+        let open = self.join_or_spawn_open(provider_addr, deposit_hint)?;
 
-        // Re-check under the slot: a concurrent open may have created the channel
-        // between the fast-path miss and claiming the slot (closes the TOCTOU).
-        if let Some(ctx) = self.try_reuse_live(provider_addr)? {
-            return Ok(ctx);
-        }
-
-        // Any record still present here is expired (the re-check above returned
-        // for a live one). Reclaim its deposit BEFORE rotating: the store is
-        // provider-keyed, so opening a replacement would overwrite the expired
-        // record and the reclaim sweep (which iterates `load_all`) would never
-        // see it — silently abandoning a refundable deposit (10 USDC default +
-        // any top-ups). `try_reclaim` is best-effort and CAS-forgets on success.
-        if let Some(existing) = self
-            .store
-            .get_by_provider(provider_addr)
-            .context("look up expired buyer channel before reopen")?
-        {
-            debug!(
-                provider = %provider_addr,
-                channel_id = %existing.channel_id,
-                "tracked buyer channel expired; reclaiming before opening a replacement"
-            );
-            // Outcome intentionally ignored here: a persistent failure on this
-            // one-off open-path reclaim is already surfaced to the caller as a
-            // retryable error below — the consecutive-failure escalation (#906)
-            // is the background sweep's job, not this synchronous open.
-            let _ = try_reclaim(&self.contract, &self.store, self.self_address, &existing).await;
-            // If the expired record is still present (reclaim hit an RPC error,
-            // or the chain clock has not yet reached expiry under host-clock
-            // skew), do NOT open a replacement that would overwrite and orphan
-            // it — surface an error so the caller retries after the sweep clears
-            // it. This trades a transient open failure for never dropping funds.
-            if self
-                .store
-                .get_by_provider(provider_addr)
-                .context("re-check expired channel after reclaim")?
-                .is_some_and(|s| s.channel_id == existing.channel_id)
-            {
-                anyhow::bail!(
-                    "expired buyer channel {} (provider {provider_addr}) is not yet reclaimable; \
-                     retry after the reclaim sweep clears it",
-                    existing.channel_id
+        match tokio::time::timeout(budget, open).await {
+            // Still running. The task owns the tx; hand the caller a typed "not
+            // yet" so it can move to the next candidate.
+            Err(_) => Err(anyhow::Error::new(ChannelOpenPending {
+                provider: provider_addr,
+                waited: budget,
+            })),
+            Ok(Err(err)) => Err(rehydrate_open_error(&err)),
+            // The task persisted the channel before it signalled, so re-reading the
+            // store is how we collect the result — that is also exactly what a
+            // *later* pull would do, so success and reuse share one code path.
+            Ok(Ok(())) => self.reuse_live_or_report(provider_addr)?.ok_or_else(|| {
+                self.metrics.node_pull_channel_open_failure();
+                error!(
+                    provider = %provider_addr,
+                    "buyer channel opened on-chain but is not live in the store — a deposit \
+                     is escrowed against a row we cannot see"
                 );
-            }
+                anyhow::anyhow!(
+                    "buyer channel for provider {provider_addr} opened but is not live in the \
+                     store (expired between open and read?)"
+                )
+                .context(OpenReported)
+            }),
         }
-
-        self.open_and_persist(provider_addr, deposit_hint).await
     }
 
-    /// Open a fresh channel on-chain against `provider_addr` and persist it.
-    /// Called by [`Self::open_or_reuse_channel`] once it holds the per-provider
-    /// open slot and has confirmed no live channel exists. The deposit is
-    /// `max(deposit_hint, default_deposit, min_deposit)`.
-    async fn open_and_persist(
+    /// [`Self::try_reuse_live`], reporting a store fault at the severity it deserves.
+    ///
+    /// This is the leg a SUSTAINED store fault actually takes — a corrupt page, fd
+    /// exhaustion, an unwritable `data_dir`. It runs before the open task is spawned, so
+    /// `run_open`'s loud store leg does not cover it: that one only fires when the read
+    /// here SUCCEEDED and the in-task read then failed, i.e. an intermittent blip. Left
+    /// bare, the persistent fault — the one that makes this node unable to open a channel
+    /// to ANY provider — was the quieter of the two.
+    ///
+    /// Metered and marked [`OpenReported`], so the caller-side ladder does not restate it.
+    fn reuse_live_or_report(&self, provider_addr: Address) -> Result<Option<ChannelContext>> {
+        self.try_reuse_live(provider_addr).map_err(|err| {
+            self.metrics.node_pull_channel_open_failure();
+            error!(
+                provider = %provider_addr,
+                error = %format!("{err:#}"),
+                "buyer channel store read failed; this node can neither open nor reuse a \
+                 channel to any provider until the store recovers"
+            );
+            err.context(OpenReported)
+        })
+    }
+
+    /// The synchronous decision behind [`Self::spawn_refill_if_low`]: given the
+    /// reused channel's `deposit` and cumulative `prior_amount` (read off the
+    /// [`ChannelContext`] the reuse path already built — no second store read), if
+    /// its remaining deposit is below the low-water mark, claim the per-provider
+    /// refill slot and return it with the top-up amount. `None` means nothing to
+    /// do — still has headroom, or a refill is already in flight for this provider.
+    /// The channel is known-live: `spawn_refill_if_low` is only called after the
+    /// reuse gate (`try_reuse_live`) returns a non-expired channel, so there is no
+    /// expiry or store-fault branch to handle here. Split out from the spawn so the
+    /// decision + claim is unit-testable without spawning the on-chain task.
+    fn plan_refill(
         &self,
         provider_addr: Address,
         deposit_hint: U256,
-    ) -> Result<ChannelContext> {
-        let deposit = deposit_hint.max(self.default_deposit).max(self.min_deposit);
-
-        // The openChannel tx, the authoritative ChannelOpened-from-receipt
-        // decode, and the state/ctx construction are the shared kernel (#940).
-        // What stays node-specific: from the moment the kernel returns, the
-        // deposit is escrowed on-chain, so a failure to persist locally leaves
-        // it tracked ONLY on-chain. The reclaim sweep iterates `load_all` and so
-        // never sees an unpersisted channel, so we escalate to `error!` with the
-        // open tx for manual reconcile (the bootstrap reconciliation scan, #763,
-        // also covers this on the next restart).
-        let OpenedChannel { state, ctx, tx } = open_channel(
-            &self.contract,
-            Arc::clone(&self.signer),
-            &self.voucher_domain,
-            self.token,
-            self.self_address,
-            provider_addr,
+        deposit: U256,
+        prior_amount: U256,
+    ) -> Option<(RefillSlot, U256)> {
+        let additional = refill_decision(
             deposit,
-        )
-        .await?;
-
-        if let Err(err) = self.store.record(&state) {
-            error!(
-                %tx,
-                provider = %provider_addr,
-                channel_id = %state.channel_id,
-                %deposit,
-                %err,
-                "buyer channel opened on-chain (deposit escrowed) but persisting the local record \
-                 failed; the deposit is UNTRACKED and will not be auto-reclaimed — reconcile \
-                 manually against the tx"
-            );
-            return Err(err).context("persist newly-opened buyer channel");
+            prior_amount,
+            deposit_hint,
+            self.default_deposit,
+            self.min_deposit,
+        );
+        if additional.is_zero() {
+            return None; // still above the low-water mark
         }
 
-        Ok(ctx)
+        // `None` here = a refill for this provider is already in flight (dedup).
+        let slot = claim_refill_slot(&self.topups_in_flight, provider_addr)?;
+        Some((slot, additional))
+    }
+
+    /// Best-effort background top-up of a reused channel that has run below its
+    /// low-water mark (#1146). Spawns a detached task and returns immediately — it
+    /// NEVER blocks the pull: a synchronous on-chain `topUp` (seconds-to-minutes on
+    /// a slow L2) must not sit in the non-serializing reuse fast path, so the
+    /// current pull proceeds on the existing deposit and the refill lands for a
+    /// later reuse. Deduped per provider via [`Self::topups_in_flight`], so many
+    /// concurrent reuse pulls fire at most one `topUp`.
+    ///
+    /// Every leg is advisory: an already-in-flight refill, an allowance failure, or
+    /// a reverted `topUp` all just skip the refill (logged / metered), leaving the
+    /// pre-#1146 behavior — the channel is simply not topped up, which is strictly
+    /// no worse. A channel already fully drained *now* still fails *this* pull and
+    /// heals on the next; the 20% low-water trigger means the refill normally fires
+    /// with headroom to spare.
+    ///
+    /// `ctx` is the reused channel's context (from the reuse read); its `deposit` /
+    /// `prior_amount` drive the low-water decision, so this takes no store read.
+    fn spawn_refill_if_low(
+        &self,
+        provider_addr: Address,
+        deposit_hint: U256,
+        ctx: &ChannelContext,
+    ) {
+        let Some((slot, additional)) =
+            self.plan_refill(provider_addr, deposit_hint, ctx.deposit, ctx.prior_amount)
+        else {
+            return;
+        };
+
+        let contract = self.contract.clone();
+        let store = Arc::clone(&self.store);
+        let rpc = self.contract.provider().clone();
+        let token = self.token;
+        let self_address = self.self_address;
+        let payment_channel_addr = *self.contract.address();
+        let metrics = Arc::clone(&self.metrics);
+
+        tokio::spawn(async move {
+            // Freed on task completion OR panic, so a wedged refill never blocks
+            // future refills to this provider.
+            let _slot = slot;
+
+            // Daemon posture: ensure the standing unlimited allowance (idempotent —
+            // skips when already granted) so `topUp`'s `transferFrom` can pull the
+            // funds even if the standing approval was revoked. Mirrors bootstrap and
+            // the CLI refill's allowance step.
+            if let Err(err) =
+                ensure_allowance(&rpc, token, self_address, payment_channel_addr, None).await
+            {
+                warn!(
+                    provider = %provider_addr,
+                    %additional,
+                    error = %format!("{err:#}"),
+                    "buyer refill: ensure_allowance failed; reused channel not topped up"
+                );
+                metrics.buyer_topup_failure();
+                return;
+            }
+
+            match decdn_client_pull::buyer_channel::top_up(
+                &contract,
+                store.as_ref(),
+                provider_addr,
+                additional,
+            )
+            .await
+            {
+                Ok(DepositOutcome::Added(_)) => {
+                    info!(
+                        provider = %provider_addr,
+                        %additional,
+                        "buyer refill: topped up reused channel below its low-water mark (#1146)"
+                    );
+                    metrics.buyer_topup_ok();
+                }
+                // The topUp landed on-chain but the local row vanished or rotated
+                // during the RPC (`top_up` already logged it at error!/warn! with
+                // the tx for reconcile). Funds are escrowed-but-untracked — NOT a
+                // clean success, so meter it as a failure rather than
+                // `buyer_topup_ok`, or an operator watching the failure metric
+                // would miss stranded deposits (#1146 review).
+                Ok(DepositOutcome::UnknownProvider | DepositOutcome::ChannelMismatch) => {
+                    metrics.buyer_topup_failure();
+                }
+                Err(err) => {
+                    warn!(
+                        provider = %provider_addr,
+                        %additional,
+                        error = %format!("{err:#}"),
+                        "buyer refill: topUp failed; reused channel not topped up"
+                    );
+                    metrics.buyer_topup_failure();
+                }
+            }
+        });
+    }
+
+    /// Join the in-flight open for `provider_addr`, or spawn one.
+    ///
+    /// The map lock is what serializes this: the check and the insert happen under
+    /// one acquisition, so two callers cannot both decide to spawn. Nothing is
+    /// awaited while it is held.
+    fn join_or_spawn_open(&self, provider_addr: Address, deposit_hint: U256) -> Result<SharedOpen> {
+        // A poisoned lock is terminal for this node's buyer side: acquisition bails
+        // (unlike `Drop`, which recovers so the slot still releases), so EVERY subsequent
+        // open to EVERY provider fails here for the life of the process. Report it at that
+        // severity rather than letting it trickle out as one more unlabeled open failure.
+        let mut in_flight = self.opens_in_flight.lock().map_err(|err| {
+            self.metrics.node_pull_channel_open_failure();
+            error!(
+                provider = %provider_addr,
+                %err,
+                "opens_in_flight mutex poisoned by an earlier panic; this node can no longer \
+                 open a buyer channel to ANY provider and must be restarted"
+            );
+            anyhow::anyhow!("opens_in_flight mutex poisoned: {err}").context(OpenReported)
+        })?;
+
+        if let Some(existing) = in_flight.get(&provider_addr) {
+            debug!(
+                provider = %provider_addr,
+                "joining an openChannel already in flight for this provider"
+            );
+            return Ok(existing.clone());
+        }
+
+        // Everything the open needs, cloned so the task is `'static` and outlives
+        // any single caller.
+        let contract = self.contract.clone();
+        let store = Arc::clone(&self.store);
+        let signer = Arc::clone(&self.signer);
+        let voucher_domain = self.voucher_domain.clone();
+        let token = self.token;
+        let self_address = self.self_address;
+        let deposit = deposit_hint.max(self.default_deposit).max(self.min_deposit);
+        let metrics = Arc::clone(&self.metrics);
+
+        // `spawn_open` reserves the slot (in the map we hold locked) AND holds it in the task
+        // for the open's whole life. The guard is never constructible here, so this cannot
+        // release it early — and the reservation is no longer a separate line this caller
+        // could forget (#1145 review).
+        Ok(InFlightOpenGuard::spawn_open(
+            &self.opens_in_flight,
+            &mut in_flight,
+            provider_addr,
+            &self.metrics,
+            async move {
+                run_open(
+                    &contract,
+                    &store,
+                    signer,
+                    &voucher_domain,
+                    token,
+                    self_address,
+                    provider_addr,
+                    deposit,
+                    &metrics,
+                )
+                .await
+                .map_err(Arc::new)
+            },
+        ))
     }
 
     /// Persist the cumulative voucher totals after a delivery exchange so a
@@ -576,9 +1164,14 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             // `forget_if_channel` miss) and must not fail the already-paid pull.
             // But a delivered-and-paid voucher's progress was dropped, and a
             // *sustained* rate here would mean a `channel_id`-plumbing bug rather
-            // than the rare benign mid-pull replacement — so `warn!`, not
-            // `debug!`, to keep it observable.
+            // than the rare benign mid-pull replacement — so it is METERED, not just
+            // logged (#1145 review). It used to be a bare `warn!` + `Ok(())`, which
+            // asked an operator to watch for a trend in a signal that had no series
+            // to trend: `node_pull_progress_persist_failure` fires only on `Err`, so
+            // this path — real USDC paid, watermark discarded — was indistinguishable
+            // in metrics from a clean persist.
             AdvanceOutcome::ChannelMismatch => {
+                self.metrics.node_pull_progress_dropped();
                 warn!(
                     provider = %provider_addr,
                     %channel_id,
@@ -587,9 +1180,36 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                 );
                 Ok(())
             }
-            AdvanceOutcome::Regressed(err) => Err(anyhow::Error::new(err))
-                .with_context(|| format!("advance progress for provider {provider_addr}")),
+            // A CONCURRENT pull on this shared channel ledger already persisted a higher
+            // watermark, and the store is monotonic, so it kept the correct (higher) value and
+            // rejected ours. No voucher is lost — this is the routine outcome of two concurrent
+            // settles racing under `BuyerLedgers`, not a persist failure (#1145 review).
+            // Returning `Err` here fired `node_pull_progress_persist_failure` — the "we paid and
+            // lost the record" alert — on ordinary, healthy concurrency. Metered as benign and
+            // treated as `Ok`; a real store-write failure is still the `?` above.
+            AdvanceOutcome::Regressed(_err) => {
+                self.metrics.node_pull_progress_superseded();
+                debug!(
+                    provider = %provider_addr,
+                    %channel_id,
+                    "record_progress: a concurrent settle persisted a higher watermark first; \
+                     ours superseded (benign under the shared ledger)"
+                );
+                Ok(())
+            }
         }
+    }
+
+    /// Retire the tracked channel for `provider_addr` if it is still `channel_id`.
+    /// See [`ChannelOpener::retire_channel`] for the contract and why it exists.
+    ///
+    /// # Errors
+    ///
+    /// On store write failure.
+    pub fn retire_channel(&self, provider_addr: Address, channel_id: ChannelId) -> Result<bool> {
+        self.store
+            .forget_if_channel(provider_addr, channel_id)
+            .context("retire buyer channel")
     }
 
     /// Run one reclaim-sweep pass synchronously: reclaim the deposit of every
@@ -634,6 +1254,10 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             additional,
         )
         .await
+        // This manual entry point (used by tests / operator tooling) does not
+        // grade the escrowed-but-untracked outcomes the way the background refill
+        // does — `top_up` already logs them; drop the outcome to keep `Result<()>`.
+        .map(|_| ())
     }
 }
 
@@ -663,6 +1287,7 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
         &self,
         provider_addr: Address,
         deposit_hint: U256,
+        budget: Duration,
     ) -> Result<ChannelContext>;
 
     /// Persist the cumulative voucher totals paid on `provider_addr`'s channel so
@@ -686,6 +1311,42 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
         bytes_delivered: U256,
         amount: U256,
     ) -> Result<()>;
+
+    /// Retire the tracked channel for `provider_addr` so the next pull opens a fresh
+    /// one, IF the tracked row is still `channel_id` (#1145 review).
+    ///
+    /// Called when an upstream's voucher rejection proves the channel can never pay
+    /// again: the deposit is spent, it expired, or our watermark has desynced from
+    /// the nonce the upstream committed. Without this the channel is simply handed
+    /// back on the next miss — the reuse fast path gates only on expiry — so the provider
+    /// stays top-ranked and unable to serve a byte until the channel expires.
+    ///
+    /// Compare-and-delete on `channel_id`, for the same reason
+    /// [`Self::record_progress`] is: a concurrent open may already have replaced the
+    /// row, and retiring a channel we never used would strand its deposit.
+    ///
+    /// Returns whether a row was actually retired. Retiring the LOCAL row does not
+    /// touch on-chain state — the deposit remains escrowed and is recovered by the
+    /// settlement sweep / `reclaimExpired`, exactly as for any other channel we stop
+    /// using.
+    ///
+    /// # Errors
+    ///
+    /// On store write failure.
+    fn retire_channel(&self, provider_addr: Address, channel_id: ChannelId) -> Result<bool>;
+
+    /// The on-chain expiry (Unix seconds) of `provider_addr`'s currently-tracked channel,
+    /// or `None` if none is tracked or the implementation does not model expiry.
+    ///
+    /// Bounds wedged-provider suppression to the channel's real lifetime (#1145 review): a
+    /// channel that rejected our voucher on a terminal reason is unusable until it expires and
+    /// the reclaim sweep frees the provider for a fresh open, so that expiry is the horizon
+    /// past which the provider becomes worth ranking again. Defaults to `None` (no expiry
+    /// modelled) so an implementation that does not track channels need not override it — a
+    /// `None` horizon simply falls back to the per-`(peer, hash)` suppression.
+    fn channel_expiry(&self, _provider_addr: Address) -> Option<u64> {
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -694,8 +1355,9 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
         &self,
         provider_addr: Address,
         deposit_hint: U256,
+        budget: Duration,
     ) -> Result<ChannelContext> {
-        BuyerChannelService::open_or_reuse_channel(self, provider_addr, deposit_hint).await
+        BuyerChannelService::open_or_reuse_channel(self, provider_addr, deposit_hint, budget).await
     }
 
     fn record_progress(
@@ -714,6 +1376,21 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
             bytes_delivered,
             amount,
         )
+    }
+
+    fn retire_channel(&self, provider_addr: Address, channel_id: ChannelId) -> Result<bool> {
+        BuyerChannelService::retire_channel(self, provider_addr, channel_id)
+    }
+
+    fn channel_expiry(&self, provider_addr: Address) -> Option<u64> {
+        // The wedged channel's row is KEPT (only it can reclaim the deposit), so its expiry is
+        // readable straight from the store. An unreadable/absent row yields `None`, which falls
+        // back to per-(peer, hash) suppression rather than guessing a horizon.
+        self.store
+            .get_by_provider(provider_addr)
+            .ok()
+            .flatten()
+            .map(|state| state.expires_at)
     }
 }
 
@@ -1505,6 +2182,204 @@ async fn reclaim_once<P: Provider + Clone>(
     prune_reclaim_failures(&mut guard, &seen);
 }
 
+/// The body of a detached channel open (#1143): confirm no usable channel exists,
+/// rotate an expired one, then `openChannel` and persist.
+///
+/// Runs in a `tokio::spawn`, holding the provider's in-flight slot for its whole
+/// life, so it survives any individual caller giving up on it.
+///
+/// Returns `Ok(())` rather than the `ChannelContext`: a successful open persists to
+/// the store, and every waiter reads it back from there. That keeps "I opened it"
+/// and "someone else opened it" on one code path, which is also what makes the
+/// no-op arm below correct.
+// Linear guard-and-act sequence (reuse re-check → rotate/reclaim → open → persist);
+// the tracing macros on each failure leg inflate the metric past threshold, as on
+// `try_reclaim`. Splitting would scatter one flow across helpers.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cognitive_complexity,
+    clippy::too_many_lines
+)]
+async fn run_open<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    store: &Arc<dyn BuyerChannelStore>,
+    signer: Arc<PrivateKeySigner>,
+    voucher_domain: &Eip712Domain,
+    token: Address,
+    self_address: Address,
+    provider_addr: Address,
+    deposit: U256,
+    metrics: &Arc<Metrics>,
+) -> Result<()> {
+    // Re-check the store now that we hold the slot. The caller's fast-path miss
+    // happened BEFORE we took the map lock, so a previous open for this provider
+    // could have landed and persisted in between — and this task would otherwise
+    // escrow a second deposit for a provider that already has a live channel. The
+    // map lock alone cannot close that window: the prior open removes its map entry
+    // on completion, so a caller arriving right after sees an empty map and a
+    // populated store.
+    // Every failure leg below reports for itself — `warn!`/`error!`, the failure
+    // counter, and the `OpenReported` marker — for the same reason the `open_channel`
+    // leg does: this runs detached, so by the time it fails there may be nobody left
+    // waiting to observe the `Err`. A leg that only bubbles up an error is silent
+    // in the common case, not the rare one.
+    let existing = match store.get_by_provider(provider_addr) {
+        Ok(existing) => existing,
+        Err(err) => {
+            // A store read fault (corrupt page, fd exhaustion, a full or unwritable
+            // data_dir) makes this node unable to open a channel to ANY provider —
+            // i.e. unable to pay for anything. It must never be silent.
+            error!(
+                provider = %provider_addr,
+                %err,
+                "buyer channel store read failed under the open slot; cannot open a channel to \
+                 this provider"
+            );
+            metrics.node_pull_channel_open_failure();
+            return Err(anyhow::Error::new(err))
+                .context("look up existing buyer channel under the open slot")
+                .context(OpenReported);
+        }
+    };
+    if let Some(existing) = existing {
+        if !existing.is_expired_at(unix_now()) {
+            debug!(
+                provider = %provider_addr,
+                channel_id = %existing.channel_id,
+                "a live buyer channel appeared while claiming the open slot; not opening a second"
+            );
+            return Ok(());
+        }
+        // Expired. Reclaim its deposit BEFORE rotating: the store is provider-keyed,
+        // so opening a replacement would overwrite the expired record, and the
+        // reclaim sweep (which iterates `load_all`) would never see it again —
+        // silently abandoning a refundable deposit (10 USDC default, plus top-ups).
+        debug!(
+            provider = %provider_addr,
+            channel_id = %existing.channel_id,
+            "tracked buyer channel expired; reclaiming before opening a replacement"
+        );
+        // Outcome intentionally ignored, and the guarantee that makes that safe is
+        // NOT the caller: this runs in a detached task, so the retryable error below
+        // may reach nobody (#1143). What actually covers a failure here is
+        // `try_reclaim`'s own internal `warn!` on every leg, plus the hourly reclaim
+        // sweep, which retries and carries the consecutive-failure escalation (#906).
+        // The bail below still prevents an open from overwriting an unreclaimed row —
+        // it just cannot be relied on to REPORT anything.
+        let _ = try_reclaim(contract, store, self_address, &existing).await;
+        let after_reclaim = match store.get_by_provider(provider_addr) {
+            Ok(after) => after,
+            Err(err) => {
+                error!(
+                    provider = %provider_addr,
+                    %err,
+                    "buyer channel store read failed re-checking the expired channel after \
+                     reclaim; cannot rotate this provider's channel"
+                );
+                metrics.node_pull_channel_open_failure();
+                return Err(anyhow::Error::new(err))
+                    .context("re-check expired channel after reclaim")
+                    .context(OpenReported);
+            }
+        };
+        if after_reclaim.is_some_and(|s| s.channel_id == existing.channel_id) {
+            // The reclaim did not clear the row, so we must not open a replacement
+            // (it would overwrite the provider-keyed record and abandon the old
+            // deposit). Until the sweep clears it, this provider cannot be opened at
+            // ALL — and the caller is USUALLY long gone: when `try_reclaim` reaches its
+            // receipt wait it blocks for RECLAIM_RECEIPT_TIMEOUT (minutes) against a
+            // caller budget of seconds. Not always, though: a `getChannel` RPC error or a
+            // failed `send` returns `Failed` in milliseconds, well inside the budget, with
+            // the caller still waiting. So report it HERE — otherwise the common case is
+            // invisible and the operator sees only `node_pull_channel_open_pending`
+            // climbing, whose meaning ("a slow L2 / stuck nonce") is the wrong diagnosis
+            // entirely — and mark it `OpenReported` so the caller who IS still there does
+            // not count it twice.
+            warn!(
+                provider = %provider_addr,
+                channel_id = %existing.channel_id,
+                "expired buyer channel is not yet reclaimable; this provider cannot be opened \
+                 until the reclaim sweep clears it"
+            );
+            metrics.node_pull_channel_open_failure();
+            return Err(anyhow::anyhow!(
+                "expired buyer channel {} (provider {provider_addr}) is not yet reclaimable; \
+                 retry after the reclaim sweep clears it",
+                existing.channel_id
+            )
+            .context(OpenReported));
+        }
+    }
+
+    // The openChannel tx, the authoritative ChannelOpened-from-receipt decode, and
+    // the state construction are the shared kernel (#940). Its receipt wait is
+    // UNBOUNDED by design — see `open_channel`'s doc: abandoning an escrowing tx is
+    // how a second deposit gets opened against the same provider. This task holds
+    // the provider's slot for exactly as long as that wait runs, which is what makes
+    // it safe: no caller is blocked (they time out on their own budget), and no
+    // second open can start behind it.
+    //
+    // What stays node-specific: from the moment the kernel returns, the deposit is
+    // escrowed on-chain, so a failure to persist locally leaves it tracked ONLY on
+    // chain. The reclaim sweep iterates `load_all` and so never sees an unpersisted
+    // channel; escalate to `error!` with the open tx for manual reconcile (the
+    // bootstrap reconciliation scan, #763, also adopts it on the next restart).
+    let opened = open_channel(
+        contract,
+        signer,
+        voucher_domain,
+        token,
+        self_address,
+        provider_addr,
+        deposit,
+    )
+    .await;
+
+    let OpenedChannel { state, tx, .. } = match opened {
+        Ok(opened) => opened,
+        Err(err) => {
+            // Report HERE, not at the caller (#1143). This runs in a detached task,
+            // and by the time an open fails, every caller that was waiting on it may
+            // already have timed out and walked away with `ChannelOpenPending` — in
+            // which case nobody is left to observe the `Err`. Before this, a failed
+            // open could produce zero log lines and zero metric increments, and the
+            // legs that go silent are the ones that matter most: a reverted or
+            // under-funded open means this node cannot pay for anything.
+            let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
+            warn!(
+                provider = %provider_addr,
+                %deposit,
+                reason = reason.map_or("unclassified", ChannelOpenFailureReason::as_label),
+                err = %format!("{err:#}"),
+                "buyer channel open failed"
+            );
+            metrics.node_pull_channel_open_failure();
+            if let Some(reason) = reason {
+                metrics.channel_open_failure_by_reason(reason);
+            }
+            return Err(err.context(OpenReported));
+        }
+    };
+
+    if let Err(err) = store.record(&state) {
+        error!(
+            %tx,
+            provider = %provider_addr,
+            channel_id = %state.channel_id,
+            %deposit,
+            %err,
+            "buyer channel opened on-chain (deposit escrowed) but persisting the local record \
+             failed; the deposit is UNTRACKED and will not be auto-reclaimed — reconcile \
+             manually against the tx"
+        );
+        metrics.node_pull_channel_open_failure();
+        return Err(anyhow::Error::new(err))
+            .context("persist newly-opened buyer channel")
+            .context(OpenReported);
+    }
+    Ok(())
+}
+
 /// Reclaim one expired channel's deposit (or drop the record if the upstream
 /// already closed it). All failure modes are logged and swallowed.
 // Linear guard-and-act sequence (getChannel → status branch → reclaim →
@@ -1544,13 +2419,29 @@ async fn try_reclaim<P: Provider + Clone>(
     }
 
     let receipt = match contract.reclaimExpired(st.channel_id).send().await {
-        Ok(pending) => match pending.get_receipt().await {
-            Ok(r) => r,
-            Err(err) => {
-                warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: receipt failed");
-                return ReclaimOutcome::Failed;
+        // Bounded (#1143): `run_open` calls this on the rotate leg, INSIDE the
+        // detached open task that holds the provider's in-flight slot. An unbounded
+        // wait here would let a stuck `reclaimExpired` pin that slot for the life of
+        // the process, wedging the provider — the very starvation #1143 removes.
+        // Safe to bound precisely because a reclaim refunds rather than escrows: the
+        // row stays, the hourly sweep retries, nothing is stranded.
+        Ok(pending) => {
+            match tokio::time::timeout(RECLAIM_RECEIPT_TIMEOUT, pending.get_receipt()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(err)) => {
+                    warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: receipt failed");
+                    return ReclaimOutcome::Failed;
+                }
+                Err(_) => {
+                    warn!(
+                        channel_id = %st.channel_id,
+                        timeout = ?RECLAIM_RECEIPT_TIMEOUT,
+                        "buyer reclaim: receipt timed out; the tx may still mine and the sweep will retry"
+                    );
+                    return ReclaimOutcome::Failed;
+                }
             }
-        },
+        }
         Err(err) => {
             warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: send failed");
             return ReclaimOutcome::Failed;
@@ -1723,7 +2614,7 @@ async fn reconcile_one_opened<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn BuyerChannelStore>,
     self_address: Address,
-    opens_in_flight: &Arc<Mutex<HashSet<Address>>>,
+    opens_in_flight: &Arc<Mutex<HashMap<Address, SharedOpen>>>,
     event: &PaymentChannel::ChannelOpened,
 ) -> Result<bool> {
     // The query already topic-filters on `client == self_address` (the indexed
@@ -1744,8 +2635,103 @@ async fn reconcile_one_opened<P: Provider + Clone>(
     // could overwrite (orphan) a channel a live open just escrowed and recorded.
     // Claiming the same per-provider slot the live path uses makes the read +
     // record below atomic with respect to opens: a live open in flight → we skip
-    // (it persists the real channel); otherwise the slot is ours until drop.
-    let Some(_open_guard) = InFlightOpenGuard::claim(opens_in_flight, ch.provider)? else {
+    // (it persists the real channel); otherwise the slot is ours until the body
+    // returns. Held via `under_claim` so the guard is never bound here and cannot
+    // be dropped early — see its docs.
+    let rehydrated = InFlightOpenGuard::under_claim(opens_in_flight, ch.provider, || {
+        // Read the local row UNDER the slot so the decision + record are atomic wrt
+        // live opens. Distinguish an *unreadable* row (corrupt bytes / a future
+        // schema after a downgrade) — whose channel_id is unrecoverable from disk, so
+        // re-hydrating from chain is the repair — from a *backend/IO fault*, where the
+        // row may be perfectly healthy and overwriting it would clobber a live
+        // channel. Repair the former (treat as "no row"); skip the latter.
+        // Match every `StoreError` variant explicitly (no catch-all) so adding a
+        // future variant is a compile error that forces a repair-vs-skip decision
+        // here, rather than silently defaulting to "skip" (which would strand an
+        // orphan whose row became unreadable in a new way).
+        let existing = match store.get_by_provider(ch.provider) {
+            Ok(row) => row,
+            // Unreadable row — corrupt bytes, a future on-disk schema after a
+            // downgrade, or a decode failure. Its channel_id is unrecoverable from
+            // disk, so re-hydrating from chain is the repair: treat as "no row".
+            Err(
+                err @ (StoreError::Corrupt { .. }
+                | StoreError::UnsupportedSchema { .. }
+                | StoreError::Codec(_)),
+            ) => {
+                warn!(
+                    provider = %ch.provider,
+                    channel_id = %event.channelId,
+                    %err,
+                    "buyer reconcile: local row unreadable (corrupt/downgraded); re-hydrating from chain"
+                );
+                None
+            }
+            // Backend/IO/permission fault — the row may be perfectly healthy and
+            // overwriting it would clobber a live channel. Skip; a later boot retries.
+            // `AlreadyOpen` (another process holds the store lock) can't arise from
+            // this read — the store is already open by this process — but it is the
+            // same "store unavailable, don't decide" case, so skip it too.
+            Err(
+                err @ (StoreError::Backend(_)
+                | StoreError::Io(_)
+                | StoreError::PermissionTighten { .. }
+                | StoreError::AlreadyOpen { .. }),
+            ) => {
+                warn!(
+                    provider = %ch.provider,
+                    channel_id = %event.channelId,
+                    %err,
+                    "buyer reconcile: store read failed (backend/IO); skipping to avoid clobbering a possibly-healthy row"
+                );
+                return Ok(false);
+            }
+        };
+        let view = OnChainOpen {
+            channel_id: event.channelId,
+            client: ch.client,
+            provider: ch.provider,
+            token: ch.token,
+            // `Channel.expiresAt` is `uint64` in the binding — no clamp needed.
+            expires_at: ch.expiresAt,
+            deposit: ch.deposit,
+            claimed_nonce: ch.claimedNonce,
+            claimed_bytes: ch.claimedBytes,
+            claimed_amount: ch.claimedAmount,
+            is_open: matches!(ch.status, PaymentChannel::Status::Open),
+        };
+        let state = match reconcile_decision(&view, self_address, existing.as_ref()) {
+            ReconcileOutcome::Rehydrate(state) => state,
+            // The one orphan the scan deliberately cannot auto-recover (a second
+            // still-open channel for a provider a live row already covers); log it so
+            // the deferred deposit is observable rather than silently skipped.
+            ReconcileOutcome::DeferredSecondOpen => {
+                warn!(
+                    provider = %view.provider,
+                    orphan_channel_id = %view.channel_id,
+                    deposit = %view.deposit,
+                    "buyer reconcile: a second still-open channel for this provider is already covered by a \
+                     live row; its deposit is deferred to a later boot once the live row clears"
+                );
+                return Ok(false);
+            }
+            ReconcileOutcome::Skip => return Ok(false),
+        };
+        store
+            .record(&state)
+            .context("persist re-hydrated buyer channel")?;
+        info!(
+            provider = %state.provider,
+            channel_id = %state.channel_id,
+            deposit = %state.deposit,
+            expires_at = state.expires_at,
+            "buyer reconcile: re-hydrated orphaned channel; reclaim sweep will recover the deposit"
+        );
+        Ok(true)
+    })?;
+    let Some(did_rehydrate) = rehydrated else {
+        // `under_claim` returned `None`: a real open holds the slot, so it will persist the
+        // authoritative channel — the reconciler steps past.
         debug!(
             provider = %ch.provider,
             channel_id = %event.channelId,
@@ -1753,96 +2739,7 @@ async fn reconcile_one_opened<P: Provider + Clone>(
         );
         return Ok(false);
     };
-
-    // Read the local row UNDER the slot so the decision + record are atomic wrt
-    // live opens. Distinguish an *unreadable* row (corrupt bytes / a future
-    // schema after a downgrade) — whose channel_id is unrecoverable from disk, so
-    // re-hydrating from chain is the repair — from a *backend/IO fault*, where the
-    // row may be perfectly healthy and overwriting it would clobber a live
-    // channel. Repair the former (treat as "no row"); skip the latter.
-    // Match every `StoreError` variant explicitly (no catch-all) so adding a
-    // future variant is a compile error that forces a repair-vs-skip decision
-    // here, rather than silently defaulting to "skip" (which would strand an
-    // orphan whose row became unreadable in a new way).
-    let existing = match store.get_by_provider(ch.provider) {
-        Ok(row) => row,
-        // Unreadable row — corrupt bytes, a future on-disk schema after a
-        // downgrade, or a decode failure. Its channel_id is unrecoverable from
-        // disk, so re-hydrating from chain is the repair: treat as "no row".
-        Err(
-            err @ (StoreError::Corrupt { .. }
-            | StoreError::UnsupportedSchema { .. }
-            | StoreError::Codec(_)),
-        ) => {
-            warn!(
-                provider = %ch.provider,
-                channel_id = %event.channelId,
-                %err,
-                "buyer reconcile: local row unreadable (corrupt/downgraded); re-hydrating from chain"
-            );
-            None
-        }
-        // Backend/IO/permission fault — the row may be perfectly healthy and
-        // overwriting it would clobber a live channel. Skip; a later boot retries.
-        // `AlreadyOpen` (another process holds the store lock) can't arise from
-        // this read — the store is already open by this process — but it is the
-        // same "store unavailable, don't decide" case, so skip it too.
-        Err(
-            err @ (StoreError::Backend(_)
-            | StoreError::Io(_)
-            | StoreError::PermissionTighten { .. }
-            | StoreError::AlreadyOpen { .. }),
-        ) => {
-            warn!(
-                provider = %ch.provider,
-                channel_id = %event.channelId,
-                %err,
-                "buyer reconcile: store read failed (backend/IO); skipping to avoid clobbering a possibly-healthy row"
-            );
-            return Ok(false);
-        }
-    };
-    let view = OnChainOpen {
-        channel_id: event.channelId,
-        client: ch.client,
-        provider: ch.provider,
-        token: ch.token,
-        // `Channel.expiresAt` is `uint64` in the binding — no clamp needed.
-        expires_at: ch.expiresAt,
-        deposit: ch.deposit,
-        claimed_nonce: ch.claimedNonce,
-        claimed_bytes: ch.claimedBytes,
-        claimed_amount: ch.claimedAmount,
-        is_open: matches!(ch.status, PaymentChannel::Status::Open),
-    };
-    let state = match reconcile_decision(&view, self_address, existing.as_ref()) {
-        ReconcileOutcome::Rehydrate(state) => state,
-        // The one orphan the scan deliberately cannot auto-recover (a second
-        // still-open channel for a provider a live row already covers); log it so
-        // the deferred deposit is observable rather than silently skipped.
-        ReconcileOutcome::DeferredSecondOpen => {
-            warn!(
-                provider = %view.provider,
-                orphan_channel_id = %view.channel_id,
-                deposit = %view.deposit,
-                "buyer reconcile: a second still-open channel for this provider is already covered by a \
-                 live row; its deposit is deferred to a later boot once the live row clears"
-            );
-            return Ok(false);
-        }
-        ReconcileOutcome::Skip => return Ok(false),
-    };
-    store
-        .record(&state)
-        .context("persist re-hydrated buyer channel")?;
-    info!(
-        provider = %state.provider,
-        channel_id = %state.channel_id,
-        deposit = %state.deposit,
-        expires_at = state.expires_at,
-        "buyer reconcile: re-hydrated orphaned channel; reclaim sweep will recover the deposit"
-    );
-    Ok(true)
+    Ok(did_rehydrate)
 }
 
 /// One-shot bootstrap reconciliation scan (#763): enumerate
@@ -1863,7 +2760,7 @@ async fn reconcile_orphans_once<P: Provider + Clone>(
     contract: PaymentChannel::PaymentChannelInstance<P>,
     store: Arc<dyn BuyerChannelStore>,
     self_address: Address,
-    opens_in_flight: Arc<Mutex<HashSet<Address>>>,
+    opens_in_flight: Arc<Mutex<HashMap<Address, SharedOpen>>>,
 ) {
     let head = match contract.provider().get_block_number().await {
         Ok(h) => h,
@@ -1982,6 +2879,145 @@ mod tests {
         assert_eq!(ctx.prior_nonce, U256::from(3u64));
         assert_eq!(ctx.prior_bytes_delivered, U256::from(3_000u64));
         assert_eq!(ctx.prior_amount, U256::from(30u64));
+    }
+
+    // ---- low-water refill decision (#1146) ------------------------------
+
+    #[test]
+    fn refill_decision_no_topup_with_headroom() {
+        // deposit 10 USDC, nothing spent → remaining == target, well above the 20%
+        // low-water mark, so no top-up.
+        let ten = U256::from(10_000_000u64);
+        assert_eq!(
+            refill_decision(ten, U256::ZERO, ten, ten, U256::from(1u64)),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn refill_decision_tops_up_to_target_when_below_low_water() {
+        // remaining (1 USDC) is below the 2 USDC low-water mark
+        // (target 10 / LOW_WATER_DIVISOR) → refill restores to the full target.
+        let ten = U256::from(10_000_000u64);
+        let prior = U256::from(9_000_000u64); // remaining == 1 USDC
+        assert_eq!(
+            refill_decision(ten, prior, ten, ten, U256::from(1u64)),
+            U256::from(9_000_000u64)
+        );
+    }
+
+    #[test]
+    fn refill_decision_target_is_max_of_hint_default_and_min() {
+        // A tiny deposit_hint must not shrink the target: it is
+        // max(hint, default_deposit, min_deposit), exactly the fresh-open deposit.
+        let ten = U256::from(10_000_000u64);
+        let prior = U256::from(9_999_999u64); // remaining == 1 µUSDC
+        // hint below both → target = default (10 USDC), low_water = 2 USDC.
+        assert_eq!(
+            refill_decision(ten, prior, U256::from(1u64), ten, U256::from(2_000_000u64)),
+            ten - U256::from(1u64),
+        );
+
+        // min_deposit as the DECIDING term of the max(): min > default > hint.
+        assert_eq!(
+            refill_decision(ten, prior, U256::from(1u64), ten, U256::from(20_000_000u64)),
+            U256::from(20_000_000u64) - U256::from(1u64),
+            "min_deposit must be able to raise the target above default/hint"
+        );
+    }
+
+    #[test]
+    fn claim_refill_slot_dedups_per_provider_and_frees_on_drop() {
+        let set: Arc<Mutex<HashSet<Address>>> = Arc::new(Mutex::new(HashSet::new()));
+        let p = Address::repeat_byte(7);
+        let first = claim_refill_slot(&set, p);
+        assert!(first.is_some(), "first claim must succeed");
+        assert!(
+            claim_refill_slot(&set, p).is_none(),
+            "a second claim while the first is held is deduped"
+        );
+        assert!(
+            claim_refill_slot(&set, Address::repeat_byte(8)).is_some(),
+            "a distinct provider is independent"
+        );
+        drop(first);
+        assert!(
+            claim_refill_slot(&set, p).is_some(),
+            "the slot frees on drop so a later refill can run"
+        );
+    }
+
+    // ---- plan_refill wiring (#1146): decision + per-provider slot claim, from the
+    //      reuse `ctx`'s deposit/prior_amount — no store read, no spawned task.
+    //      (Expiry / no-channel are handled upstream by the reuse gate, so
+    //      `spawn_refill_if_low` is only ever reached for a live channel.) ----
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn plan_refill_claims_slot_and_amount_below_low_water() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x71);
+        let ten = U256::from(10_000_000u64); // target 10 USDC, low_water 2 USDC
+        // deposit 10 USDC, 9 spent → remaining 1 USDC, below the low-water mark.
+        let (slot, additional) = service
+            .plan_refill(provider, ten, ten, U256::from(9_000_000u64))
+            .expect("a below-low-water channel must plan a refill");
+        assert_eq!(additional, U256::from(9_000_000u64)); // restore to the target
+        assert!(
+            service.topups_in_flight.lock().unwrap().contains(&provider),
+            "planning a refill claims the provider's slot"
+        );
+        drop(slot);
+        assert!(
+            !service.topups_in_flight.lock().unwrap().contains(&provider),
+            "dropping the plan frees the slot"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn plan_refill_none_with_headroom() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x72);
+        let ten = U256::from(10_000_000u64);
+        // nothing spent → remaining above the 2 USDC low-water mark.
+        assert!(
+            service
+                .plan_refill(provider, ten, ten, U256::ZERO)
+                .is_none(),
+            "a channel with headroom must not plan a refill"
+        );
+        assert!(
+            service.topups_in_flight.lock().unwrap().is_empty(),
+            "no slot is claimed when above the low-water mark"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn plan_refill_dedups_concurrent_reuse() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x75);
+        let ten = U256::from(10_000_000u64);
+        let prior = U256::from(9_000_000u64); // remaining 1 USDC, below low-water
+
+        let first = service.plan_refill(provider, ten, ten, prior);
+        assert!(
+            first.is_some(),
+            "first reuse below low-water plans a refill"
+        );
+        assert!(
+            service.plan_refill(provider, ten, ten, prior).is_none(),
+            "a concurrent reuse while the first refill is in flight is deduped"
+        );
+        drop(first);
+        assert!(
+            service.plan_refill(provider, ten, ten, prior).is_some(),
+            "once the in-flight refill completes, a later reuse can plan again"
+        );
     }
 
     /// A channel observed for the first time is tracked but never immediately
@@ -2200,38 +3236,201 @@ mod tests {
         assert!(!failures.contains_key(&gone), "untracked channel is pruned");
     }
 
-    /// The per-provider in-flight-open slot refuses a second concurrent claim
-    /// (the open path bails for retry) and frees on guard drop, so a later open
-    /// proceeds. This is the mechanism that makes the one-channel-per-provider
-    /// invariant real rather than a documented caller contract (#753 review).
+    /// The per-provider in-flight-open slot refuses a second concurrent claim and
+    /// frees on guard drop, so a later open proceeds. This is the mechanism that
+    /// makes the one-channel-per-provider invariant real rather than a documented
+    /// caller contract (#753 review).
+    ///
+    /// Since #1143 the guard is held by the detached open TASK, so "the slot is
+    /// occupied" now means "an `openChannel` is genuinely still in flight" — which
+    /// is exactly why a caller that times out must not release it.
     #[test]
     fn in_flight_open_guard_refuses_concurrent_then_releases() {
-        let set: Arc<Mutex<HashSet<Address>>> = Arc::new(Mutex::new(HashSet::new()));
+        let map: Arc<Mutex<HashMap<Address, SharedOpen>>> = Arc::new(Mutex::new(HashMap::new()));
         let provider = sample(7).provider;
-        // Exercises the production `claim` constructor (the same call
-        // `open_or_reuse_channel` makes), not a re-implementation of it.
+        // Exercises the production `claim` constructor (the same call the boot
+        // reconcile scan makes), not a re-implementation of it.
         // `.ok().flatten()` discards the (impossible here) poison error.
-        let guard = InFlightOpenGuard::claim(&set, provider).ok().flatten();
+        let guard = InFlightOpenGuard::claim(&map, provider).ok().flatten();
         assert!(guard.is_some(), "first claim acquires the open slot");
         assert!(
-            InFlightOpenGuard::claim(&set, provider)
+            InFlightOpenGuard::claim(&map, provider)
                 .ok()
                 .flatten()
                 .is_none(),
             "a concurrent claim for the same provider is refused"
         );
         drop(guard);
-        let reclaimed = InFlightOpenGuard::claim(&set, provider).ok().flatten();
+        let reclaimed = InFlightOpenGuard::claim(&map, provider).ok().flatten();
         assert!(
             reclaimed.is_some(),
             "the slot is free once the prior guard drops"
         );
         drop(reclaimed);
         assert!(
-            set.lock()
+            map.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty(),
             "dropping the guard releases the slot",
+        );
+    }
+
+    /// `under_claim` is the reconcile scan's ONLY safe path to a claim (#1145 review): the
+    /// guard is never bound at a call site, so it holds the slot for exactly the body's
+    /// lifetime — a concurrent claim during the body is refused — and releases it on return.
+    /// `Ok(None)` when a real open already holds the slot.
+    #[test]
+    fn under_claim_holds_the_slot_for_the_body_then_releases() {
+        let map: Arc<Mutex<HashMap<Address, SharedOpen>>> = Arc::new(Mutex::new(HashMap::new()));
+        let provider = sample(9).provider;
+
+        // While the body runs, a concurrent claim for the same provider is refused.
+        let held_during_body = InFlightOpenGuard::under_claim(&map, provider, || {
+            Ok(InFlightOpenGuard::claim(&map, provider)
+                .ok()
+                .flatten()
+                .is_none())
+        })
+        .unwrap_or(None);
+        assert_eq!(
+            held_during_body,
+            Some(true),
+            "the slot must be held for the whole body"
+        );
+
+        // The slot is released once the body returns.
+        let after = InFlightOpenGuard::claim(&map, provider).ok().flatten();
+        assert!(after.is_some(), "the slot is free once the body returns");
+        drop(after);
+
+        // A real open already in flight → `under_claim` skips the body and returns `None`.
+        let _live = InFlightOpenGuard::claim(&map, provider).ok().flatten();
+        let mut body_ran = false;
+        let skipped = InFlightOpenGuard::under_claim(&map, provider, || {
+            body_ran = true;
+            Ok(())
+        })
+        .unwrap_or(Some(()));
+        assert!(skipped.is_none(), "a live open makes under_claim skip");
+        assert!(!body_ran, "the body must not run when the slot is taken");
+    }
+
+    /// A watermark write REGRESSED by a concurrent settle on the shared ledger is benign — the
+    /// monotonic store kept the higher (correct) value — so it must NOT fire the "we paid and
+    /// lost the record" persist-failure alert (#1145 review). It meters `superseded` and
+    /// returns `Ok`. Fail-on-revert: restore the `Err` arm and this write reports a persist
+    /// failure on ordinary, healthy concurrency.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn a_superseded_watermark_is_benign_not_a_persist_failure() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x5a);
+        let channel_id = B256::repeat_byte(0x5a);
+        let token = Address::repeat_byte(0x11);
+
+        // Seed the channel and advance it to a HIGH watermark, as a concurrent winning pull would.
+        service
+            .store
+            .record(&decdn_incentive::BuyerChannelState::new(
+                channel_id,
+                provider,
+                token,
+                U256::from(1_000u64),
+                0,
+            ))
+            .expect("seed channel");
+        let seeded = service
+            .store
+            .advance_progress(
+                provider,
+                channel_id,
+                U256::from(10u64),
+                U256::from(1_000u64),
+                U256::from(100u64),
+            )
+            .expect("advance to high watermark");
+        assert!(
+            matches!(seeded, AdvanceOutcome::Advanced),
+            "seed must advance"
+        );
+
+        // A LOWER write (the losing concurrent settle) regresses against the stored watermark.
+        let result = service.record_progress(
+            provider,
+            channel_id,
+            U256::from(5u64),
+            U256::from(500u64),
+            U256::from(50u64),
+        );
+        assert!(
+            result.is_ok(),
+            "a superseded write is benign, not an error: {result:?}"
+        );
+        let encoded = service.metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_progress_superseded_total 1"),
+            "a superseded write must be metered as benign. Got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("decdn_node_pull_progress_persist_failures_total 0"),
+            "a superseded write must NOT fire the persist-failure alert. Got:\n{encoded}"
+        );
+    }
+
+    /// A slot claimed by the reconcile scan hands any joining pull the typed
+    /// [`OpenSlotReserved`] rather than a channel (#1143). It must not resolve to
+    /// `Ok`: the claimant is not opening anything, so a caller that treated it as
+    /// "the open succeeded" would read an empty store and report a confusing failure
+    /// — and it must not leave the caller waiting out its whole budget on an open
+    /// that is never coming.
+    ///
+    /// Driven through the REAL join path and asserted on the typed sentinel — never by
+    /// awaiting `reserved_open()` directly, and never on `.to_string().contains("retry")`.
+    /// Either shortcut passes while a joining pull ignores the reserved slot entirely, and
+    /// a string assertion cannot see whether the error carries the sentinel that keeps it
+    /// from being metered as a hard failure.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_reserved_slot_tells_a_joining_pull_to_retry() {
+        let server = wedged_chain().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0xab);
+
+        // The reconciler claims the slot, exactly as `reconcile_one_opened` does.
+        let _claim = InFlightOpenGuard::claim(&service.opens_in_flight, provider)
+            .expect("claiming a free slot cannot fail")
+            .expect("the slot is free, so the claim must succeed");
+
+        // A pull arriving mid-reconcile joins that slot rather than racing an
+        // openChannel into the row the reconciler is rewriting.
+        let joined = service
+            .join_or_spawn_open(provider, U256::from(1u64))
+            .expect("joining a reserved slot must not error at the map layer");
+        let err = rehydrate_open_error(
+            &joined
+                .await
+                .expect_err("a reserved slot never yields a channel"),
+        );
+
+        let reserved = err.downcast_ref::<OpenSlotReserved>();
+        assert!(
+            reserved.is_some(),
+            "a joining pull must receive the typed OpenSlotReserved — a bare string lands in \
+             record_channel_open_failure's unclassified arm and is counted as a real \
+             channel-open failure on every single boot: {err:#}"
+        );
+        assert_eq!(
+            reserved.map(|r| r.provider),
+            Some(provider),
+            "the sentinel must name the provider whose slot is held"
+        );
+        // No openChannel may have been attempted: the whole point is that the pull
+        // does NOT race the reconciler into the store.
+        assert_eq!(
+            server.received_requests().await.map_or(0, |r| r.len()),
+            0,
+            "joining a reserved slot must not reach the chain"
         );
     }
 
@@ -2332,6 +3531,430 @@ mod tests {
             reconcile_decision(&v, self_addr(), None),
             ReconcileOutcome::Skip,
             "a channel whose on-chain client is not us is never reclaimed for someone else"
+        );
+    }
+
+    // ================================================================
+    // #1143 — the singleflight, driven through the REAL service.
+    //
+    // The `WedgedOpener` fixture in `tests/node_origin_pull.rs` is a mock
+    // `ChannelOpener` whose body re-implements the timeout, so it covers
+    // `node_origin`'s candidate loop but says nothing about the mechanism here.
+    // It passes with the budget bound removed from `open_or_reuse_channel`.
+    // These drive `BuyerChannelService` itself: real `join_or_spawn_open`, real
+    // `run_open` task, real `InFlightOpenGuard`.
+    //
+    // The chain is a JSON-RPC endpoint that answers nothing in time, so the open
+    // wedges on its first fill — the state that matters, because that is when a
+    // deposit is (or is about to be) escrowed and releasing the slot would let a
+    // second `openChannel` through.
+    // ================================================================
+
+    /// Longer than any budget in these tests: every RPC the open issues hangs.
+    const RPC_HANG: Duration = Duration::from_secs(30);
+    /// What a caller in these tests is willing to wait on a wedged open.
+    const CALLER_BUDGET: Duration = Duration::from_millis(200);
+    /// A ceiling on the *call*, not the open. `open_or_reuse_channel` must return
+    /// on `CALLER_BUDGET`; blowing this means it blocked on the open instead —
+    /// which is exactly the pre-#1143 bug, so the failure must be a clean assert
+    /// rather than a hung test.
+    const CALL_CEILING: Duration = Duration::from_secs(5);
+
+    async fn wedged_chain() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(RPC_HANG))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The real service, pointed at a chain that never answers. Built by struct
+    /// literal rather than `bootstrap` because `bootstrap` self-checks the
+    /// contract over RPC — which would itself wedge.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    fn service_against(
+        server: &wiremock::MockServer,
+    ) -> BuyerChannelService<impl Provider + Clone + use<>> {
+        let signer = Arc::new(PrivateKeySigner::random());
+        let self_address = signer.address();
+        let payment_channel = Address::repeat_byte(0xcc);
+        let url = server
+            .uri()
+            .parse()
+            .unwrap_or_else(|err| panic!("mock server uri must parse: {err}"));
+        let provider = alloy::providers::ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from((*signer).clone()))
+            .connect_http(url);
+
+        BuyerChannelService {
+            contract: PaymentChannel::new(payment_channel, provider),
+            store: Arc::new(decdn_incentive::MemoryBuyerChannelStore::new()),
+            signer: Arc::clone(&signer),
+            voucher_domain: decdn_incentive::voucher::voucher_domain(1, payment_channel),
+            token: Address::repeat_byte(0x11),
+            self_address,
+            min_deposit: U256::from(1u64),
+            default_deposit: U256::from(1u64),
+            opens_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            topups_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            reclaim_failures: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(Metrics::new()),
+            _reclaimer: AbortOnDrop(tokio::spawn(std::future::pending())),
+            _reconciler: AbortOnDrop(tokio::spawn(std::future::pending())),
+            _idle_reconciler: None,
+        }
+    }
+
+    /// Call the real `open_or_reuse_channel` and require that it comes back on its
+    /// own budget with a `ChannelOpenPending`.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn expect_pending<P: Provider + Clone>(
+        service: &BuyerChannelService<P>,
+        provider: Address,
+    ) {
+        let call = tokio::time::timeout(
+            CALL_CEILING,
+            service.open_or_reuse_channel(provider, U256::from(1u64), CALLER_BUDGET),
+        );
+        let Ok(result) = call.await else {
+            panic!(
+                "open_or_reuse_channel blocked on the wedged open instead of returning after its \
+                 {CALLER_BUDGET:?} budget — the caller's bound is gone (#1143)"
+            );
+        };
+        let Err(err) = result else {
+            panic!("a wedged open cannot yield a live channel");
+        };
+        assert!(
+            err.downcast_ref::<ChannelOpenPending>().is_some(),
+            "a caller that outran its budget gets the typed pending sentinel, not a failure: {err:#}"
+        );
+    }
+
+    fn slot_held<P: Provider + Clone>(service: &BuyerChannelService<P>, provider: Address) -> bool {
+        service
+            .opens_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&provider)
+    }
+
+    /// Reads clean once — satisfying `open_or_reuse_channel`'s fast-path miss — then
+    /// faults on every later read, which is where `run_open`'s re-check under the
+    /// slot lands. Models a `data_dir` that goes bad (corrupt page, fd exhaustion,
+    /// disk full) rather than one that was never readable.
+    #[derive(Debug)]
+    struct StoreThatFaultsUnderTheSlot {
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BuyerChannelStore for StoreThatFaultsUnderTheSlot {
+        fn get_by_provider(&self, _p: Address) -> Result<Option<BuyerChannelState>, StoreError> {
+            if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Ok(None);
+            }
+            Err(StoreError::Backend("simulated store fault".to_string()))
+        }
+        fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn record(&self, _s: &BuyerChannelState) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn forget(&self, _p: Address) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn forget_if_channel(&self, _p: Address, _c: ChannelId) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+        fn advance_progress(
+            &self,
+            _p: Address,
+            _c: ChannelId,
+            _n: U256,
+            _b: U256,
+            _a: U256,
+        ) -> Result<AdvanceOutcome, StoreError> {
+            Ok(AdvanceOutcome::Advanced)
+        }
+        fn add_deposit(
+            &self,
+            _p: Address,
+            _c: ChannelId,
+            _additional: U256,
+        ) -> Result<decdn_incentive::DepositOutcome, StoreError> {
+            Ok(decdn_incentive::DepositOutcome::UnknownProvider)
+        }
+    }
+
+    /// Value of a `decdn_<name>` counter in the scrape, or 0 when the line is absent.
+    #[allow(clippy::expect_used)]
+    fn counter(metrics: &Metrics, name: &str) -> u64 {
+        let text = metrics.encode().expect("encode metrics");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("decdn_{name} ")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A store fault under the open slot must be LOUD (#1145 review). `run_open` is
+    /// detached, so on the rotate leg — where `try_reclaim`'s receipt wait runs for
+    /// minutes against a caller budget of seconds — every caller has already left
+    /// with `ChannelOpenPending` by the time this fires. If the leg only bubbles up
+    /// an error, nobody observes it: a node whose `data_dir` has gone bad silently
+    /// cannot open a channel to anyone, while the operator sees only the *pending*
+    /// counter climbing (whose documented meaning, "a slow L2", is the wrong
+    /// diagnosis).
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_store_fault_under_the_open_slot_is_reported_by_the_task() {
+        let server = wedged_chain().await;
+        let mut service = service_against(&server);
+        service.store = Arc::new(StoreThatFaultsUnderTheSlot {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let metrics = Arc::clone(&service.metrics);
+        let provider = Address::repeat_byte(0xab);
+
+        // The fault is raised before any RPC, so this resolves well inside the budget.
+        let err = service
+            .open_or_reuse_channel(provider, U256::from(1u64), Duration::from_secs(5))
+            .await
+            .expect_err("a faulting store cannot yield a channel");
+
+        assert!(
+            err.downcast_ref::<OpenReported>().is_some(),
+            "the open task must mark a store fault as already-reported, or a caller that happens \
+             to still be waiting double-counts it: {err:#}"
+        );
+        assert_eq!(
+            counter(&metrics, "node_pull_channel_open_failures_total"),
+            1,
+            "a store fault under the open slot must bump the channel-open failure counter from \
+             inside the task — it is the only party guaranteed to see it"
+        );
+    }
+
+    /// Panics on the read under the slot, so the open TASK unwinds.
+    #[derive(Debug)]
+    struct StoreThatPanicsUnderTheSlot {
+        reads: std::sync::atomic::AtomicUsize,
+        /// Stall before panicking, so the caller's budget expires first and the panic lands
+        /// with NOBODY polling the shared open — the case that actually matters.
+        delay: Duration,
+    }
+
+    impl BuyerChannelStore for StoreThatPanicsUnderTheSlot {
+        #[allow(clippy::panic)]
+        fn get_by_provider(&self, _p: Address) -> Result<Option<BuyerChannelState>, StoreError> {
+            if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Ok(None);
+            }
+            std::thread::sleep(self.delay);
+            panic!("simulated panic inside the detached open task");
+        }
+        fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn record(&self, _s: &BuyerChannelState) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn forget(&self, _p: Address) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn forget_if_channel(&self, _p: Address, _c: ChannelId) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+        fn advance_progress(
+            &self,
+            _p: Address,
+            _c: ChannelId,
+            _n: U256,
+            _b: U256,
+            _a: U256,
+        ) -> Result<AdvanceOutcome, StoreError> {
+            Ok(AdvanceOutcome::Advanced)
+        }
+        fn add_deposit(
+            &self,
+            _p: Address,
+            _c: ChannelId,
+            _additional: U256,
+        ) -> Result<decdn_incentive::DepositOutcome, StoreError> {
+            Ok(decdn_incentive::DepositOutcome::UnknownProvider)
+        }
+    }
+
+    /// A PANIC in the detached open task must be reported and must not wedge the provider
+    /// (#1145 review).
+    ///
+    /// This leg is the one with no caller. `run_open`'s own error legs report themselves,
+    /// but nothing reports the task *dying*: the `JoinError` surfaces inside a `Shared`
+    /// future that only a caller ever polls, and with a caller budget of seconds against an
+    /// unbounded receipt wait, the overwhelmingly likely case is that no caller is left to
+    /// poll it. Reported from inside the wrapper — not handed to a caller who may not exist
+    /// — a panicking open leaves a trace instead of only tokio's raw stderr line.
+    ///
+    /// Two assertions, and the second is the one that protects money:
+    /// 1. the failure is metered, so an operator sees it at all;
+    /// 2. the slot is RELEASED. `InFlightOpenGuard::drop` runs on unwind, so a panicking
+    ///    open cannot wedge the provider for the life of the process. (Contrast the
+    ///    timeout case above, where the slot must be HELD — the difference is that a panic
+    ///    means no tx is in flight to protect.)
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_panicking_open_task_is_reported_and_frees_the_provider() {
+        let server = wedged_chain().await;
+        let mut service = service_against(&server);
+        service.store = Arc::new(StoreThatPanicsUnderTheSlot {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            delay: Duration::ZERO,
+        });
+        let metrics = Arc::clone(&service.metrics);
+        let provider = Address::repeat_byte(0xab);
+
+        let err = service
+            .open_or_reuse_channel(provider, U256::from(1u64), Duration::from_secs(5))
+            .await
+            .expect_err("a panicking open cannot yield a channel");
+
+        assert!(
+            err.downcast_ref::<OpenReported>().is_some(),
+            "a dead open task must mark itself reported — it fires the metric and the log \
+             itself, precisely because no caller is guaranteed to be listening: {err:#}"
+        );
+        assert_eq!(
+            counter(&metrics, "node_pull_channel_open_failures_total"),
+            1,
+            "a panicking open task must bump the channel-open failure counter; unmetered, a \
+             panicking open is visible only as tokio's unstructured stderr line"
+        );
+        assert!(
+            !slot_held(&service, provider),
+            "the guard must release the provider's slot on unwind — otherwise one panic \
+             wedges that provider for the life of the process"
+        );
+    }
+
+    /// …and the case that actually matters: the open panics with **nobody left polling**.
+    ///
+    /// The test above keeps a caller waiting the whole time, which is the EASY half. The
+    /// half that protects money is this one: a panic during the unbounded receipt wait —
+    /// minutes long, so no caller is still there by construction — is exactly when an
+    /// `openChannel` may already be in the mempool, i.e. a deposit escrowed against no
+    /// persisted row.
+    ///
+    /// So the report must come from a SPAWNED supervisor, and this test is what holds it
+    /// there. Reporting from a combinator on the returned future would fire only while a
+    /// caller was still waiting: a `Shared` advances only when a clone is POLLED, and once
+    /// the caller's budget expires the sole remaining clone is the one parked in
+    /// `opens_in_flight`, which nobody polls. The report would then be unreachable in exactly
+    /// the case it exists for, and its sibling test above — which keeps a caller waiting
+    /// throughout — would stay green and say nothing. Hence this one, which lets the caller
+    /// LEAVE before the panic lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_panicking_open_is_reported_even_when_no_caller_is_left_to_see_it() {
+        let server = wedged_chain().await;
+        let mut service = service_against(&server);
+        service.store = Arc::new(StoreThatPanicsUnderTheSlot {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            delay: Duration::from_millis(300),
+        });
+        let metrics = Arc::clone(&service.metrics);
+        let provider = Address::repeat_byte(0xab);
+
+        // The caller gives up long before the task panics, and drops its clone of the
+        // shared open — so from here on nothing polls it.
+        let err = service
+            .open_or_reuse_channel(provider, U256::from(1u64), Duration::from_millis(30))
+            .await
+            .expect_err("the caller must give up on its budget");
+        assert!(
+            err.downcast_ref::<ChannelOpenPending>().is_some(),
+            "the caller left on its budget, so it holds a pending sentinel: {err:#}"
+        );
+
+        // Now let the task panic, with no caller in sight. Polled rather than slept on a
+        // fixed delay: the store blocks a worker thread for 300 ms, and under a loaded
+        // full-suite run a fixed sleep is a flake waiting to happen.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while counter(&metrics, "node_pull_channel_open_failures_total") == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert_eq!(
+            counter(&metrics, "node_pull_channel_open_failures_total"),
+            1,
+            "a panicking open must be metered even when NOBODY is polling the shared open — \
+             this is the leg where an escrowed deposit goes missing, and a report that only \
+             fires for a caller who is still waiting is no report at all"
+        );
+        assert!(
+            !slot_held(&service, provider),
+            "the guard must still release the provider's slot on unwind"
+        );
+    }
+
+    /// The load-bearing one. A caller that gives up must NOT take the provider's
+    /// open slot with it: the `openChannel` may already be in the mempool, and a
+    /// released slot lets the next miss escrow a SECOND deposit against the same
+    /// provider — which the boot reconcile scan then declines to adopt
+    /// (`DeferredSecondOpen`), stranding it past the event lookback.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_caller_that_times_out_leaves_the_open_slot_held() {
+        let server = wedged_chain().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0xab);
+
+        expect_pending(&service, provider).await;
+
+        assert!(
+            slot_held(&service, provider),
+            "the departed caller released the provider's open slot while its openChannel is still \
+             in flight — the next miss would escrow a second deposit (#1143)"
+        );
+    }
+
+    /// The other half: a second miss arriving while the first open is still wedged
+    /// must JOIN it, not start its own. Asserted on what actually reaches the
+    /// chain, because that is what costs money.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_second_caller_joins_the_in_flight_open_rather_than_opening_again() {
+        let server = wedged_chain().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0xab);
+
+        expect_pending(&service, provider).await;
+        // Every response is stalled for RPC_HANG, so the first open cannot issue
+        // any follow-up call; its request count is settled by the time it yields.
+        let after_first = server.received_requests().await.map_or(0, |r| r.len());
+        assert!(
+            after_first > 0,
+            "the first open must have actually reached the chain, or this proves nothing"
+        );
+
+        expect_pending(&service, provider).await;
+        let after_second = server.received_requests().await.map_or(0, |r| r.len());
+
+        assert_eq!(
+            after_second, after_first,
+            "the second caller started a SECOND openChannel instead of joining the one in flight \
+             — that is a duplicate escrowed deposit (#1143)"
+        );
+        assert_eq!(
+            service
+                .opens_in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "one provider mid-open must occupy exactly one slot"
         );
     }
 }
