@@ -462,9 +462,9 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     function test_lifecycle_CapacityBond_setUnbondingPeriod_outOfBounds() public {
         _runLifecycleExpectExecuteRevert(
             address(bond),
-            abi.encodeCall(CapacityBond.setUnbondingPeriod, (31 days)),
+            abi.encodeCall(CapacityBond.setUnbondingPeriod, (61 days)),
             abi.encodeWithSelector(
-                CapacityBond.ParamOutOfBounds.selector, uint256(31 days), uint256(3 days), uint256(30 days)
+                CapacityBond.ParamOutOfBounds.selector, uint256(61 days), uint256(7 days), uint256(60 days)
             )
         );
     }

@@ -139,13 +139,10 @@ contract CapacityBond is
     uint256 internal constant ONE_GBPS_BOND_FLOOR = 10_000e18;
     uint256 internal constant ONE_GBPS_BOND_CEILING = 200_000e18;
 
-    // Deviation from ADR 009 § CapacityBond curve and governance parameters
-    // (spec table is [7d, 60d]). Bounds narrowed to [3d, 30d] for the testnet
-    // rapid-iteration phase; this lets the network exercise short unbond
-    // cycles without an ADR amendment. Production deployment MUST widen these
-    // back to [7d, 60d] via a CapacityBond upgrade or redeploy.
-    uint256 internal constant UNBONDING_PERIOD_FLOOR = 3 days;
-    uint256 internal constant UNBONDING_PERIOD_CEILING = 30 days;
+    // Governance bounds on `unbondingPeriod` per ADR 009 § CapacityBond curve
+    // and governance parameters (mirrored by ADR 016 and ADR 014).
+    uint256 internal constant UNBONDING_PERIOD_FLOOR = 7 days;
+    uint256 internal constant UNBONDING_PERIOD_CEILING = 60 days;
 
     uint256 internal constant MULTIADDR_COOLDOWN_CEILING = 1 days;
 
@@ -255,8 +252,8 @@ contract CapacityBond is
     ///         after CapacityBond (deploy-order circular dependency). While unset
     ///         (`address(0)`), `setUnbondingPeriod` applies only the live
     ///         `[UNBONDING_PERIOD_FLOOR, UNBONDING_PERIOD_CEILING]` bound — the
-    ///         testnet `[3d,30d]` window, which intentionally deviates from ADR
-    ///         014/009's `[7d,60d]` spec (see the bounds' declaration note).
+    ///         `[7d,60d]` window from ADR 014/009 (see the bounds' declaration
+    ///         note).
     ISlashJudgeEvidenceView public slashJudge;
 
     /// @notice Governable declared-capacity band (Mbps) enforced on
@@ -1229,7 +1226,7 @@ contract CapacityBond is
         // unbonding period (ADR 014): maxEvidenceAgeUs MUST stay strictly below
         // unbondingPeriod * 1e6, so the invariant holds the instant the judge is
         // wired, not only after the next setUnbondingPeriod. `unbondingPeriod` is
-        // bounded [3d,30d] so the multiply cannot overflow.
+        // bounded [7d,60d] so the multiply cannot overflow.
         uint256 unbondingUs = unbondingPeriod * 1_000_000;
         // `maxEvidenceAgeUs()` is a view on the about-to-be-wired `slashJudge`; this
         // setter is GOVERNANCE_ROLE-gated, so no reentrancy vector (aderyn FP).
@@ -1248,7 +1245,7 @@ contract CapacityBond is
         // the evidence-age ceiling, else a node could offend, unbond, and withdraw
         // before evidence can be submitted. Mirrors SlashJudge._enforceUnbondingInvariant.
         // Skipped until `slashJudge` is wired (deploy window); `newPeriod` is bounded
-        // [3d,30d] so `newPeriod * 1_000_000` cannot overflow.
+        // [7d,60d] so `newPeriod * 1_000_000` cannot overflow.
         ISlashJudgeEvidenceView judge = slashJudge;
         if (address(judge) != address(0)) {
             uint256 newPeriodUs = newPeriod * 1_000_000;
