@@ -1909,11 +1909,10 @@ fn record_settle_receipt_outcome(party: SettleParty, metrics: &Arc<Metrics>, lan
 /// with the pending entry:
 /// - `Closed`: another party finalized it — drop the entry.
 /// - `Closing`: the window is still open. This happens when our local clock
-///   ran ahead, or — the case worth handling — a `disputeChannel` *extended*
-///   `disputeDeadline` past the value we stored at close
-///   (`PaymentChannel.sol` forced-inclusion guarantee). Re-stamp `settle_after`
-///   from the live deadline so the gate stops submitting a guaranteed-revert
-///   `settleChannel` (and burning gas) every sweep until the new window passes.
+///   ran ahead of the chain relative to the deadline we stored at close.
+///   Re-stamp `settle_after` from the live on-chain `disputeDeadline` so the
+///   gate stops submitting a guaranteed-revert `settleChannel` (and burning
+///   gas) every sweep until the window actually passes.
 /// - read error: keep the entry and retry next sweep.
 async fn drop_pending_if_finalized<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
@@ -1933,8 +1932,8 @@ async fn drop_pending_if_finalized<P: Provider + Clone>(
                 PaymentChannel::Status::Closing => {
                     // Re-stamp the gate to the current on-chain deadline
                     // (overwrites by contract). A no-op when unchanged; the fix
-                    // when a dispute pushed the deadline out from under our
-                    // stored value.
+                    // when our stored `settle_after` ran ahead of the live
+                    // deadline.
                     restamp_pending_logged(
                         pending_store,
                         channel_id,
@@ -1969,8 +1968,8 @@ async fn drop_pending_if_finalized<P: Provider + Clone>(
 /// Count how a reverted `settleChannel` resolved once the channel was re-read.
 /// `Some(Closed)` → a co-settler finalized first (`..._confirmed_closed`,
 /// benign; the pending entry is then dropped by the caller); `Some(Closing)` →
-/// a dispute extended the window, so the caller re-stamps and retries
-/// (`..._restamped`, benign); everything else — `None` (the confirming
+/// our stored deadline ran ahead of the live one, so the caller re-stamps and
+/// retries (`..._restamped`, benign); everything else — `None` (the confirming
 /// `getChannel` read itself failed) and `Some(Open)` (unreachable for a closed
 /// channel, so an anomaly) — is an unresolved revert counted as
 /// `..._confirm_failed`, the genuinely-degraded signal. Folding the two

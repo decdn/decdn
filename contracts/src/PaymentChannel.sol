@@ -148,21 +148,24 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     mapping(address client => uint256) public clientChannelNonce;
 
     struct Channel {
+        // Each `address` (20 bytes) shares its slot with a `uint64` timestamp (8
+        // bytes) — and `client`'s slot also carries the 1-byte `Status` enum — so
+        // the three addresses, three timestamps, and status pack into 3 slots
+        // instead of 4. `uint64` holds timestamps for ~584 billion years, matching
+        // the `SlashRecord`/`Appeal` convention.
         address client;
+        uint64 openedAt;
+        Status status;
         address provider;
+        uint64 expiresAt;
         address token;
+        uint64 disputeDeadline;
         uint256 deposit;
         uint256 claimedAmount;
         uint256 claimedNonce;
         uint256 claimedBytes;
         uint256 withdrawnAmount;
         uint256 withdrawnBytes;
-        // Packed into one slot (8+8+8+1 = 25 bytes): timestamps fit `uint64`
-        // for ~584 billion years, matching the `SlashRecord`/`Appeal` convention.
-        uint64 openedAt;
-        uint64 expiresAt;
-        uint64 disputeDeadline;
-        Status status;
     }
 
     mapping(bytes32 channelId => Channel) internal channels;

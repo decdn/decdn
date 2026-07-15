@@ -75,7 +75,7 @@ the default dispute window at **48 hours** for a 24-hour effective response wind
 under worst-case censorship (forced-inclusion ≤ 24 h); with all three at ~24 h, 48 h
 is adequate and no [ADR 003](003-payments.md#adr-003-payment-model) parameter change is required. [ADR 009](009-governance.md#adr-009-governance-model) governance bounds
 (48 h–72 h) apply identically; the 48-hour floor equals the default, so the baseline
-window can only be tightened upward and never dropped below a ≤ 24 h forced-inclusion delay.
+window can only be tightened upward and never dropped below the forced-inclusion delay (≤ 24 h).
 
 ### Balancer V3 and Liquidity
 

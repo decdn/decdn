@@ -367,20 +367,22 @@ The `PaymentChannel` is the payment-channel contract, handling payment-token cha
 **Channel state:**
 
 ```solidity
+// Fields are ordered so each address shares a storage slot with a uint64
+// timestamp (and status), packing the header into 3 slots instead of 4.
 struct Channel {
     address client;
+    uint64  openedAt;
+    uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
     address provider;
+    uint64  expiresAt;
     address token;            // USDC; set once at deployment (immutable)
+    uint64  disputeDeadline;  // set when close is initiated; fixed for the dispute window
     uint256 deposit;          // in USDC base units (6 decimals)
     uint256 claimedAmount;    // cumulative amount of the current best voucher; advanced by withdraw (while Open), closeChannel, and disputeChannel
     uint256 claimedNonce;     // nonce of the current best voucher, for dispute/withdraw comparison
     uint256 claimedBytes;     // cumulative bytes delivered per the current best voucher; forwarded to FeeRouter (see ADR 026)
     uint256 withdrawnAmount;  // cumulative USDC already paid out to the provider via withdraw while Open (≤ claimedAmount)
     uint256 withdrawnBytes;   // cumulative bytes already routed/counted via withdraw (≤ claimedBytes)
-    uint256 openedAt;
-    uint256 expiresAt;
-    uint8   status;           // 0 = Open, 1 = Closing (dispute window active), 2 = Closed (settled)
-    uint256 disputeDeadline;  // set when close is initiated; fixed for the dispute window
 }
 ```
 
