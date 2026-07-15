@@ -87,12 +87,6 @@ const DEFAULT_BUYER_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
 const DEFAULT_PEER_TTL_SEC: u64 = 600;
-/// Default hard cap on `PeerTable` entry count (#577 H3). Sized for ~tens
-/// of MB of resident memory at the ~few-hundred-byte `PeerEntry` size,
-/// which is plenty of headroom for the tens-of-nodes `PoC` while still
-/// capping the fresh-keypair memory-DoS that the empty-allowlist
-/// stand-in would otherwise leave unbounded.
-const DEFAULT_MAX_PEER_TABLE_ENTRIES: u64 = 100_000;
 /// Default for subscribing to the global `cdn/reputation/v1` topic (ADR 008).
 const DEFAULT_SUBSCRIBE_REPUTATION: bool = true;
 /// Default interval between reputation-report publish ticks. Matches the ADR
@@ -189,14 +183,39 @@ pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
 /// (#831). Five is enough to find a healthy upstream in a tens-of-nodes
 /// network without spending the miss-latency budget on a wide probe fan-out.
 pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
-/// Default wall-clock bound (seconds) on a single upstream pull during a
-/// node-to-node cache-miss fill (#831). Matches the integration-test budget;
-/// a slow upstream is abandoned for the next ranked candidate at this deadline.
-/// This is the *per-upstream* budget: the node derives the overall pull-through
-/// deadline as roughly `MAX_PROVIDER_ATTEMPTS ×` it plus a fixed discovery
-/// allowance, so the fallback loop can reach every ranked candidate before the
-/// serving path gives up (#859).
+/// Default wall-clock bound (seconds) on the STREAM-OPEN stage of a single upstream
+/// pull during a node-to-node cache-miss fill (#831) — connect, handshake, signed
+/// `StreamResponse`. Matches the integration-test budget; a slow upstream is abandoned
+/// for the next ranked candidate at this deadline.
+///
+/// It does NOT cover the buyer-channel open, which precedes it on its own 5 s budget
+/// (`CHANNEL_OPEN_CALLER_BUDGET`), nor the streaming that follows it, which is bounded by
+/// inactivity ([`DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`]). All three are sequential stages
+/// of ONE candidate attempt, and the node derives the overall pull-through deadline as
+/// `MAX_PROVIDER_ATTEMPTS × (channel open + this + stall) + a fixed discovery allowance`,
+/// so the fallback loop can reach every ranked candidate before the serving path gives up
+/// (#859).
+///
+/// Raising this to give a slow L2 more room does nothing: that is the channel open, on the
+/// budget named above.
 pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
+/// Default INACTIVITY bound (seconds) on the streaming stage of an upstream pull
+/// (#1134). The clock resets on every byte received, so it trips only when an
+/// upstream falls silent — never because a blob is large or a link is slow.
+///
+/// Set equal to [`DEFAULT_NODE_PULL_TIMEOUT_SEC`] because both answer the same
+/// question ("how long do we wait on an unresponsive upstream?"), just at
+/// different stages; they are separate knobs because only one of them can be
+/// safely raised for large content.
+///
+/// Raising it is not free, even though it does not scale with blob size. A candidate that
+/// goes SILENT costs one full window of this before the pull abandons it, and
+/// `outer_pull_deadline` must budget that window for each of `MAX_PROVIDER_ATTEMPTS`
+/// candidates — otherwise a single silent peer eats the whole deadline and the fallback
+/// loop never reaches the others (#859, and the reason this knob is an argument to that
+/// function). So each second added here adds ~3 to the worst-case wait a client can see on
+/// a total miss: 172 s at defaults.
+pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 
 /// Default window-paced pull-through pipeline window (#856, ADR 037
 /// `pull_ahead_bytes`): 1 MiB ≈ one voucher interval. The serving node pulls at
@@ -1397,6 +1416,30 @@ fn resolve_cache_into(
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
+    bag.check(
+        node_pull_timeout_sec > 0,
+        "cache.node_pull_timeout_sec",
+        "cache.node_pull_timeout_sec must be > 0 (a 0 budget abandons every upstream \
+         before its handshake can complete, so no pull can ever succeed)",
+    );
+    let node_pull_stall_timeout_sec = file
+        .and_then(|c| c.node_pull_stall_timeout_sec)
+        .unwrap_or(DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC);
+    // Rejecting 0 here matters more than it does for most knobs, because #1134 made
+    // a stall REPUTATION-AFFECTING. A 0 budget trips `PullStalled` on the first poll
+    // of every streaming read, and `classify_pull_failure` scores that `Unreachable`
+    // — folding it into the local EWMA *and* the observation buffer the gossip
+    // publisher drains. So a single fat-fingered value would not merely break this
+    // node: it would broadcast false `Unreachable` observations about every honest
+    // peer it touches. (Its predecessor, `PullTimeout`, was exonerating, so the
+    // blast radius of a bad value used to stop at the local node.)
+    bag.check(
+        node_pull_stall_timeout_sec > 0,
+        "cache.node_pull_stall_timeout_sec",
+        "cache.node_pull_stall_timeout_sec must be > 0 (a 0 budget marks every \
+         upstream as stalled on the first read, scoring — and gossiping — every \
+         honest peer as unreachable)",
+    );
     // Resolve the seed-leech knobs to their typed `Bytes` / `Percent` form and
     // keep them typed through the cross-field check and `ResolvedCache`
     // construction below, so a bytes<->percent (or bytes<->bytes) transposition
@@ -1452,6 +1495,7 @@ fn resolve_cache_into(
         node_to_node_pull_through_enabled,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
+        node_pull_stall_timeout_sec,
         pull_ahead_bytes,
         max_unrecouped_leech_bytes,
         pull_share_ratio_percent,
@@ -2196,14 +2240,17 @@ fn resolve_gossip_into(
         "gossip.peer_ttl_sec must be > 0",
     );
 
-    let max_peer_table_entries = file
-        .and_then(|g| g.max_peer_table_entries)
-        .unwrap_or(DEFAULT_MAX_PEER_TABLE_ENTRIES);
-    bag.check(
-        max_peer_table_entries > 0,
-        "gossip.max_peer_table_entries",
-        "gossip.max_peer_table_entries must be > 0",
-    );
+    // Optional ceiling: absent => no cap (unlimited). A `Some(0)` is a
+    // misconfiguration (0 would read as unlimited via the peer table's
+    // sentinel), so reject it rather than silently treating it as "no cap".
+    let max_peer_entries = file.and_then(|g| g.max_peer_entries);
+    if let Some(cap) = max_peer_entries {
+        bag.check(
+            cap > 0,
+            "gossip.max_peer_entries",
+            "gossip.max_peer_entries must be > 0 when set",
+        );
+    }
 
     let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
 
@@ -2239,7 +2286,7 @@ fn resolve_gossip_into(
         subscribe_reputation,
         reputation_publish_interval_sec,
         allowlist,
-        max_peer_table_entries,
+        max_peer_entries,
     }
 }
 
@@ -3249,7 +3296,7 @@ mod tests {
             subscribe_reputation: true,
             reputation_publish_interval_sec: 3600,
             allowlist: Vec::new(),
-            max_peer_table_entries: DEFAULT_MAX_PEER_TABLE_ENTRIES,
+            max_peer_entries: None,
         }
     }
 
@@ -3284,7 +3331,7 @@ mod tests {
             peer_ttl_sec: Some(123),
             subscribe_global: Some(false),
             allowlist: None,
-            max_peer_table_entries: Some(7),
+            max_peer_entries: Some(7),
             ..Default::default()
         };
         let g = resolve_gossip(Some(&cfg))?;
@@ -3292,7 +3339,7 @@ mod tests {
         assert_eq!(g.peer_ttl_sec, 123);
         assert!(!g.subscribe_global);
         assert!(g.allowlist.is_empty());
-        assert_eq!(g.max_peer_table_entries, 7);
+        assert_eq!(g.max_peer_entries, Some(7));
         Ok(())
     }
 
@@ -3308,7 +3355,7 @@ mod tests {
             DEFAULT_REPUTATION_PUBLISH_INTERVAL_SEC
         );
         assert!(g.allowlist.is_empty());
-        assert_eq!(g.max_peer_table_entries, DEFAULT_MAX_PEER_TABLE_ENTRIES);
+        assert_eq!(g.max_peer_entries, None);
         Ok(())
     }
 
@@ -3458,39 +3505,39 @@ mod tests {
     }
 
     #[test]
-    fn resolve_gossip_rejects_zero_max_peer_table_entries() {
+    fn resolve_gossip_rejects_zero_max_peer_entries() {
         let cfg = types::GossipConfig {
-            max_peer_table_entries: Some(0),
+            max_peer_entries: Some(0),
             ..Default::default()
         };
         let err = resolve_gossip(Some(&cfg))
             .expect_err("expected error")
             .to_string();
         assert!(
-            err.contains("max_peer_table_entries"),
+            err.contains("max_peer_entries"),
             "error missing field context: {err}"
         );
     }
 
     #[test]
-    fn resolve_gossip_max_peer_table_entries_file_override() -> anyhow::Result<()> {
+    fn resolve_gossip_max_peer_entries_file_override() -> anyhow::Result<()> {
         let cfg = types::GossipConfig {
-            max_peer_table_entries: Some(42_000),
+            max_peer_entries: Some(42_000),
             ..Default::default()
         };
         let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.max_peer_table_entries, 42_000);
+        assert_eq!(g.max_peer_entries, Some(42_000));
         Ok(())
     }
 
     #[test]
-    fn resolve_gossip_max_peer_table_entries_default_when_field_absent() -> anyhow::Result<()> {
+    fn resolve_gossip_max_peer_entries_unlimited_when_field_absent() -> anyhow::Result<()> {
         let cfg = types::GossipConfig {
             announce_interval_sec: Some(30),
             ..Default::default()
         };
         let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.max_peer_table_entries, DEFAULT_MAX_PEER_TABLE_ENTRIES);
+        assert_eq!(g.max_peer_entries, None);
         Ok(())
     }
 
@@ -4285,11 +4332,45 @@ mod tests {
         Ok(())
     }
 
-    // The FS arm of `resolve_origin` calls `expand_tilde` so a TOML
-    // like `path = "~/origin"` resolves to `<home>/origin`. The
-    // expansion happens inside resolution (not in `expand_env`),
-    // because `~` is filesystem-shaped and the `expand_env`
-    // contract only handles `${VAR}` substitution.
+    /// A zero stall budget is the most dangerous value in this file (#1134 review).
+    /// `PullStalled` — unlike the `PullTimeout` it replaced — SCORES the peer, and
+    /// `record_outcome` writes both the local EWMA and the observation buffer the
+    /// gossip publisher drains. So a `0` here would not merely break this node: it
+    /// would trip on the first poll of every streaming read and broadcast false
+    /// `Unreachable` observations about every honest peer the node touches.
+    #[test]
+    fn resolve_cache_rejects_zero_stall_timeout() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            node_pull_stall_timeout_sec: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "a 0 stall budget must be rejected: it would gossip every honest peer as unreachable"
+        );
+    }
+
+    /// A zero open budget abandons every upstream before its handshake can finish,
+    /// so no pull can ever succeed. Local-only blast radius (a `PullTimeout` is
+    /// exonerating), but still a config that cannot work.
+    #[test]
+    fn resolve_cache_rejects_zero_pull_timeout() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            node_pull_timeout_sec: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "a 0 open budget must be rejected: no pull could ever complete its handshake"
+        );
+    }
+
+    // The FS arm of `resolve_origin` calls `expand_tilde` so a TOML like
+    // `path = "~/origin"` resolves to `<home>/origin`. The expansion happens inside
+    // resolution (not in `expand_env`), because `~` is filesystem-shaped and the
+    // `expand_env` contract only handles `${VAR}` substitution.
     #[test]
     fn resolve_cache_origin_fs_expands_tilde_in_path() -> anyhow::Result<()> {
         let home_dir = TempDir::new()?;

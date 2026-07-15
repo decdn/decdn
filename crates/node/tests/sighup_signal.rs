@@ -93,6 +93,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             node_to_node_pull_through_enabled: false,
             node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
+            node_pull_stall_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
             pull_ahead_bytes: decdn_cache::Bytes::new(
                 decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
             ),
@@ -127,7 +128,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             subscribe_reputation: true,
             reputation_publish_interval_sec: 3600,
             allowlist: Vec::new(),
-            max_peer_table_entries: 100_000,
+            max_peer_entries: Some(100_000),
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,

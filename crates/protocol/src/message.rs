@@ -145,6 +145,23 @@ pub enum MessageValidationError {
     /// [`crate::client::StreamResponse::validate`].
     #[error("StreamResponse.error carries VoucherRejected (a mid-stream-only code)")]
     VoucherRejectedInResponse,
+    /// A [`crate::client::ChunkData`] carries a zero-length payload. ADR 005
+    /// §Partial final chunk permits a *smaller* final frame, never an *empty*
+    /// one: an empty frame advances neither the receiver's cumulative byte count
+    /// nor its voucher accounting, so an unbounded run of them drives the receive
+    /// loop without application-level progress (#1088). Enforced by
+    /// [`crate::client::ChunkData::new`] and the `try_from` decode gate — the only
+    /// two ways to obtain a frame.
+    #[error(
+        "ChunkData carries a zero-length payload (ADR 005: a chunk must carry at least 1 byte)"
+    )]
+    EmptyChunk,
+    /// A [`crate::client::ChunkData`] payload exceeds [`crate::CHUNK_SIZE`].
+    /// The ceiling bounds receiver allocation per frame (ADR 005
+    /// §`cdn/client/v1`). Enforced by [`crate::client::ChunkData::new`] and the
+    /// `try_from` decode gate, as above.
+    #[error("ChunkData payload of {len} bytes exceeds CHUNK_SIZE ({max})", max = crate::CHUNK_SIZE)]
+    ChunkTooLarge { len: usize },
 }
 
 /// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per
@@ -163,6 +180,12 @@ pub enum ProbeMessage {
     Request(ProbeRequest),
     /// discriminant 1 — asserted by `probe_message_response_discriminant_is_one`
     Response(ProbeResponse),
+}
+
+impl crate::framing::TopLevelEnum for ProbeMessage {
+    /// `Request` (0), `Response` (1). Pinned by
+    /// `probe_message_variant_count_matches_discriminants`.
+    const VARIANT_COUNT: u32 = 2;
 }
 
 /// Client → node request on `cdn/probe/v1` (ADR 005 §`cdn/probe/v1`).
@@ -367,6 +390,33 @@ mod tests {
         let bytes = [99u8, 0, 0, 0, 0];
         let r: Result<ProbeMessage, _> = postcard::from_bytes(&bytes);
         assert!(r.is_err());
+    }
+
+    // Pins `TopLevelEnum::VARIANT_COUNT` to the actual highest discriminant so a
+    // future variant addition (which shifts the unknown/known boundary the ADR
+    // 013 classifier relies on) must update the count in lockstep.
+    #[test]
+    fn probe_message_variant_count_matches_discriminants() -> Result<(), postcard::Error> {
+        use crate::framing::TopLevelEnum;
+        assert_eq!(ProbeMessage::VARIANT_COUNT, 2);
+        // The last declared variant (`Response`) must encode to discriminant
+        // VARIANT_COUNT - 1. Compare against postcard's own varint encoding of
+        // that index (not `bytes.first()`) so the pin stays correct even if the
+        // enum ever grows a multi-byte discriminant (> 127 variants).
+        let last = ProbeMessage::Response(sample_response());
+        let bytes = postcard::to_allocvec(&last)?;
+        let expected_disc = postcard::to_allocvec(&(ProbeMessage::VARIANT_COUNT - 1))?;
+        assert!(bytes.starts_with(&expected_disc));
+        Ok(())
+    }
+
+    #[test]
+    fn probe_message_unknown_discriminant_is_flagged_unsupported() {
+        // Discriminant 2 is the first index past the known set → UNSUPPORTED.
+        assert!(crate::is_unknown_variant::<ProbeMessage>(&[2u8, 0, 0]));
+        // Discriminant 1 (Response) is known — an over-cap-rate decode failure
+        // on it must stay MALFORMED, not flip to UNSUPPORTED.
+        assert!(!crate::is_unknown_variant::<ProbeMessage>(&[1u8, 0xFF]));
     }
 
     // Issue #378: the wire boundary MUST reject `rate_per_mb` above

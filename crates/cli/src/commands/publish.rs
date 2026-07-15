@@ -48,19 +48,13 @@ fn registry_ctx(
     let config_path = chain.common.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
     let resolved = chain_ctx::resolve_publish(chain, &file)?;
-    let registry = chain_ctx::parse_address(
-        resolved
-            .publisher_registry_address
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "publisher_registry_address not set (pass \
-                     --publisher-registry-address or set \
-                     blockchain.publisher_registry_address)"
-                )
-            })?,
-        "publisher_registry_address",
-    )?;
+    let registry = resolved.publisher_registry_address.ok_or_else(|| {
+        anyhow::anyhow!(
+            "publisher_registry_address not set (pass \
+             --publisher-registry-address or set \
+             blockchain.publisher_registry_address)"
+        )
+    })?;
     Ok((resolved, registry))
 }
 
@@ -74,18 +68,12 @@ fn assignment_ctx(
     let config_path = chain.common.config.as_deref().or(global_config);
     let file = chain_ctx::load_optional_config(config_path)?;
     let resolved = chain_ctx::resolve_publish(chain, &file)?;
-    let origin_assignment = chain_ctx::parse_address(
-        resolved
-            .origin_assignment_address
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "origin_assignment_address not set (pass --origin-assignment-address \
-                     or set blockchain.origin_assignment_address)"
-                )
-            })?,
-        "origin_assignment_address",
-    )?;
+    let origin_assignment = resolved.origin_assignment_address.ok_or_else(|| {
+        anyhow::anyhow!(
+            "origin_assignment_address not set (pass --origin-assignment-address \
+             or set blockchain.origin_assignment_address)"
+        )
+    })?;
     Ok((resolved, origin_assignment))
 }
 

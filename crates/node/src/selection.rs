@@ -9,47 +9,126 @@ use rand::RngExt;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use crate::dht::lookup::{DEFAULT_ROUND_TIMEOUT, MAX_LOOKUP_ROUNDS};
+
 /// Maximum providers to attempt before reporting a fetch failure to the
 /// caller (issue #322 — "max 3 provider attempts before returning error").
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
-/// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential
-/// per-candidate stream budgets when computing the outer pull-through deadline
-/// (#859). It covers the *one-time* discover → probe → rank overhead that runs
-/// under the outer deadline but is not a per-candidate stream (probing is
-/// concurrent, bounded by a single probe timeout, so it does not scale with the
-/// attempt count). A tunable judgement value: small relative to one per-candidate
-/// budget so it doesn't materially inflate worst-case miss latency.
+/// Per-candidate probe timeout. Short relative to the pull timeout — a probe is a single
+/// unpaid round trip, so a slow candidate is dropped quickly rather than burning the
+/// caller's miss-latency budget on it.
 ///
-/// Note what it does *not* model: per-candidate `open_or_reuse_channel`
-/// (potentially an on-chain `openChannel` tx, once per attempt) is not bounded by
-/// the per-candidate `pull_timeout`, so on a cold cache with a slow L2 the outer
-/// deadline can still preempt before the last candidate. That is a known
-/// fragility at *small* configured per-candidate budgets, not a regression: it is
-/// still strictly better than the pre-#859 `outer == per_candidate` wiring, which
-/// killed the fallback after a single stall.
-pub const PULL_THROUGH_OUTER_SLACK: Duration = Duration::from_secs(10);
+/// Lives here, beside the deadline arithmetic that has to budget for it, rather than in
+/// `node_origin` where it is used (#1145 review). Every term of [`outer_pull_deadline`] is
+/// then visible in one file, which is what stops the next one from being guessed.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Outer deadline for a node-to-node pull-through, derived from the configured
-/// *per-candidate* timeout (`cache.node_pull_timeout_sec`).
+/// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential per-candidate
+/// costs when computing the outer pull-through deadline (#859). It covers the *one-time*
+/// `discover → probe → rank` overhead: work that runs under the outer deadline but does not
+/// scale with the attempt count.
+///
+/// **Derived, not chosen** (#1145 review). This used to be a flat 10 s described as "a
+/// tunable judgement value… small relative to one per-candidate budget", and it was smaller
+/// than the thing it was named for:
+///
+/// - probing is concurrent, so it costs one [`PROBE_TIMEOUT`] — 5 s; but
+/// - discovery is `find_providers`, whose rounds are each bounded by
+///   [`DEFAULT_ROUND_TIMEOUT`] (8 s) and whose ROUND COUNT was unbounded.
+///
+/// So a single slow round plus the probe phase already cost 13 s against a 10 s budget,
+/// before any lookup that needed a second round. The outer deadline was therefore short of
+/// what the fetch could actually spend, and the `tokio::time::timeout` around
+/// `discover → probe → rank → pull` could fire while candidate #3 was still in its stall
+/// window — the #859 fallback starvation this whole formula exists to prevent, reachable at
+/// the defaults.
+///
+/// The fix is in two halves, and both are necessary: [`MAX_LOOKUP_ROUNDS`] makes discovery's
+/// worst case finite, and this makes it a TERM. An unbounded cost cannot be budgeted for by
+/// any constant, however generous.
+pub const PULL_THROUGH_OUTER_SLACK: Duration =
+    PROBE_TIMEOUT.saturating_add(DEFAULT_ROUND_TIMEOUT.saturating_mul(MAX_LOOKUP_ROUNDS));
+
+/// How long a pull is willing to WAIT on a buyer-channel open before giving up on
+/// that candidate — not how long the open itself is allowed to take (#1143).
+///
+/// Since #1143 the `openChannel` runs in a detached task that owns the tx, so a
+/// caller that stops waiting costs nothing: the open continues, the channel lands,
+/// and the next pull to that provider reuses it. What the caller buys by waiting is
+/// only the chance to use the channel on *this* pull. That makes a short budget the
+/// right trade — a cache miss must fall through to another candidate in seconds,
+/// while an `openChannel` may legitimately need minutes to mine on a slow L2.
+///
+/// Deliberately much smaller than `cache.node_pull_timeout_sec`: the channel open, the
+/// stream open, and the streaming stage are SEQUENTIAL stages of one candidate attempt,
+/// and [`outer_pull_deadline`] has to cover all three for every candidate.
+pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
+
+/// Outer deadline for a node-to-node pull-through, derived from the two configured
+/// per-candidate budgets: the stream-open timeout (`cache.node_pull_timeout_sec`) and
+/// the streaming inactivity timeout (`cache.node_pull_stall_timeout_sec`).
 ///
 /// The delivery handler wraps the whole `discover → probe → rank → pull` fetch
 /// in a single `tokio::time::timeout`. For the sequential `MAX_PROVIDER_ATTEMPTS`
 /// fallback loop to actually reach candidates #2..N when candidate #1 *stalls*,
-/// this outer deadline must strictly exceed the sum of all per-candidate *stream*
-/// budgets — otherwise both clocks (sourced from the same config value before
-/// #859) expire together and the outer timeout cancels the whole fetch at the
-/// instant candidate #1's own timeout fires, killing the fallback. We therefore
-/// budget `MAX_PROVIDER_ATTEMPTS × per_candidate` plus [`PULL_THROUGH_OUTER_SLACK`]
-/// of one-time discovery overhead. The strict-exceed guarantee is over the
-/// per-candidate *stream* budgets; see [`PULL_THROUGH_OUTER_SLACK`] for what the
-/// slack does and does not absorb (notably per-candidate channel-open).
-/// `node_pull_timeout_sec` keeps its documented per-upstream meaning; only the
-/// derived outer backstop grows.
+/// this outer deadline must strictly exceed the sum of all per-candidate costs —
+/// otherwise both clocks (sourced from the same config value before #859) expire
+/// together and the outer timeout cancels the whole fetch at the instant candidate
+/// #1's own timeout fires, killing the fallback.
+///
+/// # What one candidate actually costs
+///
+/// THREE sequential bounded stages:
+///
+/// 1. the **channel open** — [`CHANNEL_OPEN_CALLER_BUDGET`] (#1143); then
+/// 2. the **stream open** — connect → handshake → verified `StreamResponse`,
+///    bounded by `per_candidate` (#1134); then
+/// 3. **streaming**, which for a peer that opens honestly and then goes SILENT costs
+///    one full inactivity window (`stall`) before the pull gives up on it (#1134).
+///
+/// So the worst case for a candidate is `CHANNEL_OPEN_CALLER_BUDGET + per_candidate + stall`,
+/// and that is what this must budget `MAX_PROVIDER_ATTEMPTS` of, plus
+/// [`PULL_THROUGH_OUTER_SLACK`] of one-time discovery overhead.
+///
+/// Every stage has to be a term here, and each one was learned the same way. Budgeting
+/// only `per_candidate` let a cold cache against a slow L2 burn the whole deadline on
+/// candidates #1 and #2 and never dial #3. Adding the channel open but not the stall
+/// window left the same hole for a peer that goes silent mid-stream instead of failing
+/// to open — and made it *worse*, because `stall` is operator-tunable: at
+/// `node_pull_stall_timeout_sec = 120` a single silent candidate outlasts the whole
+/// two-term deadline on its own. Taking `stall` as an argument is what keeps the two
+/// from drifting apart again.
+///
+/// # What this deadline does not bound
+///
+/// A candidate's streaming stage is bounded by *inactivity* rather than a wall clock,
+/// because a wall clock over the bytes caps the blob size a node can pull through
+/// (#1134). The `stall` term above is therefore the cost of a candidate that **stops**
+/// — not a ceiling on one that keeps going. A candidate that is **slow but progressing**
+/// resets that clock on every byte and can consume the whole outer deadline on its own.
+///
+/// That is correct: it is succeeding, and falling through mid-stream would restart the
+/// download from zero against another peer. The foreground request gives up (a clean miss)
+/// while a detached background warm RE-PULLS the blob from scratch under a far larger
+/// backstop (`BACKGROUND_FILL_HARD_CAP`), for exactly this reason.
+///
+/// "Re-pulls from scratch", not "the transfer continues" (#1145 review): the warm calls
+/// `cache.populate(hash)`, which starts a new pull. Nothing hands it the bytes the
+/// foreground had already paid for. That does not change the conclusion — the acquisition
+/// still completes, under an hour-long cap rather than the client's — but it does undercut
+/// the "restart from zero" argument in the sentence above, which is worth being honest
+/// about: the warm restarts from zero too. What falling through actually costs is the
+/// *paid* bytes, and what it buys is the client a faster answer.
+///
+/// So this is best read as a bound on how long a **client** waits, not on how long
+/// an acquisition takes.
 #[must_use]
-pub fn outer_pull_deadline(per_candidate: Duration) -> Duration {
+pub fn outer_pull_deadline(per_candidate: Duration, stall: Duration) -> Duration {
     let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
-    per_candidate
+    CHANNEL_OPEN_CALLER_BUDGET
+        .saturating_add(per_candidate)
+        .saturating_add(stall)
         .saturating_mul(attempts)
         .saturating_add(PULL_THROUGH_OUTER_SLACK)
 }
@@ -386,37 +465,105 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
-    // #859 regression guard: the derived outer pull-through deadline must
-    // strictly exceed the sum of all per-candidate budgets, so the outer
-    // `tokio::time::timeout` can never preempt the `MAX_PROVIDER_ATTEMPTS`
-    // fallback loop when an early candidate stalls.
+    // #859 regression guard: the derived outer pull-through deadline must strictly
+    // exceed the sum of what all `MAX_PROVIDER_ATTEMPTS` candidates can actually
+    // cost, so the outer `tokio::time::timeout` can never preempt the fallback loop
+    // when early candidates stall.
+    //
+    // Asserted against the REAL worst case per candidate — all THREE sequential stages
+    // (channel open, stream open, one silent streaming window) — not against the
+    // formula's own arithmetic. Restated with any stage missing, this test passes while
+    // the loop silently cannot reach the last candidate. Both of the deadline's shipped
+    // versions were wrong in exactly that way, one stage apart.
+    //
+    // `stall` is swept independently of `per` because it is the term an operator can
+    // raise on its own: a formula that ignores it looks fine at defaults and starves the
+    // loop at `node_pull_stall_timeout_sec = 120`.
     #[test]
-    fn outer_pull_deadline_exceeds_all_per_candidate_budgets() {
+    fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
         let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
         for per_secs in [1_u64, 5, 20, 60] {
-            let per = Duration::from_secs(per_secs);
-            let outer = outer_pull_deadline(per);
-            let all_candidates = per.saturating_mul(attempts);
-            assert!(
-                outer > all_candidates,
-                "outer {outer:?} must exceed {MAX_PROVIDER_ATTEMPTS}×{per:?}"
-            );
-            // And it equals exactly N×per + the discovery slack.
-            assert_eq!(outer, all_candidates + PULL_THROUGH_OUTER_SLACK);
+            for stall_secs in [1_u64, 5, 20, 120] {
+                let per = Duration::from_secs(per_secs);
+                let stall = Duration::from_secs(stall_secs);
+                let outer = outer_pull_deadline(per, stall);
+                // One candidate = channel open, then stream open, then a silent stream.
+                let worst_candidate = CHANNEL_OPEN_CALLER_BUDGET
+                    .saturating_add(per)
+                    .saturating_add(stall);
+                let all_candidates = worst_candidate.saturating_mul(attempts);
+                assert!(
+                    outer > all_candidates,
+                    "outer {outer:?} must exceed {MAX_PROVIDER_ATTEMPTS}×{worst_candidate:?} \
+                     (channel open + stream open + stall), or the loop cannot reach the \
+                     last candidate"
+                );
+                assert_eq!(outer, all_candidates + PULL_THROUGH_OUTER_SLACK);
+            }
         }
     }
 
+    // There is deliberately NO unit test here asserting that the slack covers the
+    // `discover → probe → rank` overhead it is named for (#1145 review).
+    //
+    // There was one, and it could not fail. `PULL_THROUGH_OUTER_SLACK` is now DEFINED as
+    // `PROBE_TIMEOUT + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so a test that recomputes
+    // that expression and asserts the slack is at least as big is asserting `A >= A`. It
+    // would pass with any value of any of the three constants — which is precisely the sin
+    // its own doc comment accused its predecessor of ("proves only that the slack is
+    // whatever the slack is"), restated one level up. Deriving the constant is what MAKES it
+    // correct by construction; there is nothing left for arithmetic to check.
+    //
+    // What can still break is the assumption underneath: that `find_providers` actually
+    // honours `MAX_LOOKUP_ROUNDS`. An unbounded cost cannot be budgeted for by any constant,
+    // however generous, so if that loop stops terminating the slack is worthless no matter
+    // what it evaluates to. That is a property of the LOOP, not of this arithmetic, and it is
+    // guarded where it lives — `dht_lookup::find_providers_stops_at_the_round_ceiling_even_
+    // while_still_finding_closer_nodes` walks a chain of servers that keeps revealing closer
+    // nodes and asserts the lookup is cut off before it reaches a record six hops away.
+
+    // The defaults an operator actually runs: `node_pull_timeout_sec = 20` and
+    // `node_pull_stall_timeout_sec = 20` (both `DEFAULT_*` in decdn-common, which this
+    // crate does not depend on — hence the literals). Pinned because the worst-case client
+    // wait is a user-visible number RESTATED IN PROSE elsewhere, and it moved three times
+    // while the formula was corrected — most recently when the slack stopped being a guess
+    // (#1145 review): 10 s -> 5 + 4×8 = 37 s, so 145 s -> 172 s.
+    //
+    // The sites that restate it, so the next person to move it can find them all — this list
+    // is the whole reason the number keeps going stale, and the previous version of this
+    // comment named the wrong ones ("the CLI help and the metrics docs"; the metrics docs
+    // never quoted it):
+    //
+    //   - `common::config` (the `node_pull_timeout_sec` / `node_pull_stall_timeout_sec` docs)
+    //   - `cli::commands::config` (the DEFAULT_CONFIG template)
+    //   - `handlers::client::BACKGROUND_FILL_HARD_CAP` + `runtime` (as a RATIO against it)
+    #[test]
+    fn outer_pull_deadline_at_defaults_is_172s() {
+        let outer = outer_pull_deadline(Duration::from_secs(20), Duration::from_secs(20));
+        assert_eq!(outer, Duration::from_secs(172), "(5 + 20 + 20) × 3 + 37");
+    }
+
     // A zero per-candidate budget still yields a positive outer deadline (the
-    // slack), and a saturating multiply can't panic on absurd inputs.
+    // channel-open budgets + the slack), and a saturating multiply can't panic on
+    // absurd inputs.
     #[test]
     fn outer_pull_deadline_handles_edges() {
+        let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
         assert_eq!(
-            outer_pull_deadline(Duration::ZERO),
-            PULL_THROUGH_OUTER_SLACK
+            outer_pull_deadline(Duration::ZERO, Duration::ZERO),
+            CHANNEL_OPEN_CALLER_BUDGET.saturating_mul(attempts) + PULL_THROUGH_OUTER_SLACK
         );
         // Saturates to MAX rather than overflowing/panicking — guards against a
-        // future switch to non-saturating arithmetic.
-        assert_eq!(outer_pull_deadline(Duration::MAX), Duration::MAX);
+        // future switch to non-saturating arithmetic. Checked on each term
+        // independently, since either one alone can saturate the sum.
+        assert_eq!(
+            outer_pull_deadline(Duration::MAX, Duration::ZERO),
+            Duration::MAX
+        );
+        assert_eq!(
+            outer_pull_deadline(Duration::ZERO, Duration::MAX),
+            Duration::MAX
+        );
     }
 
     // ADR 001 multiplier table: rep=1.0 → 1×, 0.8 → 1.56×, 0.5 → 4×, 0.3 → 11.1×, 0.1 → 100×.

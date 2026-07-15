@@ -9,6 +9,7 @@
 pub mod admin;
 pub mod blacklist_watcher;
 pub mod buyer_channel;
+pub mod buyer_ledgers;
 pub mod chain_events;
 pub mod channel_store;
 /// The `cdn/client/v1` paid-pull requester now lives in the shared

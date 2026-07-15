@@ -455,15 +455,37 @@ pub struct CacheConfig {
     /// probes none, so no pull can succeed (a way to disable the pull while
     /// keeping the feature flag on).
     pub node_pull_probe_fanout: Option<usize>,
-    /// Wall-clock timeout in seconds for a single upstream pull on a
-    /// node-to-node miss (#831). Absent =>
+    /// Wall-clock timeout in seconds for the STREAM-OPEN stage of a single upstream pull
+    /// on a node-to-node miss (#831) — connect, handshake, and the
+    /// signed `StreamResponse`. It does NOT bound the buyer-channel open, which precedes
+    /// it on its own 5 s budget. Absent =>
     /// [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`] (20). Bounds how long a
     /// miss blocks the serving path on one upstream before falling through to
     /// the next ranked candidate (or `NotFound`). This is the *per-upstream*
     /// budget; the overall pull-through deadline is derived as roughly
-    /// `MAX_PROVIDER_ATTEMPTS ×` it plus a fixed discovery allowance, so the
-    /// fallback loop reaches every ranked candidate (#859).
+    /// `MAX_PROVIDER_ATTEMPTS × (channel open + it + stall)` plus a fixed discovery
+    /// allowance, so the fallback loop reaches every ranked candidate (#859).
+    ///
+    /// It does NOT bound the streaming stage (#1134) — that is
+    /// [`Self::node_pull_stall_timeout_sec`]. A wall clock over the bytes would
+    /// cap the blob size a node can pull through at roughly
+    /// `this × link speed`, which is what it used to do.
     pub node_pull_timeout_sec: Option<u64>,
+    /// Inactivity timeout in seconds for the STREAMING stage of an upstream pull
+    /// (#1134). Absent => [`crate::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`]
+    /// (20). The clock resets on every byte received, so this trips only when an
+    /// upstream goes silent mid-transfer — never because a blob is large or a link
+    /// is slow. It is what makes a pull of any size safe to leave uncapped.
+    ///
+    /// Tune it against upstream responsiveness, not content size: too low and a
+    /// brief network hiccup abandons a healthy transfer (and scores the upstream
+    /// `Unreachable`); too high and a dead upstream is held onto for longer than
+    /// necessary before the fallback loop moves on.
+    ///
+    /// "Longer" is multiplied, not added. A silent candidate costs one full window of
+    /// this, and the derived outer deadline budgets that for EVERY candidate, so a second
+    /// here is ~3 seconds of worst-case client wait on a total miss (172 s at defaults).
+    pub node_pull_stall_timeout_sec: Option<u64>,
     /// Window-paced pull-through per-request pipeline window in bytes (#856, ADR
     /// 037 `pull_ahead_bytes`). Absent =>
     /// [`crate::config::DEFAULT_PULL_AHEAD_BYTES`] (1 MiB ≈ one voucher
@@ -739,15 +761,14 @@ pub struct GossipConfig {
     /// announce. Local stand-in for ADR 001 rule 2 (staked-node check)
     /// until the on-chain staking registry contract lands.
     pub allowlist: Option<Vec<String>>,
-    /// Hard cap on `PeerTable` entry count (#577 H3). Once the table is at
-    /// the cap, new announces from previously-unseen node IDs are
+    /// Optional hard cap on `PeerTable` entry count
+    /// (appendix-peer-table-eviction § No hard size cap). Once the table is
+    /// at the cap, new announces from previously-unseen node IDs are
     /// rejected after a one-shot inline TTL sweep; existing entries are
-    /// still refreshed. Absent => default 100 000. Must be `> 0`. A
-    /// generous default sized for a ~tens-of-MB memory budget at the
-    /// ~few-hundred-byte `PeerEntry` size, while still capping the
-    /// fresh-keypair memory-DoS that the empty-allowlist `PoC` stand-in
-    /// would otherwise leave unbounded.
-    pub max_peer_table_entries: Option<u64>,
+    /// still refreshed. Absent => no cap (unlimited); `decdn_peer_table_size`
+    /// is the early-warning signal operators watch to set the ceiling
+    /// reactively. Must be `> 0` when set.
+    pub max_peer_entries: Option<u64>,
 }
 
 /// Security / rate-limiting section of the config file.

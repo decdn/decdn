@@ -176,6 +176,31 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// missing-`ChannelOpened` leg carries no reason — the deposit is escrowed but
 /// untracked, so it surfaces as an unclassified error for manual reconciliation
 /// rather than a metric bump.
+///
+/// # The receipt wait is deliberately UNBOUNDED
+///
+/// `ensure_allowance`'s `approve` bounds its receipt wait (`APPROVE_RECEIPT_TIMEOUT`).
+/// `openChannel` must not — and neither does `top_up`, the module's third tx, which awaits
+/// its receipt unbounded for exactly the reason below. The line is not "one tx is special";
+/// it is ESCROWING vs idempotent, and it is load-bearing rather than an oversight (#1143).
+///
+/// `approve` is idempotent: giving up on its receipt costs nothing, because the
+/// allowance read on the next run makes a re-approve a no-op. `openChannel` and `top_up`
+/// **escrow funds**. Giving up on the receipt does not cancel the tx — it only
+/// makes us stop watching a transfer of real USDC that is still in the mempool. The
+/// caller then has no row, believes no open is in flight, and the next cache miss
+/// escrows a **second** deposit against the same provider. When the first tx mines,
+/// the boot reconcile scan finds a live row already covering that provider and
+/// classifies the orphan `DeferredSecondOpen` — it declines to adopt it, and the
+/// deposit is stranded for the channel's full expiry.
+///
+/// So: while an `openChannel` is outstanding, the only safe thing to do is keep
+/// waiting. The node calls this inside a DETACHED task that holds the provider's
+/// open slot for exactly as long as this future runs, which is what makes the wait
+/// harmless — no caller is blocked by it (they time out on their own budget and get
+/// `ChannelOpenPending`), and no second open can start behind it. It is also what
+/// lets the boot scan do its job: with no second open, there is no live row, so an
+/// orphan is `Rehydrate`d rather than deferred.
 pub async fn open_channel<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     signer: Arc<PrivateKeySigner>,
@@ -199,6 +224,9 @@ pub async fn open_channel<P: Provider + Clone>(
                 .context(reason);
         }
     };
+    // Unbounded by design — see the `# The receipt wait is deliberately UNBOUNDED`
+    // section above. A `tokio::time::timeout` here would be worse than no bound at
+    // all: it abandons an escrowing tx that is still going to land.
     let receipt = pending
         .get_receipt()
         .await
@@ -233,6 +261,17 @@ pub async fn open_channel<P: Provider + Clone>(
         .map(|decoded| decoded.inner.data)
         .find(|ev| ev.client == self_address && ev.provider == provider_addr)
     else {
+        // The deposit is escrowed on-chain and we cannot name the channel it bought.
+        // Log it HERE rather than leaving it to the caller: the node's caller is a
+        // detached task whose `Err` nobody may be waiting on (#1143), so a bare
+        // `bail!` could lose the only record of real, escrowed USDC.
+        error!(
+            %tx,
+            provider = %provider_addr,
+            %deposit,
+            "openChannel mined but its ChannelOpened event is missing from the receipt logs; \
+             the deposit is escrowed on-chain but UNTRACKED — reconcile manually against the tx"
+        );
         anyhow::bail!(
             "ChannelOpened event for provider {provider_addr} not found in openChannel receipt \
              logs (tx {tx}); the deposit is escrowed on-chain but untracked — reconcile manually"
