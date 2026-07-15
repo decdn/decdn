@@ -160,16 +160,17 @@ since project inception and will roll into the first tagged release.
 
 #### CLI
 
-- **The CLI now rejects the zero address for every resolved contract address,
-  not just the appeal address (#1153).** `resolve` / `resolve_appeal` /
-  `resolve_publish` route all four addresses (`capacity_bond_address`,
-  `slash_appeal_address`, `publisher_registry_address`,
-  `origin_assignment_address`) through a shared `parse_nonzero_address` guard, so
-  a misconfigured `0x0000…0000` fails fast at resolve time with a clear
-  "must not be the zero address" error instead of an opaque on-chain revert
-  later. Previously only `slash_appeal_address` was guarded. This is a new hard
-  error on `0x0` for the three other addresses (present-but-zero only; an unset
-  optional publish address still resolves to `None`).
+- **The CLI now rejects the zero address for the four addresses resolved by
+  `resolve` / `resolve_appeal` / `resolve_publish`, not just the appeal address
+  (#1153).** Those four (`capacity_bond_address`, `slash_appeal_address`,
+  `publisher_registry_address`, `origin_assignment_address`) route through a
+  shared `parse_nonzero_address` guard, so a misconfigured `0x0000…0000` fails
+  fast at resolve time with a clear "must not be the zero address" error instead
+  of an opaque on-chain revert later. Previously only `slash_appeal_address` was
+  guarded. This is a new hard error on `0x0` for the three other addresses
+  (present-but-zero only; an unset optional publish address still resolves to
+  `None`). Other CLI contract addresses parsed outside these resolvers are not
+  yet guarded (tracked separately).
 
 #### Gossip
 

@@ -184,8 +184,8 @@ pub fn resolve_appeal(
             )
         })?;
     // Reject the zero address via the shared guard (#1153) — see
-    // `parse_nonzero_address`; every resolved contract address gets the same
-    // early, labelled rejection.
+    // `parse_nonzero_address`; each of the four addresses resolved here and in
+    // `resolve` / `resolve_publish` gets the same early, labelled rejection.
     let slash_appeal_address = parse_nonzero_address(&slash_appeal_raw, "slash_appeal_address")?;
     let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
     Ok(ResolvedAppeal {
@@ -207,7 +207,10 @@ pub fn parse_address(value: &str, label: &str) -> anyhow::Result<Address> {
 /// Parse a contract address and reject the zero address. `Address::ZERO` parses
 /// cleanly but is never a real deployment — it would surface only as an opaque
 /// on-chain revert at call time, so reject it here with a clear, labelled error.
-/// The sole validation site for every resolved contract address (#1153).
+/// Applied to the four addresses resolved by `resolve` / `resolve_appeal` /
+/// `resolve_publish` (#1153). Other contract addresses parsed directly via
+/// [`parse_address`] elsewhere in the CLI are not yet guarded (tracked
+/// separately).
 pub fn parse_nonzero_address(value: &str, label: &str) -> anyhow::Result<Address> {
     let addr = parse_address(value, label)?;
     anyhow::ensure!(
