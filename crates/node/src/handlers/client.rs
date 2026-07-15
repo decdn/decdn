@@ -51,7 +51,7 @@ use decdn_protocol::client::{
 };
 use decdn_protocol::{
     ALPN_CLIENT, APP_ERR_RATE_LIMITED, FrameError, MB_BYTES, decode_message, encode_message,
-    read_frame, write_frame,
+    is_unknown_variant, read_frame, write_frame,
 };
 use futures_util::StreamExt as _;
 use iroh::PublicKey;
@@ -87,6 +87,7 @@ const WINDOW_PULL_FALLBACK_DEADLINE: Duration = Duration::from_mins(1);
 // voucher rejection does NOT use these — it writes a `StreamError` frame and
 // finishes the stream so the reason survives.
 const APP_ERR_NO_ERROR: u32 = 0x00;
+const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
 const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 
 /// Per-channel delivery state: the validated voucher state plus the channel-wide
@@ -2773,12 +2774,23 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
         }
         Ok((_, _)) => Err(StreamReadError {
             err: anyhow::anyhow!("expected StreamRequest or CooperativeCloseRequest"),
-            app_code: 0x01, // UNSUPPORTED_MESSAGE
+            app_code: APP_ERR_UNSUPPORTED_MESSAGE,
         }),
-        Err(e) => Err(StreamReadError {
-            err: anyhow::anyhow!("stream request decode failed: {e}"),
-            app_code: APP_ERR_MALFORMED_MESSAGE,
-        }),
+        Err(e) => {
+            // ADR 013: an unknown enum discriminant closes with
+            // UNSUPPORTED_MESSAGE (0x01), not MALFORMED_MESSAGE (0x03). A
+            // genuine parse fault (in-range discriminant, bad payload) stays
+            // MALFORMED.
+            let app_code = if is_unknown_variant::<ClientMessage>(&frame) {
+                APP_ERR_UNSUPPORTED_MESSAGE
+            } else {
+                APP_ERR_MALFORMED_MESSAGE
+            };
+            Err(StreamReadError {
+                err: anyhow::anyhow!("stream request decode failed: {e}"),
+                app_code,
+            })
+        }
     }
 }
 

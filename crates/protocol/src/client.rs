@@ -117,6 +117,12 @@ pub enum ClientMessage {
     CooperativeCloseAuth(CooperativeCloseAuth),
 }
 
+impl crate::framing::TopLevelEnum for ClientMessage {
+    /// `StreamRequest` (0) … `CooperativeCloseAuth` (8). Pinned by
+    /// `client_message_variant_count_matches_discriminants`.
+    const VARIANT_COUNT: u32 = 9;
+}
+
 impl ClientMessage {
     /// Validate the payload's requester-side invariants, dispatching to the
     /// per-variant `validate()`. This is the single decode-then-validate seam a
@@ -929,6 +935,39 @@ mod tests {
         let bytes = [99u8, 0, 0, 0, 0];
         let r: Result<ClientMessage, _> = postcard::from_bytes(&bytes);
         assert!(r.is_err());
+    }
+
+    // Pins `TopLevelEnum::VARIANT_COUNT` to the highest discriminant so a future
+    // variant addition must update the count the ADR 013 unknown/known
+    // classifier relies on.
+    #[test]
+    fn client_message_variant_count_matches_discriminants() -> Result<(), postcard::Error> {
+        use crate::framing::TopLevelEnum;
+        assert_eq!(ClientMessage::VARIANT_COUNT, 9);
+        // The last declared variant (`CooperativeCloseAuth`) must encode to
+        // discriminant VARIANT_COUNT - 1. Compare against postcard's own varint
+        // encoding of that index (not `first_byte`/`bytes.first()`) so the pin
+        // survives a future multi-byte discriminant (> 127 variants).
+        let last = ClientMessage::CooperativeCloseAuth(CooperativeCloseAuth {
+            channel_id: [0u8; 32],
+            amount: [0u8; 32],
+            nonce: [0u8; 32],
+            bytes_delivered: [0u8; 32],
+            signature: vec![0u8; COOPERATIVE_CLOSE_SIG_LEN],
+        });
+        let bytes = postcard::to_allocvec(&last)?;
+        let expected_disc = postcard::to_allocvec(&(ClientMessage::VARIANT_COUNT - 1))?;
+        assert!(bytes.starts_with(&expected_disc));
+        Ok(())
+    }
+
+    #[test]
+    fn client_message_unknown_discriminant_is_flagged_unsupported() {
+        // Discriminant 9 is the first index past the known set → UNSUPPORTED.
+        assert!(crate::is_unknown_variant::<ClientMessage>(&[9u8, 0, 0]));
+        // A known in-range discriminant (1 = StreamResponse) with a bad payload
+        // stays MALFORMED.
+        assert!(!crate::is_unknown_variant::<ClientMessage>(&[1u8, 0xFF]));
     }
 
     // --- Wire-format stability (fixed bytes) ---------------------------------
