@@ -58,7 +58,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 | Resets on rotation | Impact |
 |--------------------|--------|
-| Reputation observations from peers | Reports indexed by `(reporter, provider)` NodeId pair ([ADR 008](008-reputation.md#adr-008-reputation-system)); new NodeId starts at cold-start bootstrap score |
+| Reputation observations from peers | Reports indexed by `(reporter, provider)` NodeId pair ([ADR 008](008-reputation.md#adr-008-reputation-system)); new NodeId starts at the default 0.5 neutral score |
 | Local DHT routing-table position | New NodeId reseeds the Kademlia bucket structure ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) |
 | 0-RTT session tickets cached by clients | Clients fall back to 1-RTT until they re-cache ([ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment)); brief P95 bump |
 
@@ -100,7 +100,7 @@ cast code <addr>      # EOA → returns 0x ; Safe → returns deployed proxy cod
 
 ### EOA → EOA migration (PoC default)
 
-**No rebinding API exists for the on-chain Ethereum address.** The address is the stake owner — to rotate, move the entire identity. Expect downtime and loss of `firstBondedAt` (cold-start bootstrap signal in [ADR 008 § Cold-Start Bootstrap](008-reputation.md#cold-start-bootstrap)).
+**No rebinding API exists for the on-chain Ethereum address.** The address is the stake owner — to rotate, move the entire identity. Expect downtime and loss of `firstBondedAt` (the `age_ramp` governance-weight anchor in [ADR 026 § Governance](026-tokenomics.md#governance)).
 
 Procedure:
 
@@ -115,7 +115,7 @@ Procedure:
 9. **Restart** the node with config pointing at the new EVM keystore. Confirm `/health` reports `ready` and `decdn_channel_deposit_usdc` is zero (no channels yet).
 10. **Re-open outbound channels** as needed for cache-miss pulls — no carry-over.
 
-**Real cost:** `firstBondedAt` resets to the new registration timestamp (cold-start bootstrap window restarts); the operator's `age_ramp` resets to zero and rebuilds to full weight at 6 months per [ADR 026 § Governance](026-tokenomics.md#governance); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score decay](008-reputation.md#adr-008-reputation-system).
+**Real cost:** `firstBondedAt` resets to the new registration timestamp; the operator's `age_ramp` resets to zero and rebuilds to full weight at 6 months per [ADR 026 § Governance](026-tokenomics.md#governance); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score decay](008-reputation.md#adr-008-reputation-system).
 
 > **Recommendation.** Treat EOA rotation as a last resort. Prefer the **one-time migration to a Safe** ([§ EOA → Safe migration (one-time, recommended)](#eoa--safe-migration-one-time-recommended)) — once on a Safe, all future "rotations" are owner/session-key swaps with no on-chain identity change.
 
