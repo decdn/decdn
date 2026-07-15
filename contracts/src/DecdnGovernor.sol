@@ -8,6 +8,7 @@ import { TimelockController } from "@openzeppelin/contracts/governance/TimelockC
 import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 import { Time } from "@openzeppelin/contracts/utils/types/Time.sol";
 import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
 import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
@@ -21,6 +22,19 @@ import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
 /// @dev    `VotingEscrow` and `IVotes`/IERC-5805 are intentionally NOT used —
 ///         voting weight is derived from `FeeRouter` epoch accounting, not
 ///         from per-account checkpoint structures. See ADR 036 § Formula.
+///
+///         Vote delegation (ADR 009 / ADR 026, Governor Bravo pattern) is a
+///         lightweight registry layered on top: an operator names a `delegatee`
+///         (via a direct `delegate` call or an EIP-712 signed `delegateBySig`),
+///         and that delegatee may then cast the operator's vote through
+///         `castVoteByDelegate`. Only the vote-casting right moves — the bond,
+///         NodeId binding, and served-bytes accrual all stay on the operator,
+///         and the vote is tallied under (and `hasVoted`-guarded by) the
+///         operator's own address, so `_getVotes` and the per-operator cap are
+///         untouched. Because the tally is keyed on the operator, an operator's
+///         weight can be cast at most once per proposal regardless of who casts
+///         or how delegation changes mid-vote, so the delegation relationship
+///         needs no snapshotting.
 contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockControl {
     using Checkpoints for Checkpoints.Trace208;
     using SafeCast for uint256;
@@ -288,6 +302,133 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         // slither-disable-next-line unused-return
         _ageRampMonthsHistory.push(clock(), newValue.toUint208());
         emit AgeRampMonthsUpdated(old, newValue);
+    }
+
+    // -----------------------------------------------------------------
+    // Vote delegation (ADR 009 / ADR 026 — Governor Bravo pattern)
+    // -----------------------------------------------------------------
+    //
+    // A minimal delegation registry: an operator (the delegator) authorises a
+    // `delegatee` to cast the operator's vote. The served-bytes weight, the
+    // bond, and the NodeId binding all stay on the operator; `_getVotes` is
+    // never consulted for the delegatee's own address on the operator's behalf.
+    // Instead the delegatee calls `castVoteByDelegate`, which routes through
+    // OZ's `_castVote(proposalId, operator, …)` so the weight, the `VoteCast`
+    // event, and the `hasVoted` flag are all attributed to the operator. That
+    // single `hasVoted[proposalId][operator]` guard makes each operator's
+    // weight cast at most once per proposal — whoever casts first (the operator
+    // themselves or their current delegatee) wins, and re-delegating mid-vote
+    // cannot double-count — so the delegation link is read live and needs no
+    // per-timepoint checkpoint.
+
+    /// @dev EIP-712 type hash for a signed delegation. `delegator` is carried
+    ///      explicitly (rather than recovered) so contract wallets can delegate
+    ///      via EIP-1271, mirroring OZ's `castVoteBySig(…, voter, signature)`.
+    bytes32 public constant DELEGATION_TYPEHASH =
+        keccak256("Delegation(address delegator,address delegatee,uint256 nonce,uint256 expiry)");
+
+    /// @dev operator ⇒ the address currently authorised to cast its vote.
+    ///      `address(0)` means no delegation (only the operator can vote).
+    mapping(address => address) private _delegatee;
+
+    /// @dev Replay-protection nonce for `delegateBySig`, kept in a dedicated
+    ///      namespace so it never collides with the ballot nonces OZ's
+    ///      `Nonces` tracks for `castVoteBySig`.
+    mapping(address => uint256) private _delegationNonces;
+
+    event DelegateChanged(address indexed delegator, address indexed fromDelegatee, address indexed toDelegatee);
+
+    error NotDelegatee(address delegator, address caller);
+    error DelegationSignatureExpired(uint256 expiry);
+    error InvalidDelegationSignature(address delegator);
+    error InvalidDelegationNonce(address delegator, uint256 expected, uint256 provided);
+
+    /// @notice The address currently authorised to cast `operator`'s vote, or
+    ///         `address(0)` if the operator has not delegated.
+    function delegates(address operator) external view returns (address) {
+        return _delegatee[operator];
+    }
+
+    /// @notice Next unused `delegateBySig` nonce for `operator`.
+    function delegationNonces(address operator) external view returns (uint256) {
+        return _delegationNonces[operator];
+    }
+
+    /// @notice Delegate the caller's vote-casting right to `delegatee`. Pass
+    ///         `address(0)` to revoke. Overwrites any prior delegation.
+    function delegate(address delegatee) external {
+        _delegate(_msgSender(), delegatee);
+    }
+
+    /// @notice Delegate `delegator`'s vote-casting right to `delegatee` from an
+    ///         off-chain EIP-712 signature, so a relayer can submit it. The
+    ///         `expiry` bounds when the signature may be redeemed; once
+    ///         redeemed the delegation stands until changed. `nonce` must equal
+    ///         the delegator's current `delegationNonces` value and is consumed
+    ///         on success (single-use, replay-proof). Supports EIP-1271
+    ///         contract signers via `SignatureChecker`.
+    function delegateBySig(
+        address delegator,
+        address delegatee,
+        uint256 nonce,
+        uint256 expiry,
+        bytes calldata signature
+    ) external {
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > expiry) revert DelegationSignatureExpired(expiry);
+        bytes32 digest =
+            _hashTypedDataV4(keccak256(abi.encode(DELEGATION_TYPEHASH, delegator, delegatee, nonce, expiry)));
+        if (!SignatureChecker.isValidSignatureNow(delegator, digest, signature)) {
+            revert InvalidDelegationSignature(delegator);
+        }
+        uint256 expected = _delegationNonces[delegator];
+        if (nonce != expected) revert InvalidDelegationNonce(delegator, expected, nonce);
+        _delegationNonces[delegator] = expected + 1;
+        _delegate(delegator, delegatee);
+    }
+
+    /// @notice Cast `delegator`'s vote. Caller must be `delegator`'s current
+    ///         delegatee. The vote (weight, `VoteCast` event, `hasVoted`) is
+    ///         attributed to `delegator`, not the caller.
+    function castVoteByDelegate(uint256 proposalId, address delegator, uint8 support) external returns (uint256) {
+        _requireDelegatee(delegator, _msgSender());
+        return _castVote(proposalId, delegator, support, "");
+    }
+
+    /// @notice `castVoteByDelegate` with a human-readable reason (attributed to
+    ///         `delegator` in the emitted `VoteCast`).
+    function castVoteByDelegateWithReason(uint256 proposalId, address delegator, uint8 support, string calldata reason)
+        external
+        returns (uint256)
+    {
+        _requireDelegatee(delegator, _msgSender());
+        return _castVote(proposalId, delegator, support, reason);
+    }
+
+    /// @notice Cast the votes of several operators that have all delegated to
+    ///         the caller, in one transaction. Reverts wholesale if the caller
+    ///         is not the current delegatee of every `delegator` (or if any has
+    ///         already voted). The loop is bounded by the caller-supplied array
+    ///         and the caller pays its gas, so it carries no griefing surface.
+    function castVotesByDelegate(uint256 proposalId, address[] calldata delegators, uint8 support)
+        external
+        returns (uint256 totalWeight)
+    {
+        address caller = _msgSender();
+        for (uint256 i = 0; i < delegators.length; ++i) {
+            _requireDelegatee(delegators[i], caller);
+            totalWeight += _castVote(proposalId, delegators[i], support, "");
+        }
+    }
+
+    function _delegate(address delegator, address delegatee) private {
+        address from = _delegatee[delegator];
+        _delegatee[delegator] = delegatee;
+        emit DelegateChanged(delegator, from, delegatee);
+    }
+
+    function _requireDelegatee(address delegator, address caller) private view {
+        if (_delegatee[delegator] != caller) revert NotDelegatee(delegator, caller);
     }
 
     // -----------------------------------------------------------------
