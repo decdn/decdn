@@ -19,7 +19,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::providers::Provider;
+use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::cooperative_close::{
     AuthorizedWatermark, CooperativeCloseOutcome, cooperative_close,
 };
@@ -29,7 +32,7 @@ use decdn_incentive::buyer_channel::{BuyerChannelState, BuyerChannelStore};
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
-use decdn_incentive::voucher_domain;
+use decdn_incentive::{Voucher, voucher_domain};
 use iroh::{EndpointAddr, PublicKey};
 use serde::Serialize;
 
@@ -45,6 +48,9 @@ pub async fn channel_dispatch(
     match &args.command {
         cli::ChannelCommand::List(a) => list(a, config_path),
         cli::ChannelCommand::CoopClose(a) => coop_close(a, config_path).await,
+        cli::ChannelCommand::Close(a) => close(a, config_path).await,
+        cli::ChannelCommand::Settle(a) => settle(a, config_path).await,
+        cli::ChannelCommand::Clean(a) => clean(a, config_path).await,
     }
 }
 
@@ -135,16 +141,8 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
         bytes_delivered: state.last_bytes_delivered,
     };
 
-    // Buyer signer (the client voucher + the cooperativeClose tx). Password from
-    // env, else TTY.
-    let password = read_password(
-        &[
-            PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-            PasswordSource::Prompt { confirm: false },
-        ],
-        "eth keystore password",
-    )?;
-    let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+    // Buyer signer (the client voucher + the cooperativeClose tx).
+    let signer = Arc::new(load_buyer_signer(&chain.keystore)?);
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentChannel::new(chain.payment_channel, rpc);
     let domain = voucher_domain(chain.chain_id, chain.payment_channel);
@@ -206,6 +204,516 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
             )
         }
     }
+}
+
+/// Buyer signer for the on-chain `channel` commands (the client voucher +
+/// close/settle/reclaim txs). Password from `KEYSTORE_PASSWORD_ENV`, else TTY.
+fn load_buyer_signer(keystore: &Path) -> anyhow::Result<PrivateKeySigner> {
+    let password = read_password(
+        &[
+            PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
+            PasswordSource::Prompt { confirm: false },
+        ],
+        "eth keystore password",
+    )?;
+    load_signer(keystore, &password)
+}
+
+/// Current Unix time (seconds) for the local pre-flight expiry / dispute-window
+/// checks. Only a candidate filter — the contract's own `block.timestamp` gate
+/// is authoritative, so a too-early attempt simply reverts (mirrors the node's
+/// `payment_settlement::unix_now`). A clock before the epoch yields `0` (treat
+/// everything as not-yet-ready — the safe direction).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Local mirror of the on-chain `PaymentChannel.Status`, decoupled from the
+/// alloy-generated type so [`next_action`] stays a pure, table-testable fn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelStatus {
+    Open,
+    Closing,
+    Closed,
+}
+
+/// Map the on-chain status. Any unexpected/invalid discriminant is treated as
+/// `Closed` (terminal — drop the local record), the safe direction.
+const fn map_status(s: PaymentChannel::Status) -> ChannelStatus {
+    match s {
+        PaymentChannel::Status::Open => ChannelStatus::Open,
+        PaymentChannel::Status::Closing => ChannelStatus::Closing,
+        _ => ChannelStatus::Closed,
+    }
+}
+
+/// The next on-chain step to wind a channel down, from its current status and
+/// the two deadlines. Pure so every branch is unit-testable without a chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanAction {
+    /// Open and not yet expired: `closeChannel` with the latest voucher to open
+    /// the dispute window.
+    Close,
+    /// Open but past `expiresAt`: `reclaimExpired` to refund the deposit.
+    Reclaim,
+    /// Closing and the dispute window has elapsed: `settleChannel` to finalize.
+    Settle,
+    /// Closing but the window is still open until this Unix deadline — re-run
+    /// later; no tx now.
+    PendingWindow(u64),
+    /// Already `Closed`: nothing on-chain to do, drop the local record.
+    AlreadyClosed,
+}
+
+/// `expires_at == 0` is the "untracked / never expires" sentinel (treated as not
+/// expired); the dispute deadline uses `>=` to match the contract's
+/// `block.timestamp >= disputeDeadline` finalize gate.
+const fn next_action(
+    status: ChannelStatus,
+    expires_at: u64,
+    dispute_deadline: u64,
+    now: u64,
+) -> CleanAction {
+    match status {
+        ChannelStatus::Open if expires_at != 0 && now >= expires_at => CleanAction::Reclaim,
+        ChannelStatus::Open => CleanAction::Close,
+        ChannelStatus::Closing if now >= dispute_deadline => CleanAction::Settle,
+        ChannelStatus::Closing => CleanAction::PendingWindow(dispute_deadline),
+        ChannelStatus::Closed => CleanAction::AlreadyClosed,
+    }
+}
+
+/// Terminal outcome of a single close/settle/reclaim tx.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxOutcome {
+    /// Mined with a success receipt.
+    Landed,
+    /// Deterministically reverted (caught at estimation or a failing receipt) —
+    /// non-fatal; the caller re-reads on-chain state and re-decides.
+    Reverted,
+}
+
+/// Re-sign the client voucher over the persisted watermark. The buyer store
+/// keeps only `(amount, nonce, bytes)` — never the signature — so `closeChannel`
+/// re-produces it on demand, exactly as the node reconcile path and
+/// `cooperative_close::prepare_close` do.
+fn sign_client_voucher(
+    state: &BuyerChannelState,
+    signer: &PrivateKeySigner,
+    domain: &Eip712Domain,
+) -> anyhow::Result<Bytes> {
+    let sig = Voucher {
+        channel_id: state.channel_id,
+        amount: state.last_amount,
+        nonce: state.last_nonce,
+        bytes_delivered: state.last_bytes_delivered,
+        token: state.token,
+    }
+    .sign(signer, domain)
+    .map_err(|e| anyhow::anyhow!("client voucher signing failed: {e}"))?
+    .signature;
+    Ok(Bytes::from(sig.as_bytes().to_vec()))
+}
+
+/// `closeChannel` with the re-signed latest voucher (opens the dispute window).
+async fn submit_close<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    state: &BuyerChannelState,
+    signer: &PrivateKeySigner,
+    domain: &Eip712Domain,
+) -> anyhow::Result<TxOutcome> {
+    let sig = sign_client_voucher(state, signer, domain)?;
+    let pending = match contract
+        .closeChannel(
+            state.channel_id,
+            state.last_amount,
+            state.last_nonce,
+            state.last_bytes_delivered,
+            sig,
+        )
+        .send()
+        .await
+    {
+        Ok(pending) => pending,
+        Err(e) if e.as_revert_data().is_some() => return Ok(TxOutcome::Reverted),
+        Err(e) => return Err(anyhow::anyhow!("closeChannel send failed: {e}")),
+    };
+    let receipt = pending
+        .get_receipt()
+        .await
+        .map_err(|e| anyhow::anyhow!("closeChannel receipt failed: {e}"))?;
+    Ok(receipt_outcome(receipt.status()))
+}
+
+/// `settleChannel` — finalize a closed channel past its dispute window.
+async fn submit_settle<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    channel_id: B256,
+) -> anyhow::Result<TxOutcome> {
+    let pending = match contract.settleChannel(channel_id).send().await {
+        Ok(pending) => pending,
+        Err(e) if e.as_revert_data().is_some() => return Ok(TxOutcome::Reverted),
+        Err(e) => return Err(anyhow::anyhow!("settleChannel send failed: {e}")),
+    };
+    let receipt = pending
+        .get_receipt()
+        .await
+        .map_err(|e| anyhow::anyhow!("settleChannel receipt failed: {e}"))?;
+    Ok(receipt_outcome(receipt.status()))
+}
+
+/// `reclaimExpired` — refund the deposit of an expired, never-closed channel.
+async fn submit_reclaim<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    channel_id: B256,
+) -> anyhow::Result<TxOutcome> {
+    let pending = match contract.reclaimExpired(channel_id).send().await {
+        Ok(pending) => pending,
+        Err(e) if e.as_revert_data().is_some() => return Ok(TxOutcome::Reverted),
+        Err(e) => return Err(anyhow::anyhow!("reclaimExpired send failed: {e}")),
+    };
+    let receipt = pending
+        .get_receipt()
+        .await
+        .map_err(|e| anyhow::anyhow!("reclaimExpired receipt failed: {e}"))?;
+    Ok(receipt_outcome(receipt.status()))
+}
+
+/// A mined-but-reverted tx returns `Ok(receipt)` with `status() == false`, so map
+/// the receipt status to the outcome (mirrors the node settlement path).
+const fn receipt_outcome(landed: bool) -> TxOutcome {
+    if landed {
+        TxOutcome::Landed
+    } else {
+        TxOutcome::Reverted
+    }
+}
+
+/// Drop a terminal channel's local record. A failed clear only risks a later
+/// stale-reuse attempt (rejected on-chain), so warn rather than fail.
+fn forget_terminal(store: &RedbBuyerChannelStore, provider: Address, channel_id: B256) {
+    if let Err(e) = store.forget_if_channel(provider, channel_id) {
+        eprintln!(
+            "warning: channel {channel_id} finalized on-chain but clearing it from the buyer \
+             store failed: {e}"
+        );
+    }
+}
+
+/// `decdn channel close` (#1136): unilaterally close the channel tracked for a
+/// provider with the latest client voucher, opening the on-chain dispute window.
+/// No provider contact needed — use `channel coop-close` for the instant path.
+async fn close(args: &cli::ChannelCloseArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let file = load_file_config(config_path)?;
+    let chain = resolve_chain(&args.chain, &file)?;
+    let provider_addr = chain_ctx::parse_address(&args.provider_address, "--provider-address")?;
+
+    let store = RedbBuyerChannelStore::open(&chain.data_dir)?;
+    let state = store.get_by_provider(provider_addr)?.ok_or_else(|| {
+        anyhow::anyhow!("no buyer channel tracked for provider {provider_addr} — nothing to close")
+    })?;
+
+    let signer = Arc::new(load_buyer_signer(&chain.keystore)?);
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+    let contract = PaymentChannel::new(chain.payment_channel, rpc);
+    let domain = voucher_domain(chain.chain_id, chain.payment_channel);
+
+    let ch = contract
+        .getChannel(state.channel_id)
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("getChannel failed: {e}"))?;
+    ensure_owned(ch.client, signer.address(), state.channel_id)?;
+
+    match next_action(
+        map_status(ch.status),
+        ch.expiresAt,
+        ch.disputeDeadline,
+        unix_now(),
+    ) {
+        CleanAction::Close => {}
+        CleanAction::Reclaim => anyhow::bail!(
+            "channel {} expired while open — run `decdn channel settle` to reclaim the deposit",
+            state.channel_id
+        ),
+        CleanAction::Settle | CleanAction::PendingWindow(_) => anyhow::bail!(
+            "channel {} is already closing — run `decdn channel settle` to finalize it",
+            state.channel_id
+        ),
+        CleanAction::AlreadyClosed => {
+            anyhow::bail!("channel {} is already closed", state.channel_id)
+        }
+    }
+
+    match submit_close(&contract, &state, &signer, &domain).await? {
+        TxOutcome::Landed => {
+            let settle_after = contract
+                .getChannel(state.channel_id)
+                .call()
+                .await
+                .map_or(ch.disputeDeadline, |c| c.disputeDeadline);
+            println!(
+                "closed channel {} (provider {provider_addr}); dispute window open — run \
+                 `decdn channel settle --provider-address {provider_addr}` after Unix {settle_after}",
+                state.channel_id
+            );
+            Ok(())
+        }
+        TxOutcome::Reverted => anyhow::bail!(
+            "closeChannel reverted on-chain for channel {} (it may have raced a withdraw/close, or \
+             the voucher regressed against the on-chain claimed watermark)",
+            state.channel_id
+        ),
+    }
+}
+
+/// `decdn channel settle` (#1136): finalize the channel tracked for a provider —
+/// `settleChannel` once its dispute window has elapsed, or `reclaimExpired` if it
+/// expired while still open. On success the local record is dropped.
+async fn settle(args: &cli::ChannelSettleArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let file = load_file_config(config_path)?;
+    let chain = resolve_chain(&args.chain, &file)?;
+    let provider_addr = chain_ctx::parse_address(&args.provider_address, "--provider-address")?;
+
+    let store = RedbBuyerChannelStore::open(&chain.data_dir)?;
+    let state = store.get_by_provider(provider_addr)?.ok_or_else(|| {
+        anyhow::anyhow!("no buyer channel tracked for provider {provider_addr} — nothing to settle")
+    })?;
+
+    let signer = Arc::new(load_buyer_signer(&chain.keystore)?);
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+    let contract = PaymentChannel::new(chain.payment_channel, rpc);
+
+    let ch = contract
+        .getChannel(state.channel_id)
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("getChannel failed: {e}"))?;
+    ensure_owned(ch.client, signer.address(), state.channel_id)?;
+
+    match next_action(
+        map_status(ch.status),
+        ch.expiresAt,
+        ch.disputeDeadline,
+        unix_now(),
+    ) {
+        CleanAction::Settle => match submit_settle(&contract, state.channel_id).await? {
+            TxOutcome::Landed => {
+                forget_terminal(&store, provider_addr, state.channel_id);
+                println!(
+                    "settled channel {}; remaining balance refunded to {}",
+                    state.channel_id,
+                    signer.address()
+                );
+                Ok(())
+            }
+            TxOutcome::Reverted => anyhow::bail!(
+                "settleChannel reverted for channel {} (already finalized, or the dispute window \
+                 has not elapsed on-chain yet)",
+                state.channel_id
+            ),
+        },
+        CleanAction::Reclaim => match submit_reclaim(&contract, state.channel_id).await? {
+            TxOutcome::Landed => {
+                forget_terminal(&store, provider_addr, state.channel_id);
+                println!(
+                    "reclaimed expired channel {}; deposit refunded to {}",
+                    state.channel_id,
+                    signer.address()
+                );
+                Ok(())
+            }
+            TxOutcome::Reverted => anyhow::bail!(
+                "reclaimExpired reverted for channel {} (not expired/open on-chain yet)",
+                state.channel_id
+            ),
+        },
+        CleanAction::AlreadyClosed => {
+            forget_terminal(&store, provider_addr, state.channel_id);
+            println!(
+                "channel {} already closed; cleared local record",
+                state.channel_id
+            );
+            Ok(())
+        }
+        CleanAction::Close => anyhow::bail!(
+            "channel {} is still open — run `decdn channel close` first (or wait until it expires \
+             to reclaim)",
+            state.channel_id
+        ),
+        CleanAction::PendingWindow(deadline) => anyhow::bail!(
+            "channel {} dispute window is still open — run `decdn channel settle` after Unix {deadline}",
+            state.channel_id
+        ),
+    }
+}
+
+/// Reject a tracked record whose on-chain `client` isn't this keystore — a wrong
+/// keystore/contract or a stale local record (a zero `client` means the channel
+/// was never opened on this contract).
+fn ensure_owned(on_chain_client: Address, ours: Address, channel_id: B256) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        on_chain_client == ours,
+        "channel {channel_id} on-chain client {on_chain_client} is not this keystore's address \
+         {ours} — wrong keystore/contract, or a stale local record"
+    );
+    Ok(())
+}
+
+/// Terminal status of one channel after a `clean` pass, for reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanStatus {
+    /// Finalized via `settleChannel`.
+    Settled,
+    /// Refunded via `reclaimExpired`.
+    Reclaimed,
+    /// Just closed unilaterally; needs a later `settle` once the window elapses.
+    Closed { settle_after: u64 },
+    /// Already closing; dispute window still open until this Unix deadline.
+    Pending { settle_after: u64 },
+    /// Already closed on-chain; local record cleared.
+    AlreadyClosed,
+    /// Not owned by this keystore on-chain; stale local record cleared.
+    ClearedStale,
+    /// The on-chain tx reverted; a re-run re-reads state and re-decides.
+    Reverted(&'static str),
+}
+
+impl CleanStatus {
+    /// Whether the channel still needs a later `clean` run (a closed channel
+    /// mid-window, or a revert to re-evaluate). Terminal outcomes return false.
+    const fn incomplete(self) -> bool {
+        matches!(
+            self,
+            Self::Closed { .. } | Self::Pending { .. } | Self::Reverted(_)
+        )
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Settled => "settled — balance refunded".to_string(),
+            Self::Reclaimed => "reclaimed — expired deposit refunded".to_string(),
+            Self::Closed { settle_after } => {
+                format!("closed — run `clean` again after Unix {settle_after} to settle")
+            }
+            Self::Pending { settle_after } => {
+                format!("closing — dispute window open until Unix {settle_after}")
+            }
+            Self::AlreadyClosed => "already closed — cleared local record".to_string(),
+            Self::ClearedStale => "not owned by this keystore — cleared local record".to_string(),
+            Self::Reverted(op) => format!("{op} reverted — re-run to re-evaluate"),
+        }
+    }
+}
+
+/// Advance one tracked channel through its wind-down state machine. Transient
+/// RPC/receipt failures surface as `Err` (the caller flags a needed re-run);
+/// on-chain reverts are captured as [`CleanStatus::Reverted`], not errors.
+async fn clean_one<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    store: &RedbBuyerChannelStore,
+    signer: &PrivateKeySigner,
+    domain: &Eip712Domain,
+    state: &BuyerChannelState,
+    now: u64,
+) -> anyhow::Result<CleanStatus> {
+    let ch = contract
+        .getChannel(state.channel_id)
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("getChannel failed: {e}"))?;
+    if ch.client != signer.address() {
+        forget_terminal(store, state.provider, state.channel_id);
+        return Ok(CleanStatus::ClearedStale);
+    }
+
+    match next_action(map_status(ch.status), ch.expiresAt, ch.disputeDeadline, now) {
+        CleanAction::Close => match submit_close(contract, state, signer, domain).await? {
+            TxOutcome::Landed => {
+                let settle_after = contract
+                    .getChannel(state.channel_id)
+                    .call()
+                    .await
+                    .map_or(ch.disputeDeadline, |c| c.disputeDeadline);
+                Ok(CleanStatus::Closed { settle_after })
+            }
+            TxOutcome::Reverted => Ok(CleanStatus::Reverted("closeChannel")),
+        },
+        CleanAction::Reclaim => match submit_reclaim(contract, state.channel_id).await? {
+            TxOutcome::Landed => {
+                forget_terminal(store, state.provider, state.channel_id);
+                Ok(CleanStatus::Reclaimed)
+            }
+            TxOutcome::Reverted => Ok(CleanStatus::Reverted("reclaimExpired")),
+        },
+        CleanAction::Settle => match submit_settle(contract, state.channel_id).await? {
+            TxOutcome::Landed => {
+                forget_terminal(store, state.provider, state.channel_id);
+                Ok(CleanStatus::Settled)
+            }
+            TxOutcome::Reverted => Ok(CleanStatus::Reverted("settleChannel")),
+        },
+        CleanAction::PendingWindow(settle_after) => Ok(CleanStatus::Pending { settle_after }),
+        CleanAction::AlreadyClosed => {
+            forget_terminal(store, state.provider, state.channel_id);
+            Ok(CleanStatus::AlreadyClosed)
+        }
+    }
+}
+
+/// `decdn channel clean` (#1136): reclaim USDC across every tracked channel by
+/// driving each through the unilateral close → dispute-window → settle/reclaim
+/// sweep. Idempotent and resumable — channels mid dispute-window are reported and
+/// finalized by a later run. Processed sequentially (one signer nonce at a time).
+async fn clean(args: &cli::ChannelCleanArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let file = load_file_config(config_path)?;
+    let chain = resolve_chain(&args.chain, &file)?;
+
+    let store = RedbBuyerChannelStore::open(&chain.data_dir)?;
+    let mut channels = store.load_all()?;
+    channels.sort_by_key(|c| c.provider);
+    if channels.is_empty() {
+        println!("no tracked channels to clean");
+        return Ok(());
+    }
+
+    let signer = Arc::new(load_buyer_signer(&chain.keystore)?);
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+    let contract = PaymentChannel::new(chain.payment_channel, rpc);
+    let domain = voucher_domain(chain.chain_id, chain.payment_channel);
+    let now = unix_now();
+
+    let mut failed = 0usize;
+    let mut incomplete = 0usize;
+    for state in &channels {
+        let provider_col = short_hex(&format!("{:#x}", state.provider));
+        match clean_one(&contract, &store, &signer, &domain, state, now).await {
+            Ok(status) => {
+                if status.incomplete() {
+                    incomplete += 1;
+                }
+                println!("{provider_col}  {}", status.label());
+            }
+            Err(e) => {
+                failed += 1;
+                println!("{provider_col}  needs-retry: {e}");
+            }
+        }
+    }
+
+    if incomplete > 0 {
+        println!(
+            "{incomplete} channel(s) still winding down — re-run `decdn channel clean` after their \
+             dispute windows elapse to finish settling"
+        );
+    }
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} channel(s) hit a transient error; re-run `decdn channel clean` to retry"
+    );
+    Ok(())
 }
 
 /// `decdn channel list` / `status` (#1133): read-only dump of the tracked buyer
@@ -326,8 +834,6 @@ fn short_hex(hex: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use alloy::primitives::B256;
-
     use super::*;
 
     fn args() -> cli::CoopCloseArgs {
@@ -469,6 +975,79 @@ mod tests {
         assert_eq!(
             short_hex("0x1111111111111111111111111111111111111111"),
             "0x1111111111…"
+        );
+    }
+
+    #[test]
+    fn next_action_open_not_expired_closes() {
+        // expires_at = 0 (never) and a future expiry both stay Open -> Close.
+        assert_eq!(
+            next_action(ChannelStatus::Open, 0, 0, 1_000),
+            CleanAction::Close
+        );
+        assert_eq!(
+            next_action(ChannelStatus::Open, 2_000, 0, 1_000),
+            CleanAction::Close
+        );
+    }
+
+    #[test]
+    fn next_action_open_expired_reclaims() {
+        // Past expiry (and not the 0 sentinel) -> reclaim.
+        assert_eq!(
+            next_action(ChannelStatus::Open, 1_000, 0, 1_000),
+            CleanAction::Reclaim
+        );
+        assert_eq!(
+            next_action(ChannelStatus::Open, 900, 0, 1_000),
+            CleanAction::Reclaim
+        );
+    }
+
+    #[test]
+    fn next_action_closing_gates_on_dispute_deadline() {
+        // Window still open -> report; elapsed (>=) -> settle.
+        assert_eq!(
+            next_action(ChannelStatus::Closing, 0, 5_000, 4_999),
+            CleanAction::PendingWindow(5_000)
+        );
+        assert_eq!(
+            next_action(ChannelStatus::Closing, 0, 5_000, 5_000),
+            CleanAction::Settle
+        );
+    }
+
+    #[test]
+    fn next_action_closed_is_terminal() {
+        assert_eq!(
+            next_action(ChannelStatus::Closed, 0, 0, 1_000),
+            CleanAction::AlreadyClosed
+        );
+    }
+
+    #[test]
+    fn clean_status_incomplete_only_for_re_runnable() {
+        assert!(CleanStatus::Closed { settle_after: 9 }.incomplete());
+        assert!(CleanStatus::Pending { settle_after: 9 }.incomplete());
+        assert!(CleanStatus::Reverted("settleChannel").incomplete());
+        assert!(!CleanStatus::Settled.incomplete());
+        assert!(!CleanStatus::Reclaimed.incomplete());
+        assert!(!CleanStatus::AlreadyClosed.incomplete());
+        assert!(!CleanStatus::ClearedStale.incomplete());
+    }
+
+    #[test]
+    fn clean_status_labels_are_descriptive() {
+        assert!(CleanStatus::Settled.label().contains("settled"));
+        assert!(
+            CleanStatus::Closed { settle_after: 42 }
+                .label()
+                .contains("42")
+        );
+        assert!(
+            CleanStatus::Reverted("closeChannel")
+                .label()
+                .contains("closeChannel")
         );
     }
 }

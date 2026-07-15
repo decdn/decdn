@@ -33,6 +33,49 @@ pub enum ChannelCommand {
     /// Cooperatively close the channel tracked for a provider: fetch the
     /// provider's waiver and settle on-chain with no dispute window.
     CoopClose(CoopCloseArgs),
+    /// Unilaterally close the channel tracked for a provider with the latest
+    /// client voucher, opening the on-chain dispute window (no provider needed).
+    Close(ChannelCloseArgs),
+    /// Finalize the channel tracked for a provider: `settleChannel` after its
+    /// dispute window, or `reclaimExpired` if it expired while still open.
+    Settle(ChannelSettleArgs),
+    /// Reclaim USDC from every tracked channel by driving each through the
+    /// unilateral close -> dispute-window -> settle/reclaim sweep. Idempotent:
+    /// re-run to advance channels whose windows have since elapsed.
+    Clean(ChannelCleanArgs),
+}
+
+/// `decdn channel close` flags.
+#[derive(Args, Debug)]
+pub struct ChannelCloseArgs {
+    /// Provider's Ethereum address — selects the tracked buyer channel to close.
+    #[arg(long, value_name = "ADDRESS")]
+    pub provider_address: String,
+
+    /// Shared chain + store coordinates.
+    #[command(flatten)]
+    pub chain: ChannelChainArgs,
+}
+
+/// `decdn channel settle` flags.
+#[derive(Args, Debug)]
+pub struct ChannelSettleArgs {
+    /// Provider's Ethereum address — selects the tracked buyer channel to
+    /// finalize.
+    #[arg(long, value_name = "ADDRESS")]
+    pub provider_address: String,
+
+    /// Shared chain + store coordinates.
+    #[command(flatten)]
+    pub chain: ChannelChainArgs,
+}
+
+/// `decdn channel clean` flags.
+#[derive(Args, Debug)]
+pub struct ChannelCleanArgs {
+    /// Shared chain + store coordinates.
+    #[command(flatten)]
+    pub chain: ChannelChainArgs,
 }
 
 /// Shared chain + store coordinates for `decdn channel` subcommands.
