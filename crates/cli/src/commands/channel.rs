@@ -443,20 +443,31 @@ async fn close(args: &cli::ChannelCloseArgs, config_path: Option<&Path>) -> anyh
             state.channel_id
         ),
         CleanAction::AlreadyClosed => {
-            anyhow::bail!("channel {} is already closed", state.channel_id)
+            // Terminal on-chain (and confirmed ours above): clear the stale record
+            // and report success rather than erroring — consistent with `settle`.
+            forget_terminal(&store, provider_addr, state.channel_id);
+            println!(
+                "channel {} is already closed; cleared local record",
+                state.channel_id
+            );
+            return Ok(());
         }
     }
 
     match submit_close(&contract, &state, &signer, &domain).await? {
         TxOutcome::Landed => {
-            let settle_after = contract
-                .getChannel(state.channel_id)
-                .call()
-                .await
-                .map_or(ch.disputeDeadline, |c| c.disputeDeadline);
+            // Always report the successful close; the settle-after deadline is only
+            // known post-close, so read it best-effort and never print the
+            // pre-close `0` if that read fails.
+            let deadline_note = match contract.getChannel(state.channel_id).call().await {
+                Ok(c) => format!("after Unix {}", c.disputeDeadline),
+                Err(e) => {
+                    format!("after the dispute window (couldn't read the exact deadline: {e})")
+                }
+            };
             println!(
                 "closed channel {} (provider {provider_addr}); dispute window open — run \
-                 `decdn channel settle --provider-address {provider_addr}` after Unix {settle_after}",
+                 `decdn channel settle --provider-address {provider_addr}` {deadline_note}",
                 state.channel_id
             );
             Ok(())
@@ -570,13 +581,20 @@ enum CleanStatus {
     /// Refunded via `reclaimExpired`.
     Reclaimed,
     /// Just closed unilaterally; needs a later `settle` once the window elapses.
-    Closed { settle_after: u64 },
+    /// `settle_after` is `None` when the post-close deadline read failed (the
+    /// close still landed) — a re-run reports the real deadline.
+    Closed { settle_after: Option<u64> },
     /// Already closing; dispute window still open until this Unix deadline.
     Pending { settle_after: u64 },
     /// Already closed on-chain; local record cleared.
     AlreadyClosed,
-    /// Not owned by this keystore on-chain; stale local record cleared.
+    /// The channel doesn't exist on-chain (zeroed `client`); stale local record
+    /// cleared — safe, there's nothing to lose.
     ClearedStale,
+    /// The channel is live on-chain but owned by a different `client` than this
+    /// keystore — skipped *without* clearing, so a wrong-keystore run can't
+    /// destroy a valid record.
+    NotOwned,
     /// The on-chain tx reverted; a re-run re-reads state and re-decides.
     Reverted(&'static str),
 }
@@ -595,14 +613,20 @@ impl CleanStatus {
         match self {
             Self::Settled => "settled — balance refunded".to_string(),
             Self::Reclaimed => "reclaimed — expired deposit refunded".to_string(),
-            Self::Closed { settle_after } => {
-                format!("closed — run `clean` again after Unix {settle_after} to settle")
+            Self::Closed {
+                settle_after: Some(deadline),
+            } => format!("closed — run `clean` again after Unix {deadline} to settle"),
+            Self::Closed { settle_after: None } => {
+                "closed — run `clean` again after the dispute window to settle".to_string()
             }
             Self::Pending { settle_after } => {
                 format!("closing — dispute window open until Unix {settle_after}")
             }
             Self::AlreadyClosed => "already closed — cleared local record".to_string(),
-            Self::ClearedStale => "not owned by this keystore — cleared local record".to_string(),
+            Self::ClearedStale => "not found on-chain — cleared stale local record".to_string(),
+            Self::NotOwned => {
+                "owned by a different keystore on-chain — skipped (record kept)".to_string()
+            }
             Self::Reverted(op) => format!("{op} reverted — re-run to re-evaluate"),
         }
     }
@@ -625,18 +649,31 @@ async fn clean_one<P: Provider + Clone>(
         .await
         .map_err(|e| anyhow::anyhow!("getChannel failed: {e}"))?;
     if ch.client != signer.address() {
-        forget_terminal(store, state.provider, state.channel_id);
-        return Ok(CleanStatus::ClearedStale);
+        // A zeroed `client` means the channel doesn't exist on-chain (settled and
+        // pruned, or never opened) — safe to drop the stale record. A *different*
+        // non-zero client means the channel is live but belongs to another
+        // keystore: never delete it, or a run with the wrong keystore would
+        // destroy a valid record. Skip it instead.
+        return if ch.client == Address::ZERO {
+            forget_terminal(store, state.provider, state.channel_id);
+            Ok(CleanStatus::ClearedStale)
+        } else {
+            Ok(CleanStatus::NotOwned)
+        };
     }
 
     match next_action(map_status(ch.status), ch.expiresAt, ch.disputeDeadline, now) {
         CleanAction::Close => match submit_close(contract, state, signer, domain).await? {
             TxOutcome::Landed => {
+                // The close landed; the real deadline is only known post-close. A
+                // failed re-read must not fabricate the pre-close `0` — report it
+                // as unknown (`None`) and let a re-run surface the true deadline.
                 let settle_after = contract
                     .getChannel(state.channel_id)
                     .call()
                     .await
-                    .map_or(ch.disputeDeadline, |c| c.disputeDeadline);
+                    .ok()
+                    .map(|c| c.disputeDeadline);
                 Ok(CleanStatus::Closed { settle_after })
             }
             TxOutcome::Reverted => Ok(CleanStatus::Reverted("closeChannel")),
@@ -1027,23 +1064,44 @@ mod tests {
 
     #[test]
     fn clean_status_incomplete_only_for_re_runnable() {
-        assert!(CleanStatus::Closed { settle_after: 9 }.incomplete());
+        assert!(
+            CleanStatus::Closed {
+                settle_after: Some(9)
+            }
+            .incomplete()
+        );
+        assert!(
+            CleanStatus::Closed { settle_after: None }.incomplete(),
+            "a landed close with an unread deadline still needs a re-run"
+        );
         assert!(CleanStatus::Pending { settle_after: 9 }.incomplete());
         assert!(CleanStatus::Reverted("settleChannel").incomplete());
         assert!(!CleanStatus::Settled.incomplete());
         assert!(!CleanStatus::Reclaimed.incomplete());
         assert!(!CleanStatus::AlreadyClosed.incomplete());
         assert!(!CleanStatus::ClearedStale.incomplete());
+        assert!(
+            !CleanStatus::NotOwned.incomplete(),
+            "a foreign channel is skipped, not retried with this keystore"
+        );
     }
 
     #[test]
     fn clean_status_labels_are_descriptive() {
         assert!(CleanStatus::Settled.label().contains("settled"));
         assert!(
-            CleanStatus::Closed { settle_after: 42 }
-                .label()
-                .contains("42")
+            CleanStatus::Closed {
+                settle_after: Some(42)
+            }
+            .label()
+            .contains("42")
         );
+        assert!(
+            CleanStatus::Closed { settle_after: None }
+                .label()
+                .contains("dispute window")
+        );
+        assert!(CleanStatus::NotOwned.label().contains("different keystore"));
         assert!(
             CleanStatus::Reverted("closeChannel")
                 .label()
