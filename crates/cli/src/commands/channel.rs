@@ -213,19 +213,29 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
 /// chain, keystore, or network access — so a client can see its own last nonce /
 /// amount / bytes next to the deposit (e.g. to spot a voucher desync).
 fn list(args: &cli::ChannelListArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
-    let file = load_file_config(config_path)?;
-    let data_dir = resolve_data_dir(args.data_dir.clone(), &file)?;
+    // Only the data dir is needed. An explicit `--data-dir` skips config loading
+    // entirely so this read-only command can't fail on an unrelated `${VAR}` in
+    // the config (`load_file_config` env-expands `blockchain.*` too); config is
+    // read only for the `[identity].data_dir` fallback when the flag is absent.
+    let data_dir = match args.data_dir.clone() {
+        Some(dir) => expand_tilde(&dir),
+        None => resolve_data_dir(None, &load_file_config(config_path)?)?,
+    };
 
     let store = RedbBuyerChannelStore::open(&data_dir)?;
     let mut channels = store.load_all()?;
     // Stable output regardless of the store's internal key order.
     channels.sort_by_key(|c| c.provider);
 
+    // Write to locked stdout so a `BrokenPipe` (e.g. piping to `head`) surfaces
+    // as a propagated error rather than a `println!` panic, and the JSON isn't
+    // buffered into one allocation.
+    let mut out = std::io::stdout().lock();
     if args.json {
         let view: Vec<ChannelJson> = channels.iter().map(ChannelJson::from).collect();
-        println!("{}", serde_json::to_string_pretty(&view)?);
+        serde_json::to_writer_pretty(&mut out, &view)?;
+        writeln!(out)?;
     } else {
-        let mut out = std::io::stdout().lock();
         write_channels(&mut out, &channels)?;
     }
     Ok(())

@@ -7,6 +7,7 @@
 //! covered by the unit tests next to the command impl (`commands::channel`);
 //! this file owns the on-disk round-trip only.
 
+#![cfg(unix)] // The buyer store enforces POSIX `0o700` on its data dir.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -89,4 +90,21 @@ async fn empty_store_lists_without_error() {
     channel_dispatch(&list_args(dir.path(), false), Some(&cfg))
         .await
         .expect("listing an empty store should succeed");
+}
+
+#[tokio::test]
+async fn list_with_data_dir_ignores_broken_config_env_expansion() {
+    let dir = data_dir();
+    // A config that would fail `load_file_config` env-expansion (an unset `${VAR}`
+    // in an unrelated blockchain field). With `--data-dir` given, the read-only
+    // `list` must not read/expand it at all.
+    let cfg = dir.path().join("node.toml");
+    std::fs::write(
+        &cfg,
+        "[blockchain]\nrpc_url = \"${DECDN_TEST_DEFINITELY_UNSET_VAR_XYZ}\"\n",
+    )
+    .unwrap();
+    channel_dispatch(&list_args(dir.path(), false), Some(&cfg))
+        .await
+        .expect("list with --data-dir must not load or env-expand the config");
 }
