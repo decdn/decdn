@@ -168,7 +168,7 @@ pub struct ResolvedAppeal {
 /// Resolve appeal-command coordinates. Pure so precedence is unit-testable.
 /// `slash_appeal_flag` is the command's `--slash-appeal-address` override.
 pub fn resolve_appeal(
-    chain: &cli::ChainArgs,
+    chain: &cli::CommonChainArgs,
     slash_appeal_flag: Option<&str>,
     file: &FileConfig,
 ) -> anyhow::Result<ResolvedAppeal> {
@@ -193,7 +193,7 @@ pub fn resolve_appeal(
         "slash_appeal_address must not be the zero address — \
          set it to the deployed SlashAppeal contract (ADR 028)"
     );
-    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(&chain.common, file)?;
+    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
     Ok(ResolvedAppeal {
         rpc_url,
         chain_id,
@@ -218,17 +218,18 @@ pub fn parse_address(value: &str, label: &str) -> anyhow::Result<Address> {
 /// (hundreds of ms); it is offloaded to `spawn_blocking` so it doesn't stall
 /// the async executor, matching `decdn-node`'s runtime keystore load.
 pub async fn load_operator_signer(
-    chain: &cli::ChainArgs,
+    chain: &cli::CommonChainArgs,
     keystore: &Path,
 ) -> anyhow::Result<PrivateKeySigner> {
-    load_signer_with_password_file(chain.common.keystore_password_file.as_deref(), keystore).await
+    load_signer_with_password_file(chain.keystore_password_file.as_deref(), keystore).await
 }
 
 /// Load an Ethereum keystore signer, sourcing the password from the
 /// `DECDN_KEYSTORE_PASSWORD` env var, then `password_file`, then an interactive
 /// prompt. The scrypt KDF is offloaded to `spawn_blocking` so it doesn't stall
-/// the async executor. Shared by the `node` commands (via
-/// [`load_operator_signer`]) and the `publish` commands.
+/// the async executor. The `node`, `appeal`, and `publish` commands all reach
+/// it through [`load_operator_signer`], which pulls the password-file path off
+/// the shared [`cli::CommonChainArgs`].
 pub async fn load_signer_with_password_file(
     password_file: Option<&Path>,
     keystore: &Path,
