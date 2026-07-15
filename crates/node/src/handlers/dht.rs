@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use decdn_protocol::{
     ALPN_DHT, APP_ERR_RATE_LIMITED, FrameError, MAX_CLOSER_NODES, decode_message, dht as wire,
-    encode_message, read_frame, write_frame,
+    encode_message, is_unknown_variant, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -806,10 +806,20 @@ async fn read_dht_request(
 
     match decode_message::<wire::DhtMessage>(&frame) {
         Err(e) => {
-            reset(send, recv, APP_ERR_MALFORMED_MESSAGE);
+            // ADR 013: an unknown enum discriminant closes with
+            // UNSUPPORTED_MESSAGE (0x01), not MALFORMED_MESSAGE (0x03). A
+            // genuine parse fault (in-range discriminant, bad payload — e.g.
+            // an over-cap `BatchStore` rejected by `deserialize_batch_hashes`)
+            // stays MALFORMED.
+            let app_code = if is_unknown_variant::<wire::DhtMessage>(&frame) {
+                APP_ERR_UNSUPPORTED_MESSAGE
+            } else {
+                APP_ERR_MALFORMED_MESSAGE
+            };
+            reset(send, recv, app_code);
             Err(DhtReadError {
                 err: anyhow::anyhow!("dht decode failed: {e}"),
-                app_code: APP_ERR_MALFORMED_MESSAGE,
+                app_code,
             })
         }
         Ok((msg, _tail)) => {

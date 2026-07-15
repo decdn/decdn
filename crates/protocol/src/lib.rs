@@ -23,7 +23,8 @@ pub use dht::{
     MAX_CLOSER_NODES, MAX_PROVIDERS_PER_HASH, StoreAck, StoreRequest,
 };
 pub use framing::{
-    FrameError, MAX_MESSAGE_SIZE, decode_message, encode_message, read_frame, write_frame,
+    FrameError, MAX_MESSAGE_SIZE, TopLevelEnum, decode_message, encode_message, is_unknown_variant,
+    read_frame, write_frame,
 };
 pub use gossip::{
     GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, ReportMetrics,

@@ -533,13 +533,41 @@ async fn probe_garbage_postcard_returns_malformed_code() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
 
-    // Valid length-prefixed frame, but payload has unknown ProbeMessage discriminant.
-    write_frame(&mut send, &[99u8, 0])
+    // Discriminant 0x00 is `Request`, a known variant, but its body
+    // (`hash` 32 bytes + `timestamp_us`) is truncated to a single byte —
+    // postcard hits end-of-input mid-struct. A genuine parse fault → 0x03,
+    // distinct from an unknown discriminant (see
+    // `probe_unknown_discriminant_returns_unsupported_code`).
+    write_frame(&mut send, &[0x00u8, 0x01])
         .await
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
     assert_reset_with_code(&mut recv, 0x03).await?;
+    tear_down(h).await
+}
+
+/// ADR 013 §Application Error Codes: an unknown enum discriminant is the
+/// Tier-2 graceful-evolution signal — `UNSUPPORTED_MESSAGE` (0x01), NOT
+/// `MALFORMED_MESSAGE` (0x03). Pairs
+/// `probe_garbage_postcard_returns_malformed_code` (genuine parse fault under
+/// a known discriminant).
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_unknown_discriminant_returns_unsupported_code() -> anyhow::Result<()> {
+    let h = spin_up_probe_harness().await?;
+    let (mut send, mut recv) = h
+        .client_conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    // Discriminant 99 is far past ProbeMessage's two declared variants.
+    write_frame(&mut send, &[99u8, 0])
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+
+    assert_reset_with_code(&mut recv, 0x01).await?;
     tear_down(h).await
 }
 
