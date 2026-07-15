@@ -143,7 +143,7 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
                  blockchain.capacity_bond_address)"
             )
         })?;
-    let capacity_bond_address = parse_address(&capacity_bond_raw, "capacity_bond_address")?;
+    let capacity_bond_address = parse_nonzero_address(&capacity_bond_raw, "capacity_bond_address")?;
     Ok(Resolved {
         rpc_url,
         chain_id,
@@ -183,15 +183,10 @@ pub fn resolve_appeal(
                  blockchain.slash_appeal_address)"
             )
         })?;
-    let slash_appeal_address = parse_address(&slash_appeal_raw, "slash_appeal_address")?;
-    // Guard the *consumer*: a zero address parses fine but is never a real
-    // deployment (it would surface only as an opaque on-chain revert at appeal
-    // time). This is the sole validation site for the appeal address.
-    anyhow::ensure!(
-        slash_appeal_address != Address::ZERO,
-        "slash_appeal_address must not be the zero address — \
-         set it to the deployed SlashAppeal contract (ADR 028)"
-    );
+    // Reject the zero address via the shared guard (#1153) — see
+    // `parse_nonzero_address`; every resolved contract address gets the same
+    // early, labelled rejection.
+    let slash_appeal_address = parse_nonzero_address(&slash_appeal_raw, "slash_appeal_address")?;
     let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
     Ok(ResolvedAppeal {
         rpc_url,
@@ -207,6 +202,19 @@ pub fn parse_address(value: &str, label: &str) -> anyhow::Result<Address> {
     value
         .parse()
         .with_context(|| format!("{label} {value:?} is not a valid address"))
+}
+
+/// Parse a contract address and reject the zero address. `Address::ZERO` parses
+/// cleanly but is never a real deployment — it would surface only as an opaque
+/// on-chain revert at call time, so reject it here with a clear, labelled error.
+/// The sole validation site for every resolved contract address (#1153).
+pub fn parse_nonzero_address(value: &str, label: &str) -> anyhow::Result<Address> {
+    let addr = parse_address(value, label)?;
+    anyhow::ensure!(
+        addr != Address::ZERO,
+        "{label} must not be the zero address — set it to the deployed contract address"
+    );
+    Ok(addr)
 }
 
 /// Load the operator's Ethereum keystore signer, sourcing the password from
@@ -274,13 +282,13 @@ pub fn resolve_publish(
         .publisher_registry_address
         .clone()
         .or_else(|| bc.and_then(|b| b.publisher_registry_address.clone()))
-        .map(|raw| parse_address(&raw, "publisher_registry_address"))
+        .map(|raw| parse_nonzero_address(&raw, "publisher_registry_address"))
         .transpose()?;
     let origin_assignment_address = args
         .origin_assignment_address
         .clone()
         .or_else(|| bc.and_then(|b| b.origin_assignment_address.clone()))
-        .map(|raw| parse_address(&raw, "origin_assignment_address"))
+        .map(|raw| parse_nonzero_address(&raw, "origin_assignment_address"))
         .transpose()?;
     Ok(ResolvedPublish {
         rpc_url,
@@ -522,6 +530,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_rejects_zero_capacity_bond_address() {
+        // The zero address parses cleanly but is never a real deployment; the
+        // shared guard rejects it at resolve time rather than as an opaque
+        // `CapacityBond` revert later (#1153).
+        let mut chain = empty_chain();
+        chain.common.rpc_url = Some("http://x".to_string());
+        chain.capacity_bond_address = Some(Address::ZERO.to_string());
+        let err = resolve(&chain, &FileConfig::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("capacity_bond_address"), "{err}");
+        assert!(msg.contains("must not be the zero address"), "{err}");
+    }
+
     /// Publish-side counterpart of [`empty_chain`], so the publish resolver's
     /// precedence can be exercised as thoroughly as the node resolver's — both
     /// now route through `resolve_common`, so a regression there hits both.
@@ -648,6 +670,32 @@ mod tests {
             err.to_string().contains("origin_assignment_address"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn resolve_publish_rejects_zero_address() {
+        // A present `0x0…0` for either publish address must fail at resolve time
+        // via the shared guard, not surface as an opaque `PublisherRegistry` /
+        // `OriginAssignment` revert later. Unset stays `None` (checked elsewhere);
+        // only a *present* zero errors. Each field is checked independently
+        // (#1153).
+        let zero = Address::ZERO.to_string();
+
+        let mut args = empty_publish_chain();
+        args.common.rpc_url = Some("http://x".to_string());
+        args.publisher_registry_address = Some(zero.clone());
+        let err = resolve_publish(&args, &FileConfig::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("publisher_registry_address"), "{err}");
+        assert!(msg.contains("must not be the zero address"), "{err}");
+
+        let mut args = empty_publish_chain();
+        args.common.rpc_url = Some("http://x".to_string());
+        args.origin_assignment_address = Some(zero);
+        let err = resolve_publish(&args, &FileConfig::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("origin_assignment_address"), "{err}");
+        assert!(msg.contains("must not be the zero address"), "{err}");
     }
 
     #[test]
