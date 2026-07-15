@@ -16,6 +16,8 @@ pub decdn_protocol::client::ClientMessage::Voucher(decdn_protocol::client::Vouch
 pub decdn_protocol::client::ClientMessage::VoucherAck
 impl decdn_protocol::client::ClientMessage
 pub const fn decdn_protocol::client::ClientMessage::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::client::ClientMessage
+pub const decdn_protocol::client::ClientMessage::VARIANT_COUNT: u32
 pub enum decdn_protocol::client::StreamError
 pub decdn_protocol::client::StreamError::BlobTooLarge
 pub decdn_protocol::client::StreamError::EvictedSinceProbe
@@ -109,6 +111,8 @@ pub decdn_protocol::dht::DhtMessage::FindValue(decdn_protocol::dht::FindValueReq
 pub decdn_protocol::dht::DhtMessage::FindValueResponse(decdn_protocol::dht::FindValueResponse)
 pub decdn_protocol::dht::DhtMessage::Store(decdn_protocol::dht::StoreRequest)
 pub decdn_protocol::dht::DhtMessage::StoreAck(decdn_protocol::dht::StoreAck)
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::dht::DhtMessage
+pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 pub struct decdn_protocol::dht::BatchStoreAck
 pub decdn_protocol::dht::BatchStoreAck::results: alloc::vec::Vec<bool>
 pub struct decdn_protocol::dht::BatchStoreRequest
@@ -159,8 +163,17 @@ pub decdn_protocol::framing::FrameError::Io(std::io::error::Error)
 pub decdn_protocol::framing::FrameError::TooLarge(u32)
 pub decdn_protocol::framing::FrameError::Varint
 pub const decdn_protocol::framing::MAX_MESSAGE_SIZE: u32
+pub trait decdn_protocol::framing::TopLevelEnum
+pub const decdn_protocol::framing::TopLevelEnum::VARIANT_COUNT: u32
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::client::ClientMessage
+pub const decdn_protocol::client::ClientMessage::VARIANT_COUNT: u32
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::dht::DhtMessage
+pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
+pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub fn decdn_protocol::framing::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::framing::encode_message<M: serde_core::ser::Serialize>(&M) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
+pub fn decdn_protocol::framing::is_unknown_variant<M: decdn_protocol::framing::TopLevelEnum>(&[u8]) -> bool
 pub async fn decdn_protocol::framing::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub async fn decdn_protocol::framing::write_frame<W: tokio::io::async_write::AsyncWrite + core::marker::Unpin>(&mut W, &[u8]) -> core::result::Result<(), decdn_protocol::framing::FrameError>
 pub mod decdn_protocol::gossip
@@ -236,6 +249,8 @@ pub decdn_protocol::message::MessageValidationError::VoucherRejectedInResponse
 pub enum decdn_protocol::message::ProbeMessage
 pub decdn_protocol::message::ProbeMessage::Request(decdn_protocol::message::ProbeRequest)
 pub decdn_protocol::message::ProbeMessage::Response(decdn_protocol::message::ProbeResponse)
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
+pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub struct decdn_protocol::message::ProbeRequest
 pub decdn_protocol::message::ProbeRequest::hash: [u8; 32]
 pub decdn_protocol::message::ProbeRequest::timestamp_us: u64
@@ -266,6 +281,8 @@ pub decdn_protocol::ClientMessage::Voucher(decdn_protocol::client::Voucher)
 pub decdn_protocol::ClientMessage::VoucherAck
 impl decdn_protocol::client::ClientMessage
 pub const fn decdn_protocol::client::ClientMessage::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::client::ClientMessage
+pub const decdn_protocol::client::ClientMessage::VARIANT_COUNT: u32
 pub enum decdn_protocol::DhtMessage
 pub decdn_protocol::DhtMessage::BatchStore(decdn_protocol::dht::BatchStoreRequest)
 pub decdn_protocol::DhtMessage::BatchStoreAck(decdn_protocol::dht::BatchStoreAck)
@@ -275,6 +292,8 @@ pub decdn_protocol::DhtMessage::FindValue(decdn_protocol::dht::FindValueRequest)
 pub decdn_protocol::DhtMessage::FindValueResponse(decdn_protocol::dht::FindValueResponse)
 pub decdn_protocol::DhtMessage::Store(decdn_protocol::dht::StoreRequest)
 pub decdn_protocol::DhtMessage::StoreAck(decdn_protocol::dht::StoreAck)
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::dht::DhtMessage
+pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 pub enum decdn_protocol::FrameError
 pub decdn_protocol::FrameError::Decode(postcard::error::Error)
 pub decdn_protocol::FrameError::Io(std::io::error::Error)
@@ -303,6 +322,8 @@ pub decdn_protocol::MessageValidationError::VoucherRejectedInResponse
 pub enum decdn_protocol::ProbeMessage
 pub decdn_protocol::ProbeMessage::Request(decdn_protocol::message::ProbeRequest)
 pub decdn_protocol::ProbeMessage::Response(decdn_protocol::message::ProbeResponse)
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
+pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub enum decdn_protocol::StreamError
 pub decdn_protocol::StreamError::BlobTooLarge
 pub decdn_protocol::StreamError::EvictedSinceProbe
@@ -488,9 +509,18 @@ pub const decdn_protocol::TOPIC_GLOBAL: &str
 pub const decdn_protocol::TOPIC_REGION_PREFIX: &str
 pub const decdn_protocol::TOPIC_REPUTATION: &str
 pub const decdn_protocol::VOUCHER_SIG_LEN: usize
+pub trait decdn_protocol::TopLevelEnum
+pub const decdn_protocol::TopLevelEnum::VARIANT_COUNT: u32
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::client::ClientMessage
+pub const decdn_protocol::client::ClientMessage::VARIANT_COUNT: u32
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::dht::DhtMessage
+pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
+impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
+pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub fn decdn_protocol::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::encode_message<M: serde_core::ser::Serialize>(&M) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::is_unknown_variant<M: decdn_protocol::framing::TopLevelEnum>(&[u8]) -> bool
 pub fn decdn_protocol::is_valid_region(&str) -> bool
 pub fn decdn_protocol::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
 pub async fn decdn_protocol::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>

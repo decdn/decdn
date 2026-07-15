@@ -541,7 +541,10 @@ mod adr_013_error_codes {
         }
     }
 
-    /// Malformed postcard body → `APP_ERR_MALFORMED_MESSAGE` (0x03).
+    /// Malformed postcard body under a *known* discriminant →
+    /// `APP_ERR_MALFORMED_MESSAGE` (0x03). Distinct from an unknown
+    /// discriminant, which is `UNSUPPORTED_MESSAGE` (see
+    /// `unknown_discriminant_returns_unsupported_message_code`).
     #[tokio::test(flavor = "multi_thread")]
     async fn malformed_frame_returns_malformed_message_code() -> anyhow::Result<()> {
         let (server_ep, server_addr, server_id, accept_task) = spin_up_dht_server().await?;
@@ -555,16 +558,49 @@ mod adr_013_error_codes {
             .open_bi()
             .await
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-        // Write a valid frame header but garbage postcard body — the
-        // discriminant byte 0x55 has no matching DhtMessage variant.
-        let garbage = [0x55u8, 0x00, 0x00, 0x00];
-        write_frame(&mut send, &garbage).await?;
+        // Discriminant 0x00 is `FindValue`, a known variant, but its body
+        // (`hash` + `requester`, 64 fixed bytes) is truncated to 3 bytes —
+        // postcard hits end-of-input mid-struct. A genuine parse fault, so
+        // the ADR 013 code is MALFORMED, not UNSUPPORTED.
+        let truncated = [0x00u8, 0x01, 0x02];
+        write_frame(&mut send, &truncated).await?;
         send.finish()?;
         let r = recv.read_to_end(64).await;
         assert_close_code(r, APP_ERR_MALFORMED_MESSAGE);
         conn.close(0u32.into(), b"bye");
         client_ep.close().await;
         // The server task is expected to surface the rejection as an Err.
+        let _ = accept_task.await;
+        server_ep.close().await;
+        Ok(())
+    }
+
+    /// Unknown enum discriminant → `APP_ERR_UNSUPPORTED_MESSAGE` (0x01), NOT
+    /// `MALFORMED_MESSAGE`. ADR 013 §Application Error Codes: a frame naming a
+    /// variant this build does not know is the Tier-2 graceful-evolution
+    /// signal, distinct from a genuine parse fault.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_discriminant_returns_unsupported_message_code() -> anyhow::Result<()> {
+        let (server_ep, server_addr, server_id, accept_task) = spin_up_dht_server().await?;
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        // Discriminant 0x55 (85) is far past DhtMessage's 8 declared variants —
+        // an unknown variant. The trailing bytes are irrelevant.
+        let unknown = [0x55u8, 0x00, 0x00, 0x00];
+        write_frame(&mut send, &unknown).await?;
+        send.finish()?;
+        let r = recv.read_to_end(64).await;
+        assert_close_code(r, APP_ERR_UNSUPPORTED_MESSAGE);
+        conn.close(0u32.into(), b"bye");
+        client_ep.close().await;
         let _ = accept_task.await;
         server_ep.close().await;
         Ok(())
