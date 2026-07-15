@@ -1485,9 +1485,14 @@ impl Metrics {
         self.decdn.buyer_topup_ok.inc();
     }
 
-    /// A background low-water top-up (#1146) failed — the allowance re-approval or
-    /// the `topUp` submit/receipt errored or reverted. Best-effort, so the channel
-    /// is left un-topped; pairs with the `warn!` in `spawn_refill_if_low`.
+    /// A background low-water top-up (#1146) did not cleanly land — the allowance
+    /// re-approval or the `topUp` submit/receipt errored or reverted, OR the `topUp`
+    /// landed on-chain but the local row vanished/rotated during the RPC
+    /// (`DepositOutcome::UnknownProvider` / `ChannelMismatch`, i.e. escrowed-but-
+    /// untracked). Folding the untracked case in here keeps stranded deposits
+    /// visible on this counter. Best-effort, so the channel is left un-topped; pairs
+    /// with the `warn!` (or `top_up`'s own error!/warn!) around the call in
+    /// `spawn_refill_if_low`.
     pub fn buyer_topup_failure(&self) {
         self.decdn.buyer_topup_failure.inc();
     }
