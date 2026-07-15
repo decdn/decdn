@@ -745,11 +745,17 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             revert AppealNotOpen(appealId);
         }
 
+        // Cache the repeatedly-read fields to avoid redundant warm SLOADs
+        // (mirrors `fastTrackBlacklistAppeal`).
+        bytes32 region = a.region;
+        bytes32 hash = a.hash;
+        address filer = a.filer;
+
         // Condition (c) takes precedence and skips the window gate: a global
         // override removed the entry (`addedAt == 0`) mid-appeal, so there is
         // nothing left to adjudicate and no reason to make the filer wait out
         // the review/ratification window.
-        bool entryGone = _hashEntries[a.region][a.hash].addedAt == 0;
+        bool entryGone = _hashEntries[region][hash].addedAt == 0;
         uint8 reason;
         if (entryGone) {
             reason = 3; // GlobalOverride
@@ -770,21 +776,21 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // is already gone (condition c on a fast-tracked appeal), there is no
         // `suspended` flag to clear — the slot release still applies.
         if (status == AppealStatus.FastTracked) {
-            if (!entryGone) _hashEntries[a.region][a.hash].suspended = false;
-            if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
-            if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
+            if (!entryGone) _hashEntries[region][hash].suspended = false;
+            if (regionActiveReliefCount[region] != 0) regionActiveReliefCount[region] -= 1;
+            if (filerRegionActiveRelief[region][filer] != 0) filerRegionActiveRelief[region][filer] -= 1;
         }
 
         uint256 bond = a.bond;
         a.bond = 0;
         a.status = AppealStatus.Lapsed;
-        hasActiveAppeal[a.region][a.hash] = false;
+        hasActiveAppeal[region][hash] = false;
 
         // Effects complete above (CEI); the token call is last and this function
         // is `nonReentrant`. Global override refunds; the timeout lapses burn.
         if (bond != 0) {
             if (reason == 3) {
-                IERC20(address(token)).safeTransfer(a.filer, bond);
+                IERC20(address(token)).safeTransfer(filer, bond);
             } else {
                 token.burn(bond);
             }
