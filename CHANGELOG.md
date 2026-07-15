@@ -141,7 +141,36 @@ since project inception and will roll into the first tagged release.
   paths — a wedged on-chain RPC can still consume the outer deadline. Tracked
   separately.)
 
+#### Origin directory
+
+- **Origin-directory genesis replay no longer skips silently on an inverted
+  block range (#1152).** `bootstrap_cache` replays `ContentClaimed` over
+  `[replay_from, latest]`. Since the replay floor resumes from a persisted
+  checkpoint (#1108), a stale/lagging RPC head can put `replay_from > latest`
+  (replication lag or a reorg); `backfill_windows` yields no windows for that
+  range, so the replay was silently skipped with no signal. The anomaly now
+  emits a `warn!` and bumps a new
+  `decdn_origin_directory_bootstrap_range_anomaly_total` counter. Behaviour is
+  otherwise unchanged — the replay is still skipped that boot (per-namespace
+  membership absent, so claimed hashes fall back to the default-open set until
+  the live tail re-surfaces claims) rather than crashing startup, since the
+  bootstrap call site is one-shot with no retry.
+
 ### Changed
+
+#### CLI
+
+- **The CLI now rejects the zero address for the four addresses resolved by
+  `resolve` / `resolve_appeal` / `resolve_publish`, not just the appeal address
+  (#1153).** Those four (`capacity_bond_address`, `slash_appeal_address`,
+  `publisher_registry_address`, `origin_assignment_address`) route through a
+  shared `parse_nonzero_address` guard, so a misconfigured `0x0000…0000` fails
+  fast at resolve time with a clear "must not be the zero address" error instead
+  of an opaque on-chain revert later. Previously only `slash_appeal_address` was
+  guarded. This is a new hard error on `0x0` for the three other addresses
+  (present-but-zero only; an unset optional publish address still resolves to
+  `None`). Other CLI contract addresses parsed outside these resolvers are not
+  yet guarded (tracked separately).
 
 #### Gossip
 

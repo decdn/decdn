@@ -103,7 +103,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
-    backfill_windows,
+    backfill_windows, check_backfill_range,
 };
 use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
@@ -314,7 +314,7 @@ impl ChainOriginDirectory {
             .load_checkpoint(CheckpointKey::Origin)
             .context("read origin-directory scan checkpoint at bootstrap")?
             .unwrap_or(from_block);
-        let (cache, snapshot_block) = bootstrap_cache(&contracts, replay_from)
+        let (cache, snapshot_block) = bootstrap_cache(&contracts, replay_from, &metrics)
             .await
             .context("snapshot OriginAssignment / PublisherRegistry at bootstrap")?;
         info!(
@@ -634,6 +634,7 @@ impl Drop for AbortOnDrop {
 async fn bootstrap_cache<P>(
     contracts: &Contracts<P>,
     replay_from_block: u64,
+    metrics: &Metrics,
 ) -> Result<(DirectoryCache, u64)>
 where
     P: Provider + Clone,
@@ -652,21 +653,43 @@ where
         .get_block_number()
         .await
         .context("get_block_number for ContentClaimed replay")?;
-    for (from, to) in backfill_windows(replay_from_block, latest, REPLAY_WINDOW_BLOCKS) {
-        let logs = contracts
-            .publisher
-            .ContentClaimed_filter()
-            .from_block(from)
-            .to_block(to)
-            .query()
-            .await
-            .with_context(|| format!("query ContentClaimed logs [{from}, {to}]"))?;
-        for (event, _log) in logs {
-            cache
-                .namespaces_of
-                .entry(Hash::from_bytes(event.blake3Hash.0))
-                .or_default()
-                .insert(event.namespaceId);
+    // The replay floor resumes from a persisted checkpoint (#1108), so a stale /
+    // lagging RPC head can legitimately sit *behind* it (`replay_from_block >
+    // latest`) — replication lag or a reorg. `backfill_windows` would silently
+    // yield no windows for that inverted range, skipping the replay with no
+    // signal. Do not propagate the error: `bootstrap` is one-shot (no retry) and
+    // a fatal startup crash is strictly worse than graceful degradation. Instead
+    // warn + bump a counter and degrade to default-open routing. `namespaces_of`
+    // stays empty, so the `getOrigins` loop below is a no-op and per-namespace
+    // membership is absent this boot — every claimed hash falls back to the
+    // default-open set (namespace 0, still authoritative via `getOrigins(0)`).
+    // Per-namespace membership is restored once the live tail re-surfaces the
+    // claims (#1152). Mirrors the buyer-reconcile consumer of the same range
+    // check in `buyer_channel`.
+    if let Err(err) = check_backfill_range(replay_from_block, latest) {
+        warn!(
+            %err, replay_from_block, latest,
+            "origin-directory genesis replay: invalid range; skipping replay this boot \
+             (default-open routing until claims re-surface via the live tail)"
+        );
+        metrics.origin_directory_bootstrap_range_anomaly();
+    } else {
+        for (from, to) in backfill_windows(replay_from_block, latest, REPLAY_WINDOW_BLOCKS) {
+            let logs = contracts
+                .publisher
+                .ContentClaimed_filter()
+                .from_block(from)
+                .to_block(to)
+                .query()
+                .await
+                .with_context(|| format!("query ContentClaimed logs [{from}, {to}]"))?;
+            for (event, _log) in logs {
+                cache
+                    .namespaces_of
+                    .entry(Hash::from_bytes(event.blake3Hash.0))
+                    .or_default()
+                    .insert(event.namespaceId);
+            }
         }
     }
 

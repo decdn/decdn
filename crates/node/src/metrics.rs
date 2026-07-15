@@ -1018,6 +1018,16 @@ pub struct DecdnMetrics {
     /// that cache, so sustained restarts gate real prefetch demand. The
     /// `OpenMetrics` encoder appends the `_total` suffix.
     pub origin_directory_watcher_restarts: Counter,
+    /// `decdn_origin_directory_bootstrap_range_anomaly_total` (#1152): boots on
+    /// which the `ContentClaimed` replay range was inverted
+    /// (`replay_from > latest`) — the persisted replay checkpoint (#1108) sat
+    /// ahead of a stale / lagging RPC head (replication lag or a reorg). The
+    /// genesis replay is skipped that boot (per-namespace membership absent —
+    /// claimed hashes fall back to the default-open set until the live tail
+    /// re-surfaces claims), so without this counter the anomaly would move no
+    /// metric. Pairs with the
+    /// warn! in `bootstrap_cache`. The `OpenMetrics` encoder appends `_total`.
+    pub origin_directory_bootstrap_range_anomaly: Counter,
     /// `decdn_origin_directory_watcher_resolve_failures_total` (#651): times a
     /// `getOrigins` for a newly-claimed namespace OR a `nodeIdOf(operator)`
     /// binding lookup failed, leaving an operator unmapped (and so unresolvable
@@ -2054,6 +2064,17 @@ impl Metrics {
     /// `origin_directory_watcher_resolve_failures_total`.
     pub fn origin_directory_watcher_resolve_failure(&self) {
         self.decdn.origin_directory_watcher_resolve_failures.inc();
+    }
+
+    /// The origin-directory bootstrap replay range was inverted
+    /// (`replay_from > latest`) — a stale / lagging RPC head vs. the persisted
+    /// replay checkpoint (#1152). The genesis replay was skipped this boot;
+    /// claimed hashes fall back to the default-open set until the live tail
+    /// re-surfaces claims. Bumps
+    /// `origin_directory_bootstrap_range_anomaly_total`. Pairs with the warn! in
+    /// `bootstrap_cache`.
+    pub fn origin_directory_bootstrap_range_anomaly(&self) {
+        self.decdn.origin_directory_bootstrap_range_anomaly.inc();
     }
 
     /// Mark the origin-directory watcher's poll cycle as established
@@ -3209,6 +3230,37 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_staker_set_active_count", 7),
             "expected active-count gauge to report 7:\n{text}"
+        );
+    }
+
+    #[test]
+    fn origin_directory_bootstrap_range_anomaly_starts_at_zero_and_increments() {
+        // #1152. The field is `origin_directory_bootstrap_range_anomaly`; the
+        // OpenMetrics encoder appends `_total`, so the exported name is
+        // `decdn_origin_directory_bootstrap_range_anomaly_total`. Exposed at zero
+        // on a fresh registry so a dashboard shows a quiet 0 rather than `(no
+        // data)` before the first inverted-range boot.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(
+                &text,
+                "decdn_origin_directory_bootstrap_range_anomaly_total",
+                0
+            ),
+            "bootstrap range-anomaly counter should be exposed at zero on a fresh registry:\n{text}"
+        );
+
+        metrics.origin_directory_bootstrap_range_anomaly();
+        metrics.origin_directory_bootstrap_range_anomaly();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(
+                &text,
+                "decdn_origin_directory_bootstrap_range_anomaly_total",
+                2
+            ),
+            "expected 2 range-anomaly bumps:\n{text}"
         );
     }
 
