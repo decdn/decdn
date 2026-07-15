@@ -21,7 +21,7 @@ pub mod setup;
 
 pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
-pub use channel::{ChannelArgs, ChannelCommand, CoopCloseArgs};
+pub use channel::{ChannelArgs, ChannelChainArgs, ChannelCommand, ChannelListArgs, CoopCloseArgs};
 pub use common::{
     CommonChainArgs, ConfigPathSource, LogFormat, default_client_data_dir, default_config_path,
     default_data_dir,
@@ -99,7 +99,7 @@ pub enum Command {
     /// linking BLAKE3-content-addressed blobs by relative path. See
     /// `appendix-bundles.md` for the format and issue #391 for status.
     Bundle(BundleArgs),
-    /// Client-side payment-channel lifecycle (`coop-close`).
+    /// Client-side payment-channel lifecycle (`list`/`status`, `coop-close`).
     Channel(ChannelArgs),
     /// Publisher control plane: create namespaces, claim content hashes, and
     /// propose authorized-origin operator sets on-chain (issue #1029).
