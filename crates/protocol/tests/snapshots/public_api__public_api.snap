@@ -42,7 +42,10 @@ pub decdn_protocol::client::VoucherRejectReason::WrongChannel
 pub decdn_protocol::client::VoucherRejectReason::WrongSigner
 pub decdn_protocol::client::VoucherRejectReason::WrongToken
 pub struct decdn_protocol::client::ChunkData
-pub decdn_protocol::client::ChunkData::bytes: alloc::vec::Vec<u8>
+impl decdn_protocol::client::ChunkData
+pub fn decdn_protocol::client::ChunkData::bytes(&self) -> &[u8]
+pub fn decdn_protocol::client::ChunkData::into_bytes(self) -> alloc::vec::Vec<u8>
+pub fn decdn_protocol::client::ChunkData::new(alloc::vec::Vec<u8>) -> core::result::Result<Self, decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::ClientBinding
 pub decdn_protocol::client::ClientBinding::binding_signature: alloc::vec::Vec<u8>
 pub decdn_protocol::client::ClientBinding::ethereum_address: [u8; 20]
@@ -230,6 +233,9 @@ pub fn [u8; 32]::from(decdn_protocol::identity::NodeId) -> Self
 pub const decdn_protocol::identity::ID_LEN: usize
 pub mod decdn_protocol::message
 pub enum decdn_protocol::message::MessageValidationError
+pub decdn_protocol::message::MessageValidationError::ChunkTooLarge
+pub decdn_protocol::message::MessageValidationError::ChunkTooLarge::len: usize
+pub decdn_protocol::message::MessageValidationError::EmptyChunk
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen::len: usize
 pub decdn_protocol::message::MessageValidationError::InvalidCooperativeCloseSigLen
@@ -303,6 +309,9 @@ pub enum decdn_protocol::GossipPayload
 pub decdn_protocol::GossipPayload::NodeAnnounce(decdn_protocol::gossip::NodeAnnounce)
 pub decdn_protocol::GossipPayload::ReputationReport(decdn_protocol::gossip::ReputationReport)
 pub enum decdn_protocol::MessageValidationError
+pub decdn_protocol::MessageValidationError::ChunkTooLarge
+pub decdn_protocol::MessageValidationError::ChunkTooLarge::len: usize
+pub decdn_protocol::MessageValidationError::EmptyChunk
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen::len: usize
 pub decdn_protocol::MessageValidationError::InvalidCooperativeCloseSigLen
@@ -353,7 +362,10 @@ pub struct decdn_protocol::BatchStoreRequest
 pub decdn_protocol::BatchStoreRequest::hashes: alloc::vec::Vec<decdn_protocol::identity::ContentHash>
 pub decdn_protocol::BatchStoreRequest::holder: decdn_protocol::identity::NodeId
 pub struct decdn_protocol::ChunkData
-pub decdn_protocol::ChunkData::bytes: alloc::vec::Vec<u8>
+impl decdn_protocol::client::ChunkData
+pub fn decdn_protocol::client::ChunkData::bytes(&self) -> &[u8]
+pub fn decdn_protocol::client::ChunkData::into_bytes(self) -> alloc::vec::Vec<u8>
+pub fn decdn_protocol::client::ChunkData::new(alloc::vec::Vec<u8>) -> core::result::Result<Self, decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::ClientBinding
 pub decdn_protocol::ClientBinding::binding_signature: alloc::vec::Vec<u8>
 pub decdn_protocol::ClientBinding::ethereum_address: [u8; 20]

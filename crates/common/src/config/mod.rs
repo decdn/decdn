@@ -183,14 +183,39 @@ pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
 /// (#831). Five is enough to find a healthy upstream in a tens-of-nodes
 /// network without spending the miss-latency budget on a wide probe fan-out.
 pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
-/// Default wall-clock bound (seconds) on a single upstream pull during a
-/// node-to-node cache-miss fill (#831). Matches the integration-test budget;
-/// a slow upstream is abandoned for the next ranked candidate at this deadline.
-/// This is the *per-upstream* budget: the node derives the overall pull-through
-/// deadline as roughly `MAX_PROVIDER_ATTEMPTS ×` it plus a fixed discovery
-/// allowance, so the fallback loop can reach every ranked candidate before the
-/// serving path gives up (#859).
+/// Default wall-clock bound (seconds) on the STREAM-OPEN stage of a single upstream
+/// pull during a node-to-node cache-miss fill (#831) — connect, handshake, signed
+/// `StreamResponse`. Matches the integration-test budget; a slow upstream is abandoned
+/// for the next ranked candidate at this deadline.
+///
+/// It does NOT cover the buyer-channel open, which precedes it on its own 5 s budget
+/// (`CHANNEL_OPEN_CALLER_BUDGET`), nor the streaming that follows it, which is bounded by
+/// inactivity ([`DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`]). All three are sequential stages
+/// of ONE candidate attempt, and the node derives the overall pull-through deadline as
+/// `MAX_PROVIDER_ATTEMPTS × (channel open + this + stall) + a fixed discovery allowance`,
+/// so the fallback loop can reach every ranked candidate before the serving path gives up
+/// (#859).
+///
+/// Raising this to give a slow L2 more room does nothing: that is the channel open, on the
+/// budget named above.
 pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
+/// Default INACTIVITY bound (seconds) on the streaming stage of an upstream pull
+/// (#1134). The clock resets on every byte received, so it trips only when an
+/// upstream falls silent — never because a blob is large or a link is slow.
+///
+/// Set equal to [`DEFAULT_NODE_PULL_TIMEOUT_SEC`] because both answer the same
+/// question ("how long do we wait on an unresponsive upstream?"), just at
+/// different stages; they are separate knobs because only one of them can be
+/// safely raised for large content.
+///
+/// Raising it is not free, even though it does not scale with blob size. A candidate that
+/// goes SILENT costs one full window of this before the pull abandons it, and
+/// `outer_pull_deadline` must budget that window for each of `MAX_PROVIDER_ATTEMPTS`
+/// candidates — otherwise a single silent peer eats the whole deadline and the fallback
+/// loop never reaches the others (#859, and the reason this knob is an argument to that
+/// function). So each second added here adds ~3 to the worst-case wait a client can see on
+/// a total miss: 172 s at defaults.
+pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 
 /// Default window-paced pull-through pipeline window (#856, ADR 037
 /// `pull_ahead_bytes`): 1 MiB ≈ one voucher interval. The serving node pulls at
@@ -1391,6 +1416,30 @@ fn resolve_cache_into(
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
+    bag.check(
+        node_pull_timeout_sec > 0,
+        "cache.node_pull_timeout_sec",
+        "cache.node_pull_timeout_sec must be > 0 (a 0 budget abandons every upstream \
+         before its handshake can complete, so no pull can ever succeed)",
+    );
+    let node_pull_stall_timeout_sec = file
+        .and_then(|c| c.node_pull_stall_timeout_sec)
+        .unwrap_or(DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC);
+    // Rejecting 0 here matters more than it does for most knobs, because #1134 made
+    // a stall REPUTATION-AFFECTING. A 0 budget trips `PullStalled` on the first poll
+    // of every streaming read, and `classify_pull_failure` scores that `Unreachable`
+    // — folding it into the local EWMA *and* the observation buffer the gossip
+    // publisher drains. So a single fat-fingered value would not merely break this
+    // node: it would broadcast false `Unreachable` observations about every honest
+    // peer it touches. (Its predecessor, `PullTimeout`, was exonerating, so the
+    // blast radius of a bad value used to stop at the local node.)
+    bag.check(
+        node_pull_stall_timeout_sec > 0,
+        "cache.node_pull_stall_timeout_sec",
+        "cache.node_pull_stall_timeout_sec must be > 0 (a 0 budget marks every \
+         upstream as stalled on the first read, scoring — and gossiping — every \
+         honest peer as unreachable)",
+    );
     // Resolve the seed-leech knobs to their typed `Bytes` / `Percent` form and
     // keep them typed through the cross-field check and `ResolvedCache`
     // construction below, so a bytes<->percent (or bytes<->bytes) transposition
@@ -1446,6 +1495,7 @@ fn resolve_cache_into(
         node_to_node_pull_through_enabled,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
+        node_pull_stall_timeout_sec,
         pull_ahead_bytes,
         max_unrecouped_leech_bytes,
         pull_share_ratio_percent,
@@ -4282,11 +4332,45 @@ mod tests {
         Ok(())
     }
 
-    // The FS arm of `resolve_origin` calls `expand_tilde` so a TOML
-    // like `path = "~/origin"` resolves to `<home>/origin`. The
-    // expansion happens inside resolution (not in `expand_env`),
-    // because `~` is filesystem-shaped and the `expand_env`
-    // contract only handles `${VAR}` substitution.
+    /// A zero stall budget is the most dangerous value in this file (#1134 review).
+    /// `PullStalled` — unlike the `PullTimeout` it replaced — SCORES the peer, and
+    /// `record_outcome` writes both the local EWMA and the observation buffer the
+    /// gossip publisher drains. So a `0` here would not merely break this node: it
+    /// would trip on the first poll of every streaming read and broadcast false
+    /// `Unreachable` observations about every honest peer the node touches.
+    #[test]
+    fn resolve_cache_rejects_zero_stall_timeout() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            node_pull_stall_timeout_sec: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "a 0 stall budget must be rejected: it would gossip every honest peer as unreachable"
+        );
+    }
+
+    /// A zero open budget abandons every upstream before its handshake can finish,
+    /// so no pull can ever succeed. Local-only blast radius (a `PullTimeout` is
+    /// exonerating), but still a config that cannot work.
+    #[test]
+    fn resolve_cache_rejects_zero_pull_timeout() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            node_pull_timeout_sec: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "a 0 open budget must be rejected: no pull could ever complete its handshake"
+        );
+    }
+
+    // The FS arm of `resolve_origin` calls `expand_tilde` so a TOML like
+    // `path = "~/origin"` resolves to `<home>/origin`. The expansion happens inside
+    // resolution (not in `expand_env`), because `~` is filesystem-shaped and the
+    // `expand_env` contract only handles `${VAR}` substitution.
     #[test]
     fn resolve_cache_origin_fs_expands_tilde_in_path() -> anyhow::Result<()> {
         let home_dir = TempDir::new()?;

@@ -4,7 +4,7 @@
 //! [`NodeId`] (DHT `FIND_VALUE` / origin directory), but paying one requires
 //! its bonded operator address: [`crate::buyer_channel::BuyerChannelService`]
 //! opens the USDC channel *to* that address, and
-//! [`crate::client_requester::stream_fetch`] verifies the delivery `slash_sig`
+//! `stream_fetch` verifies the delivery `slash_sig`
 //! recovers *to* it. This module resolves that binding from the same
 //! `CapacityBond` data [`crate::dht::chain_staker_set::ChainStakerSet`] already
 //! reads — `getActiveNodes()` returns `NodeInfo { nodeId, ethAddress, .. }` and

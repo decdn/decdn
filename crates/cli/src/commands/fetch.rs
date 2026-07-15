@@ -33,8 +33,8 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
 use decdn_client_pull::{
-    ChannelContext, ProgressCallback, VoucherProgress, sign_client_binding,
-    stream_fetch_tracked_with_progress,
+    ChannelContext, ProgressCallback, PullDeadlines, UpstreamRefused, VoucherProgress,
+    sign_client_binding, stream_fetch_tracked_with_progress,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -43,6 +43,7 @@ use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
+use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
 use super::chain_ctx;
@@ -417,9 +418,10 @@ pub(crate) async fn resolve_target_node(
 /// is not fixed by a binding) and to unbound contexts, so a bound fetch's error
 /// is passed through untouched. Every other error is returned verbatim.
 fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyhow::Error {
-    let msg = err.to_string();
-    if ctx.client_binding.is_none() && msg.contains("delivery refused") && msg.contains("NotFound")
-    {
+    let refused_not_found = err
+        .downcast_ref::<UpstreamRefused>()
+        .is_some_and(|refused| matches!(refused.error, StreamError::NotFound));
+    if ctx.client_binding.is_none() && refused_not_found {
         err.context(
             "no client identity binding was sent because \
              blockchain.capacity_bond_address is unset, so the node could not \
@@ -440,7 +442,7 @@ pub(crate) async fn fetch_blob(
     provider: Address,
     store: &RedbBuyerChannelStore,
     hash: [u8; 32],
-    timeout: Duration,
+    deadlines: PullDeadlines,
     max_blob_bytes: u64,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Vec<u8>> {
@@ -461,7 +463,7 @@ pub(crate) async fn fetch_blob(
         hash,
         0,
         timestamp_us,
-        timeout,
+        deadlines,
         max_blob_bytes,
         &mut progress,
         on_progress,
@@ -501,6 +503,12 @@ pub(crate) async fn fetch_blob(
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
+    // Before any network or keystore work: a hard cap at or below TWICE the stall budget
+    // parses fine and silently disables stall detection — the open stage is bounded by that
+    // same budget, so both can run inside the cap consecutively (#1145 review). The
+    // `PullDeadlines::capped` below refuses it too; this is the early error, in the flags the
+    // user actually typed.
+    common.validate()?;
 
     // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
     // `[network.discovery]` composes operator resolution legs, else N0 (#936).
@@ -612,7 +620,16 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         provider,
         &store,
         hash,
-        common.effective_timeout(),
+        // A node that accepts the connection and never answers is as dead as one that
+        // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
+        // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
+        // said so in the user's own flags, so this `?` is the belt to that braces (#1145
+        // review).
+        PullDeadlines::capped(
+            common.stall_timeout(),
+            common.stall_timeout(),
+            common.hard_cap(),
+        )?,
         max_blob_bytes,
         Some(&on_progress),
     )
@@ -794,7 +811,8 @@ mod tests {
             data_dir: Some(PathBuf::from("/tmp/d")),
             deposit_micro_usdc: None,
             max_blob_mb: 1024,
-            timeout_ms: 30_000,
+            stall_timeout_ms: 30_000,
+            timeout_ms: 3_600_000,
         }
     }
 
@@ -816,14 +834,20 @@ mod tests {
         }
     }
 
+    /// The refusal these tests annotate, built the way the fetch path builds it: the typed
+    /// `UpstreamRefused` sentinel (#1144). Never hand-roll one with
+    /// `anyhow!("delivery refused: …")` — the annotation downcasts, so a look-alike string
+    /// would exercise nothing and pass against a hint that never fires in production.
+    fn refusal(error: StreamError) -> anyhow::Error {
+        anyhow::Error::new(UpstreamRefused { error })
+    }
+
     /// An unbound (no `capacity_bond_address`) fetch refused with `NotFound` gets
     /// the actionable hint attached, reconnecting the opaque refusal to its cause.
     #[test]
     fn unbound_notfound_refusal_gets_actionable_hint() {
-        let annotated = annotate_unbound_cache_miss(
-            anyhow::anyhow!("delivery refused: Some(NotFound)"),
-            &ctx_with(None),
-        );
+        let annotated =
+            annotate_unbound_cache_miss(refusal(StreamError::NotFound), &ctx_with(None));
         assert!(
             annotated.to_string().contains("capacity_bond_address"),
             "expected the binding hint, got: {annotated}"
@@ -838,11 +862,25 @@ mod tests {
         let binding =
             sign_client_binding(&signer, B256::ZERO, &bind_node_id_domain(1, Address::ZERO))
                 .expect("sign binding");
-        let annotated = annotate_unbound_cache_miss(
-            anyhow::anyhow!("delivery refused: Some(NotFound)"),
-            &ctx_with(Some(binding)),
-        );
+        let annotated =
+            annotate_unbound_cache_miss(refusal(StreamError::NotFound), &ctx_with(Some(binding)));
         assert!(!annotated.to_string().contains("capacity_bond_address"));
+    }
+
+    /// A refusal that is NOT `NotFound` gets no binding hint even when unbound: a
+    /// client binding authorizes reactive pull-through, so it cannot fix a node
+    /// that is degraded (`InternalError`) or a blob that is over the ceiling.
+    /// Previously indistinguishable — the string sniff matched any refusal whose
+    /// text happened to contain `NotFound`.
+    #[test]
+    fn unbound_non_notfound_refusal_is_untouched() {
+        for error in [StreamError::InternalError, StreamError::BlobTooLarge] {
+            let annotated = annotate_unbound_cache_miss(refusal(error.clone()), &ctx_with(None));
+            assert!(
+                !annotated.to_string().contains("capacity_bond_address"),
+                "{error:?} must not get the binding hint"
+            );
+        }
     }
 
     /// A non-`NotFound` failure (e.g. a transport error) is never mislabeled as a
@@ -890,15 +928,24 @@ mod tests {
         );
     }
 
+    /// The deadlines a fetch actually runs under (#1134): an inactivity bound for
+    /// health, plus a generous overall cap that only a pathological provider can reach
+    /// (#1145 review). The blob-size ceiling feeds into NEITHER — it used to scale the
+    /// deadline at an assumed 35 MiB/s, which is what made a large-but-healthy transfer
+    /// fail.
     #[test]
-    fn effective_timeout_delegates_with_correct_arg_order() {
-        // Default pair (1024 MiB, 30_000 ms): scaled ≈ 29_257 < floor → 30 s.
+    fn deadlines_are_stall_bound_with_a_generous_leak_guard() {
         let mut c = common();
-        assert_eq!(c.effective_timeout(), Duration::from_secs(30));
-        // Larger blob scales the timeout up (proves max_blob_mb, not timeout_ms,
-        // is the scaled term — a transposed delegation would fail here).
+        assert_eq!(c.stall_timeout(), Duration::from_secs(30));
+        assert_eq!(c.hard_cap(), Duration::from_hours(1));
         c.max_blob_mb = 4096;
-        assert_eq!(c.effective_timeout(), Duration::from_millis(117_028));
+        assert_eq!(
+            c.hard_cap(),
+            Duration::from_hours(1),
+            "blob size must not move the deadline"
+        );
+        c.timeout_ms = 200_000;
+        assert_eq!(c.hard_cap(), Duration::from_secs(200));
     }
 
     #[test]

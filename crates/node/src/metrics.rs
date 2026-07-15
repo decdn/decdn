@@ -593,6 +593,20 @@ pub struct DecdnMetrics {
     /// (DHT plus the origin-directory fallback) surfaced no provider — the blob
     /// is unavailable on the network, not a pull failure.
     pub node_pull_no_providers: Counter,
+    /// `decdn_dht_lookup_round_ceiling_total` (#1145 review): a `find_providers` lookup was
+    /// TRUNCATED at `MAX_LOOKUP_ROUNDS` while still finding closer nodes.
+    ///
+    /// Not an error — the providers already found are usable and the pull proceeds with them
+    /// — but not nothing either, and it was previously only a `debug!`, invisible at the
+    /// project's default `RUST_LOG=info`. The ceiling exists because discovery's worst case
+    /// has to be FINITE for `PULL_THROUGH_OUTER_SLACK` to budget for it at all; the cost is
+    /// that a lookup which needs more rounds silently returns a smaller candidate set.
+    ///
+    /// So a sustained rate means this node's round ceiling is too low for its network size:
+    /// every lookup is cut short, and `MAX_PROVIDER_ATTEMPTS` is choosing from a worse set of
+    /// providers than the DHT could have offered. Kademlia converges in `O(log n)` rounds, so
+    /// this is the metric that says "your network outgrew the constant".
+    pub dht_lookup_round_ceiling: Counter,
     /// `decdn_node_pull_corruption_total` (#831): an upstream served
     /// hash-mismatched bytes for a paid pull (Byzantine / buggy provider). A
     /// sustained nonzero rate means a peer is taking payment for wrong content;
@@ -645,14 +659,29 @@ pub struct DecdnMetrics {
     /// ceiling), so it does not tar the provider's reputation. A sustained rate
     /// means this node's ceiling is below the content it is trying to warm.
     pub node_pull_too_large: Counter,
-    /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit this
-    /// node's own per-candidate `pull_timeout` deadline. Like a channel-open
-    /// failure this is a buyer-side condition (a possibly mis-sized local
-    /// timeout), NOT evidence the provider is unreachable, so it does NOT tar the
-    /// provider's reputation locally or over gossip. Distinct from
+    /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit one of this node's
+    /// own deadlines. Like a channel-open failure this is a buyer-side condition (a possibly
+    /// mis-sized local budget), NOT evidence the provider is unreachable, so it does NOT tar
+    /// the provider's reputation locally or over gossip. Distinct from
     /// `node_pull_through_timeouts` (the delivery handler's own serving deadline).
-    /// A sustained rate means this node's `pull_timeout` is too tight for the
-    /// upstreams it selects.
+    ///
+    /// It fires on **two** budgets, and they have different remedies (#1145 review):
+    ///
+    /// - the STREAM-OPEN stage exceeding `node_pull_timeout_sec`; and
+    /// - a pull that has received no first byte within `node_pull_stall_timeout_sec`. Before
+    ///   the first chunk, that clock is measuring the server's time-to-FIRST-byte, which
+    ///   scales with blob size (the serve path materialises the whole bao encoding before it
+    ///   can emit chunk #1) — so it is our deadline, not the peer's fault, and it lands here
+    ///   rather than on `node_pull_stalled_total`.
+    ///
+    /// A sustained rate therefore means one of those two is too tight for the upstreams this
+    /// node selects — and for the large-blob case it is `node_pull_stall_timeout_sec`, not
+    /// `node_pull_timeout_sec`, that wants raising. (The doc named only the latter, which is
+    /// the wrong knob for the flagship scenario it described.)
+    ///
+    /// The peer is not scored, but it IS suppressed briefly: see `REFUSAL_SUPPRESSION_TTL`.
+    /// Exonerating a peer and ignoring it are different things, and a peer that accepts a
+    /// stream and then says nothing lands here.
     pub node_pull_timeout: Counter,
     /// `decdn_node_pull_voucher_rejected_total` (#857): an upstream rejected a
     /// voucher this node presented mid-pull (a stale nonce per #852, deposit
@@ -661,6 +690,93 @@ pub struct DecdnMetrics {
     /// sustained rate means this node's buyer channels are drifting out of sync
     /// with what upstreams accept.
     pub node_pull_voucher_rejected: Counter,
+    /// `decdn_node_pull_channel_retired_total` (#1145 review): a channel was SETTLED
+    /// on-chain — the upstream rejected our voucher with `CooperativeCloseSigned` — so
+    /// its row was dropped and the next pull to that provider opens a fresh channel.
+    ///
+    /// Only that one reject reason lands here, and the narrowness is the point. The row
+    /// is this node's only handle on the escrowed deposit (`reclaimExpired` needs the
+    /// `channel_id`; both recovery sweeps enumerate the store), so dropping it is safe
+    /// ONLY once the channel is settled and there is no remainder to reclaim. Every other
+    /// terminal rejection — a desync, a drained-for-this-voucher balance, an expiry —
+    /// keeps its row and lands on `node_pull_channel_wedged_total` instead.
+    ///
+    /// A steady trickle here is healthy: cooperative closes are the normal end of a
+    /// channel's life.
+    pub node_pull_channel_retired: Counter,
+    /// `decdn_node_pull_channel_wedged_total` (#1145 review): an upstream rejected our
+    /// voucher on terms this channel cannot recover from, while its deposit is STILL
+    /// ESCROWED — a nonce/amount/bytes desync, a balance too small for this voucher, or an
+    /// expiry.
+    ///
+    /// The row is KEPT (it is the only thing that can still reclaim the deposit) and the
+    /// provider is suppressed, so this node cannot use that provider again until the
+    /// channel expires and the reclaim sweep refunds it.
+    ///
+    /// **Any sustained rate is money at rest.** Each tick is a channel whose deposit is
+    /// locked up until expiry and a provider this node has taken out of rotation. A spike
+    /// means buyer watermarks are drifting out of sync with what upstreams have committed
+    /// — the desync tracked in #1122 — and the deposit sizing and channel count should be
+    /// reviewed alongside it.
+    pub node_pull_channel_wedged: Counter,
+    /// `decdn_node_pull_channel_retire_failure_total` (#1145 review): the store write that
+    /// retires a settled channel's row FAILED, so the row survives and the next pull will
+    /// reuse the closed channel and be rejected again until it expires.
+    ///
+    /// Its own series rather than borrowing `node_pull_progress_persist_failure_total`,
+    /// which means something else entirely (a voucher WATERMARK write failed). Sharing it
+    /// made a node whose every retire write fails indistinguishable from one that never
+    /// needed to retire — `node_pull_channel_retired_total` would read `0` either way —
+    /// while its persist-failure series climbed for a reason its own docs ruled out.
+    pub node_pull_channel_retire_failure: Counter,
+    /// `decdn_node_pull_refused_total` (#1144): a selected upstream refused
+    /// delivery up front (a `StreamResponse` with `ok == false`). Counts every
+    /// wire code, including the `InternalError` that DOES tar the provider's
+    /// reputation — so this is a refusal counter, not an exoneration counter, and
+    /// it is deliberately not split by code (`iroh_metrics` has no label support,
+    /// and a per-code counter set is not yet worth five more series). Most refusals
+    /// are honest and benign: a `NotFound` is simply a healthy-but-empty node, so
+    /// a sustained rate here usually means content discovery is steering this node
+    /// at upstreams that do not hold the blob — not that the upstreams are bad.
+    pub node_pull_refused: Counter,
+    /// `decdn_node_pull_stalled_total` (#1134): an upstream went silent mid-stream
+    /// — no byte of progress within `node_pull_stall_timeout_sec` — so the pull was
+    /// abandoned. UNLIKE `node_pull_timeout` (our own budget expiring, which is not
+    /// evidence about the peer), this one DOES tar the provider's reputation: the
+    /// clock resets on every byte received, so it can only fire on a provider that
+    /// stopped delivering while we waited. A sustained rate points at flaky
+    /// upstreams or a `node_pull_stall_timeout_sec` too tight for the network.
+    pub node_pull_stalled: Counter,
+    /// `decdn_node_pull_local_fault_total` (#1145 review): a pull failed for a reason
+    /// that is OURS — a broken signer, an encode fault, a bad range computation — and
+    /// the upstream was exonerated.
+    ///
+    /// The only counter here that says nothing about the network. Any sustained rate is
+    /// an emergency: a node that cannot sign a voucher cannot pay for anything, so every
+    /// pull it attempts will fail. Before this existed those failures were scored against
+    /// whichever honest providers the node happened to try, so the symptom was a node
+    /// steadily gossiping `Unreachable` about a healthy network.
+    pub node_pull_local_fault: Counter,
+    /// `decdn_node_pull_channel_open_pending_total` (#1143): a buyer channel open
+    /// was still in flight when the per-candidate budget expired, so the pull moved
+    /// to the next candidate while the open continued in the background.
+    ///
+    /// NOT a failure — kept separate from `node_pull_channel_open_failures` because
+    /// the diagnosis is different: a failure says the tx reverted or the wallet is
+    /// under-funded, whereas this says the open is simply *not done yet*. It scores no
+    /// reputation: a wedged open is our lane, not evidence about the peer.
+    ///
+    /// # Two distinct causes, one counter
+    ///
+    /// 1. the node's own chain lane (a slow L2, a stuck nonce) is slower than
+    ///    `CHANNEL_OPEN_CALLER_BUDGET` — the interesting one; and
+    /// 2. a boot or idle **reconcile** holds the provider's open slot (`OpenSlotReserved`).
+    ///
+    /// The verdict is the same for both — try the next candidate, score nothing — which
+    /// is why they share a counter. But the *diagnosis* is not: reconcile runs at every
+    /// boot, so a restart produces a burst here that means nothing is wrong. Read a
+    /// sustained rate as a chain-lane signal only once it outlives a restart.
+    pub node_pull_channel_open_pending: Counter,
     /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
     /// voucher but persisting the buyer channel's resume watermark
     /// (`record_progress`) failed. The bytes were delivered, but the channel's
@@ -669,6 +785,25 @@ pub struct DecdnMetrics {
     /// non-zero count means a provider is at risk of becoming unusable until
     /// channel rotation.
     pub node_pull_progress_persist_failures: Counter,
+    /// `decdn_node_pull_progress_dropped_total` (#1145 review): a pull paid ≥1
+    /// voucher, but by the time the watermark was written the provider's slot had
+    /// been replaced by a newer open — so the write was skipped rather than clobber
+    /// the replacement, and that voucher's progress is gone.
+    ///
+    /// Sibling of `node_pull_progress_persist_failures_total`, which only counts the
+    /// `Err` path; this is the `Ok`-but-dropped path, which is otherwise invisible.
+    /// The rare benign case is a channel rotating mid-pull. A *sustained* rate means
+    /// a `channel_id`-plumbing bug, and every tick is real USDC whose watermark was
+    /// discarded — so this is the counter to alert on, not just to look at.
+    pub node_pull_progress_dropped: Counter,
+    /// `decdn_node_pull_progress_superseded_total` (#1145 review): a pull's watermark write was
+    /// REGRESSED because a CONCURRENT pull on the same shared channel ledger had already
+    /// persisted a higher (correct) watermark. Benign and EXPECTED under the shared
+    /// `BuyerLedgers` — concurrent pulls on one channel are routine — because the monotonic
+    /// store keeps the winner's higher value, so no voucher is lost. Split from
+    /// `node_pull_progress_persist_failures_total` (a real store-write failure that leaves the
+    /// watermark lagging) so ordinary settle races do not drown out a genuine persist fault.
+    pub node_pull_progress_superseded: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
@@ -687,14 +822,66 @@ pub struct DecdnMetrics {
     /// deadline fired, to keep warming the cache from a slow-but-available
     /// upstream for future requests.
     pub node_pull_through_background_spawned: Counter,
+    /// `decdn_node_pull_through_background_shed_total` (#1145 review): background
+    /// cache-fills NOT spawned because the in-flight warms already reserve the whole
+    /// `MAX_BACKGROUND_FILL_MB` memory budget.
+    ///
+    /// Not an error — shedding speculative work is the designed response to load, and
+    /// the hash stays unclaimed so a later miss retries it. A sustained rate means the
+    /// node is missing faster than it can warm (slow upstreams, or a miss storm); the
+    /// cost is future cache misses, never a failed live request. Since each warm reserves
+    /// `max_blob_size_mb`, a node with a large blob ceiling sheds sooner — that is the
+    /// intended trade, not a fault.
+    pub node_pull_through_background_shed: Counter,
     /// `decdn_node_pull_through_background_succeeded_total` (#859): background
     /// cache-fills that populated the blob into the store.
     pub node_pull_through_background_succeeded: Counter,
-    /// `decdn_node_pull_through_background_failed_total` (#859): background
-    /// cache-fills that gave up (engine error, clean miss, or their own
-    /// deadline) without populating the blob. Cancellation on shutdown is not
-    /// counted as a failure.
+    /// `decdn_node_pull_through_background_failed_total` (#859): background cache-fills
+    /// that failed on a FAULT — a store/IO error, bytes that did not verify, a blob over
+    /// the ceiling, a broken origin, or the absolute cap.
+    ///
+    /// **This is the alertable one.** It used to also count a clean miss (no provider, no
+    /// origin), which is routine and expected — so the two were indistinguishable and no
+    /// threshold on this counter could fire *for* the emergency it would need to signal
+    /// (#1145 review). A warm that finds nothing now lands on
+    /// `node_pull_through_background_missed_total` instead, and this is reserved for the
+    /// faults an operator must act on. Cancellation on shutdown is not a failure either —
+    /// see `node_pull_through_background_cancelled`.
     pub node_pull_through_background_failed: Counter,
+    /// `decdn_node_pull_through_background_missed_total` (#1145 review): background
+    /// cache-fills that found nothing to warm — no provider had the blob, or no origin is
+    /// configured.
+    ///
+    /// Routine, and split out of `..._failed_total` precisely so that counter can mean
+    /// something. A sustained rate here is a discovery/availability signal (this node keeps
+    /// missing content the network does not hold), not a fault to page on.
+    pub node_pull_through_background_missed: Counter,
+    /// `decdn_node_pull_through_background_panicked_total` (#1145 review): a background
+    /// cache-fill task PANICKED.
+    ///
+    /// Nothing awaits these tasks — they are spawned and their `JoinHandle` dropped — so a
+    /// panic inside `populate`, the tee, or the decoder reaches nobody. It moved no counter
+    /// and wrote no log, and `spawned` simply sat one above the sum of its outcomes forever,
+    /// a gap that reads like an in-flight warm rather than a crash. Recorded from a `Drop`
+    /// guard, which is the only thing that still runs on the unwind.
+    ///
+    /// **Any non-zero value is a bug in this node.** These tasks have no business panicking.
+    pub node_pull_through_background_panicked: Counter,
+    /// `decdn_node_pull_through_background_cancelled_total` (#1145 review): background
+    /// cache-fills abandoned because the node began shutting down — either recorded explicitly
+    /// or, when a spawned warm is dropped UNPOLLED at runtime teardown, by `WarmOutcome::drop`
+    /// (which distinguishes that clean drop from a real panic via `thread::panicking()`).
+    ///
+    /// Exists so the books balance:
+    /// `spawned == succeeded + missed + failed + cancelled + panicked`.
+    ///
+    /// `shed` is NOT a term: a shed warm returns before `spawned` is ever incremented, so it
+    /// is disjoint from all of these (the comment that put it in the identity was wrong —
+    /// an operator building a dashboard from it got an equation that could never balance).
+    /// Without `cancelled` a warm that dies at drain leaves an unexplained gap between
+    /// `spawned` and the terminal counters, which on a node that restarts often looks
+    /// exactly like a leak.
+    pub node_pull_through_background_cancelled: Counter,
     /// `decdn_node_pull_through_window_paused_total` (#856): times the
     /// window-paced serve loop paused the upstream pull because the per-request
     /// unrecouped frontier (`bytes pulled − bytes paid`) reached the effective
@@ -1467,6 +1654,12 @@ impl Metrics {
         self.decdn.node_pull_no_providers.inc();
     }
 
+    /// A DHT lookup was truncated at `MAX_LOOKUP_ROUNDS` while still finding closer nodes
+    /// (#1145 review). A sustained rate means the ceiling is too low for the network size.
+    pub fn dht_lookup_round_ceiling(&self) {
+        self.decdn.dht_lookup_round_ceiling.inc();
+    }
+
     /// An upstream served hash-mismatched bytes for a paid pull (#831).
     pub fn node_pull_corruption(&self) {
         self.decdn.node_pull_corruption.inc();
@@ -1634,10 +1827,65 @@ impl Metrics {
         self.decdn.node_pull_voucher_rejected.inc();
     }
 
+    /// A channel was settled on-chain (`CooperativeCloseSigned`), so its row was dropped
+    /// and the next pull to that provider opens a fresh one (#1145 review).
+    pub fn node_pull_channel_retired(&self) {
+        self.decdn.node_pull_channel_retired.inc();
+    }
+
+    /// A channel can no longer pay but its deposit is still escrowed, so the row was KEPT
+    /// for the reclaim sweep and the provider suppressed instead (#1145 review). Money at
+    /// rest — see the counter's docs.
+    pub fn node_pull_channel_wedged(&self) {
+        self.decdn.node_pull_channel_wedged.inc();
+    }
+
+    /// The store write retiring a settled channel's row failed (#1145 review).
+    pub fn node_pull_channel_retire_failure(&self) {
+        self.decdn.node_pull_channel_retire_failure.inc();
+    }
+
+    /// A selected upstream refused delivery up front (#1144). Counts every wire
+    /// code; only `InternalError` also scores the provider's reputation.
+    pub fn node_pull_refused(&self) {
+        self.decdn.node_pull_refused.inc();
+    }
+
+    /// An upstream went silent mid-stream (#1134); the pull was abandoned and the
+    /// provider scored `Unreachable`.
+    pub fn node_pull_stalled(&self) {
+        self.decdn.node_pull_stalled.inc();
+    }
+
+    /// A pull failed for a LOCAL reason (#1145 review) — signer, encode, range — so
+    /// the upstream was exonerated. Says nothing about the network; any sustained
+    /// rate means this node cannot pay for anything.
+    pub fn node_pull_local_fault(&self) {
+        self.decdn.node_pull_local_fault.inc();
+    }
+
+    /// A buyer channel open outlived the per-candidate budget (#1143). The open
+    /// continues in the background; the pull moves on. No reputation effect.
+    pub fn node_pull_channel_open_pending(&self) {
+        self.decdn.node_pull_channel_open_pending.inc();
+    }
+
     /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark
     /// failed (#852); the channel's stored progress now lags the upstream.
     pub fn node_pull_progress_persist_failure(&self) {
         self.decdn.node_pull_progress_persist_failures.inc();
+    }
+
+    /// A paid voucher's watermark was DROPPED because the provider's channel slot had
+    /// been replaced by a newer open before the write landed (#1145 review).
+    pub fn node_pull_progress_dropped(&self) {
+        self.decdn.node_pull_progress_dropped.inc();
+    }
+
+    /// A concurrent settle on the shared channel ledger persisted a higher watermark first, so
+    /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
+    pub fn node_pull_progress_superseded(&self) {
+        self.decdn.node_pull_progress_superseded.inc();
     }
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).
@@ -1656,14 +1904,42 @@ impl Metrics {
         self.decdn.node_pull_through_background_spawned.inc();
     }
 
+    /// A background cache-fill was shed because the in-flight warms already reserve the
+    /// whole memory budget (#1145 review). Speculative work dropped under load; the hash
+    /// stays unclaimed, so a later miss retries it.
+    pub fn node_pull_through_background_shed(&self) {
+        self.decdn.node_pull_through_background_shed.inc();
+    }
+
     /// A background cache-fill populated the blob into the store (#859).
     pub fn node_pull_through_background_succeeded(&self) {
         self.decdn.node_pull_through_background_succeeded.inc();
     }
 
-    /// A background cache-fill gave up without populating the blob (#859).
+    /// A background cache-fill failed on a FAULT — a store/IO error, unverifiable bytes, a
+    /// broken origin, or the absolute cap (#859). Alertable; a clean miss is not counted
+    /// here (#1145 review).
     pub fn node_pull_through_background_failed(&self) {
         self.decdn.node_pull_through_background_failed.inc();
+    }
+
+    /// A background cache-fill found nothing to warm — no provider, or no origin (#1145
+    /// review). Routine, and kept out of `..._failed_total` so that counter can be alerted
+    /// on.
+    pub fn node_pull_through_background_missed(&self) {
+        self.decdn.node_pull_through_background_missed.inc();
+    }
+
+    /// A background cache-fill task PANICKED (#1145 review). Nothing awaits these tasks, so
+    /// this counter is the only trace one leaves. Any non-zero value is a bug in this node.
+    pub fn node_pull_through_background_panicked(&self) {
+        self.decdn.node_pull_through_background_panicked.inc();
+    }
+
+    /// A background cache-fill was abandoned at shutdown (#1145 review). Not a failure —
+    /// counted so `spawned == succeeded + missed + failed + cancelled + panicked` balances.
+    pub fn node_pull_through_background_cancelled(&self) {
+        self.decdn.node_pull_through_background_cancelled.inc();
     }
 
     /// Open a drift window for the `NodeId → address` resolver watcher (#831):

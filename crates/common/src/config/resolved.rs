@@ -244,7 +244,15 @@ pub struct ResolvedCache {
     pub node_pull_probe_fanout: usize,
     /// Per-pull wall-clock timeout in seconds for a node-to-node miss fill
     /// (#831). Default [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`].
+    ///
+    /// Bounds the OPEN stage only; the streaming stage is bounded by
+    /// [`Self::node_pull_stall_timeout_sec`] (#1134).
     pub node_pull_timeout_sec: u64,
+    /// Inactivity bound (seconds) on the streaming stage of an upstream pull; the
+    /// clock resets on every byte received, so it trips only on a silent upstream,
+    /// never on a large blob or a slow link (#1134). Default
+    /// [`crate::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`].
+    pub node_pull_stall_timeout_sec: u64,
     /// Window-paced pull-through pipeline window in bytes (#856, ADR 037
     /// `pull_ahead_bytes`). Default [`crate::config::DEFAULT_PULL_AHEAD_BYTES`].
     /// Bounds per-request speculative loss to this window.
