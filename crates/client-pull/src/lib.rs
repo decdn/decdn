@@ -1,7 +1,7 @@
 //! Reusable `cdn/client/v1` paid-pull requester, shared by the node
 //! (node-to-node miss pulls, #317) and the CLI (client fetch / bundle pull).
 //!
-//! [`stream_fetch`] performs one full delivery exchange against a remote node:
+//! `stream_fetch` performs one full delivery exchange against a remote node:
 //! it sends a [`StreamRequest`], validates and verifies the signed
 //! [`StreamResponse`], receives `ChunkData` while paying cumulative vouchers
 //! at each `voucher_interval_mb` boundary, and returns the assembled blob on
@@ -284,7 +284,7 @@ impl VoucherProgress {
 /// invariant, ADR 014/038). Under ADR 038 the verifier is the per-chunk-group
 /// `bao-tree` decoder (`decode_verified_range`), not a whole-blob re-hash, so
 /// this fires the moment any group's proof mismatches. Returned (via `anyhow`)
-/// by [`stream_fetch`] so callers can `downcast_ref` to classify corruption
+/// by `stream_fetch` so callers can `downcast_ref` to classify corruption
 /// (e.g. a reputation `Corruption` outcome) without matching on the error
 /// message string. The `Display` text is kept stable for logs and the existing
 /// requester tests.
@@ -332,16 +332,19 @@ impl std::error::Error for BlobTooLargeClaim {}
 /// negative assertion in `node_to_node_pull_through`'s deadline test).
 ///
 /// Since #1134 it is raised by OUR OWN wall clocks only, and the message is
-/// deliberately stage-NEUTRAL because there are two of them: the shared
+/// deliberately stage-NEUTRAL because there are THREE of them: the shared
 /// `open_stream` open bound (`PullDeadlines::open`, on both the buffered and the
-/// progressive path), and the optional overall `hard_cap`. `decdn-node` also wraps
-/// `open_progressive_pull` in its per-candidate budget as belt-and-braces, which
-/// raises the same sentinel.
+/// progressive path), the optional overall `hard_cap`, and the stall clock elapsing
+/// before the FIRST byte (`cumulative == 0`) in either streaming loop — where it is
+/// measuring the server's time-to-first-byte, not mid-stream inactivity. `decdn-node`
+/// also wraps `open_progressive_pull` in its per-candidate budget as belt-and-braces,
+/// which raises the same sentinel.
 ///
-/// It is NOT raised by the streaming loops — a mid-stream stall is [`PullStalled`],
-/// which is a fact about the PEER and scores its reputation, whereas this is a fact
-/// about our own possibly mis-sized budget and must not. Keeping the two apart is
-/// the whole point of the split.
+/// The one thing it is NOT is a mid-stream STALL once bytes have flowed — that is
+/// [`PullStalled`], a fact about the PEER that scores its reputation, whereas this is a
+/// fact about our own possibly mis-sized budget (or an honest slow server's TTFB) and
+/// must not. Keeping the two apart is the whole point of the split, and the `cumulative
+/// == 0` carve-out is where the two loops draw the line (see [`PullStalled`]).
 ///
 /// Callers that want to name the stage add a `.context(…)` layer; `downcast_ref`
 /// still recovers the sentinel through it — pinned by
@@ -709,14 +712,15 @@ impl PullDeadlines {
     /// reach for this (#1145 review).
     ///
     /// It is also the reason this constructor stays infallible while [`Self::capped`] is not:
-    /// it deliberately builds the very state `capped` refuses. Test-only, `#[doc(hidden)]`,
-    /// and named to be hard to reach for by accident.
+    /// it deliberately builds the very state `capped` refuses.
     ///
-    /// TEST-ONLY. Used by the loopback helper [`stream_fetch`] and directly by the
-    /// `client_loopback` suite, whose blobs are small enough that none of this matters.
-    /// Do not reach for it in production code: a production caller wants [`Self::new`]
-    /// (stall-bounded) or [`Self::capped`] (stall-bounded with a leak guard).
-    #[doc(hidden)]
+    /// TEST-ONLY, and now unrepresentable in production by construction: gated behind the
+    /// `test-util` feature (#1145 review), so a production caller cannot name it and reach for
+    /// the zero-stall / uncapped state — it wants [`Self::new`] (stall-bounded) or
+    /// [`Self::capped`] (stall-bounded with a leak guard). Used by the loopback helper
+    /// `stream_fetch` and directly by the `client_loopback` suite, whose blobs are small
+    /// enough that none of this matters.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub const fn whole_transfer(timeout: Duration) -> Self {
         Self {
@@ -751,11 +755,16 @@ fn refusal(error: Option<StreamError>) -> anyhow::Error {
 /// [`stream_fetch_tracked`] instead if you need to persist the voucher watermark
 /// the channel reached (#852); this convenience wrapper discards it.
 ///
+/// TEST-ONLY: gated behind the `test-util` feature alongside
+/// [`PullDeadlines::whole_transfer`], the single-deadline shape it passes (#1145 review).
+/// Production callers use [`stream_fetch_tracked`] directly with a split [`PullDeadlines`].
+///
 /// # Errors
 ///
 /// Fails on connect/transport errors, an invalid or zero-rate response, a
 /// `slash_sig` that does not recover to `expected_signer`, a mismatched echoed
 /// field, a mid-stream `VoucherRejected`, a hash mismatch, or a timeout.
+#[cfg(any(test, feature = "test-util"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_fetch(
     endpoint: &Endpoint,
@@ -792,7 +801,7 @@ pub async fn stream_fetch(
     .await
 }
 
-/// Like [`stream_fetch`], but reports the channel's acked voucher watermark via
+/// Like `stream_fetch`, but reports the channel's acked voucher watermark via
 /// the `progress` out-param so the caller can persist what it paid (#852).
 ///
 /// `progress` is an out-param: on return it holds the cumulative `(nonce,
@@ -804,7 +813,7 @@ pub async fn stream_fetch(
 ///
 /// # Errors
 ///
-/// Same as [`stream_fetch`].
+/// Same as `stream_fetch`.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_fetch_tracked(
     endpoint: &Endpoint,
@@ -853,7 +862,7 @@ pub type ProgressCallback = dyn Fn(u64, u64) + Send + Sync;
 ///
 /// # Errors
 ///
-/// Same as [`stream_fetch`].
+/// Same as `stream_fetch`.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_fetch_tracked_with_progress(
     endpoint: &Endpoint,
@@ -922,7 +931,7 @@ where
     }
 }
 
-/// Like [`stream_fetch`], but issues vouchers through a caller-owned shared
+/// Like `stream_fetch`, but issues vouchers through a caller-owned shared
 /// [`ChannelLedger`] so multiple concurrent pulls on ONE payment channel coordinate.
 ///
 /// The bug this fixes: each `stream_fetch`/`stream_fetch_tracked` call seeds its
@@ -934,13 +943,17 @@ where
 /// ledger's mutex: each issues the next nonce in turn, the channel advances
 /// monotonically, and all pulls succeed.
 ///
-/// The caller owns the ledger's lifetime and reads its final cumulative via
-/// [`ChannelLedger::snapshot`] to persist what the channel paid (this entrypoint
-/// does not surface a [`VoucherProgress`] — the shared ledger IS the watermark).
+/// The caller owns the ledger's lifetime and persists what the channel paid from it
+/// directly (this entrypoint does not surface a [`VoucherProgress`] — the shared ledger
+/// IS the watermark). Persist via [`ChannelLedger::settlement`], NOT `snapshot`:
+/// `snapshot`/`committed` report only ACKED vouchers, so a voucher left in the ack wait
+/// (the drop the node's `SettleOnDrop` guard handles) is under-reported and its deposit
+/// stranded — `settlement` adds the in-flight voucher back (#1122/#1145). `snapshot` is
+/// also `async`, so a `Drop` guard cannot call it at all.
 ///
 /// # Errors
 ///
-/// Same as [`stream_fetch`].
+/// Same as `stream_fetch`.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_fetch_shared(
     endpoint: &Endpoint,
@@ -1459,7 +1472,7 @@ pub struct UpstreamPullHeader {
 }
 
 /// A live, progressive `cdn/client/v1` pull (#856), the streaming counterpart of
-/// the buffered [`stream_fetch`]. Opened by [`open_progressive_pull`] (which has
+/// the buffered `stream_fetch`. Opened by [`open_progressive_pull`] (which has
 /// already done the handshake and verified the response), driven chunk-by-chunk
 /// via [`Self::next_chunk`], and closed by [`Self::finish`] (a wire-completeness
 /// check — integrity is verified per bao chunk group by the tee's decoder and the
@@ -1541,13 +1554,13 @@ impl std::fmt::Debug for UpstreamPull {
 /// [`StreamRequest`], read and verify the signed [`StreamResponse`] (so
 /// `total_bytes` is known up front), and return its header plus a live
 /// [`UpstreamPull`] to drive. The same response-validation rules as
-/// [`stream_fetch`] apply — zero-rate rejection, `slash_sig` recovery, echoed
+/// `stream_fetch` apply — zero-rate rejection, `slash_sig` recovery, echoed
 /// field checks, the [`BlobTooLargeClaim`] ceiling, and the
 /// `total_bytes >= byte_offset` floor — all enforced BEFORE the first chunk.
 ///
 /// # Errors
 ///
-/// Same set as [`stream_fetch`] for the handshake/response phase (connect /
+/// Same set as `stream_fetch` for the handshake/response phase (connect /
 /// transport, refused or zero-rate response, bad `slash_sig`, mismatched echoed
 /// field, oversized `total_bytes`).
 ///
@@ -1694,9 +1707,12 @@ impl UpstreamPull {
     ///
     /// # Errors
     ///
-    /// An over-`CHUNK_SIZE` chunk, more bytes than promised, a mid-stream
-    /// `StreamError`, an unexpected message, or a [`UpstreamVoucherRejected`] /
-    /// transport error while paying.
+    /// More bytes than promised, a mid-stream `StreamError` (typed [`UpstreamRefused`]), an
+    /// unexpected message, a [`UpstreamVoucherRejected`] / transport error while paying, or —
+    /// on the inactivity clock — [`PullStalled`] once bytes have flowed, or [`PullTimeout`] if
+    /// the stall budget elapses before the first byte (`cumulative == 0`). An empty or
+    /// over-`CHUNK_SIZE` `ChunkData` is no longer raised here: it is rejected at decode by
+    /// `ChunkData`'s `serde(try_from)` (#1088), so it surfaces out of `read_client_message`.
     pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
         if self.ended {
             return Ok(None);
@@ -1779,8 +1795,9 @@ impl UpstreamPull {
     ///
     /// # Errors
     ///
-    /// A short delivery (fewer wire bytes than promised before `StreamEnd`), or a
-    /// stream/protocol error while draining to the end of the stream.
+    /// A short delivery (fewer wire bytes than promised before `StreamEnd`), a stream/protocol
+    /// error while draining, or — on the same inactivity bound as `next_chunk` — [`PullStalled`]
+    /// if the upstream goes silent before `StreamEnd`.
     pub async fn finish(mut self) -> anyhow::Result<VoucherProgress> {
         while !self.ended {
             // Same inactivity bound as `next_chunk` (#1134): an upstream that
@@ -1913,15 +1930,18 @@ async fn self_pay(
                 ClientMessage::VoucherAck => Ok(()),
                 // Only a `VoucherRejected` is OUR payment-side fault. Carry its
                 // typed reason so the orchestrator can exonerate the provider
-                // (#857). Any OTHER `StreamError` here is the upstream violating
-                // the ack protocol (only `VoucherAck`/`VoucherRejected` are valid
-                // in reply to a voucher), so it stays a bare error and is
-                // classified as provider-attributable upstream.
+                // (#857).
                 ClientMessage::StreamError(StreamError::VoucherRejected { reason }) => {
                     Err(anyhow::Error::new(UpstreamVoucherRejected { reason }))
                 }
+                // Any OTHER `StreamError` in reply to a voucher is the upstream refusing
+                // mid-stream (it violated the ack protocol, or it is shedding). Carry the
+                // typed wire code as `UpstreamRefused`, exactly as the three mid-stream
+                // receive sites do (#1145 review) — stringifying it here dropped the code
+                // through every downcast to the `Unreachable` catch-all, scoring an honest
+                // `Overloaded`/`NotFound` peer as a dead node.
                 ClientMessage::StreamError(e) => {
-                    anyhow::bail!("unexpected stream error awaiting voucher ack: {e:?}")
+                    Err(anyhow::Error::new(UpstreamRefused { error: e }))
                 }
                 other => anyhow::bail!("expected VoucherAck, got {}", variant_name(&other)),
             }

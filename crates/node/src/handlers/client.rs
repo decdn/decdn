@@ -377,15 +377,25 @@ impl<'a> WarmOutcome<'a> {
 
 impl Drop for WarmOutcome<'_> {
     fn drop(&mut self) {
-        if !self.recorded {
-            // The only way to leave the select without recording a verdict is to unwind
-            // through it.
+        if self.recorded {
+            return;
+        }
+        // A verdict was never recorded — two very different reasons, told apart by
+        // `thread::panicking()`: a real panic unwinds THROUGH this Drop (so it is true), whereas
+        // a task dropped UNPOLLED at runtime teardown does not (#1145 review). Conflating them
+        // fired a false `error!("PANICKED")` on every clean shutdown against a counter whose
+        // doc says any non-zero value is a bug.
+        if std::thread::panicking() {
+            // Nothing awaits the warm's `JoinHandle`, so this counter is the panic's only trace.
             self.metrics.node_pull_through_background_panicked();
             tracing::error!(
                 hash = %self.hash,
                 "background cache-fill PANICKED; nothing awaits this task, so this counter is \
                  the only trace it leaves"
             );
+        } else {
+            // Cancelled / dropped unpolled at shutdown — expected, not a crash.
+            self.metrics.node_pull_through_background_cancelled();
         }
     }
 }
@@ -3409,38 +3419,63 @@ mod tests {
     }
 
     /// A warm that PANICS must still be counted — it is the one outcome the task cannot
-    /// report for itself (#1145 review).
+    /// report for itself (#1145 review) — but a warm merely DROPPED unpolled at shutdown is
+    /// NOT a panic and must not fire the `PANICKED` error.
     ///
     /// Nothing awaits a warm's `JoinHandle`; it is spawned and forgotten. So a panic inside
     /// `populate`, the tee, or the decoder reached nobody: no counter moved, nothing was
     /// logged, and `spawned` sat permanently one above the sum of its outcomes — a gap that
     /// reads like an in-flight warm rather than a crash. `Drop` runs on the unwind, which is
-    /// what makes the guard able to see it at all.
+    /// what makes the guard able to see it. But it also runs on a clean teardown drop, so the
+    /// guard must distinguish the two via `thread::panicking()`, or every restart cries wolf.
     ///
-    /// Asserted on the REAL `Metrics`, and on both halves: a guard that recorded a verdict
-    /// must NOT also report a panic, or every warm would look like a crash.
+    /// Asserted on the REAL `Metrics`, across three cases: a genuine unwind → `panicked`; a
+    /// drop-unpolled (no panic) → `cancelled`, NOT `panicked`; a recorded verdict → neither.
     #[test]
-    fn a_panicking_warm_is_counted_by_the_guard_that_outlives_it() {
+    #[allow(clippy::panic, clippy::expect_used)] // deliberately panics to test the unwind path
+    fn a_panicking_warm_is_counted_but_a_dropped_one_is_not() {
         let hash = Hash::new(b"warm-panic");
 
-        // Dropped without a verdict — exactly what an unwind does.
+        // (1) A GENUINE unwind: the guard is dropped while `thread::panicking()` is true.
+        let metrics = Metrics::new();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic's backtrace
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _outcome = WarmOutcome::new(hash, &metrics);
+            panic!("warm body exploded");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(unwound.is_err(), "the closure must have panicked");
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_panicked_total 1"),
+            "a warm that unwound must be metered as a panic. Got:\n{encoded}"
+        );
+
+        // (2) A DROP WITHOUT A PANIC — a task cancelled/dropped unpolled at teardown. This is
+        // the false-alarm case: it must count `cancelled`, not `panicked`. Fails on revert.
         let metrics = Metrics::new();
         drop(WarmOutcome::new(hash, &metrics));
         let encoded = metrics.encode().expect("metrics encode");
         assert!(
-            encoded.contains("decdn_node_pull_through_background_panicked_total 1"),
-            "a warm that unwound must be metered; nothing else will ever see it. Got:\n{encoded}"
+            encoded.contains("decdn_node_pull_through_background_panicked_total 0"),
+            "a clean drop must NOT report a panic. Got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("decdn_node_pull_through_background_cancelled_total 1"),
+            "a clean drop-unpolled must count as cancelled. Got:\n{encoded}"
         );
 
-        // A warm that ended normally is NOT a panic.
+        // (3) A warm that recorded a verdict is neither a panic nor a cancel.
         let metrics = Metrics::new();
         let mut outcome = WarmOutcome::new(hash, &metrics);
         outcome.record(WarmVerdict::Succeeded);
         drop(outcome);
         let encoded = metrics.encode().expect("metrics encode");
         assert!(
-            encoded.contains("decdn_node_pull_through_background_panicked_total 0"),
-            "a warm that recorded a verdict must not also report a panic. Got:\n{encoded}"
+            encoded.contains("decdn_node_pull_through_background_panicked_total 0")
+                && encoded.contains("decdn_node_pull_through_background_cancelled_total 0"),
+            "a warm that recorded a verdict must not also report a panic or a cancel. Got:\n{encoded}"
         );
         assert!(
             encoded.contains("decdn_node_pull_through_background_succeeded_total 1"),

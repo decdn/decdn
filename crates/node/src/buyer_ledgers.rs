@@ -15,10 +15,10 @@
 //! tens-of-nodes network both routinely rank the same provider first. Both then take the
 //! channel-reuse fast path, read the same `prior_nonce`, and collide.
 //!
-//! What made that fatal rather than merely wasteful is `retire_dead_channel`: `StaleNonce`
-//! is now a terminal verdict, so the losing pull DELETES the channel row out from under the
-//! winner — which is still streaming on it. The winner's watermark write then fails
-//! `UnknownProvider`, and the deposit is stranded (see [`crate::buyer_channel`]).
+//! What made that fatal rather than merely wasteful is that `StaleNonce` is now a terminal
+//! verdict: the losing pull's collision wedges the channel — `wedged_channel` keeps the row
+//! for the reclaim sweep but suppresses the provider — and the desync persists until the
+//! deposit is reclaimed at expiry (see [`crate::buyer_channel`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -27,17 +27,20 @@ use alloy::primitives::Address;
 use decdn_client_pull::{ChannelLedger, Cumulative};
 use decdn_incentive::ChannelId;
 
-/// The voucher ledger of each provider's CURRENT channel, shared by every concurrent pull
+/// The voucher ledger of each provider's current channel, shared by every concurrent pull
 /// on it.
 ///
-/// Keyed by provider rather than by `(provider, channel)` because a provider has exactly one
-/// live buyer channel at a time — the same shape as the buyer store's own row — so a rotated
-/// channel's ledger is evicted by the act of seeding its replacement rather than lingering.
-/// Cardinality is therefore bounded by the number of providers this node has ever paid,
-/// which is the buyer store's bound too.
+/// Keyed by `(provider, channel)` so the ledger a pull issues through is pinned to the exact
+/// channel it read: a stale or rotated `channel_id` can neither collide with nor evict a
+/// different channel's live ledger. Cardinality stays bounded without that hazard — a rotated
+/// channel's ledger is dropped by [`Self::get_or_seed`] the moment no pull still holds it
+/// (`Arc::strong_count == 1`), so at most one live channel per provider lingers, plus any
+/// whose pulls are still in flight. That is the buyer store's bound, made safe against a
+/// stale key (#1145 review): the earlier provider-only key evicted the live ledger on ANY
+/// channel-id mismatch, which is exactly the collision this type exists to prevent.
 #[derive(Debug, Default)]
 pub struct BuyerLedgers {
-    live: Mutex<HashMap<Address, (ChannelId, Arc<ChannelLedger>)>>,
+    live: Mutex<HashMap<(Address, ChannelId), Arc<ChannelLedger>>>,
 }
 
 impl BuyerLedgers {
@@ -50,8 +53,10 @@ impl BuyerLedgers {
     /// does not carry yet (it is written on settle, not on issue). Re-seeding from the row
     /// would rewind the nonce and re-create the collision this type exists to prevent.
     ///
-    /// A DIFFERENT `channel_id` means the provider's channel rotated. The old ledger belongs
-    /// to a channel no future voucher can be signed against, so it is replaced.
+    /// A DIFFERENT `channel_id` addresses a DIFFERENT entry — a rotated or stale channel id
+    /// can neither read nor evict this channel's ledger. The provider's other channels are
+    /// pruned here, but only those no pull still holds (`Arc::strong_count == 1`), so a
+    /// rotation cannot throw away a ledger a concurrent pull is issuing through.
     pub fn get_or_seed(
         &self,
         provider: Address,
@@ -59,29 +64,24 @@ impl BuyerLedgers {
         seed: Cumulative,
     ) -> Arc<ChannelLedger> {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        match live.get(&provider) {
-            Some((current, ledger)) if *current == channel_id => Arc::clone(ledger),
-            _ => {
-                let ledger = Arc::new(ChannelLedger::new(seed));
-                live.insert(provider, (channel_id, Arc::clone(&ledger)));
-                ledger
-            }
-        }
+        // Bound cardinality by dropping this provider's OTHER channels — but only those no
+        // pull still holds, so a stale/rotated key cannot evict a live ledger.
+        live.retain(|(p, c), l| *p != provider || *c == channel_id || Arc::strong_count(l) > 1);
+        Arc::clone(
+            live.entry((provider, channel_id))
+                .or_insert_with(|| Arc::new(ChannelLedger::new(seed))),
+        )
     }
 
-    /// Drop `provider`'s ledger if it is still `channel_id`'s — the channel was retired, so
-    /// no further voucher can be signed against it.
+    /// Drop `(provider, channel_id)`'s ledger — the channel was retired, so no further voucher
+    /// can be signed against it.
     ///
-    /// Compare-and-remove, for the same reason `forget_if_channel` is: a concurrent open may
-    /// already have rotated the provider onto a NEW channel, whose ledger is live and must
-    /// not be thrown away.
+    /// Keyed by the exact channel, so a concurrent open that already rotated the provider onto
+    /// a NEW channel is untouched: its ledger lives under a different key and is not thrown
+    /// away.
     pub fn forget(&self, provider: Address, channel_id: ChannelId) {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((current, _)) = live.get(&provider)
-            && *current == channel_id
-        {
-            live.remove(&provider);
-        }
+        live.remove(&(provider, channel_id));
     }
 }
 
@@ -165,6 +165,31 @@ mod tests {
         ledgers.forget(addr(1), chan(10));
         let fresh = ledgers.get_or_seed(addr(1), chan(10), seed_at(3));
         assert!(!Arc::ptr_eq(&live, &fresh), "its own retire does drop it");
+    }
+
+    /// The bug this `(provider, channel)` keying closes (#1145 review): a call carrying a
+    /// STALE `channel_id` — an older row a concurrent path read — must not evict the provider's
+    /// LIVE ledger. The earlier provider-only key evicted on ANY mismatch, so the next pull on
+    /// the live channel got a fresh ledger, re-signed a spent nonce, and wedged the channel.
+    #[test]
+    fn a_stale_channel_id_does_not_evict_the_live_ledger() {
+        let ledgers = BuyerLedgers::default();
+        // The live channel, held by a concurrent pull (so its `Arc` outlives the map entry).
+        let live = ledgers.get_or_seed(addr(1), chan(10), seed_at(5));
+        // A late call with a STALE id: under the old provider-key this evicted chan(10)'s
+        // ledger; keyed by `(provider, channel)` it just addresses chan(9)'s own entry.
+        let _stale = ledgers.get_or_seed(addr(1), chan(9), seed_at(0));
+        // chan(10)'s live ledger survives — a subsequent pull on it rejoins the SAME Arc.
+        let rejoined = ledgers.get_or_seed(addr(1), chan(10), seed_at(0));
+        assert!(
+            Arc::ptr_eq(&live, &rejoined),
+            "a stale channel_id must not evict the live channel's ledger"
+        );
+        assert_eq!(
+            rejoined.committed().nonce,
+            U256::from(5u64),
+            "the live ledger's watermark stands; the seed is ignored on a hit"
+        );
     }
 
     /// Providers do not share a ledger with each other.

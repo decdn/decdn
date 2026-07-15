@@ -208,6 +208,13 @@ impl ChannelOpener for StubOpener {
             .push((provider_addr, channel_id));
         Ok(true)
     }
+
+    fn channel_expiry(&self, _provider_addr: Address) -> Option<u64> {
+        // A far-future expiry (year ~2286) so a wedge records a LIVE provider-wide suppression
+        // horizon (#1145 review) — otherwise `None` would leave only per-(peer, hash) cover and
+        // the wedged-provider filter could never be exercised.
+        Some(9_999_999_999)
+    }
 }
 
 /// An opener that hands back a fresh-channel context but whose `record_progress`
@@ -735,6 +742,67 @@ fn build_origin_with_negative_cache(
         },
         acquisition_observer: None,
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
+        wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    });
+    origin
+}
+
+/// Build a `NodeOrigin` whose directory maps SEVERAL hashes to the same provider set, so a
+/// test can pull two different blobs from one provider through one shared `deps` — and thus
+/// one shared `wedged_providers` map (#1145 review). `max_blob_size_bytes` is 0 (no ceiling).
+#[allow(clippy::too_many_arguments, clippy::expect_used)]
+fn build_origin_multi_hash(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    hashes: &[Hash],
+    buyer: Arc<dyn ChannelOpener>,
+    local_rep: &Arc<LocalReputation>,
+    obs_buffer: &Arc<ObservationBuffer>,
+    metrics: &Arc<Metrics>,
+    region_accountant: &Arc<RegionAccountant>,
+    providers: &[DhtNodeId],
+    addr_map: HashMap<DhtNodeId, Address>,
+    pull_timeout: Duration,
+    stall_timeout: Duration,
+) -> NodeOrigin {
+    let mut dir = HashMap::new();
+    for h in hashes {
+        dir.insert(DhtHash::from_bytes(*h.as_bytes()), providers.to_vec());
+    }
+    let origin = NodeOrigin::new();
+    origin.provision(NodeOriginDeps {
+        endpoint: ep_b.clone(),
+        routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
+        staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
+        origin_directory: Arc::new(ConfigOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
+        addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
+            as Arc<dyn NodeAddressResolver>,
+        buyer,
+        self_id: b_dht,
+        slash_domain: slash_domain(),
+        bind_domain: binding_dom(),
+        local_rep: Arc::clone(local_rep),
+        obs_buffer: Arc::clone(obs_buffer),
+        network_rep: Arc::new(
+            NetworkReputation::new(NetworkReputationConfig::default())
+                .expect("network reputation config"),
+        ),
+        rep_cfg: NetworkReputationConfig::default(),
+        negative_cache: NegativeProbeCache::new(),
+        metrics: Arc::clone(metrics),
+        region_accountant: Arc::clone(region_accountant),
+        config: NodeOriginConfig {
+            probe_fanout: 5,
+            pull_timeout,
+            stall_timeout,
+            max_blob_size_bytes: 0,
+            enable_0rtt: false,
+            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
+            lookup: decdn_node::dht::LookupConfig::default(),
+        },
+        acquisition_observer: None,
+        ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
+        wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
     origin
 }
@@ -936,6 +1004,7 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
         },
         acquisition_observer: Some(observer),
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
+        wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     // B's cache with the NodeOrigin last in the chain — exactly how the runtime
@@ -1379,6 +1448,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         },
         acquisition_observer: Some(observer),
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
+        wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     let cache_dir_b = tempfile::tempdir()?;
@@ -2168,6 +2238,126 @@ async fn serve_then_reject_voucher(
     let _ = send.finish();
     conn.closed().await;
     Ok(())
+}
+
+/// Serve the whole payload, read the closing voucher, then reply with an ARBITRARY
+/// `StreamError` (not a `VoucherRejected`) — the shape that lands in `self_pay`'s ack-wait
+/// catch-all (#1145 review). Modelled on [`serve_then_reject_voucher`], differing only in the
+/// final frame: an `Overloaded`/`NotFound` in reply to a voucher must be metered as a refusal,
+/// not stringified into the `Unreachable` catch-all.
+async fn serve_then_error_on_voucher(
+    conn: Connection,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    served: &[u8],
+    rate: u64,
+    error: StreamError,
+) -> Result<()> {
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
+    let req_msg = {
+        let frame = read_frame(&mut recv)
+            .await
+            .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
+        decode_message::<ClientMessage>(&frame)
+            .map_err(|e| anyhow::anyhow!("decode request: {e}"))?
+            .0
+    };
+    let ClientMessage::StreamRequest(req) = req_msg else {
+        anyhow::bail!("voucher-erroring upstream: expected a StreamRequest");
+    };
+    let body = StreamResponseBody {
+        hash: req.hash,
+        ok: true,
+        rate_per_mb: rate,
+        total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
+        channel_id: req.channel_id,
+        timestamp_us: req.timestamp_us,
+        redirect: None,
+    };
+    let slash_sig = StreamSlashData::from_response_body(&body)
+        .sign(eth.as_ref(), slash)
+        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+        .as_bytes()
+        .to_vec();
+    let resp = StreamResponse {
+        body,
+        error: None,
+        voucher_interval_mb: Some(1),
+        slash_sig,
+    };
+    write_frame(
+        &mut send,
+        &encode_message(&ClientMessage::StreamResponse(resp))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    for chunk in served.chunks(CHUNK_SIZE) {
+        write_frame(
+            &mut send,
+            &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
+    }
+    let voucher_msg = {
+        let frame = read_frame(&mut recv)
+            .await
+            .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
+        decode_message::<ClientMessage>(&frame)
+            .map_err(|e| anyhow::anyhow!("decode voucher: {e}"))?
+            .0
+    };
+    let ClientMessage::Voucher(_) = voucher_msg else {
+        anyhow::bail!("voucher-erroring upstream: expected a Voucher");
+    };
+    // The non-`VoucherRejected` reply: this is the frame `self_pay`'s ack-wait catch-all sees.
+    write_frame(
+        &mut send,
+        &encode_message(&ClientMessage::StreamError(error))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write voucher-reply error: {e}"))?;
+    let _ = send.finish();
+    conn.closed().await;
+    Ok(())
+}
+
+/// Spawn A answering probes truthfully but replying to the buyer's closing voucher with
+/// `error` (a non-`VoucherRejected` `StreamError`) — the ack-wait catch-all path (#1145).
+fn spawn_a_voucher_erroring_server(
+    ep: iroh::Endpoint,
+    a_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    served: Vec<u8>,
+    advertised_bytes: u64,
+    rate: u64,
+    error: StreamError,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let eth = Arc::clone(&a_eth);
+            let dom = slash.clone();
+            let served = served.clone();
+            let error = error.clone();
+            if conn.alpn() == ALPN_PROBE {
+                tokio::spawn(async move {
+                    let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    let _ =
+                        serve_then_error_on_voucher(conn, &eth, &dom, &served, rate, error).await;
+                });
+            }
+        }
+    })
 }
 
 /// Spawn A serving probes truthfully but rejecting the buyer's voucher on the
@@ -5082,6 +5272,239 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         "an honest mid-stream refusal must leave the local score neutral, got {}",
         local_rep.score(a_id)
     );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.abort();
+    Ok(())
+}
+
+/// #1145 review (4th `{e:?}` site) — a non-`VoucherRejected` `StreamError` arriving in reply
+/// to the CLOSING VOUCHER lands in `self_pay`'s ack-wait catch-all. Round 2 typed the three
+/// mid-stream receive sites but left this one stringifying the wire code, so an honest
+/// `Overloaded`/`NotFound` in the ack wait fell through every downcast to the `Unreachable`
+/// catch-all — scoring a reachable, honestly-answering peer as a dead node.
+///
+/// Driven through the REAL ack wait (the server delivers the whole payload, reads the closing
+/// voucher, then replies `Overloaded`), because — as the mid-stream sibling spells out — an
+/// assertion against `classify_pull_failure`'s ladder would pass with the `bail!("{e:?}")`
+/// restored: the classifier was never the thing that broke. `node_pull_refused_total` is
+/// reachable only if `self_pay` kept the wire code as `UpstreamRefused`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
+async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
+    // A single-bao-group payload (≤ 16 KiB): its bao wire equals the raw content, so serving raw
+    // bytes matches `expected_wire_bytes` and exactly ONE closing voucher fires — after every
+    // chunk has arrived. The server can then read that single voucher and reply, with no
+    // mid-stream voucher racing the chunk writes into the ack wait (the #857 test's fixture size).
+    let payload = vec![0x4Du8; 4096];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    // `Overloaded` in reply to the voucher: backpressure from a reachable peer, the code the
+    // ack-wait catch-all used to stringify into `Unreachable`.
+    let task_a = spawn_a_voucher_erroring_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        payload.clone(),
+        total_bytes,
+        RATE,
+        StreamError::Overloaded,
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let buyer = Arc::new(StubOpener {
+        channel_id: B256::repeat_byte(0x4D),
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        providers,
+        addr_map,
+        // Generous budgets: the refusal must end this pull, not a deadline.
+        Duration::from_secs(20),
+        Duration::from_secs(20),
+        0,
+    );
+
+    let got = tokio::time::timeout(
+        Duration::from_secs(30),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("an ack-wait refusal never ended the pull"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a refused delivery must not surface bytes (NotFound)"
+    );
+
+    // Metered as a REFUSAL — only possible if `self_pay` kept the wire code as `UpstreamRefused`.
+    assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
+    // …and NOT as an unreachable peer. This is the assertion the 4th-site bug fails.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_stalled_total", 0)?;
+    // The peer answered honestly, so its local score is untouched.
+    anyhow::ensure!(
+        local_rep.score(a_id) >= 0.5,
+        "an honest ack-wait refusal must leave the local score neutral, got {}",
+        local_rep.score(a_id)
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.abort();
+    Ok(())
+}
+
+/// #1145 review — a WEDGED provider must be skipped for ALL hashes until its channel expires,
+/// not just the one that wedged it. The `(peer, hash)` negative-cache entry the wedge writes
+/// covers only the same blob for 30s; the provider-wide `wedged_providers` entry (held to the
+/// channel's expiry) is what a miss for a DIFFERENT blob needs. Without it, `try_reuse_live`
+/// (expiry-gated) hands the dead channel back and re-wedges it on the next miss.
+///
+/// Fail-on-revert: drop the `provider_is_wedged` filter in `probe_and_rank` and the second
+/// pull re-selects A, re-wedging it — `node_pull_channel_wedged_total` becomes 2, not 1.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<()> {
+    // Two distinct blobs the same provider advertises (single-bao-group, so the closing
+    // voucher fires cleanly — see the ack-wait test).
+    let payload1 = vec![0x11u8; 4096];
+    let payload2 = vec![0x22u8; 4096];
+    let hash1 = Hash::new(&payload1);
+    let hash2 = Hash::new(&payload2);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    // A rejects every closing voucher with `StaleNonce` → wedges the channel on any pull it
+    // is selected for. The server loops, so it handles both pulls.
+    let task_a = spawn_a_voucher_rejecting_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        payload1.clone(),
+        u64::try_from(payload1.len()).unwrap_or(u64::MAX),
+        RATE,
+        VoucherRejectReason::StaleNonce,
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let b_dht = DhtNodeId::from_bytes(*b_id.as_bytes());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    // Probe A for BOTH hashes so it is a live, reachable candidate for each — the filter, not a
+    // failed probe, must be what keeps A out of the second pull.
+    for h in [&hash1, &hash2] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(a_id).with_ip_addr(addr_a),
+            *h.as_bytes(),
+            1,
+            false,
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let buyer = Arc::new(StubOpener {
+        channel_id: B256::repeat_byte(0xA1),
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+    let mut addr_map = HashMap::new();
+    addr_map.insert(a_dht, a_eth.address());
+    let origin = build_origin_multi_hash(
+        &ep_b,
+        b_dht,
+        &[hash1, hash2],
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        &[a_dht],
+        addr_map,
+        Duration::from_secs(20),
+        Duration::from_secs(20),
+    );
+
+    // Pull 1 (hash1): A wedges its channel. One wedge event.
+    let got1 = tokio::time::timeout(
+        Duration::from_secs(30),
+        Origin::fetch(&origin, hash1, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("pull 1 never ended"))?
+    .map_err(|e| anyhow::anyhow!("pull 1: {e}"))?;
+    anyhow::ensure!(matches!(got1, OriginFetch::NotFound), "pull 1 must refuse");
+    assert_counter(&b_metrics, "node_pull_channel_wedged_total", 1)?;
+
+    // Pull 2 (hash2, a DIFFERENT blob): A is wedged provider-wide, so `probe_and_rank` must skip
+    // it. With no other provider, the pull finds no candidate and returns NotFound WITHOUT
+    // re-selecting A — so no second wedge.
+    let got2 = tokio::time::timeout(
+        Duration::from_secs(30),
+        Origin::fetch(&origin, hash2, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("pull 2 never ended"))?
+    .map_err(|e| anyhow::anyhow!("pull 2: {e}"))?;
+    anyhow::ensure!(
+        matches!(got2, OriginFetch::NotFound),
+        "pull 2 must find no candidate"
+    );
+    // The load-bearing assertion: still ONE wedge, not two. A re-selected-and-re-wedged
+    // provider would tick this to 2 — which is exactly what dropping the filter does.
+    assert_counter(&b_metrics, "node_pull_channel_wedged_total", 1)?;
 
     ep_b.close().await;
     ep_a.close().await;
@@ -8579,11 +9002,12 @@ async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
 /// With a ledger each, both pulls sign `prior_nonce + 1`. Node A — the real `ClientHandler`,
 /// enforcing real nonce monotonicity — accepts the first and rejects the second
 /// `StaleNonce`, so one of these two fetches comes back empty. That alone was a bad day;
-/// what makes it a money bug is `retire_dead_channel`, which now treats `StaleNonce` as
-/// terminal and DELETES the channel row — out from under the winner, which is still
-/// streaming on it. Hence the two assertions beyond "both blobs arrived": nothing was
-/// retired, and the watermark advanced monotonically through both pulls rather than one
-/// pull's voucher being refused.
+/// what makes it a money bug is that `StaleNonce` is now a TERMINAL verdict — it wedges the
+/// channel (the row is kept for the reclaim sweep, but the provider is suppressed and the
+/// loser's ledger desyncs) — so a collision the shared ledger prevents would otherwise strand
+/// the deposit. Hence the two assertions beyond "both blobs arrived": nothing was retired, and
+/// the watermark advanced monotonically through both pulls rather than one pull's voucher being
+/// refused.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Result<()> {
@@ -8713,6 +9137,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         },
         acquisition_observer: None,
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
+        wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     // The two misses race, exactly as two cache misses for different blobs do.

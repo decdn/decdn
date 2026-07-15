@@ -78,9 +78,12 @@ pub const DEFAULT_ROUND_TIMEOUT: Duration = Duration::from_secs(8);
 /// [`crate::selection::PULL_THROUGH_OUTER_SLACK`] budgeted 10 s for something that could
 /// exceed that in a single slow round.
 ///
-/// Kademlia converges in `O(log n)` rounds — for a network of tens to thousands of nodes
-/// that is a handful — so a ceiling this far above the expected count does not truncate a
-/// healthy lookup. It bounds the pathological one, which is all a deadline needs.
+/// Kademlia converges in `O(log n)` rounds. For the initial deployment target — tens of
+/// nodes on a testnet — that is ~2-3 rounds, so this ceiling clears a healthy lookup while
+/// bounding the pathological one, which is all a deadline needs. It is NOT generous at scale:
+/// at thousands of nodes `O(log n)` with α-way fan-out is already ~10 rounds, ABOVE this cap
+/// (`dht_lookup_round_ceiling` is the signal that the network outgrew the constant and it —
+/// and `PULL_THROUGH_OUTER_SLACK`, derived from it — must be raised).
 pub const MAX_LOOKUP_ROUNDS: u32 = 4;
 
 /// Lookup tuning knobs. `alpha` and `k` are `NonZeroUsize` so the

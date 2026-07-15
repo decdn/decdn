@@ -13,7 +13,7 @@
 //! 2. probes each candidate for rate + RTT and ranks them by the combined
 //!    local+network reputation score ([`crate::selection::rank_candidates`]),
 //! 3. opens (or reuses) a buyer payment channel to the best candidate and pulls
-//!    via [`crate::client_requester::stream_fetch`], falling back through up to
+//!    via `stream_fetch`, falling back through up to
 //!    [`crate::selection::MAX_PROVIDER_ATTEMPTS`] providers,
 //! 4. records the per-provider [`Outcome`] into the local reputation score and
 //!    the observation buffer, so the gossip publisher emits reports about the
@@ -38,6 +38,7 @@
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -274,6 +275,13 @@ pub struct NodeOriginDeps {
     /// concurrent pull on it (#1145 review). Not a cache — see [`BuyerLedgers`] for
     /// why a per-pull ledger collides at `prior_nonce + 1` and what that now costs.
     pub ledgers: Arc<BuyerLedgers>,
+    /// Providers whose buyer channel is WEDGED — it rejected our voucher on a terminal
+    /// reason, so it cannot serve a paid byte until it expires — mapped to the channel's
+    /// expiry (Unix seconds), the horizon past which the provider becomes rankable again
+    /// (#1145 review). Keyed by the peer's [`DhtNodeId`], so `probe_and_rank` can skip a
+    /// wedged provider for ALL hashes, not just the one that wedged it. In-memory: on
+    /// restart the first miss re-wedges and re-suppresses within one pull.
+    pub wedged_providers: Arc<Mutex<HashMap<DhtNodeId, u64>>>,
 }
 
 impl std::fmt::Debug for NodeOriginDeps {
@@ -282,6 +290,37 @@ impl std::fmt::Debug for NodeOriginDeps {
             .field("self_id", &self.self_id)
             .field("config", &self.config)
             .finish_non_exhaustive()
+    }
+}
+
+impl NodeOriginDeps {
+    /// Record that `pk`'s buyer channel is wedged until `expires_at` (Unix seconds), so
+    /// `probe_and_rank` skips the provider for ALL hashes until then (#1145 review). An
+    /// `expires_at` of `0` is the `NEVER_EXPIRES` sentinel — a channel that never expires on
+    /// its own is wedged indefinitely, stored as `u64::MAX`.
+    fn record_wedged(&self, pk: &PublicKey, expires_at: u64) {
+        let horizon = if expires_at == 0 {
+            u64::MAX
+        } else {
+            expires_at
+        };
+        let node = DhtNodeId::from_bytes(*pk.as_bytes());
+        self.wedged_providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(node, horizon);
+    }
+
+    /// True if `peer`'s channel is wedged and still within its expiry horizon. Prunes horizons
+    /// that have passed on read: once the channel expires the reclaim sweep frees the deposit
+    /// and a fresh channel can open, so the provider is worth ranking again.
+    fn provider_is_wedged(&self, peer: &DhtNodeId, now_secs: u64) -> bool {
+        let mut wedged = self
+            .wedged_providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wedged.retain(|_, expires_at| *expires_at > now_secs);
+        wedged.contains_key(peer)
     }
 }
 
@@ -754,6 +793,19 @@ impl Origin for NodeOrigin {
             let ranked = probe_and_rank(deps, providers, hash_bytes).await;
             match try_pull(deps, &ranked, hash_bytes).await {
                 Some(bytes) => Ok(OriginFetch::found_one_shot(bytes)),
+                // KNOWN LIMITATION (#1145 review, #1129): this collapses every non-hit onto a
+                // clean `NotFound` — no providers, all refused, all stalled, AND a LOCAL fault
+                // (e.g. a broken buyer key that fails `bind_upstream_ctx`/voucher signing on
+                // every candidate). The local-fault case ought to surface as
+                // `Err(OriginPullError::Permanent(..))` so the serve path refuses `InternalError`
+                // rather than signing a wire `NotFound` (the laundering `InternalError` exists to
+                // prevent). It is metered honestly today — `classify_pull_failure` routes it to
+                // `node_pull_local_fault`, "any sustained rate is an emergency" — but the wire
+                // answer is still `NotFound`. Distinguishing it here needs `classify_pull_failure`
+                // to RETURN its verdict (it is currently side-effecting) and `pull_from_candidate`
+                // /`try_pull` to propagate an our-fault signal, plus care through the
+                // cache-engine `OriginPullError -> CacheError` mapping — a refactor of the
+                // classification path deliberately left as a follow-up rather than risked here.
                 None => Ok(OriginFetch::NotFound),
             }
         })
@@ -815,6 +867,11 @@ async fn probe_and_rank(
         // Filtered BEFORE `take`, so a suppressed peer does not consume a probe-fanout
         // slot that a viable provider could have used.
         .filter(|peer| !deps.negative_cache.contains_active(peer, &target))
+        // Also drop providers whose buyer channel is WEDGED, for ALL hashes until it expires
+        // (#1145 review): a wedged channel cannot serve any blob, and the reuse fast path gates
+        // on expiry alone, so without this the dead channel is handed back on every miss for a
+        // different hash and re-wedged — burning a candidate slot each time.
+        .filter(|peer| !deps.provider_is_wedged(peer, now_secs))
         .take(deps.config.probe_fanout)
         .map(|peer| probe_candidate(deps, peer, hash_bytes, now_secs));
     let candidates: Vec<Candidate> = futures_util::future::join_all(probes)
@@ -1393,12 +1450,17 @@ enum PullVerdict {
 ///
 /// So this deliberately does NOT call `retire_channel`. What it does instead:
 ///
-/// - **Suppress the provider.** The row survives, so `try_reuse_live` (which gates on expiry
-///   alone) would hand the dead channel straight back on the next miss and burn a candidate
-///   slot on a pull that cannot pay. Suppression takes the provider out of ranking for
-///   [`REFUSAL_SUPPRESSION_TTL`] instead — the same instrument this module already uses for
-///   an unattributable refusal, and for the same reason: not the peer's fault, but no use
-///   trying it either.
+/// - **Suppress the PROVIDER, for all hashes, until the channel expires.** The row survives,
+///   so `try_reuse_live` (which gates on expiry alone) would hand the dead channel straight
+///   back on the next miss — for ANY blob, not just the one that wedged it — and burn a
+///   candidate slot on a pull that cannot pay. Two suppressions cover this: a short
+///   per-`(peer, hash)` negative-cache entry ([`REFUSAL_SUPPRESSION_TTL`]) for the immediate
+///   same-blob retry, and a provider-wide entry in `wedged_providers` keyed by the peer and
+///   held until the channel's on-chain expiry, so `probe_and_rank` drops the provider from
+///   ranking for every hash until then. The earlier version wrote ONLY the `(peer, hash)`
+///   entry (#1145 review), which suppressed one blob for 30s while the channel stayed dead
+///   for its whole ~90-day lifetime — so a miss for any other blob re-selected the provider
+///   and re-wedged it on every pull.
 /// - **Score nothing.** The peer behaved correctly; our accounting is what broke.
 ///
 /// The cost is this provider until its channel expires: the store is provider-keyed, so we
@@ -1415,19 +1477,28 @@ fn wedged_channel(
     channel: Option<B256>,
 ) {
     deps.metrics.node_pull_channel_wedged();
-    // Suppress the (peer, hash) pair the negative cache is keyed by, so the next miss ranks
-    // someone else rather than re-presenting a voucher this channel cannot honour.
+    // Immediate cover: suppress this (peer, hash) for the short refusal TTL so a retry for the
+    // SAME blob does not re-present the dead voucher before the provider-wide horizon lands.
     deps.negative_cache.record_failure_with_ttl(
         DhtNodeId::from_bytes(*pk.as_bytes()),
         DhtHash::from_bytes(hash_bytes),
         REFUSAL_SUPPRESSION_TTL,
     );
+    // Provider-wide: the wedged channel cannot serve ANY hash until it expires, so take the
+    // provider out of ranking for every hash until its channel expiry. `None` (no row / a
+    // non-store opener) leaves only the (peer, hash) cover above — the horizon is unknown, so
+    // we do not guess one.
+    // `None` (no row / a non-store opener) leaves only the (peer, hash) cover above — the
+    // horizon is unknown, so we do not guess one.
+    if let Some(expires_at) = deps.buyer.channel_expiry(provider_addr) {
+        deps.record_wedged(&pk, expires_at);
+    }
     warn!(
         %provider_addr, channel_id = ?channel, ?reason,
         "node-origin: upstream rejected our voucher on terms this channel cannot recover \
          from. Its deposit is STILL ESCROWED, so the row is kept for the reclaim sweep and \
-         the provider is suppressed instead — it cannot be used again until the channel \
-         expires and the sweep refunds it (#1122)"
+         the PROVIDER is suppressed for all hashes until the channel expires and the sweep \
+         refunds it (#1122)"
     );
 }
 
@@ -1494,7 +1565,7 @@ fn forget_settled_channel(
 ///
 /// Exhaustive on purpose, like [`classify_refusal`]: a new `VoucherRejectReason` must break
 /// this build rather than silently inherit a verdict. The reasons are not variations on one
-/// theme — three genuinely different things arrive on this wire code:
+/// theme — four genuinely different things arrive on this wire code:
 ///
 /// - **Our signer is broken.** `BadSignature`/`WrongSigner` mean the upstream could not
 ///   verify a signature WE produced. That is not a payment problem, it is a defect in this
@@ -1779,6 +1850,16 @@ fn combined_reputation(deps: &NodeOriginDeps, pk: PublicKey, now_secs: u64) -> f
 /// misses spend that a future routing change pushes onto the window path. The
 /// observer itself filters to prefetch-initiated pulls; a demand-miss pull (the
 /// entire window-paced serve path today) is a harmless no-op inside `on_pull`.
+// KNOWN LIMITATION (#1145 review, tracked with #1122): `progress` carries the CHANNEL-WIDE
+// cumulative, and `prior_*` is the channel watermark captured when THIS pull opened/reused the
+// channel. With the shared `BuyerLedgers`, two concurrent pulls on one channel read the same
+// `prior_*` and settle against the same shared watermark, so each reports ≈ the SUM of both
+// pulls' spend, attributed to its own hash. This is a prefetch-budget OVER-count, not a money
+// bug: the observer feeds a rolling throttle, and over-counting sheds prefetch EARLY (the safe
+// direction, matching `narrow_pull_delta`'s under-count-on-overflow). A precise per-pull figure
+// would need this pull's OWN issued-voucher deltas accumulated through `self_pay` — a per-stream
+// accounting channel that `VoucherProgress` (channel-cumulative by design, for persistence) does
+// not carry — so it is deliberately left for a follow-up rather than risk the voucher path here.
 fn feed_acquisition_observer(
     deps: &NodeOriginDeps,
     hash_bytes: [u8; 32],

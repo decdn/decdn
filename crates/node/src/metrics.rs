@@ -780,6 +780,14 @@ pub struct DecdnMetrics {
     /// a `channel_id`-plumbing bug, and every tick is real USDC whose watermark was
     /// discarded — so this is the counter to alert on, not just to look at.
     pub node_pull_progress_dropped: Counter,
+    /// `decdn_node_pull_progress_superseded_total` (#1145 review): a pull's watermark write was
+    /// REGRESSED because a CONCURRENT pull on the same shared channel ledger had already
+    /// persisted a higher (correct) watermark. Benign and EXPECTED under the shared
+    /// `BuyerLedgers` — concurrent pulls on one channel are routine — because the monotonic
+    /// store keeps the winner's higher value, so no voucher is lost. Split from
+    /// `node_pull_progress_persist_failures_total` (a real store-write failure that leaves the
+    /// watermark lagging) so ordinary settle races do not drown out a genuine persist fault.
+    pub node_pull_progress_superseded: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
@@ -844,7 +852,9 @@ pub struct DecdnMetrics {
     /// **Any non-zero value is a bug in this node.** These tasks have no business panicking.
     pub node_pull_through_background_panicked: Counter,
     /// `decdn_node_pull_through_background_cancelled_total` (#1145 review): background
-    /// cache-fills abandoned because the node began shutting down.
+    /// cache-fills abandoned because the node began shutting down — either recorded explicitly
+    /// or, when a spawned warm is dropped UNPOLLED at runtime teardown, by `WarmOutcome::drop`
+    /// (which distinguishes that clean drop from a real panic via `thread::panicking()`).
     ///
     /// Exists so the books balance:
     /// `spawned == succeeded + missed + failed + cancelled + panicked`.
@@ -1854,6 +1864,12 @@ impl Metrics {
     /// been replaced by a newer open before the write landed (#1145 review).
     pub fn node_pull_progress_dropped(&self) {
         self.decdn.node_pull_progress_dropped.inc();
+    }
+
+    /// A concurrent settle on the shared channel ledger persisted a higher watermark first, so
+    /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
+    pub fn node_pull_progress_superseded(&self) {
+        self.decdn.node_pull_progress_superseded.inc();
     }
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).

@@ -367,6 +367,30 @@ impl InFlightOpenGuard {
         }))
     }
 
+    /// Run `body` under `provider`'s open slot, releasing it when `body` returns — the ONLY
+    /// safe way for a non-opening writer (the reconcile scan) to hold a claim.
+    ///
+    /// The guard is never bound at the call site, so it cannot be dropped early: the
+    /// `let Some(_open_guard) = claim(..)` → `let Some(_) = claim(..)` edit — one character
+    /// from releasing the slot with a live open racing the reconciler onto the same provider
+    /// row, orphaning one of the two channels and stranding its deposit — is simply
+    /// unavailable, exactly as [`Self::spawn_open`] makes it unavailable on the opening path
+    /// (#1145 review). `Ok(None)` means a real open is already in flight; the caller skips,
+    /// because that open persists the authoritative channel.
+    fn under_claim<T>(
+        map: &Arc<Mutex<HashMap<Address, SharedOpen>>>,
+        provider: Address,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let Some(_guard) = Self::claim(map, provider)? else {
+            return Ok(None);
+        };
+        // `_guard` is in scope for the whole call and drops here, after `body` — so the slot
+        // is held for exactly the body's lifetime and released on every exit (including a
+        // panic unwind, via `Drop`).
+        body().map(Some)
+    }
+
     /// Reserve `provider`'s slot and run `open` under it in a DETACHED task, returning the
     /// joinable outcome. This is the ONLY way to obtain a guard for a real open.
     ///
@@ -376,9 +400,11 @@ impl InFlightOpenGuard {
     /// `let _ = guard;`, which drops the guard on the task's first line and releases the
     /// slot with an `openChannel` still in the mempool. That is the stranded-deposit bug
     /// this guard exists to prevent, it is a change a reader would wave through, and no
-    /// compiler diagnostic stands between the two. Here it is written once, under test,
-    /// and a caller cannot express the wrong thing: no other constructor is reachable, and
-    /// the guard never exists outside the task.
+    /// compiler diagnostic stands between the two. Here it is written once, under test, and a
+    /// caller cannot express the wrong thing: this is the only way to obtain a guard for a real
+    /// OPEN, and the guard never exists outside the task. (The non-opening reconcile scan takes
+    /// a guard via [`Self::claim`], but only through [`Self::under_claim`], which likewise never
+    /// binds it at a call site — see there.)
     ///
     /// `in_flight` is the CALLER'S LOCKED map, and taking it is what makes the reservation
     /// real (#1145 review). This function's doc has always said it "reserves the slot" — but
@@ -939,8 +965,23 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                 );
                 Ok(())
             }
-            AdvanceOutcome::Regressed(err) => Err(anyhow::Error::new(err))
-                .with_context(|| format!("advance progress for provider {provider_addr}")),
+            // A CONCURRENT pull on this shared channel ledger already persisted a higher
+            // watermark, and the store is monotonic, so it kept the correct (higher) value and
+            // rejected ours. No voucher is lost — this is the routine outcome of two concurrent
+            // settles racing under `BuyerLedgers`, not a persist failure (#1145 review).
+            // Returning `Err` here fired `node_pull_progress_persist_failure` — the "we paid and
+            // lost the record" alert — on ordinary, healthy concurrency. Metered as benign and
+            // treated as `Ok`; a real store-write failure is still the `?` above.
+            AdvanceOutcome::Regressed(_err) => {
+                self.metrics.node_pull_progress_superseded();
+                debug!(
+                    provider = %provider_addr,
+                    %channel_id,
+                    "record_progress: a concurrent settle persisted a higher watermark first; \
+                     ours superseded (benign under the shared ledger)"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -1074,6 +1115,19 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
     ///
     /// On store write failure.
     fn retire_channel(&self, provider_addr: Address, channel_id: ChannelId) -> Result<bool>;
+
+    /// The on-chain expiry (Unix seconds) of `provider_addr`'s currently-tracked channel,
+    /// or `None` if none is tracked or the implementation does not model expiry.
+    ///
+    /// Bounds wedged-provider suppression to the channel's real lifetime (#1145 review): a
+    /// channel that rejected our voucher on a terminal reason is unusable until it expires and
+    /// the reclaim sweep frees the provider for a fresh open, so that expiry is the horizon
+    /// past which the provider becomes worth ranking again. Defaults to `None` (no expiry
+    /// modelled) so an implementation that does not track channels need not override it — a
+    /// `None` horizon simply falls back to the per-`(peer, hash)` suppression.
+    fn channel_expiry(&self, _provider_addr: Address) -> Option<u64> {
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -1107,6 +1161,17 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
 
     fn retire_channel(&self, provider_addr: Address, channel_id: ChannelId) -> Result<bool> {
         BuyerChannelService::retire_channel(self, provider_addr, channel_id)
+    }
+
+    fn channel_expiry(&self, provider_addr: Address) -> Option<u64> {
+        // The wedged channel's row is KEPT (only it can reclaim the deposit), so its expiry is
+        // readable straight from the store. An unreadable/absent row yields `None`, which falls
+        // back to per-(peer, hash) suppression rather than guessing a horizon.
+        self.store
+            .get_by_provider(provider_addr)
+            .ok()
+            .flatten()
+            .map(|state| state.expires_at)
     }
 }
 
@@ -2351,8 +2416,103 @@ async fn reconcile_one_opened<P: Provider + Clone>(
     // could overwrite (orphan) a channel a live open just escrowed and recorded.
     // Claiming the same per-provider slot the live path uses makes the read +
     // record below atomic with respect to opens: a live open in flight → we skip
-    // (it persists the real channel); otherwise the slot is ours until drop.
-    let Some(_open_guard) = InFlightOpenGuard::claim(opens_in_flight, ch.provider)? else {
+    // (it persists the real channel); otherwise the slot is ours until the body
+    // returns. Held via `under_claim` so the guard is never bound here and cannot
+    // be dropped early — see its docs.
+    let rehydrated = InFlightOpenGuard::under_claim(opens_in_flight, ch.provider, || {
+        // Read the local row UNDER the slot so the decision + record are atomic wrt
+        // live opens. Distinguish an *unreadable* row (corrupt bytes / a future
+        // schema after a downgrade) — whose channel_id is unrecoverable from disk, so
+        // re-hydrating from chain is the repair — from a *backend/IO fault*, where the
+        // row may be perfectly healthy and overwriting it would clobber a live
+        // channel. Repair the former (treat as "no row"); skip the latter.
+        // Match every `StoreError` variant explicitly (no catch-all) so adding a
+        // future variant is a compile error that forces a repair-vs-skip decision
+        // here, rather than silently defaulting to "skip" (which would strand an
+        // orphan whose row became unreadable in a new way).
+        let existing = match store.get_by_provider(ch.provider) {
+            Ok(row) => row,
+            // Unreadable row — corrupt bytes, a future on-disk schema after a
+            // downgrade, or a decode failure. Its channel_id is unrecoverable from
+            // disk, so re-hydrating from chain is the repair: treat as "no row".
+            Err(
+                err @ (StoreError::Corrupt { .. }
+                | StoreError::UnsupportedSchema { .. }
+                | StoreError::Codec(_)),
+            ) => {
+                warn!(
+                    provider = %ch.provider,
+                    channel_id = %event.channelId,
+                    %err,
+                    "buyer reconcile: local row unreadable (corrupt/downgraded); re-hydrating from chain"
+                );
+                None
+            }
+            // Backend/IO/permission fault — the row may be perfectly healthy and
+            // overwriting it would clobber a live channel. Skip; a later boot retries.
+            // `AlreadyOpen` (another process holds the store lock) can't arise from
+            // this read — the store is already open by this process — but it is the
+            // same "store unavailable, don't decide" case, so skip it too.
+            Err(
+                err @ (StoreError::Backend(_)
+                | StoreError::Io(_)
+                | StoreError::PermissionTighten { .. }
+                | StoreError::AlreadyOpen { .. }),
+            ) => {
+                warn!(
+                    provider = %ch.provider,
+                    channel_id = %event.channelId,
+                    %err,
+                    "buyer reconcile: store read failed (backend/IO); skipping to avoid clobbering a possibly-healthy row"
+                );
+                return Ok(false);
+            }
+        };
+        let view = OnChainOpen {
+            channel_id: event.channelId,
+            client: ch.client,
+            provider: ch.provider,
+            token: ch.token,
+            // `Channel.expiresAt` is `uint64` in the binding — no clamp needed.
+            expires_at: ch.expiresAt,
+            deposit: ch.deposit,
+            claimed_nonce: ch.claimedNonce,
+            claimed_bytes: ch.claimedBytes,
+            claimed_amount: ch.claimedAmount,
+            is_open: matches!(ch.status, PaymentChannel::Status::Open),
+        };
+        let state = match reconcile_decision(&view, self_address, existing.as_ref()) {
+            ReconcileOutcome::Rehydrate(state) => state,
+            // The one orphan the scan deliberately cannot auto-recover (a second
+            // still-open channel for a provider a live row already covers); log it so
+            // the deferred deposit is observable rather than silently skipped.
+            ReconcileOutcome::DeferredSecondOpen => {
+                warn!(
+                    provider = %view.provider,
+                    orphan_channel_id = %view.channel_id,
+                    deposit = %view.deposit,
+                    "buyer reconcile: a second still-open channel for this provider is already covered by a \
+                     live row; its deposit is deferred to a later boot once the live row clears"
+                );
+                return Ok(false);
+            }
+            ReconcileOutcome::Skip => return Ok(false),
+        };
+        store
+            .record(&state)
+            .context("persist re-hydrated buyer channel")?;
+        info!(
+            provider = %state.provider,
+            channel_id = %state.channel_id,
+            deposit = %state.deposit,
+            expires_at = state.expires_at,
+            "buyer reconcile: re-hydrated orphaned channel; reclaim sweep will recover the deposit"
+        );
+        Ok(true)
+    })?;
+    let Some(did_rehydrate) = rehydrated else {
+        // `under_claim` returned `None`: a real open holds the slot, so it will persist the
+        // authoritative channel — the reconciler steps past.
         debug!(
             provider = %ch.provider,
             channel_id = %event.channelId,
@@ -2360,96 +2520,7 @@ async fn reconcile_one_opened<P: Provider + Clone>(
         );
         return Ok(false);
     };
-
-    // Read the local row UNDER the slot so the decision + record are atomic wrt
-    // live opens. Distinguish an *unreadable* row (corrupt bytes / a future
-    // schema after a downgrade) — whose channel_id is unrecoverable from disk, so
-    // re-hydrating from chain is the repair — from a *backend/IO fault*, where the
-    // row may be perfectly healthy and overwriting it would clobber a live
-    // channel. Repair the former (treat as "no row"); skip the latter.
-    // Match every `StoreError` variant explicitly (no catch-all) so adding a
-    // future variant is a compile error that forces a repair-vs-skip decision
-    // here, rather than silently defaulting to "skip" (which would strand an
-    // orphan whose row became unreadable in a new way).
-    let existing = match store.get_by_provider(ch.provider) {
-        Ok(row) => row,
-        // Unreadable row — corrupt bytes, a future on-disk schema after a
-        // downgrade, or a decode failure. Its channel_id is unrecoverable from
-        // disk, so re-hydrating from chain is the repair: treat as "no row".
-        Err(
-            err @ (StoreError::Corrupt { .. }
-            | StoreError::UnsupportedSchema { .. }
-            | StoreError::Codec(_)),
-        ) => {
-            warn!(
-                provider = %ch.provider,
-                channel_id = %event.channelId,
-                %err,
-                "buyer reconcile: local row unreadable (corrupt/downgraded); re-hydrating from chain"
-            );
-            None
-        }
-        // Backend/IO/permission fault — the row may be perfectly healthy and
-        // overwriting it would clobber a live channel. Skip; a later boot retries.
-        // `AlreadyOpen` (another process holds the store lock) can't arise from
-        // this read — the store is already open by this process — but it is the
-        // same "store unavailable, don't decide" case, so skip it too.
-        Err(
-            err @ (StoreError::Backend(_)
-            | StoreError::Io(_)
-            | StoreError::PermissionTighten { .. }
-            | StoreError::AlreadyOpen { .. }),
-        ) => {
-            warn!(
-                provider = %ch.provider,
-                channel_id = %event.channelId,
-                %err,
-                "buyer reconcile: store read failed (backend/IO); skipping to avoid clobbering a possibly-healthy row"
-            );
-            return Ok(false);
-        }
-    };
-    let view = OnChainOpen {
-        channel_id: event.channelId,
-        client: ch.client,
-        provider: ch.provider,
-        token: ch.token,
-        // `Channel.expiresAt` is `uint64` in the binding — no clamp needed.
-        expires_at: ch.expiresAt,
-        deposit: ch.deposit,
-        claimed_nonce: ch.claimedNonce,
-        claimed_bytes: ch.claimedBytes,
-        claimed_amount: ch.claimedAmount,
-        is_open: matches!(ch.status, PaymentChannel::Status::Open),
-    };
-    let state = match reconcile_decision(&view, self_address, existing.as_ref()) {
-        ReconcileOutcome::Rehydrate(state) => state,
-        // The one orphan the scan deliberately cannot auto-recover (a second
-        // still-open channel for a provider a live row already covers); log it so
-        // the deferred deposit is observable rather than silently skipped.
-        ReconcileOutcome::DeferredSecondOpen => {
-            warn!(
-                provider = %view.provider,
-                orphan_channel_id = %view.channel_id,
-                deposit = %view.deposit,
-                "buyer reconcile: a second still-open channel for this provider is already covered by a \
-                 live row; its deposit is deferred to a later boot once the live row clears"
-            );
-            return Ok(false);
-        }
-        ReconcileOutcome::Skip => return Ok(false),
-    };
-    store
-        .record(&state)
-        .context("persist re-hydrated buyer channel")?;
-    info!(
-        provider = %state.provider,
-        channel_id = %state.channel_id,
-        deposit = %state.deposit,
-        expires_at = state.expires_at,
-        "buyer reconcile: re-hydrated orphaned channel; reclaim sweep will recover the deposit"
-    );
-    Ok(true)
+    Ok(did_rehydrate)
 }
 
 /// One-shot bootstrap reconciliation scan (#763): enumerate
@@ -2843,6 +2914,109 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty(),
             "dropping the guard releases the slot",
+        );
+    }
+
+    /// `under_claim` is the reconcile scan's ONLY safe path to a claim (#1145 review): the
+    /// guard is never bound at a call site, so it holds the slot for exactly the body's
+    /// lifetime — a concurrent claim during the body is refused — and releases it on return.
+    /// `Ok(None)` when a real open already holds the slot.
+    #[test]
+    fn under_claim_holds_the_slot_for_the_body_then_releases() {
+        let map: Arc<Mutex<HashMap<Address, SharedOpen>>> = Arc::new(Mutex::new(HashMap::new()));
+        let provider = sample(9).provider;
+
+        // While the body runs, a concurrent claim for the same provider is refused.
+        let held_during_body = InFlightOpenGuard::under_claim(&map, provider, || {
+            Ok(InFlightOpenGuard::claim(&map, provider)
+                .ok()
+                .flatten()
+                .is_none())
+        })
+        .unwrap_or(None);
+        assert_eq!(
+            held_during_body,
+            Some(true),
+            "the slot must be held for the whole body"
+        );
+
+        // The slot is released once the body returns.
+        let after = InFlightOpenGuard::claim(&map, provider).ok().flatten();
+        assert!(after.is_some(), "the slot is free once the body returns");
+        drop(after);
+
+        // A real open already in flight → `under_claim` skips the body and returns `None`.
+        let _live = InFlightOpenGuard::claim(&map, provider).ok().flatten();
+        let mut body_ran = false;
+        let skipped = InFlightOpenGuard::under_claim(&map, provider, || {
+            body_ran = true;
+            Ok(())
+        })
+        .unwrap_or(Some(()));
+        assert!(skipped.is_none(), "a live open makes under_claim skip");
+        assert!(!body_ran, "the body must not run when the slot is taken");
+    }
+
+    /// A watermark write REGRESSED by a concurrent settle on the shared ledger is benign — the
+    /// monotonic store kept the higher (correct) value — so it must NOT fire the "we paid and
+    /// lost the record" persist-failure alert (#1145 review). It meters `superseded` and
+    /// returns `Ok`. Fail-on-revert: restore the `Err` arm and this write reports a persist
+    /// failure on ordinary, healthy concurrency.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn a_superseded_watermark_is_benign_not_a_persist_failure() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x5a);
+        let channel_id = B256::repeat_byte(0x5a);
+        let token = Address::repeat_byte(0x11);
+
+        // Seed the channel and advance it to a HIGH watermark, as a concurrent winning pull would.
+        service
+            .store
+            .record(&decdn_incentive::BuyerChannelState::new(
+                channel_id,
+                provider,
+                token,
+                U256::from(1_000u64),
+                0,
+            ))
+            .expect("seed channel");
+        let seeded = service
+            .store
+            .advance_progress(
+                provider,
+                channel_id,
+                U256::from(10u64),
+                U256::from(1_000u64),
+                U256::from(100u64),
+            )
+            .expect("advance to high watermark");
+        assert!(
+            matches!(seeded, AdvanceOutcome::Advanced),
+            "seed must advance"
+        );
+
+        // A LOWER write (the losing concurrent settle) regresses against the stored watermark.
+        let result = service.record_progress(
+            provider,
+            channel_id,
+            U256::from(5u64),
+            U256::from(500u64),
+            U256::from(50u64),
+        );
+        assert!(
+            result.is_ok(),
+            "a superseded write is benign, not an error: {result:?}"
+        );
+        let encoded = service.metrics.encode().expect("metrics encode");
+        assert!(
+            encoded.contains("decdn_node_pull_progress_superseded_total 1"),
+            "a superseded write must be metered as benign. Got:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("decdn_node_pull_progress_persist_failures_total 0"),
+            "a superseded write must NOT fire the persist-failure alert. Got:\n{encoded}"
         );
     }
 

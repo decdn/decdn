@@ -8,6 +8,8 @@ use alloy::primitives::U256;
 use decdn_protocol::MB_BYTES;
 use tokio::sync::Mutex;
 
+use crate::UpstreamVoucherRejected;
+
 /// A channel's cumulative voucher state: the absolute totals carried by the most
 /// recent voucher. All three advance monotonically over the channel's lifetime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,18 +68,22 @@ pub struct ChannelLedger {
     ///
     /// `committed` alone is not enough, because the losing window is not the one it
     /// closes. The upstream persists a voucher and only THEN writes `VoucherAck`
-    /// (ADR 003; `handlers::client` acks after `apply_voucher`). So a pull dropped
-    /// *inside* the ack wait — the longest await in the streaming loop, and exactly
-    /// where a slow peer trips the caller's deadline — leaves the upstream holding
-    /// nonce N while `committed` still says N-1. The next reuse re-signs N, the
-    /// upstream rejects `StaleNonce`, and the channel is wedged (the desync noted in
-    /// `self_pay` and tracked in #1122 — which `retire_dead_channel` has since turned
-    /// from a lag into a stranded deposit, so it can no longer be left standing).
+    /// (ADR 003; `handlers::client` acks after `apply_voucher`). So a pull that loses
+    /// this voucher *inside* the ack wait — the longest await in the streaming loop,
+    /// and exactly where a slow peer trips the caller's deadline — leaves the upstream
+    /// holding nonce N while `committed` still says N-1. Settle low and the next reuse
+    /// re-signs N, the upstream rejects `StaleNonce` (now terminal), and the channel is
+    /// wedged with its deposit escrowed until expiry (the desync noted in `self_pay`
+    /// and tracked in #1122).
     ///
-    /// Only a DROP can leave this `Some`: an `exchange` that resolves clears it,
-    /// whether it acked or was rejected. That distinction is the whole point — a
-    /// REJECTED voucher was never committed upstream, and settling at it would
-    /// inflate our cumulative for bytes the upstream refused to be paid for.
+    /// A voucher is left armed here whenever its fate is UNKNOWN — not only a DROP.
+    /// `issue` clears it on the two outcomes that resolve the fate: an `Ok` ack (the
+    /// upstream took it; `committed` carries it) and a typed [`UpstreamVoucherRejected`]
+    /// (the upstream explicitly declined it, so it was never persisted). EVERY other
+    /// resolved error — a stall timeout, a transport reset, a protocol violation — is
+    /// as ambiguous as a drop: the upstream may already hold the voucher, so the slot
+    /// stays armed and [`Self::settlement`] returns it. Clearing it on those errors is
+    /// exactly the settle-low bug above (#1145 review).
     in_flight: std::sync::Mutex<Option<Cumulative>>,
 }
 
@@ -129,9 +135,11 @@ impl ChannelLedger {
     ///   nonce GAP (it meters `voucher_nonce_gap` and accepts); it does not tolerate a
     ///   regression. The two errors are not symmetric, so we take the survivable one.
     ///
-    /// A voucher the upstream REJECTED is never in flight here — `issue` clears it on
-    /// the error path too — so this cannot inflate our cumulative for bytes the
-    /// upstream declined to be paid for.
+    /// A voucher the upstream explicitly REJECTED is never in flight here — `issue`
+    /// clears it on a typed [`UpstreamVoucherRejected`] — so this cannot inflate our
+    /// cumulative for bytes the upstream declined to be paid for. An ambiguous failure
+    /// (a stall, a reset) is the opposite: it stays armed, because the upstream may
+    /// hold it and settling low would strand the deposit.
     #[must_use]
     pub fn settlement(&self) -> Cumulative {
         let committed = self.committed();
@@ -150,10 +158,11 @@ impl ChannelLedger {
     /// Issue one voucher for `delta_bytes` newly delivered since the last voucher.
     ///
     /// Holds the channel lock across `exchange`, which performs the actual I/O
-    /// (write the signed voucher, await the node's ack). The next cumulative is
-    /// computed from the live watermark *before* the I/O and committed *only* if
-    /// `exchange` succeeds — a rejected or lost ack leaves the watermark unmoved.
-    /// Returns the committed cumulative.
+    /// (write the signed voucher, await the node's ack). The committed watermark
+    /// advances *only* on a successful ack; a rejection or an ambiguous failure leaves
+    /// it unmoved. But an ambiguous failure (unlike an explicit rejection) leaves the
+    /// voucher ARMED, so [`Self::settlement`] still reports it — see the `in_flight`
+    /// field docs. Returns the committed cumulative.
     ///
     /// `exchange` receives the next [`Cumulative`] (the values the caller must
     /// sign and send); the caller owns signing + framing so this module stays
@@ -169,17 +178,31 @@ impl ChannelLedger {
         Fut: Future<Output = anyhow::Result<()>>,
     {
         let mut guard = self.cumulative.lock().await;
-        let next = next_voucher(&guard, delta_bytes, rate_per_mb);
+        // Build on the SETTLEMENT watermark, not the committed one. If a prior concurrent
+        // pull on this shared ledger left a voucher armed (an ambiguous failure it settled
+        // high), the next voucher must exceed THAT nonce, or we re-sign one the upstream may
+        // already hold and collide on `StaleNonce`. A nonce GAP is survivable upstream (it
+        // meters `voucher_nonce_gap` and accepts); a regression is not — see `settlement`.
+        let next = next_voucher(&self.settlement(), delta_bytes, rate_per_mb);
         // Arm the in-flight slot BEFORE the voucher goes out, so that if this future is
         // dropped inside `exchange` — after the upstream committed, before we read its
         // ack — `settlement()` still knows what we owe. See the field's docs.
         self.set_in_flight(Some(next));
         let outcome = exchange(next).await;
-        // Disarm on BOTH outcomes. A resolved exchange has a known fate: an ack means
-        // `committed` is about to carry it, a rejection means the upstream never took it.
-        // Only a DROP skips this line, which is precisely the case `settlement()` exists
-        // for — so this must not be a `?` above it.
-        self.set_in_flight(None);
+        // Disarm ONLY when the voucher's fate is known: an `Ok` ack (`committed` is about to
+        // carry it) or a typed `UpstreamVoucherRejected` (the upstream declared it never took
+        // it). Every OTHER resolved error — a stall timeout, a transport reset, a protocol
+        // violation — is as ambiguous as a drop (the upstream persists before it acks, ADR
+        // 003), so the slot stays armed and `settlement()` settles high. Clearing it here was
+        // the settle-low bug (#1145 review): a stalled ack looked exactly like a drop but took
+        // this line and stranded the deposit.
+        let fate_known = match &outcome {
+            Ok(()) => true,
+            Err(err) => err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
+        };
+        if fate_known {
+            self.set_in_flight(None);
+        }
         outcome?;
         *guard = next;
         // Mirror the commit while still holding the issuance lock, so a reader that
@@ -207,6 +230,8 @@ impl ChannelLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PullStalled;
+    use decdn_protocol::client::VoucherRejectReason;
     use std::time::Duration;
 
     #[tokio::test]
@@ -258,8 +283,8 @@ mod tests {
     /// The window this exists to close (#1122): the upstream persists a voucher and only
     /// THEN acks it (ADR 003), so a pull dropped inside the ack wait leaves the upstream
     /// holding a voucher we have no record of. Settle low and the next reuse re-signs a
-    /// spent nonce, the upstream rejects `StaleNonce`, and — since `retire_dead_channel`
-    /// — the channel row is deleted and its deposit stranded.
+    /// spent nonce, the upstream rejects `StaleNonce` (a terminal verdict), and the channel
+    /// is wedged with its deposit escrowed until expiry.
     ///
     /// `tokio::time::timeout` is the mechanism, not a stand-in for one: it drops the
     /// inner future on elapse, which is exactly what `outer_pull_deadline`, the warm's
@@ -293,21 +318,96 @@ mod tests {
     }
 
     /// The other half, and the reason `settlement` cannot simply be "always the highest
-    /// voucher we built": a REJECTED voucher was never committed upstream, so settling at
-    /// it would inflate our cumulative for bytes the upstream refused to be paid for.
-    /// Only an UNRESOLVED exchange may be settled optimistically.
+    /// voucher we built": an EXPLICITLY REJECTED voucher was never committed upstream, so
+    /// settling at it would inflate our cumulative for bytes the upstream refused to be paid
+    /// for. Only the rejection is known-uncommitted — so the discriminator is the TYPED
+    /// `UpstreamVoucherRejected`, not any error (an ambiguous stall settles high; see below).
     #[tokio::test]
     async fn a_rejected_voucher_is_not_settled_optimistically() {
         let ledger = ChannelLedger::new(Cumulative::default());
         let result = ledger
-            .issue(100, 10, |_next| async { anyhow::bail!("voucher rejected") })
+            .issue(100, 10, |_next| async {
+                Err(anyhow::Error::new(UpstreamVoucherRejected {
+                    reason: VoucherRejectReason::StaleNonce,
+                }))
+            })
             .await;
         assert!(result.is_err());
         assert_eq!(
             ledger.settlement(),
             Cumulative::default(),
-            "a rejected voucher must not advance what we persist"
+            "an explicitly rejected voucher must not advance what we persist"
         );
+    }
+
+    /// The load-bearing case (#1145 review): an AMBIGUOUS ack failure — a stall timeout, a
+    /// transport reset — is not a rejection. The upstream persists before it acks (ADR 003),
+    /// so it may already hold the voucher; settling low here re-signs a spent nonce on the
+    /// next reuse and wedges the channel. So an ambiguous failure must settle HIGH, exactly
+    /// as a drop does. A `PullStalled` is the production trigger: `self_pay` wraps the ack
+    /// read in `tokio::time::timeout(stall, …)`, which RESOLVES the exchange as
+    /// `Err(PullStalled)` rather than dropping it.
+    ///
+    /// This is the test that fails on revert: restore the unconditional `set_in_flight(None)`
+    /// and the settlement drops back to `default`.
+    #[tokio::test]
+    async fn an_ambiguous_ack_failure_settles_high() {
+        for make_err in [
+            || {
+                anyhow::Error::new(PullStalled {
+                    after: Duration::from_secs(1),
+                })
+            },
+            || anyhow::anyhow!("connection reset by peer"),
+        ] {
+            let ledger = ChannelLedger::new(Cumulative::default());
+            let result = ledger
+                .issue(100, 10, move |_next| async move { Err(make_err()) })
+                .await;
+            assert!(
+                result.is_err(),
+                "the ambiguous exchange must surface its error"
+            );
+            // `committed` is untouched — nothing was acked.
+            assert_eq!(ledger.committed(), Cumulative::default());
+            // But settlement is the voucher we sent: the upstream may hold it.
+            let settled = ledger.settlement();
+            assert_eq!(settled.nonce, U256::from(1u64), "settle at the sent nonce");
+            assert_eq!(settled.bytes, U256::from(100u64));
+        }
+    }
+
+    /// The shared-ledger corollary: after an ambiguous failure arms nonce N, the NEXT issue
+    /// on the same ledger must sign N+1, not re-sign N (which the upstream may already hold).
+    /// `issue` computes the next voucher from `settlement()`, so the armed voucher advances
+    /// the basis. Reverting that to `next_voucher(&guard, …)` re-signs N here.
+    #[tokio::test]
+    async fn a_later_issue_builds_on_an_armed_voucher() -> anyhow::Result<()> {
+        let ledger = ChannelLedger::new(Cumulative::default());
+        // First pull stalls: arms nonce 1, settles high.
+        let stalled = ledger
+            .issue(100, 10, |_next| async {
+                Err(anyhow::Error::new(PullStalled {
+                    after: Duration::from_secs(1),
+                }))
+            })
+            .await;
+        assert!(stalled.is_err());
+        // Second pull on the same shared ledger must not re-sign nonce 1.
+        let mut signed_nonce = None;
+        let committed = ledger
+            .issue(100, 10, |next: Cumulative| {
+                signed_nonce = Some(next.nonce);
+                async { Ok(()) }
+            })
+            .await?;
+        assert_eq!(
+            signed_nonce,
+            Some(U256::from(2u64)),
+            "the next voucher must build on the armed nonce, not collide with it"
+        );
+        assert_eq!(committed.nonce, U256::from(2u64));
+        Ok(())
     }
 
     /// A drop AFTER the ack settles at the acked voucher and no higher — the in-flight

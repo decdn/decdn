@@ -1705,6 +1705,12 @@ pub async fn run(
                     // which is the point: a per-pull ledger makes concurrent pulls collide
                     // on `prior_nonce + 1`. See `buyer_ledgers::BuyerLedgers`.
                     ledgers: Arc::new(crate::buyer_ledgers::BuyerLedgers::default()),
+                    // Providers whose channel wedged on a terminal voucher rejection, skipped
+                    // in ranking until the channel expires (#1145 review). In-memory, like the
+                    // negative cache beside it.
+                    wedged_providers: Arc::new(std::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    )),
                     // Feed the prefetch ledger when prefetch is enabled (#820);
                     // the observer records only prefetch-initiated pulls.
                     acquisition_observer: node_origin_prefetch_enabled.then(|| {
