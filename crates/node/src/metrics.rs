@@ -636,6 +636,14 @@ pub struct DecdnMetrics {
     ///
     /// [`Outcome::Unreachable`]: decdn_reputation::Outcome::Unreachable
     pub node_pull_unreachable: Counter,
+    /// `decdn_node_region_latency_penalty_total` (#1177): a probed peer
+    /// self-attested this node's own region yet answered slower than the ADR 030
+    /// latency ceiling, so it was penalized in local reputation
+    /// ([`Outcome::RegionLatencyMismatch`]). A sustained rate points at
+    /// region-spoofing peers (or a genuinely mis-set local `identity.region`).
+    ///
+    /// [`Outcome::RegionLatencyMismatch`]: decdn_reputation::Outcome::RegionLatencyMismatch
+    pub node_region_latency_penalty: Counter,
     /// `decdn_node_pull_channel_open_failures_total` (#831): a buyer
     /// `open_or_reuse_channel` failed before a pull could start. This is the
     /// node's own payment-side fault (gas, RPC, expired channel), NOT the
@@ -1706,6 +1714,12 @@ impl Metrics {
     /// A probe or pull to a candidate failed at the transport (#831).
     pub fn node_pull_unreachable(&self) {
         self.decdn.node_pull_unreachable.inc();
+    }
+
+    /// A probed peer claimed this node's own region but exceeded the ADR 030
+    /// latency ceiling, so it took the local reputation penalty (#1177).
+    pub fn node_region_latency_penalty(&self) {
+        self.decdn.node_region_latency_penalty.inc();
     }
 
     /// A buyer channel open/reuse failed before a pull could start (#831).

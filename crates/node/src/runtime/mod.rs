@@ -1528,9 +1528,15 @@ pub async fn run(
     // are cheap and the admin API may read the local score), but the publisher
     // that drains the buffer is only spawned when pull-through is enabled — see
     // `report_drain` below.
+    // Opt into ADR 008 §8's ±0.05 per-report clamp (the library default is a
+    // no-op cap per §14a) so one bad interaction cannot over-penalize an
+    // otherwise good peer (#1176).
     let local_reputation = Arc::new(
-        decdn_reputation::LocalReputation::new(decdn_reputation::LocalReputationConfig::default())
-            .context("local reputation config invalid")?,
+        decdn_reputation::LocalReputation::new(
+            decdn_reputation::LocalReputationConfig::default()
+                .with_max_delta_per_update(decdn_reputation::LOCAL_SCORE_MAX_DELTA_PER_REPORT),
+        )
+        .context("local reputation config invalid")?,
     );
     let observation_buffer = Arc::new(decdn_reputation::ObservationBuffer::new());
     let reputation_wiring = decdn_gossip::ReputationWiring {
@@ -1597,6 +1603,9 @@ pub async fn run(
         enable_0rtt: cfg.network.enable_0rtt,
         deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
         lookup: crate::dht::LookupConfig::default(),
+        // Own self-attested region for the ADR 030 latency-vs-claim penalty
+        // (#1177); `None` disables it (nothing to compare a peer's claim against).
+        own_region: cfg.identity.region.clone(),
     };
     let node_origin_prefetch_enabled = cfg.prefetch.enabled;
     let node_origin_reputation_cfg = reputation_cfg.clone();

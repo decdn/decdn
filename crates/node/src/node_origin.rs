@@ -197,6 +197,31 @@ pub struct NodeOriginConfig {
     pub deposit_hint: U256,
     /// DHT lookup tuning.
     pub lookup: LookupConfig,
+    /// This node's self-attested region (`identity.region`), or `None` when
+    /// unset. Used to apply the ADR 030 latency-vs-claim penalty: a probed peer
+    /// that claims *this* region yet answers slower than the latency ceiling
+    /// (`REGION_LATENCY_MAX_MS`) is a region-spoofing signal. `None` disables the
+    /// penalty (nothing to compare against).
+    pub own_region: Option<String>,
+}
+
+/// ADR 030 default heuristic (RTT > 150ms to a same-claimed-region node). The
+/// value compared against it is `probe_once`'s observed probe latency, which on
+/// the cold path also spans QUIC connection setup — not a bare network round
+/// trip — so 150ms is a deliberately generous ceiling that a truly in-region
+/// peer clears even with a full handshake. The threshold is a documented
+/// constant, deliberately not yet a governance knob per ADR 030 (which defers
+/// threshold/sample/decay tuning to a later ADR 008 revision).
+const REGION_LATENCY_MAX_MS: u32 = 150;
+
+/// Whether the ADR 030 latency-vs-claim penalty applies to a probed peer.
+///
+/// It fires only when the peer self-attests the observer's *own* region
+/// (`own_region`) yet the observed probe latency exceeds [`REGION_LATENCY_MAX_MS`]
+/// — the canonical region-spoofing signal. An unset own region (`None`) or an
+/// unknown peer region (empty) disables it: there is nothing to contradict.
+fn region_latency_penalty_applies(own_region: Option<&str>, claimed: &str, rtt_ms: u32) -> bool {
+    !claimed.is_empty() && own_region == Some(claimed) && rtt_ms > REGION_LATENCY_MAX_MS
 }
 
 impl NodeOriginConfig {
@@ -926,15 +951,43 @@ async fn probe_candidate(
             .record_failure(peer, DhtHash::from_bytes(hash_bytes));
         return None;
     }
+    let rtt = ms_to_u32(rtt_ms);
+    // Peer's self-attested region from its NodeAnnounce (ADR 030); empty when the
+    // peer is not in the gossip peer table.
+    let region = deps
+        .region_accountant
+        .region_of(peer.as_bytes())
+        .await
+        .unwrap_or_default();
+    // ADR 030 canonical latency-vs-claim penalty: a peer that self-attests THIS
+    // node's own region yet answers slower than the latency ceiling is spoofing
+    // its region. A local-only signal — folded straight into the local EWMA, never
+    // the outbound observation buffer / gossip — so it self-corrects as fast as we
+    // probe and needs no new protocol surface.
+    if region_latency_penalty_applies(deps.config.own_region.as_deref(), &region, rtt) {
+        // Log with the disambiguating context (the metric alone cannot tell a
+        // spoofer from a mis-set local `identity.region`): peer, both regions,
+        // and the observed latency vs ceiling.
+        debug!(
+            %pk,
+            own_region = deps.config.own_region.as_deref().unwrap_or(""),
+            claimed_region = %region,
+            rtt_ms = rtt,
+            ceiling_ms = REGION_LATENCY_MAX_MS,
+            "node-origin: same-region claim contradicted by probe latency; \
+             applying ADR 030 latency penalty"
+        );
+        deps.metrics.node_region_latency_penalty();
+        deps.local_rep.record(pk, Outcome::RegionLatencyMismatch);
+    }
     Some(Candidate {
         node_id: *peer.as_bytes(),
         rate_per_mb: resp.body.rate_per_mb,
-        rtt_ms: ms_to_u32(rtt_ms),
+        rtt_ms: rtt,
         reputation: combined_reputation(deps, pk, now_secs),
-        // Region drives only the geo-diversity tie-break tier; left empty here
-        // (we do not consult the peer table on this path). A follow-up can
-        // populate it from the NodeAnnounce region.
-        region: String::new(),
+        // Drives the geo-diversity tie-break tier (selection.rs) and the
+        // latency-vs-claim penalty above.
+        region,
         stake: None,
     })
 }
@@ -1913,6 +1966,14 @@ fn record_outcome(deps: &NodeOriginDeps, pk: PublicKey, outcome: &Outcome) {
                 data_correct: None,
             }
         }
+        // Local-only signal (ADR 030 region penalty): the local EWMA was already
+        // updated above; it must NOT reach the observation buffer / gossip. Return
+        // before `observe` rather than emitting a no-signal report — which would
+        // also clobber this peer's pending Delivered/Corruption/Unreachable report
+        // for the tick, since `ObservationBuffer` coalesces by overwrite. This
+        // keeps the `Outcome::RegionLatencyMismatch` "never gossiped" invariant
+        // true structurally, not just by the probe path's call-site choice.
+        Outcome::RegionLatencyMismatch => return,
         // `Outcome` is `#[non_exhaustive]`: a future variant defaults to an
         // all-`None` (no-signal) report rather than mis-attributing one of the
         // three known shapes. Add an explicit arm when such a variant lands.
@@ -1968,6 +2029,28 @@ fn now_micros() -> u64 {
 mod tests {
     use super::*;
     use decdn_protocol::VoucherRejectReason;
+
+    #[test]
+    fn region_penalty_only_for_same_region_slow_peer() {
+        // Same region, slow → penalized.
+        assert!(region_latency_penalty_applies(
+            Some("DE"),
+            "DE",
+            REGION_LATENCY_MAX_MS + 1
+        ));
+        // Same region but at/under the ceiling → not penalized (boundary is >).
+        assert!(!region_latency_penalty_applies(
+            Some("DE"),
+            "DE",
+            REGION_LATENCY_MAX_MS
+        ));
+        // Different region, however slow → not penalized (the claim is plausible).
+        assert!(!region_latency_penalty_applies(Some("DE"), "US", 5000));
+        // Own region unset → penalty disabled (nothing to compare against).
+        assert!(!region_latency_penalty_applies(None, "DE", 5000));
+        // Peer region unknown (not in the peer table) → no claim to contradict.
+        assert!(!region_latency_penalty_applies(Some("DE"), "", 5000));
+    }
 
     /// The failure-class `reason` (#966) the `open_channel` kernel attaches to
     /// the `anyhow` error chain must survive the additional `.context(...)`
