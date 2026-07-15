@@ -46,13 +46,14 @@ Startup sequence from first launch to ready state:
 3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
      starting at offset 0, incrementing until a page returns fewer than 100
      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
-4. If the registry query yields no usable peers:
+4. If the registry cannot be reached (all retries exhausted):
      On cached peers present: fall back to ~/.decdn/peers.json
      On no cache: exit with error —
        "Cannot reach bootstrap sources. Check network connectivity
         and RPC endpoint configuration."
 5. Connect to iroh relay (for NAT traversal)
-6. Build peer table from the registry results
+6. Build peer table from the resolved bootstrap peers
+     (registry results, or the cached peers.json on fallback)
 7. Persist peer list to ~/.decdn/peers.json
 8. Begin periodic registry refresh (every 10 minutes)
 ```
@@ -191,7 +192,7 @@ Splitting a large blob across multiple nodes and fetching byte ranges in paralle
 
 ## Download Resume
 
-A `decdn pull` interrupted by a crash, kill, or network drop resumes from the partial output file already on disk: the client re-hashes the bytes it has, discards any trailing unverified remainder, and continues the fetch from the last BLAKE3-verified offset via `StreamRequest{byte_offset}`. If the original payment channel is still open on-chain, the client reuses it; if it has settled, a new channel is opened sized for the remaining bytes only.
+A `decdn pull` interrupted by a crash, kill, or network drop resumes from the partial output file already on disk: the client re-hashes the bytes it has, discards any trailing unverified remainder, and continues the fetch from the last BLAKE3-verified offset via `StreamRequest{byte_offset}`. If the original payment channel is still open on-chain, the client reuses it; if it is closing or settled, a new channel is opened sized for the remaining bytes only.
 
 ## File Manifests and Reconstruction
 
