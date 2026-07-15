@@ -505,7 +505,7 @@ mod tests {
         let mut chain = empty_chain();
         chain.common.rpc_url = Some("http://x".to_string());
         let flag = FLAG_ADDR.to_string();
-        let r = resolve_appeal(&chain, Some(flag.as_str()), &FileConfig::default()).unwrap();
+        let r = resolve_appeal(&chain.common, Some(flag.as_str()), &FileConfig::default()).unwrap();
         assert_eq!(r.slash_appeal_address, FLAG_ADDR);
     }
 
@@ -514,7 +514,8 @@ mod tests {
         let mut chain = empty_chain();
         chain.common.rpc_url = Some("http://x".to_string());
         let zero = Address::ZERO.to_string();
-        let err = resolve_appeal(&chain, Some(zero.as_str()), &FileConfig::default()).unwrap_err();
+        let err =
+            resolve_appeal(&chain.common, Some(zero.as_str()), &FileConfig::default()).unwrap_err();
         assert!(
             err.to_string().contains("must not be the zero address"),
             "{err}"
