@@ -233,12 +233,6 @@ When multiple nodes have the same unified selection score (within 1% — see [AD
 2. Higher stake (more skin in the game)
 3. Random (final tiebreaker)
 
-### Cold-Start Bootstrap
-
-During the first 7 days after staking (or first 50 completed interactions, whichever comes first), new nodes receive a 10% selection bonus — scores temporarily boosted by 0.05 (additive), clamped to 1.0: `boosted_score = min(final_score + 0.05, 1.0)`. Local to each client, decays linearly over the bootstrap period.
-
-**Anti-gaming: one-time bonus per operator.** Granted only once per operator Ethereum address. Clients check `CapacityBond.firstBondedAt(operator)` against the chain's latest block timestamp. If `firstBondedAt > 0` and the first registration is older than 7 days, no bonus is applied, regardless of the current `registeredAt`. The 7-day bootstrap timer derives from `firstBondedAt`, not `registeredAt`. This prevents the unstake → re-stake cycle in the threat model. `firstBondedAt` is immutable once set and survives deregistration, auto-ejection, and re-registration (see [ADR 003 § Data Structure](003-payments.md#data-structure)).
-
 ### Rate Limiting
 
 - Max 1 report per (reporter, node) pair per hour
@@ -339,7 +333,6 @@ Consumers should note the signal trusts the reporter's self-declared `node.regio
 - Distinct-counterparty discount and settlement time decay raise the cost of wash trading from a single self-dealing pair to requiring 5+ capacity bonds (each ≥ entry-tier 50K TOKEN per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) plus the per-cycle `FeeRouter` non-base skim (40% per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)) across 5+ counterparties — an order-of-magnitude increase in capital requirements
 - Local observations dominate (70%), so a node's own experience always outweighs the crowd
 - Score clamping limits the damage from individual malicious reports
-- Cold-start bootstrap gives new nodes enough traffic to build a real track record
 - Decay prevents stale high scores from persisting indefinitely
 - Regional-coverage signal (per [§ Regional-Coverage Reputation Signal](#regional-coverage-reputation-signal)) is exposed but not coupled to scoring or selection — downstream operational programs own deployment-grant decisions, keeping the reputation system narrowly focused on service-quality measurement
 
