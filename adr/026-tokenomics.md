@@ -309,7 +309,7 @@ N                          = windowEpochs                                       
 The voting set is narrow at launch (likely <50 operators in the first 6–12 months). Direct application of capacity-weighted governance pre-bootstrap risks hostile takeover via a cheap operator-fleet setup.
 
 - For the first 6–12 months, governance runs through a multisig with hard-cap pause powers (extends [ADR 009](009-governance.md#adr-009-governance-model)'s emergency-multisig pattern).
-- Transition to full operator-weighted governance is a one-shot setter the multisig executes manually when it judges the operator set broad enough (see [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase)).
+- Transition to full operator-weighted governance is triggered by the one-shot `transitionToGovernor` setter the multisig executes manually when it judges the operator set broad enough (see [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase)).
 - Before transition, the multisig can execute parameter changes within the safety bounds in [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds).
 
 ### Operator economics
@@ -394,7 +394,7 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 ### Negative
 
 - **Capital-cost-to-operate at edge tier.** The super-linear curve makes 100 Gbps + tiers expensive: ~12.6M TOKEN bond at the 100G tier. Mitigated by α-tunability and by the off-chain USDC infrastructure subsidies for early operators; operators must otherwise buy TOKEN on market to climb tiers, by design (there is no on-chain TOKEN credit).
-- **Governance bootstrap depends on multisig discipline.** First 6–12 months run through a multisig; capacity-weighted DAO voting kicks in when the multisig executes the one-shot transition. Pre-transition parameter changes are constrained to the [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds).
+- **Governance bootstrap depends on multisig discipline.** First 6–12 months run through a multisig; served-bytes-weighted DAO voting kicks in when the multisig executes the one-shot transition. Pre-transition parameter changes are constrained to the [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds).
 - **Smaller external LP base in year 1.** No Liquidity Mining subsidy means external LP growth depends on organic trading-fee yield. POL provides the depth.
 - **Per-byte burn flow may exceed market depth at low TOKEN prices.** [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)'s per-epoch liquidity cap on `BuybackBurner` is load-bearing.
 - **Operator-only DAO is politically narrow.** Investors, team, and treasury hold TOKEN but cannot vote unless they also operate. This is the deliberate regulatory-cleanliness commitment; consistent with the entity design Pattern A.
