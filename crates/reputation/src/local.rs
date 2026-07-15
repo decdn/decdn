@@ -16,10 +16,18 @@ const DEFAULT_SPEED_WEIGHT: f64 = 0.4;
 const DEFAULT_CORRECTNESS_WEIGHT: f64 = 0.4;
 const DEFAULT_REACHABILITY_WEIGHT: f64 = 0.2;
 // ADR 008 §14a excludes per-report clamping from the local scoring rule. The
-// clamp logic is kept so operators can opt into §8's ±0.05 cap by overriding
-// this field, but the default is `1.0` — a no-op cap given EWMA delta cannot
-// exceed 1.0 when prev, sample ∈ [0,1] and alpha ∈ [0,1].
+// clamp logic is kept so callers can opt into §8's ±0.05 cap by overriding this
+// field, but the default is `1.0` — a no-op cap given EWMA delta cannot exceed
+// 1.0 when prev, sample ∈ [0,1] and alpha ∈ [0,1]. The production node wiring
+// opts in via [`LocalReputationConfig::with_max_delta_per_update`] +
+// [`LOCAL_SCORE_MAX_DELTA_PER_REPORT`]; the library default stays a no-op.
 const DEFAULT_MAX_DELTA_PER_UPDATE: f64 = 1.0;
+
+/// ADR 008 §8 per-report score-movement cap (±0.05). The library default is a
+/// no-op cap of `1.0`; the node opts into this value via
+/// [`LocalReputationConfig::with_max_delta_per_update`] so a single bad
+/// interaction cannot over-penalize an otherwise good peer.
+pub const LOCAL_SCORE_MAX_DELTA_PER_REPORT: f64 = 0.05;
 
 /// Validation errors when constructing a [`LocalReputation`].
 #[derive(Debug, Error, PartialEq)]
@@ -70,6 +78,13 @@ pub enum Outcome {
     Corruption,
     /// Peer delivered correctly verified bytes over the wire.
     Delivered { bytes: u64, elapsed: Duration },
+    /// Peer self-attested *this node's own* region yet the observed probe
+    /// latency exceeded the ADR 030 ceiling — the canonical region-spoofing
+    /// signal
+    /// ([ADR 030 §Soft mitigation](../../../adr/030-node-region-self-attestation.md)).
+    /// Scored as a fully negative sample (like [`Outcome::Unreachable`]); it is a
+    /// local-only observation and is never folded into a gossiped report.
+    RegionLatencyMismatch,
 }
 
 /// Tunable parameters for the local EWMA score.
@@ -105,6 +120,20 @@ impl Default for LocalReputationConfig {
             reachability_weight: DEFAULT_REACHABILITY_WEIGHT,
             max_delta_per_update: DEFAULT_MAX_DELTA_PER_UPDATE,
         }
+    }
+}
+
+impl LocalReputationConfig {
+    /// Set the per-report score-movement cap and return the config.
+    ///
+    /// The struct is `#[non_exhaustive]`, so downstream crates cannot use a
+    /// struct-update literal to override a single field; this builder is how the
+    /// node wiring opts into [`LOCAL_SCORE_MAX_DELTA_PER_REPORT`]. The value is
+    /// validated (finite, `[0.0, 1.0]`) at [`LocalReputation::new`], not here.
+    #[must_use]
+    pub const fn with_max_delta_per_update(mut self, cap: f64) -> Self {
+        self.max_delta_per_update = cap;
+        self
     }
 }
 
@@ -184,8 +213,11 @@ impl LocalReputation {
             reachability: self.config.reachability_weight,
         };
         match outcome {
-            // speed 0, correctness 0, reachability 0
-            Outcome::Unreachable => 0.0,
+            // Fully negative sample (speed 0, correctness 0, reachability 0):
+            // `Unreachable` — the peer could not be reached; and
+            // `RegionLatencyMismatch` — the ADR 030 latency-vs-claim penalty,
+            // which taxes a same-region claim contradicted by measured RTT.
+            Outcome::Unreachable | Outcome::RegionLatencyMismatch => 0.0,
             // reachable but the bytes failed verification: only reachability
             Outcome::Corruption => crate::interaction::interaction_score(w, 0.0, 0.0, 1.0),
             // correctly delivered: full correctness + reachability, scaled speed
@@ -400,6 +432,60 @@ mod tests {
         let p = fresh_peer();
         let next = r.record(p, Outcome::Unreachable);
         ensure!(approx(next, 0.45), "got {next}");
+        Ok(())
+    }
+
+    #[test]
+    fn builder_opts_into_adr008_per_report_clamp() -> anyhow::Result<()> {
+        ensure!(approx(LOCAL_SCORE_MAX_DELTA_PER_REPORT, 0.05));
+        // Same invariant as `clamp_caps_per_update_movement`, but reached through
+        // the public builder the node wiring uses (the struct is
+        // `#[non_exhaustive]`, so a downstream crate cannot set the field with a
+        // struct-update literal).
+        let cfg = LocalReputationConfig::default()
+            .with_max_delta_per_update(LOCAL_SCORE_MAX_DELTA_PER_REPORT);
+        ensure!(
+            approx(cfg.max_delta_per_update, 0.05),
+            "builder did not set cap"
+        );
+        let r = LocalReputation::new(cfg)?;
+        let p = fresh_peer();
+        // Drive the score up so a single Unreachable would swing by more than
+        // 0.05 (unclamped delta = 0.1 * prev) — the clamp must bind.
+        for _ in 0..20 {
+            r.record(
+                p,
+                Outcome::Delivered {
+                    bytes: 10 * 1024 * 1024,
+                    elapsed: Duration::from_secs(1),
+                },
+            );
+        }
+        let before = r.score(p);
+        ensure!(
+            before > 0.5,
+            "precondition: score should have climbed, got {before}"
+        );
+        let after = r.record(p, Outcome::Unreachable);
+        ensure!(
+            approx(after, before - 0.05),
+            "clamp did not bind: before={before} after={after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn region_latency_mismatch_scores_like_unreachable() -> anyhow::Result<()> {
+        // ADR 030 penalty is a fully negative sample — assert the equivalence the
+        // name promises (shared `=> 0.0` arm) directly, so the test survives any
+        // change to the default alpha/initial_score rather than pinning 0.45.
+        let r = LocalReputation::new(LocalReputationConfig::default())?;
+        let via_penalty = r.record(fresh_peer(), Outcome::RegionLatencyMismatch);
+        let via_unreachable = r.record(fresh_peer(), Outcome::Unreachable);
+        ensure!(
+            approx(via_penalty, via_unreachable),
+            "penalty {via_penalty} != unreachable {via_unreachable}"
+        );
         Ok(())
     }
 
