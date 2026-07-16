@@ -173,16 +173,18 @@ impl PositiveProbeCache {
     pub fn get(&self, hash: &Hash) -> Option<Vec<ProbedProvider>> {
         let now = Instant::now();
         let mut guard = self.lock();
-        let expiry = guard.entries.get(hash)?.expiry;
-        if expiry <= now {
-            guard.entries.shift_remove(hash);
+        // Remove first: an expired entry is then already evicted (below), and a
+        // live one is re-inserted at the front. This drops the redundant `get`
+        // that a check-then-remove-then-reinsert shape would cost, and keeps the
+        // hit path to two `IndexMap` ops (Gemini review).
+        let entry = guard.entries.shift_remove(hash)?;
+        if entry.expiry <= now {
             return None;
         }
         // Bump to front of LRU, preserving the original expiry. Unlike
         // `negative_cache`, whose `Instant` value is `Copy` and so can ride a
         // single `shift_insert(0, key, expiry)`, the `Entry` here must be moved
         // out and back.
-        let entry = guard.entries.shift_remove(hash)?;
         let providers = entry.providers.clone();
         guard.entries.shift_insert(0, *hash, entry);
         Some(providers)
