@@ -340,7 +340,7 @@ mod tests {
         );
     }
 
-    /// A `nodeIdOf` resolution failure in `apply_operator_change` bumps
+    /// A `nodeIdOf` resolution failure in `RegistrySink::on_operator_change` bumps
     /// `decdn_staker_set_watcher_resolve_failures_total` (#788). Exercises the
     /// metric wiring directly — the `Err` arm calls exactly this method.
     #[test]

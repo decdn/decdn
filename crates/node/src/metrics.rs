@@ -570,14 +570,15 @@ pub struct DecdnMetrics {
     /// it — exactly the silent drift these #783/#788 metrics exist to surface.
     /// Unlike a stream-level error, this does NOT trip a backoff/restart, so it
     /// would otherwise move no metric at all. Pairs with the per-failure
-    /// `warn!` in `apply_operator_change`. Field has no `_total` suffix because
+    /// `warn!` in [`crate::dht::capacity_bond_registry`]'s
+    /// `RegistrySink::on_operator_change`. Field has no `_total` suffix because
     /// the `OpenMetrics` encoder appends it.
     pub staker_set_watcher_resolve_failures: Counter,
     /// `decdn_staker_set_watcher_down_seconds` (#783, semantics corrected
     /// #788): true downtime — seconds the staker-set watcher has been in the
-    /// error/backoff state with no established event filters. Reads `0` for the
-    /// entire life of any established cycle, however long or quiet (a healthy
-    /// filter stream persists indefinitely, so this must NOT measure cycle
+    /// error/backoff state, i.e. failing its `eth_getLogs` poll tick. Reads `0`
+    /// for the entire life of any established cycle, however long or quiet (a
+    /// healthy poll loop persists indefinitely, so this must NOT measure cycle
     /// age), and climbs only while the loop is between a failed cycle and the
     /// next successful re-establishment. Reads `0` until the first cycle is
     /// established after bootstrap. Recomputed at scrape time from a monotonic
@@ -1023,8 +1024,8 @@ pub struct DecdnMetrics {
     /// per-failure `warn!` in `chain_origin_directory`.
     pub origin_directory_watcher_resolve_failures: Counter,
     /// `decdn_origin_directory_watcher_down_seconds` (#651): true downtime —
-    /// seconds the origin-directory watcher has been in the error/backoff state
-    /// with no established filters. Reads `0` for the life of any established
+    /// seconds the origin-directory watcher has been in the error/backoff state,
+    /// i.e. failing its `eth_getLogs` poll tick. Reads `0` for the life of any established
     /// cycle; recomputed at scrape time from a monotonic `down_since`. A
     /// poisoned lock reports `i64::MAX` (alerting direction).
     pub origin_directory_watcher_down_seconds: Gauge,
@@ -1637,7 +1638,8 @@ impl Metrics {
     /// A `nodeIdOf(operator)` resolution for an operator-indexed event failed,
     /// dropping the membership change (#788, [`crate::dht::chain_staker_set`]).
     /// Bumps `staker_set_watcher_resolve_failures_total`. Pairs with the
-    /// per-failure `warn!` in `apply_operator_change`.
+    /// per-failure `warn!` in [`crate::dht::capacity_bond_registry`]'s
+    /// `RegistrySink::on_operator_change`.
     pub fn staker_set_watcher_resolve_failure(&self) {
         self.decdn.staker_set_watcher_resolve_failures.inc();
     }
@@ -3213,7 +3215,7 @@ mod tests {
     #[test]
     fn staker_set_watcher_down_seconds_reads_zero_across_a_long_healthy_cycle() {
         // CRITICAL-fix regression guard (#788): `down_seconds` measures true
-        // downtime, NOT cycle age. A healthy filter stream persists
+        // downtime, NOT cycle age. A healthy poll loop persists
         // indefinitely, so the gauge must read 0 for the entire life of an
         // established cycle — even when the node has been up (and the cycle
         // live) for a while. We simulate "a while" by backdating the metrics'
