@@ -826,18 +826,62 @@ impl Origin for NodeOrigin {
                 return Ok(OriginFetch::NotFound);
             };
             let hash_bytes = *hash.as_bytes();
+            let target = DhtHash::from_bytes(hash_bytes);
+            // ONE budget for the whole fetch, spent across both phases — see
+            // `PullOutcome`.
+            let mut budget = MAX_PROVIDER_ATTEMPTS;
+            // `node_pull_attempts` counts pull ORCHESTRATIONS ("found ≥1 candidate
+            // to try"), and is the denominator for the success / corruption /
+            // unreachable rates. One `fetch` is one orchestration however many
+            // candidate lists it walks, so a probe-cache hit that exhausts its
+            // providers and falls through to the cold path must still meter
+            // exactly once — otherwise every such fetch inflates the denominator
+            // and quietly deflates every rate built on it.
+            let mut attempt_metered = false;
+
+            // ADR 001 §Probe cache: "On a cache miss the requester checks the probe
+            // cache first; if a valid entry exists, it skips DHT lookup and goes
+            // straight to selection."
+            if let Some(cached) = cached_candidates(deps, target).await {
+                deps.metrics.probe_cache_hit();
+                deps.metrics.node_pull_attempt();
+                attempt_metered = true;
+                let outcome = try_pull(deps, &cached, hash_bytes, budget).await;
+                if let Some(bytes) = outcome.bytes {
+                    return Ok(OriginFetch::found_one_shot(bytes));
+                }
+                budget = budget.saturating_sub(outcome.attempts);
+                // Every cached provider failed to deliver. The entry has been
+                // disproved by the only evidence that outranks a probe — an actual
+                // pull — so drop it rather than let it keep hitting for the rest of
+                // its 15s.
+                deps.probe_cache.invalidate(&target);
+                if budget == 0 {
+                    // The cached candidates ate the whole fetch-wide budget.
+                    // Running a fresh lookup + probe now would either exceed the
+                    // worst case `outer_pull_deadline` is sized for, or discover
+                    // providers it has no attempts left to try. This fetch is a
+                    // clean miss; the entry is gone, so the next one goes cold.
+                    debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
+                    return Ok(OriginFetch::NotFound);
+                }
+            } else {
+                deps.metrics.probe_cache_miss();
+            }
+
+            // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
             let providers = discover(deps, hash_bytes).await;
             if providers.is_empty() {
                 deps.metrics.node_pull_no_providers();
                 debug!(%hash, "node-origin: no providers discovered for cache-miss pull");
                 return Ok(OriginFetch::NotFound);
             }
-            deps.metrics.node_pull_attempt();
+            if !attempt_metered {
+                deps.metrics.node_pull_attempt();
+            }
+            // Writes the probe cache at its tail.
             let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-            match try_pull(deps, &ranked, hash_bytes, MAX_PROVIDER_ATTEMPTS)
-                .await
-                .bytes
-            {
+            match try_pull(deps, &ranked, hash_bytes, budget).await.bytes {
                 Some(bytes) => Ok(OriginFetch::found_one_shot(bytes)),
                 // KNOWN LIMITATION (#1145 review, #1129): this collapses every non-hit onto a
                 // clean `NotFound` — no providers, all refused, all stalled, AND a LOCAL fault
@@ -1053,6 +1097,71 @@ async fn probe_candidate(
     })
 }
 
+/// Rebuild ranked [`Candidate`]s from a probe-cache hit (ADR 001 §Probe cache).
+///
+/// `None` means "no usable cached candidate", covering three cases the caller has
+/// no reason to distinguish: no entry, an expired entry, and an entry whose every
+/// provider is currently suppressed. All three cost a fresh lookup + probe and all
+/// three count as `probe_cache_miss` — a hit that saves no network work is not a
+/// hit in any sense a dashboard cares about.
+///
+/// The cache stores only the ADR triple. `reputation` and `region` are rebuilt
+/// here, FRESH, and the result re-ranked. That is what ADR 001's "goes straight to
+/// selection" means: skip discovery and probing — not skip the selection
+/// algorithm. Caching a `Candidate` whole would have been less code and would have
+/// frozen `reputation` for 15 seconds, letting a node that failed three pulls in
+/// the meantime keep the rank it earned before them; the fields we decline to
+/// cache are the ones that MOVE.
+async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec<Candidate>> {
+    let providers = deps.probe_cache.get(&target)?;
+    let now_secs = crate::payment_settlement::unix_now();
+    let mut candidates = Vec::with_capacity(providers.len());
+    for provider in providers {
+        // A 15-second-old entry can be stale INSIDE its own TTL, so the same two
+        // filters `probe_and_rank` applies are applied here — this is the other
+        // chokepoint every candidate passes through. A pull-time refusal recorded
+        // a negative for this exact (peer, hash) seconds ago
+        // (`classify_pull_failure`), and a wedged channel cannot serve ANY hash.
+        if deps
+            .negative_cache
+            .contains_active(&provider.node_id, &target)
+            || deps.provider_is_wedged(&provider.node_id, now_secs)
+        {
+            continue;
+        }
+        let Ok(pk) = PublicKey::from_bytes(provider.node_id.as_bytes()) else {
+            // Matches `probe_candidate`: a key that does not decode implies
+            // upstream state corruption — skip rather than panic.
+            continue;
+        };
+        let region = deps
+            .region_accountant
+            .region_of(provider.node_id.as_bytes())
+            .await
+            .unwrap_or_default();
+        // Deliberately NOT re-running the ADR 030 region-latency penalty here,
+        // unlike `probe_candidate`. That penalty reads a probe's `rtt` as EVIDENCE
+        // against a self-attested region claim, and we already scored this rtt
+        // once — at probe time, when it was evidence. A cache hit performs no
+        // probe and produces no new evidence, so re-recording would charge one
+        // probe's latency to the peer again on every hit inside the TTL: an EWMA
+        // beaten down by a single 15-second-old sample replayed as many times as
+        // the blob happens to be requested. Popularity is not guilt.
+        candidates.push(Candidate {
+            node_id: *provider.node_id.as_bytes(),
+            rate_per_mb: provider.rate_per_mb,
+            rtt_ms: provider.rtt_ms,
+            reputation: combined_reputation(deps, pk, now_secs),
+            region,
+            stake: None,
+        });
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(rank(candidates))
+}
+
 /// What one walk of a ranked candidate list consumed and produced.
 ///
 /// The `attempts` count is the load-bearing half (#1165). [`MAX_PROVIDER_ATTEMPTS`]
@@ -1073,7 +1182,6 @@ struct PullOutcome {
     bytes: Option<Bytes>,
     /// Candidates actually TRIED — i.e. `pull_from_candidate` calls, whether or
     /// not they delivered. Never exceeds the `budget` passed in.
-    #[allow(dead_code)] // Consumed by the probe-cache fallback wiring (#1165, Task 5).
     attempts: usize,
 }
 
