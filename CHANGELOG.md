@@ -172,7 +172,9 @@ since project inception and will roll into the first tagged release.
   so a node with `cache.node_to_node_pull_through_enabled = false` reported
   `down_seconds` frozen at `0` forever — an alert that could never fire.
   `decdn_node_address_directory_size` is **not** affected: it measures the
-  projection rather than the loop, has independent producers, and is retained.
+  projection's cardinality rather than the loop's health, and is retained. Note
+  that it is exported even when pull-through is off, where it sits at a
+  permanent `0`; scope any alert on it to nodes with pull-through on.
 
 #### CLI
 

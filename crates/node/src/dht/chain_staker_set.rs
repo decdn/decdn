@@ -172,11 +172,14 @@ where
 /// moved — `false` for an idempotent no-op (a re-insert, or a remove of an
 /// absent id), which a re-scanned `eth_getLogs` window produces routinely.
 ///
-/// Callers may ignore the return (hence no `#[must_use]`): it exists because
-/// it is the only observable signal that a change was real. That used to be
-/// visible as a `broadcast` emission, which is what the idempotence tests
-/// below watched — but the channel had no production subscriber and was
-/// retired in #1231, so the bool carries the observation now.
+/// The bool mirrors the `HashSet::insert` / `HashSet::remove` contract this
+/// function dispatches to, and is computed anyway to gate the
+/// `staker_set_active_count` republish below. Callers may ignore it (hence no
+/// `#[must_use]`) — every production call site does, since an idempotent no-op
+/// is a routine outcome rather than an error. In production the mutation-gated
+/// gauge is the observable signal; the bool is what the idempotence tests below
+/// assert on, having previously watched a `broadcast` emission that was retired
+/// in #1231.
 pub(super) fn apply_change(
     active: &Arc<RwLock<HashSet<NodeId>>>,
     metrics: &Arc<Metrics>,

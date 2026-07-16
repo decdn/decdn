@@ -54,11 +54,12 @@ pub trait StakerSet: Send + Sync + std::fmt::Debug {
 /// In-memory [`StakerSet`] implementation, built from a parsed
 /// `NodeId` set or empty.
 ///
-/// The runtime wires this with [`Self::empty`] until the chain-backed
-/// `ChainStakerSet` (reads `CapacityBond.getActiveNodes()` once at
-/// startup and subscribes to the registry's membership events) is
-/// ready — same trait, drop-in swap at the runtime construction site.
-/// Tests construct via [`Self::new`] with a known `HashSet`.
+/// The runtime wires the chain-backed `ChainStakerSet` (reads
+/// `CapacityBond.getActiveNodes()` once at startup, then follows the registry's
+/// membership events via the shared `eth_getLogs` poll) — see
+/// `capacity_bond_registry::bootstrap`, #1110. This impl is what tests and
+/// explicit operator-supplied sets use: construct via [`Self::new`] with a known
+/// `HashSet`, or [`Self::empty`]. Same trait, so it stays a drop-in swap.
 #[derive(Debug)]
 pub struct ConfigStakerSet {
     active: HashSet<NodeId>,
