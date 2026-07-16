@@ -98,7 +98,7 @@ fn resolve_chain(args: &cli::ChannelChainArgs, file: &FileConfig) -> anyhow::Res
             )
         })?;
     let payment_channel =
-        chain_ctx::parse_address(&payment_channel_raw, "payment_channel_address")?;
+        chain_ctx::parse_nonzero_address(&payment_channel_raw, "payment_channel_address")?;
     let chain_id = args
         .chain_id
         .or_else(|| bc.and_then(|b| b.chain_id))
@@ -948,6 +948,21 @@ mod tests {
             err.to_string().contains("payment_channel_address not set"),
             "{err}"
         );
+    }
+
+    /// A present-but-zero `payment_channel_address` fails fast via the shared
+    /// `parse_nonzero_address` guard rather than as an opaque on-chain revert
+    /// (#1213). The EOA `--provider-address` stays unguarded by design.
+    #[test]
+    fn rejects_zero_payment_channel() {
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\n\
+             payment_channel_address = \"0x0000000000000000000000000000000000000000\"\n",
+        );
+        let err = resolve_chain(&args().chain, &file).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("payment_channel_address"), "{err}");
+        assert!(msg.contains("must not be the zero address"), "{err}");
     }
 
     /// Build a `BuyerChannelState` for the formatter tests. Fields chosen so the

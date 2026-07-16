@@ -1075,8 +1075,12 @@ async fn prepare_usdc_swap<P: Provider + Clone + 'static>(
         return Ok(SwapPrep::None);
     }
 
+    // `from_config` above already parsed + zero-guarded this same `usdc` string,
+    // so a zero here is unreachable in practice; re-parsing via the non-zero
+    // guard (rather than `parse_address`) just keeps the two USDC parse sites
+    // consistent (#1213).
     let usdc = Erc20::new(
-        chain_ctx::parse_address(&resolved_swap.usdc, "usdc_address")?,
+        chain_ctx::parse_nonzero_address(&resolved_swap.usdc, "usdc_address")?,
         provider.clone(),
     );
     let usdc_balance = usdc

@@ -124,6 +124,25 @@ pub struct ResolvedSwap {
     pub pool: Option<String>,
 }
 
+/// Parse a swap contract address with a labelled error and reject the zero
+/// address. `Address::ZERO` parses cleanly but is never a real deployment — it
+/// would surface only as an opaque on-chain revert deep in the swap path (a
+/// call to the codeless zero address), so reject it here with a clear, labelled
+/// error. Mirrors the CLI's `chain_ctx::parse_nonzero_address` guard
+/// (#1153/#1213); duplicated because `incentive` cannot depend on the `cli`
+/// crate. The "… is not a valid address" wording is preserved so the existing
+/// malformed-address tests keep matching.
+fn parse_nonzero(value: &str, label: &str) -> anyhow::Result<Address> {
+    let addr: Address = value
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{label} {value:?} is not a valid address: {e}"))?;
+    anyhow::ensure!(
+        addr != Address::ZERO,
+        "{label} must not be the zero address — set it to the deployed contract address"
+    );
+    Ok(addr)
+}
+
 /// Construct the configured [`SwapVenue`] from resolved chain config,
 /// dispatching on `resolved.venue`. `token` is the TOKEN address being
 /// bought (not carried by `ResolvedSwap`, which is USDC-side config only).
@@ -138,31 +157,17 @@ pub fn from_config<P: Provider + Clone + 'static>(
 ) -> anyhow::Result<SwapVenue> {
     match resolved.venue.as_str() {
         "uniswap-v3" => {
-            let router: Address = resolved.router.parse().map_err(|e| {
-                anyhow::anyhow!(
-                    "swap_router_address {:?} is not a valid address: {e}",
-                    resolved.router
-                )
-            })?;
+            let router = parse_nonzero(&resolved.router, "swap_router_address")?;
             let quoter_str = resolved.quoter.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("swap_quoter_address required for --swap-venue uniswap-v3")
             })?;
-            let quoter: Address = quoter_str.parse().map_err(|e| {
-                anyhow::anyhow!("swap_quoter_address {quoter_str:?} is not a valid address: {e}")
-            })?;
-            let usdc: Address = resolved.usdc.parse().map_err(|e| {
-                anyhow::anyhow!(
-                    "usdc_address {:?} is not a valid address: {e}",
-                    resolved.usdc
-                )
-            })?;
+            let quoter = parse_nonzero(quoter_str, "swap_quoter_address")?;
+            let usdc = parse_nonzero(&resolved.usdc, "usdc_address")?;
             let fee = resolved.uniswap_fee_tier.ok_or_else(|| {
                 anyhow::anyhow!("uniswap_fee_tier required for --swap-venue uniswap-v3")
             })?;
             let pool = match &resolved.pool {
-                Some(p) => Some(p.parse::<Address>().map_err(|e| {
-                    anyhow::anyhow!("swap_pool_address {p:?} is not a valid address: {e}")
-                })?),
+                Some(p) => Some(parse_nonzero(p, "swap_pool_address")?),
                 None => None,
             };
             Ok(SwapVenue::UniswapV3(UniswapV3Venue::new(
@@ -170,24 +175,12 @@ pub fn from_config<P: Provider + Clone + 'static>(
             )))
         }
         "balancer-v3" => {
-            let router: Address = resolved.router.parse().map_err(|e| {
-                anyhow::anyhow!(
-                    "swap_router_address {:?} is not a valid address: {e}",
-                    resolved.router
-                )
-            })?;
-            let usdc: Address = resolved.usdc.parse().map_err(|e| {
-                anyhow::anyhow!(
-                    "usdc_address {:?} is not a valid address: {e}",
-                    resolved.usdc
-                )
-            })?;
+            let router = parse_nonzero(&resolved.router, "swap_router_address")?;
+            let usdc = parse_nonzero(&resolved.usdc, "usdc_address")?;
             let pool_str = resolved.balancer_pool_address.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("swap_balancer_pool required for --swap-venue balancer-v3")
             })?;
-            let pool: Address = pool_str.parse().map_err(|e| {
-                anyhow::anyhow!("swap_balancer_pool {pool_str:?} is not a valid address: {e}")
-            })?;
+            let pool = parse_nonzero(pool_str, "swap_balancer_pool")?;
             Ok(SwapVenue::BalancerV3(BalancerV3Venue::new(
                 provider, router, pool, usdc, token, payer,
             )))
@@ -430,5 +423,136 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("swap_router_address"), "{err}");
+    }
+
+    /// `addr_hex(0x00)` is the zero address as a hex string. A zero contract
+    /// address parses cleanly but is never a real deployment; `from_config` now
+    /// rejects it at parse time via the local `parse_nonzero` guard (#1213)
+    /// rather than letting it surface as an opaque on-chain revert deep in the
+    /// swap path. Every parsed swap address is covered across both venues.
+    fn assert_rejects_zero(resolved: &ResolvedSwap, label: &str) {
+        let err = from_config(
+            unconnected_provider(),
+            resolved,
+            Address::repeat_byte(0x44),
+            Address::ZERO,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(label), "expected label {label:?}, got: {err}");
+        assert!(msg.contains("must not be the zero address"), "{err}");
+    }
+
+    #[test]
+    fn from_config_rejects_zero_uniswap_router() {
+        assert_rejects_zero(
+            &ResolvedSwap {
+                venue: "uniswap-v3".to_string(),
+                router: addr_hex(0x00),
+                quoter: Some(addr_hex(0x22)),
+                usdc: addr_hex(0x33),
+                uniswap_fee_tier: Some(3000),
+                balancer_pool_address: None,
+                pool: None,
+            },
+            "swap_router_address",
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_zero_uniswap_quoter() {
+        assert_rejects_zero(
+            &ResolvedSwap {
+                venue: "uniswap-v3".to_string(),
+                router: addr_hex(0x11),
+                quoter: Some(addr_hex(0x00)),
+                usdc: addr_hex(0x33),
+                uniswap_fee_tier: Some(3000),
+                balancer_pool_address: None,
+                pool: None,
+            },
+            "swap_quoter_address",
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_zero_uniswap_usdc() {
+        assert_rejects_zero(
+            &ResolvedSwap {
+                venue: "uniswap-v3".to_string(),
+                router: addr_hex(0x11),
+                quoter: Some(addr_hex(0x22)),
+                usdc: addr_hex(0x00),
+                uniswap_fee_tier: Some(3000),
+                balancer_pool_address: None,
+                pool: None,
+            },
+            "usdc_address",
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_zero_uniswap_pool() {
+        // The pool is optional, but a present zero must still be rejected.
+        assert_rejects_zero(
+            &ResolvedSwap {
+                venue: "uniswap-v3".to_string(),
+                router: addr_hex(0x11),
+                quoter: Some(addr_hex(0x22)),
+                usdc: addr_hex(0x33),
+                uniswap_fee_tier: Some(3000),
+                balancer_pool_address: None,
+                pool: Some(addr_hex(0x00)),
+            },
+            "swap_pool_address",
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_zero_balancer_router() {
+        assert_rejects_zero(
+            &ResolvedSwap {
+                venue: "balancer-v3".to_string(),
+                router: addr_hex(0x00),
+                quoter: None,
+                usdc: addr_hex(0x33),
+                uniswap_fee_tier: None,
+                balancer_pool_address: Some(addr_hex(0x55)),
+                pool: None,
+            },
+            "swap_router_address",
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_zero_balancer_usdc() {
+        assert_rejects_zero(
+            &ResolvedSwap {
+                venue: "balancer-v3".to_string(),
+                router: addr_hex(0x11),
+                quoter: None,
+                usdc: addr_hex(0x00),
+                uniswap_fee_tier: None,
+                balancer_pool_address: Some(addr_hex(0x55)),
+                pool: None,
+            },
+            "usdc_address",
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_zero_balancer_pool() {
+        assert_rejects_zero(
+            &ResolvedSwap {
+                venue: "balancer-v3".to_string(),
+                router: addr_hex(0x11),
+                quoter: None,
+                usdc: addr_hex(0x33),
+                uniswap_fee_tier: None,
+                balancer_pool_address: Some(addr_hex(0x00)),
+                pool: None,
+            },
+            "swap_balancer_pool",
+        );
     }
 }

@@ -42,7 +42,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 ## iroh node-key rotation only
 
-**API used:** `CapacityBond.bindNodeId(newNodeId, signature)` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)).
+**API used:** `CapacityBond.bindNodeId(newNodeId, bindingSignature, ed25519Signature)` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)).
 
 `bindNodeId` is rebind-only — atomically deletes the old `nodeId → ethAddress` mapping and writes the new one. Ethereum address unchanged.
 
@@ -71,8 +71,8 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
    Probe-hold drain is critical: rotating before holds clear opens a phantom-slash window — outstanding holds were signed by the *old* NodeId but the *new* one would not honor them. See [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold).
 3. **Stop** the node process.
-4. **Build the EIP-712 `BindNodeId` binding signature** with the operator's Ethereum key at the current `bindingNonce[ethAddress]` — `bindingSignature = EIP-712 sign(ethKey, BindNodeId { nodeId: newNodeId, nonce: bindingNonce[ethAddress] })`.
-5. **Submit** `CapacityBond.bindNodeId(newNodeId, bindingSignature)`. The transaction must originate from the same Ethereum address that owns the existing binding. Wait one block confirmation and verify the `NodeIdBound` event.
+4. **Build the two signatures `bindNodeId` requires.** (a) The EIP-712 `BindNodeId` binding signature with the operator's Ethereum key at the current `bindingNonce[ethAddress]` — `bindingSignature = EIP-712 sign(ethKey, BindNodeId { nodeId: newNodeId, nonce: bindingNonce[ethAddress] })`. (b) The ed25519 ownership proof, signed with the **new** iroh ed25519 private key, proving control of the NodeId being bound — `ed25519Signature = ed25519_sign(newIrohKey, keccak256(abi.encodePacked(newNodeId, ethAddress, block.chainid, registrationNonce[newNodeId])))` (see [ADR 003 § NodeId Ownership Verification](003-payments.md#nodeid-ownership-verification) for the exact preimage). Signing over `newNodeId` alone builds the wrong digest and reverts with `InvalidEd25519Signature`; the `ethAddress` in the preimage is the `msg.sender` of the submit in step 5, so both signatures must come from the same operator.
+5. **Submit** `CapacityBond.bindNodeId(newNodeId, bindingSignature, ed25519Signature)`. The transaction must originate from the same Ethereum address that owns the existing binding. Wait one block confirmation and verify the `NodeIdBound` event.
 6. **Update** the node config to point at the new keystore; replace the iroh keystore file at the configured path.
 7. **Restart** the node, confirm:
    - `/health` reports `ready`
