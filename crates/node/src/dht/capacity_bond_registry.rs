@@ -45,7 +45,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -56,12 +55,12 @@ use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
 };
-use crate::dht::chain_staker_set::{ChainStakerSet, apply_change};
+use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
 use crate::dht::node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, remove_binding, set_binding,
 };
 use crate::dht::routing::NodeId;
-use crate::dht::staker_set::{StakerChange, StakerSet};
+use crate::dht::staker_set::StakerSet;
 use crate::metrics::Metrics;
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::capacity_bond::CapacityBond;
@@ -70,18 +69,18 @@ use decdn_incentive::capacity_bond::CapacityBond;
 /// 3.3's worked-example limit.
 const PAGE_SIZE: u64 = 100;
 
-/// Capacity of the `StakerChange` broadcast channel. Sized so a slow subscriber
-/// can fall behind by a single bootstrap cycle (~100 changes in the bursty
-/// re-sync window) without forcing a lagging recv into the `Lagged` arm.
-const CHANGES_CHANNEL_CAPACITY: usize = 128;
-
 /// Both projections, plus the shared watcher that keeps them current.
 ///
 /// `node_addresses` is `None` when `cache.node_to_node_pull_through_enabled` is
-/// off: the bindings projection is not built at all, so its
-/// `node_address_directory_size` gauge stays absent rather than appearing on
-/// every default node meaning something subtly different ("registered nodes"
-/// rather than "resolvable payout targets").
+/// off: the bindings projection is not built at all, so nothing ever moves
+/// `node_address_directory_size` off `0`.
+///
+/// The gauge is still *exported* in that state — every `DecdnMetrics` field
+/// registers unconditionally as one group — so a pull-through-off node (the
+/// default) publishes a permanent `0`, which is indistinguishable from a
+/// pull-through-on node whose directory has collapsed. Any alert on this gauge
+/// must therefore be scoped to nodes with pull-through on. Making it genuinely
+/// absent needs a split group or a labelled family; see #1231.
 #[derive(Debug)]
 pub struct RegistryHandles {
     pub staker_set: Arc<dyn StakerSet>,
@@ -138,7 +137,6 @@ impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
 pub(crate) struct RegistrySink<R> {
     pub(crate) reads: R,
     pub(crate) active: Arc<RwLock<HashSet<NodeId>>>,
-    pub(crate) changes_tx: broadcast::Sender<StakerChange>,
     /// `None` when pull-through is off — see [`RegistryHandles::node_addresses`].
     pub(crate) bindings: Option<Arc<RwLock<HashMap<NodeId, Address>>>>,
     pub(crate) metrics: Arc<Metrics>,
@@ -148,12 +146,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
     /// `NodeRegistered`: active insert (unfiltered — see the module doc) AND a
     /// binding insert.
     fn on_registered(&self, node_id: NodeId, eth_address: Address) {
-        apply_change(
-            &self.active,
-            &self.changes_tx,
-            &self.metrics,
-            StakerChange::Active(node_id),
-        );
+        apply_change(&self.active, &self.metrics, StakerChange::Active(node_id));
         if let Some(bindings) = &self.bindings {
             set_binding(bindings, &self.metrics, node_id, eth_address);
         }
@@ -163,12 +156,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
     /// it and `deregisterNode` clears it. Bond/unbonding/ejection transitions flip
     /// `isActive` without touching the binding.
     fn on_deregistered(&self, node_id: NodeId) {
-        apply_change(
-            &self.active,
-            &self.changes_tx,
-            &self.metrics,
-            StakerChange::Inactive(node_id),
-        );
+        apply_change(&self.active, &self.metrics, StakerChange::Inactive(node_id));
         if let Some(bindings) = &self.bindings {
             remove_binding(bindings, &self.metrics, &node_id);
         }
@@ -212,7 +200,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
         } else {
             StakerChange::Inactive(node_id)
         };
-        apply_change(&self.active, &self.changes_tx, &self.metrics, change);
+        apply_change(&self.active, &self.metrics, change);
     }
 }
 
@@ -239,12 +227,13 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                     // Deactivates WITHOUT clearing the binding: ejection flips
                     // `isActive` only, and the operator may still be owed payment
                     // on an open channel.
-                    Ok(event) => apply_change(
-                        &self.active,
-                        &self.changes_tx,
-                        &self.metrics,
-                        StakerChange::Inactive(event.nodeId.0.into()),
-                    ),
+                    Ok(event) => {
+                        apply_change(
+                            &self.active,
+                            &self.metrics,
+                            StakerChange::Inactive(event.nodeId.0.into()),
+                        );
+                    }
                     Err(err) => warn!(%err, "skipping undecodable NodeAutoEjected log"),
                 }
             }
@@ -311,35 +300,30 @@ where
     Ok((active, bindings))
 }
 
-/// Fire the staker-set gauges, plus the node-address ones only when that
-/// projection exists.
+/// Wire the watcher's healthy-cycle transition to the established gauge.
 ///
-/// Both families are kept rather than collapsed to one: they now describe the
-/// same loop, so they are perfectly correlated — but retiring one would break
-/// existing dashboards and alerts, and freezing `node_address_watcher_down_seconds`
-/// at 0 forever would be an alert that can never fire, which is worse than
-/// deleting it. The `bindings_live` gate stops a pull-through-off node reporting
-/// health for a directory it does not have.
-fn hooks(metrics: &Arc<Metrics>, bindings_live: bool) -> (WatcherHook, WatcherHook) {
-    let established = {
-        let metrics = Arc::clone(metrics);
-        Box::new(move || {
-            metrics.staker_set_watcher_cycle_established();
-            if bindings_live {
-                metrics.node_address_watcher_cycle_established();
-            }
-        }) as WatcherHook
-    };
-    let backoff = {
-        let metrics = Arc::clone(metrics);
-        Box::new(move || {
-            metrics.staker_set_watcher_backoff_started();
-            if bindings_live {
-                metrics.node_address_watcher_backoff_started();
-            }
-        }) as WatcherHook
-    };
-    (established, backoff)
+/// `staker_set_watcher_*` is the shared `capacity-bond` loop's health, and it
+/// covers the bindings projection too — one loop feeds both, so there is one
+/// thing to report.
+///
+/// A parallel `node_address_watcher_*` family used to be fired alongside these
+/// and was retired in #1231: since #1226 collapsed the two loops into one it was
+/// a perfectly-correlated shadow, reporting the same outage twice. It was kept
+/// at the time on the grounds that retiring it would break existing dashboards
+/// and alerts — no dashboard, alert, ADR, or runbook in this repo ever
+/// referenced it — and that a gauge frozen at `0` forever is an alert that can
+/// never fire. That second argument was the stronger one, and it cut the other
+/// way: the family was gated on the bindings projection existing, so a
+/// pull-through-off node reported exactly that frozen `0`.
+fn established_hook(metrics: &Arc<Metrics>) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || metrics.staker_set_watcher_cycle_established())
+}
+
+/// Wire a tick failure to the backoff gauge.
+fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || metrics.staker_set_watcher_backoff_started())
 }
 
 /// Enumerate `CapacityBond` once, then spawn the single watcher that keeps both
@@ -388,17 +372,14 @@ where
         metrics.node_address_directory_size(initial_bindings.len());
     }
 
-    let (changes_tx, _) = broadcast::channel(CHANGES_CHANNEL_CAPACITY);
     let active = Arc::new(RwLock::new(initial_active));
     let bindings = track_node_addresses.then(|| Arc::new(RwLock::new(initial_bindings)));
 
-    let (on_established, on_backoff) = hooks(&metrics, bindings.is_some());
     let sink = RegistrySink {
         reads: ContractReads {
             registry: registry.clone(),
         },
         active: Arc::clone(&active),
-        changes_tx: changes_tx.clone(),
         bindings: bindings.clone(),
         metrics: Arc::clone(&metrics),
     };
@@ -429,8 +410,8 @@ where
         shutdown: CancellationToken::new(),
         seed_cursor: Some(snapshot_block),
         label: "capacity-bond",
-        on_established: Some(on_established),
-        on_backoff: Some(on_backoff),
+        on_established: Some(established_hook(&metrics)),
+        on_backoff: Some(backoff_hook(&metrics)),
     };
     // One task, one `AbortOnDrop`, shared by both façades: it lives while either
     // does and aborts when the last is dropped. Strictly safer than the old shape,
@@ -439,11 +420,8 @@ where
         provider, cfg, sink,
     ))));
 
-    let staker_set: Arc<dyn StakerSet> = Arc::new(ChainStakerSet::from_parts(
-        active,
-        changes_tx,
-        Arc::clone(&watcher),
-    ));
+    let staker_set: Arc<dyn StakerSet> =
+        Arc::new(ChainStakerSet::from_parts(active, Arc::clone(&watcher)));
     let node_addresses = bindings.map(|b| {
         Arc::new(ChainNodeAddressDirectory::from_parts(b, watcher)) as Arc<dyn NodeAddressResolver>
     });
@@ -498,11 +476,9 @@ mod tests {
         let active = Arc::new(RwLock::new(HashSet::new()));
         let bindings = bindings_on.then(|| Arc::new(RwLock::new(HashMap::new())));
         let metrics = Arc::new(Metrics::new());
-        let (changes_tx, _rx) = broadcast::channel(16);
         let s = RegistrySink {
             reads,
             active: Arc::clone(&active),
-            changes_tx,
             bindings: bindings.clone(),
             metrics: Arc::clone(&metrics),
         };
@@ -694,46 +670,33 @@ mod tests {
         assert!(!is_active(&active, nid(1)));
     }
 
-    /// Both gauge families track the one shared loop when bindings are live.
+    /// The staker-set family tracks the one shared loop. It is unconditional:
+    /// this loop feeds the bindings projection too, so its health is the same
+    /// health whether or not pull-through is on. (Before #1231 a second,
+    /// perfectly-correlated `node_address_watcher_*` family was fired alongside
+    /// it, gated on the projection existing — which is what made the gate, and
+    /// a second test for the gated-off case, necessary.)
+    ///
+    /// The third call is what gives the `established` leg coverage.
+    /// `backoff_started` is edge-triggered on `down_since` being unset, so the
+    /// re-arm only counts if `established` actually closed the window. Asserting
+    /// `down_seconds 0` after an `established` instead would prove nothing: an
+    /// immediate scrape reads `0` even with the window open, because the elapsed
+    /// time floors to zero seconds.
     #[test]
-    fn composed_hooks_bump_both_families_when_bindings_live() {
+    fn watcher_hooks_track_the_shared_loop() {
         let metrics = Arc::new(Metrics::new());
-        let (established, backoff) = hooks(&metrics, true);
+        let established = established_hook(&metrics);
+        let backoff = backoff_hook(&metrics);
         backoff();
         established();
+        backoff();
 
         let text = metrics.encode().unwrap();
         assert!(
             text.lines()
-                .any(|l| l == "decdn_staker_set_watcher_restarts_total 1"),
-            "staker-set family must track the shared loop:\n{text}"
-        );
-        assert!(
-            text.lines()
-                .any(|l| l == "decdn_node_address_watcher_restarts_total 1"),
-            "node-address family must track the same shared loop:\n{text}"
-        );
-    }
-
-    /// ...and only staker-set's when the directory does not exist, so a
-    /// pull-through-off node never reports health for a projection it lacks.
-    #[test]
-    fn composed_hooks_bump_only_staker_set_when_bindings_absent() {
-        let metrics = Arc::new(Metrics::new());
-        let (established, backoff) = hooks(&metrics, false);
-        backoff();
-        established();
-
-        let text = metrics.encode().unwrap();
-        assert!(
-            text.lines()
-                .any(|l| l == "decdn_staker_set_watcher_restarts_total 1"),
-            "staker-set family still tracks the loop:\n{text}"
-        );
-        assert!(
-            text.lines()
-                .any(|l| l == "decdn_node_address_watcher_restarts_total 0"),
-            "node-address family must stay flat when no directory exists:\n{text}"
+                .any(|l| l == "decdn_staker_set_watcher_restarts_total 2"),
+            "established() must close the drift window so a later backoff re-arms:\n{text}"
         );
     }
 }

@@ -1,7 +1,7 @@
 //! Chain-backed [`StakerSet`] implementation.
 //!
-//! This module owns the **projection** only: the cached `NodeId → active?` set,
-//! its accessors, and the change broadcast. The `CapacityBond` enumeration and
+//! This module owns the **projection** only: the cached `NodeId → active?` set
+//! and its accessors. The `CapacityBond` enumeration and
 //! the event watcher that keep it current live in
 //! [`crate::dht::capacity_bond_registry`] (#1110), which builds this via
 //! `ChainStakerSet::from_parts` — it shares one `getActiveNodes` read and one
@@ -12,8 +12,9 @@
 //! filtered through `isActive(operator)` to apply the full predicate — registered,
 //! bond ≥ minBond, no unbonding, not ejected — because the `getActiveNodes` page
 //! is the un-filtered `_registeredAddrs` array per the contract's own comment. It
-//! then follows the five membership-mutating events, emitting [`StakerChange`]
-//! for every observed transition.
+//! then follows the five membership-mutating events, applying a `StakerChange`
+//! for every observed transition. (Not an intra-doc link: `StakerChange` is
+//! private to `dht` since #1231, and this module doc is public.)
 //!
 //! # Spec mapping
 //!
@@ -64,9 +65,10 @@
 //! - `decdn_staker_set_active_count` — current cached active-set size,
 //!   to spot a frozen or collapsed cache.
 //!
-//! Since #1110 these describe the one shared `capacity-bond` loop, so they move
-//! in lockstep with the `node_address_watcher_*` family whenever pull-through is
-//! on.
+//! Since #1110 these describe the one shared `capacity-bond` loop, which also
+//! feeds the bindings projection — so they are that loop's health for both, and
+//! there is no separate node-address watcher family to correlate against
+//! (#1231).
 //!
 //! A `getActiveNodes` resync-on-extended-outage path is a follow-up;
 //! these metrics surface the window that path would close.
@@ -74,13 +76,33 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::chain_events::AbortOnDrop;
 use crate::dht::routing::NodeId;
-use crate::dht::staker_set::{StakerChange, StakerSet};
+use crate::dht::staker_set::StakerSet;
 use crate::metrics::Metrics;
+
+/// One membership transition, as [`apply_change`] applies it to the cached set.
+///
+/// `capacity_bond_registry` builds one of these for every observed
+/// `CapacityBond` event that flips the canonical `isActive` predicate
+/// (`NodeRegistered` / `NodeDeregistered` / `NodeAutoEjected` / `Reinstated` /
+/// `UnbondingRequested`).
+///
+/// Internal to `dht`, and it lives here rather than in `staker_set` because
+/// `ConfigStakerSet` has no use for it: the only producer
+/// (`capacity_bond_registry`) and the only consumer (`apply_change`, below) are
+/// both on the chain-backed path. It was briefly public, as the payload of a
+/// `StakerSet::subscribe_changes` broadcast that nothing ever subscribed to
+/// (#1231).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StakerChange {
+    /// `node_id` joined the active set (was absent, now present).
+    Active(NodeId),
+    /// `node_id` left the active set (was present, now absent).
+    Inactive(NodeId),
+}
 
 /// Chain-backed staker set. Cheap to clone via the shared inner
 /// [`Arc`]; the runtime holds one `Arc<dyn StakerSet>` and consumers
@@ -90,7 +112,6 @@ use crate::metrics::Metrics;
 #[derive(Debug)]
 pub struct ChainStakerSet {
     active: Arc<RwLock<HashSet<NodeId>>>,
-    changes_tx: broadcast::Sender<StakerChange>,
     _watcher: Arc<AbortOnDrop>,
 }
 
@@ -101,12 +122,10 @@ impl ChainStakerSet {
     /// whichever façade is dropped first.
     pub(super) const fn from_parts(
         active: Arc<RwLock<HashSet<NodeId>>>,
-        changes_tx: broadcast::Sender<StakerChange>,
         watcher: Arc<AbortOnDrop>,
     ) -> Self {
         Self {
             active,
-            changes_tx,
             _watcher: watcher,
         }
     }
@@ -127,10 +146,6 @@ impl StakerSet for ChainStakerSet {
 
     fn len(&self) -> usize {
         read_active(&self.active, HashSet::len)
-    }
-
-    fn subscribe_changes(&self) -> broadcast::Receiver<StakerChange> {
-        self.changes_tx.subscribe()
     }
 }
 
@@ -153,17 +168,23 @@ where
     }
 }
 
-/// Apply a change to the active set, then broadcast it. The broadcast
-/// send error case (no live subscribers) is ignored: the set has
-/// already been updated, and any later `subscribe_changes` call sees
-/// the post-update state via `is_active` / `active_nodes`. A `Lagged`
-/// subscriber is on the receiver to handle.
+/// Apply a change to the active set. Returns whether membership actually
+/// moved — `false` for an idempotent no-op (a re-insert, or a remove of an
+/// absent id), which a re-scanned `eth_getLogs` window produces routinely.
+///
+/// The bool mirrors the `HashSet::insert` / `HashSet::remove` contract this
+/// function dispatches to, and is computed anyway to gate the
+/// `staker_set_active_count` republish below. Callers may ignore it (hence no
+/// `#[must_use]`) — every production call site does, since an idempotent no-op
+/// is a routine outcome rather than an error. In production the mutation-gated
+/// gauge is the observable signal; the bool is what the idempotence tests below
+/// assert on, having previously watched a `broadcast` emission that was retired
+/// in #1231.
 pub(super) fn apply_change(
     active: &Arc<RwLock<HashSet<NodeId>>>,
-    changes_tx: &broadcast::Sender<StakerChange>,
     metrics: &Arc<Metrics>,
     change: StakerChange,
-) {
+) -> bool {
     let (mutated, size) = {
         let mut guard = match active.write() {
             Ok(g) => g,
@@ -185,11 +206,8 @@ pub(super) fn apply_change(
         // (re-insert / absent-remove) leaves the set — and the gauge —
         // unchanged.
         metrics.staker_set_active_count(size);
-        // No live subscriber is a normal case for an empty
-        // ConfigStakerSet runtime, or a chain-backed set during
-        // bootstrap before any consumer has subscribed.
-        let _ = changes_tx.send(change);
     }
+    mutated
 }
 
 #[cfg(test)]
@@ -206,52 +224,49 @@ mod tests {
         NodeId::from_bytes([byte; 32])
     }
 
-    fn fresh_state() -> (
-        Arc<RwLock<HashSet<NodeId>>>,
-        broadcast::Sender<StakerChange>,
-        Arc<Metrics>,
-    ) {
-        let (tx, _) = broadcast::channel(8);
+    fn fresh_state() -> (Arc<RwLock<HashSet<NodeId>>>, Arc<Metrics>) {
         (
             Arc::new(RwLock::new(HashSet::new())),
-            tx,
             Arc::new(Metrics::new()),
         )
     }
 
-    /// `apply_change(Active)` on an absent `NodeId` inserts and emits.
-    /// Re-applying the same Active is a no-op (idempotent — no extra
-    /// emission).
+    /// `apply_change(Active)` on an absent `NodeId` inserts and reports the
+    /// mutation. Re-applying the same Active is a no-op — the set is unchanged
+    /// and the return says so. Idempotence is load-bearing: a re-scanned
+    /// `eth_getLogs` window replays events routinely.
     #[test]
     fn apply_change_active_idempotent() {
-        let (active, tx, metrics) = fresh_state();
-        let mut rx = tx.subscribe();
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
+        let (active, metrics) = fresh_state();
+        assert!(
+            apply_change(&active, &metrics, StakerChange::Active(nid(1))),
+            "first insert of an absent id is a real change"
+        );
         assert!(active.read().unwrap().contains(&nid(1)));
-        assert_eq!(rx.try_recv().unwrap(), StakerChange::Active(nid(1)));
 
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
+        assert!(
+            !apply_change(&active, &metrics, StakerChange::Active(nid(1))),
+            "re-inserting a present id must report no change"
+        );
         assert_eq!(active.read().unwrap().len(), 1);
-        // Second application was a no-op; channel empty.
-        let err = rx.try_recv().expect_err("no second emission");
-        assert!(matches!(err, broadcast::error::TryRecvError::Empty));
     }
 
-    /// `apply_change(Inactive)` removes and emits. Removing an absent
-    /// `NodeId` is a no-op (no emission).
+    /// `apply_change(Inactive)` removes and reports the mutation. Removing an
+    /// absent `NodeId` is a no-op.
     #[test]
     fn apply_change_inactive_idempotent() {
-        let (active, tx, metrics) = fresh_state();
+        let (active, metrics) = fresh_state();
         active.write().unwrap().insert(nid(1));
-        let mut rx = tx.subscribe();
-        apply_change(&active, &tx, &metrics, StakerChange::Inactive(nid(1)));
+        assert!(
+            apply_change(&active, &metrics, StakerChange::Inactive(nid(1))),
+            "removing a present id is a real change"
+        );
         assert!(!active.read().unwrap().contains(&nid(1)));
-        assert_eq!(rx.try_recv().unwrap(), StakerChange::Inactive(nid(1)));
 
-        apply_change(&active, &tx, &metrics, StakerChange::Inactive(nid(2)));
-        // nid(2) was never in the set; no emission.
-        let err = rx.try_recv().expect_err("no emission for absent removal");
-        assert!(matches!(err, broadcast::error::TryRecvError::Empty));
+        assert!(
+            !apply_change(&active, &metrics, StakerChange::Inactive(nid(2))),
+            "removing an id that was never present must report no change"
+        );
     }
 
     /// A real membership change republishes `decdn_staker_set_active_count`;
@@ -260,10 +275,10 @@ mod tests {
     /// (#783).
     #[test]
     fn apply_change_updates_active_count_gauge_only_on_real_change() {
-        let (active, tx, metrics) = fresh_state();
+        let (active, metrics) = fresh_state();
         // Two distinct inserts → gauge tracks the growing set.
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(2)));
+        apply_change(&active, &metrics, StakerChange::Active(nid(1)));
+        apply_change(&active, &metrics, StakerChange::Active(nid(2)));
         let text = metrics.encode().unwrap();
         assert!(
             text.lines().any(|l| l == "decdn_staker_set_active_count 2"),
@@ -271,7 +286,7 @@ mod tests {
         );
 
         // A no-op re-insert must not move the gauge.
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
+        apply_change(&active, &metrics, StakerChange::Active(nid(1)));
         let text = metrics.encode().unwrap();
         assert!(
             text.lines().any(|l| l == "decdn_staker_set_active_count 2"),
@@ -279,7 +294,7 @@ mod tests {
         );
 
         // A real removal shrinks it.
-        apply_change(&active, &tx, &metrics, StakerChange::Inactive(nid(1)));
+        apply_change(&active, &metrics, StakerChange::Inactive(nid(1)));
         let text = metrics.encode().unwrap();
         assert!(
             text.lines().any(|l| l == "decdn_staker_set_active_count 1"),
@@ -328,7 +343,7 @@ mod tests {
         );
     }
 
-    /// A `nodeIdOf` resolution failure in `apply_operator_change` bumps
+    /// A `nodeIdOf` resolution failure in `RegistrySink::on_operator_change` bumps
     /// `decdn_staker_set_watcher_resolve_failures_total` (#788). Exercises the
     /// metric wiring directly — the `Err` arm calls exactly this method.
     #[test]

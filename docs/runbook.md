@@ -77,11 +77,18 @@ blacklist updates and stop being able to settle channels. Once
 
 - `decdn_staker_set_watcher_down_seconds` climbing (with
   `decdn_staker_set_watcher_restarts_total` advancing) is the chain-side
-  symptom specific to the active-staker set watcher (#783): a mid-run RPC
-  outage stops the watcher following `CapacityBond` membership events, so the
-  cached active-staker set drifts from chain state and mis-sheds stake-lane
-  probes / DHT `Store`s. This watcher is **not** covered by
-  `decdn_rpc_healthy`. See
+  symptom of the shared `capacity-bond` watcher (#783, #1226): a mid-run RPC
+  outage stops the watcher following `CapacityBond` events. Since #1226 one loop
+  feeds **both** projections, so this pair is the health of both:
+  - The cached active-staker set drifts from chain state and mis-sheds
+    stake-lane probes / DHT `Store`s.
+  - Fresh `NodeRegistered` bindings are missed, so those providers become
+    unpayable and are silently skipped — the pull path's reachable-provider set
+    may be capped by stale bindings. (Only on nodes with
+    `cache.node_to_node_pull_through_enabled` on; the projection is not built
+    otherwise.)
+
+  This watcher is **not** covered by `decdn_rpc_healthy`. See
   [appendix-observability § Active-Staker Set Watcher Metrics](../adr/appendix-observability.md#active-staker-set-watcher-metrics).
 
 **Remediate:**

@@ -63,19 +63,12 @@ fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
 /// an infinite or empty list would lie either way. Tests that *do*
 /// need a concrete active set use the production `ConfigStakerSet`
 /// with an explicit `HashSet`.
-///
-/// Holds a `broadcast::Sender<StakerChange>` solely to satisfy
-/// [`StakerSet::subscribe_changes`]; never sends. Equivalent to
-/// `ConfigStakerSet`'s no-op subscribe semantics.
 #[derive(Debug)]
-struct AllStaked {
-    changes_tx: tokio::sync::broadcast::Sender<decdn_node::dht::StakerChange>,
-}
+struct AllStaked;
 
 impl AllStaked {
-    fn new() -> Self {
-        let (changes_tx, _) = tokio::sync::broadcast::channel(1);
-        Self { changes_tx }
+    const fn new() -> Self {
+        Self
     }
 }
 
@@ -96,9 +89,6 @@ impl StakerSet for AllStaked {
     /// set contents) MUST agree per the [`StakerSet`] trait contract.
     fn len(&self) -> usize {
         0
-    }
-    fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<decdn_node::dht::StakerChange> {
-        self.changes_tx.subscribe()
     }
 }
 

@@ -12,25 +12,7 @@
 
 use std::collections::HashSet;
 
-use tokio::sync::broadcast;
-
 use crate::dht::routing::NodeId;
-
-/// Membership change emitted by [`StakerSet::subscribe_changes`].
-///
-/// The chain-backed implementation emits one of these for every
-/// observed `CapacityBond` event that flips the canonical
-/// `isActive` predicate (`NodeRegistered` / `NodeDeregistered` /
-/// `NodeAutoEjected` / `Reinstated` / `UnbondingRequested`), after
-/// the in-memory active set has been updated. `ConfigStakerSet` never
-/// emits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StakerChange {
-    /// `node_id` joined the active set (was absent, now present).
-    Active(NodeId),
-    /// `node_id` left the active set (was present, now absent).
-    Inactive(NodeId),
-}
 
 /// Read-only view of the cached active-staker set.
 ///
@@ -40,12 +22,13 @@ pub enum StakerChange {
 ///
 /// `is_active` is the only call the handler makes per request.
 /// `active_nodes` is exposed for the bootstrap path (seed the routing
-/// table from it) and for operator tooling. `subscribe_changes` lets
-/// long-running consumers follow membership without polling; the
-/// chain-backed impl emits on every relevant event, while the
-/// in-memory [`ConfigStakerSet`] returns a receiver that stays open
-/// forever without firing — this lets call sites be implementation-
-/// agnostic instead of branching on the concrete impl.
+/// table from it) and for operator tooling.
+///
+/// There is deliberately no change-subscription seam. One existed
+/// (`subscribe_changes`, a `broadcast` of membership transitions) and was
+/// retired in #1231 with zero production consumers — every `send` was
+/// unconditionally a `SendError`. Consumers read the cached set directly;
+/// re-add a subscription only alongside the code that needs it.
 pub trait StakerSet: Send + Sync + std::fmt::Debug {
     /// Whether `node_id` is in the active-staker set.
     fn is_active(&self, node_id: &NodeId) -> bool;
@@ -66,47 +49,27 @@ pub trait StakerSet: Send + Sync + std::fmt::Debug {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Subscribe to membership changes. The chain-backed impl emits on
-    /// every `CapacityBond` event that flips a node's `isActive`
-    /// predicate, after its own cache has been updated — so a
-    /// `recv().await` followed by `is_active` returns the post-event
-    /// state. `ConfigStakerSet` returns a receiver that never fires.
-    ///
-    /// Receivers must handle `RecvError::Lagged` (a slow consumer is
-    /// not a fatal condition for the producer); subscribers that fall
-    /// further behind than the channel capacity can re-sync by
-    /// reading `active_nodes()`.
-    fn subscribe_changes(&self) -> broadcast::Receiver<StakerChange>;
 }
 
 /// In-memory [`StakerSet`] implementation, built from a parsed
 /// `NodeId` set or empty.
 ///
-/// The runtime wires this with [`Self::empty`] until the chain-backed
-/// `ChainStakerSet` (reads `CapacityBond.getActiveNodes()` once at
-/// startup and subscribes to the registry's membership events) is
-/// ready — same trait, drop-in swap at the runtime construction site.
-/// Tests construct via [`Self::new`] with a known `HashSet`.
-///
-/// The struct holds a [`broadcast::Sender`] to satisfy
-/// [`StakerSet::subscribe_changes`], but no code path ever sends on
-/// it; receivers stay open indefinitely with no incoming change events.
+/// The runtime wires the chain-backed `ChainStakerSet` (reads
+/// `CapacityBond.getActiveNodes()` once at startup, then follows the registry's
+/// membership events via the shared `eth_getLogs` poll) — see
+/// `capacity_bond_registry::bootstrap`, #1110. This impl is what tests and
+/// explicit operator-supplied sets use: construct via [`Self::new`] with a known
+/// `HashSet`, or [`Self::empty`]. Same trait, so it stays a drop-in swap.
 #[derive(Debug)]
 pub struct ConfigStakerSet {
     active: HashSet<NodeId>,
-    /// Sender kept alive solely to hand out live receivers via
-    /// [`Self::subscribe_changes`]. Capacity is the minimum (1) — the
-    /// channel never carries traffic so its buffer size is irrelevant.
-    changes_tx: broadcast::Sender<StakerChange>,
 }
 
 impl ConfigStakerSet {
     /// Build from a parsed `NodeId` set.
     #[must_use]
-    pub fn new(active: HashSet<NodeId>) -> Self {
-        let (changes_tx, _) = broadcast::channel(1);
-        Self { active, changes_tx }
+    pub const fn new(active: HashSet<NodeId>) -> Self {
+        Self { active }
     }
 
     /// Empty set — useful in tests where no staker check is desired
@@ -130,10 +93,6 @@ impl StakerSet for ConfigStakerSet {
 
     fn len(&self) -> usize {
         self.active.len()
-    }
-
-    fn subscribe_changes(&self) -> broadcast::Receiver<StakerChange> {
-        self.changes_tx.subscribe()
     }
 }
 
@@ -181,25 +140,5 @@ mod tests {
         assert_eq!(got, s);
         assert_eq!(set.len(), 3);
         assert!(!set.is_empty());
-    }
-
-    /// `subscribe_changes` returns a receiver that stays open for the
-    /// lifetime of the `ConfigStakerSet` (since the sender lives inside
-    /// the struct) but never carries an event. The receiver MUST NOT
-    /// observe `RecvError::Closed` while the staker set is alive — that
-    /// would force every call site into `Result`-handling for a path
-    /// that can never fire.
-    #[tokio::test]
-    async fn config_staker_set_subscribe_changes_stays_open_never_fires() {
-        let set = ConfigStakerSet::empty();
-        let mut rx = set.subscribe_changes();
-        // try_recv on an empty channel that hasn't dropped its sender
-        // returns Empty, not Closed. If we ever start returning Closed
-        // here, downstream code that just calls `recv().await` would
-        // spuriously error on Closed before any event arrived.
-        let err = rx
-            .try_recv()
-            .expect_err("subscribe_changes never fires on ConfigStakerSet");
-        assert!(matches!(err, broadcast::error::TryRecvError::Empty));
     }
 }
