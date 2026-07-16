@@ -65,7 +65,7 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use decdn_cache::{CacheEngine, Hash};
-use decdn_common::redact::sanitize_rpc_display;
+use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::content_blacklist::ContentBlacklist;
 use decdn_incentive::content_blacklist::ContentBlacklist::{HashBlacklisted, HashRemoved};
 use tokio::time::Instant;
@@ -76,10 +76,8 @@ use crate::chain_events::resumable_watcher::{self, CursorPolicy, LogSink, Watche
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+    timed,
 };
-/// Per-call ceiling on RPC reads (scope view, log query, head) so a stalled
-/// provider — which has no request timeout configured — cannot wedge the watcher.
-const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Mutable deny-set carried across poll ticks. The scan cursor lives on the
 /// resumable watcher; this holds only the re-scopable entry set.
@@ -248,7 +246,7 @@ pub(crate) async fn run<P>(
         cursor: cursor_policy(from_block),
         initial_backoff: WATCHER_INITIAL_BACKOFF,
         max_backoff: WATCHER_MAX_BACKOFF,
-        rpc_call_timeout: Some(RPC_CALL_TIMEOUT),
+        rpc_call_timeout: None,
         shutdown,
         seed_cursor: None,
         label: "blacklist",
@@ -407,9 +405,12 @@ where
     }
 }
 
-/// `isHashBlacklistedForOperator` bounded by [`RPC_CALL_TIMEOUT`]. `None` on
-/// timeout or RPC error (caller keeps the hash in `known` for the next re-scope),
-/// `Some(bool)` otherwise.
+/// `isHashBlacklistedForOperator` bounded by the shared
+/// [`chain_events::DEFAULT_RPC_CALL_TIMEOUT`]. `None` on timeout or RPC error
+/// (caller keeps the hash in `known` for the next re-scope), `Some(bool)`
+/// otherwise.
+///
+/// [`chain_events::DEFAULT_RPC_CALL_TIMEOUT`]: crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT
 async fn scope_check<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
@@ -419,28 +420,27 @@ where
     P: Provider + Clone,
 {
     let hash_key = B256::from(*hash.as_bytes());
-    match tokio::time::timeout(
-        RPC_CALL_TIMEOUT,
+    match timed(
+        None,
+        "isHashBlacklistedForOperator",
         contract
             .isHashBlacklistedForOperator(hash_key, operator)
             .call(),
     )
     .await
     {
-        Ok(Ok(flag)) => Some(flag),
-        Ok(Err(err)) => {
+        Ok(flag) => Some(flag),
+        // One arm for both legs: `timed` folds the elapsed case into the same
+        // `Err`, and its message names the call and the deadline ("… timed out
+        // after 10s"), so the timeout stays distinguishable in the log text
+        // without a separate arm carrying a `timeout_secs` field. That holds
+        // only because the render is `sanitize_err_chain` — plain Display would
+        // drop the deadline the moment anything above added context.
+        Err(err) => {
             warn!(
                 %hash,
-                err = %sanitize_rpc_display(&err),
+                err = %sanitize_err_chain(&err),
                 "blacklist watcher: isHashBlacklistedForOperator failed; keeping for re-scope"
-            );
-            None
-        }
-        Err(_elapsed) => {
-            warn!(
-                %hash,
-                timeout_secs = RPC_CALL_TIMEOUT.as_secs(),
-                "blacklist watcher: isHashBlacklistedForOperator timed out; keeping for re-scope"
             );
             None
         }

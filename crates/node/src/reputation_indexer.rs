@@ -55,7 +55,7 @@ use crate::metrics::Metrics;
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
-    WATCHER_MAX_BACKOFF,
+    WATCHER_MAX_BACKOFF, timed,
 };
 use crate::reputation_wiring::NodeSettlementSource;
 
@@ -466,9 +466,17 @@ fn apply_settlement(
 /// - `Ok(Some(..))` — a live binding to a valid curve point.
 /// - `Ok(None)` — *permanently* unresolvable: no binding, or the bound bytes
 ///   aren't a valid key. The caller may safely mark the settlement seen.
-/// - `Err(..)` — a *transient* RPC failure. The caller propagates this to the
-///   watcher loop's backoff-and-retry rather than dropping the settlement (the
-///   watcher meters it as an RPC failure on the retry boundary).
+/// - `Err(..)` — a *transient* RPC failure (including a [`timed`] timeout). The
+///   caller propagates this to the watcher loop's backoff-and-retry rather than
+///   dropping the settlement (the watcher meters it as an RPC failure on the
+///   retry boundary).
+///
+/// Note the deliberate asymmetry with `capacity_bond_registry::ContractReads`,
+/// which issues the *same* `nodeIdOf` read but counts-and-skips a failure
+/// instead of failing the tick. Both are right for their watcher: a skipped
+/// settlement here is a silent accounting gap in reporter weight that nothing
+/// re-derives, whereas the registry's projection self-heals on the operator's
+/// next event. Do not "unify" them.
 async fn resolve_binding<P>(
     capacity_bond: &CapacityBond::CapacityBondInstance<P>,
     addr: Address,
@@ -476,9 +484,7 @@ async fn resolve_binding<P>(
 where
     P: Provider + Clone,
 {
-    let resolved = capacity_bond
-        .nodeIdOf(addr)
-        .call()
+    let resolved = timed(None, "nodeIdOf", capacity_bond.nodeIdOf(addr).call())
         .await
         .with_context(|| format!("nodeIdOf RPC for {addr}"))?;
     let bytes = resolved.nodeId.0;
@@ -585,6 +591,27 @@ mod tests {
     use alloy::primitives::U256;
     use decdn_reputation::{SettlementSource, compute_reporter_weight};
     use iroh::SecretKey;
+
+    /// A stalled `nodeIdOf` must fail the tick, not hang it — so the settlement
+    /// is retried by the watcher's backoff rather than silently un-credited.
+    ///
+    /// This is the counterpart to `capacity_bond_registry`'s deliberately
+    /// *opposite* policy for the same RPC (see `resolve_binding`'s doc). Driving
+    /// the real read path is the point: a stub that returns `Err` would pass
+    /// whether or not the `timed` wrap exists.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_node_id_of_fails_the_tick_rather_than_wedging() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let bond = CapacityBond::CapacityBondInstance::new(addr(1), hanging_provider());
+        let err = bounded("resolve_binding", resolve_binding(&bond, addr(2)))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref().is_some_and(|e| e.contains("timed out after")),
+            "a stalled nodeIdOf must surface as a retryable Err: {err:?}"
+        );
+    }
 
     fn pk() -> PublicKey {
         SecretKey::generate().public()

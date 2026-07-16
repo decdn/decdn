@@ -89,6 +89,13 @@ proptest = { workspace = true }
 # otherwise force us to use `libc::raise` directly.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 wiremock = { workspace = true }
+# `chain_events::test_support::hanging_provider` — a transport whose RPCs never
+# resolve, so the `timed`-bounding tests drive each watcher's *production* read
+# path against a stalled provider. See the workspace manifest for why alloy's
+# `Asserter` can't cover this, and why the packet types come from a dev-dep
+# rather than alloy's `json-rpc` feature.
+tower = { workspace = true }
+alloy-json-rpc = { workspace = true }
 # `tests/origin_range_pull.rs` builds the `{H}.obao4` pre-order outboard a
 # range-pull origin must publish, so the e2e test can verify the cold ranged
 # cdn/client/v1 path (#823/#990). Matches the cache crate's outboard codec.

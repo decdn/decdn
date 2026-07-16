@@ -122,8 +122,10 @@ impl<P: Provider> HeadSource for SharedHead<P> {
         {
             return match &entry.result {
                 Ok(head) => Ok(*head),
-                // Re-wrap rather than clone: `sanitize_rpc_display` renders only
-                // the outermost context, so nothing observable is lost.
+                // Re-wrap rather than clone (`anyhow::Error` is not `Clone`).
+                // `{err:#}` flattens the whole chain into the new message, so a
+                // caller rendering this with `sanitize_err_chain` sees the same
+                // text the first caller did — the cause is folded in, not lost.
                 Err(err) => Err(anyhow::anyhow!("{err:#}")),
             };
         }

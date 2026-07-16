@@ -29,7 +29,7 @@ use std::time::Duration;
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use anyhow::{Context, Result};
-use decdn_common::redact::sanitize_rpc_display as n;
+use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display as n};
 use decdn_incentive::{CheckpointKey, KeyedCheckpointStore};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -379,9 +379,15 @@ where
             Err(err) => {
                 established = false;
                 fire(cfg.on_backoff.as_ref());
+                // The chain, not the checkpoint store: render the full cause
+                // chain. This error is a `timed` bound ("get_logs timed out
+                // after 10s") under whatever context the tick added above it
+                // ("getChannel for closing reconciliation of 0x…"), and plain
+                // Display would print only the latter — naming what was
+                // attempted while dropping why it failed.
                 warn!(
                     label = cfg.label,
-                    err = %n(&err),
+                    err = %sanitize_err_chain(&err),
                     backoff_secs = backoff.as_secs(),
                     "watcher RPC error; restarting after backoff"
                 );

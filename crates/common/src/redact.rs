@@ -140,13 +140,25 @@ fn redact_bare_urls(s: &str) -> Cow<'_, str> {
 /// Render any error's Display, with URL fragments stripped, for a single
 /// log/error line. Use at `tracing` sites where the value is the raw `alloy`
 /// transport error (its transparent Display carries the `reqwest` URL tail).
+///
+/// Prefer [`sanitize_err_chain`] for an `anyhow::Error`: Display renders only
+/// the *outermost* context, so any `.with_context(…)` on the way up silently
+/// replaces the underlying reason rather than adding to it.
 pub fn sanitize_rpc_display(err: impl std::fmt::Display) -> String {
     strip_urls(&err.to_string()).into_owned()
 }
 
 /// Render an `anyhow` error's full `context: cause: cause` chain (alternate
-/// Display) with URL fragments stripped. Use at the `main()` print boundary so
-/// no propagated chain-RPC error echoes the raw `rpc_url`.
+/// Display) with URL fragments stripped.
+///
+/// Use for any propagated chain-RPC error — at the `main()` print boundary so
+/// no raw `rpc_url` is echoed, and at watcher `tracing` sites so the reason
+/// survives. The latter is not a style preference: a chain read is wrapped by
+/// `chain_events::timed`, whose "… timed out after 10s" is the *cause*, and
+/// call sites add context above it (`getOrigins(namespace=1)`,
+/// `nodeIdOf(0x…)`). Rendering such an error with plain Display prints only
+/// that context and drops the timeout entirely — the operator sees a bare
+/// restatement of what was attempted, never why it failed.
 pub fn sanitize_err_chain(err: &anyhow::Error) -> String {
     strip_urls(&format!("{err:#}")).into_owned()
 }
