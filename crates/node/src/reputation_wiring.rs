@@ -75,6 +75,18 @@ impl StakedNodeSet for NodeStakedNodeSet {
     }
 }
 
+/// Build the `NodeAnnounce` admission gate handed to
+/// [`decdn_gossip::GossipService::spawn`]. ADR 001 rule 2: the runtime *always*
+/// enforces the gate against the live staker set, so this returns `Some`, never
+/// `None` — `None` disables rule 2 (fail-open) and exists only for tests.
+///
+/// Named and unit-tested so a future refactor cannot silently drop the runtime
+/// to `None`: that would reopen the exact hole #1170 closed while every existing
+/// test still passed (`run()` is otherwise reachable only via the anvil e2e).
+pub fn announce_staked_gate(staker_set: Arc<dyn StakerSet>) -> Option<Arc<dyn StakedNodeSet>> {
+    Some(Arc::new(NodeStakedNodeSet::new(staker_set)))
+}
+
 /// One settlement attributed to a reporter, stored with its absolute
 /// settlement time so [`SettlementSource::settlements`] can recompute age at
 /// query time.
@@ -416,6 +428,19 @@ mod tests {
         let gate = NodeStakedNodeSet::new(staker_set_with(member));
         assert!(gate.contains(member.as_bytes()));
         assert!(!gate.contains(outsider.as_bytes()));
+    }
+
+    /// The runtime's `NodeAnnounce` gate constructor must always enforce
+    /// (ADR 001 rule 2) — it returns `Some`, never the fail-open `None`. Guards
+    /// against a future refactor silently disabling rule 2 (the #1170 hole),
+    /// which `run()` alone would only surface under the anvil e2e (#1222).
+    #[test]
+    fn announce_staked_gate_is_always_some() {
+        let gate = announce_staked_gate(staker_set_with(pk()));
+        assert!(
+            gate.is_some(),
+            "announce gate must enforce, never fail open"
+        );
     }
 
     #[test]
