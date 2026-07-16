@@ -9,6 +9,7 @@ pub mod auth;
 pub mod batch_fallback;
 pub mod bootstrap;
 pub mod bucket_refresh;
+pub mod capacity_bond_registry;
 pub mod chain_origin_directory;
 pub mod chain_staker_set;
 pub mod client;

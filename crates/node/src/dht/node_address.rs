@@ -11,51 +11,43 @@
 //! `NodeRegistered(nodeId, ethAddress, ..)` carries both — so no new contract
 //! surface is needed.
 //!
+//! This module owns the **projection** only. Because both views come from one
+//! contract, [`crate::dht::capacity_bond_registry`] does a single
+//! `getActiveNodes` enumeration and runs a single `eth_getLogs` loop feeding
+//! both, building this via `ChainNodeAddressDirectory::from_parts` (#1110).
+//!
 //! The binding is set at `registerNode` and cleared at `deregisterNode`; it is
 //! unaffected by bond / unbonding / ejection transitions (those flip
-//! `isActive`, which the *staker set* tracks separately). So unlike
-//! `ChainStakerSet` this directory follows only `NodeRegistered` (insert) and
-//! `NodeDeregistered` (remove), applies no `isActive` filter, and never issues a
-//! follow-up `nodeIdOf` RPC — there is no operator-indexed event to resolve.
+//! `isActive`, which the *staker set* tracks separately). So the registry's
+//! bindings arms follow only `NodeRegistered` (insert) and `NodeDeregistered`
+//! (remove) — notably `NodeAutoEjected` deactivates without clearing a binding —
+//! and the enumeration applies no `isActive` filter: an operator mid-unbonding is
+//! momentarily inactive but still payable.
 //!
 //! # Failure model
 //!
-//! Bootstrap RPC failure → the caller decides (the runtime treats node-to-node
-//! pull-through as opportunistic and non-fatal, so it logs and disables the
-//! buyer path rather than aborting). Watcher RPC failure mid-run → log at
-//! `warn!`, back off (1s → 60s cap), and re-poll. The cursor is retained across
-//! the backoff, so the next `eth_getLogs` tick re-scans `[cursor, head]` and
-//! re-applies any binding event that landed during the outage — no backoff-gap
-//! drift. A missing binding fails the pull
-//! *closed* — the orchestrator skips a provider it cannot resolve rather than
-//! guessing an address it would then pay.
+//! Bootstrap: the bindings projection is derived from page data the (fatal,
+//! unconditional) staker-set enumeration already read, so it has no RPC of its
+//! own and cannot fail independently — see `capacity_bond_registry`'s
+//! §Fatality. It is simply not built when
+//! `cache.node_to_node_pull_through_enabled` is off.
+//!
+//! Watcher RPC failure mid-run → the shared loop logs at `warn!`, backs off
+//! (1s → 60s cap), and re-polls. The cursor is retained across the backoff, so
+//! the next `eth_getLogs` tick re-scans `[cursor, head]` and re-applies any
+//! binding event that landed during the outage — no backoff-gap drift. A missing
+//! binding fails the pull *closed* — the orchestrator skips a provider it cannot
+//! resolve rather than guessing an address it would then pay.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
-use alloy::rpc::types::{Filter, Log};
-use alloy::sol_types::SolEvent;
-use anyhow::{Context, Result};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use alloy::primitives::Address;
+use tracing::warn;
 
-use crate::chain_events::resumable_watcher::{
-    self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
-};
-use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{
-    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
-};
+use crate::chain_events::AbortOnDrop;
 use crate::dht::routing::NodeId;
 use crate::metrics::Metrics;
-use decdn_incentive::capacity_bond::CapacityBond;
-
-/// Page size for the initial paginated `getActiveNodes` read (matches
-/// [`crate::dht::chain_staker_set`]).
-const PAGE_SIZE: u64 = 100;
 
 /// Read-only resolver from a provider's iroh [`NodeId`] to its bonded operator
 /// Ethereum [`Address`]. Implementations MUST be cheap to clone (typically
@@ -115,132 +107,22 @@ impl NodeAddressResolver for StaticNodeAddressDirectory {
 #[derive(Debug)]
 pub struct ChainNodeAddressDirectory {
     bindings: Arc<RwLock<HashMap<NodeId, Address>>>,
-    _watcher: AbortOnDrop,
+    _watcher: Arc<AbortOnDrop>,
 }
 
 impl ChainNodeAddressDirectory {
-    /// Initial bootstrap: paginate `getActiveNodes` capturing every
-    /// `(nodeId, ethAddress)` binding, then spawn the background event watcher.
-    /// Returns once the cache is populated and the watcher is running.
-    pub async fn bootstrap<P>(
-        provider: P,
-        registry_addr: Address,
-        event_poll_interval: Duration,
-        head: Arc<dyn HeadSource>,
-        metrics: Arc<Metrics>,
-    ) -> Result<Self>
-    where
-        P: Provider + Clone + 'static,
-    {
-        let registry = CapacityBond::new(registry_addr, provider.clone());
-        let initial = bootstrap_bindings(&registry).await.with_context(|| {
-            format!("paginated getActiveNodes from CapacityBond at {registry_addr}")
-        })?;
-        info!(
-            binding_count = initial.len(),
-            %registry_addr,
-            "ChainNodeAddressDirectory bootstrap from CapacityBond complete"
-        );
-        metrics.node_address_directory_size(initial.len());
-
-        let bindings = Arc::new(RwLock::new(initial));
-        // Authoritative bindings came from `getActiveNodes` enumeration above; the
-        // watcher only live-tails binding events from head on the getLogs poller
-        // (#1092/#1106), no historical backfill and no persisted cursor.
-        let sink = NodeAddressSink {
-            bindings: Arc::clone(&bindings),
-            metrics: Arc::clone(&metrics),
-        };
-        let cfg = WatcherConfig {
-            head,
-            filter: Filter::new().address(registry_addr).event_signature(vec![
-                CapacityBond::NodeRegistered::SIGNATURE_HASH,
-                CapacityBond::NodeDeregistered::SIGNATURE_HASH,
-            ]),
-            from_block: 0,
-            poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: 0,
-            // Live-from-head, but still chunk `[cursor, head]` so a long lag
-            // (RPC outage / rate-limit) recovers in bounded windows instead of one
-            // range-limit-tripping `eth_getLogs`.
-            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-            cursor: CursorPolicy::HeadMinusWindow {
-                window_blocks: 0,
-                floor: 0,
-            },
-            initial_backoff: WATCHER_INITIAL_BACKOFF,
-            max_backoff: WATCHER_MAX_BACKOFF,
-            rpc_call_timeout: None,
-            shutdown: CancellationToken::new(),
-            seed_cursor: None,
-            label: "node-address",
-            on_established: Some(established_hook(&metrics)),
-            on_backoff: Some(backoff_hook(&metrics)),
-        };
-        let watcher_handle = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
-
-        Ok(Self {
+    /// Assemble from parts owned by `capacity_bond_registry`, which does the
+    /// enumeration and runs the shared watcher. `watcher` is shared with
+    /// `ChainStakerSet`, so the task outlives whichever façade is dropped first.
+    pub(super) const fn from_parts(
+        bindings: Arc<RwLock<HashMap<NodeId, Address>>>,
+        watcher: Arc<AbortOnDrop>,
+    ) -> Self {
+        Self {
             bindings,
-            _watcher: AbortOnDrop(watcher_handle),
-        })
-    }
-}
-
-/// Applies `CapacityBond` `NodeRegistered`/`NodeDeregistered` logs to the
-/// node→address bindings (#1092). `apply` live-tails from head (the
-/// authoritative set came from `getActiveNodes` at bootstrap) and never returns
-/// `Err` — an undecodable log is logged and skipped.
-struct NodeAddressSink {
-    bindings: Arc<RwLock<HashMap<NodeId, Address>>>,
-    metrics: Arc<Metrics>,
-}
-
-impl LogSink for NodeAddressSink {
-    #[allow(clippy::cognitive_complexity)]
-    async fn apply(&mut self, log: Log) -> Result<()> {
-        match log.topic0().copied() {
-            Some(sig) if sig == CapacityBond::NodeRegistered::SIGNATURE_HASH => {
-                match CapacityBond::NodeRegistered::decode_log_data(&log.inner.data) {
-                    Ok(event) => set_binding(
-                        &self.bindings,
-                        &self.metrics,
-                        NodeId::from_bytes(event.nodeId.0),
-                        event.ethAddress,
-                    ),
-                    Err(err) => warn!(%err, "skipping undecodable NodeRegistered log"),
-                }
-            }
-            Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
-                match CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data) {
-                    Ok(event) => {
-                        remove_binding(
-                            &self.bindings,
-                            &self.metrics,
-                            &NodeId::from_bytes(event.nodeId.0),
-                        );
-                    }
-                    Err(err) => warn!(%err, "skipping undecodable NodeDeregistered log"),
-                }
-            }
-            _ => {
-                debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
-            }
+            _watcher: watcher,
         }
-        Ok(())
     }
-}
-
-/// Wire the healthy-cycle transition to the down-seconds gauge (→ 0).
-fn established_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.node_address_watcher_cycle_established())
-}
-
-/// Wire a tick failure to the backoff gauge.
-fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.node_address_watcher_backoff_started())
 }
 
 impl NodeAddressResolver for ChainNodeAddressDirectory {
@@ -277,41 +159,10 @@ impl NodeAddressResolver for ChainNodeAddressDirectory {
     }
 }
 
-/// Paginate `getActiveNodes`, collecting every registered node's
-/// `nodeId → ethAddress` binding. Unlike the staker-set bootstrap this applies
-/// NO `isActive` filter: the binding is valid for any registered operator, and
-/// we may need to pay one whose `isActive` predicate is momentarily false
-/// (mid-unbonding) but whose channel is still serviceable.
-async fn bootstrap_bindings<P>(
-    registry: &CapacityBond::CapacityBondInstance<P>,
-) -> Result<HashMap<NodeId, Address>>
-where
-    P: Provider + Clone,
-{
-    let mut bindings = HashMap::new();
-    let mut offset = 0u64;
-    loop {
-        let page = registry
-            .getActiveNodes(U256::from(offset), U256::from(PAGE_SIZE))
-            .call()
-            .await
-            .with_context(|| format!("getActiveNodes(offset={offset}, limit={PAGE_SIZE})"))?;
-        if page.is_empty() {
-            break;
-        }
-        let page_len = page.len() as u64;
-        for node in &page {
-            bindings.insert(NodeId::from_bytes(node.nodeId.0), node.ethAddress);
-        }
-        offset = offset.saturating_add(page_len);
-    }
-    Ok(bindings)
-}
-
 /// Insert/update `node_id → address`, republishing the size gauge only when the
 /// set actually grew (a re-registration that overwrites an existing binding
 /// with the same key does not change cardinality).
-fn set_binding(
+pub(super) fn set_binding(
     bindings: &Arc<RwLock<HashMap<NodeId, Address>>>,
     metrics: &Arc<Metrics>,
     node_id: NodeId,
@@ -338,7 +189,7 @@ fn set_binding(
 
 /// Remove `node_id`'s binding, republishing the size gauge only on a real
 /// removal (removing an absent key is a no-op).
-fn remove_binding(
+pub(super) fn remove_binding(
     bindings: &Arc<RwLock<HashMap<NodeId, Address>>>,
     metrics: &Arc<Metrics>,
     node_id: &NodeId,
