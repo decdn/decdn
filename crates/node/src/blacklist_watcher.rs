@@ -76,6 +76,7 @@ use crate::chain_events::resumable_watcher::{self, CursorPolicy, LogSink, Watche
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+    timed,
 };
 /// Per-call ceiling on RPC reads (scope view, log query, head) so a stalled
 /// provider — which has no request timeout configured — cannot wedge the watcher.
@@ -419,28 +420,25 @@ where
     P: Provider + Clone,
 {
     let hash_key = B256::from(*hash.as_bytes());
-    match tokio::time::timeout(
-        RPC_CALL_TIMEOUT,
+    match timed(
+        Some(RPC_CALL_TIMEOUT),
+        "isHashBlacklistedForOperator",
         contract
             .isHashBlacklistedForOperator(hash_key, operator)
             .call(),
     )
     .await
     {
-        Ok(Ok(flag)) => Some(flag),
-        Ok(Err(err)) => {
+        Ok(flag) => Some(flag),
+        // One arm for both legs: `timed` folds the elapsed case into the same
+        // `Err`, and its message names the call and the deadline ("… timed out
+        // after 10s"), so the timeout stays distinguishable in the log text
+        // without a separate arm carrying a `timeout_secs` field.
+        Err(err) => {
             warn!(
                 %hash,
                 err = %sanitize_rpc_display(&err),
                 "blacklist watcher: isHashBlacklistedForOperator failed; keeping for re-scope"
-            );
-            None
-        }
-        Err(_elapsed) => {
-            warn!(
-                %hash,
-                timeout_secs = RPC_CALL_TIMEOUT.as_secs(),
-                "blacklist watcher: isHashBlacklistedForOperator timed out; keeping for re-scope"
             );
             None
         }

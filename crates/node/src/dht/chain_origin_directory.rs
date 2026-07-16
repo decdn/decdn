@@ -103,7 +103,7 @@ use crate::chain_events::resumable_watcher::{
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
-    WATCHER_MAX_BACKOFF, backfill_windows, check_backfill_range,
+    WATCHER_MAX_BACKOFF, backfill_windows, check_backfill_range, timed,
 };
 use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
@@ -255,9 +255,11 @@ where
     P: Provider + Clone,
 {
     async fn get_origins(&self, namespace: U256) -> Result<Vec<Address>> {
-        self.origin
-            .getOrigins(namespace)
-            .call()
+        // Bounded here, in the production impl, rather than at the sink: a
+        // timeout must surface as the same `Err` the sink's existing defer/retry
+        // path already handles (`on_tick_complete` bails while any namespace is
+        // deferred, driving the backoff). `StubReads` needs no timeout.
+        timed(None, "getOrigins", self.origin.getOrigins(namespace).call())
             .await
             .with_context(|| format!("getOrigins(namespace={namespace})"))
     }
@@ -727,7 +729,8 @@ where
 
 /// Resolve an operator address to its bound `NodeId` via `nodeIdOf`. Returns
 /// `Ok(None)` when the operator has no binding (`bytes32(0)`) — it cannot be a
-/// probeable origin. RPC errors propagate (caller decides fatal vs. drop).
+/// probeable origin. The read is bounded by [`timed`]; RPC errors (including a
+/// timeout) propagate (caller decides fatal vs. drop).
 async fn resolve_node_id<P>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     operator: Address,
@@ -735,9 +738,7 @@ async fn resolve_node_id<P>(
 where
     P: Provider + Clone,
 {
-    let resolved = bond
-        .nodeIdOf(operator)
-        .call()
+    let resolved = timed(None, "nodeIdOf", bond.nodeIdOf(operator).call())
         .await
         .with_context(|| format!("nodeIdOf({operator})"))?;
     let node_id = resolved.nodeId.0;
@@ -979,6 +980,55 @@ mod tests {
     use tokio::sync::broadcast;
 
     use crate::dht::staker_set::StakerChange;
+
+    /// Both of origin's sink-internal reads are bounded, so a stalled provider
+    /// fails the tick into the existing defer/retry path instead of wedging it.
+    ///
+    /// These drive `Contracts<P>` — the *production* [`OriginChainReads`] impl —
+    /// deliberately. Every other test in this module uses `StubReads`, which
+    /// carries no `timed` wrap and would therefore pass whether or not the
+    /// production impl bounds anything: a stub-level test here would look like a
+    /// wiring test while asserting nothing about the wiring.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_get_origins_fails_the_tick_rather_than_wedging() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let provider = hanging_provider();
+        let contracts = Contracts {
+            origin: OriginAssignment::OriginAssignmentInstance::new(
+                Address::ZERO,
+                provider.clone(),
+            ),
+            publisher: PublisherRegistry::PublisherRegistryInstance::new(
+                Address::ZERO,
+                provider.clone(),
+            ),
+            bond: CapacityBond::CapacityBondInstance::new(Address::ZERO, provider),
+        };
+        let err = bounded("get_origins", contracts.get_origins(U256::from(1)))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.contains("getOrigins timed out after")),
+            "a stalled getOrigins must fail into the backoff, not hang: {err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_node_id_of_fails_the_tick_rather_than_wedging() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let bond = CapacityBond::CapacityBondInstance::new(Address::ZERO, hanging_provider());
+        let err = bounded("resolve_node_id", resolve_node_id(&bond, Address::ZERO))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.contains("nodeIdOf timed out after")),
+            "a stalled nodeIdOf must fail into the backoff, not hang: {err:?}"
+        );
+    }
 
     fn h(b: u8) -> Hash {
         Hash::from_bytes([b; 32])
