@@ -73,7 +73,7 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::CacheEngine;
 use decdn_common::config::ResolvedSecurity;
 use decdn_gossip::{
-    GossipRuntimeConfig, GossipService, PeerTable, ReputationWiring, build_gossip,
+    GossipRuntimeConfig, GossipService, PeerTable, ReputationWiring, StakedNodeSet, build_gossip,
     metrics::NoopMetrics,
 };
 use decdn_node::dispatch::ConnectionLimiter;
@@ -147,6 +147,7 @@ async fn spawn_publisher(
     peers: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn decdn_gossip::GossipMetrics>,
     shutdown: CancellationToken,
+    staked: Option<Arc<dyn StakedNodeSet>>,
 ) -> decdn_gossip::GossipHandles {
     GossipService::spawn(
         ep,
@@ -156,17 +157,27 @@ async fn spawn_publisher(
             announce_interval_sec: 60,
             subscribe_global: true,
             region: Some(region.to_string()),
-            allowlist: std::collections::HashSet::new(),
             subscribe_reputation: false,
             reputation_publish_interval_sec: 3600,
         },
         peers,
         metrics,
         shutdown,
+        staked,
         ReputationWiring::default(),
     )
     .await
     .expect("gossip service starts")
+}
+
+/// Accept-any stub for the ADR 001 rule-2 gate — stands in for a live registry
+/// in which every participating node is currently staked.
+#[derive(Debug)]
+struct AllStaked;
+impl StakedNodeSet for AllStaked {
+    fn contains(&self, _node_id: &[u8; 32]) -> bool {
+        true
+    }
 }
 
 /// Check whether `peers` has learned `node_id` via `NodeAnnounce`, asserting the
@@ -321,6 +332,9 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
     // and runs the subscriber that validates + inserts B's announce. Node B is
     // wired identically with region "DE"; giving B a region (mirroring A)
     // enables its publisher, so the exchange is mutual.
+    // Both nodes staked: the real spawn → subscriber → `validate_envelope`
+    // path enforces ADR 001 rule 2, and a mutual learn proves the gate is
+    // threaded end-to-end and admits staked announcers.
     let a_handles = spawn_publisher(
         a_ep.clone(),
         a_secret.clone(),
@@ -329,6 +343,7 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
         Arc::clone(&a_peers),
         Arc::clone(&metrics),
         shutdown.clone(),
+        Some(Arc::new(AllStaked)),
     )
     .await;
     let b_handles = spawn_publisher(
@@ -339,6 +354,7 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
         Arc::clone(&b_peers),
         Arc::clone(&metrics),
         shutdown.clone(),
+        Some(Arc::new(AllStaked)),
     )
     .await;
 

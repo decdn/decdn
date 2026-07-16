@@ -1,6 +1,5 @@
 //! Gossip publisher + subscriber service wiring iroh-gossip to the peer table.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::reputation::{
     MAX_REPORTS_PER_REPORTER_PER_HR, ReportDrain, ReputationRateLimiter, ReputationSink,
-    StakedReporterSet, validate_reputation_envelope,
+    StakedNodeSet, validate_reputation_envelope,
 };
 use crate::{AnnounceReject, GossipMetrics, InsertOutcome, PeerTable, validate_envelope};
 
@@ -75,8 +74,6 @@ pub struct GossipRuntimeConfig {
     /// reject a region-less announce at validation time. `decdn-node`
     /// enforces this at config resolution.
     pub region: Option<String>,
-    /// Hex-validated set of permitted announcer node IDs. Empty = accept any.
-    pub allowlist: HashSet<[u8; 32]>,
     /// Subscribe to (and, when a report drain is supplied, publish on) the
     /// global `cdn/reputation/v1` topic (ADR 008). Independent of `region`.
     pub subscribe_reputation: bool,
@@ -216,6 +213,11 @@ impl GossipService {
     /// [`GossipMetrics::inc_rejected`] with the `subscribe_failed` label and
     /// an error-level log line; the old code merely `warn!`'d and left the
     /// subscriber task silently dead.
+    ///
+    /// `staked` gates `NodeAnnounce` admission to currently-staked nodes (ADR 001
+    /// rule 2). The runtime always passes `Some(live registry set)`; `None`
+    /// (accept any signature-valid announce) is for tests only — there is no
+    /// production path that disables the gate.
     #[allow(
         clippy::too_many_arguments,
         clippy::needless_pass_by_value,
@@ -229,6 +231,7 @@ impl GossipService {
         peer_table: Arc<RwLock<PeerTable>>,
         metrics: Arc<dyn GossipMetrics>,
         shutdown: CancellationToken,
+        staked: Option<Arc<dyn StakedNodeSet>>,
         reputation: ReputationWiring,
     ) -> Result<GossipHandles, GossipSpawnError> {
         let topics = build_topic_list(&cfg);
@@ -253,7 +256,6 @@ impl GossipService {
             });
         }
 
-        let allowlist = Arc::new(cfg.allowlist.clone());
         let announce_interval = Duration::from_secs(cfg.announce_interval_sec);
         let region = cfg.region.clone();
         let attempted = topics.len();
@@ -314,7 +316,7 @@ impl GossipService {
                 wiring,
                 gossip.clone(),
                 self_node_id,
-                Arc::clone(&allowlist),
+                staked.clone(),
                 Arc::clone(&peer_table),
                 Arc::clone(&metrics),
                 shutdown.clone(),
@@ -367,7 +369,7 @@ pub struct ReputationWiring {
     /// Consumer of validated inbound reports (the aggregator).
     pub sink: Option<Arc<dyn ReputationSink>>,
     /// Staked-reporter membership gate for inbound reports.
-    pub staked: Option<Arc<dyn StakedReporterSet>>,
+    pub staked: Option<Arc<dyn StakedNodeSet>>,
     /// Source of pending outbound reports for the publisher.
     pub report_drain: Option<Arc<dyn ReportDrain>>,
 }
@@ -540,7 +542,7 @@ fn subscriber_task(
     wiring: TopicWiring,
     gossip: Gossip,
     self_node_id: [u8; 32],
-    allowlist: Arc<HashSet<[u8; 32]>>,
+    staked: Option<Arc<dyn StakedNodeSet>>,
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
     shutdown: CancellationToken,
@@ -594,7 +596,7 @@ fn subscriber_task(
                 // share the same timestamp (avoids a race if the system clock
                 // moves between the two reads) and halves the syscall cost.
                 let now = now_us();
-                match validate_envelope(&msg.content, now, allowlist.as_ref()) {
+                match validate_envelope(&msg.content, now, staked.as_deref()) {
                     Ok(announce) if is_self_announce(&announce, &self_node_id) => {
                         // Echo of our own announce (#845): drop it before it
                         // reaches `dispatch_insert` — inserting ourselves into
@@ -786,7 +788,7 @@ fn reputation_subscriber_task(
     topic_id: TopicId,
     gossip: Gossip,
     sink: Arc<dyn ReputationSink>,
-    staked: Arc<dyn StakedReporterSet>,
+    staked: Arc<dyn StakedNodeSet>,
     metrics: Arc<dyn GossipMetrics>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
@@ -1039,7 +1041,6 @@ mod tests {
             announce_interval_sec: 60,
             subscribe_global,
             region: region.map(String::from),
-            allowlist: HashSet::new(),
             subscribe_reputation: false,
             reputation_publish_interval_sec: 3600,
         }
@@ -1413,6 +1414,7 @@ mod tests {
             peer_table,
             metrics,
             shutdown.clone(),
+            None,
             ReputationWiring::default(),
         )
         .await
@@ -1470,8 +1472,8 @@ mod tests {
             fn accept(&self, _report: ValidatedReport) {}
         }
         struct Staked;
-        impl StakedReporterSet for Staked {
-            fn contains(&self, _reporter: &[u8; 32]) -> bool {
+        impl StakedNodeSet for Staked {
+            fn contains(&self, _node_id: &[u8; 32]) -> bool {
                 true
             }
         }
@@ -1506,6 +1508,7 @@ mod tests {
             peer_table,
             metrics,
             shutdown.clone(),
+            None,
             wiring,
         )
         .await
@@ -1576,6 +1579,7 @@ mod tests {
             peer_table,
             metrics,
             shutdown.clone(),
+            None,
             wiring,
         )
         .await

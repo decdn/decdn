@@ -422,10 +422,6 @@ pub struct ResolvedGossip {
     /// Interval between reputation-report publish ticks (seconds). Matches the
     /// ADR 008 1-hour per-(reporter, node) rate limit by default.
     pub reputation_publish_interval_sec: u64,
-    /// Validated allowlist of accepted announcer node IDs. Empty = accept any
-    /// signature-valid announce (local substitute for ADR 001 rule 2 until
-    /// the on-chain staking registry contract lands).
-    pub allowlist: Vec<[u8; 32]>,
     /// Optional hard cap on `PeerTable` entry count
     /// (appendix-peer-table-eviction § No hard size cap). `None` => no cap
     /// (unlimited); `Some(n)` is always positive (the resolver rejects `0`).

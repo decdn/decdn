@@ -357,6 +357,18 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Gossip rule-2 enforced against the live registry, not a static allowlist
+  (#1170).** `NodeAnnounce` admission (ADR 001 rule 2) now checks the announcer
+  against the live on-chain staker set (`CapacityBond`, kept fresh by the
+  `NodeRegistered` / `NodeDeregistered` / `NodeAutoEjected` event tail) instead
+  of the file-configured allowlist, so a deregistered or slashed node can no
+  longer enter peer tables during its stale-cache window. The rejection metric
+  label changed from `not_allowlisted` to `not_staked`.
+  - **Config-breaking:** the `gossip.allowlist` field is removed. Because
+    `[gossip]` uses `deny_unknown_fields`, a config file that still sets
+    `gossip.allowlist` now fails `decdn config validate` and node startup —
+    delete the key. The staked-node check is no longer operator-tunable; it is
+    always enforced against the registry.
 - `rustls-webpki` → 0.103.12 (RUSTSEC-2026-0098, RUSTSEC-2026-0099) (#253).
 - `rustls-webpki` → 0.103.13 (RUSTSEC-2026-0104: reachable panic in CRL
   parsing) (#286).

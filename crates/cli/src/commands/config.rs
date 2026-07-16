@@ -487,7 +487,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # subscribe_global = true                   # subscribe/publish on cdn/global/v1
 # subscribe_reputation = true               # subscribe/publish on cdn/reputation/v1 (ADR 008)
 # reputation_publish_interval_sec = 3600    # reputation-report publish cadence; matches the ADR 008 1-hour rate limit
-# allowlist = []                            # accepted announcer node IDs (64-char hex); empty = accept any signature-valid announce
 # max_peer_entries = 100000                 # optional hard cap on PeerTable entries; omit = unlimited; must be > 0 when set
 
 [security]

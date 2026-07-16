@@ -66,7 +66,7 @@ pub trait SettlementSource: Send + Sync {
 
 // NB: the staked-reporter gate (ADR 008 §Gossip Protocol — reports accepted
 // only from staked nodes) is enforced at the gossip layer via
-// `decdn_gossip::StakedReporterSet` (implemented in `node` over the chain
+// `decdn_gossip::StakedNodeSet` (implemented in `node` over the chain
 // staker set), so this crate intentionally does not define a parallel trait.
 
 /// `min(distinct_counterparties / min_counterparties, 1.0)` (ADR 008

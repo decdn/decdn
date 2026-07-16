@@ -16,7 +16,7 @@ pub use metrics::GossipMetrics;
 pub use peer_table::{InsertOutcome, PeerEntry, PeerTable, StaleTimestamp};
 pub use reputation::{
     ALLOWED_CLOCK_SKEW_SECS, MAX_REPORT_AGE_SECS, MAX_REPORTS_PER_REPORTER_PER_HR, ReportDrain,
-    ReputationRateLimiter, ReputationReject, ReputationSink, StakedReporterSet, ValidatedReport,
+    ReputationRateLimiter, ReputationReject, ReputationSink, StakedNodeSet, ValidatedReport,
     validate_reputation_envelope,
 };
 pub use service::{
